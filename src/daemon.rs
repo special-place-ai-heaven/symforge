@@ -190,6 +190,11 @@ pub struct DaemonSessionClient {
     /// deduplicated, shared across clones so a reconnect can reopen the
     /// whole working set and verify deterministic IDs before serving.
     opened_roots: std::sync::Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+    /// Locked contract: the root a default (non-`add`) `index_folder` last
+    /// ACTIVATED for unqualified reads on this connection. `None` = home is
+    /// active. Shared across clones so a reconnect can restore the active
+    /// project after re-opening the working set.
+    active_root: std::sync::Arc<parking_lot::Mutex<Option<PathBuf>>>,
     auth_token: Option<String>,
     /// The process-coordination namespace that owns this daemon connection.
     /// Reconnect must reuse this exact typed owner rather than re-resolving
@@ -305,6 +310,11 @@ struct SessionRecord {
     /// active/bound one; for Phase 0/1 it is the sole project, byte-for-byte the
     /// prior `project_id`.
     active_project_id: String,
+    /// The immutable HOME identity (the project this session opened with).
+    /// `active_project_id` may move via a default `index_folder`; this never
+    /// does — reconnect verifies home identity against it, and health renders
+    /// home and active distinctly.
+    home_project_id: String,
     /// Per-session copy-on-write working set (Feature 012). Seeded on open with a
     /// SINGLE entry — the active project + its interned shared base + an EMPTY
     /// overlay — and grown by additive opens. The CROSS-PROJECT read route reads
@@ -331,6 +341,7 @@ impl Clone for SessionRecord {
         Self {
             session_id: self.session_id.clone(),
             active_project_id: self.active_project_id.clone(),
+            home_project_id: self.home_project_id.clone(),
             // Share the SAME working-set lock across clones (O(1), singular state).
             working_set: Arc::clone(&self.working_set),
             servers: self.servers.clone(),
@@ -1123,6 +1134,7 @@ impl DaemonState {
         let session = SessionRecord {
             session_id: session_id.clone(),
             active_project_id: project_id.to_string(),
+            home_project_id: project_id.to_string(),
             working_set: Arc::new(RwLock::new(working_set)),
             servers: HashMap::from([(project_id.to_string(), server)]),
             client_name: request.client_name.clone(),
@@ -1500,17 +1512,23 @@ impl DaemonState {
         };
         let target_root = &binding.canonical_root;
 
-        // Immutable home: `index_folder` NEVER retargets the session. The
-        // omitted-`add` default and the compatibility spelling `add=true` share
-        // this ONE canonical open contract — open/refresh `target_root` as a
-        // working-set project while unqualified reads stay bound to the home
-        // project. The `add` spelling is deliberately NOT part of the canonical
-        // idempotency request, so both spellings replay each other.
+        // Per-session activation (locked contract): the omitted-`add` default
+        // opens/refreshes `target_root` AND makes it the session's ACTIVE
+        // project for unqualified reads. The compatibility spelling
+        // `add=true` opens additively WITHOUT changing the active project.
+        // Home — the session/descriptor identity verified across reconnects —
+        // is immutable; only `active_project_id` moves, and only for THIS
+        // session (no cross-session interference). The working set retains
+        // every open project, so activation is non-destructive.
+        //
+        // The `add` spelling changes side effects (activation), so it IS part
+        // of the canonical idempotency request (hashed as `activate`).
         //
         // Cross-project replay is process coordination, not state owned by the
         // session's home repository. The one resolved ControlStateDir therefore
         // observes every open before any target ProjectInstance is constructed.
         let reset_requested = crate::protocol::tools::index_folder_reset_requested();
+        let activate = input.add != Some(true);
         let (idempotency, replay_response) = match input.idempotency_key.as_deref() {
             Some(raw_key) => {
                 let Some(control_state) = self.control_state_dir.as_ref() else {
@@ -1525,6 +1543,7 @@ impl DaemonState {
                     raw_key,
                     reset_requested,
                     allow_protected_root,
+                    activate,
                 ) {
                     Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
                         (Some(active), None)
@@ -1538,6 +1557,14 @@ impl DaemonState {
 
         match self.open_project_for_session(session_id, &binding) {
             Ok(mut output) => {
+                if activate
+                    && self.set_active_project(session_id, &binding.root_id.0)
+                {
+                    output.push_str(&format!(
+                        "active_project={} (default index_folder: unqualified reads on this session now target this project)\n",
+                        binding.root_id.0
+                    ));
+                }
                 if let Some(response) = replay_response {
                     return Ok(response);
                 }
@@ -1564,10 +1591,10 @@ impl DaemonState {
         }
     }
 
-    /// The ONE canonical daemon open path behind `index_folder` (immutable
-    /// home): opens/refreshes `target_root` as a working-set project WITHOUT
-    /// touching `active_project_id`. Both the omitted-`add` default and the
-    /// compatibility spelling `add=true` land here.
+    /// The ONE canonical daemon open path behind `index_folder`: opens/refreshes
+    /// `target_root` as a working-set project WITHOUT touching
+    /// `active_project_id` — the caller (`index_folder_for_session`) owns
+    /// per-session activation (default spelling activates; `add=true` does not).
     ///
     /// Steps:
     /// 1. ensure + join the authoritative project slot — session membership is
@@ -1745,13 +1772,9 @@ impl DaemonState {
     /// is not an open working-set entry (cannot activate a project that is not
     /// open). Only flips `active_project_id`; the working set is untouched (the
     /// target entry already exists). No overlay is written.
-    //
-    // ponytail: explicit working-set management seam. It has no production route
-    // yet — the DEFERRED "dedicated working-set management tool" (US-follow-up)
-    // owns wiring it to an MCP verb. Exercised by daemon unit tests today; allow
-    // dead_code so the server build (dead-code-on) stays green until that tool
-    // lands, rather than deleting a vetted, tested primitive.
-    #[allow(dead_code)]
+    ///
+    /// Production caller: `index_folder_for_session` activates on the default
+    /// (non-`add`) spelling, after the open has attached the project.
     fn set_active_project(&self, session_id: &str, project_id: &str) -> bool {
         match self.sessions.write().get_mut(session_id) {
             Some(session) => {
@@ -1829,12 +1852,13 @@ impl DaemonState {
 
     /// Task 4 (outstanding-work hardening): the ONE shared resolver from a
     /// session plus an optional explicit `project` selector to the bound
-    /// per-project runtime. Omission selects the immutable home project.
-    /// An explicit selector resolves an open project ID first, then a UNIQUE
-    /// current `project_name` among the session's OPEN working-set projects —
-    /// display text, not a persistent alias. Unknown/not-open/ambiguous
-    /// selectors return deterministic candidate data and never trigger
-    /// indexing or frecency.
+    /// per-project runtime. Omission selects the session's ACTIVE project
+    /// (home unless a default `index_folder` activated another working-set
+    /// project). An explicit selector resolves an open project ID first, then
+    /// a UNIQUE current `project_name` among the session's OPEN working-set
+    /// projects — display text, not a persistent alias. Unknown/not-open/
+    /// ambiguous selectors return deterministic candidate data and never
+    /// trigger indexing or frecency.
     fn runtime_for_target(
         &self,
         session_id: &str,
@@ -1954,8 +1978,16 @@ impl DaemonState {
                 };
                 let meta = slot.metadata.read();
                 let published = meta.index.published_state();
-                let home = if *id == session.active_project_id {
+                // Home and active are DISTINCT identities since the
+                // worktree-routing fix: home is the immutable session
+                // identity; active is what unqualified reads serve.
+                let home = if *id == session.home_project_id {
                     " home=yes"
+                } else {
+                    ""
+                };
+                let active = if *id == session.active_project_id {
+                    " active=yes"
                 } else {
                     ""
                 };
@@ -1970,7 +2002,7 @@ impl DaemonState {
                     "absent"
                 };
                 lines.push(format!(
-                    "{id}{home} name={} root={} files={} symbols={} index={} generation={} opened={} snapshot={}",
+                    "{id}{home}{active} name={} root={} files={} symbols={} index={} generation={} opened={} snapshot={}",
                     meta.project_name,
                     normalized_path_string(&meta.canonical_root),
                     published.file_count,
@@ -2061,6 +2093,7 @@ impl DaemonSessionClient {
             control_state_dir,
             project_root: None,
             opened_roots: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            active_root: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -2081,6 +2114,20 @@ impl DaemonSessionClient {
         if !roots.iter().any(|existing| existing == &root) {
             roots.push(root);
         }
+    }
+
+    /// Locked contract: record the root a default (non-`add`) `index_folder`
+    /// just ACTIVATED for this connection, so `reconnect` can restore the
+    /// active project after re-opening the working set. Recording `None`
+    /// means home is active again.
+    pub(crate) fn record_active_root(&self, root: PathBuf) {
+        *self.active_root.lock() = Some(root);
+    }
+
+    /// The root currently ACTIVE for unqualified reads on this connection
+    /// (set by a default `index_folder`), or `None` when home is active.
+    pub(crate) fn activated_root(&self) -> Option<PathBuf> {
+        self.active_root.lock().clone()
     }
 
     #[cfg(test)]
@@ -2196,12 +2243,16 @@ impl DaemonSessionClient {
         // verifies to a different id fails the whole reconnect (fail closed:
         // a silently missing sibling would turn explicit reads into
         // not-open errors, and a mismatched one would serve the wrong code).
+        //
+        // Sibling reopens use `add:true` so they CANNOT steal per-session
+        // activation — a fresh session's active project is its home, and the
+        // pre-reconnect active root is restored explicitly below.
         let siblings: Vec<PathBuf> = self.opened_roots.lock().clone();
         for root in &siblings {
             let response = new_client
                 .call_tool_value(
                     "index_folder",
-                    serde_json::json!({ "path": root.display().to_string() }),
+                    serde_json::json!({ "path": root.display().to_string(), "add": true }),
                 )
                 .await
                 .with_context(|| {
@@ -2216,6 +2267,48 @@ impl DaemonSessionClient {
                 );
             }
             new_client.record_opened_root(root.clone());
+        }
+
+        // Restore the pre-reconnect ACTIVE project: a fresh session's active
+        // project is its home, so when the caller had activated a sibling via
+        // a default `index_folder`, re-issue that default open (which now
+        // activates per the locked contract). Fail closed on a receipt for a
+        // different project.
+        //
+        // ponytail: re-running the default open re-reloads the project; a
+        // dedicated set-active route would avoid the reload. Deferred until
+        // reload cost matters in practice.
+        let active = self.active_root.lock().clone();
+        if let Some(active) = active {
+            let is_home = canonical_project_root(&active)
+                .ok()
+                .zip(canonical_project_root(project_root).ok())
+                .map(|(a, h)| a == h)
+                .unwrap_or(false);
+            if !is_home {
+                let response = new_client
+                    .call_tool_value(
+                        "index_folder",
+                        serde_json::json!({ "path": active.display().to_string() }),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "reconnect failed to restore active project {}",
+                            active.display()
+                        )
+                    })?;
+                if let Ok(canonical_active) = canonical_project_root(&active) {
+                    let expected = project_key(&canonical_active);
+                    anyhow::ensure!(
+                        response.contains(&format!("project_id={expected}")),
+                        "reconnect restored active project {} with an unexpected identity; refusing to serve (receipt: {response})",
+                        active.display()
+                    );
+                }
+                new_client.record_opened_root(active.clone());
+                new_client.record_active_root(active);
+            }
         }
         Ok(new_client)
     }
@@ -4549,7 +4642,7 @@ fn ensure_targets_open(targets: &Targets, working_set: &WorkingSet) -> Result<()
     } else {
         Err(format!(
             "project not open: {}. Open it in this session first with \
-             index_folder(path=..., add=true), then retarget.",
+             index_folder(path=...) — the default spelling opens AND activates it; add=true opens additively.",
             missing
                 .iter()
                 .map(|id| format!("'{id}'"))
@@ -4879,7 +4972,7 @@ fn execute_cross_project_knowledge(
     if !missing.is_empty() {
         anyhow::bail!(
             "project not open: {}. Open it in this session first with \
-             index_folder(path=..., add=true), then retarget.",
+             index_folder(path=...) — the default spelling opens AND activates it; add=true opens additively.",
             missing
                 .iter()
                 .map(|id| format!("'{id}'"))
@@ -4951,7 +5044,7 @@ fn execute_cross_project_review(
     if !missing.is_empty() {
         anyhow::bail!(
             "project not open: {}. Open it in this session first with \
-             index_folder(path=..., add=true), then retarget.",
+             index_folder(path=...) — the default spelling opens AND activates it; add=true opens additively.",
             missing
                 .iter()
                 .map(|id| format!("'{id}'"))
@@ -6969,7 +7062,10 @@ mod tests {
                     IndexFolderInput {
                         path: root.display().to_string(),
                         idempotency_key: None,
-                        add: None,
+                        // Additive: this test asserts the RESOLVER contract
+                        // (omission -> active), not activation — keep home A
+                        // active by not default-opening.
+                        add: Some(true),
                         allow_protected_root: None,
                     },
                 )
@@ -6978,7 +7074,8 @@ mod tests {
         let id_one = project_key(&canonical_project_root(&same_name_one).expect("canonical 1"));
         let id_two = project_key(&canonical_project_root(&same_name_two).expect("canonical 2"));
 
-        // Omission -> immutable home.
+        // Omission -> the ACTIVE project (home A; the same-name siblings were
+        // opened additively, which never activates).
         let home = state
             .runtime_for_target(&opened.session_id, None)
             .expect("home runtime");
@@ -7015,9 +7112,9 @@ mod tests {
         );
     }
 
-    // ── Feature 012 Phase 2 — retarget re-seeds the working set's active entry ───
+    // ── Locked contract — default open ACTIVATES the target, keeps the working set ───
     #[test]
-    fn test_default_index_folder_open_keeps_home_and_adds_to_working_set() {
+    fn test_default_index_folder_open_activates_and_keeps_working_set() {
         let project_a = project_dir("symforge-reseed-a");
         let project_b = project_dir("symforge-reseed-b");
         std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
@@ -7059,14 +7156,14 @@ mod tests {
         let sessions = state.sessions.read();
         let session = sessions.get(&opened.session_id).expect("session");
         assert_eq!(
-            session.active_project_id, active_a,
-            "default index_folder must preserve immutable home A"
+            session.active_project_id, project_b_id,
+            "default index_folder must ACTIVATE the opened project (locked contract)"
         );
         let ws = session.working_set.read();
         assert_eq!(ws.len(), 2, "default open must keep A and add B");
         assert!(
             ws.get(&active_a).is_some(),
-            "home project A must stay in the working set"
+            "home project A must stay in the working set (activation is non-destructive)"
         );
         let entry = ws
             .get(&project_b_id)
@@ -8809,6 +8906,7 @@ mod tests {
             SessionRecord {
                 session_id: session_id.clone(),
                 active_project_id: "missing-project".to_string(),
+                home_project_id: "missing-project".to_string(),
                 working_set: Arc::new(RwLock::new(WorkingSet::new())),
                 servers: HashMap::new(),
                 client_name: "codex".to_string(),
@@ -9677,7 +9775,7 @@ mod tests {
             "explicit active project query must NOT surface B's symbol: {explicit_active}"
         );
         assert!(
-            !explicit_active.contains("Cross-project queries"),
+            !explicit_active.contains("cross-project queries"),
             "explicit active project must not hit the local cross-project refusal: {explicit_active}"
         );
         assert!(
@@ -11553,7 +11651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_folder_open_keeps_immutable_home() {
+    async fn test_index_folder_default_open_activates_target() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -11615,6 +11713,10 @@ mod tests {
             reload.contains("Indexed"),
             "index_folder should report success, got: {reload}"
         );
+        assert!(
+            reload.contains("active_project="),
+            "default open must report activation, got: {reload}"
+        );
 
         let target_sessions = client
             .get(format!(
@@ -11631,6 +11733,11 @@ mod tests {
             .expect("session list body");
         assert_eq!(target_sessions.len(), 1);
         assert_eq!(target_sessions[0].session_id, opened.session_id);
+        assert_eq!(
+            target_sessions[0].project_id,
+            project_key(&canonical_project_root(project_b.path()).expect("canonical root")),
+            "session summary must report B as the ACTIVE project"
+        );
 
         let home_sessions = client
             .get(format!(
@@ -11645,7 +11752,11 @@ mod tests {
             .json::<Vec<SessionSummary>>()
             .await
             .expect("home session list body");
-        assert_eq!(home_sessions.len(), 1, "opening B must not evict home A");
+        assert_eq!(
+            home_sessions.len(),
+            1,
+            "opening B must not evict home A from the working set"
+        );
         assert_eq!(home_sessions[0].session_id, opened.session_id);
 
         let outline = client
@@ -11665,12 +11776,12 @@ mod tests {
             .await
             .expect("outline body");
         assert!(
-            outline.contains("old.rs"),
-            "unqualified reads must remain bound to immutable home A: {outline}"
+            outline.contains("new.rs"),
+            "unqualified reads must follow the ACTIVATED project B: {outline}"
         );
         assert!(
-            !outline.contains("new.rs"),
-            "opening B must not retarget unqualified reads away from home A: {outline}"
+            !outline.contains("old.rs"),
+            "default open of B must switch unqualified reads off home A: {outline}"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -11682,8 +11793,9 @@ mod tests {
     }
 
     /// Task 4 parity table (daemon route): explicit `project` selects the open
-    /// project B, omission stays bound to immutable home A, and an unknown
-    /// selector returns deterministic candidates without touching any index.
+    /// project B, omission stays bound to the ACTIVE project (home A — B was
+    /// opened additively, which never activates), and an unknown selector
+    /// returns deterministic candidates without touching any index.
     #[tokio::test]
     async fn test_project_routing_parity_table() {
         let _env_lock = env_lock().await;
@@ -11734,7 +11846,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
-                add: None,
+                add: Some(true),
                 allow_protected_root: None,
             })
             .send()
@@ -12051,12 +12163,13 @@ mod tests {
         .with_project_root(project_a.path().to_path_buf());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
 
-        // Open B additively through the proxy so the sibling root is recorded.
+        // Open B additively through the proxy so the sibling root is recorded
+        // WITHOUT changing the active project (home A stays active).
         let opened_b = server
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
-                add: None,
+                add: Some(true),
                 allow_protected_root: None,
             }))
             .await;
@@ -12093,7 +12206,8 @@ mod tests {
             "explicit B must remain routable after reconnect: {map_b}"
         );
 
-        // Unqualified reads still serve immutable home A.
+        // Unqualified reads still serve the ACTIVE project (home A — B was
+        // opened additively, which never activates).
         let map_home_input =
             serde_json::from_value(serde_json::json!({"detail": "full"})).expect("home input");
         let map_home = server.get_repo_map(Parameters(map_home_input)).await;
@@ -12110,10 +12224,105 @@ mod tests {
         .await;
     }
 
-    /// Task 7: every routed daemon tool response carries a machine-readable
-    /// selected-project receipt (out-of-band header) identifying the project
-    /// that actually served — home by default, the routed sibling when
-    /// `project` was explicit.
+    /// Locked-contract regression (worktree-routing incident): a DEFAULT
+    /// `index_folder` activates the opened project, and a reconnect across a
+    /// daemon endpoint replacement must RESTORE that activation — otherwise
+    /// unqualified reads silently fall back to the launch-CWD home, the exact
+    /// wrong-repo failure from the field.
+    #[tokio::test]
+    async fn test_reconnect_restores_activated_project() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-reconnect-active-home-a");
+        let project_b = project_dir("symforge-reconnect-active-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let first = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn first daemon");
+        let base_url = format!("http://127.0.0.1:{}", first.port);
+        let http = authed_client(&first);
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reconnect-active".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // DEFAULT open of B: activates B for unqualified reads.
+        let opened_b = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        assert!(opened_b.starts_with("Indexed "), "open B: {opened_b}");
+        assert!(
+            opened_b.contains("active_project="),
+            "default open must report activation: {opened_b}"
+        );
+
+        // Kill the daemon and bring up a replacement on the same home.
+        let _ = first.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            daemon_port_file_name(),
+        ))
+        .await;
+        let second = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn second daemon");
+
+        // Unqualified read through the stale proxy: first attempt fails, the
+        // reconnect discovers the replacement, restores the working set AND
+        // re-activates B, and the retry must serve B — not home A.
+        let map_input =
+            serde_json::from_value(serde_json::json!({"detail": "full"})).expect("map input");
+        let map = server.get_repo_map(Parameters(map_input)).await;
+        assert!(
+            map.contains("new.rs") && !map.contains("old.rs"),
+            "activated project B must survive reconnect (unqualified read): {map}"
+        );
+
+        let _ = second.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
     #[tokio::test]
     async fn test_tool_receipt_carries_project_evidence() {
         let _env_lock = env_lock().await;
@@ -12164,7 +12373,9 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
-                add: None,
+                // Additive: keep home A active so the omitted-project
+                // attestation below asserts the home evidence.
+                add: Some(true),
                 allow_protected_root: None,
             })
             .send()
@@ -12429,6 +12640,10 @@ mod tests {
             "home project must carry the home marker: {inventory}"
         );
         assert!(
+            inventory.contains(&format!("{project_b_id} active=yes")),
+            "the default-opened project must carry the active marker: {inventory}"
+        );
+        assert!(
             inventory.contains("snapshot=present") || inventory.contains("snapshot=absent"),
             "inventory rows must carry snapshot evidence: {inventory}"
         );
@@ -12465,7 +12680,8 @@ mod tests {
     }
 
     /// Task 5: structural edits route by explicit project. An explicit B edit
-    /// mutates ONLY B, an omitted edit mutates immutable home A, and an
+    /// mutates ONLY B, an omitted edit mutates the ACTIVE project (home A — B
+    /// is opened ADDITIVELY here, which never activates), and an
     /// unknown/ambiguous target writes NOTHING anywhere. Worktree routing and
     /// `working_directory` validation run against the SELECTED project's
     /// repository (the existing per-project edit safety, now bound by the
@@ -12514,7 +12730,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
-                add: None,
+                add: Some(true),
                 allow_protected_root: None,
             })
             .send()
@@ -12567,7 +12783,7 @@ mod tests {
             "explicit B edit must not touch home A: {on_disk_a}"
         );
 
-        // Omitted edit mutates immutable home A.
+        // Omitted edit mutates the ACTIVE project (home A — B was opened additively).
         let result_a = edit(serde_json::json!({
             "path": "src/lib.rs",
             "name": "shared_name",
@@ -13364,9 +13580,11 @@ mod tests {
         // fails over immediately instead of entering the reconnect path, which
         // would try to discover or SPAWN a real daemon — the opposite of a
         // hermetic unit test.
-        server
-            .daemon_degraded
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut state = server.daemon_degraded.lock();
+            state.degraded = true;
+            state.last_reconnect_attempt = Some(std::time::Instant::now());
+        }
         server
             .index
             .reload(&home_root)
@@ -13698,14 +13916,34 @@ mod tests {
                 IndexFolderInput {
                     path: project_b.path().display().to_string(),
                     idempotency_key: Some("shared-open-key".to_string()),
+                    add: None,
+                    allow_protected_root: None,
+                },
+            )
+            .expect("identical default replay B");
+        assert_eq!(
+            replay, first,
+            "same key + same request (including the activation spelling) must replay"
+        );
+
+        // The `add` spelling changes observable side effects (activation), so
+        // it MUST distinguish the canonical request: same key + different
+        // spelling conflicts deterministically rather than silently skipping
+        // activation.
+        let spelling_conflict = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: Some("shared-open-key".to_string()),
                     add: Some(true),
                     allow_protected_root: None,
                 },
             )
-            .expect("compatibility add=true replay B");
-        assert_eq!(
-            replay, first,
-            "default and add=true must share one canonical replay contract"
+            .expect("add=true against a default-open record");
+        assert!(
+            spelling_conflict.contains("Idempotency conflict"),
+            "same key with a different activation spelling must conflict: {spelling_conflict}"
         );
 
         let conflict = state
@@ -13714,7 +13952,7 @@ mod tests {
                 IndexFolderInput {
                     path: project_c.path().display().to_string(),
                     idempotency_key: Some("shared-open-key".to_string()),
-                    add: Some(true),
+                    add: None,
                     allow_protected_root: None,
                 },
             )
@@ -13842,13 +14080,21 @@ mod tests {
             "user-local placement must checkpoint through its resolved state directory: {receipt}"
         );
 
-        // The in-memory open stayed published: B is attached to the working set
-        // and home A is untouched.
+        // The in-memory open stayed published: B is attached to the working
+        // set, and the default spelling ACTIVATED B (locked contract) while
+        // home A stays in the working set.
         let project_b_id =
             project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
         let sessions = state.sessions.read();
         let session = sessions.get(&opened.session_id).expect("session");
-        assert_eq!(session.active_project_id, opened.project_id, "home stays A");
+        assert_eq!(
+            session.active_project_id, project_b_id,
+            "default open must activate B"
+        );
+        assert!(
+            session.working_set.read().get(&opened.project_id).is_some(),
+            "home A must stay in the working set"
+        );
         assert!(
             session.working_set.read().get(&project_b_id).is_some(),
             "B must be attached despite project-local state being unavailable"

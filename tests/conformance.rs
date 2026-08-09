@@ -586,13 +586,14 @@ fn all_tools_have_annotations() {
 
     const ADDITIVE_WRITE: &[&str] = &["insert_symbol", "edit_within_symbol", "batch_insert"];
 
-    const IDEMPOTENT_STATE: &[&str] = &["checkpoint_now", "analyze_file_impact"];
+    const IDEMPOTENT_STATE: &[&str] = &["checkpoint_now", "analyze_file_impact", "index_folder"];
 
-    // Destructive AND idempotent: `index_folder` replaces the active index
-    // (destructive) yet converges to the same result on re-run (idempotent).
-    // Both MCP hints are independent and honestly true, so it gets its own
-    // bucket rather than being mislabeled non-destructive.
-    const DESTRUCTIVE_IDEMPOTENT_STATE: &[&str] = &["index_folder", "curate_knowledge"];
+    // Destructive AND idempotent: `curate_knowledge` discards prior curated
+    // state (destructive) yet converges to the same result on re-run
+    // (idempotent). `index_folder` LEFT this bucket with the worktree-routing
+    // fix: it is now honestly non-destructive — the working set is retained
+    // and only the per-session ACTIVE pointer moves on the default spelling.
+    const DESTRUCTIVE_IDEMPOTENT_STATE: &[&str] = &["curate_knowledge"];
 
     let tools = SymForgeServer::tool_definitions();
 

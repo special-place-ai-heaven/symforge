@@ -202,7 +202,12 @@ fn is_admission_refusal(text: &str) -> bool {
 /// `classify_edit_output` caller. Deliberately narrow: BOTH anchors must match,
 /// so no unrelated body is reclassified.
 fn is_foreign_project_refusal(text: &str) -> bool {
-    text.starts_with("project '") && text.contains("is not available on this connection")
+    // Current shape carries the typed `Error: project_routing:` prefix; the
+    // legacy anchor below still classifies pre-10.1 bodies that came back
+    // through DISPATCH rather than an early return.
+    (text.starts_with("Error: project_routing: project '")
+        || text.starts_with("project '"))
+        && text.contains("is not available on this connection")
 }
 
 /// Sibling shape emitted by [`SymForgeServer::local_cross_project_refusal`] for
@@ -212,7 +217,10 @@ fn is_foreign_project_refusal(text: &str) -> bool {
 /// anchoring the FULL opening clause at position 0: a rendered search hit or doc
 /// line that quotes the message is prefixed (`7: // ...`) and stays `Found`.
 fn is_local_cross_project_refusal(text: &str) -> bool {
-    text.starts_with("Cross-project queries (project/projects) require the daemon")
+    // Current shape carries the typed `Error: project_routing:` prefix; the
+    // legacy anchor still classifies pre-10.1 bodies.
+    text.starts_with("Error: project_routing: cross-project queries")
+        || text.starts_with("Cross-project queries (project/projects) require the daemon")
 }
 
 fn classify_get_symbol_output(text: &str) -> OutcomeClass {
@@ -444,6 +452,22 @@ use super::SymForgeServer;
 
 // ─── Input parameter structs ────────────────────────────────────────────────
 
+/// Case-tolerant, separator-tolerant root comparison (mirrors
+/// `sidecar::port_file::same_root_identity`, kept local so protocol never
+/// imports a sidecar-private helper).
+fn same_root_text(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |path: &std::path::Path| {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let trimmed = normalized.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            trimmed.to_lowercase()
+        } else {
+            trimmed
+        }
+    };
+    canon(a) == canon(b)
+}
+
 /// Input for `index_folder`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct IndexFolderInput {
@@ -452,13 +476,16 @@ pub struct IndexFolderInput {
     /// Optional key used to replay an identical `index_folder` request safely.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// Feature 012 (Phase 2): when true, OPEN this folder ADDITIVELY in the
-    /// current session's working set instead of retargeting. The session keeps
-    /// its existing active project AND gains this one, enabling cross-project
-    /// reads (`project`/`projects` on `search_symbols`/`search_text`/
-    /// `find_references`). Default/omitted = the existing retarget behavior
-    /// (FR-006, byte-identical). Multi-project requires the daemon; on stdio/embed
-    /// (no daemon) an `add:true` call honestly refuses (Principle VII).
+    /// When true, OPEN this folder ADDITIVELY in the current session's
+    /// working set WITHOUT changing the active project. Default/omitted:
+    /// open the folder AND make it the session's ACTIVE project — unqualified
+    /// reads on this connection target it from then on (FR-006 retarget,
+    /// per-session; other connections are unaffected, and the previous
+    /// project stays in the working set, so nothing is discarded). The
+    /// active project enables cross-project reads (`project`/`projects` on
+    /// `search_symbols`/`search_text`/`find_references`) across the whole
+    /// working set. Multi-project requires the daemon; on stdio/embed (no
+    /// daemon) an `add:true` call honestly refuses (Principle VII).
     #[serde(default, deserialize_with = "lenient_bool")]
     pub add: Option<bool>,
     /// Direct, per-request authority to index the exact protected root in
@@ -6849,11 +6876,52 @@ impl SymForgeServer {
     }
 
     fn local_runtime_mode(&self) -> format::RuntimeMode {
-        if self.daemon_client.is_some() && self.daemon_degraded.load(Ordering::Relaxed) {
+        if self.daemon_client.is_some() && self.daemon_degraded.lock().degraded {
             format::RuntimeMode::DaemonDegradedLocalFallback
         } else {
             format::RuntimeMode::LocalProcess
         }
+    }
+
+    /// Locked-contract observability appended to health: daemon-degradation
+    /// diagnostics (failed endpoint, failure class, retry eligibility) and a
+    /// loud `project_mismatch` warning when the caller-declared root differs
+    /// from the root actually serving unqualified reads. Empty when healthy
+    /// and aligned.
+    fn health_trust_diagnostics(&self) -> String {
+        let mut out = String::new();
+        if let Some(snapshot) = self.daemon_degradation_snapshot() {
+            out.push_str(&format!(
+                "\nDaemon degraded: endpoint={} last_failure=\"{}\" retry_in={}s (bounded rediscovery armed; serving local fallback)",
+                snapshot.endpoint, snapshot.last_failure, snapshot.retry_after_secs
+            ));
+        }
+        if let Some(declared) = self.caller_declared_root.read().clone() {
+            // Serving root: the daemon session's ACTIVATED root when a
+            // default index_folder moved it, else the bound home.
+            let serving = self
+                .daemon_client
+                .as_ref()
+                .and_then(|slot| slot.try_read().ok())
+                .and_then(|client| client.activated_root())
+                .or_else(|| self.capture_repo_root());
+            let aligned = serving
+                .as_ref()
+                .map(|root| same_root_text(&declared, root))
+                .unwrap_or(false);
+            if !aligned {
+                out.push_str(&format!(
+                    "\nProject mismatch (project_mismatch): the caller declared root '{}' but unqualified reads are served by {}. Remediation: index_folder(path=\"{}\") (the default spelling activates it), or fix the harness launch CWD/declared roots.",
+                    declared.display(),
+                    serving
+                        .as_ref()
+                        .map(|root| format!("'{}'", root.display()))
+                        .unwrap_or_else(|| "(nothing bound)".to_string()),
+                    declared.display()
+                ));
+            }
+        }
+        out
     }
 
     fn health_for_runtime(
@@ -6881,6 +6949,7 @@ impl SymForgeServer {
         );
         result.push('\n');
         result.push_str(&format::format_runtime_status(&runtime_status));
+        result.push_str(&self.health_trust_diagnostics());
         let sidecar_status = sidecar_status_for_server(self);
         result.push('\n');
         result.push_str(&format::format_sidecar_status(&sidecar_status));
@@ -7054,6 +7123,7 @@ impl SymForgeServer {
         );
         result.push('\n');
         result.push_str(&format::format_runtime_status_compact(&runtime_status));
+        result.push_str(&self.health_trust_diagnostics());
         let sidecar_status = sidecar_status_for_server(self);
         result.push('\n');
         result.push_str(&format::format_sidecar_status_compact(&sidecar_status));
@@ -7450,8 +7520,11 @@ impl SymForgeServer {
             return None;
         }
         let bound_root = self.capture_repo_root();
+        // `Error:` anchor: routing refusals are semantic ERRORS, and the
+        // shared `is_error_output` predicate (analytics, edit classifiers,
+        // status wrappers) must never classify them as successful answers.
         Some(format!(
-            "project '{selector}' is not available on this connection: this server is bound \
+            "Error: project_routing: project '{selector}' is not available on this connection: this server is bound \
              to the single project '{}'{}. Explicit project routing requires the daemon \
              transport with the target project opened via index_folder(path=...).",
             self.project_name,
@@ -7512,7 +7585,7 @@ impl SymForgeServer {
         }
 
         Some(
-            "Cross-project queries (project/projects) require the daemon: the \
+            "Error: project_routing: cross-project queries (project/projects) require the daemon: the \
              working set of open projects lives on the daemon transport, not on \
              the /mcp HTTP transport, stdio/embed, or while the daemon is \
              unreachable. Start the daemon to query across projects."
@@ -7520,36 +7593,48 @@ impl SymForgeServer {
         )
     }
 
-    /// Reindex a directory from scratch — replaces the current index, restarts watcher, triggers
-    /// git temporal analysis. Use when switching projects. Destructive to current index.
+    /// Open or refresh a directory's index in this session's working set and (by
+    /// default) make it the ACTIVE project for unqualified reads on this
+    /// connection. Restarts the watcher and triggers git temporal analysis for the
+    /// target. Use when switching projects. Non-destructive: previously opened
+    /// projects stay in the working set. Pass `add:true` to open additively
+    /// without switching the active project.
     #[tool(
-        description = "Reindex a directory from scratch — replaces the current index, restarts watcher, triggers git temporal analysis. Use when switching projects. Destructive to current index. NOT for re-reading a single changed file (use analyze_file_impact). NOT for reading content from an existing index (use get_file_content).",
+        description = "Open or refresh a directory's index in this session's working set and (by default) make it the ACTIVE project for unqualified reads on this connection — use when switching projects. Non-destructive: previously opened projects stay in the working set. Pass add:true to open additively without switching the active project. NOT for re-reading a single changed file (use analyze_file_impact). NOT for reading content from an existing index (use get_file_content).",
         annotations(
-            // Destructive: replaces the active index (discards current contents),
-            // matching the description. Also idempotent: re-running with the same
-            // path converges to the same index. Destructive + idempotent are
-            // independent MCP hints, so both are honestly true here.
+            // Non-destructive: the working set is retained; only the
+            // per-session active pointer moves. Idempotent: re-running with
+            // the same path converges to the same index and active project.
             read_only_hint = false,
-            destructive_hint = true,
+            destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
     pub async fn index_folder(&self, params: Parameters<IndexFolderInput>) -> String {
         if let Some(result) = self.proxy_tool_call("index_folder", &params.0).await {
-            // Immutable home: a daemon `index_folder` (default or `add=true`)
-            // opens/refreshes the target in the daemon-owned working set and
-            // NEVER retargets this connection. The bound `repo_root` and any
-            // local home-fallback state in `self.index` stay exactly as they
-            // are — unqualified reads remain bound to home.
+            // Locked contract: a daemon `index_folder` opens/refreshes the
+            // target in the daemon-owned working set; the default spelling
+            // additionally makes it this session's ACTIVE project
+            // (unqualified reads follow it), while `add:true` leaves the
+            // active project unchanged. Home identity, the bound `repo_root`,
+            // and any local home-fallback state in `self.index` are
+            // untouched.
             //
-            // Task 8: remember the successfully opened sibling root so a
-            // reconnect can restore the whole working set.
+            // Task 8 + activation: remember the opened root so a reconnect
+            // can restore the working set, and remember the DEFAULT-opened
+            // root as the active one so reconnect restores it AFTER the
+            // sibling reopens (which use `add:true` precisely so they cannot
+            // steal activation).
             if result.starts_with("Indexed ")
                 && let Some(daemon_lock) = self.daemon_client.as_ref()
                 && let Ok(root) = std::path::Path::new(&params.0.path).canonicalize()
             {
-                daemon_lock.read().await.record_opened_root(root);
+                let client = daemon_lock.read().await;
+                client.record_opened_root(root.clone());
+                if params.0.add != Some(true) {
+                    client.record_active_root(root);
+                }
             }
             return result;
         }
@@ -7642,6 +7727,10 @@ impl SymForgeServer {
                     raw_key,
                     reset_requested,
                     allow_protected_root,
+                    // Local mode is single-project: reaching here means
+                    // `add:true` already refused, so the default reload IS
+                    // the activation (it rebinds this process's one index).
+                    true,
                 ) {
                     Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
                         (Some(active), None)
@@ -11315,6 +11404,15 @@ impl SymForgeServer {
         }
 
         let body = self.render_stel_status_body(&request);
+        // Never silently serve a degraded local render as daemon truth: when
+        // the proxy fell back, say so at the top of the body.
+        let body = if self.daemon_client.is_some() && self.daemon_degraded.lock().degraded {
+            format!(
+                "daemon_degraded_local_fallback: the daemon is unreachable; this status was rendered from the LOCAL fallback index, not the daemon working set.\n{body}"
+            )
+        } else {
+            body
+        };
         statused_tool_result(body, OutcomeClass::Found)
     }
 

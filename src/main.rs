@@ -277,14 +277,6 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
         )?;
     }
 
-    let heartbeat_client = session.clone();
-    let heartbeat_task = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            let _ = heartbeat_client.heartbeat().await;
-        }
-    });
-
     let state_placement = session.project_root().and_then(|root| {
         match discovery::resolve_root_candidate(
             root,
@@ -305,6 +297,26 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
         session.clone(),
         state_placement,
     );
+    // Reconnect lifecycle fence: the heartbeat must beat the CURRENT session
+    // (read from the server's shared slot each tick), not a stale clone of the
+    // original — otherwise the old session is kept alive while the NEW session
+    // is never heartbeated and eventually reaped. The descriptor context lets
+    // the proxy republish this adapter's descriptor with the new session id
+    // after a reconnect.
+    if let Some(state_dir) = control_state_dir.as_ref() {
+        server.set_descriptor_state_dir(state_dir.clone());
+    }
+    let heartbeat_slot = server.daemon_client_slot();
+    let heartbeat_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let Some(slot) = heartbeat_slot.as_ref() else {
+                continue;
+            };
+            let current = slot.read().await.clone();
+            let _ = current.heartbeat().await;
+        }
+    });
 
     // Feature 013 US1 (T021): the DEFAULT operator stdio is daemon-backed, and
     // the `symforge` compact tool — the ONLY tool that records STEL economics
@@ -343,6 +355,7 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
         session_id = %session.session_id(),
         "starting daemon-backed MCP server on stdio transport"
     );
+    let shutdown_slot = server.daemon_client_slot();
     let service = serve_server(server, transport::stdio()).await?;
 
     tokio::select! {
@@ -353,7 +366,11 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     }
 
     heartbeat_task.abort();
-    let _ = session.close().await;
+    // Close the CURRENT session (post-reconnect), not the stale original.
+    if let Some(slot) = shutdown_slot {
+        let current = slot.read().await.clone();
+        let _ = current.close().await;
+    }
     // Task 8: remove ONLY this adapter's descriptor; sibling adapters on the
     // same root keep theirs.
     if let Some(state_dir) = control_state_dir.as_ref() {

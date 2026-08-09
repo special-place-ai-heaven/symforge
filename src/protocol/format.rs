@@ -2514,7 +2514,14 @@ fn sidecar_port_label(status: &crate::sidecar::port_file::SidecarStatus) -> Stri
 
 pub(crate) fn format_sidecar_status(status: &crate::sidecar::port_file::SidecarStatus) -> String {
     if status.liveness == crate::sidecar::port_file::SidecarLiveness::NoSidecar {
-        return "Sidecar: none (.symforge/sidecar.* absent)".to_string();
+        // Identity-rejected candidates must NOT vanish into a bare "none":
+        // rejected descriptors mean a sidecar EXISTS but refused this
+        // caller's root — exactly the evidence a wrong-project investigation
+        // needs.
+        return match status.detail.as_deref() {
+            Some(detail) => format!("Sidecar: none usable ({detail})"),
+            None => "Sidecar: none (.symforge/sidecar.* absent)".to_string(),
+        };
     }
 
     let mut line = format!(
@@ -2533,7 +2540,10 @@ pub(crate) fn format_sidecar_status_compact(
     status: &crate::sidecar::port_file::SidecarStatus,
 ) -> String {
     if status.liveness == crate::sidecar::port_file::SidecarLiveness::NoSidecar {
-        return "Sidecar: none".to_string();
+        return match status.detail.as_deref() {
+            Some(detail) => format!("Sidecar: none usable ({detail})"),
+            None => "Sidecar: none".to_string(),
+        };
     }
 
     format!(

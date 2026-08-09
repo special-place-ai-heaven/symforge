@@ -426,12 +426,14 @@ pub fn begin_index_folder_replay(
     raw_key: &str,
     reset_requested: bool,
     allow_protected_root: bool,
+    activate: bool,
 ) -> Result<ReplayStart, IdempotencyError> {
     let key = IdempotencyKey::new(raw_key)?;
     let request_hash = index_folder_request_hash(
         canonical_request_root,
         reset_requested,
         allow_protected_root,
+        activate,
     )?;
 
     let store = FileReplayStore::open_control(control_state)?;
@@ -504,6 +506,7 @@ pub fn index_folder_request_hash(
     canonical_root: &Path,
     reset_requested: bool,
     allow_protected_root: bool,
+    activate: bool,
 ) -> Result<RequestHash, IdempotencyError> {
     RequestHash::for_tool_request(
         "index_folder",
@@ -511,6 +514,11 @@ pub fn index_folder_request_hash(
             "path": normalized_path_string(canonical_root),
             "reset": reset_requested,
             "allow_protected_root": allow_protected_root,
+            // The `add` spelling changes observable side effects (per-session
+            // activation), so it MUST distinguish the canonical request:
+            // replaying an `add:true` record for a default call would skip
+            // activation, and vice versa.
+            "activate": activate,
         }),
     )
 }

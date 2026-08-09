@@ -367,7 +367,7 @@ async fn cross_project_targeting_is_refused_over_http() {
     let url = server.mcp_url();
 
     // The refusal prefix emitted by `local_cross_project_refusal`.
-    const REFUSAL_PREFIX: &str = "Cross-project queries (project/projects) require";
+    const REFUSAL_PREFIX: &str = "Error: project_routing: cross-project queries";
 
     let cross_project_calls = [
         (
