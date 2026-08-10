@@ -1125,8 +1125,7 @@ impl SymForgeServer {
         // Reconnect attempt — take a write lock so only one caller does this.
         let reconnected = {
             let mut client = daemon_lock.write().await;
-            self.daemon_degraded.lock().last_reconnect_attempt =
-                Some(std::time::Instant::now());
+            self.daemon_degraded.lock().last_reconnect_attempt = Some(std::time::Instant::now());
             match client.reconnect().await {
                 Ok(new_client) => {
                     tracing::info!("daemon reconnected successfully");
@@ -1228,7 +1227,10 @@ impl SymForgeServer {
             return None;
         }
         Some(DaemonDegradationSnapshot {
-            endpoint: state.last_endpoint.clone().unwrap_or_else(|| "(unknown)".to_string()),
+            endpoint: state
+                .last_endpoint
+                .clone()
+                .unwrap_or_else(|| "(unknown)".to_string()),
             last_failure: state
                 .last_failure
                 .clone()
@@ -1803,9 +1805,7 @@ impl ServerHandler for SymForgeServer {
                         let body = result
                             .content
                             .iter()
-                            .filter_map(|block| {
-                                block.as_text().map(|text| text.text.as_str())
-                            })
+                            .filter_map(|block| block.as_text().map(|text| text.text.as_str()))
                             .collect::<Vec<_>>()
                             .join("\n");
                         if !body.is_empty() && tools::is_error_output(&body) {
@@ -2041,7 +2041,10 @@ mod tests {
             .proxy_tool_call("health", &serde_json::json!({}))
             .await;
 
-        assert!(result.is_none(), "failed rediscovery still falls back local");
+        assert!(
+            result.is_none(),
+            "failed rediscovery still falls back local"
+        );
         let state = server.daemon_degraded.lock();
         let bumped = state
             .last_reconnect_attempt
@@ -2050,7 +2053,10 @@ mod tests {
             bumped > past_attempt,
             "the reconnect attempt marker must advance past the cooldown"
         );
-        assert!(state.degraded, "failed rediscovery keeps the degraded state");
+        assert!(
+            state.degraded,
+            "failed rediscovery keeps the degraded state"
+        );
     }
 
     /// Feature 013 US1 (T021): a daemon-PROXY server with a durable

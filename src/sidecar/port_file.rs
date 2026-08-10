@@ -417,7 +417,11 @@ fn select_descriptor_status(
     if let Some(unprobed) = candidates.get(probed) {
         Some(selected(unprobed, SidecarLiveness::Unknown, epoch_rejected))
     } else {
-        Some(selected(&candidates[0], SidecarLiveness::Dead, epoch_rejected))
+        Some(selected(
+            &candidates[0],
+            SidecarLiveness::Dead,
+            epoch_rejected,
+        ))
     }
 }
 
@@ -949,30 +953,16 @@ mod tests {
         let pid = std::process::id();
 
         // Matching epoch: selected.
-        write_descriptor_for_pid_at(
-            dir,
-            pid,
-            port,
-            Some("session-7"),
-            None,
-            Some(1_700_000_000),
-        )
-        .expect("write matching descriptor");
+        write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), None, Some(1_700_000_000))
+            .expect("write matching descriptor");
         let status = read_sidecar_status_at(dir, "127.0.0.1");
         assert_eq!(status.liveness, SidecarLiveness::Alive);
         assert_eq!(status.port, Some(port), "matching epoch must select");
 
         // Stale epoch (descriptor written against the PREVIOUS daemon boot):
         // rejected even though the port is alive and serves 200.
-        write_descriptor_for_pid_at(
-            dir,
-            pid,
-            port,
-            Some("session-7"),
-            None,
-            Some(1_600_000_000),
-        )
-        .expect("write stale-epoch descriptor");
+        write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), None, Some(1_600_000_000))
+            .expect("write stale-epoch descriptor");
         let status = read_sidecar_status_at(dir, "127.0.0.1");
         assert_ne!(
             status.liveness,
@@ -980,7 +970,11 @@ mod tests {
             "stale epoch must not select: {status:?}"
         );
         assert!(
-            status.detail.as_deref().unwrap_or("").contains("epoch-rejected"),
+            status
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("epoch-rejected"),
             "rejection must be attributed to the epoch probe: {status:?}"
         );
 
