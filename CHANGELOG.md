@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.0.3](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.2...v10.0.3) (2026-08-10)
+
+
+### Miscellaneous Chores
+
+* release 10.0.3 ([d77c416](https://github.com/special-place-ai-heaven/symforge/commit/d77c416cb01a30751077eb679e365f522e9a3037))
+
 ## [10.0.2](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.1...v10.0.2) (2026-08-10)
 
 
