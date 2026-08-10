@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.0.4](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.3...v10.0.4) (2026-08-10)
+
+
+### Bug Fixes
+
+* gate sidecar enrichment on trusted index state ([#547](https://github.com/special-place-ai-heaven/symforge/issues/547)) ([3c169cf](https://github.com/special-place-ai-heaven/symforge/commit/3c169cf27f4b5409cfb404d074b7b3c2d92d703c))
+
 ## [10.0.3](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.2...v10.0.3) (2026-08-10)
 
 
