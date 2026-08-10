@@ -292,17 +292,23 @@ existing 5-second best-of-N gate. Likewise, the early pass's first-file Empty
 admission, formatting, post-impact 503, deletion convergence, and live HTTP 500
 findings are fixed and covered on the frozen target.
 
-The full release-grade gate remains intentionally pending until the three frozen
-reviews return:
+Claude Fable's frozen-target round-2 review independently ran the full
+release-grade gate below and reported every command green. The landing agent
+accepted that frozen review as the external gate; no implementation changed
+afterward, and PR CI will rerun the repository gates before merge:
 
 ```text
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets -- --test-threads=1
 cargo build --release
-node scripts/verify-tools.cjs --fixture
-node scripts/verify-tools.cjs --fixture --surface compact
+node scripts/verify-tools.cjs --bin target/release/symforge.exe
+node scripts/verify-tools.cjs --fixture verify-tools-real --bin target/release/symforge.exe
 ```
+
+On Unix, omit the `.exe` suffix. There is no `--surface` CLI flag: compact
+cases are exercised inside the canonical fixture harness, which sets
+`SYMFORGE_SURFACE=compact` for the cases that require it.
 
 Green commands are evidence of build/test health, not proof of the concurrency
 contracts above.
