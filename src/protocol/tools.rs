@@ -205,8 +205,7 @@ fn is_foreign_project_refusal(text: &str) -> bool {
     // Current shape carries the typed `Error: project_routing:` prefix; the
     // legacy anchor below still classifies pre-10.1 bodies that came back
     // through DISPATCH rather than an early return.
-    (text.starts_with("Error: project_routing: project '")
-        || text.starts_with("project '"))
+    (text.starts_with("Error: project_routing: project '") || text.starts_with("project '"))
         && text.contains("is not available on this connection")
 }
 

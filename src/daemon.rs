@@ -1572,9 +1572,7 @@ impl DaemonState {
 
         match self.open_project_for_session(session_id, &binding) {
             Ok(mut output) => {
-                if activate
-                    && self.set_active_project(session_id, &binding.root_id.0)
-                {
+                if activate && self.set_active_project(session_id, &binding.root_id.0) {
                     output.push_str(&format!(
                         "active_project={} (default index_folder: unqualified reads on this session now target this project)\n",
                         binding.root_id.0
@@ -2480,7 +2478,9 @@ async fn connect_or_spawn_session_at(
     // Capture the daemon's boot epoch for descriptor epoch validation.
     // Unauthenticated /health by design; failure is non-fatal (epoch simply
     // absent, selection falls back to PID+TCP for legacy records).
-    let daemon_started_at = daemon_health(port).await.and_then(|h| h.started_at_unix_secs);
+    let daemon_started_at = daemon_health(port)
+        .await
+        .and_then(|h| h.started_at_unix_secs);
 
     Ok(DaemonSessionClient::new_with_auth_token(
         base_url,
@@ -4242,8 +4242,7 @@ fn guard_session_caller_root(
     runtime: &SessionRuntime,
     query: Option<&str>,
 ) -> Result<(), StatusCode> {
-    if let Some(caller_root) =
-        crate::sidecar::handlers::query_param(query, "caller_root")
+    if let Some(caller_root) = crate::sidecar::handlers::query_param(query, "caller_root")
         && !crate::sidecar::handlers::roots_match(
             std::path::Path::new(&caller_root),
             &runtime.canonical_root,
@@ -11604,11 +11603,7 @@ mod tests {
             "caller_root=B (the active project) must be served"
         );
 
-        let unpinned = client
-            .get(url(""))
-            .send()
-            .await
-            .expect("unpinned request");
+        let unpinned = client.get(url("")).send().await.expect("unpinned request");
         assert!(
             unpinned.status().is_success(),
             "a request without caller_root stays unguarded"
