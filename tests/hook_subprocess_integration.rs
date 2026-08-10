@@ -59,11 +59,28 @@ fn write_sidecar_descriptor(control_root: &Path, project_root: &Path, port: u16)
     symforge::sidecar::port_file::write_session_descriptor(
         &control_state,
         port,
-        Some("hook-subprocess-test"),
+        None,
         Some(project_root),
         None,
     )
     .expect("write sidecar session descriptor");
+}
+
+fn write_daemon_session_descriptor(
+    control_root: &Path,
+    project_root: &Path,
+    port: u16,
+    session_id: &str,
+) {
+    let control_state = symforge::domain::ControlStateDir::new(control_root.to_path_buf());
+    symforge::sidecar::port_file::write_session_descriptor(
+        &control_state,
+        port,
+        Some(session_id),
+        Some(project_root),
+        None,
+    )
+    .expect("write daemon-backed session descriptor");
 }
 
 fn write_daemon_port(control_root: &Path, port: u16) {
@@ -201,6 +218,602 @@ fn run_hook_routed_success_writes_source_read_routed_event() {
     );
 }
 
+#[test]
+fn run_hook_index_not_ready_fails_open_as_sidecar_error() {
+    const PARTIAL_MARKER: &str = "partial-index-context-must-not-escape";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let port = listener
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let mock = thread::spawn(move || {
+        serve_mock_http_response(listener, "503 Service Unavailable", PARTIAL_MARKER)
+    });
+
+    let tmp = TempDir::new().expect("tempdir creation");
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), port);
+
+    let (stdout, log, stderr) = run_hook_in_tempdir_with_env_and_stderr(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[
+            ("SYMFORGE_HOME", home.path().to_string_lossy().as_ref()),
+            ("SYMFORGE_HOOK_VERBOSE", "1"),
+        ],
+    );
+    mock.join().expect("mock sidecar thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert_eq!(
+        parsed["hookSpecificOutput"]["additionalContext"], "",
+        "an index-loading refusal must fail open with empty context"
+    );
+    assert!(
+        !stdout.contains(PARTIAL_MARKER),
+        "503 response body must not be injected into hook context; got:\n{stdout}"
+    );
+    assert!(
+        log.contains("\tsource-read\tsidecar-error"),
+        "an index-loading refusal must use the honest sidecar-error lane; \
+         stderr:\n{stderr}\nlog:\n{log}"
+    );
+    assert!(
+        !log.contains("sidecar_port_stale"),
+        "an index-loading refusal must not suggest restarting a live sidecar; got:\n{log}"
+    );
+    assert!(
+        stderr.contains("index not ready"),
+        "verbose diagnostics must name the live-but-loading condition; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("sidecar not running"),
+        "a live sidecar's 503 must not emit the restart diagnostic; got:\n{stderr}"
+    );
+    let hint_marker = symforge::paths::control_state_path(
+        &symforge::domain::ControlStateDir::new(home.path().to_path_buf()),
+        "hook-hint-shown",
+    );
+    assert!(
+        !hint_marker.exists(),
+        "an index-loading refusal must not create the sidecar restart-hint marker"
+    );
+}
+
+#[test]
+fn run_hook_local_http_500_fails_open_as_http_failure_without_restart_hint() {
+    const ERROR_MARKER: &str = "live-sidecar-500-body-must-not-escape";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let port = listener
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let mock = thread::spawn(move || {
+        serve_mock_http_response(listener, "500 Internal Server Error", ERROR_MARKER)
+    });
+
+    let tmp = TempDir::new().expect("tempdir creation");
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), port);
+
+    let (stdout, log, stderr) = run_hook_in_tempdir_with_env_and_stderr(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[
+            ("SYMFORGE_HOME", home.path().to_string_lossy().as_ref()),
+            ("SYMFORGE_HOOK_VERBOSE", "1"),
+        ],
+    );
+    mock.join().expect("mock sidecar thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
+    assert!(!stdout.contains(ERROR_MARKER));
+    assert!(log.contains("\tsource-read\tsidecar-error"));
+    assert!(!log.contains("sidecar_port_stale"));
+    assert!(stderr.contains("outcome=SidecarError reason=http_failure"));
+    assert!(!stderr.contains("sidecar not running"));
+    assert!(!stderr.contains("restart_sidecar"));
+    let hint_marker = symforge::paths::control_state_path(
+        &symforge::domain::ControlStateDir::new(home.path().to_path_buf()),
+        "hook-hint-shown",
+    );
+    assert!(!hint_marker.exists());
+}
+
+#[test]
+fn run_hook_root_conflict_fails_open_without_stale_sidecar_hint() {
+    const CONFLICT_MARKER: &str = "wrong-project-context-must-not-escape";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let port = listener
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let mock =
+        thread::spawn(move || serve_mock_http_response(listener, "409 Conflict", CONFLICT_MARKER));
+
+    let tmp = TempDir::new().expect("tempdir creation");
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), port);
+    let (stdout, log, stderr) = run_hook_in_tempdir_with_env_and_stderr(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[
+            ("SYMFORGE_HOME", home.path().to_string_lossy().as_ref()),
+            ("SYMFORGE_HOOK_VERBOSE", "1"),
+        ],
+    );
+    mock.join().expect("mock sidecar thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
+    assert!(!stdout.contains(CONFLICT_MARKER));
+    assert!(log.contains("\tsource-read\tsidecar-error"));
+    assert!(!log.contains("sidecar_port_stale"));
+    assert!(stderr.contains("root conflict"));
+    assert!(!stderr.contains("sidecar not running"));
+    let hint_marker = symforge::paths::control_state_path(
+        &symforge::domain::ControlStateDir::new(home.path().to_path_buf()),
+        "hook-hint-shown",
+    );
+    assert!(!hint_marker.exists());
+}
+
+#[test]
+fn run_hook_index_not_ready_uses_ready_daemon_fallback() {
+    const PARTIAL_MARKER: &str = "partial-local-sidecar-context-must-not-escape";
+
+    let sidecar = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let sidecar_port = sidecar
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let sidecar_thread = thread::spawn(move || {
+        serve_mock_http_response(sidecar, "503 Service Unavailable", PARTIAL_MARKER)
+    });
+
+    let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
+    let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
+    let tmp = TempDir::new().expect("tempdir creation");
+    let canonical_root = std::fs::canonicalize(tmp.path())
+        .unwrap_or_else(|_| tmp.path().to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let daemon_thread = thread::spawn(move || serve_mock_daemon(daemon, &canonical_root));
+
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), sidecar_port);
+    write_daemon_port(home.path(), daemon_port);
+
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    sidecar_thread
+        .join()
+        .expect("mock loading sidecar thread joins");
+    daemon_thread.join().expect("mock daemon thread joins");
+
+    assert!(
+        stdout.contains(ENRICHED_MARKER),
+        "a ready daemon must enrich when the selected local sidecar is still loading; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(PARTIAL_MARKER),
+        "the local 503 body must never be injected; got:\n{stdout}"
+    );
+    assert!(
+        log.contains("mock-session\tsource-read\tdaemon-fallback"),
+        "daemon-routed enrichment must be attributed to the daemon session; got:\n{log}"
+    );
+}
+
+#[test]
+fn run_hook_daemon_index_not_ready_uses_daemon_session_error() {
+    const LOCAL_PARTIAL: &str = "partial-local-context-must-not-escape";
+    const DAEMON_PARTIAL: &str = "partial-daemon-context-must-not-escape";
+
+    let sidecar = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let sidecar_port = sidecar
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let sidecar_thread = thread::spawn(move || {
+        serve_mock_http_response(sidecar, "503 Service Unavailable", LOCAL_PARTIAL)
+    });
+
+    let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
+    let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
+    let tmp = TempDir::new().expect("tempdir creation");
+    let canonical_root = std::fs::canonicalize(tmp.path())
+        .unwrap_or_else(|_| tmp.path().to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let daemon_thread = thread::spawn(move || {
+        serve_mock_daemon_with_enrichment(
+            daemon,
+            &canonical_root,
+            "503 Service Unavailable",
+            DAEMON_PARTIAL,
+        )
+    });
+
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), sidecar_port);
+    write_daemon_port(home.path(), daemon_port);
+
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    sidecar_thread
+        .join()
+        .expect("mock loading sidecar thread joins");
+    daemon_thread.join().expect("mock daemon thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
+    assert!(!stdout.contains(LOCAL_PARTIAL));
+    assert!(!stdout.contains(DAEMON_PARTIAL));
+    assert!(
+        log.contains("mock-session\tsource-read\tsidecar-error"),
+        "the daemon's 503 must be attributed to the daemon session; got:\n{log}"
+    );
+    assert!(!log.contains("sidecar_port_stale"));
+    assert!(!log.contains("restart_sidecar"));
+}
+
+#[test]
+fn run_hook_daemon_root_conflict_uses_daemon_session_error() {
+    const LOCAL_PARTIAL: &str = "partial-local-context-before-daemon-conflict";
+    const DAEMON_CONFLICT: &str = "wrong-project-daemon-context-must-not-escape";
+
+    let sidecar = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let sidecar_port = sidecar
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let sidecar_thread = thread::spawn(move || {
+        serve_mock_http_response(sidecar, "503 Service Unavailable", LOCAL_PARTIAL)
+    });
+
+    let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
+    let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
+    let tmp = TempDir::new().expect("tempdir creation");
+    let canonical_root = std::fs::canonicalize(tmp.path())
+        .unwrap_or_else(|_| tmp.path().to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let daemon_thread = thread::spawn(move || {
+        serve_mock_daemon_with_enrichment(daemon, &canonical_root, "409 Conflict", DAEMON_CONFLICT)
+    });
+
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), sidecar_port);
+    write_daemon_port(home.path(), daemon_port);
+    let (stdout, log, stderr) = run_hook_in_tempdir_with_env_and_stderr(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[
+            ("SYMFORGE_HOME", home.path().to_string_lossy().as_ref()),
+            ("SYMFORGE_HOOK_VERBOSE", "1"),
+        ],
+    );
+    sidecar_thread
+        .join()
+        .expect("mock loading sidecar thread joins");
+    daemon_thread.join().expect("mock daemon thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
+    assert!(!stdout.contains(LOCAL_PARTIAL));
+    assert!(!stdout.contains(DAEMON_CONFLICT));
+    assert!(log.contains("mock-session\tsource-read\tsidecar-error"));
+    assert!(!log.contains("sidecar_port_stale"));
+    assert!(stderr.contains("reason=root_conflict"));
+    assert!(!stderr.contains("restart_sidecar"));
+}
+
+#[test]
+fn run_hook_initial_daemon_index_not_ready_fails_open_without_retry() {
+    const DAEMON_PARTIAL: &str = "initial-daemon-partial-context-must-not-escape";
+
+    let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
+    let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
+    let tmp = TempDir::new().expect("tempdir creation");
+    let canonical_root = std::fs::canonicalize(tmp.path())
+        .unwrap_or_else(|_| tmp.path().to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let daemon_thread = thread::spawn(move || {
+        serve_initially_discovered_loading_daemon(daemon, &canonical_root, DAEMON_PARTIAL)
+    });
+
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_daemon_port(home.path(), daemon_port);
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    let daemon_requests = daemon_thread.join().expect("mock daemon thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
+    assert!(!stdout.contains(DAEMON_PARTIAL));
+    assert!(
+        log.contains("mock-session\tsource-read\tsidecar-error"),
+        "the initially selected daemon's 503 must use its own session; got:\n{log}"
+    );
+    assert!(!log.contains("sidecar_port_stale"));
+    assert_request_routes(
+        &daemon_requests,
+        &[
+            "/v1/projects",
+            "/v1/projects/mock-project/sessions",
+            "/v1/sessions/mock-session/sidecar/outline",
+        ],
+        "initial daemon discovery",
+    );
+    assert!(
+        daemon_requests
+            .last()
+            .is_some_and(|path| path.contains("caller_root=")),
+        "the initially discovered daemon request must retain the root fence; got {daemon_requests:?}"
+    );
+}
+
+#[test]
+fn run_hook_daemon_descriptor_index_not_ready_is_not_retried() {
+    const DAEMON_PARTIAL: &str = "descriptor-daemon-partial-context-must-not-escape";
+
+    let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
+    let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
+    let tmp = TempDir::new().expect("tempdir creation");
+    let canonical_root = std::fs::canonicalize(tmp.path())
+        .unwrap_or_else(|_| tmp.path().to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let daemon_thread = thread::spawn(move || {
+        serve_descriptor_selected_loading_daemon(daemon, &canonical_root, DAEMON_PARTIAL)
+    });
+
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_daemon_session_descriptor(home.path(), tmp.path(), daemon_port, "mock-session");
+    // Keep daemon discovery available so the regression would make a second
+    // enrichment request instead of merely failing to find a fallback port.
+    write_daemon_port(home.path(), daemon_port);
+
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    let enrichment_requests = daemon_thread.join().expect("mock daemon thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
+    assert!(!stdout.contains(DAEMON_PARTIAL));
+    assert_eq!(
+        enrichment_requests, 1,
+        "a descriptor-selected daemon must not be rediscovered and called twice after 503"
+    );
+    assert!(log.contains("mock-session\tsource-read\tsidecar-error"));
+    assert!(!log.contains("sidecar_port_stale"));
+}
+
+#[test]
+fn run_hook_empty_descriptor_session_503_routes_locally_then_falls_back() {
+    assert_blank_descriptor_session_routes_locally_then_falls_back(
+        "",
+        "503 Service Unavailable",
+        "empty-session-local-503-must-not-escape",
+    );
+}
+
+#[test]
+fn run_hook_whitespace_descriptor_session_409_routes_locally_then_falls_back() {
+    assert_blank_descriptor_session_routes_locally_then_falls_back(
+        " \t ",
+        "409 Conflict",
+        "whitespace-session-local-409-must-not-escape",
+    );
+}
+
+fn assert_blank_descriptor_session_routes_locally_then_falls_back(
+    descriptor_session_id: &str,
+    initial_status: &'static str,
+    initial_body: &'static str,
+) {
+    let initial = TcpListener::bind("127.0.0.1:0").expect("bind descriptor endpoint");
+    let initial_port = initial.local_addr().expect("descriptor local_addr").port();
+    let initial_thread = thread::spawn(move || {
+        serve_recording_descriptor_endpoint(initial, initial_status, initial_body)
+    });
+
+    let fallback = TcpListener::bind("127.0.0.1:0").expect("bind fallback daemon");
+    let fallback_port = fallback.local_addr().expect("fallback local_addr").port();
+    let tmp = TempDir::new().expect("tempdir creation");
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let fallback_thread = thread::spawn(move || {
+        serve_recording_daemon(
+            fallback,
+            &canonical_root,
+            r#"[{"session_id":"fresh-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#,
+            "fresh-session",
+        )
+    });
+
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_daemon_session_descriptor(home.path(), tmp.path(), initial_port, descriptor_session_id);
+    write_daemon_port(home.path(), fallback_port);
+
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    let initial_requests = initial_thread
+        .join()
+        .expect("descriptor endpoint thread joins");
+    let fallback_requests = fallback_thread
+        .join()
+        .expect("fallback daemon thread joins");
+
+    assert!(
+        stdout.contains(ENRICHED_MARKER),
+        "a blank descriptor session id must remain local and permit one daemon fallback; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(initial_body),
+        "the initial refusal body must never escape into hook context; got:\n{stdout}"
+    );
+    assert!(
+        log.contains("fresh-session\tsource-read\tdaemon-fallback"),
+        "the successful fallback must be attributed to the discovered daemon session; got:\n{log}"
+    );
+
+    assert_request_routes(
+        &initial_requests,
+        &["/health", "/outline"],
+        "blank-session descriptor endpoint",
+    );
+    let local_request = initial_requests
+        .last()
+        .expect("local enrichment request must exist");
+    assert!(
+        local_request.contains("path=") && local_request.contains("caller_root="),
+        "the local request must preserve both source path and root fence; got {local_request:?}"
+    );
+    assert_request_routes(
+        &fallback_requests,
+        &[
+            "/v1/projects",
+            "/v1/projects/mock-project/sessions",
+            "/v1/sessions/fresh-session/sidecar/outline",
+        ],
+        "blank-session daemon fallback",
+    );
+    assert!(
+        fallback_requests
+            .last()
+            .is_some_and(|path| path.contains("caller_root=")),
+        "the fallback enrichment request must retain the root fence; got {fallback_requests:?}"
+    );
+}
+
+#[test]
+fn run_hook_daemon_descriptor_404_rediscovers_different_session() {
+    assert_descriptor_daemon_failure_rediscovers_different_session(
+        "404 Not Found",
+        "closed-descriptor-session-must-not-escape",
+    );
+}
+
+#[test]
+fn run_hook_daemon_descriptor_409_rediscovers_different_session() {
+    assert_descriptor_daemon_failure_rediscovers_different_session(
+        "409 Conflict",
+        "conflicted-descriptor-session-must-not-escape",
+    );
+}
+
+fn assert_descriptor_daemon_failure_rediscovers_different_session(
+    initial_status: &'static str,
+    initial_body: &'static str,
+) {
+    let initial = TcpListener::bind("127.0.0.1:0").expect("bind descriptor daemon");
+    let initial_port = initial
+        .local_addr()
+        .expect("descriptor daemon local_addr")
+        .port();
+    let initial_thread = thread::spawn(move || {
+        serve_recording_descriptor_endpoint(initial, initial_status, initial_body)
+    });
+
+    let fallback = TcpListener::bind("127.0.0.1:0").expect("bind alternate daemon");
+    let fallback_port = fallback.local_addr().expect("alternate local_addr").port();
+    let tmp = TempDir::new().expect("tempdir creation");
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let fallback_thread = thread::spawn(move || {
+        serve_recording_daemon(
+            fallback,
+            &canonical_root,
+            r#"[{"session_id":"stale-session","project_id":"mock-project","last_seen_at_unix_secs":2},{"session_id":"fresh-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#,
+            "fresh-session",
+        )
+    });
+
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_daemon_session_descriptor(home.path(), tmp.path(), initial_port, "stale-session");
+    write_daemon_port(home.path(), fallback_port);
+
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    let initial_requests = initial_thread
+        .join()
+        .expect("descriptor daemon thread joins");
+    let fallback_requests = fallback_thread
+        .join()
+        .expect("alternate daemon thread joins");
+
+    assert!(
+        stdout.contains(ENRICHED_MARKER),
+        "a closed or conflicted descriptor session must recover through a different active session; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(initial_body),
+        "the failed descriptor session body must never escape into hook context; got:\n{stdout}"
+    );
+    assert!(
+        log.contains("fresh-session\tsource-read\tdaemon-fallback"),
+        "the recovered request must be attributed to the alternate session; got:\n{log}"
+    );
+
+    assert_request_routes(
+        &initial_requests,
+        &["/health", "/v1/sessions/stale-session/sidecar/outline"],
+        "descriptor-selected daemon",
+    );
+    assert!(
+        initial_requests
+            .last()
+            .is_some_and(|path| path.contains("caller_root=")),
+        "the failed descriptor request must be root-fenced; got {initial_requests:?}"
+    );
+    assert_request_routes(
+        &fallback_requests,
+        &[
+            "/v1/projects",
+            "/v1/projects/mock-project/sessions",
+            "/v1/sessions/fresh-session/sidecar/outline",
+        ],
+        "alternate daemon discovery",
+    );
+    assert!(
+        fallback_requests
+            .last()
+            .is_some_and(|path| path.contains("caller_root=")),
+        "the alternate daemon request must retain the root fence; got {fallback_requests:?}"
+    );
+}
+
 /// Pin the stale-sidecar daemon-fallback path: the sidecar port file points
 /// at a dead listener (HTTP times out), but a live mock daemon is reachable
 /// via `SYMFORGE_HOME`. The hook must route the SAME enrichment request
@@ -260,7 +873,7 @@ fn run_hook_stale_sidecar_with_live_daemon_routes_via_daemon_fallback() {
     );
     // The adoption log must record the degraded-but-routed state honestly.
     assert!(
-        log.contains("\tsource-read\tdaemon-fallback"),
+        log.contains("mock-session\tsource-read\tdaemon-fallback"),
         "log must contain a tab-separated `source-read\\tdaemon-fallback` \
          entry (regression: stale sidecar served via daemon must record \
          DaemonFallback, not no-sidecar); got:\n{log}"
@@ -361,12 +974,156 @@ fn run_hook_stdin_held_open_exits_fail_open_within_deadline() {
 /// from any fail-open output so the test can prove enrichment was served.
 const ENRICHED_MARKER: &str = "MOCK_DAEMON_ENRICHED_OUTLINE";
 
+fn canonical_root_for_mock(root: &Path) -> String {
+    std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn assert_request_routes(requests: &[String], expected: &[&str], label: &str) {
+    let actual: Vec<_> = requests
+        .iter()
+        .map(|path| path.split('?').next().unwrap_or(path))
+        .collect();
+    assert_eq!(
+        actual.as_slice(),
+        expected,
+        "{label} must make exactly the expected requests; full paths: {requests:?}"
+    );
+}
+
+/// Records the semantic HTTP requests made to a descriptor endpoint. The
+/// descriptor scan may also open a bare TCP liveness connection; empty reads
+/// are intentionally ignored because they are not hook HTTP requests.
+fn serve_recording_descriptor_endpoint(
+    listener: TcpListener,
+    enrichment_status: &str,
+    enrichment_body: &str,
+) -> Vec<String> {
+    listener
+        .set_nonblocking(true)
+        .expect("set descriptor endpoint non-blocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut requests = Vec::new();
+
+    while Instant::now() < deadline {
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => panic!("descriptor endpoint accept failed: {error}"),
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let request = read_http_request(&mut stream);
+        if request.is_empty() {
+            continue;
+        }
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string();
+        let route = path.split('?').next().unwrap_or(&path);
+        requests.push(path.clone());
+
+        if route == "/health" {
+            let health = r#"{"project_count":0,"session_count":1,"daemon_version":"10.0.3","executable_path":"mock","auth_required":true,"pid":0}"#;
+            write_http_ok(&mut stream, health);
+            continue;
+        }
+
+        write_http_response(&mut stream, enrichment_status, enrichment_body);
+        return requests;
+    }
+
+    panic!("hook never sent enrichment to descriptor endpoint; requests={requests:?}")
+}
+
+/// Records one complete daemon rediscovery: root lookup, active-session lookup,
+/// then the root-fenced enrichment request through `expected_session_id`.
+fn serve_recording_daemon(
+    listener: TcpListener,
+    canonical_root: &str,
+    sessions_json: &str,
+    expected_session_id: &str,
+) -> Vec<String> {
+    listener
+        .set_nonblocking(true)
+        .expect("set recording daemon non-blocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut requests = Vec::new();
+    let expected_enrichment_route = format!("/v1/sessions/{expected_session_id}/sidecar/outline");
+
+    while Instant::now() < deadline {
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => panic!("recording daemon accept failed: {error}"),
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let request = read_http_request(&mut stream);
+        if request.is_empty() {
+            continue;
+        }
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string();
+        let route = path.split('?').next().unwrap_or(&path);
+        requests.push(path.clone());
+
+        if route == "/v1/projects" {
+            let body = format!(
+                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":2}}]"#,
+                canonical_root.replace('"', "\\\"")
+            );
+            write_http_ok(&mut stream, &body);
+        } else if route == "/v1/projects/mock-project/sessions" {
+            write_http_ok(&mut stream, sessions_json);
+        } else if route == expected_enrichment_route {
+            let body = format!(r#"{{"enriched":"{ENRICHED_MARKER}"}}"#);
+            write_http_ok(&mut stream, &body);
+            return requests;
+        } else {
+            write_http_response(
+                &mut stream,
+                "404 Not Found",
+                "unexpected recording-daemon route",
+            );
+            return requests;
+        }
+    }
+
+    panic!("hook did not complete daemon rediscovery; requests={requests:?}")
+}
+
 /// Single-purpose mock daemon HTTP server for the fallback test. Serves each
 /// `Connection: close` request the hook makes — `/v1/projects`, the project's
 /// `/sessions` list, then the `/v1/sessions/{id}/sidecar/outline` enrichment —
 /// routing by request-line path. Loops until the enrichment request is served
 /// or the listener is dropped.
 fn serve_mock_daemon(listener: TcpListener, canonical_root: &str) {
+    let body = format!("{{\"enriched\":\"{ENRICHED_MARKER}\"}}");
+    serve_mock_daemon_with_enrichment(listener, canonical_root, "200 OK", &body);
+}
+
+fn serve_mock_daemon_with_enrichment(
+    listener: TcpListener,
+    canonical_root: &str,
+    enrichment_status: &str,
+    enrichment_body: &str,
+) {
     // Non-blocking accept so a missing enrichment request can never hang the
     // join() on the test thread — the deadline always wins.
     listener
@@ -386,32 +1143,31 @@ fn serve_mock_daemon(listener: TcpListener, canonical_root: &str) {
         // timeout so the request read below behaves like a normal server.
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        let request = String::from_utf8_lossy(&buf[..n]);
+        let request = read_http_request(&mut stream);
         let path = request
             .lines()
             .next()
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or("");
+        let route = path.split('?').next().unwrap_or(path);
 
-        let body: String = if path.starts_with("/v1/projects/") && path.contains("/sessions") {
-            // Sessions list for the matched project.
-            r#"[{"session_id":"mock-session","last_seen_at_unix_secs":1}]"#.to_string()
-        } else if path.starts_with("/v1/projects") {
+        let body: String = if route.starts_with("/v1/projects/") && route.contains("/sessions") {
+            // Include a newer session whose active project no longer matches.
+            // The hook must filter it out and route through `mock-session`.
+            r#"[{"session_id":"wrong-session","project_id":"other-project","last_seen_at_unix_secs":2},{"session_id":"mock-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#.to_string()
+        } else if route == "/v1/projects" {
             // Projects list — advertise our canonical root.
             format!(
                 r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":1}}]"#,
                 canonical_root.replace('"', "\\\"")
             )
+        } else if route == "/v1/sessions/mock-session/sidecar/outline"
+            && path.contains("caller_root=")
+        {
+            write_http_response(&mut stream, enrichment_status, enrichment_body);
+            return;
         } else {
-            // Enrichment endpoint (/v1/sessions/.../sidecar/outline).
-            let last = path.contains("sidecar");
-            let out = format!("{{\"enriched\":\"{ENRICHED_MARKER}\"}}");
-            write_http_ok(&mut stream, &out);
-            if last {
-                return;
-            }
+            write_http_response(&mut stream, "404 Not Found", "unexpected mock-daemon route");
             continue;
         };
 
@@ -419,10 +1175,222 @@ fn serve_mock_daemon(listener: TcpListener, canonical_root: &str) {
     }
 }
 
+/// Record an initially discovered daemon's complete request sequence and keep
+/// listening briefly after its first 503. An erroneous fallback retry then
+/// reaches the same live mock and becomes an observable duplicate discovery.
+fn serve_initially_discovered_loading_daemon(
+    listener: TcpListener,
+    canonical_root: &str,
+    enrichment_body: &str,
+) -> Vec<String> {
+    listener
+        .set_nonblocking(true)
+        .expect("set initially discovered daemon listener non-blocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut first_enrichment_at: Option<Instant> = None;
+    let mut requests = Vec::new();
+
+    while Instant::now() < deadline {
+        if first_enrichment_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(750)) {
+            return requests;
+        }
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => panic!("initially discovered daemon accept failed: {error}"),
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let request = read_http_request(&mut stream);
+        if request.is_empty() {
+            continue;
+        }
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string();
+        let route = path.split('?').next().unwrap_or(&path);
+        requests.push(path.clone());
+
+        if route == "/v1/projects" {
+            let body = format!(
+                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":1}}]"#,
+                canonical_root.replace('"', "\\\"")
+            );
+            write_http_ok(&mut stream, &body);
+        } else if route == "/v1/projects/mock-project/sessions" {
+            let body = r#"[{"session_id":"mock-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#;
+            write_http_ok(&mut stream, body);
+        } else if route == "/v1/sessions/mock-session/sidecar/outline"
+            && path.contains("caller_root=")
+        {
+            first_enrichment_at.get_or_insert_with(Instant::now);
+            write_http_response(&mut stream, "503 Service Unavailable", enrichment_body);
+        } else {
+            write_http_response(&mut stream, "404 Not Found", "unexpected mock-daemon route");
+        }
+    }
+
+    panic!("hook never sent enrichment to the initially discovered daemon; requests={requests:?}")
+}
+
+/// Serve a daemon selected directly from a session descriptor and keep it
+/// alive briefly after the first 503. If the hook incorrectly rediscovers
+/// the same daemon, this mock serves the discovery endpoints and counts the
+/// second enrichment request deterministically.
+fn serve_descriptor_selected_loading_daemon(
+    listener: TcpListener,
+    canonical_root: &str,
+    enrichment_body: &str,
+) -> usize {
+    listener
+        .set_nonblocking(true)
+        .expect("set descriptor daemon listener non-blocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut first_enrichment_at: Option<Instant> = None;
+    let mut enrichment_requests = 0usize;
+
+    while Instant::now() < deadline {
+        if first_enrichment_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(750)) {
+            return enrichment_requests;
+        }
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => panic!("descriptor daemon accept failed: {error}"),
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let request = read_http_request(&mut stream);
+        if request.is_empty() {
+            continue;
+        }
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("");
+        let route = path.split('?').next().unwrap_or(path);
+
+        if route == "/health" {
+            let health = r#"{"project_count":0,"session_count":1,"daemon_version":"10.0.3","executable_path":"mock","auth_required":true,"pid":0}"#;
+            write_http_ok(&mut stream, health);
+        } else if route == "/v1/projects" {
+            let body = format!(
+                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":1}}]"#,
+                canonical_root.replace('"', "\\\"")
+            );
+            write_http_ok(&mut stream, &body);
+        } else if route.starts_with("/v1/projects/") && route.contains("/sessions") {
+            let body = r#"[{"session_id":"mock-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#;
+            write_http_ok(&mut stream, body);
+        } else if route == "/v1/sessions/mock-session/sidecar/outline"
+            && path.contains("caller_root=")
+        {
+            enrichment_requests += 1;
+            first_enrichment_at.get_or_insert_with(Instant::now);
+            write_http_response(&mut stream, "503 Service Unavailable", enrichment_body);
+            if enrichment_requests > 1 {
+                return enrichment_requests;
+            }
+        } else {
+            write_http_response(&mut stream, "404 Not Found", "unexpected mock-daemon route");
+        }
+    }
+
+    panic!("hook never sent an enrichment request to the descriptor-selected daemon")
+}
+
+/// Serve one real HTTP response while tolerating descriptor-liveness probes
+/// that connect without sending a request. The non-blocking deadline keeps a
+/// failed hook connection from stranding the test on `join()`.
+fn serve_mock_http_response(listener: TcpListener, status: &str, body: &str) {
+    listener
+        .set_nonblocking(true)
+        .expect("set mock sidecar listener non-blocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => panic!("mock sidecar accept failed: {error}"),
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let request = read_http_request(&mut stream);
+        if request.is_empty() {
+            continue;
+        }
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("");
+        if path.split('?').next().unwrap_or(path) == "/health" {
+            let health = r#"{"project_count":0,"session_count":0,"daemon_version":"10.0.3","executable_path":"mock","auth_required":true,"pid":0}"#;
+            write_http_ok(&mut stream, health);
+            continue;
+        }
+
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write mock HTTP response");
+        stream.flush().expect("flush mock HTTP response");
+        return;
+    }
+    panic!("hook never sent an HTTP request to the mock sidecar before the deadline");
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    const MAX_REQUEST_BYTES: usize = 16 * 1024;
+    let mut request = Vec::new();
+    while request.len() < MAX_REQUEST_BYTES {
+        let mut chunk = [0u8; 1024];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
 /// Write a minimal `200 OK` HTTP response with the given body and close.
 fn write_http_ok(stream: &mut std::net::TcpStream, body: &str) {
+    write_http_response(stream, "200 OK", body);
+}
+
+fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -452,6 +1420,15 @@ fn run_hook_in_tempdir_with_env(
     payload: &str,
     extra_env: &[(&str, &str)],
 ) -> (String, String) {
+    let (stdout, log, _) = run_hook_in_tempdir_with_env_and_stderr(cwd, payload, extra_env);
+    (stdout, log)
+}
+
+fn run_hook_in_tempdir_with_env_and_stderr(
+    cwd: &Path,
+    payload: &str,
+    extra_env: &[(&str, &str)],
+) -> (String, String, String) {
     let control_root = extra_env
         .iter()
         .rev()
@@ -492,6 +1469,10 @@ fn run_hook_in_tempdir_with_env(
     if let Some(mut out) = child.stdout.take() {
         let _ = out.read_to_string(&mut stdout);
     }
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
 
     let log_path = control_root.join(ADOPTION_LOG_FILE);
     assert!(
@@ -503,7 +1484,7 @@ fn run_hook_in_tempdir_with_env(
     );
 
     let log = std::fs::read_to_string(&log_path).expect("log readable");
-    (stdout, log)
+    (stdout, log, stderr)
 }
 
 /// Poll the child for exit with a timeout. `Ok(Some)` on clean exit,

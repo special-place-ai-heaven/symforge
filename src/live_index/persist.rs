@@ -2362,6 +2362,18 @@ pub async fn background_verify(
     background_verify_with_hook(index, root, snapshot_mtimes, || {}).await;
 }
 
+fn remove_snapshot_deleted_file_if_still_absent(
+    index: &crate::live_index::store::SharedIndex,
+    root: &Path,
+    path: &str,
+    expected: crate::live_index::store::PublicationFence,
+) -> bool {
+    let absolute_path = root.join(path);
+    index
+        .remove_file_if_absent_at_publication_fence_with_receipt(path, &absolute_path, expected)
+        .is_some()
+}
+
 async fn background_verify_with_hook<F>(
     index: crate::live_index::store::SharedIndex,
     root: std::path::PathBuf,
@@ -2392,7 +2404,7 @@ async fn background_verify_with_hook<F>(
     // 2. Remove deleted files
     if !stat_result.deleted.is_empty() {
         for path in &stat_result.deleted {
-            if !index.remove_file_at_publication_fence(path, commit_fence) {
+            if !remove_snapshot_deleted_file_if_still_absent(&index, &root, path, commit_fence) {
                 return;
             }
             commit_fence = index.publication_fence();
@@ -3425,6 +3437,39 @@ mod tests {
         assert_eq!(published.parsed_count, 0);
         assert_eq!(published.partial_parse_count, 0);
         assert_eq!(published.failed_count, 0);
+    }
+
+    #[test]
+    fn background_verify_deleted_file_removal_refuses_disk_recreation() {
+        let tmp = TempDir::new().unwrap();
+        let relative_path = "src/main.rs";
+        let file_path = tmp.path().join(relative_path);
+        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
+            vec![(relative_path, b"fn before() {}\n")],
+        ));
+
+        assert!(
+            !file_path.exists(),
+            "the verifier's stat observation starts from disk absence"
+        );
+        let absence_fence = shared.publication_fence();
+
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"fn recreated() {}\n").unwrap();
+
+        assert!(
+            !remove_snapshot_deleted_file_if_still_absent(
+                &shared,
+                tmp.path(),
+                relative_path,
+                absence_fence,
+            ),
+            "a disk recreation after stat must reject snapshot cleanup"
+        );
+        assert!(
+            shared.read().get_file(relative_path).is_some(),
+            "the last-valid indexed entry must survive the rejected removal"
+        );
     }
 
     #[tokio::test]

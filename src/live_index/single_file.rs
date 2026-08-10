@@ -12,6 +12,7 @@
 //! hand-rolled parse-and-poke (which would bypass admission entirely).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tracing::{debug, trace, warn};
 
@@ -19,7 +20,7 @@ use crate::domain::{
     FileClassification, FileDisposition, LanguageId, MetadataOnlyReason, ScoutDecision,
 };
 use crate::hash;
-use crate::live_index::store::{IndexedFile, SharedIndex};
+use crate::live_index::store::{IndexedFile, PublicationFence, PublishedGeneration, SharedIndex};
 use crate::parsing;
 
 /// Result of a single re-index attempt for one file.
@@ -41,6 +42,77 @@ pub enum ReindexResult {
     ReadError(String),
 }
 
+/// Crate-internal result of a single-file publication attempt.
+///
+/// `ReindexResult` is part of the semver-public embed facade and downstream
+/// callers can exhaustively match its six variants. Publication contention is
+/// therefore carried on this private result instead of widening that public
+/// enum in a patch release.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReindexOutcome {
+    HashSkip,
+    Reindexed,
+    Skipped,
+    NotFound,
+    Removed,
+    ReadError(String),
+    /// The observed change did not reach a publication boundary. Callers must
+    /// retry or refuse rather than claim the stale state was reconciled.
+    PublicationRejected,
+}
+
+impl ReindexOutcome {
+    fn into_public_compat(self) -> ReindexResult {
+        match self {
+            Self::HashSkip => ReindexResult::HashSkip,
+            Self::Reindexed => ReindexResult::Reindexed,
+            Self::Skipped => ReindexResult::Skipped,
+            Self::NotFound => ReindexResult::NotFound,
+            Self::Removed => ReindexResult::Removed,
+            Self::ReadError(error) => ReindexResult::ReadError(error),
+            // Before this patch the public update seam reported a lost
+            // publication race as Skipped. Preserve that compatibility only at
+            // the frozen embed boundary; in-crate callers retain the typed
+            // rejection and must retry or refuse.
+            Self::PublicationRejected => ReindexResult::Skipped,
+        }
+    }
+}
+
+pub(crate) struct ReindexReceipt {
+    pub outcome: ReindexOutcome,
+    /// Publication fence captured immediately before this attempt's
+    /// filesystem observation.
+    pub observed_at: PublicationFence,
+    /// Exact immutable generation returned by the winning publication seam.
+    pub published: Option<Arc<PublishedGeneration>>,
+    pub snapshot_created: bool,
+}
+
+impl ReindexReceipt {
+    fn observed(outcome: ReindexOutcome, observed_at: PublicationFence) -> Self {
+        Self {
+            outcome,
+            observed_at,
+            published: None,
+            snapshot_created: false,
+        }
+    }
+
+    fn published(
+        outcome: ReindexOutcome,
+        observed_at: PublicationFence,
+        published: Arc<PublishedGeneration>,
+    ) -> Self {
+        Self {
+            outcome,
+            observed_at,
+            published: Some(published),
+            snapshot_created: false,
+        }
+    }
+}
+
 /// Content-hash-gated single-file re-index.
 ///
 /// Reads the file, compares its hash against the existing index entry, and
@@ -58,33 +130,70 @@ pub(crate) fn maybe_reindex<L>(
     shared: &SharedIndex,
     language: L,
     expected_gen: u64,
-) -> ReindexResult
+) -> ReindexOutcome
 where
     L: Into<Option<LanguageId>>,
 {
     let language = language.into();
-    match read_and_index(relative_path, abs_path, shared, language, expected_gen) {
-        ReindexResult::NotFound => {}
-        other => return other,
+    let first =
+        read_and_index_with_receipt(relative_path, abs_path, shared, language, expected_gen);
+    if first.observed_at.project_generation != expected_gen {
+        return ReindexOutcome::PublicationRejected;
     }
+    let mut last_absence_fence = match first.outcome {
+        ReindexOutcome::NotFound => first.observed_at,
+        other => return other,
+    };
 
     let delays_ms = [50u64, 200, 500];
     for delay_ms in delays_ms {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        match read_and_index(relative_path, abs_path, shared, language, expected_gen) {
-            ReindexResult::NotFound => continue,
+        let retry =
+            read_and_index_with_receipt(relative_path, abs_path, shared, language, expected_gen);
+        if retry.observed_at.project_generation != expected_gen {
+            return ReindexOutcome::PublicationRejected;
+        }
+        match retry.outcome {
+            ReindexOutcome::NotFound => last_absence_fence = retry.observed_at,
             other => return other,
         }
     }
 
-    if shared.remove_file_at_generation(relative_path, expected_gen) {
+    finalize_missing_file(
+        shared,
+        relative_path,
+        abs_path,
+        expected_gen,
+        last_absence_fence,
+    )
+}
+
+fn finalize_missing_file(
+    shared: &SharedIndex,
+    relative_path: &str,
+    abs_path: &Path,
+    expected_gen: u64,
+    absence_fence: PublicationFence,
+) -> ReindexOutcome {
+    if absence_fence.project_generation != expected_gen {
+        return ReindexOutcome::PublicationRejected;
+    }
+    if shared
+        .remove_file_if_absent_at_publication_fence_with_receipt(
+            relative_path,
+            abs_path,
+            absence_fence,
+        )
+        .is_some()
+    {
         warn!("watcher: file not found after retries, removed from index: {relative_path}");
+        ReindexOutcome::Removed
     } else {
         trace!(
-            "watcher: file not found after retries, stale generation rejected remove: {relative_path}"
+            "watcher: file not found after retries, stale publication rejected remove: {relative_path}"
         );
+        ReindexOutcome::PublicationRejected
     }
-    ReindexResult::Removed
 }
 
 /// Recover the project root by walking up from the absolute event path once per
@@ -112,11 +221,24 @@ pub(crate) fn read_and_index<L>(
     shared: &SharedIndex,
     language: L,
     expected_gen: u64,
-) -> ReindexResult
+) -> ReindexOutcome
 where
     L: Into<Option<LanguageId>>,
 {
-    read_and_index_with_stable_read(
+    read_and_index_with_receipt(relative_path, abs_path, shared, language, expected_gen).outcome
+}
+
+fn read_and_index_with_receipt<L>(
+    relative_path: &str,
+    abs_path: &Path,
+    shared: &SharedIndex,
+    language: L,
+    expected_gen: u64,
+) -> ReindexReceipt
+where
+    L: Into<Option<LanguageId>>,
+{
+    read_and_index_with_stable_read_receipt(
         relative_path,
         abs_path,
         shared,
@@ -133,23 +255,65 @@ pub(crate) fn admit_and_index_single_path(
     abs_path: &Path,
     shared: &SharedIndex,
     expected_gen: u64,
-) -> ReindexResult {
-    read_and_index(relative_path, abs_path, shared, None, expected_gen)
+) -> ReindexOutcome {
+    admit_and_index_single_path_with_receipt(relative_path, abs_path, shared, expected_gen).outcome
 }
 
+pub(crate) fn admit_and_index_single_path_with_receipt(
+    relative_path: &str,
+    abs_path: &Path,
+    shared: &SharedIndex,
+    expected_gen: u64,
+) -> ReindexReceipt {
+    read_and_index_with_stable_read_receipt(
+        relative_path,
+        abs_path,
+        shared,
+        None,
+        expected_gen,
+        crate::live_index::store::stable_read_file,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn read_and_index_with_stable_read<L, R>(
     relative_path: &str,
     abs_path: &Path,
     shared: &SharedIndex,
     language: L,
     expected_gen: u64,
+    stable_read: R,
+) -> ReindexOutcome
+where
+    L: Into<Option<LanguageId>>,
+    R: FnMut(&Path, &crate::domain::FileStamp) -> crate::live_index::store::StableReadOutcome,
+{
+    read_and_index_with_stable_read_receipt(
+        relative_path,
+        abs_path,
+        shared,
+        language,
+        expected_gen,
+        stable_read,
+    )
+    .outcome
+}
+
+fn read_and_index_with_stable_read_receipt<L, R>(
+    relative_path: &str,
+    abs_path: &Path,
+    shared: &SharedIndex,
+    language: L,
+    expected_gen: u64,
     mut stable_read: R,
-) -> ReindexResult
+) -> ReindexReceipt
 where
     L: Into<Option<LanguageId>>,
     R: FnMut(&Path, &crate::domain::FileStamp) -> crate::live_index::store::StableReadOutcome,
 {
     let language = language.into();
+    let mut base = shared.published_generation();
+    let mut observed_at = PublicationFence::from_published(&base);
     // Keep single-file watcher/freshen paths symmetric with the bulk walk.
     // Both universal name exclusions and placement-derived subtree exclusions
     // run before any metadata/content read from VCS or runtime-state internals.
@@ -158,18 +322,32 @@ where
         || shared.is_source_excluded(relative)
         || shared.read().is_path_gitignored(relative_path)
     {
-        let removed = shared.remove_file_at_generation(relative_path, expected_gen);
-        if removed {
-            debug!("watcher: source-scope eviction {relative_path}");
-        } else {
-            trace!("watcher: source-scope skip (no prior record) {relative_path}");
+        if observed_at.project_generation != expected_gen {
+            return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
         }
-        return ReindexResult::Skipped;
+        return match shared
+            .remove_file_at_publication_fence_with_receipt(relative_path, observed_at)
+        {
+            Some(published) => {
+                debug!("watcher: source-scope eviction {relative_path}");
+                ReindexReceipt::published(ReindexOutcome::Skipped, observed_at, published)
+            }
+            None => {
+                trace!("watcher: source-scope eviction publication rejected {relative_path}");
+                ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at)
+            }
+        };
     }
 
     const MAX_PUBLICATION_ATTEMPTS: usize = 4;
     for attempt in 1..=MAX_PUBLICATION_ATTEMPTS {
-        let base_publication_gen = shared.published_state().generation;
+        base = shared.published_generation();
+        observed_at = PublicationFence::from_published(&base);
+        // The store mutation CAS protects the health/live index base, whose
+        // generation is intentionally distinct from the full publication
+        // bundle generation. Bridge- or authority-only publishes can advance
+        // the latter while retaining this same live-index base.
+        let expected_index_state_generation = base.health.generation;
 
         // Run the same metadata-first scout as cold load before any whole-file read.
         let mut scouted = match crate::discovery::scout_single_path(relative_path, abs_path) {
@@ -179,10 +357,13 @@ where
                     std::fs::metadata(abs_path),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound
                 ) {
-                    return ReindexResult::NotFound;
+                    return ReindexReceipt::observed(ReindexOutcome::NotFound, observed_at);
                 }
                 warn!("watcher: failed to scout {relative_path}: {error}");
-                return ReindexResult::ReadError(error.to_string());
+                return ReindexReceipt::observed(
+                    ReindexOutcome::ReadError(error.to_string()),
+                    observed_at,
+                );
             }
         };
         let mtime_secs = scouted
@@ -193,51 +374,55 @@ where
             .unwrap_or(0);
 
         if let Some(disposition) = catalog_terminal_disposition(&scouted.decision) {
-            if shared.publish_terminal_disposition_at_generation(
+            if let Some(published) = shared.publish_terminal_disposition_at_generation(
                 relative_path,
                 scouted,
                 disposition,
                 expected_gen,
-                base_publication_gen,
+                expected_index_state_generation,
             ) {
                 debug!("watcher: metadata-terminal admission {relative_path}");
-                return ReindexResult::Skipped;
+                return ReindexReceipt::published(ReindexOutcome::Skipped, observed_at, published);
             }
             if shared.current_project_generation() == expected_gen
-                && shared.published_state().generation != base_publication_gen
+                && shared.published_state().generation != expected_index_state_generation
             {
                 trace!(attempt, "watcher: retrying metadata-terminal publication");
                 continue;
             }
             trace!("watcher: stale metadata-terminal admission rejected: {relative_path}");
-            return ReindexResult::Skipped;
+            return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
         }
         if let ScoutDecision::Unavailable { stage, kind } = &scouted.decision {
             if *stage == crate::domain::AccessStage::Metadata
                 && *kind == crate::domain::AccessErrorKind::NotFound
             {
-                return ReindexResult::NotFound;
+                return ReindexReceipt::observed(ReindexOutcome::NotFound, observed_at);
             }
             let disposition = FileDisposition::Unreadable {
                 stage: *stage,
                 kind: *kind,
             };
-            if shared.publish_terminal_disposition_at_generation(
+            if let Some(published) = shared.publish_terminal_disposition_at_generation(
                 relative_path,
                 scouted,
                 disposition,
                 expected_gen,
-                base_publication_gen,
+                expected_index_state_generation,
             ) {
-                return ReindexResult::ReadError("single-path scout unavailable".to_string());
+                return ReindexReceipt::published(
+                    ReindexOutcome::ReadError("single-path scout unavailable".to_string()),
+                    observed_at,
+                    published,
+                );
             }
             if shared.current_project_generation() == expected_gen
-                && shared.published_state().generation != base_publication_gen
+                && shared.published_state().generation != expected_index_state_generation
             {
                 trace!(attempt, "watcher: retrying unavailable publication");
                 continue;
             }
-            return ReindexResult::ReadError("single-path scout unavailable".to_string());
+            return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
         }
 
         // Generated-output placement is metadata policy too; evaluate it before
@@ -251,22 +436,22 @@ where
             let disposition = catalog_terminal_disposition(&decision)
                 .expect("metadata-only decision must project to a terminal disposition");
             scouted.decision = decision;
-            if shared.publish_terminal_disposition_at_generation(
+            if let Some(published) = shared.publish_terminal_disposition_at_generation(
                 relative_path,
                 scouted,
                 disposition,
                 expected_gen,
-                base_publication_gen,
+                expected_index_state_generation,
             ) {
-                return ReindexResult::Skipped;
+                return ReindexReceipt::published(ReindexOutcome::Skipped, observed_at, published);
             }
             if shared.current_project_generation() == expected_gen
-                && shared.published_state().generation != base_publication_gen
+                && shared.published_state().generation != expected_index_state_generation
             {
                 trace!(attempt, "watcher: retrying generated-output publication");
                 continue;
             }
-            return ReindexResult::Skipped;
+            return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
         }
 
         let targets = match &scouted.decision {
@@ -283,17 +468,21 @@ where
                 let disposition = catalog_terminal_disposition(&decision)
                     .expect("hard-skip decision must project to a terminal disposition");
                 scouted.decision = decision;
-                if shared.publish_terminal_disposition_at_generation(
+                if let Some(published) = shared.publish_terminal_disposition_at_generation(
                     relative_path,
                     scouted,
                     disposition,
                     expected_gen,
-                    base_publication_gen,
+                    expected_index_state_generation,
                 ) {
-                    return ReindexResult::Skipped;
+                    return ReindexReceipt::published(
+                        ReindexOutcome::Skipped,
+                        observed_at,
+                        published,
+                    );
                 }
                 if shared.current_project_generation() == expected_gen
-                    && shared.published_state().generation != base_publication_gen
+                    && shared.published_state().generation != expected_index_state_generation
                 {
                     trace!(
                         attempt,
@@ -301,17 +490,25 @@ where
                     );
                     continue;
                 }
-                return ReindexResult::Skipped;
+                return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
             }
             crate::live_index::store::StableReadOutcome::Unreadable { stage, kind } => {
-                if !shared.publish_terminal_disposition_at_generation(
+                let publication = shared.publish_terminal_disposition_at_generation(
                     relative_path,
                     scouted,
                     FileDisposition::Unreadable { stage, kind },
                     expected_gen,
-                    base_publication_gen,
-                ) && shared.current_project_generation() == expected_gen
-                    && shared.published_state().generation != base_publication_gen
+                    expected_index_state_generation,
+                );
+                if let Some(published) = publication {
+                    return ReindexReceipt::published(
+                        ReindexOutcome::ReadError("stable read unavailable".to_string()),
+                        observed_at,
+                        published,
+                    );
+                }
+                if shared.current_project_generation() == expected_gen
+                    && shared.published_state().generation != expected_index_state_generation
                 {
                     trace!(
                         attempt,
@@ -319,22 +516,30 @@ where
                     );
                     continue;
                 }
-                return ReindexResult::ReadError("stable read unavailable".to_string());
+                return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
             }
             crate::live_index::store::StableReadOutcome::UnstableDuringRead => {
-                if !shared.publish_terminal_disposition_at_generation(
+                let publication = shared.publish_terminal_disposition_at_generation(
                     relative_path,
                     scouted,
                     FileDisposition::UnstableDuringRead,
                     expected_gen,
-                    base_publication_gen,
-                ) && shared.current_project_generation() == expected_gen
-                    && shared.published_state().generation != base_publication_gen
+                    expected_index_state_generation,
+                );
+                if let Some(published) = publication {
+                    return ReindexReceipt::published(
+                        ReindexOutcome::ReadError("file changed during stable read".to_string()),
+                        observed_at,
+                        published,
+                    );
+                }
+                if shared.current_project_generation() == expected_gen
+                    && shared.published_state().generation != expected_index_state_generation
                 {
                     trace!(attempt, "watcher: retrying unstable-read publication");
                     continue;
                 }
-                return ReindexResult::ReadError("file changed during stable read".to_string());
+                return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
             }
         };
 
@@ -344,22 +549,22 @@ where
         if let crate::knowledge::StableContentAdmission::MetadataOnly(reason) =
             crate::knowledge::classify_stable_content(relative_path, targets, &bytes)
         {
-            if shared.publish_terminal_disposition_at_generation(
+            if let Some(published) = shared.publish_terminal_disposition_at_generation(
                 relative_path,
                 scouted,
                 FileDisposition::MetadataOnly { reason },
                 expected_gen,
-                base_publication_gen,
+                expected_index_state_generation,
             ) {
-                return ReindexResult::Skipped;
+                return ReindexReceipt::published(ReindexOutcome::Skipped, observed_at, published);
             }
             if shared.current_project_generation() == expected_gen
-                && shared.published_state().generation != base_publication_gen
+                && shared.published_state().generation != expected_index_state_generation
             {
                 trace!(attempt, "watcher: retrying content-policy publication");
                 continue;
             }
-            return ReindexResult::Skipped;
+            return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
         }
 
         // Compute the hash and compare without holding the publication writer lock.
@@ -370,24 +575,29 @@ where
                 && existing.content_hash == new_hash
             {
                 drop(index);
-                if shared.publish_hash_skip_at_generation(
+                if let Some(published) = shared.publish_hash_skip_at_generation(
                     relative_path,
                     mtime_secs,
                     scouted,
                     targets,
                     expected_gen,
-                    base_publication_gen,
+                    expected_index_state_generation,
                 ) {
                     debug!("watcher: hash-skip {relative_path}");
-                    return ReindexResult::HashSkip;
+                    return ReindexReceipt {
+                        outcome: ReindexOutcome::HashSkip,
+                        observed_at,
+                        published: Some(published),
+                        snapshot_created: false,
+                    };
                 }
                 if shared.current_project_generation() == expected_gen
-                    && shared.published_state().generation != base_publication_gen
+                    && shared.published_state().generation != expected_index_state_generation
                 {
                     trace!(attempt, "watcher: retrying hash-skip publication");
                     continue;
                 }
-                return ReindexResult::Skipped;
+                return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
             }
         }
 
@@ -403,31 +613,36 @@ where
         // Commit every observable lane under one source-base fence and one
         // publication boundary. If another update won while this build was
         // off-lock, retry from disk instead of overwriting that newer bundle.
-        if shared.publish_indexed_file_at_generation(
+        if let Some(publication) = shared.publish_indexed_file_at_generation(
             relative_path,
             indexed,
             scouted,
             targets,
             expected_gen,
-            base_publication_gen,
+            expected_index_state_generation,
         ) {
             debug!("watcher: re-indexed {relative_path}");
-            return ReindexResult::Reindexed;
+            return ReindexReceipt {
+                outcome: ReindexOutcome::Reindexed,
+                observed_at,
+                published: Some(publication.published),
+                snapshot_created: publication.snapshot_created,
+            };
         }
         if shared.current_project_generation() == expected_gen
-            && shared.published_state().generation != base_publication_gen
+            && shared.published_state().generation != expected_index_state_generation
         {
             trace!(attempt, "watcher: retrying indexed-file publication");
             continue;
         }
         trace!("watcher: stale indexed-file publication rejected: {relative_path}");
-        return ReindexResult::Skipped;
+        return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
     }
 
     warn!(
         "watcher: aborting {relative_path} after {MAX_PUBLICATION_ATTEMPTS} concurrent publications"
     );
-    ReindexResult::Skipped
+    ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at)
 }
 
 /// Re-index one repository file FROM DISK through the canonical single-file
@@ -451,7 +666,7 @@ pub fn update_file_from_disk(
     let relative = relative_path.replace('\\', "/");
     let abs_path = repo_root.join(&relative);
     let expected_gen = shared.current_project_generation();
-    admit_and_index_single_path(&relative, &abs_path, shared, expected_gen)
+    admit_and_index_single_path(&relative, &abs_path, shared, expected_gen).into_public_compat()
 }
 
 /// Remove one file from the live index (embed facade; task #24 / AAP ask 3).
@@ -535,5 +750,270 @@ mod tests {
             matches!(outcome, ReindexResult::NotFound),
             "missing file must be NotFound, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn reindex_receipt_remains_exact_after_later_publication() {
+        let dir = tempfile::TempDir::new().expect("root");
+        let path = dir.path().join("lib.rs");
+        std::fs::write(&path, "pub fn first() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let expected_gen = shared.current_project_generation();
+
+        std::fs::write(&path, "pub fn second() {}\n").expect("first edit");
+        let second =
+            admit_and_index_single_path_with_receipt("lib.rs", &path, &shared, expected_gen);
+        assert_eq!(second.outcome, ReindexOutcome::Reindexed);
+        assert!(second.snapshot_created);
+        let second_published = second.published.expect("second publication receipt");
+        let second_fence = PublicationFence::from_published(&second_published);
+
+        let unchanged =
+            admit_and_index_single_path_with_receipt("lib.rs", &path, &shared, expected_gen);
+        assert_eq!(unchanged.outcome, ReindexOutcome::HashSkip);
+        assert!(!unchanged.snapshot_created);
+        let unchanged_published = unchanged.published.expect("hash-skip publication receipt");
+        assert!(
+            unchanged_published
+                .live
+                .get_file("lib.rs")
+                .expect("hash-skip file")
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "second")
+        );
+
+        std::fs::write(&path, "pub fn third() {}\n").expect("second edit");
+        let third =
+            admit_and_index_single_path_with_receipt("lib.rs", &path, &shared, expected_gen);
+        assert_eq!(third.outcome, ReindexOutcome::Reindexed);
+        let third_published = third.published.expect("third publication receipt");
+        let third_fence = PublicationFence::from_published(&third_published);
+        assert_ne!(second_fence, third_fence);
+
+        let second_file = second_published
+            .live
+            .get_file("lib.rs")
+            .expect("second file");
+        assert!(
+            second_file
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "second")
+        );
+        assert!(
+            !second_file
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "third")
+        );
+        assert!(
+            !unchanged_published
+                .live
+                .get_file("lib.rs")
+                .expect("immutable hash-skip file")
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "third")
+        );
+        assert!(
+            third_published
+                .live
+                .get_file("lib.rs")
+                .expect("third file")
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "third")
+        );
+
+        assert!(
+            shared
+                .take_pre_update_snapshot_for_publication_at_generation(
+                    "lib.rs",
+                    expected_gen,
+                    second_fence,
+                )
+                .is_none(),
+            "the old receipt must not drain the later publication's snapshot"
+        );
+        let third_baseline = shared
+            .take_pre_update_snapshot_for_publication_at_generation(
+                "lib.rs",
+                expected_gen,
+                third_fence,
+            )
+            .expect("third publication owns the current snapshot");
+        assert!(
+            third_baseline
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "second")
+        );
+    }
+
+    #[test]
+    fn bridge_only_publication_does_not_invalidate_live_index_reindex_cas() {
+        let dir = tempfile::TempDir::new().expect("root");
+        let path = dir.path().join("lib.rs");
+        std::fs::write(&path, "pub fn before() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let before = shared.published_generation();
+        let health_generation = before.health.generation;
+
+        let prepared = shared.prepare_bridge_rebuild();
+        assert!(shared.publish_prepared_bridge(prepared));
+        let bridge_only = shared.published_generation();
+        assert!(
+            bridge_only.publication_generation > before.publication_generation,
+            "bridge publication must advance the full publication bundle"
+        );
+        assert_eq!(
+            bridge_only.health.generation, health_generation,
+            "bridge publication must retain the live-index health base"
+        );
+
+        std::fs::write(&path, "pub fn after() {}\n").expect("edit");
+        let receipt = admit_and_index_single_path_with_receipt(
+            "lib.rs",
+            &path,
+            &shared,
+            shared.current_project_generation(),
+        );
+        assert_eq!(receipt.outcome, ReindexOutcome::Reindexed);
+        assert!(
+            receipt
+                .published
+                .expect("winning reindex publication")
+                .live
+                .get_file("lib.rs")
+                .expect("reindexed file")
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "after")
+        );
+    }
+
+    #[test]
+    fn stale_not_found_fence_preserves_recreated_file_and_reports_rejection() {
+        let dir = tempfile::TempDir::new().expect("root");
+        let path = dir.path().join("lib.rs");
+        std::fs::write(&path, "pub fn first() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+
+        std::fs::remove_file(&path).expect("simulate missing observation");
+        let absence_fence = shared.publication_fence();
+
+        std::fs::write(&path, "pub fn recreated() {}\n").expect("recreate");
+        assert_eq!(
+            finalize_missing_file(
+                &shared,
+                "lib.rs",
+                &path,
+                shared.current_project_generation(),
+                absence_fence,
+            ),
+            ReindexOutcome::PublicationRejected,
+            "a rejected stale removal must not claim the file was removed"
+        );
+        assert!(
+            shared
+                .read()
+                .get_file("lib.rs")
+                .expect("last-valid indexed file remains")
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "first")
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("recreated disk file")
+                .contains("recreated")
+        );
+    }
+
+    #[test]
+    fn missing_file_finalization_ignores_unrelated_same_project_publication() {
+        let dir = tempfile::TempDir::new().expect("root");
+        let a_path = dir.path().join("a.rs");
+        let b_path = dir.path().join("b.rs");
+        std::fs::write(&a_path, "pub fn a_before() {}\n").expect("seed a");
+        std::fs::write(&b_path, "pub fn b_before() {}\n").expect("seed b");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let expected_gen = shared.current_project_generation();
+
+        std::fs::remove_file(&a_path).expect("observe a missing");
+        let absence_fence = shared.publication_fence();
+
+        std::fs::write(&b_path, "pub fn b_after() {}\n").expect("edit b");
+        let b_receipt =
+            admit_and_index_single_path_with_receipt("b.rs", &b_path, &shared, expected_gen);
+        assert_eq!(b_receipt.outcome, ReindexOutcome::Reindexed);
+        let after_b = shared.publication_fence();
+        assert_eq!(after_b.project_generation, absence_fence.project_generation);
+        assert_ne!(
+            after_b.publication_generation, absence_fence.publication_generation,
+            "the regression requires an intervening unrelated publication"
+        );
+
+        assert_eq!(
+            finalize_missing_file(&shared, "a.rs", &a_path, expected_gen, absence_fence,),
+            ReindexOutcome::Removed,
+            "an unrelated publication must not prevent convergence to disk absence"
+        );
+        let published = shared.published_generation();
+        assert!(published.live.get_file("a.rs").is_none());
+        assert!(
+            published
+                .live
+                .get_file("b.rs")
+                .expect("unrelated publication survives")
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "b_after")
+        );
+    }
+
+    #[test]
+    fn stale_project_generation_cannot_remove_from_rebound_project() {
+        let project_a = tempfile::TempDir::new().expect("project A");
+        let project_b = tempfile::TempDir::new().expect("project B");
+        std::fs::write(project_a.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(project_b.path().join("lib.rs"), "pub fn b() {}\n").unwrap();
+        let shared = LiveIndex::load(project_a.path()).expect("load A");
+        let stale_gen = shared.current_project_generation();
+        shared.reload(project_b.path()).expect("rebind to B");
+        let rebound_fence = shared.publication_fence();
+
+        assert_eq!(
+            finalize_missing_file(
+                &shared,
+                "lib.rs",
+                &project_a.path().join("lib.rs"),
+                stale_gen,
+                rebound_fence,
+            ),
+            ReindexOutcome::PublicationRejected
+        );
+        assert!(
+            shared
+                .read()
+                .get_file("lib.rs")
+                .expect("B file survives stale absence finalization")
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "b")
+        );
+
+        let publication_before = shared.publication_fence();
+        let excluded = read_and_index_with_receipt(
+            ".git/config",
+            &project_b.path().join(".git/config"),
+            &shared,
+            None::<LanguageId>,
+            stale_gen,
+        );
+        assert_eq!(excluded.outcome, ReindexOutcome::PublicationRejected);
+        assert_eq!(shared.publication_fence(), publication_before);
+        assert!(shared.read().get_file("lib.rs").is_some());
     }
 }

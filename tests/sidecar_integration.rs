@@ -76,24 +76,17 @@ fn make_rust_file(path: &str, fn_name: &str) -> IndexedFile {
     }
 }
 
-/// Build a `SharedIndex` as an unrooted bootstrap placeholder
-/// (`LiveIndex::empty()` + `add_file`).
-///
-/// NOT the embedder construction route — that is `LiveIndex::from_indexed_files`
-/// (rooted, Ready). This shape is retained here only because these tests assert
-/// sidecar ENDPOINT behaviour, which does not consult index readiness. Anything
-/// asserting on index state must build a rooted index instead; see
-/// `tests/sidecar_contract.rs::build_shared_index`.
+/// Build the healthy, source-bound index expected by endpoint happy-path tests.
 fn build_shared_index(files: Vec<IndexedFile>) -> SharedIndex {
-    let shared = LiveIndex::empty();
-    {
-        let mut guard = shared.write();
-        for file in files {
-            let path = file.relative_path.clone();
-            guard.add_file(path, file);
-        }
-    }
-    shared
+    let root = std::env::current_dir().expect("sidecar test cwd must be available");
+    LiveIndex::from_indexed_files(
+        &root,
+        files
+            .into_iter()
+            .map(|file| (file.relative_path.clone(), file))
+            .collect(),
+    )
+    .expect("sidecar test cwd resolves")
 }
 
 fn control_state(root: &Path) -> ControlStateDir {
@@ -102,7 +95,11 @@ fn control_state(root: &Path) -> ControlStateDir {
 
 /// Make a synchronous raw HTTP GET request to `127.0.0.1:{port}{path}?{query}`.
 /// Returns the response body or an error.
-fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
+fn raw_http_get_with_status(
+    port: u16,
+    path: &str,
+    query: &str,
+) -> anyhow::Result<(String, String)> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
     let timeout = Duration::from_millis(500);
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
@@ -123,12 +120,17 @@ fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
 
+    let status = response.lines().next().unwrap_or_default().to_string();
     let body = response
         .split_once("\r\n\r\n")
         .map(|(_, b)| b)
         .unwrap_or("")
         .to_string();
-    Ok(body)
+    Ok((status, body))
+}
+
+fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
+    raw_http_get_with_status(port, path, query).map(|(_, body)| body)
 }
 
 fn stable_cwd() -> PathBuf {
@@ -332,10 +334,14 @@ async fn test_workflow_source_read_endpoint_matches_outline() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let canonical = raw_http_get(handle.port, "/outline", "path=src/foo.rs")
-        .expect("GET /outline must succeed");
-    let workflow = raw_http_get(handle.port, "/workflows/source-read", "path=src/foo.rs")
-        .expect("GET /workflows/source-read must succeed");
+    let (canonical_status, canonical) =
+        raw_http_get_with_status(handle.port, "/outline", "path=src/foo.rs")
+            .expect("GET /outline must succeed");
+    let (workflow_status, workflow) =
+        raw_http_get_with_status(handle.port, "/workflows/source-read", "path=src/foo.rs")
+            .expect("GET /workflows/source-read must succeed");
+    assert!(canonical_status.contains(" 200 "));
+    assert!(workflow_status.contains(" 200 "));
 
     assert_eq!(
         workflow, canonical,
@@ -626,9 +632,13 @@ async fn test_workflow_repo_start_endpoint_matches_repo_map() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let canonical = raw_http_get(handle.port, "/repo-map", "").expect("GET /repo-map must succeed");
-    let workflow = raw_http_get(handle.port, "/workflows/repo-start", "")
-        .expect("GET /workflows/repo-start must succeed");
+    let (canonical_status, canonical) =
+        raw_http_get_with_status(handle.port, "/repo-map", "").expect("GET /repo-map must succeed");
+    let (workflow_status, workflow) =
+        raw_http_get_with_status(handle.port, "/workflows/repo-start", "")
+            .expect("GET /workflows/repo-start must succeed");
+    assert!(canonical_status.contains(" 200 "));
+    assert!(workflow_status.contains(" 200 "));
 
     assert_eq!(
         workflow, canonical,
@@ -698,10 +708,14 @@ async fn test_workflow_prompt_context_endpoint_matches_prompt_context() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let query = "text=please%20inspect%20src%2Ffoo.rs";
-    let canonical = raw_http_get(handle.port, "/prompt-context", query)
-        .expect("GET /prompt-context must succeed");
-    let workflow = raw_http_get(handle.port, "/workflows/prompt-context", query)
-        .expect("GET /workflows/prompt-context must succeed");
+    let (canonical_status, canonical) =
+        raw_http_get_with_status(handle.port, "/prompt-context", query)
+            .expect("GET /prompt-context must succeed");
+    let (workflow_status, workflow) =
+        raw_http_get_with_status(handle.port, "/workflows/prompt-context", query)
+            .expect("GET /workflows/prompt-context must succeed");
+    assert!(canonical_status.contains(" 200 "));
+    assert!(workflow_status.contains(" 200 "));
 
     assert_eq!(
         workflow, canonical,

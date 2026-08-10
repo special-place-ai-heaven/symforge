@@ -64,6 +64,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejected_index_publications_classify_as_retryable_internal_failures() {
+        for output in [
+            "Error: index refresh for 'src/lib.rs' did not publish; retry the edit.",
+            "Error: index refresh for 'src/lib.rs' did not publish; retry the batch edit.",
+        ] {
+            assert_eq!(
+                classify_edit_output(output, false),
+                EditResultStatus::InternalFailure,
+                "output was: {output}"
+            );
+        }
+    }
+
     /// Test-only RAII guard serializing `SYMFORGE_SURFACE` mutation so the D23
     /// stale-session regressions can prove the CONNECTION surface overrides the
     /// daemon's own env. Single-threaded test context (`--test-threads=1`).
@@ -298,6 +312,8 @@ fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
         || text.contains("File disappeared:")
         || text.contains("byte range")
         || text.contains("Session stale")
+        || (text.starts_with("Error: index refresh for '")
+            && text.contains(" did not publish; retry the "))
     {
         EditResultStatus::InternalFailure
     } else if is_error_output(text)
@@ -418,6 +434,12 @@ pub(crate) fn prepare_exact_path_for_edit(
                     }
                 ));
             }
+            watcher::FreshenResult::PublicationRejected => {
+                return Err(format!(
+                    "Error: index refresh for '{}' did not publish; retry the edit.",
+                    relative_path
+                ));
+            }
         };
     Ok((abs_path, source_authority))
 }
@@ -457,6 +479,12 @@ pub(super) fn prepare_batch_paths_for_edit(
                         path: abs_path,
                         recovery: session_stale_recovery(),
                     }
+                ));
+            }
+            watcher::FreshenResult::PublicationRejected => {
+                return Err(format!(
+                    "Error: index refresh for '{}' did not publish; retry the batch edit.",
+                    relative_path
                 ));
             }
         }

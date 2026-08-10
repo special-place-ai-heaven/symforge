@@ -127,17 +127,17 @@ fn make_rust_file_with_refs(
     file
 }
 
-/// Build a `SharedIndex` from a list of `IndexedFile`s using the public API.
+/// Build the healthy, source-bound index expected by hook happy-path tests.
 fn build_shared_index(files: Vec<IndexedFile>) -> SharedIndex {
-    let shared = LiveIndex::empty();
-    {
-        let mut guard = shared.write();
-        for file in files {
-            let path = file.relative_path.clone();
-            guard.add_file(path, file);
-        }
-    }
-    shared
+    let root = std::env::current_dir().expect("hook test cwd must be available");
+    LiveIndex::from_indexed_files(
+        &root,
+        files
+            .into_iter()
+            .map(|file| (file.relative_path.clone(), file))
+            .collect(),
+    )
+    .expect("hook test cwd resolves")
 }
 
 fn control_state(root: &std::path::Path) -> ControlStateDir {
@@ -186,6 +186,138 @@ fn raw_http_get_with_status(
 /// Returns the response body or an error.
 fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
     raw_http_get_with_status(port, path, query).map(|(_, body)| body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loading_sidecar_refuses_all_content_routes_without_mutation() {
+    let tmp = TempDir::new().expect("tempdir creation");
+    let _guard = CWD_LOCK.lock().await;
+    let original = std::env::current_dir().expect("current directory");
+    std::env::set_current_dir(tmp.path()).expect("switch to sidecar test root");
+
+    std::fs::create_dir_all(tmp.path().join("src")).expect("create source directory");
+    std::fs::write(
+        tmp.path().join("src/foo.rs"),
+        "pub fn alpha() { println!(\"disk version\"); }\n",
+    )
+    .expect("write stale-on-disk source fixture");
+    std::fs::write(
+        tmp.path().join("src/new.rs"),
+        "pub fn newly_admitted() {}\n",
+    )
+    .expect("write mutation-capable new-file fixture");
+
+    let index = LiveIndex::empty();
+    let empty_handle = spawn_sidecar(
+        Arc::clone(&index),
+        "127.0.0.1",
+        Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
+    )
+    .await
+    .expect("spawn source-unbound empty sidecar");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (empty_status, empty_body) = raw_http_get_with_status(empty_handle.port, "/repo-map", "")
+        .expect("GET /repo-map against source-unbound Empty");
+    assert!(empty_status.contains(" 503 "));
+    assert!(empty_body.is_empty());
+    empty_handle.shutdown_and_join().await;
+
+    {
+        let mut guard = index.write();
+        let file = make_rust_file_with_symbols("src/foo.rs", vec![("alpha", SymbolKind::Function)]);
+        guard.add_file(file.relative_path.clone(), file);
+    }
+    let before = index.published_generation();
+    assert!(
+        before.source.is_none(),
+        "fixture must remain source-unbound"
+    );
+    assert!(
+        index.published_state().indexed_root.is_none(),
+        "fixture must remain rootless"
+    );
+    assert!(matches!(
+        before.health.status,
+        symforge::live_index::PublishedIndexStatus::Loading
+    ));
+    let before_foo = before
+        .live
+        .get_file("src/foo.rs")
+        .expect("placeholder contains foo")
+        .content
+        .clone();
+
+    let handle = spawn_sidecar(
+        Arc::clone(&index),
+        "127.0.0.1",
+        Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
+    )
+    .await
+    .expect("spawn loading sidecar");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let routes = [
+        ("/outline", "path=src/foo.rs"),
+        ("/workflows/source-read", "path=src/foo.rs"),
+        ("/impact", "path=src/foo.rs"),
+        (
+            "/workflows/post-edit-impact",
+            "path=src/new.rs&new_file=true",
+        ),
+        ("/symbol-context", "name=alpha"),
+        ("/workflows/search-hit-expansion", "name=alpha"),
+        ("/repo-map", ""),
+        ("/workflows/repo-start", ""),
+        ("/prompt-context", "text=alpha"),
+        ("/workflows/prompt-context", "text=alpha"),
+    ];
+    for (path, query) in routes {
+        let (status, body) = raw_http_get_with_status(handle.port, path, query)
+            .unwrap_or_else(|error| panic!("GET {path}?{query} failed: {error}"));
+        assert!(
+            status.contains(" 503 "),
+            "{path} must refuse a loading index; status={status}, body={body:?}"
+        );
+        assert!(
+            body.is_empty(),
+            "{path} refusal body must be empty: {body:?}"
+        );
+    }
+
+    let (health_status, health_body) =
+        raw_http_get_with_status(handle.port, "/health", "").expect("GET /health");
+    assert!(health_status.contains(" 200 "));
+    let health: serde_json::Value =
+        serde_json::from_str(&health_body).expect("health body is JSON");
+    assert_eq!(health["index_state"], "Loading");
+
+    let (stats_status, stats_body) =
+        raw_http_get_with_status(handle.port, "/stats", "").expect("GET /stats");
+    assert!(stats_status.contains(" 200 "));
+    let stats: serde_json::Value = serde_json::from_str(&stats_body).expect("stats body is JSON");
+    for field in ["read_fires", "edit_fires", "write_fires", "grep_fires"] {
+        assert_eq!(stats[field], 0, "{field} must not advance on refusals");
+    }
+
+    let after = index.published_generation();
+    assert_eq!(after.publication_generation, before.publication_generation);
+    assert_eq!(after.content_generation, before.content_generation);
+    assert_eq!(after.project_generation, before.project_generation);
+    assert_eq!(after.health.file_count, 1);
+    assert_eq!(
+        after
+            .live
+            .get_file("src/foo.rs")
+            .expect("placeholder retains foo")
+            .content,
+        before_foo
+    );
+    assert!(after.live.get_file("src/new.rs").is_none());
+
+    handle.shutdown_and_join().await;
+    std::env::set_current_dir(original).expect("restore current directory");
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +608,20 @@ async fn test_write_hook_confirms_index() {
     )
     .unwrap();
 
-    let index = build_shared_index(vec![]); // empty — file not yet indexed
+    let index = build_shared_index(vec![]); // source-bound empty; file not yet indexed
+    let empty = index.published_generation();
+    assert!(matches!(
+        empty.health.status,
+        symforge::live_index::PublishedIndexStatus::Empty
+    ));
+    assert!(
+        empty.source.is_some(),
+        "an empty project must retain its source identity"
+    );
+    assert!(
+        index.published_state().indexed_root.is_some(),
+        "an empty project must retain its indexed root"
+    );
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -505,6 +650,45 @@ async fn test_write_hook_confirms_index() {
     assert!(
         body.contains("fn") || body.contains("struct") || body.contains("Symbols"),
         "new_file response must mention symbols or language info; body: {body}"
+    );
+
+    std::fs::write(
+        &new_file_path,
+        b"pub fn create_thing() { println!(\"changed\"); }\npub struct Config {}\npub fn destroy_thing() {}",
+    )
+    .unwrap();
+    let (edited_status, edited) =
+        raw_http_get_with_status(handle.port, "/impact", "path=src/new_module.rs")
+            .expect("the first edit after new-file admission must succeed");
+    assert!(
+        edited_status.contains(" 200 "),
+        "the first edit must be accepted; status={edited_status}, body={edited}"
+    );
+    assert!(
+        !edited.is_empty(),
+        "the accepted edit must render impact text"
+    );
+    assert!(
+        !edited.contains("[Added]"),
+        "the new-file receipt must seed the next edit baseline; body: {edited}"
+    );
+    let changed: Vec<&str> = edited
+        .lines()
+        .filter(|line| line.contains("[Changed]"))
+        .collect();
+    assert_eq!(
+        changed.len(),
+        1,
+        "only the edited function may be reported changed; body: {edited}"
+    );
+    assert!(
+        changed[0].contains("create_thing"),
+        "the changed function must be named; body: {edited}"
+    );
+    assert!(
+        !edited.contains("[Changed] struct Config")
+            && !edited.contains("[Changed] function destroy_thing"),
+        "unchanged symbols must not be invented as changes; body: {edited}"
     );
 
     handle.shutdown_and_join().await;

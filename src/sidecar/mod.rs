@@ -208,6 +208,9 @@ pub struct SymbolSnapshot {
     pub byte_range: (u32, u32),
 }
 
+/// Public cache shape retained for sidecar embedders.
+pub type SymbolSnapshotCache = HashMap<String, Vec<SymbolSnapshot>>;
+
 // ---------------------------------------------------------------------------
 // SidecarState — bundles index + stats + symbol cache for all handlers
 // ---------------------------------------------------------------------------
@@ -224,8 +227,8 @@ pub struct SidecarState {
     /// `None` falls back to process cwd for local test setups.
     pub repo_root: Option<PathBuf>,
     /// Per-file symbol snapshot cache for impact diff.
-    /// Key: relative file path. Value: symbol list captured before last edit.
-    pub symbol_cache: Arc<RwLock<HashMap<String, Vec<SymbolSnapshot>>>>,
+    /// Key: relative file path. Value: symbol list captured after the last impact.
+    pub symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
 }
 
 // ---------------------------------------------------------------------------
