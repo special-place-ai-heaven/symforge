@@ -61,6 +61,7 @@ fn write_sidecar_descriptor(control_root: &Path, project_root: &Path, port: u16)
         port,
         Some("hook-subprocess-test"),
         Some(project_root),
+        None,
     )
     .expect("write sidecar session descriptor");
 }
@@ -138,20 +139,36 @@ fn run_hook_routed_success_writes_source_read_routed_event() {
         .expect("mock sidecar local_addr")
         .port();
 
-    // Minimal single-shot HTTP responder. Started BEFORE the subprocess
+    // Minimal multi-shot HTTP responder. Started BEFORE the subprocess
     // spawns so the accept loop is already waiting when the subprocess
     // connects — the 50ms HTTP_TIMEOUT leaves no room for thread start-up
-    // races. Writes a fixed 200-OK response and drops the stream, which
-    // closes the connection and lets the subprocess's `read_to_string`
-    // return.
+    // races. GET /health answers a DaemonHealth JSON body (the descriptor
+    // boot-epoch probe; no epoch = legacy-compatible accept for a legacy
+    // descriptor); any other request gets a fixed 200-OK and drops the
+    // stream, which closes the connection and lets the subprocess's
+    // `read_to_string` return.
     let mock = thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..4 {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
             let mut buf = [0u8; 2048];
-            if stream.read(&mut buf).is_ok_and(|read| read > 0) {
+            let Ok(read) = stream.read(&mut buf) else {
+                return;
+            };
+            if read == 0 {
+                continue;
+            }
+            if buf.starts_with(b"GET /health ") {
+                let body = br#"{"project_count":0,"session_count":0,"daemon_version":"10.1.0","executable_path":"x","auth_required":true,"pid":0}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    String::from_utf8_lossy(body)
+                );
+                let _ = stream.write_all(response.as_bytes());
+            } else {
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                 return;
             }

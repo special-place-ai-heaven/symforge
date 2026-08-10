@@ -408,6 +408,14 @@ async fn cross_project_targeting_is_refused_over_http() {
             text.contains("/mcp HTTP transport"),
             "{name} refusal should name the /mcp transport, got:\n{text}"
         );
+        // Semantic refusals are typed MCP errors, never isError:false (the
+        // incident's "refusal returned as success" defect).
+        assert_eq!(
+            response["result"]["isError"],
+            serde_json::json!(true),
+            "{name} refusal must carry isError:true, got:\n{}",
+            response["result"]
+        );
     }
 
     // Control: the SAME tool with NO project/projects must NOT trip the refusal —

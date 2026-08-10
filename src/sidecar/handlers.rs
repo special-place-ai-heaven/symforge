@@ -361,7 +361,7 @@ pub async fn caller_root_guard(
     next.run(request).await
 }
 
-fn query_param(query: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     for pair in query?.split('&') {
         if let Some((k, v)) = pair.split_once('=')
             && k == key
@@ -372,7 +372,7 @@ fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     None
 }
 
-fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -> bool {
+pub(crate) fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -> bool {
     fn norm(p: &std::path::Path) -> String {
         let canon = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let s = canon.to_string_lossy().replace('\\', "/");

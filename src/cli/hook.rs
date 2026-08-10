@@ -2149,6 +2149,7 @@ mod tests {
             41_321,
             Some("session-a"),
             Some(tmp.path()),
+            None,
         )
         .unwrap();
 

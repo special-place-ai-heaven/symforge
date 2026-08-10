@@ -1060,10 +1060,16 @@ impl SymForgeServer {
         // write lock). We wrap in a timeout so read locks release promptly
         // on failure — the reqwest client also has its own timeout as a
         // backstop, but this ensures lock release within a tighter window.
+        //
+        // 30s (matching the post-reconnect retry and the governor's execution
+        // bound), NOT tighter: a legitimately heavy read (get_repo_map full
+        // outline on a large index) must not be misclassified as transport
+        // death — that was the delayed-refusal incident. A DEAD endpoint
+        // still fails fast (connect refused), so this costs nothing there.
         {
             let client = daemon_lock.read().await;
             match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(30),
                 client.call_tool_value(tool_name, value.clone()),
             )
             .await
@@ -1082,11 +1088,11 @@ impl SymForgeServer {
                 Err(_elapsed) => {
                     self.note_daemon_failure(
                         client.base_url(),
-                        "probe timed out after 10s".to_string(),
+                        "probe timed out after 30s".to_string(),
                     );
                     tracing::warn!(
                         tool = tool_name,
-                        "daemon proxy call timed out after 10s, attempting reconnect"
+                        "daemon proxy call timed out after 30s, attempting reconnect"
                     );
                 }
             }
@@ -1251,6 +1257,7 @@ impl SymForgeServer {
             port,
             Some(client.session_id()),
             client.project_root(),
+            client.daemon_started_at(),
         ) {
             tracing::warn!("failed to republish session descriptor after reconnect: {error}");
         }
@@ -1785,6 +1792,26 @@ impl ServerHandler for SymForgeServer {
             response.map(|response| match response {
                 rmcp::model::CallToolResponse::Complete(mut result) => {
                     result_status::attach_project_evidence_meta(&mut result.meta);
+                    // Semantic-error typing (worktree-routing incident): most
+                    // primitive tools return plain String bodies, so a
+                    // routing refusal or tool error reached the wire as
+                    // isError:false — an authoritative-looking "failure read
+                    // as success". Reclassify centrally via the ONE shared
+                    // error-shape predicate so every tool inherits it without
+                    // per-handler signature churn.
+                    if result.is_error != Some(true) {
+                        let body = result
+                            .content
+                            .iter()
+                            .filter_map(|block| {
+                                block.as_text().map(|text| text.text.as_str())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !body.is_empty() && tools::is_error_output(&body) {
+                            result.is_error = Some(true);
+                        }
+                    }
                     rmcp::model::CallToolResponse::Complete(result)
                 }
                 other => other,

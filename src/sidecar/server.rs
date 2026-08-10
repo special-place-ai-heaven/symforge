@@ -71,7 +71,7 @@ pub async fn spawn_sidecar(
     // purely local sidecar) so hook scripts can locate this sidecar without
     // clobbering a sibling's record.
     if let Some(state_dir) = control_state_dir.as_ref() {
-        port_file::write_session_descriptor(state_dir, port, None, repo_root.as_deref())?;
+        port_file::write_session_descriptor(state_dir, port, None, repo_root.as_deref(), None)?;
     }
 
     // Install panic hook to clean up port files if the process panics.

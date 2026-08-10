@@ -161,6 +161,12 @@ pub struct SessionDescriptor {
     pub session_id: Option<String>,
     /// The project root this adapter serves, for identity validation.
     pub project_root: Option<String>,
+    /// Boot epoch of the daemon this adapter's session belongs to (10.1+).
+    /// Selection rejects a descriptor whose epoch differs from the live
+    /// daemon's /health epoch — a stale record must not alias an unrelated
+    /// `session-N` after a daemon restart.
+    #[serde(default)]
+    pub daemon_started_at: Option<u64>,
     pub pid: u32,
     pub port: u16,
     /// Heartbeat/update time; refreshed on every write.
@@ -175,12 +181,14 @@ pub(crate) fn write_descriptor_for_pid_at(
     port: u16,
     session_id: Option<&str>,
     project_root: Option<&Path>,
+    daemon_started_at: Option<u64>,
 ) -> io::Result<()> {
     let sessions = dir.join(SESSIONS_DIR);
     std::fs::create_dir_all(&sessions)?;
     let descriptor = SessionDescriptor {
         session_id: session_id.map(str::to_string),
         project_root: project_root.map(|root| root.display().to_string()),
+        daemon_started_at,
         pid,
         port,
         updated_at_unix_secs: now_unix_secs(),
@@ -206,9 +214,17 @@ pub fn write_session_descriptor(
     port: u16,
     session_id: Option<&str>,
     project_root: Option<&Path>,
+    daemon_started_at: Option<u64>,
 ) -> io::Result<()> {
     let dir = ensure_symforge_dir(control_state_dir)?;
-    write_descriptor_for_pid_at(&dir, std::process::id(), port, session_id, project_root)
+    write_descriptor_for_pid_at(
+        &dir,
+        std::process::id(),
+        port,
+        session_id,
+        project_root,
+        daemon_started_at,
+    )
 }
 
 /// Remove exactly one pid's descriptor. Never touches siblings.
@@ -339,17 +355,22 @@ fn select_descriptor_status(
             .then(a.pid.cmp(&b.pid))
     });
 
-    let selected = |best: &SessionDescriptor, liveness| SelectedSidecar {
+    let selected = |best: &SessionDescriptor, liveness, epoch_rejected: usize| SelectedSidecar {
         status: SidecarStatus {
             pid: Some(best.pid),
             port: Some(best.port),
             liveness,
             detail: Some(format!(
-                "descriptor sidecar.{} ({} candidate(s){})",
+                "descriptor sidecar.{} ({} candidate(s){}{})",
                 best.pid,
                 candidates.len(),
                 if rejected > 0 {
                     format!(", {rejected} identity-rejected")
+                } else {
+                    String::new()
+                },
+                if epoch_rejected > 0 {
+                    format!(", {epoch_rejected} epoch-rejected")
                 } else {
                     String::new()
                 }
@@ -359,6 +380,7 @@ fn select_descriptor_status(
     };
 
     let mut probed = 0usize;
+    let mut epoch_rejected = 0usize;
     for candidate in &candidates {
         let remaining = DESCRIPTOR_SCAN_TIMEOUT.saturating_sub(scan_started.elapsed());
         if remaining.is_zero() {
@@ -368,15 +390,90 @@ fn select_descriptor_status(
             .unwrap_or(false);
         probed += 1;
         if alive {
-            return Some(selected(candidate, SidecarLiveness::Alive));
+            // Daemon-backed records (session_id present) must also prove the
+            // candidate port is the SAME daemon process the descriptor was
+            // written against: after a daemon restart the new process re-issues
+            // `session-N` ids from 1, so a stale descriptor would otherwise
+            // alias an unrelated session. The boot-epoch probe is that proof.
+            if candidate.session_id.is_some() {
+                let remaining = DESCRIPTOR_SCAN_TIMEOUT.saturating_sub(scan_started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                if !probe_daemon_epoch(
+                    bind_host,
+                    candidate.port,
+                    candidate.daemon_started_at,
+                    remaining,
+                ) {
+                    epoch_rejected += 1;
+                    continue;
+                }
+            }
+            return Some(selected(candidate, SidecarLiveness::Alive, epoch_rejected));
         }
     }
 
     if let Some(unprobed) = candidates.get(probed) {
-        Some(selected(unprobed, SidecarLiveness::Unknown))
+        Some(selected(unprobed, SidecarLiveness::Unknown, epoch_rejected))
     } else {
-        Some(selected(&candidates[0], SidecarLiveness::Dead))
+        Some(selected(&candidates[0], SidecarLiveness::Dead, epoch_rejected))
     }
+}
+
+/// Semantic probe for daemon-backed descriptors: GET /health on the candidate
+/// port and require the daemon's boot epoch to equal the descriptor's
+/// recorded epoch (both absent is the legacy-compatible accept case: an old
+/// daemon paired with an old descriptor). Any HTTP/parse failure or epoch
+/// mismatch rejects the candidate — fail closed, never alias.
+fn probe_daemon_epoch(
+    bind_host: &str,
+    port: u16,
+    expected: Option<u64>,
+    timeout: Duration,
+) -> bool {
+    use std::io::{Read, Write};
+    let Ok(sock_addr) = sidecar_socket_addr(bind_host, port) else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&sock_addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    if stream
+        .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 16 * 1024 {
+                    return false;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let Ok(response) = std::str::from_utf8(&buf) else {
+        return false;
+    };
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        return false;
+    }
+    let Some(body) = response.split("\r\n\r\n").nth(1) else {
+        return false;
+    };
+    let Ok(health) = serde_json::from_str::<crate::daemon::DaemonHealth>(body) else {
+        return false;
+    };
+    health.started_at_unix_secs == expected
 }
 
 #[cfg(windows)]
@@ -595,10 +692,20 @@ pub fn read_sidecar_endpoint(
     expected_project_root: Option<&Path>,
 ) -> io::Result<(u16, Option<String>)> {
     let dir = resolve_symforge_dir(control_state_dir);
-    if let Some(selected) = select_descriptor_status(&dir, bind_host, expected_project_root)
-        && let Some(port) = selected.status.port
-    {
-        return Ok((port, selected.session_id));
+    if let Some(selected) = select_descriptor_status(&dir, bind_host, expected_project_root) {
+        if let Some(port) = selected.status.port {
+            return Ok((port, selected.session_id));
+        }
+        // Fail closed: modern descriptors EXISTED but were all
+        // identity-rejected for this root. Falling through to the legacy
+        // fixed files would route around the project-root check — a
+        // fail-closed mismatch must never degrade into an unscoped lookup.
+        if let Some(detail) = selected.status.detail.as_deref() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("sidecar descriptor identity mismatch: {detail}"),
+            ));
+        }
     }
 
     let port = read_port_at(&dir)?;
@@ -673,9 +780,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         {
-            write_descriptor_for_pid_at(dir, 111, 40001, Some("session-a"), None)
+            write_descriptor_for_pid_at(dir, 111, 40001, Some("session-a"), None, None)
                 .expect("write descriptor A");
-            write_descriptor_for_pid_at(dir, 222, 40002, Some("session-b"), None)
+            write_descriptor_for_pid_at(dir, 222, 40002, Some("session-b"), None, None)
                 .expect("write descriptor B");
             assert_eq!(read_descriptors_at(dir).len(), 2, "both descriptors exist");
 
@@ -709,6 +816,7 @@ mod tests {
                 u32::MAX - offset,
                 recycled_port,
                 Some("stale-session"),
+                None,
                 None,
             )
             .expect("write dead-pid descriptor");
@@ -755,14 +863,14 @@ mod tests {
             let live_pid = std::process::id();
             let dead_pid = u32::MAX;
 
-            write_descriptor_for_pid_at(dir, live_pid, live_port, Some("session-live"), None)
+            write_descriptor_for_pid_at(dir, live_pid, live_port, None, None, None)
                 .expect("write live descriptor");
-            write_descriptor_for_pid_at(dir, dead_pid, dead_port, Some("session-dead"), None)
+            write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, None, None)
                 .expect("write dead descriptor");
             // The dead one is FRESHER (rewrite bumps updated_at); force order by
             // rewriting it after the live one.
             std::thread::sleep(std::time::Duration::from_millis(1100));
-            write_descriptor_for_pid_at(dir, dead_pid, dead_port, Some("session-dead"), None)
+            write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, None, None)
                 .expect("refresh dead descriptor");
 
             let status = read_sidecar_status_at(dir, "127.0.0.1");
@@ -782,8 +890,9 @@ mod tests {
                 dir,
                 live_pid,
                 live_port,
-                Some("session-foreign"),
+                None,
                 Some(std::path::Path::new("/somewhere/else/entirely")),
+                None,
             )
             .expect("write foreign descriptor");
             let status = read_sidecar_status_at(dir, "127.0.0.1");
@@ -794,6 +903,97 @@ mod tests {
             );
             drop(listener);
         }
+    }
+
+    /// Boot-epoch probe (session-aliasing incident): a daemon-backed descriptor
+    /// is only selectable when the port's /health proves the SAME daemon
+    /// process wrote it. After a daemon restart the new process re-issues
+    /// `session-N` from 1 — epoch equality is what stops a stale descriptor
+    /// from aliasing an unrelated session.
+    #[test]
+    fn test_daemon_backed_descriptor_requires_matching_boot_epoch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Minimal HTTP fake: fixed 200 + DaemonHealth JSON body.
+        fn spawn_health_daemon(epoch: Option<u64>) -> u16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            std::thread::spawn(move || {
+                while let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::{Read, Write};
+                    let mut req = [0u8; 512];
+                    let _ = stream.read(&mut req);
+                    let health = crate::daemon::DaemonHealth {
+                        project_count: 0,
+                        session_count: 0,
+                        daemon_version: "10.1.0".to_string(),
+                        executable_path: "x".to_string(),
+                        auth_required: true,
+                        pid: Some(std::process::id()),
+                        started_at_unix_secs: epoch,
+                    };
+                    let body = serde_json::to_string(&health).expect("health json");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            port
+        }
+
+        let port = spawn_health_daemon(Some(1_700_000_000));
+        let pid = std::process::id();
+
+        // Matching epoch: selected.
+        write_descriptor_for_pid_at(
+            dir,
+            pid,
+            port,
+            Some("session-7"),
+            None,
+            Some(1_700_000_000),
+        )
+        .expect("write matching descriptor");
+        let status = read_sidecar_status_at(dir, "127.0.0.1");
+        assert_eq!(status.liveness, SidecarLiveness::Alive);
+        assert_eq!(status.port, Some(port), "matching epoch must select");
+
+        // Stale epoch (descriptor written against the PREVIOUS daemon boot):
+        // rejected even though the port is alive and serves 200.
+        write_descriptor_for_pid_at(
+            dir,
+            pid,
+            port,
+            Some("session-7"),
+            None,
+            Some(1_600_000_000),
+        )
+        .expect("write stale-epoch descriptor");
+        let status = read_sidecar_status_at(dir, "127.0.0.1");
+        assert_ne!(
+            status.liveness,
+            SidecarLiveness::Alive,
+            "stale epoch must not select: {status:?}"
+        );
+        assert!(
+            status.detail.as_deref().unwrap_or("").contains("epoch-rejected"),
+            "rejection must be attributed to the epoch probe: {status:?}"
+        );
+
+        // Legacy descriptor (no epoch) against a NEW daemon (epoch present):
+        // rejected — this is the exact aliasing case from the incident.
+        write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), None, None)
+            .expect("write legacy descriptor");
+        let status = read_sidecar_status_at(dir, "127.0.0.1");
+        assert_ne!(
+            status.liveness,
+            SidecarLiveness::Alive,
+            "legacy descriptor must not alias a restarted daemon: {status:?}"
+        );
     }
 
     #[test]

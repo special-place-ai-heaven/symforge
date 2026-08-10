@@ -274,6 +274,7 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
             port,
             Some(session.session_id()),
             session.project_root(),
+            session.daemon_started_at(),
         )?;
     }
 

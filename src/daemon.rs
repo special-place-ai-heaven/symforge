@@ -195,6 +195,11 @@ pub struct DaemonSessionClient {
     /// active. Shared across clones so a reconnect can restore the active
     /// project after re-opening the working set.
     active_root: std::sync::Arc<parking_lot::Mutex<Option<PathBuf>>>,
+    /// The connected daemon's boot epoch (from /health at connect). Written
+    /// into this adapter's session descriptor so descriptor selection can
+    /// reject the record after a daemon restart instead of aliasing an
+    /// unrelated `session-N`.
+    daemon_started_at: Option<u64>,
     auth_token: Option<String>,
     /// The process-coordination namespace that owns this daemon connection.
     /// Reconnect must reuse this exact typed owner rather than re-resolving
@@ -226,6 +231,9 @@ pub struct DaemonState {
     projects: RwLock<HashMap<String, Arc<ProjectSlot>>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
+    /// Boot epoch minted once per daemon process (unix seconds). Served on
+    /// /health; descriptor selection rejects records from a previous boot.
+    started_at_unix_secs: u64,
     /// The bearer token this daemon requires on every authenticated route.
     /// Non-optional by design: the daemon ALWAYS establishes a token at startup
     /// (env pin or freshly generated), so `authorize_daemon_request` is strictly
@@ -733,6 +741,12 @@ pub struct DaemonHealth {
     pub auth_required: bool,
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Daemon boot epoch (unix seconds). Present on 10.1+ daemons; descriptors
+    /// record it and selection rejects a descriptor whose epoch differs from
+    /// the live daemon's — a stale record can no longer alias an unrelated
+    /// `session-N` after a daemon restart (the counter resets per process).
+    #[serde(default)]
+    pub started_at_unix_secs: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -807,6 +821,7 @@ impl DaemonState {
             projects: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             identity: current_daemon_identity(),
+            started_at_unix_secs: now_epoch_millis() / 1000,
             auth_token,
             control_state_dir,
             governor: crate::sidecar::governor::RequestGovernor::new(),
@@ -2050,6 +2065,7 @@ impl DaemonState {
             // can surface that authentication is in force.
             auth_required: true,
             pid: Some(std::process::id()),
+            started_at_unix_secs: Some(self.started_at_unix_secs),
         }
     }
 }
@@ -2075,7 +2091,7 @@ impl DaemonSessionClient {
         // layer. This creates a deadlock-like scenario when a reconnect
         // attempt needs a write lock but reads never release.
         //
-        // 30s connect + 60s total covers heavy ops (batch_edit on large repos)
+        // 5s connect + 60s total covers heavy ops (batch_edit on large repos)
         // while ensuring stuck requests eventually fail and release locks.
         let http_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
@@ -2094,12 +2110,23 @@ impl DaemonSessionClient {
             project_root: None,
             opened_roots: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             active_root: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            daemon_started_at: None,
         }
     }
 
     fn with_project_root(mut self, root: PathBuf) -> Self {
         self.project_root = Some(root);
         self
+    }
+
+    fn with_daemon_started_at(mut self, started_at: Option<u64>) -> Self {
+        self.daemon_started_at = started_at;
+        self
+    }
+
+    /// The connected daemon's boot epoch, when known (10.1+ daemons).
+    pub fn daemon_started_at(&self) -> Option<u64> {
+        self.daemon_started_at
     }
 
     /// Task 8: remember a sibling root this connection opened additively so
@@ -2450,6 +2477,11 @@ async fn connect_or_spawn_session_at(
         .await
         .context("daemon session open body")?;
 
+    // Capture the daemon's boot epoch for descriptor epoch validation.
+    // Unauthenticated /health by design; failure is non-fatal (epoch simply
+    // absent, selection falls back to PID+TCP for legacy records).
+    let daemon_started_at = daemon_health(port).await.and_then(|h| h.started_at_unix_secs);
+
     Ok(DaemonSessionClient::new_with_auth_token(
         base_url,
         opened.project_id,
@@ -2458,7 +2490,8 @@ async fn connect_or_spawn_session_at(
         auth_token,
         control_state_dir.clone(),
     )
-    .with_project_root(project_root.to_path_buf()))
+    .with_project_root(project_root.to_path_buf())
+    .with_daemon_started_at(daemon_started_at))
 }
 
 async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow::Result<u16> {
@@ -4197,6 +4230,35 @@ async fn call_tool_handler(
     }
 }
 
+/// Dogfood #6 parity for daemon-proxied sidecar routes: the local sidecar
+/// router installs `caller_root_guard`; the daemon duplicates those routes
+/// and must enforce the SAME check, or a session whose ACTIVE project moved
+/// (a default `index_folder` by this or another agent) answers a caller
+/// rooted elsewhere with the wrong project's data. 409 mirrors the local
+/// contract so the hook falls back and re-resolves the project BY ROOT.
+/// `/health`-style liveness is never routed here, so no path exemption is
+/// needed.
+fn guard_session_caller_root(
+    runtime: &SessionRuntime,
+    query: Option<&str>,
+) -> Result<(), StatusCode> {
+    if let Some(caller_root) =
+        crate::sidecar::handlers::query_param(query, "caller_root")
+        && !crate::sidecar::handlers::roots_match(
+            std::path::Path::new(&caller_root),
+            &runtime.canonical_root,
+        )
+    {
+        tracing::warn!(
+            caller_root,
+            serving_root = %runtime.canonical_root.display(),
+            "daemon sidecar caller-root mismatch — 409 (hook re-resolves by root)"
+        );
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(())
+}
+
 async fn sidecar_health_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
@@ -4225,12 +4287,14 @@ async fn sidecar_outline_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
+    uri: axum::http::Uri,
     Query(params): Query<crate::sidecar::handlers::OutlineParams>,
 ) -> Result<String, StatusCode> {
     let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    guard_session_caller_root(&runtime, uri.query())?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -4253,12 +4317,14 @@ async fn sidecar_impact_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
+    uri: axum::http::Uri,
     Query(params): Query<crate::sidecar::handlers::ImpactParams>,
 ) -> Result<String, StatusCode> {
     let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    guard_session_caller_root(&runtime, uri.query())?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -4281,12 +4347,14 @@ async fn sidecar_symbol_context_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
+    uri: axum::http::Uri,
     Query(params): Query<crate::sidecar::handlers::SymbolContextParams>,
 ) -> Result<String, StatusCode> {
     let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    guard_session_caller_root(&runtime, uri.query())?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -4309,11 +4377,13 @@ async fn sidecar_repo_map_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
+    uri: axum::http::Uri,
 ) -> Result<String, StatusCode> {
     let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    guard_session_caller_root(&runtime, uri.query())?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -4333,12 +4403,14 @@ async fn sidecar_prompt_context_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
+    uri: axum::http::Uri,
     Query(params): Query<crate::sidecar::handlers::PromptContextParams>,
 ) -> Result<String, StatusCode> {
     let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    guard_session_caller_root(&runtime, uri.query())?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -11248,6 +11320,7 @@ mod tests {
             executable_path: current_daemon_identity().executable_path,
             auth_required: false,
             pid: None,
+            started_at_unix_secs: None,
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
         std::fs::write(
@@ -11276,6 +11349,7 @@ mod tests {
             executable_path: current_daemon_identity().executable_path,
             auth_required: false,
             pid: Some(42),
+            started_at_unix_secs: None,
         };
 
         assert!(daemon_health_matches_recorded_pid(&health, 42));
@@ -11317,6 +11391,7 @@ mod tests {
             executable_path: "C:/unrelated/not-symforge-daemon.exe".to_string(),
             auth_required: false,
             pid: Some(child_pid),
+            started_at_unix_secs: None,
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
         std::fs::write(
@@ -11360,6 +11435,7 @@ mod tests {
             executable_path: current_daemon_identity().executable_path,
             auth_required: false,
             pid: None,
+            started_at_unix_secs: None,
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
         std::fs::write(
@@ -11433,6 +11509,109 @@ mod tests {
         assert!(
             body.contains("Index: 1 files, 1 symbols"),
             "repo-map hook output should come from daemon project instance, got: {body}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
+    /// caller-root guard parity (worktree-routing incident): daemon-proxied
+    /// sidecar routes must enforce the SAME caller_root check the local
+    /// sidecar router installs. A session whose ACTIVE project moved must 409
+    /// a caller rooted at the old project instead of serving the wrong one.
+    #[tokio::test]
+    async fn test_daemon_sidecar_enforces_caller_root_guard() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-guard-home-a");
+        let project_b = project_dir("symforge-guard-open-b");
+        std::fs::write(project_a.path().join("src").join("a.rs"), "fn a() {}\n")
+            .expect("write source a");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "guard".to_string(),
+                pid: Some(88),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        // Default-open B: the session's ACTIVE project moves to B (locked
+        // contract). A caller rooted at A must now be refused, not served B.
+        client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status");
+
+        let url = |extra: &str| {
+            format!(
+                "{base_url}/v1/sessions/{}/sidecar/repo-map{extra}",
+                opened.session_id
+            )
+        };
+
+        let mismatched = client
+            .get(url(&format!("?caller_root={}", project_a.path().display())))
+            .send()
+            .await
+            .expect("mismatched request");
+        assert_eq!(
+            mismatched.status(),
+            StatusCode::CONFLICT,
+            "caller_root=A must 409 once B is active"
+        );
+
+        let matched = client
+            .get(url(&format!("?caller_root={}", project_b.path().display())))
+            .send()
+            .await
+            .expect("matched request");
+        assert!(
+            matched.status().is_success(),
+            "caller_root=B (the active project) must be served"
+        );
+
+        let unpinned = client
+            .get(url(""))
+            .send()
+            .await
+            .expect("unpinned request");
+        assert!(
+            unpinned.status().is_success(),
+            "a request without caller_root stays unguarded"
         );
 
         let _ = handle.shutdown_tx.send(());
