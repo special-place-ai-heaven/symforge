@@ -1,6 +1,6 @@
 {
   "name": "symforge-windows-x64",
-  "version": "10.0.1",
+  "version": "10.0.2",
   "description": "Windows x64 native binary for SymForge",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
