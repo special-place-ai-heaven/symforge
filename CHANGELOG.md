@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.0.2](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.1...v10.0.2) (2026-08-10)
+
+
+### Bug Fixes
+
+* **daemon:** descriptor epoch, caller-root parity, typed refusals, fail-closed discovery ([4c1731b](https://github.com/special-place-ai-heaven/symforge/commit/4c1731b615097b2bd113de04a3661cbea958109a))
+* **daemon:** per-session activation + bounded degraded rediscovery (worktree-routing incident) ([f56ffdd](https://github.com/special-place-ai-heaven/symforge/commit/f56ffdd73d34542f1aeb08117a05d87563b410a0))
+
 ## [10.0.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.0...v10.0.1) (2026-08-07)
 
 
