@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{LanguageId, ReferenceKind};
-use crate::sidecar::{SidecarState, SymbolSnapshot, build_with_budget};
+use crate::sidecar::{SidecarState, SymbolSnapshot, SymbolSnapshotCache, build_with_budget};
 use crate::{protocol::edit, watcher};
 
 // ---------------------------------------------------------------------------
@@ -219,14 +219,6 @@ fn format_context_envelope(
     }
 }
 
-fn freshen_sidecar_path_if_stale(
-    state: &SidecarState,
-    relative_path: &str,
-) -> ContextSourceAuthority {
-    let expected_gen = state.index.current_project_generation();
-    freshen_sidecar_path_if_stale_at_generation(state, relative_path, expected_gen)
-}
-
 fn safe_sidecar_path_for_freshen(
     repo_root: &std::path::Path,
     relative_path: &str,
@@ -253,20 +245,22 @@ fn safe_sidecar_path_for_freshen(
 
 fn freshen_sidecar_path_if_stale_at_generation(
     state: &SidecarState,
+    repo_root: Option<&std::path::Path>,
     relative_path: &str,
     expected_gen: u64,
-) -> ContextSourceAuthority {
-    let Some(repo_root) = &state.repo_root else {
-        return ContextSourceAuthority::CurrentIndex;
+) -> Result<ContextSourceAuthority, StatusCode> {
+    let Some(repo_root) = repo_root else {
+        return Ok(ContextSourceAuthority::CurrentIndex);
     };
     let Ok(abs_path) = safe_sidecar_path_for_freshen(repo_root, relative_path) else {
-        return ContextSourceAuthority::CurrentIndex;
+        return Ok(ContextSourceAuthority::CurrentIndex);
     };
     match watcher::freshen_file_if_stale(relative_path, &abs_path, &state.index, expected_gen) {
-        watcher::FreshenResult::Fresh => ContextSourceAuthority::CurrentIndex,
-        watcher::FreshenResult::StaleReindexed => ContextSourceAuthority::DiskRefreshed,
-        watcher::FreshenResult::StaleRemoved => ContextSourceAuthority::DiskRefreshed,
-        watcher::FreshenResult::GenerationMismatch => ContextSourceAuthority::CurrentIndex,
+        watcher::FreshenResult::Fresh => Ok(ContextSourceAuthority::CurrentIndex),
+        watcher::FreshenResult::StaleReindexed => Ok(ContextSourceAuthority::DiskRefreshed),
+        watcher::FreshenResult::StaleRemoved => Ok(ContextSourceAuthority::DiskRefreshed),
+        watcher::FreshenResult::GenerationMismatch => Ok(ContextSourceAuthority::CurrentIndex),
+        watcher::FreshenResult::PublicationRejected => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
@@ -412,6 +406,205 @@ pub async fn health_handler(
     }))
 }
 
+#[derive(Clone, Debug)]
+struct SidecarQueryFence {
+    project_generation: u64,
+    source: crate::domain::SourceIdentity,
+    indexed_root: std::path::PathBuf,
+}
+
+fn published_sidecar_index_is_queryable(
+    published: &crate::live_index::PublishedGeneration,
+) -> bool {
+    let health_is_ready = matches!(
+        published.health.status,
+        crate::live_index::PublishedIndexStatus::Ready
+    );
+    let health_is_empty = matches!(
+        published.health.status,
+        crate::live_index::PublishedIndexStatus::Empty
+    );
+    let freshness_is_queryable = matches!(
+        published.freshness.as_ref(),
+        crate::domain::FreshnessStatus::Current
+    ) || (health_is_empty
+        && matches!(
+            published.freshness.as_ref(),
+            crate::domain::FreshnessStatus::Verifying
+        )
+        && matches!(
+            published.health.snapshot_verify_state,
+            crate::live_index::SnapshotVerifyState::NotNeeded
+        ));
+    (health_is_ready || health_is_empty)
+        && published.source.is_some()
+        && published.live.indexed_root.is_some()
+        && freshness_is_queryable
+}
+
+fn sidecar_query_fence_for(
+    published: &crate::live_index::PublishedGeneration,
+) -> Option<SidecarQueryFence> {
+    Some(SidecarQueryFence {
+        project_generation: published.project_generation,
+        source: published.source.as_deref()?.clone(),
+        indexed_root: published.live.indexed_root.clone()?,
+    })
+}
+
+fn published_matches_sidecar_query(
+    published: &crate::live_index::PublishedGeneration,
+    fence: &SidecarQueryFence,
+) -> bool {
+    published_sidecar_index_is_queryable(published)
+        && published_matches_sidecar_fence(published, fence)
+}
+
+fn published_matches_sidecar_fence(
+    published: &crate::live_index::PublishedGeneration,
+    fence: &SidecarQueryFence,
+) -> bool {
+    published.project_generation == fence.project_generation
+        && published.source.as_deref() == Some(&fence.source)
+        && published.live.indexed_root.as_ref() == Some(&fence.indexed_root)
+}
+
+fn require_queryable_sidecar_index(state: &SidecarState) -> Result<SidecarQueryFence, StatusCode> {
+    let published = state.index.published_generation();
+    if published_sidecar_index_is_queryable(&published)
+        && state.index.current_project_generation() == published.project_generation
+    {
+        let fence = sidecar_query_fence_for(&published).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        if state
+            .repo_root
+            .as_deref()
+            .is_some_and(|root| !roots_match(root, &fence.indexed_root))
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        Ok(fence)
+    } else {
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+fn capture_queryable_sidecar_generation(
+    state: &SidecarState,
+    fence: &SidecarQueryFence,
+) -> Result<std::sync::Arc<crate::live_index::PublishedGeneration>, StatusCode> {
+    let published = state.index.published_generation();
+    if published_matches_sidecar_query(&published, fence)
+        && state.index.current_project_generation() == published.project_generation
+    {
+        Ok(published)
+    } else {
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+fn capture_sidecar_generation_at_fence(
+    state: &SidecarState,
+    fence: &SidecarQueryFence,
+) -> Result<std::sync::Arc<crate::live_index::PublishedGeneration>, StatusCode> {
+    let published = state.index.published_generation();
+    if published_matches_sidecar_fence(&published, fence)
+        && state.index.current_project_generation() == published.project_generation
+    {
+        Ok(published)
+    } else {
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+struct SymbolCacheGenerationEntry {
+    cache: std::sync::Weak<parking_lot::RwLock<SymbolSnapshotCache>>,
+    project_generation: u64,
+}
+
+static SYMBOL_CACHE_GENERATIONS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, SymbolCacheGenerationEntry>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn ensure_symbol_cache_generation(
+    state: &SidecarState,
+    expected_generation: u64,
+) -> Result<(), StatusCode> {
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let identity = std::sync::Arc::as_ptr(&state.symbol_cache) as usize;
+    let mut generations = SYMBOL_CACHE_GENERATIONS.lock();
+    generations.retain(|_, entry| entry.cache.strong_count() > 0);
+    match generations.get_mut(&identity) {
+        Some(entry)
+            if entry
+                .cache
+                .upgrade()
+                .is_some_and(|cache| std::sync::Arc::ptr_eq(&cache, &state.symbol_cache)) =>
+        {
+            if entry.project_generation != expected_generation {
+                state.symbol_cache.write().clear();
+                entry.project_generation = expected_generation;
+            }
+        }
+        _ => {
+            // A caller may pre-seed the public path-keyed cache before the first
+            // handler call. Associate that initial state with the current
+            // project; subsequent generation changes are cleared deterministically.
+            generations.insert(
+                identity,
+                SymbolCacheGenerationEntry {
+                    cache: std::sync::Arc::downgrade(&state.symbol_cache),
+                    project_generation: expected_generation,
+                },
+            );
+        }
+    }
+    if state.index.current_project_generation() == expected_generation {
+        Ok(())
+    } else {
+        state.symbol_cache.write().clear();
+        generations.remove(&identity);
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+fn cached_symbols_at_generation(
+    state: &SidecarState,
+    path: &str,
+    expected_generation: u64,
+) -> Result<Option<Vec<SymbolSnapshot>>, StatusCode> {
+    ensure_symbol_cache_generation(state, expected_generation)?;
+    let cache = state.symbol_cache.read();
+    if state.index.current_project_generation() != expected_generation {
+        drop(cache);
+        state.symbol_cache.write().clear();
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(cache.get(path).cloned())
+}
+
+fn store_cached_symbols_at_generation(
+    state: &SidecarState,
+    path: &str,
+    symbols: Vec<SymbolSnapshot>,
+    expected_generation: u64,
+) -> Result<(), StatusCode> {
+    ensure_symbol_cache_generation(state, expected_generation)?;
+    let mut cache = state.symbol_cache.write();
+    if state.index.current_project_generation() != expected_generation {
+        cache.clear();
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    cache.insert(path.to_string(), symbols);
+    if state.index.current_project_generation() == expected_generation {
+        Ok(())
+    } else {
+        cache.clear();
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
 /// `GET /outline?path=<relative>[&max_tokens=N]` — symbol outline for a single file.
 ///
 /// Returns formatted plain text with:
@@ -424,7 +617,10 @@ pub async fn outline_handler(
     State(state): State<SidecarState>,
     Query(params): Query<OutlineParams>,
 ) -> Result<String, StatusCode> {
-    outline_hook_text(&state, &params)
+    let fence = require_queryable_sidecar_index(&state)?;
+    let result = outline_hook_text(&state, &params, &fence);
+    capture_queryable_sidecar_generation(&state, &fence)?;
+    result
 }
 
 /// Workflow adapter for source-code reads/orientation.
@@ -452,8 +648,12 @@ pub(crate) fn outline_tool_text_for_generation(
     )
 }
 
-fn outline_hook_text(state: &SidecarState, params: &OutlineParams) -> Result<String, StatusCode> {
-    outline_text(state, params, HOOK_RENDER_OPTIONS)
+fn outline_hook_text(
+    state: &SidecarState,
+    params: &OutlineParams,
+    fence: &SidecarQueryFence,
+) -> Result<String, StatusCode> {
+    outline_text(state, params, HOOK_RENDER_OPTIONS, fence)
 }
 
 fn append_parse_status_lines(
@@ -520,9 +720,15 @@ fn outline_text(
     state: &SidecarState,
     params: &OutlineParams,
     options: RenderOptions,
+    fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
-    let source_authority = freshen_sidecar_path_if_stale(state, &params.path);
-    let published = state.index.published_generation();
+    let source_authority = freshen_sidecar_path_if_stale_at_generation(
+        state,
+        Some(fence.indexed_root.as_path()),
+        &params.path,
+        fence.project_generation,
+    )?;
+    let published = capture_queryable_sidecar_generation(state, fence)?;
     outline_text_for_generation(state, &published, params, options, source_authority)
 }
 
@@ -808,7 +1014,27 @@ pub async fn impact_handler(
     State(state): State<SidecarState>,
     Query(params): Query<ImpactParams>,
 ) -> Result<String, StatusCode> {
-    impact_hook_text(state, &params).await
+    let fence = require_queryable_sidecar_index(&state)?;
+    let impact_index = state.index.clone();
+    let _impact_guard = impact_index.lock_impact_analysis().await;
+    capture_queryable_sidecar_generation(&state, &fence)?;
+    let result = impact_hook_text(state.clone(), &params, &fence).await;
+    finish_impact_response_at_fence(&state, &fence, result)
+}
+
+fn finish_impact_response_at_fence(
+    state: &SidecarState,
+    fence: &SidecarQueryFence,
+    result: Result<String, StatusCode>,
+) -> Result<String, StatusCode> {
+    let response = result?;
+    // The impact operation has already committed its receipt-owned index,
+    // snapshot, cache, and stats effects. A later freshness-only transition
+    // gates the next request; it must not erase this useful response. Keep the
+    // final project/source/root fence so a concurrent project rebind still
+    // refuses cross-project output.
+    capture_sidecar_generation_at_fence(state, fence)?;
+    Ok(response)
 }
 
 /// Workflow adapter for post-edit impact summaries.
@@ -823,22 +1049,54 @@ pub(crate) async fn impact_tool_text(
     state: SidecarState,
     params: &ImpactParams,
 ) -> Result<String, StatusCode> {
-    impact_text(state, params, TOOL_RENDER_OPTIONS).await
+    let impact_index = state.index.clone();
+    let _impact_guard = impact_index.lock_impact_analysis().await;
+    let published = state.index.published_generation();
+    let expected_generation = published.project_generation;
+    let root = match published.live.indexed_root.clone() {
+        Some(root) => root,
+        None => resolve_repo_root(&state)?,
+    };
+    let result = impact_text(
+        state.clone(),
+        params,
+        TOOL_RENDER_OPTIONS,
+        root,
+        expected_generation,
+    )
+    .await;
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    result
 }
 
 async fn impact_hook_text(
     state: SidecarState,
     params: &ImpactParams,
+    fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
-    impact_text(state, params, HOOK_RENDER_OPTIONS).await
+    let root = fence.indexed_root.clone();
+    impact_text(
+        state,
+        params,
+        HOOK_RENDER_OPTIONS,
+        root,
+        fence.project_generation,
+    )
+    .await
 }
 
 async fn impact_text(
     state: SidecarState,
     params: &ImpactParams,
     options: RenderOptions,
+    root: std::path::PathBuf,
+    expected_generation: u64,
 ) -> Result<String, StatusCode> {
-    let root = resolve_repo_root(&state)?;
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let requested = std::path::Path::new(&params.path);
     let absolute = if requested.is_absolute() {
         requested.to_path_buf()
@@ -856,7 +1114,14 @@ async fn impact_text(
 
     if is_new_file {
         // HOOK-06: Index a new file from disk.
-        return handle_new_file_impact(state, &normalized_path, options).await;
+        return handle_new_file_impact(
+            state,
+            &root,
+            &normalized_path,
+            options,
+            expected_generation,
+        )
+        .await;
     }
 
     let should_auto_index_new_file = {
@@ -868,25 +1133,28 @@ async fn impact_text(
             let guard = state.index.read();
             guard.get_file(&normalized_path).is_some()
         };
-        is_supported
-            && !indexed
-            && resolve_repo_root(&state)
-                .map(|root| root.join(&normalized_path).is_file())
-                .unwrap_or(false)
+        is_supported && !indexed && root.join(&normalized_path).is_file()
     };
 
     if should_auto_index_new_file {
-        return handle_new_file_impact(state, &normalized_path, options).await;
+        return handle_new_file_impact(
+            state,
+            &root,
+            &normalized_path,
+            options,
+            expected_generation,
+        )
+        .await;
     }
 
     // HOOK-05: Re-index existing file and compute symbol diff.
-    handle_edit_impact(state, &normalized_path, options).await
+    handle_edit_impact(state, &root, &normalized_path, options, expected_generation).await
 }
 
-fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
+fn impact_skipped_text(published: &crate::live_index::PublishedGeneration, path: &str) -> String {
     use crate::domain::index::AdmissionTier;
 
-    let view = state.index.read().capture_admission_tier_lookup_view(path);
+    let view = published.live.capture_admission_tier_lookup_view(path);
     let Some(view) = view else {
         return format!(
             "Not indexed: {path} is excluded by repository scope. The admission gate applies to \
@@ -918,8 +1186,7 @@ fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
     // Key the recovery sentence on the read gate's predicted verdict (spec-023):
     // "Use get_file_content" must never point at a read the gate will refuse.
     let raw_read_advice =
-        if crate::protocol::read_gate::disk_read_would_refuse(&state.index.read(), path, view.size)
-        {
+        if crate::protocol::read_gate::disk_read_would_refuse(&published.live, path, view.size) {
             "Its contents are withheld by the admission policy — get_file_content will refuse \
          this file."
         } else {
@@ -934,7 +1201,7 @@ fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
         );
     }
 
-    let generation = state.index.current_project_generation();
+    let generation = published.project_generation;
     // Reconciled non-parser file: EXISTS in the catalog, analysis simply
     // unsupported. Report truthful existence + generation/Tier evidence and a
     // typed unsupported-analysis outcome — never false absence for a tracked file.
@@ -951,23 +1218,48 @@ fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
 
 async fn handle_new_file_impact(
     state: SidecarState,
+    root: &std::path::Path,
     path: &str,
     options: RenderOptions,
+    expected_generation: u64,
 ) -> Result<String, StatusCode> {
-    let abs_path = resolve_repo_root(&state)?.join(path);
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let abs_path = root.join(path);
     let path_owned = path.to_string();
     let index = state.index.clone();
-    let expected_gen = index.current_project_generation();
-    let outcome = tokio::task::spawn_blocking(move || {
-        crate::watcher::admit_and_index_single_path(&path_owned, &abs_path, &index, expected_gen)
+    let receipt = tokio::task::spawn_blocking(move || {
+        crate::watcher::admit_and_index_single_path_with_receipt(
+            &path_owned,
+            &abs_path,
+            &index,
+            expected_generation,
+        )
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    match outcome {
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    match &receipt.outcome {
         crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
-        crate::watcher::ReindexResult::Skipped => return Ok(impact_skipped_text(&state, path)),
+        crate::watcher::ReindexResult::Skipped => {
+            let published = receipt
+                .published
+                .as_deref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            return Ok(impact_skipped_text(published, path));
+        }
+        crate::watcher::ReindexResult::PublicationRejected => {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
         crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
+            if state.index.publication_fence() != receipt.observed_at {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             return Err(StatusCode::NOT_FOUND);
         }
         crate::watcher::ReindexResult::ReadError(_) => {
@@ -980,13 +1272,29 @@ async fn handle_new_file_impact(
     // Build symbol kind breakdown.
     let mut kind_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    let language = {
-        let index = state.index.read();
-        let file = index.get_file(path).ok_or(StatusCode::NOT_FOUND)?;
+    let published = receipt
+        .published
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if published.project_generation != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let (language, post_symbols) = {
+        let file = published.live.get_file(path).ok_or(StatusCode::NOT_FOUND)?;
         for symbol in &file.symbols {
             *kind_counts.entry(symbol.kind.to_string()).or_insert(0) += 1;
         }
-        file.language
+        let symbols = file
+            .symbols
+            .iter()
+            .map(|symbol| SymbolSnapshot {
+                name: symbol.name.clone(),
+                kind: symbol.kind.to_string(),
+                line_range: symbol.line_range,
+                byte_range: symbol.byte_range,
+            })
+            .collect();
+        (file.language, symbols)
     };
 
     let mut kind_parts: Vec<String> = kind_counts
@@ -1000,11 +1308,19 @@ async fn handle_new_file_impact(
         kind_parts.join(", ")
     };
 
-    // Update symbol cache with empty pre-edit snapshot (it's new, no pre-state).
-    {
-        let mut cache = state.symbol_cache.write();
-        cache.insert(path.to_string(), Vec::new());
+    if receipt.snapshot_created {
+        let replacement = crate::live_index::store::PublicationFence::from_published(published);
+        let _ = state
+            .index
+            .take_pre_update_snapshot_for_publication_at_generation(
+                path,
+                expected_generation,
+                replacement,
+            );
     }
+    // The next edit must diff against the newly indexed file, not an empty
+    // baseline that would report every existing symbol as added.
+    store_cached_symbols_at_generation(&state, path, post_symbols, expected_generation)?;
 
     if options.record_stats {
         state.token_stats.record_write();
@@ -1058,121 +1374,146 @@ fn symbol_body_bytes_changed(
 }
 async fn handle_edit_impact(
     state: SidecarState,
+    root: &std::path::Path,
     path: &str,
     options: RenderOptions,
+    expected_generation: u64,
 ) -> Result<String, StatusCode> {
-    // Get pre-edit symbols and bytes: sidecar cache → index pre-update snapshot → current index.
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    // Get pre-edit symbols and bytes from the exact index-owned baseline first.
+    // The public symbols-only cache is a last-resort compatibility fallback: it
+    // cannot prove symbol-body identity, so it must never shadow available
+    // content from a pre-update snapshot or the current indexed file.
     //
     // The index pre-update snapshot (`take_pre_update_snapshot`) fixes a race
     // where the watcher re-indexes the file before this hook fires, causing the
     // current index to already contain post-edit symbols/content while the hook
     // still needs the pre-edit baseline for an accurate diff.
+    let pre_update = state
+        .index
+        .peek_pre_update_snapshot_at_generation(path, expected_generation);
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let pre_snapshot_replacement = pre_update.as_ref().map(|(_, replacement)| *replacement);
     let (pre_symbols, pre_content): (Vec<SymbolSnapshot>, Option<Vec<u8>>) = {
-        let cache = state.symbol_cache.read();
-        if let Some(cached) = cache.get(path) {
-            (cached.clone(), None)
+        if let Some((pre, _)) = pre_update {
+            let symbols = pre
+                .symbols
+                .into_iter()
+                .map(|s| SymbolSnapshot {
+                    name: s.name,
+                    kind: s.kind,
+                    line_range: s.line_range,
+                    byte_range: s.byte_range,
+                })
+                .collect();
+            (symbols, Some(pre.content))
+        } else if let Some(file) = state.index.read().get_file(path).cloned() {
+            let symbols = file
+                .symbols
+                .iter()
+                .map(|s| SymbolSnapshot {
+                    name: s.name.clone(),
+                    kind: s.kind.to_string(),
+                    line_range: s.line_range,
+                    byte_range: s.byte_range,
+                })
+                .collect();
+            (symbols, Some(file.content))
+        } else if let Some(cached) =
+            cached_symbols_at_generation(&state, path, expected_generation)?
+        {
+            (cached, None)
         } else {
-            drop(cache);
-            if let Some(pre) = state.index.take_pre_update_snapshot(path) {
-                let symbols = pre
-                    .symbols
-                    .into_iter()
-                    .map(|s| SymbolSnapshot {
-                        name: s.name,
-                        kind: s.kind,
-                        line_range: s.line_range,
-                        byte_range: s.byte_range,
-                    })
-                    .collect();
-                (symbols, Some(pre.content))
-            } else {
-                let guard = state.index.read();
-                if let Some(file) = guard.get_file(path) {
-                    let symbols = file
-                        .symbols
-                        .iter()
-                        .map(|s| SymbolSnapshot {
-                            name: s.name.clone(),
-                            kind: s.kind.to_string(),
-                            line_range: s.line_range,
-                            byte_range: s.byte_range,
-                        })
-                        .collect();
-                    (symbols, Some(file.content.clone()))
-                } else {
-                    (Vec::new(), None)
-                }
-            }
+            (Vec::new(), None)
         }
     };
 
     // File byte_len before re-indexing (content baseline comes from `pre_content` above).
     let file_bytes_pre: u64 = pre_content.as_ref().map_or(0, |b| b.len() as u64);
 
-    let abs_path = resolve_repo_root(&state)?.join(path);
+    let abs_path = root.join(path);
     let path_owned = path.to_string();
     let index = state.index.clone();
-    let expected_gen = index.current_project_generation();
-    let outcome = tokio::task::spawn_blocking(move || {
-        crate::watcher::admit_and_index_single_path(&path_owned, &abs_path, &index, expected_gen)
+    let receipt = tokio::task::spawn_blocking(move || {
+        crate::watcher::admit_and_index_single_path_with_receipt(
+            &path_owned,
+            &abs_path,
+            &index,
+            expected_generation,
+        )
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    match outcome {
+    if state.index.current_project_generation() != expected_generation {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    match &receipt.outcome {
         crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
-        crate::watcher::ReindexResult::Skipped => return Ok(impact_skipped_text(&state, path)),
+        crate::watcher::ReindexResult::Skipped => {
+            let published = receipt
+                .published
+                .as_deref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            return Ok(impact_skipped_text(published, path));
+        }
+        crate::watcher::ReindexResult::PublicationRejected => {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
         crate::watcher::ReindexResult::ReadError(_) => {
             return Ok(format!(
                 "── Impact: {path} ──\nStatus: temporarily unreadable — last-valid state retained"
             ));
         }
         crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
-            // File not on disk — remove it from the index so stale data is purged.
-            let prev_symbol_count = pre_symbols.len();
-            state.index.remove_file_at_generation(path, expected_gen);
-            // Also clear the symbol cache entry.
-            {
-                let mut cache = state.symbol_cache.write();
-                cache.remove(path);
+            if state.index.publication_fence() != receipt.observed_at {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
-            // Dogfood #6 (2026-07-06): ALWAYS name the root the lookup ran
-            // against. When another session retargets the shared daemon
-            // (index_folder on a different project), every path from THIS
-            // session resolves against the wrong root and this branch fires
-            // for files that exist — a bare "not found" reads as a false
-            // alarm; naming the root exposes the mismatch immediately.
-            let root_display = resolve_repo_root(&state)
-                .map(|r| r.display().to_string())
-                .unwrap_or_else(|_| "<unresolved root>".to_string());
-            let text = if prev_symbol_count > 0 {
-                format!(
-                    "── Impact: {} ──\nStatus: not found under {} — removed from index\nPreviously had {} symbols.",
-                    path, root_display, prev_symbol_count
+            // One latency-bounded observation cannot distinguish a durable
+            // deletion from delete→recreate disk ABA. Retain last-valid state;
+            // the watcher retry/reconciliation path owns confirmed removal.
+            let prev_symbol_count = pre_symbols.len();
+            let root_display = root.display().to_string();
+            let has_index_record = state.index.read().get_file(path).is_some();
+            let (status, detail) = if has_index_record {
+                (
+                    "last-valid index state retained pending watcher confirmation",
+                    format!("Previously indexed symbols: {prev_symbol_count}."),
                 )
             } else {
-                // The file-watcher may have already purged the index entry
-                // between the on-disk delete and this call; in that case we
-                // have no pre-count to report, so say so plainly instead of
-                // printing a misleading `Previously had 0 symbols.`.
-                format!(
-                    "── Impact: {} ──\nStatus: not found under {} — no index record remains (removed by watcher, \
-                     or this daemon is rooted at a different project than your session; \
-                     re-run index_folder on your repo if the root looks wrong).",
-                    path, root_display
+                (
+                    "no index record remains; watcher confirmation pending",
+                    "No prior symbol count was observed.".to_string(),
                 )
             };
-            return Ok(text);
+            return Ok(format!(
+                "── Impact: {path} ──\nStatus: not found under {root_display} — {status}\n{detail}"
+            ));
         }
     }
 
-    // The shared publication seam captures its own pre-update snapshot. This
-    // handler already captured the authoritative baseline above, so drain the
-    // duplicate before it can leak into a later impact call.
-    let _ = state.index.take_pre_update_snapshot(path);
+    // Use the immutable generation returned by this request's winning
+    // publication seam. Sampling current state here could accidentally adopt a
+    // later watcher update and consume that update's snapshot.
+    let post_generation = receipt
+        .published
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if post_generation.project_generation != expected_generation
+        || state.index.current_project_generation() != expected_generation
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let (post_symbols, post_content) = {
-        let index = state.index.read();
-        let file = index.get_file(path).ok_or(StatusCode::NOT_FOUND)?;
+        let file = post_generation
+            .live
+            .get_file(path)
+            .ok_or(StatusCode::NOT_FOUND)?;
         let symbols: Vec<SymbolSnapshot> = file
             .symbols
             .iter()
@@ -1185,6 +1526,27 @@ async fn handle_edit_impact(
             .collect();
         (symbols, file.content.clone())
     };
+    if receipt.snapshot_created {
+        let replacement =
+            crate::live_index::store::PublicationFence::from_published(post_generation);
+        let _ = state
+            .index
+            .take_pre_update_snapshot_for_publication_at_generation(
+                path,
+                expected_generation,
+                replacement,
+            );
+    } else if matches!(receipt.outcome, crate::watcher::ReindexResult::HashSkip)
+        && let Some(replacement) = pre_snapshot_replacement
+    {
+        let _ = state
+            .index
+            .take_pre_update_snapshot_for_publication_at_generation(
+                path,
+                expected_generation,
+                replacement,
+            );
+    }
     let file_bytes: u64 = (post_content.len() as u64).max(file_bytes_pre);
 
     // Compute symbol diff using positional proximity for duplicate name+kind pairs.
@@ -1229,10 +1591,7 @@ async fn handle_edit_impact(
     let changed: Vec<&SymbolSnapshot> = changed_post.iter().map(|&i| &post_symbols[i]).collect();
 
     // Update cache with post-edit snapshot.
-    {
-        let mut cache = state.symbol_cache.write();
-        cache.insert(path.to_string(), post_symbols.clone());
-    }
+    store_cached_symbols_at_generation(&state, path, post_symbols.clone(), expected_generation)?;
 
     // Build response lines.
     let mut lines: Vec<String> = Vec::new();
@@ -1272,7 +1631,7 @@ async fn handle_edit_impact(
         let impacted: Vec<&SymbolSnapshot> =
             changed.iter().chain(removed.iter()).copied().collect();
         if !impacted.is_empty() {
-            let guard = state.index.read();
+            let guard = post_generation.live.as_ref();
             let post_file = guard.get_file(path);
             let mut callers_lines: Vec<String> = Vec::new();
             for sym in &impacted {
@@ -1318,7 +1677,6 @@ async fn handle_edit_impact(
                     }
                 }
             }
-            drop(guard);
             if !callers_lines.is_empty() {
                 lines.push(String::new());
                 lines.push("Callers to review:".to_string());
@@ -1355,7 +1713,10 @@ pub async fn symbol_context_handler(
     State(state): State<SidecarState>,
     Query(params): Query<SymbolContextParams>,
 ) -> Result<String, StatusCode> {
-    symbol_context_hook_text(&state, &params)
+    let fence = require_queryable_sidecar_index(&state)?;
+    let result = symbol_context_hook_text(&state, &params, &fence);
+    capture_queryable_sidecar_generation(&state, &fence)?;
+    result
 }
 
 /// Workflow adapter for search-hit expansion and quick caller/context reads.
@@ -1383,23 +1744,35 @@ pub(crate) fn symbol_context_tool_text_for_generation(
 fn symbol_context_hook_text(
     state: &SidecarState,
     params: &SymbolContextParams,
+    fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
-    symbol_context_text(state, params, HOOK_RENDER_OPTIONS)
+    symbol_context_text(state, params, HOOK_RENDER_OPTIONS, fence)
 }
 
 fn symbol_context_text(
     state: &SidecarState,
     params: &SymbolContextParams,
     options: RenderOptions,
+    fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
     let source_authority = if let Some(path) = params.path.as_deref() {
-        freshen_sidecar_path_if_stale(state, path)
+        freshen_sidecar_path_if_stale_at_generation(
+            state,
+            Some(fence.indexed_root.as_path()),
+            path,
+            fence.project_generation,
+        )?
     } else if let Some(file) = params.file.as_deref() {
-        freshen_sidecar_path_if_stale(state, file)
+        freshen_sidecar_path_if_stale_at_generation(
+            state,
+            Some(fence.indexed_root.as_path()),
+            file,
+            fence.project_generation,
+        )?
     } else {
         ContextSourceAuthority::CurrentIndex
     };
-    let published = state.index.published_generation();
+    let published = capture_queryable_sidecar_generation(state, fence)?;
     symbol_context_text_for_generation(state, &published, params, options, source_authority)
 }
 
@@ -1660,7 +2033,10 @@ fn symbol_context_text_for_generation(
 ///
 /// Budget: 500 tokens (2000 bytes). No token savings recorded (additive, not replacement).
 pub async fn repo_map_handler(State(state): State<SidecarState>) -> Result<String, StatusCode> {
-    repo_map_text(&state)
+    let fence = require_queryable_sidecar_index(&state)?;
+    let result = repo_map_text(&state, &fence);
+    capture_queryable_sidecar_generation(&state, &fence)?;
+    result
 }
 
 /// Workflow adapter for repo-start quick maps.
@@ -1691,8 +2067,8 @@ fn is_intra_workspace_path(path: &str) -> bool {
         .split('/')
         .any(|segment| segment == "..")
 }
-pub(crate) fn repo_map_text(state: &SidecarState) -> Result<String, StatusCode> {
-    let generation = state.index.published_source_set().current_generation();
+fn repo_map_text(state: &SidecarState, fence: &SidecarQueryFence) -> Result<String, StatusCode> {
+    let generation = capture_queryable_sidecar_generation(state, fence)?;
     repo_map_text_for_generation(&generation)
 }
 
@@ -1906,7 +2282,10 @@ pub async fn prompt_context_handler(
     State(state): State<SidecarState>,
     Query(params): Query<PromptContextParams>,
 ) -> Result<String, StatusCode> {
-    prompt_context_hook_text(&state, &params).await
+    let fence = require_queryable_sidecar_index(&state)?;
+    let result = prompt_context_hook_text(&state, &params, &fence).await;
+    capture_queryable_sidecar_generation(&state, &fence)?;
+    result
 }
 
 /// Workflow adapter for prompt-context narrowing.
@@ -1920,21 +2299,24 @@ pub async fn workflow_prompt_narrowing_handler(
 async fn prompt_context_hook_text(
     state: &SidecarState,
     params: &PromptContextParams,
+    fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
-    prompt_context_text(state, params, HOOK_RENDER_OPTIONS).await
+    prompt_context_text(state, params, HOOK_RENDER_OPTIONS, fence).await
 }
 
 async fn prompt_context_text(
     state: &SidecarState,
     params: &PromptContextParams,
     options: RenderOptions,
+    fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
     let prompt = params.text.trim();
     if prompt.is_empty() {
         return Ok(String::new());
     }
+    let hint_generation = capture_queryable_sidecar_generation(state, fence)?;
 
-    if let Some(symbol_hint) = find_prompt_qualified_symbol_hint(state, prompt)? {
+    if let Some(symbol_hint) = find_prompt_qualified_symbol_hint(&hint_generation, prompt)? {
         let line_hint = find_prompt_line_hint(prompt, Some(&symbol_hint.file_hint));
         let body = symbol_context_text(
             state,
@@ -1946,13 +2328,14 @@ async fn prompt_context_text(
                 symbol_line: line_hint,
             },
             options,
+            fence,
         )?;
         let (level, evidence) = describe_file_hint(&symbol_hint.file_hint);
         return Ok(format_prompt_context_signal(level, evidence, body));
     }
 
-    let file_hint = find_prompt_file_hint(state, prompt)?;
-    let symbol_hint = find_prompt_symbol_hint(state, prompt)?;
+    let file_hint = find_prompt_file_hint(&hint_generation, prompt)?;
+    let symbol_hint = find_prompt_symbol_hint(&hint_generation, prompt)?;
     let line_hint = find_prompt_line_hint(prompt, file_hint.as_ref());
 
     match (file_hint, symbol_hint) {
@@ -1974,8 +2357,13 @@ async fn prompt_context_text(
             // the file under several candidates, and the existing rendering
             // already reports that usefully -- so this guard must use the same
             // resolver the renderer does, not a looser name comparison.
-            let source_authority = freshen_sidecar_path_if_stale(state, &file_hint.path);
-            let published = state.index.published_generation();
+            let source_authority = freshen_sidecar_path_if_stale_at_generation(
+                state,
+                Some(fence.indexed_root.as_path()),
+                &file_hint.path,
+                fence.project_generation,
+            )?;
+            let published = capture_queryable_sidecar_generation(state, fence)?;
             let symbol_is_in_file = published
                 .live
                 .as_ref()
@@ -2017,6 +2405,7 @@ async fn prompt_context_text(
                     sections: None,
                 },
                 options,
+                fence,
             )?;
             let (level, evidence) = describe_file_hint(&file_hint);
             return Ok(format_prompt_context_signal(level, evidence, body));
@@ -2030,6 +2419,7 @@ async fn prompt_context_text(
                     sections: None,
                 },
                 options,
+                fence,
             )?;
             let (level, evidence) = describe_file_hint(&file_hint);
             return Ok(format_prompt_context_signal(level, evidence, body));
@@ -2047,7 +2437,7 @@ async fn prompt_context_text(
     }
 
     if prompt_requests_repo_map(prompt) {
-        let body = repo_map_text(state)?;
+        let body = repo_map_text_for_generation(&hint_generation)?;
         return Ok(format_prompt_context_signal(
             "high-confidence",
             "repo-map request phrase matched in the prompt",
@@ -2088,10 +2478,10 @@ fn get_dir_2level(path: &str) -> String {
 }
 
 fn find_prompt_file_hint(
-    state: &SidecarState,
+    generation: &crate::live_index::PublishedGeneration,
     prompt: &str,
 ) -> Result<Option<PromptFileHint>, StatusCode> {
-    let guard = state.index.read();
+    let guard = generation.live.as_ref();
     let prompt_lower = prompt.to_ascii_lowercase();
     let mut module_match: Option<PromptFileHint> = None;
     let mut module_ambiguous = false;
@@ -2207,10 +2597,10 @@ fn find_prompt_file_hint(
 }
 
 fn find_prompt_qualified_symbol_hint(
-    state: &SidecarState,
+    generation: &crate::live_index::PublishedGeneration,
     prompt: &str,
 ) -> Result<Option<PromptQualifiedSymbolHint>, StatusCode> {
-    let guard = state.index.read();
+    let guard = generation.live.as_ref();
     let mut qualified_symbol_match: Option<PromptQualifiedSymbolHint> = None;
     let mut qualified_symbol_ambiguous = false;
 
@@ -2290,10 +2680,10 @@ fn is_distinctive_symbol_token(token: &str) -> bool {
     token.len() >= 4 && !PROMPT_NOISE_WORDS.contains(&token)
 }
 fn find_prompt_symbol_hint(
-    state: &SidecarState,
+    generation: &crate::live_index::PublishedGeneration,
     prompt: &str,
 ) -> Result<Option<String>, StatusCode> {
-    let guard = state.index.read();
+    let guard = generation.live.as_ref();
     for token in prompt_tokens(prompt) {
         // Path- and module-qualified mentions are served by the dedicated file
         // and qualified-symbol hints; this bare-token branch only handles plain
@@ -2582,13 +2972,17 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::{Duration, Instant, SystemTime};
 
+    use once_cell::sync::Lazy;
     use parking_lot::RwLock;
+    use tempfile::TempDir;
 
     use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
-    use crate::live_index::store::{CircuitBreakerState, IndexedFile, LiveIndex, ParseStatus};
+    use crate::live_index::store::{IndexedFile, LiveIndex, ParseStatus};
     use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
+
+    static GENERIC_TEST_ROOT: Lazy<TempDir> =
+        Lazy::new(|| TempDir::new().expect("create generic sidecar handler test root"));
 
     // -----------------------------------------------------------------------
     // Test helper: minimal LiveIndex with known contents
@@ -2758,42 +3152,40 @@ mod tests {
     }
 
     fn build_shared_index(
+        root: &std::path::Path,
         files: Vec<(&str, IndexedFile)>,
     ) -> crate::live_index::store::SharedIndex {
-        use crate::live_index::trigram::TrigramIndex;
-        let files_map: HashMap<String, std::sync::Arc<IndexedFile>> = files
-            .into_iter()
-            .map(|(p, f)| (p.to_string(), std::sync::Arc::new(f)))
-            .collect();
-        let trigram_index = TrigramIndex::build_from_files(&files_map);
-        let mut index = LiveIndex {
-            files: files_map,
-            loaded_at: Instant::now(),
-            loaded_at_system: SystemTime::now(),
-            load_duration: Duration::from_millis(10),
-            cb_state: CircuitBreakerState::new(0.20),
-            is_empty: false,
-            load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
-            snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
-            reverse_index: HashMap::new(),
-            files_by_basename: HashMap::new(),
-            files_by_dir_component: HashMap::new(),
-            trigram_index,
-            gitignore: None,
-            manifest_entries: Vec::new(),
-            coupling_store: None,
-            local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
-            indexed_root: None,
-        };
-        index.rebuild_reverse_index();
-        index.rebuild_path_indices();
-        crate::live_index::SharedIndexHandle::shared(index)
+        LiveIndex::from_indexed_files(
+            root,
+            files
+                .into_iter()
+                .map(|(path, file)| (path.to_string(), file))
+                .collect(),
+        )
+        .expect("sidecar handler test root resolves")
     }
 
     /// Build a SidecarState wrapping a SharedIndex for use in tests.
     fn make_state(files: Vec<(&str, IndexedFile)>) -> SidecarState {
+        let root = GENERIC_TEST_ROOT.path().to_path_buf();
         SidecarState {
-            index: build_shared_index(files),
+            index: build_shared_index(&root, files),
+            token_stats: TokenStats::new(),
+            repo_root: None,
+            symbol_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn make_bootstrap_placeholder_state(files: Vec<(&str, IndexedFile)>) -> SidecarState {
+        let index = LiveIndex::empty();
+        {
+            let mut guard = index.write();
+            for (path, file) in files {
+                guard.add_file(path.to_string(), file);
+            }
+        }
+        SidecarState {
+            index,
             token_stats: TokenStats::new(),
             repo_root: None,
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -2805,7 +3197,7 @@ mod tests {
         repo_root: std::path::PathBuf,
     ) -> SidecarState {
         SidecarState {
-            index: build_shared_index(files),
+            index: build_shared_index(&repo_root, files),
             token_stats: TokenStats::new(),
             repo_root: Some(repo_root),
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -2831,14 +3223,199 @@ mod tests {
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
-        let source_authority =
-            freshen_sidecar_path_if_stale_at_generation(&state, "src/b.rs", stale_gen);
+        let source_authority = freshen_sidecar_path_if_stale_at_generation(
+            &state,
+            state.repo_root.as_deref(),
+            "src/b.rs",
+            stale_gen,
+        )
+        .unwrap();
 
         assert!(matches!(
             source_authority,
             ContextSourceAuthority::CurrentIndex
         ));
         assert!(state.index.read().get_file("src/b.rs").is_some());
+    }
+
+    #[test]
+    fn stale_impact_generation_cannot_consume_or_overwrite_rebound_project_state() {
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project_a.path().join("src")).unwrap();
+        std::fs::create_dir_all(project_b.path().join("src")).unwrap();
+        std::fs::write(
+            project_b.path().join("src/shared.rs"),
+            "pub fn project_b() {}\n",
+        )
+        .unwrap();
+
+        let initial = make_indexed_file(
+            "src/shared.rs",
+            vec![make_symbol("project_a", SymbolKind::Function, 1, 2)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state_with_root(
+            vec![("src/shared.rs", initial)],
+            project_a.path().to_path_buf(),
+        );
+        let stale_generation = state.index.current_project_generation();
+
+        // Seed an A-generation pre-update snapshot, then prove the project
+        // retarget clears it before B can publish any path-identical state.
+        let replacement_a = make_indexed_file(
+            "src/shared.rs",
+            vec![make_symbol("project_a_next", SymbolKind::Function, 1, 2)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        assert!(state.index.update_file_at_generation(
+            "src/shared.rs",
+            replacement_a,
+            stale_generation,
+        ));
+        state.index.reload(project_b.path()).unwrap();
+        let current_generation = state.index.current_project_generation();
+        assert_ne!(current_generation, stale_generation);
+        assert!(
+            state
+                .index
+                .take_pre_update_snapshot_at_generation("src/shared.rs", current_generation)
+                .is_none(),
+            "retarget must discard the previous project's path-keyed snapshot"
+        );
+
+        // Publish a B-generation update so both the shared pre-update snapshot
+        // and the sidecar-local cache contain replacement-project evidence.
+        let replacement_b = make_indexed_file(
+            "src/shared.rs",
+            vec![make_symbol("project_b_next", SymbolKind::Function, 1, 2)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        assert!(state.index.update_file_at_generation(
+            "src/shared.rs",
+            replacement_b,
+            current_generation,
+        ));
+        let project_b_cache = vec![SymbolSnapshot {
+            name: "project_b".to_string(),
+            kind: SymbolKind::Function.to_string(),
+            line_range: (1, 2),
+            byte_range: (0, 10),
+        }];
+        store_cached_symbols_at_generation(
+            &state,
+            "src/shared.rs",
+            project_b_cache.clone(),
+            current_generation,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cached_symbols_at_generation(&state, "src/shared.rs", stale_generation),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            store_cached_symbols_at_generation(
+                &state,
+                "src/shared.rs",
+                vec![SymbolSnapshot {
+                    name: "stale_project_a".to_string(),
+                    kind: SymbolKind::Function.to_string(),
+                    line_range: (1, 2),
+                    byte_range: (0, 10),
+                }],
+                stale_generation,
+            ),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert!(
+            state
+                .index
+                .take_pre_update_snapshot_at_generation("src/shared.rs", stale_generation)
+                .is_none(),
+            "a stale impact request must not consume B's pre-update snapshot"
+        );
+
+        assert_eq!(
+            cached_symbols_at_generation(&state, "src/shared.rs", current_generation).unwrap(),
+            Some(project_b_cache)
+        );
+        let project_b_snapshot = state
+            .index
+            .take_pre_update_snapshot_at_generation("src/shared.rs", current_generation)
+            .expect("B's snapshot must remain available to the current generation");
+        assert!(
+            project_b_snapshot
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "project_b"),
+            "the preserved snapshot must belong to project B"
+        );
+    }
+
+    #[test]
+    fn publication_bound_snapshot_take_preserves_same_hash_aba_update() {
+        let mut first = make_indexed_file(
+            "src/shared.rs",
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 2)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        first.content_hash = "hash-alpha".to_string();
+        let state = make_state(vec![("src/shared.rs", first)]);
+        let generation = state.index.current_project_generation();
+
+        let mut second = make_indexed_file(
+            "src/shared.rs",
+            vec![make_symbol("beta", SymbolKind::Function, 1, 2)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        second.content_hash = "hash-aba".to_string();
+        assert!(
+            state
+                .index
+                .update_file_at_generation("src/shared.rs", second, generation)
+        );
+        let second_fence = state.index.publication_fence();
+
+        let mut third = make_indexed_file(
+            "src/shared.rs",
+            vec![make_symbol("gamma", SymbolKind::Function, 1, 2)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        third.content_hash = "hash-aba".to_string();
+        assert!(
+            state
+                .index
+                .update_file_at_generation("src/shared.rs", third, generation)
+        );
+        let third_fence = state.index.publication_fence();
+
+        assert!(
+            state
+                .index
+                .take_pre_update_snapshot_for_publication_at_generation(
+                    "src/shared.rs",
+                    generation,
+                    second_fence,
+                )
+                .is_none(),
+            "an older receipt must not drain a newer same-hash replacement's baseline"
+        );
+        let latest = state
+            .index
+            .take_pre_update_snapshot_for_publication_at_generation(
+                "src/shared.rs",
+                generation,
+                third_fence,
+            )
+            .expect("the latest replacement must retain its own baseline");
+        assert!(latest.symbols.iter().any(|symbol| symbol.name == "beta"));
     }
 
     // -----------------------------------------------------------------------
@@ -2881,6 +3458,327 @@ mod tests {
         let body = result.0;
         assert_eq!(body.file_count, 0);
         assert_eq!(body.symbol_count, 0);
+    }
+
+    #[test]
+    fn sidecar_queryability_requires_status_source_and_root_independently() {
+        let file = make_indexed_file(
+            "src/foo.rs",
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/foo.rs", file)]);
+        let base = state.index.published_generation();
+        assert!(base.source.is_some());
+        assert!(base.live.indexed_root.is_some());
+
+        let variant = |status, source_bound: bool, root_bound: bool| {
+            let mut health = (*base.health).clone();
+            health.status = status;
+            let mut live = (*base.live).clone();
+            if !root_bound {
+                live.indexed_root = None;
+            }
+            crate::live_index::PublishedGeneration {
+                publication_generation: base.publication_generation,
+                content_generation: base.content_generation,
+                project_generation: base.project_generation,
+                source: source_bound.then(|| Arc::clone(base.source.as_ref().unwrap())),
+                source_version: base.source_version.clone(),
+                freshness: Arc::clone(&base.freshness),
+                manifest: base.manifest.clone(),
+                code_signals: Arc::clone(&base.code_signals),
+                bridge: Arc::clone(&base.bridge),
+                authority: Arc::clone(&base.authority),
+                live: Arc::new(live),
+                health: Arc::new(health),
+                outline: Arc::clone(&base.outline),
+            }
+        };
+
+        use crate::live_index::PublishedIndexStatus::{Empty, Loading, Ready};
+        assert!(published_sidecar_index_is_queryable(&variant(
+            Ready, true, true
+        )));
+        assert!(published_sidecar_index_is_queryable(&variant(
+            Empty, true, true
+        )));
+        assert!(!published_sidecar_index_is_queryable(&variant(
+            Loading, true, true
+        )));
+        assert!(!published_sidecar_index_is_queryable(&variant(
+            Ready, false, true
+        )));
+        assert!(!published_sidecar_index_is_queryable(&variant(
+            Ready, true, false
+        )));
+        let mut freshness_degraded = variant(Ready, true, true);
+        freshness_degraded.freshness = Arc::new(crate::domain::FreshnessStatus::Degraded {
+            last_valid_content_generation: base.content_generation,
+            reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
+        });
+        assert!(
+            !published_sidecar_index_is_queryable(&freshness_degraded),
+            "a retained Ready health view with degraded freshness must refuse"
+        );
+        let mut freshness_verifying_ready = variant(Ready, true, true);
+        freshness_verifying_ready.freshness = Arc::new(crate::domain::FreshnessStatus::Verifying);
+        assert!(
+            !published_sidecar_index_is_queryable(&freshness_verifying_ready),
+            "a non-empty index still being verified must refuse"
+        );
+        let mut freshness_verifying_empty = variant(Empty, true, true);
+        freshness_verifying_empty.freshness = Arc::new(crate::domain::FreshnessStatus::Verifying);
+        assert!(
+            published_sidecar_index_is_queryable(&freshness_verifying_empty),
+            "a source-bound rooted empty repository is a terminal queryable state"
+        );
+        let mut snapshot_verifying_empty = freshness_verifying_empty;
+        let mut snapshot_health = (*snapshot_verifying_empty.health).clone();
+        snapshot_health.snapshot_verify_state = crate::live_index::SnapshotVerifyState::Pending;
+        snapshot_verifying_empty.health = Arc::new(snapshot_health);
+        assert!(
+            !published_sidecar_index_is_queryable(&snapshot_verifying_empty),
+            "an empty snapshot still being verified cannot authorize absence claims"
+        );
+    }
+
+    #[test]
+    fn post_impact_fence_preserves_response_across_freshness_only_transition() {
+        let file = make_indexed_file(
+            "src/foo.rs",
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/foo.rs", file)]);
+        let fence = require_queryable_sidecar_index(&state).expect("ready sidecar fence");
+        let last_valid_content_generation = state.index.published_generation().content_generation;
+
+        state
+            .index
+            .set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation,
+                reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
+            });
+
+        let gated_error = capture_queryable_sidecar_generation(&state, &fence)
+            .err()
+            .expect("degraded freshness must gate a new read");
+        assert_eq!(gated_error, StatusCode::SERVICE_UNAVAILABLE);
+        let response = finish_impact_response_at_fence(
+            &state,
+            &fence,
+            Ok("committed impact response".to_string()),
+        )
+        .expect("freshness alone must not erase a committed impact response");
+        assert_eq!(response, "committed impact response");
+
+        let rebound = tempfile::tempdir().unwrap();
+        std::fs::write(rebound.path().join("lib.rs"), "pub fn rebound() {}\n").unwrap();
+        state.index.reload(rebound.path()).unwrap();
+        assert_eq!(
+            finish_impact_response_at_fence(
+                &state,
+                &fence,
+                Ok("cross-project response".to_string()),
+            )
+            .expect_err("a project rebind must still reject the old response"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn read_handlers_refuse_bootstrap_placeholder() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/new.rs"), "pub fn newly_added() {}\n").unwrap();
+        let file = make_indexed_file(
+            "src/foo.rs",
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let mut state = make_bootstrap_placeholder_state(vec![("src/foo.rs", file)]);
+        state.repo_root = Some(repo.path().to_path_buf());
+        let generation_before = state.index.current_project_generation();
+        let replacement = make_indexed_file(
+            "src/foo.rs",
+            vec![make_symbol("beta", SymbolKind::Function, 1, 5)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        assert!(state.index.update_file_at_generation(
+            "src/foo.rs",
+            replacement,
+            generation_before,
+        ));
+        let seeded_cache = vec![SymbolSnapshot {
+            name: "cached_alpha".to_string(),
+            kind: SymbolKind::Function.to_string(),
+            line_range: (1, 5),
+            byte_range: (0, 10),
+        }];
+        store_cached_symbols_at_generation(&state, "src/foo.rs", seeded_cache, generation_before)
+            .unwrap();
+        let cache_before = state.symbol_cache.read().clone();
+        let published_before = state.index.published_generation();
+        let published = state.index.published_state();
+        assert!(matches!(
+            published.status,
+            crate::live_index::PublishedIndexStatus::Loading
+        ));
+        assert_eq!(published.file_count, 1);
+        assert!(state.index.read().get_file("src/foo.rs").is_some());
+        let write_fires_before = state
+            .token_stats
+            .write_fires
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let edit_fires_before = state
+            .token_stats
+            .edit_fires
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let outline_error = outline_handler(
+            State(state.clone()),
+            Query(OutlineParams {
+                path: "src/foo.rs".to_string(),
+                max_tokens: None,
+                sections: None,
+            }),
+        )
+        .await
+        .expect_err("/outline must refuse an unready bootstrap placeholder");
+        assert_eq!(outline_error, StatusCode::SERVICE_UNAVAILABLE);
+
+        let impact_error = impact_handler(
+            State(state.clone()),
+            Query(ImpactParams {
+                path: "src/foo.rs".to_string(),
+                new_file: Some(false),
+            }),
+        )
+        .await
+        .expect_err("/impact must refuse an unready bootstrap placeholder");
+        assert_eq!(impact_error, StatusCode::SERVICE_UNAVAILABLE);
+
+        let new_file_impact_error = impact_handler(
+            State(state.clone()),
+            Query(ImpactParams {
+                path: "src/new.rs".to_string(),
+                new_file: Some(true),
+            }),
+        )
+        .await
+        .expect_err("/impact?new_file=true must refuse before admitting into a placeholder");
+        assert_eq!(new_file_impact_error, StatusCode::SERVICE_UNAVAILABLE);
+
+        let symbol_error = symbol_context_handler(
+            State(state.clone()),
+            Query(SymbolContextParams {
+                name: "alpha".to_string(),
+                file: None,
+                path: None,
+                symbol_kind: None,
+                symbol_line: None,
+            }),
+        )
+        .await
+        .expect_err("/symbol-context must refuse an unready bootstrap placeholder");
+        assert_eq!(symbol_error, StatusCode::SERVICE_UNAVAILABLE);
+
+        let repo_map_error = repo_map_handler(State(state.clone()))
+            .await
+            .expect_err("/repo-map must refuse an unready bootstrap placeholder");
+        assert_eq!(repo_map_error, StatusCode::SERVICE_UNAVAILABLE);
+
+        let prompt_error = prompt_context_handler(
+            State(state.clone()),
+            Query(PromptContextParams {
+                text: "alpha".to_string(),
+            }),
+        )
+        .await
+        .expect_err("the prompt hint must refuse an unready bootstrap placeholder");
+        assert_eq!(prompt_error, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.index.current_project_generation(), generation_before);
+        let published_after = state.index.published_generation();
+        assert_eq!(
+            published_after.publication_generation,
+            published_before.publication_generation
+        );
+        assert_eq!(
+            published_after.content_generation,
+            published_before.content_generation
+        );
+        assert_eq!(published_after.health.file_count, 1);
+        assert!(state.index.read().get_file("src/new.rs").is_none());
+        assert_eq!(&*state.symbol_cache.read(), &cache_before);
+        let preserved_snapshot = state
+            .index
+            .take_pre_update_snapshot_at_generation("src/foo.rs", generation_before)
+            .expect("loading refusal must preserve the pre-update snapshot");
+        assert!(
+            preserved_snapshot
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "alpha")
+        );
+        assert_eq!(
+            state
+                .token_stats
+                .write_fires
+                .load(std::sync::atomic::Ordering::Relaxed),
+            write_fires_before
+        );
+        assert_eq!(
+            state
+                .token_stats
+                .edit_fires
+                .load(std::sync::atomic::Ordering::Relaxed),
+            edit_fires_before
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_but_source_unbound_index_is_not_queryable_by_sidecar() {
+        let file = make_indexed_file(
+            "src/foo.rs",
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let mut files = HashMap::new();
+        files.insert("src/foo.rs".to_string(), Arc::new(file));
+        let index = crate::live_index::store::SharedIndexHandle::shared(
+            LiveIndex::from_source_files(files),
+        );
+        let published = index.published_generation();
+        assert!(matches!(
+            published.health.status,
+            crate::live_index::PublishedIndexStatus::Ready
+        ));
+        assert!(published.source.is_none());
+        assert!(published.live.indexed_root.is_none());
+
+        let state = SidecarState {
+            index,
+            token_stats: TokenStats::new(),
+            repo_root: None,
+            symbol_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let error = outline_handler(
+            State(state),
+            Query(OutlineParams {
+                path: "src/foo.rs".to_string(),
+                max_tokens: None,
+                sections: None,
+            }),
+        )
+        .await
+        .expect_err("a Ready label cannot authorize a source-unbound index");
+        assert_eq!(error, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // -----------------------------------------------------------------------
@@ -3063,11 +3961,79 @@ mod tests {
         };
 
         // The handler uses cwd.join(path), so with abs path it resolves correctly.
-        let result = impact_handler(State(state), Query(params)).await;
+        let result = impact_handler(State(state.clone()), Query(params)).await;
         // It may fail if the extension detection doesn't work for absolute paths, but
         // the basic test is that it doesn't panic.
         // The result depends on file system state.
         let _ = result; // just verify no panic
+    }
+
+    #[tokio::test]
+    async fn impact_entry_points_share_the_index_single_flight_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/db.rs"), "pub fn connect() {}\n").unwrap();
+        let file = make_indexed_file(
+            "src/db.rs",
+            vec![make_symbol("connect", SymbolKind::Function, 1, 1)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state_with_root(vec![("src/db.rs", file)], tmp.path().to_path_buf());
+
+        let held = state.index.lock_impact_analysis().await;
+        let http_state = state.clone();
+        let mut http = tokio::spawn(async move {
+            impact_handler(
+                State(http_state),
+                Query(ImpactParams {
+                    path: "src/db.rs".to_string(),
+                    new_file: None,
+                }),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut http)
+                .await
+                .is_err(),
+            "HTTP impact must wait for the shared index lock"
+        );
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), http)
+                .await
+                .expect("HTTP impact completes after lock release")
+                .expect("HTTP impact task joins")
+                .is_ok()
+        );
+
+        let held = state.index.lock_impact_analysis().await;
+        let tool_state = state.clone();
+        let mut tool = tokio::spawn(async move {
+            impact_tool_text(
+                tool_state,
+                &ImpactParams {
+                    path: "src/db.rs".to_string(),
+                    new_file: None,
+                },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut tool)
+                .await
+                .is_err(),
+            "direct-tool impact must wait for the shared index lock"
+        );
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), tool)
+                .await
+                .expect("direct-tool impact completes after lock release")
+                .expect("direct-tool impact task joins")
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3106,16 +4072,17 @@ mod tests {
         // The handler will try to read src/db.rs from disk (cwd). Since the file
         // doesn't exist on disk in this test, the handler should return Ok with a
         // "not readable" message and preserve the index instead of destroying it.
-        let result = impact_handler(State(state), Query(params)).await;
+        let result = impact_handler(State(state.clone()), Query(params)).await;
         assert!(
             result.is_ok(),
             "impact_handler should return Ok even if file missing from disk"
         );
         let text = result.unwrap();
         assert!(
-            text.contains("removed from index") || text.contains("not found on disk"),
-            "should indicate file was removed from index; got: {text}"
+            text.contains("last-valid index state retained"),
+            "should report that the last-valid index record was retained; got: {text}"
         );
+        assert!(state.index.read().get_file("src/db.rs").is_some());
     }
 
     /// When the watcher purges the index entry before analyze_file_impact
@@ -3309,8 +4276,8 @@ mod tests {
         }
     }
 
-    /// Proves that analyze_file_impact removes the file from the index when
-    /// it cannot be read from disk (deleted externally).
+    /// A single missing-file observation retains the last-valid index record;
+    /// the watcher retry/reconciliation path owns confirmed deletion.
     #[tokio::test]
     async fn test_impact_handler_edit_preserves_index_when_file_unreadable() {
         let file = make_indexed_file(
@@ -3320,21 +4287,50 @@ mod tests {
             ParseStatus::Parsed,
         );
         let state = make_state(vec![("src/db.rs", file)]);
+        let generation = state.index.current_project_generation();
+        let replacement = make_indexed_file(
+            "src/db.rs",
+            vec![make_symbol("connect_v2", SymbolKind::Function, 1, 10)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        assert!(
+            state
+                .index
+                .update_file_at_generation("src/db.rs", replacement, generation)
+        );
 
         let params = ImpactParams {
             path: "src/db.rs".to_string(),
             new_file: None,
         };
 
-        // File doesn't exist on disk — impact should remove it from the index.
+        // File doesn't exist on disk — impact must fail open without deleting
+        // a path that may be in a delete→recreate window.
         let result = impact_handler(State(state.clone()), Query(params)).await;
         assert!(result.is_ok(), "should return Ok, got: {result:?}");
+        assert!(
+            result
+                .as_ref()
+                .is_ok_and(|text| text.contains("last-valid index state retained"))
+        );
 
-        // Verify the file was removed from the index.
+        // Verify the last-valid file remains indexed pending confirmation.
         let guard = state.index.read();
         assert!(
-            guard.get_file("src/db.rs").is_none(),
-            "deleted file should be removed from index"
+            guard.get_file("src/db.rs").is_some(),
+            "one missing observation must not remove the last-valid index entry"
+        );
+        drop(guard);
+        let preserved = state
+            .index
+            .take_pre_update_snapshot_at_generation("src/db.rs", generation)
+            .expect("failed impact must preserve the watcher baseline");
+        assert!(
+            preserved
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "connect")
         );
     }
 
@@ -6414,7 +7410,8 @@ mod tests {
             symbol_line: None,
         };
 
-        let hook = symbol_context_hook_text(&state, &params).expect("hook render");
+        let fence = require_queryable_sidecar_index(&state).expect("queryable fixture");
+        let hook = symbol_context_hook_text(&state, &params, &fence).expect("hook render");
 
         assert!(
             hook.contains("[truncated]"),

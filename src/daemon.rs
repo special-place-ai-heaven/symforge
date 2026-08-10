@@ -43,7 +43,7 @@ use crate::protocol::tools::{
     SearchTextInput, SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
     search_symbols_options_from_input, search_text_options_from_input,
 };
-use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
+use crate::sidecar::{SidecarState, SymbolSnapshotCache, TokenStats};
 use crate::watcher::{self, WatcherInfo};
 
 // Daemon runtime files are OS-tagged (daemon.<os>.port) so a Windows daemon and a
@@ -296,7 +296,7 @@ struct ProjectInstance {
     watcher_task: Option<tokio::task::JoinHandle<()>>,
     stop_token: Arc<AtomicBool>,
     token_stats: Arc<TokenStats>,
-    symbol_cache: Arc<RwLock<HashMap<String, Vec<SymbolSnapshot>>>>,
+    symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
     session_ids: HashSet<String>,
     opened_at: SystemTime,
     activation_state: ActivationState,
@@ -756,7 +756,7 @@ struct SessionRuntime {
     session_id: String,
     index: SharedIndex,
     token_stats: Arc<TokenStats>,
-    symbol_cache: Arc<RwLock<HashMap<String, Vec<SymbolSnapshot>>>>,
+    symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
     /// Session-private, project-keyed `SymForgeServer` clone.
     server: SymForgeServer,
     /// Feature 012 (Phase 3): the session's working set, shared by `Arc` so the

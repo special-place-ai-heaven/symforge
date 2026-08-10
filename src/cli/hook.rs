@@ -297,7 +297,8 @@ pub fn run_hook_with_input_at(
                 "process control state unavailable",
             )
         })
-        .and_then(|state_dir| read_sidecar_endpoint(state_dir, &repo_root));
+        .and_then(|state_dir| read_sidecar_endpoint(state_dir, &repo_root))
+        .map(|(port, session_id)| (port, normalize_session_id(session_id)));
     let session_id = sidecar_endpoint
         .as_ref()
         .ok()
@@ -340,7 +341,7 @@ pub fn run_hook_with_input_at(
             if verbose {
                 eprintln!("[symforge-hook] attempting daemon fallback...");
             }
-            match try_daemon_fallback(&repo_root) {
+            match try_daemon_fallback(&repo_root, None) {
                 Some(fallback) => {
                     if verbose {
                         eprintln!(
@@ -378,6 +379,12 @@ pub fn run_hook_with_input_at(
             }
         }
     };
+    // A descriptor carrying a session id already targets the daemon proxy.
+    // Keep this separate from `used_daemon_fallback`: descriptor routing is a
+    // normal route (and records `Routed`), but it must not rediscover and call
+    // the same daemon a second time after a 503. Session ids are normalized at
+    // descriptor read so this predicate is identical to `proxy_path` routing.
+    let initial_endpoint_is_daemon = effective_session_id.is_some();
 
     // Step 2 — determine endpoint + query string.
     let resolved_ref = resolved.as_ref();
@@ -388,107 +395,208 @@ pub fn run_hook_with_input_at(
         eprintln!("[symforge-hook] HTTP GET 127.0.0.1:{port}{request_path}?{query}");
     }
 
-    // Keep a copy of the query so the stale-sidecar daemon fallback below can
-    // re-issue the same enrichment request — `sync_http_get` consumes `query`.
-    let fallback_query = query.clone();
-
     // Dogfood #6 / spec 012 FR-006b (hook half): pin the sidecar request to
     // the caller's repo root. A sidecar whose shared session was retargeted by
     // another agent's `index_folder` answers 409, and the daemon fallback
-    // below re-resolves the caller's project BY ROOT — no false alarms. The
-    // daemon fallback request itself stays unpinned (it is already
-    // root-resolved by `try_daemon_fallback`).
-    let query = if used_daemon_fallback {
-        query
-    } else {
-        append_caller_root(query)
-    };
+    // below re-resolves the caller's project BY ROOT. Keep the daemon request
+    // pinned too: a session can remain open while its active project changes.
+    let query = append_caller_root(query);
+    // Keep a copy so the stale-sidecar daemon fallback can re-issue the same
+    // root-pinned enrichment request — the first HTTP call consumes `query`.
+    let fallback_query = query.clone();
 
     // Step 3/4 — make sync HTTP GET with 50 ms timeout.
-    let (body, outcome) = match sync_http_get(port, &request_path, query) {
-        Ok(b) => {
+    let (body, outcome, outcome_session_id) = match sync_enrichment_http_get(
+        port,
+        &request_path,
+        query,
+    ) {
+        EnrichmentHttpResult::Success(b) => {
             let initial_outcome = if used_daemon_fallback {
                 HookOutcome::DaemonFallback
             } else {
                 HookOutcome::Routed
             };
-            (b, initial_outcome)
+            (b, initial_outcome, effective_session_id.clone())
         }
-        Err(_) => {
-            // Port file existed but the HTTP call failed — the sidecar is dead
-            // or stale. Before failing open to a NON-enriched pass-through, try
-            // routing the SAME enrichment request through the daemon, which
-            // holds the same index. This mirrors the missing-port branch above
-            // so a dead sidecar still yields enriched results.
+        initial_failure @ (EnrichmentHttpResult::IndexNotReady
+        | EnrichmentHttpResult::RootConflict
+        | EnrichmentHttpResult::HttpFailure(_)
+        | EnrichmentHttpResult::Unavailable) => {
+            let initial_index_not_ready =
+                matches!(initial_failure, EnrichmentHttpResult::IndexNotReady);
+            let initial_root_conflict =
+                matches!(initial_failure, EnrichmentHttpResult::RootConflict);
+            let initial_http_failure =
+                matches!(initial_failure, EnrichmentHttpResult::HttpFailure(_));
+
+            // Before failing open, try routing the SAME enrichment request
+            // through the daemon. A local sidecar may still be loading while a
+            // separate root-matched daemon session is already queryable.
             //
-            // Skip the fallback when we were already talking to the daemon
-            // (`used_daemon_fallback`): the daemon is the thing that just
-            // failed, so a second round-trip would be pointless — and this
-            // guard guarantees at most one daemon attempt, never a loop.
+            // A 503 from a daemon-backed endpoint is authoritative for that
+            // root-matched project and must not be retried through the same
+            // daemon. A closed session (404/unavailable) or a root conflict can
+            // still recover through a different active session, so rediscover
+            // while excluding the session that just failed.
             let port_file_path = control_state_dir
                 .as_ref()
                 .map(sidecar_descriptor_path)
                 .unwrap_or_default();
 
-            // Honest liveness diagnostics (item b): probe the actual sidecar
-            // state so a dead sidecar is never a silent bypass. The probe does
-            // a real TCP connect, so it is gated behind verbose to avoid adding
-            // latency to the degraded path on every call. The always-on honest
-            // signal is the adoption-log outcome recorded below: a successful
-            // daemon fallback records `DaemonFallback` (sidecar dead/degraded,
-            // served via daemon), and a total miss records `sidecar_port_stale`.
             if verbose {
-                let liveness = control_state_dir
-                    .as_ref()
-                    .map(|state_dir| {
-                        crate::sidecar::port_file::read_sidecar_status(
-                            state_dir,
-                            "127.0.0.1",
-                            Some(&repo_root),
-                        )
-                        .liveness
-                        .as_str()
-                    })
-                    .unwrap_or("unavailable");
-                eprintln!(
-                    "[symforge-hook] HTTP request failed — sidecar liveness={liveness}, \
-                     attempting daemon fallback before fail-open"
-                );
-            }
-
-            let daemon_enriched = if used_daemon_fallback {
-                None
-            } else {
-                try_daemon_fallback(&repo_root).and_then(|fallback| {
-                    let daemon_request_path = proxy_path(path, Some(&fallback.session_id));
-                    if verbose {
+                if initial_index_not_ready {
+                    if initial_endpoint_is_daemon {
+                        eprintln!("[symforge-hook] daemon index not ready — failing open");
+                    } else {
                         eprintln!(
-                            "[symforge-hook] daemon fallback (stale sidecar): \
-                             port={}, session={}",
-                            fallback.daemon_port, fallback.session_id
+                            "[symforge-hook] index not ready — attempting daemon fallback before fail-open"
                         );
                     }
-                    sync_http_get_with_timeout(
-                        fallback.daemon_port,
-                        &daemon_request_path,
-                        fallback_query,
-                        DAEMON_FALLBACK_DEADLINE,
-                    )
-                    .ok()
-                })
+                } else if initial_root_conflict {
+                    if initial_endpoint_is_daemon {
+                        eprintln!(
+                            "[symforge-hook] daemon root conflict — attempting alternate daemon session"
+                        );
+                    } else {
+                        eprintln!(
+                            "[symforge-hook] sidecar root conflict — attempting daemon fallback before fail-open"
+                        );
+                    }
+                } else if initial_http_failure {
+                    eprintln!(
+                        "[symforge-hook] sidecar returned a live HTTP failure — attempting daemon fallback before fail-open"
+                    );
+                } else {
+                    // Probe only transport failures. A 503 already proves the
+                    // sidecar is live and must never produce a restart hint.
+                    let liveness = control_state_dir
+                        .as_ref()
+                        .map(|state_dir| {
+                            crate::sidecar::port_file::read_sidecar_status(
+                                state_dir,
+                                "127.0.0.1",
+                                Some(&repo_root),
+                            )
+                            .liveness
+                            .as_str()
+                        })
+                        .unwrap_or("unavailable");
+                    if initial_endpoint_is_daemon {
+                        eprintln!(
+                            "[symforge-hook] daemon HTTP request failed — liveness={liveness}, attempting alternate daemon session"
+                        );
+                    } else {
+                        eprintln!(
+                            "[symforge-hook] HTTP request failed — sidecar liveness={liveness}, \
+                             attempting daemon fallback before fail-open"
+                        );
+                    }
+                }
+            }
+
+            let daemon_enriched = if initial_endpoint_is_daemon && initial_index_not_ready {
+                None
+            } else {
+                let excluded_session_id = initial_endpoint_is_daemon
+                    .then_some(effective_session_id.as_deref())
+                    .flatten();
+                match try_daemon_fallback(&repo_root, excluded_session_id) {
+                    Some(fallback) => {
+                        let fallback_session_id = fallback.session_id.clone();
+                        let daemon_request_path = proxy_path(path, Some(&fallback.session_id));
+                        if verbose {
+                            eprintln!(
+                                "[symforge-hook] daemon fallback (stale sidecar): \
+                                 port={}, session={}",
+                                fallback.daemon_port, fallback.session_id
+                            );
+                        }
+                        Some((
+                            sync_enrichment_http_get_with_timeout(
+                                fallback.daemon_port,
+                                &daemon_request_path,
+                                fallback_query,
+                                DAEMON_FALLBACK_DEADLINE,
+                            ),
+                            fallback_session_id,
+                        ))
+                    }
+                    None => None,
+                }
             };
 
             match daemon_enriched {
-                Some(b) => {
+                Some((EnrichmentHttpResult::Success(b), daemon_session_id)) => {
                     if verbose {
                         eprintln!(
                             "[symforge-hook] daemon fallback succeeded — \
                              sidecar dead/degraded, served enriched result via daemon"
                         );
                     }
-                    (b, HookOutcome::DaemonFallback)
+                    (b, HookOutcome::DaemonFallback, Some(daemon_session_id))
                 }
-                None => {
+                Some((EnrichmentHttpResult::IndexNotReady, daemon_session_id)) => {
+                    emit_live_refusal_fail_open(
+                        workflow,
+                        event_name,
+                        Some(&daemon_session_id),
+                        "index_not_ready",
+                        verbose,
+                    );
+                    return Ok(());
+                }
+                Some((EnrichmentHttpResult::RootConflict, daemon_session_id)) => {
+                    emit_live_refusal_fail_open(
+                        workflow,
+                        event_name,
+                        Some(&daemon_session_id),
+                        "root_conflict",
+                        verbose,
+                    );
+                    return Ok(());
+                }
+                Some((EnrichmentHttpResult::HttpFailure(_), daemon_session_id)) => {
+                    emit_live_refusal_fail_open(
+                        workflow,
+                        event_name,
+                        Some(&daemon_session_id),
+                        "http_failure",
+                        verbose,
+                    );
+                    return Ok(());
+                }
+                Some((EnrichmentHttpResult::Unavailable, _)) | None if initial_index_not_ready => {
+                    emit_live_refusal_fail_open(
+                        workflow,
+                        event_name,
+                        effective_session_id.as_deref(),
+                        "index_not_ready",
+                        verbose,
+                    );
+                    return Ok(());
+                }
+                Some((EnrichmentHttpResult::Unavailable, _)) | None if initial_root_conflict => {
+                    emit_live_refusal_fail_open(
+                        workflow,
+                        event_name,
+                        effective_session_id.as_deref(),
+                        "root_conflict",
+                        verbose,
+                    );
+                    return Ok(());
+                }
+                Some((EnrichmentHttpResult::Unavailable, _)) | None if initial_http_failure => {
+                    emit_live_refusal_fail_open(
+                        workflow,
+                        event_name,
+                        effective_session_id.as_deref(),
+                        "http_failure",
+                        verbose,
+                    );
+                    return Ok(());
+                }
+                Some((EnrichmentHttpResult::Unavailable, _)) | None => {
                     // Both sidecar and daemon are unreachable: degrade to a
                     // pass-through, never hang, never error the editor.
                     if verbose {
@@ -521,9 +629,23 @@ pub fn run_hook_with_input_at(
     }
 
     // Step 5/6 — output result JSON.
-    record_hook_outcome(workflow, outcome, effective_session_id.as_deref());
+    record_hook_outcome(workflow, outcome, outcome_session_id.as_deref());
     println!("{}", success_json(event_name, &body));
     Ok(())
+}
+
+fn emit_live_refusal_fail_open(
+    workflow: HookWorkflow,
+    event_name: &str,
+    session_id: Option<&str>,
+    reason: &str,
+    verbose: bool,
+) {
+    if verbose {
+        eprintln!("[symforge-hook] outcome=SidecarError reason={reason}");
+    }
+    record_hook_outcome(workflow, HookOutcome::SidecarError, session_id);
+    println!("{}", fail_open_json(event_name));
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +1068,12 @@ fn read_sidecar_endpoint(
     )
 }
 
+fn normalize_session_id(session_id: Option<String>) -> Option<String> {
+    session_id
+        .map(|session_id| session_id.trim().to_string())
+        .filter(|session_id| !session_id.is_empty())
+}
+
 fn proxy_path(base_path: &str, session_id: Option<&str>) -> String {
     match session_id {
         Some(session_id) if !session_id.trim().is_empty() => {
@@ -1018,7 +1146,10 @@ struct DaemonFallbackResult {
 /// daemon is unreachable, has no matching project, or any step times out.
 ///
 /// Total budget: DAEMON_FALLBACK_DEADLINE (500ms shared across all steps).
-fn try_daemon_fallback(repo_root: &Path) -> Option<DaemonFallbackResult> {
+fn try_daemon_fallback(
+    repo_root: &Path,
+    excluded_session_id: Option<&str>,
+) -> Option<DaemonFallbackResult> {
     let deadline = std::time::Instant::now() + DAEMON_FALLBACK_DEADLINE;
 
     // Step 1: Read the daemon port file (~/.symforge/daemon.port).
@@ -1054,12 +1185,21 @@ fn try_daemon_fallback(repo_root: &Path) -> Option<DaemonFallbackResult> {
 
     let sessions: Vec<DaemonSessionEntry> = serde_json::from_str(&sessions_json).ok()?;
 
-    // Pick the most recently seen session.
-    let session = sessions.iter().max_by_key(|s| s.last_seen_at_unix_secs)?;
+    // A session listed under this project may since have activated another
+    // project. Only route through a session whose current active project still
+    // matches the root-resolved project, then prefer the most recently seen.
+    let session = sessions
+        .iter()
+        .filter(|session| {
+            session.project_id == matching.project_id
+                && !session.session_id.trim().is_empty()
+                && excluded_session_id.is_none_or(|excluded| session.session_id.trim() != excluded)
+        })
+        .max_by_key(|session| session.last_seen_at_unix_secs)?;
 
     Some(DaemonFallbackResult {
         daemon_port,
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.trim().to_string(),
     })
 }
 
@@ -1075,7 +1215,23 @@ struct DaemonProjectEntry {
 #[derive(serde::Deserialize)]
 struct DaemonSessionEntry {
     session_id: String,
+    project_id: String,
     last_seen_at_unix_secs: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HttpResponse {
+    status_code: u16,
+    body: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnrichmentHttpResult {
+    Success(String),
+    IndexNotReady,
+    RootConflict,
+    HttpFailure(u16),
+    Unavailable,
 }
 
 /// Normalize a path for cross-platform comparison: lowercase on Windows,
@@ -1090,13 +1246,12 @@ fn normalize_path_for_match(path: &Path) -> String {
     }
 }
 
-/// Like `sync_http_get` but with a configurable timeout.
-fn sync_http_get_with_timeout(
+fn sync_http_response_with_timeout(
     port: u16,
     path: &str,
     query: String,
     timeout: Duration,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<HttpResponse> {
     let addr = format!("127.0.0.1:{port}");
     let sock_addr: std::net::SocketAddr = addr.parse()?;
 
@@ -1142,10 +1297,6 @@ fn sync_http_get_with_timeout(
         .parse()
         .map_err(|_| anyhow::anyhow!("non-numeric HTTP status code in: {status_line}"))?;
 
-    if !(200..=299).contains(&status_code) {
-        anyhow::bail!("HTTP {status_code} from {path}");
-    }
-
     // Check for chunked transfer-encoding. The sidecar uses hyper which may
     // send chunked responses. Since we use Connection: close and read_to_string,
     // the raw body includes chunk framing that must be decoded.
@@ -1154,10 +1305,47 @@ fn sync_http_get_with_timeout(
         lower.starts_with("transfer-encoding:") && lower.contains("chunked")
     });
 
-    if is_chunked {
-        Ok(decode_chunked_body(body))
+    let body = if is_chunked {
+        decode_chunked_body(body)
     } else {
-        Ok(body.to_string())
+        body.to_string()
+    };
+
+    Ok(HttpResponse { status_code, body })
+}
+
+/// Like `sync_http_get` but with a configurable timeout.
+fn sync_http_get_with_timeout(
+    port: u16,
+    path: &str,
+    query: String,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let response = sync_http_response_with_timeout(port, path, query, timeout)?;
+    if !(200..=299).contains(&response.status_code) {
+        anyhow::bail!("HTTP {} from {path}", response.status_code);
+    }
+    Ok(response.body)
+}
+
+fn classify_enrichment_response(response: HttpResponse) -> EnrichmentHttpResult {
+    match response.status_code {
+        200..=299 => EnrichmentHttpResult::Success(response.body),
+        409 => EnrichmentHttpResult::RootConflict,
+        503 => EnrichmentHttpResult::IndexNotReady,
+        status_code => EnrichmentHttpResult::HttpFailure(status_code),
+    }
+}
+
+fn sync_enrichment_http_get_with_timeout(
+    port: u16,
+    path: &str,
+    query: String,
+    timeout: Duration,
+) -> EnrichmentHttpResult {
+    match sync_http_response_with_timeout(port, path, query, timeout) {
+        Ok(response) => classify_enrichment_response(response),
+        Err(_) => EnrichmentHttpResult::Unavailable,
     }
 }
 
@@ -1441,12 +1629,13 @@ fn load_hook_adoption_snapshot_at(
         .unwrap_or_default()
 }
 
-/// Make a synchronous HTTP/1.1 GET request to `127.0.0.1:{port}{path}?{query}`.
+/// Make a synchronous enrichment GET to `127.0.0.1:{port}{path}?{query}`.
 ///
 /// Uses a raw `TcpStream` (no HTTP client crate) so there is no async runtime
-/// and the startup cost is near zero.  The timeout covers both connect and read.
-fn sync_http_get(port: u16, path: &str, query: String) -> anyhow::Result<String> {
-    sync_http_get_with_timeout(port, path, query, HTTP_TIMEOUT)
+/// and the startup cost is near zero. A 503 is kept distinct from transport
+/// failure so an index-loading refusal is not reported as a dead sidecar.
+fn sync_enrichment_http_get(port: u16, path: &str, query: String) -> EnrichmentHttpResult {
+    sync_enrichment_http_get_with_timeout(port, path, query, HTTP_TIMEOUT)
 }
 
 /// Minimal percent-encoding for query parameter values.
@@ -1540,6 +1729,45 @@ mod tests {
             .as_str()
             .expect("additionalContext must be a string");
         assert_eq!(ctx, context);
+    }
+
+    #[test]
+    fn enrichment_response_keeps_live_refusals_distinct_from_transport_failure() {
+        assert_eq!(
+            classify_enrichment_response(HttpResponse {
+                status_code: 503,
+                body: "partial index data must not be injected".to_string(),
+            }),
+            EnrichmentHttpResult::IndexNotReady
+        );
+        assert_eq!(
+            classify_enrichment_response(HttpResponse {
+                status_code: 409,
+                body: String::new(),
+            }),
+            EnrichmentHttpResult::RootConflict
+        );
+        assert_eq!(
+            classify_enrichment_response(HttpResponse {
+                status_code: 500,
+                body: String::new(),
+            }),
+            EnrichmentHttpResult::HttpFailure(500)
+        );
+        assert_eq!(
+            classify_enrichment_response(HttpResponse {
+                status_code: 404,
+                body: String::new(),
+            }),
+            EnrichmentHttpResult::HttpFailure(404)
+        );
+        assert_eq!(
+            classify_enrichment_response(HttpResponse {
+                status_code: 200,
+                body: "trusted context".to_string(),
+            }),
+            EnrichmentHttpResult::Success("trusted context".to_string())
+        );
     }
 
     // --- parse_stdin_input ---

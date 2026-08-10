@@ -991,6 +991,21 @@ pub struct PublicationFence {
     pub project_generation: u64,
 }
 
+impl PublicationFence {
+    pub(crate) fn from_published(published: &PublishedGeneration) -> Self {
+        Self {
+            publication_generation: published.publication_generation,
+            content_generation: published.content_generation,
+            project_generation: published.project_generation,
+        }
+    }
+}
+
+pub(crate) struct IndexedFilePublicationReceipt {
+    pub published: Arc<PublishedGeneration>,
+    pub snapshot_created: bool,
+}
+
 pub struct PreparedKnowledgeBridge {
     fence: PublicationFence,
     bridge: Arc<KnowledgeBridge>,
@@ -1250,6 +1265,29 @@ pub struct PreUpdateSnapshot {
 }
 
 #[derive(Clone, Debug)]
+struct StoredPreUpdateSnapshot {
+    snapshot: PreUpdateSnapshot,
+    /// Exact publication that installed the replacement content.
+    replacement: PublicationFence,
+}
+
+fn pre_update_snapshot(existing: &IndexedFile) -> PreUpdateSnapshot {
+    PreUpdateSnapshot {
+        content: existing.content.clone(),
+        symbols: existing
+            .symbols
+            .iter()
+            .map(|symbol| PreUpdateSymbol {
+                name: symbol.name.clone(),
+                kind: symbol.kind.to_string(),
+                line_range: symbol.line_range,
+                byte_range: symbol.byte_range,
+            })
+            .collect(),
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct PreUpdateSymbol {
     pub name: String,
     pub kind: String,
@@ -1283,6 +1321,10 @@ pub struct SharedIndexHandle {
     freshness_status: ArcSwap<FreshnessStatus>,
     /// Serializes writers — only one mutation in flight at a time.
     write_mutex: Mutex<()>,
+    /// Serializes impact analyses that share this index. Watcher publications
+    /// remain concurrent, but two hook/tool requests cannot regress the
+    /// sidecar's per-file baseline cache out of order.
+    impact_mutex: tokio::sync::Mutex<()>,
     published_state: ArcSwap<PublishedIndexState>,
     published_repo_outline: ArcSwap<RepoOutlineView>,
     /// Publish-versioning counter for `PublishedIndexState`; bumped on every publish.
@@ -1303,7 +1345,7 @@ pub struct SharedIndexHandle {
     /// Pre-update file snapshots: saved automatically by `update_file` before
     /// the index entry is replaced. Consumed (take) by `analyze_file_impact` to
     /// compute accurate diffs even when the watcher re-indexes before the hook fires.
-    pre_update_snapshots: Mutex<HashMap<String, PreUpdateSnapshot>>,
+    pre_update_snapshots: Mutex<HashMap<String, StoredPreUpdateSnapshot>>,
     /// Single-flights P1 local-ref/worktree reconcile. A reconcile pass reads the
     /// latest git topology, so two overlapping passes are redundant AND unsafe: the
     /// older pass's deletion step, working from a stale `local_branch_refs`
@@ -1378,7 +1420,15 @@ impl SharedIndexHandle {
             }
         }));
         let temporal = Arc::clone(&code_signals.temporal);
-        let freshness_status = if index.is_empty
+        let freshness_status = if scout_plan
+            .as_deref()
+            .is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded)
+        {
+            FreshnessStatus::Degraded {
+                last_valid_content_generation: 0,
+                reason_codes: vec![FreshnessReason::ReconciliationPending],
+            }
+        } else if index.is_empty
             || !matches!(index.snapshot_verify_state, SnapshotVerifyState::NotNeeded)
         {
             FreshnessStatus::Verifying
@@ -1469,6 +1519,7 @@ impl SharedIndexHandle {
             scout_plan: ArcSwapOption::new(scout_plan),
             freshness_status: ArcSwap::new(Arc::new(freshness_status)),
             write_mutex: Mutex::new(()),
+            impact_mutex: tokio::sync::Mutex::new(()),
             published_state: ArcSwap::new(published_state),
             published_repo_outline: ArcSwap::new(published_repo_outline),
             next_generation: AtomicU64::new(1),
@@ -1721,17 +1772,8 @@ impl SharedIndexHandle {
         scout_plan: discovery::ScoutPlan,
         source_exclusions: discovery::SourceExclusions,
     ) -> Arc<Self> {
-        let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
         let handle = Self::new_with_scout_plan(index, Some(Arc::new(scout_plan)));
         handle.source_exclusions.store(Arc::new(source_exclusions));
-        if is_degraded {
-            handle
-                .freshness_status
-                .store(Arc::new(FreshnessStatus::Degraded {
-                    last_valid_content_generation: 0,
-                    reason_codes: vec![FreshnessReason::ReconciliationPending],
-                }));
-        }
         Arc::new(handle)
     }
 
@@ -1785,6 +1827,92 @@ impl SharedIndexHandle {
     #[must_use]
     pub(crate) fn source_exclusions(&self) -> Arc<discovery::SourceExclusions> {
         self.source_exclusions.load_full()
+    }
+
+    /// Recompute freshness reasons owned by live observation, scout
+    /// reconciliation, and snapshot verification. Unrelated reasons (watcher
+    /// availability, capacity, derived publication) are retained verbatim. A
+    /// pending snapshot verification remains `Verifying` after transient
+    /// failures heal; recovery must never silently authorize an unverified
+    /// snapshot.
+    ///
+    /// Must be called while holding `write_mutex` and before publishing `live`.
+    fn recompute_freshness_locked(
+        &self,
+        live: &LiveIndex,
+        scout_plan: Option<&discovery::ScoutPlan>,
+    ) -> bool {
+        let current = self.freshness_status.load_full();
+        let (last_valid_content_generation, reason_codes) = match current.as_ref() {
+            FreshnessStatus::Degraded {
+                last_valid_content_generation,
+                reason_codes,
+            } => (*last_valid_content_generation, reason_codes.as_slice()),
+            FreshnessStatus::Current | FreshnessStatus::Verifying => (
+                self.published_generation().content_generation,
+                &[] as &[FreshnessReason],
+            ),
+        };
+
+        let observation_failed = live.manifest_entries.iter().any(|entry| {
+            matches!(
+                entry.disposition,
+                FileDisposition::Unreadable { .. } | FileDisposition::UnstableDuringRead
+            )
+        });
+        let reconciliation_pending =
+            scout_plan.is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded);
+        let snapshot_verification_failed = matches!(
+            &live.snapshot_verify_state,
+            SnapshotVerifyState::Completed(report) if report.mismatch_count > 0
+        );
+        let mut next_reasons = Vec::new();
+        for reason in reason_codes.iter().copied().filter(|reason| {
+            !matches!(
+                reason,
+                FreshnessReason::ObservationFailed
+                    | FreshnessReason::ReconciliationPending
+                    | FreshnessReason::SnapshotVerificationFailed
+            )
+        }) {
+            if !next_reasons.contains(&reason) {
+                next_reasons.push(reason);
+            }
+        }
+        if observation_failed && !next_reasons.contains(&FreshnessReason::ObservationFailed) {
+            next_reasons.push(FreshnessReason::ObservationFailed);
+        }
+        if reconciliation_pending && !next_reasons.contains(&FreshnessReason::ReconciliationPending)
+        {
+            next_reasons.push(FreshnessReason::ReconciliationPending);
+        }
+        if snapshot_verification_failed
+            && !next_reasons.contains(&FreshnessReason::SnapshotVerificationFailed)
+        {
+            next_reasons.push(FreshnessReason::SnapshotVerificationFailed);
+        }
+
+        let next = if next_reasons.is_empty() {
+            if matches!(
+                live.snapshot_verify_state,
+                SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+            ) {
+                FreshnessStatus::Verifying
+            } else {
+                FreshnessStatus::Current
+            }
+        } else {
+            FreshnessStatus::Degraded {
+                last_valid_content_generation,
+                reason_codes: next_reasons,
+            }
+        };
+        if &next != current.as_ref() {
+            self.freshness_status.store(Arc::new(next));
+            true
+        } else {
+            false
+        }
     }
 
     fn scout_plan_with_entry_locked(
@@ -1912,7 +2040,26 @@ impl SharedIndexHandle {
         if manifest_requires_degraded_coverage(&self.live.load_full()) {
             scout_plan.coverage = crate::domain::CoverageStatus::Degraded;
         }
-        self.scout_plan.store(Some(Arc::new(scout_plan)));
+        let live = self.live.load_full();
+        let scout_plan = Arc::new(scout_plan);
+        let current_scout_plan = self.scout_plan.load_full();
+        let scout_plan_changed = match current_scout_plan.as_deref() {
+            Some(current) => {
+                current.coverage != scout_plan.coverage
+                    || current.entries != scout_plan.entries
+                    || current.issues != scout_plan.issues
+                    || current.usage != scout_plan.usage
+            }
+            None => true,
+        };
+        self.scout_plan.store(Some(Arc::clone(&scout_plan)));
+        let freshness_changed = self.recompute_freshness_locked(&live, Some(&scout_plan));
+        if scout_plan_changed || freshness_changed {
+            // The scout plan and freshness are part of the published trust
+            // bundle. Republish only when that bundle changed; an unchanged
+            // periodic reconcile must not mint a generation forever.
+            self.swap_and_publish_retaining_content((*live).clone());
+        }
         true
     }
 
@@ -1953,6 +2100,12 @@ impl SharedIndexHandle {
     /// that subsequent `read()` calls will see.
     pub fn read(&self) -> Arc<LiveIndex> {
         Arc::clone(&self.published_generation().live)
+    }
+
+    /// Single-flight impact analyses that share this index and its sidecar
+    /// baseline cache. Watcher updates remain generation/publication fenced.
+    pub(crate) async fn lock_impact_analysis(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.impact_mutex.lock().await
     }
 
     pub fn published_generation(&self) -> Arc<PublishedGeneration> {
@@ -2245,7 +2398,7 @@ impl SharedIndexHandle {
         self.scout_plan.store(Some(scout_plan));
         self.freshness_status.store(Arc::new(if is_degraded {
             FreshnessStatus::Degraded {
-                last_valid_content_generation: self.published_state.load().generation,
+                last_valid_content_generation: self.published_generation().content_generation,
                 reason_codes: vec![FreshnessReason::ReconciliationPending],
             }
         } else {
@@ -2254,6 +2407,10 @@ impl SharedIndexHandle {
         self.project_state_dir
             .store(project_state_dir.map(Arc::new));
         self.project_generation.fetch_add(1, Ordering::AcqRel);
+        // Path-keyed pre-update snapshots belong to the previous project
+        // generation. Clear them under the same writer lock as the retarget so
+        // a late impact request cannot consume a replacement project's state.
+        self.pre_update_snapshots.lock().clear();
         self.swap_and_publish(live);
         self.last_reset_project_generation
             .store(0, Ordering::Release);
@@ -2264,6 +2421,31 @@ impl SharedIndexHandle {
         self.source_exclusions
             .load()
             .excludes_relative(relative_path)
+    }
+
+    fn record_pre_update_snapshot_for_publication(
+        &self,
+        path: &str,
+        snapshot: Option<PreUpdateSnapshot>,
+        replacement: PublicationFence,
+    ) -> bool {
+        let snapshot_created = snapshot.is_some();
+        let mut snapshots = self.pre_update_snapshots.lock();
+        if let Some(snapshot) = snapshot {
+            snapshots.insert(
+                path.to_string(),
+                StoredPreUpdateSnapshot {
+                    snapshot,
+                    replacement,
+                },
+            );
+        } else {
+            // A path can be removed/demoted and later re-admitted without a
+            // pre-state in the current lifetime. Do not let an older lifetime's
+            // baseline survive that successful publication.
+            snapshots.remove(path);
+        }
+        snapshot_created
     }
 
     /// Drop all indexed state and publish a fresh empty index.
@@ -2295,33 +2477,24 @@ impl SharedIndexHandle {
     pub fn update_file(&self, path: String, file: IndexedFile) {
         let _wg = self.write_mutex.lock();
         let current = self.live.load_full();
+        let path_clone = path.clone();
         // Capture pre-update symbols so analyze_file_impact can diff correctly
         // even when the watcher re-indexes before the hook fires.
-        if let Some(existing) = current.get_file(&path) {
-            self.pre_update_snapshots.lock().insert(
-                path.clone(),
-                PreUpdateSnapshot {
-                    content: existing.content.clone(),
-                    symbols: existing
-                        .symbols
-                        .iter()
-                        .map(|s| PreUpdateSymbol {
-                            name: s.name.clone(),
-                            kind: s.kind.to_string(),
-                            line_range: s.line_range,
-                            byte_range: s.byte_range,
-                        })
-                        .collect(),
-                },
-            );
-        }
+        let pre_update = current.get_file(&path).map(pre_update_snapshot);
         let mut live = (*current).clone();
-        let path_clone = path.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             live.update_file(path, file);
         }));
         match result {
-            Ok(()) => self.swap_and_publish(live),
+            Ok(()) => {
+                self.swap_and_publish(live);
+                let replacement = self.publication_fence();
+                self.record_pre_update_snapshot_for_publication(
+                    &path_clone,
+                    pre_update,
+                    replacement,
+                );
+            }
             Err(panic_info) => {
                 // Clone-mutate-swap means the original index is untouched on panic —
                 // no repair needed, just log and discard the failed clone.
@@ -2362,24 +2535,7 @@ impl SharedIndexHandle {
         let current = self.live.load_full();
         // Capture pre-update symbols so analyze_file_impact can diff correctly
         // even when the watcher re-indexes before the hook fires.
-        if let Some(existing) = current.get_file(path) {
-            self.pre_update_snapshots.lock().insert(
-                path.to_string(),
-                PreUpdateSnapshot {
-                    content: existing.content.clone(),
-                    symbols: existing
-                        .symbols
-                        .iter()
-                        .map(|s| PreUpdateSymbol {
-                            name: s.name.clone(),
-                            kind: s.kind.to_string(),
-                            line_range: s.line_range,
-                            byte_range: s.byte_range,
-                        })
-                        .collect(),
-                },
-            );
-        }
+        let pre_update = current.get_file(path).map(pre_update_snapshot);
         let mut live = (*current).clone();
         let path_owned = path.to_string();
         let path_clone = path_owned.clone();
@@ -2387,7 +2543,15 @@ impl SharedIndexHandle {
             live.update_file(path_owned, file);
         }));
         match result {
-            Ok(()) => self.swap_and_publish(live),
+            Ok(()) => {
+                self.swap_and_publish(live);
+                let replacement = self.publication_fence();
+                self.record_pre_update_snapshot_for_publication(
+                    &path_clone,
+                    pre_update,
+                    replacement,
+                );
+            }
             Err(panic_info) => {
                 // Clone-mutate-swap means the original index is untouched on panic —
                 // no repair needed, just log and discard the failed clone.
@@ -2415,8 +2579,8 @@ impl SharedIndexHandle {
         scouted: crate::domain::ScoutedEntry,
         targets: crate::domain::IndexTargets,
         expected_gen: u64,
-        expected_publication_gen: u64,
-    ) -> bool {
+        expected_index_state_generation: u64,
+    ) -> Option<IndexedFilePublicationReceipt> {
         let _wg = self.write_mutex.lock();
         let current_gen = self.project_generation.load(Ordering::Acquire);
         if current_gen != expected_gen {
@@ -2428,38 +2592,21 @@ impl SharedIndexHandle {
                 current_gen,
                 "rejecting stale indexed-file publication"
             );
-            return false;
+            return None;
         }
-        let current_publication_gen = self.published_state.load().generation;
-        if current_publication_gen != expected_publication_gen {
+        let current_index_state_generation = self.published_state.load().generation;
+        if current_index_state_generation != expected_index_state_generation {
             tracing::trace!(
                 path,
-                expected_publication_gen,
-                current_publication_gen,
+                expected_index_state_generation,
+                current_index_state_generation,
                 "rejecting indexed-file publication prepared from a stale source bundle"
             );
-            return false;
+            return None;
         }
 
         let current = self.live.load_full();
-        if let Some(existing) = current.get_file(path) {
-            self.pre_update_snapshots.lock().insert(
-                path.to_string(),
-                PreUpdateSnapshot {
-                    content: existing.content.clone(),
-                    symbols: existing
-                        .symbols
-                        .iter()
-                        .map(|symbol| PreUpdateSymbol {
-                            name: symbol.name.clone(),
-                            kind: symbol.kind.to_string(),
-                            line_range: symbol.line_range,
-                            byte_range: symbol.byte_range,
-                        })
-                        .collect(),
-                },
-            );
-        }
+        let pre_update = current.get_file(path).map(pre_update_snapshot);
 
         let parse_status = match &file.parse_status {
             ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
@@ -2490,22 +2637,31 @@ impl SharedIndexHandle {
                 path_for_log,
                 msg
             );
-            return false;
+            return None;
         }
 
         let updated_scout_plan = match self.scout_plan_with_entry_locked(scouted, &live) {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::error!(path, %error, "failed to refresh indexed-file scout plan");
-                return false;
+                return None;
             }
         };
 
         if let Some(plan) = updated_scout_plan {
             self.scout_plan.store(Some(plan));
         }
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish(live);
-        true
+        let published = self.published_generation();
+        let replacement = PublicationFence::from_published(&published);
+        let snapshot_created =
+            self.record_pre_update_snapshot_for_publication(path, pre_update, replacement);
+        Some(IndexedFilePublicationReceipt {
+            published,
+            snapshot_created,
+        })
     }
 
     /// Update only the stored mtime for a file without re-parsing.
@@ -2563,8 +2719,8 @@ impl SharedIndexHandle {
         scouted: crate::domain::ScoutedEntry,
         targets: crate::domain::IndexTargets,
         expected_gen: u64,
-        expected_publication_gen: u64,
-    ) -> bool {
+        expected_index_state_generation: u64,
+    ) -> Option<Arc<PublishedGeneration>> {
         let _wg = self.write_mutex.lock();
         let current_gen = self.project_generation.load(Ordering::Acquire);
         if current_gen != expected_gen {
@@ -2576,25 +2732,23 @@ impl SharedIndexHandle {
                 current_gen,
                 "rejecting stale hash-skip publication"
             );
-            return false;
+            return None;
         }
-        let current_publication_gen = self.published_state.load().generation;
-        if current_publication_gen != expected_publication_gen {
+        let current_index_state_generation = self.published_state.load().generation;
+        if current_index_state_generation != expected_index_state_generation {
             tracing::trace!(
                 path,
-                expected_publication_gen,
-                current_publication_gen,
+                expected_index_state_generation,
+                current_index_state_generation,
                 "rejecting hash-skip prepared from a stale source bundle"
             );
-            return false;
+            return None;
         }
 
         let current = self.live.load_full();
         let mut live = (*current).clone();
         let mut live_changed = false;
-        let Some(file) = current.files.get(path) else {
-            return false;
-        };
+        let file = current.files.get(path)?;
         if file.mtime_secs != new_mtime && new_mtime != 0 {
             let mut updated = (**file).clone();
             updated.mtime_secs = new_mtime;
@@ -2626,28 +2780,40 @@ impl SharedIndexHandle {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::error!(path, %error, "failed to refresh hash-skip scout plan");
-                return false;
+                return None;
             }
         };
         if !live_changed && updated_scout_plan.is_none() && !manifest_changed {
-            return true;
+            return Some(self.published_generation());
         }
         if let Some(plan) = updated_scout_plan {
             self.scout_plan.store(Some(plan));
         }
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish(live);
-        true
+        Some(self.published_generation())
     }
 
     pub fn add_file(&self, path: String, file: IndexedFile) {
         let _wg = self.write_mutex.lock();
-        let mut live = (*self.live.load_full()).clone();
+        let current = self.live.load_full();
+        let pre_update = current.get_file(&path).map(pre_update_snapshot);
+        let mut live = (*current).clone();
         let path_clone = path.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             live.add_file(path, file);
         }));
         match result {
-            Ok(()) => self.swap_and_publish(live),
+            Ok(()) => {
+                self.swap_and_publish(live);
+                let replacement = self.publication_fence();
+                self.record_pre_update_snapshot_for_publication(
+                    &path_clone,
+                    pre_update,
+                    replacement,
+                );
+            }
             Err(panic_info) => {
                 let msg = panic_info
                     .downcast_ref::<String>()
@@ -2671,7 +2837,10 @@ impl SharedIndexHandle {
             live.remove_file(path);
         }));
         match result {
-            Ok(()) => self.swap_and_publish(live),
+            Ok(()) => {
+                self.swap_and_publish(live);
+                self.pre_update_snapshots.lock().remove(path);
+            }
             Err(panic_info) => {
                 let msg = panic_info
                     .downcast_ref::<String>()
@@ -2688,11 +2857,47 @@ impl SharedIndexHandle {
     }
 
     pub fn remove_file_at_generation(&self, path: &str, expected_gen: u64) -> bool {
-        self.remove_file_with_fences(path, expected_gen, None, None)
+        self.remove_file_with_fences(path, expected_gen, None, None, None)
+            .is_some()
     }
 
     pub fn remove_file_at_publication_fence(&self, path: &str, expected: PublicationFence) -> bool {
-        self.remove_file_with_fences(path, expected.project_generation, None, Some(expected))
+        self.remove_file_at_publication_fence_with_receipt(path, expected)
+            .is_some()
+    }
+
+    pub(crate) fn remove_file_at_publication_fence_with_receipt(
+        &self,
+        path: &str,
+        expected: PublicationFence,
+    ) -> Option<Arc<PublishedGeneration>> {
+        self.remove_file_with_fences(
+            path,
+            expected.project_generation,
+            None,
+            Some(expected),
+            None,
+        )
+    }
+
+    pub(crate) fn remove_file_if_absent_at_publication_fence_with_receipt(
+        &self,
+        path: &str,
+        absolute_path: &Path,
+        expected: PublicationFence,
+    ) -> Option<Arc<PublishedGeneration>> {
+        // The observation fence contributes project identity, but an unrelated
+        // same-project publication must not pin a confirmed deletion forever.
+        // Re-checking filesystem absence under `write_mutex` is the path-local
+        // fence: it rejects a delete/recreate race without coupling this path to
+        // publications for other files.
+        self.remove_file_with_fences(
+            path,
+            expected.project_generation,
+            None,
+            None,
+            Some(absolute_path),
+        )
     }
 
     pub(crate) fn remove_file_if_scout_entry_at_generation(
@@ -2701,7 +2906,14 @@ impl SharedIndexHandle {
         expected_entry: &crate::domain::ScoutedEntry,
         expected_gen: u64,
     ) -> bool {
-        self.remove_file_with_fences(path, expected_gen, Some(expected_entry), None)
+        self.remove_file_with_fences(
+            path,
+            expected_gen,
+            Some(expected_entry),
+            None,
+            expected_entry.absolute_path.as_deref(),
+        )
+        .is_some()
     }
 
     fn remove_file_with_fences(
@@ -2710,7 +2922,8 @@ impl SharedIndexHandle {
         expected_gen: u64,
         expected_scout_entry: Option<&crate::domain::ScoutedEntry>,
         expected_publication: Option<PublicationFence>,
-    ) -> bool {
+        expected_absent_path: Option<&Path>,
+    ) -> Option<Arc<PublishedGeneration>> {
         let _wg = self.write_mutex.lock();
         let current_gen = self.project_generation.load(Ordering::Acquire);
         if current_gen != expected_gen {
@@ -2722,7 +2935,7 @@ impl SharedIndexHandle {
                 current_gen,
                 "rejecting stale file removal"
             );
-            return false;
+            return None;
         }
         if let Some(expected_publication) = expected_publication {
             let current_publication = self.publication_fence();
@@ -2733,7 +2946,7 @@ impl SharedIndexHandle {
                     ?current_publication,
                     "rejecting stale file removal publication"
                 );
-                return false;
+                return None;
             }
         }
         if let Some(expected_scout_entry) = expected_scout_entry {
@@ -2748,7 +2961,27 @@ impl SharedIndexHandle {
                     path,
                     "rejecting file removal because its scouted base changed"
                 );
-                return false;
+                return None;
+            }
+        }
+        if let Some(absolute_path) = expected_absent_path {
+            match std::fs::symlink_metadata(absolute_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    tracing::trace!(
+                        path,
+                        "rejecting file removal because the path was recreated"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    tracing::trace!(
+                        path,
+                        %error,
+                        "rejecting file removal because absence could not be confirmed"
+                    );
+                    return None;
+                }
             }
         }
 
@@ -2769,22 +3002,25 @@ impl SharedIndexHandle {
                 path_owned,
                 msg
             );
-            return false;
+            return None;
         }
 
         let updated_scout_plan = match self.scout_plan_without_path_locked(path) {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::error!(path, %error, "failed to refresh scout plan after removal");
-                return false;
+                return None;
             }
         };
 
         if let Some(plan) = updated_scout_plan {
             self.scout_plan.store(Some(plan));
         }
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish(live);
-        true
+        self.pre_update_snapshots.lock().remove(path);
+        Some(self.published_generation())
     }
 
     /// Publish one metadata-terminal observation under the same generation
@@ -2795,8 +3031,8 @@ impl SharedIndexHandle {
         scouted: crate::domain::ScoutedEntry,
         disposition: crate::domain::FileDisposition,
         expected_gen: u64,
-        expected_publication_gen: u64,
-    ) -> bool {
+        expected_index_state_generation: u64,
+    ) -> Option<Arc<PublishedGeneration>> {
         let _wg = self.write_mutex.lock();
         let current_gen = self.project_generation.load(Ordering::Acquire);
         if current_gen != expected_gen {
@@ -2808,17 +3044,17 @@ impl SharedIndexHandle {
                 current_gen,
                 "rejecting stale terminal disposition"
             );
-            return false;
+            return None;
         }
-        let current_publication_gen = self.published_state.load().generation;
-        if current_publication_gen != expected_publication_gen {
+        let current_index_state_generation = self.published_state.load().generation;
+        if current_index_state_generation != expected_index_state_generation {
             tracing::trace!(
                 path,
-                expected_publication_gen,
-                current_publication_gen,
+                expected_index_state_generation,
+                current_index_state_generation,
                 "rejecting terminal disposition prepared from a stale source bundle"
             );
-            return false;
+            return None;
         }
         let manifest_entry = catalog_entry_from_scout(&scouted, disposition.clone(), None);
         let mut live = (*self.live.load_full()).clone();
@@ -2844,14 +3080,14 @@ impl SharedIndexHandle {
                 path,
                 msg
             );
-            return false;
+            return None;
         }
 
         let updated_scout_plan = match self.scout_plan_with_entry_locked(scouted, &live) {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::error!(path, %error, "failed to refresh terminal scout plan");
-                return false;
+                return None;
             }
         };
 
@@ -2859,17 +3095,16 @@ impl SharedIndexHandle {
             self.scout_plan.store(Some(plan));
         }
         if retains_last_valid_content {
-            let last_valid_content_generation = self.published_generation().content_generation;
-            self.freshness_status
-                .store(Arc::new(FreshnessStatus::Degraded {
-                    last_valid_content_generation,
-                    reason_codes: vec![FreshnessReason::ObservationFailed],
-                }));
+            let scout_plan = self.scout_plan.load_full();
+            self.recompute_freshness_locked(&live, scout_plan.as_deref());
             self.swap_and_publish_retaining_content(live);
         } else {
+            let scout_plan = self.scout_plan.load_full();
+            self.recompute_freshness_locked(&live, scout_plan.as_deref());
             self.swap_and_publish(live);
+            self.pre_update_snapshots.lock().remove(path);
         }
-        true
+        Some(self.published_generation())
     }
 
     pub fn mark_snapshot_verify_running(&self) {
@@ -2898,8 +3133,8 @@ impl SharedIndexHandle {
         }
         let mut live = (*self.live.load_full()).clone();
         live.mark_snapshot_verify_running();
-        self.freshness_status
-            .store(Arc::new(FreshnessStatus::Verifying));
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish_retaining_content(live);
         Some(self.publication_fence())
     }
@@ -2933,16 +3168,9 @@ impl SharedIndexHandle {
             return false;
         }
         let mut live = (*self.live.load_full()).clone();
-        let freshness = if mismatched_paths.is_empty() {
-            FreshnessStatus::Current
-        } else {
-            FreshnessStatus::Degraded {
-                last_valid_content_generation: expected.content_generation,
-                reason_codes: vec![FreshnessReason::SnapshotVerificationFailed],
-            }
-        };
         live.mark_snapshot_verify_completed(mismatched_paths);
-        self.freshness_status.store(Arc::new(freshness));
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish_retaining_content(live);
         true
     }
@@ -3091,7 +3319,101 @@ impl SharedIndexHandle {
     /// *before* the last `update_file` call — prevents the watcher race where
     /// the index is already updated to the post-edit state before the hook fires.
     pub fn take_pre_update_snapshot(&self, path: &str) -> Option<PreUpdateSnapshot> {
-        self.pre_update_snapshots.lock().remove(path)
+        let _wg = self.write_mutex.lock();
+        self.pre_update_snapshots
+            .lock()
+            .remove(path)
+            .map(|stored| stored.snapshot)
+    }
+
+    /// Take a pre-update snapshot only while `expected_gen` is still the
+    /// active project generation.
+    ///
+    /// The generation check and removal share the index writer lock with
+    /// reload publication, so a stale sidecar request cannot consume a
+    /// snapshot produced by the replacement project.
+    pub fn take_pre_update_snapshot_at_generation(
+        &self,
+        path: &str,
+        expected_gen: u64,
+    ) -> Option<PreUpdateSnapshot> {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale pre-update snapshot take"
+            );
+            return None;
+        }
+        self.pre_update_snapshots
+            .lock()
+            .remove(path)
+            .map(|stored| stored.snapshot)
+    }
+
+    /// Clone a pre-update snapshot without consuming it, together with the
+    /// exact publication that owns the slot. The caller can later consume only
+    /// that same slot after its operation succeeds; a newer watcher publication
+    /// remains untouched.
+    pub(crate) fn peek_pre_update_snapshot_at_generation(
+        &self,
+        path: &str,
+        expected_gen: u64,
+    ) -> Option<(PreUpdateSnapshot, PublicationFence)> {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale pre-update snapshot peek"
+            );
+            return None;
+        }
+        self.pre_update_snapshots
+            .lock()
+            .get(path)
+            .map(|stored| (stored.snapshot.clone(), stored.replacement))
+    }
+
+    /// Consume the pre-state only when it belongs to the exact replacement
+    /// publication owned by this request. A later same-project watcher update
+    /// replaces the slot with a different fence and remains untouched.
+    pub(crate) fn take_pre_update_snapshot_for_publication_at_generation(
+        &self,
+        path: &str,
+        expected_gen: u64,
+        replacement: PublicationFence,
+    ) -> Option<PreUpdateSnapshot> {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale publication-bound pre-update snapshot take"
+            );
+            return None;
+        }
+        let mut snapshots = self.pre_update_snapshots.lock();
+        if snapshots
+            .get(path)
+            .is_none_or(|stored| stored.replacement != replacement)
+        {
+            return None;
+        }
+        snapshots.remove(path).map(|stored| stored.snapshot)
     }
 
     /// Backward-compatible accessor for callers that only need the symbol half.
@@ -3184,6 +3506,12 @@ impl Drop for SharedIndexWriteGuard<'_> {
             && let Some(live) = self.index.take()
         {
             self.handle.swap_and_publish(live);
+            // A generic mutable guard can alter any number of paths, so an
+            // existing path-scoped snapshot can no longer be tied to the
+            // publication that owns its replacement. Exact reconstruction is
+            // impossible here; discard the side table rather than let a later
+            // impact request consume an old-lifetime baseline.
+            self.handle.pre_update_snapshots.lock().clear();
         }
     }
 }
@@ -6158,6 +6486,71 @@ mod tests {
     }
 
     #[test]
+    fn generic_write_guard_invalidates_pre_update_snapshot_tokens() {
+        let shared = LiveIndex::empty();
+        shared.add_file(
+            "src/tracked.rs".to_string(),
+            make_indexed_file_for_mutation("src/tracked.rs"),
+        );
+        shared.update_file(
+            "src/tracked.rs".to_string(),
+            make_indexed_file_for_mutation("src/tracked.rs"),
+        );
+        let generation = shared.current_project_generation();
+        assert!(
+            shared
+                .peek_pre_update_snapshot_at_generation("src/tracked.rs", generation)
+                .is_some(),
+            "the exact update must create a baseline token"
+        );
+
+        {
+            let mut live = shared.write();
+            live.add_file(
+                "src/other.rs".to_string(),
+                make_indexed_file_for_mutation("src/other.rs"),
+            );
+        }
+
+        assert!(
+            shared
+                .peek_pre_update_snapshot_at_generation("src/tracked.rs", generation)
+                .is_none(),
+            "an arbitrary write publication must invalidate old path tokens"
+        );
+    }
+
+    #[test]
+    fn scout_reconciliation_removal_refuses_a_recreated_disk_path() {
+        let dir = TempDir::new().expect("root");
+        let path = dir.path().join("lib.rs");
+        fs::write(&path, "pub fn before() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("load");
+        let expected_entry = shared
+            .scout_plan
+            .load_full()
+            .expect("scout plan")
+            .entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some("lib.rs"))
+            .cloned()
+            .expect("lib.rs scout entry");
+
+        fs::remove_file(&path).expect("scan observes absence");
+        fs::write(&path, "pub fn recreated() {}\n").expect("recreate before removal");
+
+        assert!(
+            !shared.remove_file_if_scout_entry_at_generation(
+                "lib.rs",
+                &expected_entry,
+                shared.current_project_generation(),
+            ),
+            "a complete-scout deletion must re-confirm absence at publication"
+        );
+        assert!(shared.read().get_file("lib.rs").is_some());
+    }
+
+    #[test]
     fn mtime_only_update_is_visible_in_published_root_without_advancing_content_generation() {
         let shared = LiveIndex::empty();
         shared.add_file(
@@ -6271,6 +6664,58 @@ mod tests {
         assert_eq!(completed.file_count, initial.file_count);
         assert_eq!(completed.partial_parse_count, initial.partial_parse_count);
         assert_eq!(completed.failed_count, initial.failed_count);
+    }
+
+    #[test]
+    fn snapshot_verify_transitions_preserve_other_degraded_reasons() {
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "main.rs", "fn main() {}\n");
+        let loaded = LiveIndex::load(project.path()).unwrap();
+        let mut live = (*loaded.published_generation().live).clone();
+        live.load_source = IndexLoadSource::SnapshotRestore;
+        live.snapshot_verify_state = SnapshotVerifyState::Pending;
+        let mut degraded_plan = (*loaded.scout_plan().expect("cold scout plan")).clone();
+        degraded_plan.issues.push(crate::domain::ScoutIssue {
+            path_id: Some("transient-walk-entry".to_string()),
+            safe_path: Some("temporarily-locked".to_string()),
+            kind: crate::domain::ScoutIssueKind::DirectoryEntryUnreadable {
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+            safe_message: "directory entry unavailable".to_string(),
+        });
+        crate::discovery::refresh_scout_plan(&mut degraded_plan).unwrap();
+        let shared = SharedIndexHandle::shared_with_scout_plan(
+            live,
+            degraded_plan,
+            crate::discovery::SourceExclusions::default(),
+        );
+        assert!(matches!(
+            shared.published_generation().freshness.as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ReconciliationPending)
+        ));
+
+        let running_fence = shared
+            .mark_snapshot_verify_running_at_fence(shared.publication_fence())
+            .expect("verification starts at the captured fence");
+        assert!(matches!(
+            shared.published_generation().freshness.as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ReconciliationPending)
+        ));
+
+        assert!(shared.mark_snapshot_verify_completed_at_fence(running_fence, Vec::new()));
+        let completed = shared.published_generation();
+        assert!(matches!(
+            completed.live.snapshot_verify_state,
+            SnapshotVerifyState::Completed(_)
+        ));
+        assert!(matches!(
+            completed.freshness.as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ReconciliationPending)
+                    && !reason_codes.contains(&FreshnessReason::SnapshotVerificationFailed)
+        ));
     }
 
     #[test]
@@ -6553,16 +6998,20 @@ mod tests {
             },
         };
 
-        assert!(shared.publish_terminal_disposition_at_generation(
-            path,
-            scouted,
-            FileDisposition::Unreadable {
-                stage: crate::domain::AccessStage::FullRead,
-                kind: crate::domain::AccessErrorKind::PermissionDenied,
-            },
-            shared.current_project_generation(),
-            before.publication_generation,
-        ));
+        assert!(
+            shared
+                .publish_terminal_disposition_at_generation(
+                    path,
+                    scouted,
+                    FileDisposition::Unreadable {
+                        stage: crate::domain::AccessStage::FullRead,
+                        kind: crate::domain::AccessErrorKind::PermissionDenied,
+                    },
+                    shared.current_project_generation(),
+                    before.health.generation,
+                )
+                .is_some()
+        );
 
         let after = shared.published_generation();
         assert!(after.publication_generation > before.publication_generation);
@@ -6577,10 +7026,215 @@ mod tests {
         assert!(matches!(
             &*shared.freshness_status(),
             FreshnessStatus::Degraded {
-                last_valid_content_generation,
+                last_valid_content_generation: _,
                 reason_codes,
-            } if *last_valid_content_generation == before.content_generation
-                && reason_codes == &[FreshnessReason::ObservationFailed]
+            } if reason_codes.contains(&FreshnessReason::ObservationFailed)
+        ));
+    }
+
+    #[test]
+    fn healed_observation_restores_current_freshness() {
+        let project = TempDir::new().unwrap();
+        let path = "src/retained.rs";
+        write_file(project.path(), path, "fn retained() {}\n");
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let before = shared.published_generation();
+        let mut scouted = shared
+            .scout_plan()
+            .expect("cold scout plan")
+            .entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some(path))
+            .expect("retained file scout entry")
+            .clone();
+        scouted.decision = crate::domain::ScoutDecision::Unavailable {
+            stage: crate::domain::AccessStage::FullRead,
+            kind: crate::domain::AccessErrorKind::PermissionDenied,
+        };
+
+        assert!(
+            shared
+                .publish_terminal_disposition_at_generation(
+                    path,
+                    scouted,
+                    FileDisposition::Unreadable {
+                        stage: crate::domain::AccessStage::FullRead,
+                        kind: crate::domain::AccessErrorKind::PermissionDenied,
+                    },
+                    shared.current_project_generation(),
+                    before.health.generation,
+                )
+                .is_some()
+        );
+        assert!(matches!(
+            shared.freshness_status().as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ObservationFailed)
+        ));
+
+        write_file(project.path(), path, "fn retained_and_healed() {}\n");
+        assert_eq!(
+            crate::live_index::single_file::update_file_from_disk(&shared, project.path(), path),
+            crate::live_index::single_file::ReindexResult::Reindexed
+        );
+        let healed = shared.published_generation();
+        assert_eq!(healed.freshness.as_ref(), &FreshnessStatus::Current);
+        assert_eq!(healed.live.index_state(), IndexState::Ready);
+    }
+
+    #[test]
+    fn healed_observation_does_not_bypass_pending_snapshot_verification() {
+        let project = TempDir::new().unwrap();
+        let path = "src/retained.rs";
+        write_file(project.path(), path, "fn retained() {}\n");
+        let mut live = LiveIndex::from_source_files(HashMap::from([(
+            path.to_string(),
+            Arc::new(make_indexed_file_for_mutation(path)),
+        )]));
+        live.indexed_root = Some(dunce::canonicalize(project.path()).unwrap());
+        live.snapshot_verify_state = SnapshotVerifyState::Pending;
+        let shared = SharedIndexHandle::shared(live);
+        let before = shared.published_generation();
+        assert_eq!(before.freshness.as_ref(), &FreshnessStatus::Verifying);
+        let scouted = crate::domain::ScoutedEntry {
+            path: crate::domain::CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            absolute_path: Some(project.path().join(path)),
+            stamp: crate::domain::FileStamp {
+                size: 0,
+                created_hint: None,
+                modified_hint: None,
+                platform_id: None,
+            },
+            language: Some(LanguageId::Rust),
+            classification: crate::domain::FileClassification::for_code_path(path),
+            decision: crate::domain::ScoutDecision::Unavailable {
+                stage: crate::domain::AccessStage::FullRead,
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+        };
+
+        assert!(
+            shared
+                .publish_terminal_disposition_at_generation(
+                    path,
+                    scouted,
+                    FileDisposition::Unreadable {
+                        stage: crate::domain::AccessStage::FullRead,
+                        kind: crate::domain::AccessErrorKind::PermissionDenied,
+                    },
+                    shared.current_project_generation(),
+                    before.health.generation,
+                )
+                .is_some()
+        );
+        assert!(matches!(
+            shared.freshness_status().as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ObservationFailed)
+        ));
+
+        write_file(project.path(), path, "fn retained_and_healed() {}\n");
+        assert_eq!(
+            crate::live_index::single_file::update_file_from_disk(&shared, project.path(), path),
+            crate::live_index::single_file::ReindexResult::Reindexed
+        );
+        let healed = shared.published_generation();
+        assert_eq!(healed.freshness.as_ref(), &FreshnessStatus::Verifying);
+        assert_eq!(
+            healed.live.snapshot_verify_state,
+            SnapshotVerifyState::Pending
+        );
+    }
+
+    #[test]
+    fn reconciled_coverage_publishes_freshness_once_per_transition() {
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "main.rs", "fn main() {}\n");
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let complete_plan = (*shared.scout_plan().expect("cold scout plan")).clone();
+        let mut degraded_plan = complete_plan.clone();
+        degraded_plan.issues.push(crate::domain::ScoutIssue {
+            path_id: Some("transient-walk-entry".to_string()),
+            safe_path: Some("temporarily-locked".to_string()),
+            kind: crate::domain::ScoutIssueKind::DirectoryEntryUnreadable {
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+            safe_message: "directory entry unavailable".to_string(),
+        });
+        crate::discovery::refresh_scout_plan(&mut degraded_plan).unwrap();
+        let project_generation = shared.current_project_generation();
+        let initial = shared.published_generation();
+
+        assert!(shared.publish_reconciled_scout_plan_at_generation(
+            Some(&complete_plan),
+            degraded_plan.clone(),
+            project_generation,
+        ));
+        let degraded = shared.published_generation();
+        assert!(degraded.publication_generation > initial.publication_generation);
+        assert_eq!(degraded.content_generation, initial.content_generation);
+        assert!(matches!(
+            degraded.freshness.as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ReconciliationPending)
+        ));
+
+        assert!(shared.publish_reconciled_scout_plan_at_generation(
+            Some(&degraded_plan),
+            complete_plan.clone(),
+            project_generation,
+        ));
+        let healed = shared.published_generation();
+        assert!(healed.publication_generation > degraded.publication_generation);
+        assert_eq!(healed.content_generation, initial.content_generation);
+        assert_eq!(healed.freshness.as_ref(), &FreshnessStatus::Current);
+
+        assert!(shared.publish_reconciled_scout_plan_at_generation(
+            Some(&complete_plan),
+            complete_plan.clone(),
+            project_generation,
+        ));
+        let unchanged = shared.published_generation();
+        assert_eq!(
+            unchanged.publication_generation, healed.publication_generation,
+            "an unchanged Complete reconciliation must not mint a publication"
+        );
+        assert_eq!(unchanged.content_generation, healed.content_generation);
+    }
+
+    #[test]
+    fn degraded_initial_scout_is_published_in_the_trust_bundle() {
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "main.rs", "fn main() {}\n");
+        let loaded = LiveIndex::load(project.path()).unwrap();
+        let mut degraded_plan = (*loaded.scout_plan().expect("cold scout plan")).clone();
+        degraded_plan.issues.push(crate::domain::ScoutIssue {
+            path_id: Some("transient-walk-entry".to_string()),
+            safe_path: Some("temporarily-locked".to_string()),
+            kind: crate::domain::ScoutIssueKind::DirectoryEntryUnreadable {
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+            safe_message: "directory entry unavailable".to_string(),
+        });
+        crate::discovery::refresh_scout_plan(&mut degraded_plan).unwrap();
+        let shared = SharedIndexHandle::shared_with_scout_plan(
+            (*loaded.published_generation().live).clone(),
+            degraded_plan,
+            crate::discovery::SourceExclusions::default(),
+        );
+
+        assert!(matches!(
+            shared.freshness_status().as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ReconciliationPending)
+        ));
+        assert!(matches!(
+            shared.published_generation().freshness.as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ReconciliationPending)
         ));
     }
 

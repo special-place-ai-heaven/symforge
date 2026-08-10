@@ -169,6 +169,7 @@ pub(super) fn is_index_unavailable_output(text: &str) -> bool {
     text.starts_with("Index not loaded.")
         || text.starts_with("Index is loading")
         || text.starts_with("Index degraded:")
+        || text.starts_with("Index refresh interrupted:")
 }
 
 /// The ONE error-shape predicate for the whole protocol surface, read/write
@@ -1060,26 +1061,64 @@ fn enrich_with_callers(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetedFreshenRefusal {
+    ProjectGenerationChanged,
+    PublicationRejected,
+}
+
+impl TargetedFreshenRefusal {
+    fn message(self, relative_path: &str) -> String {
+        match self {
+            Self::ProjectGenerationChanged => format!(
+                "Index refresh interrupted: project changed while refreshing '{relative_path}'; retry the read."
+            ),
+            Self::PublicationRejected => format!(
+                "Index refresh interrupted: refresh for '{relative_path}' did not publish; retry the read."
+            ),
+        }
+    }
+
+    fn permits_authoritative_disk_fallback(self) -> bool {
+        matches!(self, Self::PublicationRejected)
+    }
+}
+
+fn classify_targeted_freshen_result(
+    result: watcher::FreshenResult,
+) -> Result<bool, TargetedFreshenRefusal> {
+    match result {
+        watcher::FreshenResult::Fresh => Ok(false),
+        watcher::FreshenResult::StaleReindexed | watcher::FreshenResult::StaleRemoved => Ok(true),
+        watcher::FreshenResult::GenerationMismatch => {
+            Err(TargetedFreshenRefusal::ProjectGenerationChanged)
+        }
+        watcher::FreshenResult::PublicationRejected => {
+            Err(TargetedFreshenRefusal::PublicationRejected)
+        }
+    }
+}
+
 fn freshen_exact_path_for_targeted_retrieval(
     server: &SymForgeServer,
     path_scope: &search::PathScope,
-) -> bool {
+) -> Result<bool, TargetedFreshenRefusal> {
     let search::PathScope::Exact(relative_path) = path_scope else {
-        return false;
+        return Ok(false);
     };
     let expected_gen = server.index.current_project_generation();
     let Some(repo_root) = server.capture_repo_root() else {
-        return false;
+        return Ok(false);
     };
     let Ok(abs_path) = safe_repo_path_for_freshen(&repo_root, relative_path) else {
-        return false;
+        return Ok(false);
     };
-    match watcher::freshen_file_if_stale(relative_path, &abs_path, &server.index, expected_gen) {
-        watcher::FreshenResult::Fresh => false,
-        watcher::FreshenResult::StaleReindexed => true,
-        watcher::FreshenResult::StaleRemoved => true,
-        watcher::FreshenResult::GenerationMismatch => false,
-    }
+    classify_targeted_freshen_result(watcher::freshen_file_if_stale(
+        relative_path,
+        &abs_path,
+        &server.index,
+        expected_gen,
+    ))
 }
 
 pub(super) fn safe_repo_path_for_freshen(
@@ -4580,7 +4619,12 @@ impl SymForgeServer {
             return refusal;
         }
         let force_refresh = params.0.force_refresh == Some(true);
-        freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(&params.0.path));
+        if let Err(refusal) = freshen_exact_path_for_targeted_retrieval(
+            self,
+            &search::PathScope::exact(&params.0.path),
+        ) {
+            return refusal.message(&params.0.path);
+        }
         let published = self.index.published_generation();
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             return message;
@@ -4833,14 +4877,14 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
-        let refreshed = params
-            .0
-            .path
-            .as_deref()
-            .or(params.0.file.as_deref())
-            .is_some_and(|path| {
-                freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(path))
-            });
+        let refreshed = if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
+            match freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(path)) {
+                Ok(refreshed) => refreshed,
+                Err(refusal) => return refusal.message(path),
+            }
+        } else {
+            false
+        };
         let published = self.index.published_generation();
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             return message;
@@ -8678,7 +8722,9 @@ impl SymForgeServer {
             Ok(options) => options,
             Err(message) => return message,
         };
-        freshen_exact_path_for_targeted_retrieval(self, &options.path_scope);
+        if let Err(refusal) = freshen_exact_path_for_targeted_retrieval(self, &options.path_scope) {
+            return refusal.message(&input.path);
+        }
 
         // Capture freshness and the immutable publication before consulting the
         // repeat-read cache. The same request against a later watcher publication
@@ -8846,7 +8892,16 @@ impl SymForgeServer {
         }
 
         let path_scope = search::PathScope::exact(&input.path);
-        freshen_exact_path_for_targeted_retrieval(self, &path_scope);
+        let force_disk_fallback = match freshen_exact_path_for_targeted_retrieval(self, &path_scope)
+        {
+            Ok(_) => false,
+            // This tool has an authoritative disk-read lane below. A rejected
+            // same-project publication therefore means "do not trust the indexed
+            // hit", not "validation is impossible". A project-generation change
+            // remains ambiguous and must be retried against the newly bound root.
+            Err(refusal) if refusal.permits_authoritative_disk_fallback() => true,
+            Err(refusal) => return refusal.message(&input.path),
+        };
 
         // One publication for the whole handler: the gate below reads the recorded
         // disposition off the SAME publication that produced the index miss, and
@@ -8862,7 +8917,7 @@ impl SymForgeServer {
         // repository. While not Ready, ignore the indexed entry and answer from
         // the authoritative disk parse below.
         let not_ready = loading_guard_message_from_published(&published.health);
-        let indexed_file = if not_ready.is_some() {
+        let indexed_file = if force_disk_fallback || not_ready.is_some() {
             None
         } else {
             published.live.capture_shared_file(&input.path)
@@ -13495,8 +13550,8 @@ mod tests {
     /// deliberately leaving `project_generation` AND `content_generation`
     /// untouched. So a publication landing mid-test breaks `Arc::ptr_eq` on the
     /// published state, and makes the CAS in `read_and_index_with_stable_read`
-    /// lose its race (4 losses → `ReindexResult::Skipped`), with no generation
-    /// counter moving to hint at why. Both failure modes are invisible to the
+    /// lose its race (4 losses → the internal `PublicationRejected` outcome),
+    /// with no generation counter moving to hint at why. Both failure modes are invisible to the
     /// generation asserts sitting right next to them.
     ///
     /// Only reproducible under full-suite load: `#[tokio::test]` is a
@@ -27603,10 +27658,54 @@ mod tests {
         let refreshed = super::freshen_exact_path_for_targeted_retrieval(
             &server,
             &super::search::PathScope::exact("src/lib.rs"),
-        );
+        )
+        .expect("confirmed removal should publish against the captured project");
 
         assert!(refreshed);
         assert!(server.index().read().get_file("src/lib.rs").is_none());
+    }
+
+    #[test]
+    fn targeted_retrieval_refuses_project_generation_mismatch() {
+        let refusal = super::classify_targeted_freshen_result(
+            crate::watcher::FreshenResult::GenerationMismatch,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            refusal,
+            super::TargetedFreshenRefusal::ProjectGenerationChanged
+        );
+        let message = refusal.message("src/lib.rs");
+        assert!(message.contains("retry the read"));
+        assert_eq!(
+            super::classify_get_file_content_output(&message),
+            OutcomeClass::InternalFailure
+        );
+        assert!(
+            !refusal.permits_authoritative_disk_fallback(),
+            "a project rebind makes even a relative-path disk fallback ambiguous"
+        );
+    }
+
+    #[test]
+    fn targeted_retrieval_refuses_unpublished_refresh_but_validation_may_use_disk() {
+        let refusal = super::classify_targeted_freshen_result(
+            crate::watcher::FreshenResult::PublicationRejected,
+        )
+        .unwrap_err();
+
+        assert_eq!(refusal, super::TargetedFreshenRefusal::PublicationRejected);
+        let message = refusal.message("src/lib.rs");
+        assert!(message.contains("did not publish"));
+        assert_eq!(
+            super::classify_get_file_context_output(&message),
+            OutcomeClass::InternalFailure
+        );
+        assert!(
+            refusal.permits_authoritative_disk_fallback(),
+            "syntax validation owns an authoritative disk-read lane and need not trust the stale index"
+        );
     }
 
     #[test]

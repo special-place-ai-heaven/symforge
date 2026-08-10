@@ -24,7 +24,8 @@ pub use crate::watcher_state::{WatcherInfo, WatcherState};
 #[cfg(test)]
 pub(crate) use crate::live_index::single_file::read_and_index_with_stable_read;
 pub(crate) use crate::live_index::single_file::{
-    ReindexResult, admit_and_index_single_path, maybe_reindex, read_and_index,
+    ReindexOutcome as ReindexResult, admit_and_index_single_path,
+    admit_and_index_single_path_with_receipt, maybe_reindex, read_and_index,
 };
 
 /// Tracks event bursts to adaptively extend the debounce window.
@@ -113,6 +114,7 @@ pub(crate) enum FreshenResult {
     StaleReindexed,
     StaleRemoved,
     GenerationMismatch,
+    PublicationRejected,
 }
 
 /// Strip `\\?\` Windows extended-length path prefix and normalize backslashes.
@@ -224,6 +226,7 @@ pub(crate) fn freshen_file_if_stale(
         // state has been resolved — without claiming the file is still indexed.
         ReindexResult::Skipped => FreshenResult::StaleReindexed,
         ReindexResult::NotFound | ReindexResult::Removed => FreshenResult::StaleRemoved,
+        ReindexResult::PublicationRejected => FreshenResult::PublicationRejected,
     }
 }
 
@@ -397,7 +400,10 @@ where
                 ReindexResult::Reindexed | ReindexResult::HashSkip | ReindexResult::Skipped => {
                     repairs_applied += 1
                 }
-                ReindexResult::NotFound | ReindexResult::Removed | ReindexResult::ReadError(_) => {}
+                ReindexResult::NotFound
+                | ReindexResult::Removed
+                | ReindexResult::ReadError(_)
+                | ReindexResult::PublicationRejected => {}
             }
         }
         for (relative_path, expected_entry) in removed_paths {
@@ -433,7 +439,9 @@ where
             let abs_path = repo_root.join(relative_path);
             match freshen_file_if_stale(relative_path, &abs_path, shared, fence_gen) {
                 FreshenResult::StaleReindexed | FreshenResult::StaleRemoved => stale_count += 1,
-                FreshenResult::Fresh | FreshenResult::GenerationMismatch => {}
+                FreshenResult::Fresh
+                | FreshenResult::GenerationMismatch
+                | FreshenResult::PublicationRejected => {}
             }
         }
     }
@@ -772,7 +780,14 @@ pub(crate) fn process_events(
 
         let mut debounce_ms = None;
         if definitely_missing {
-            shared.remove_file_at_generation(&pending.relative_path, expected_gen);
+            let fence = shared.publication_fence();
+            if fence.project_generation == expected_gen {
+                let _ = shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                    &pending.relative_path,
+                    &pending.absolute_path,
+                    fence,
+                );
+            }
         } else {
             if pending.saw_write_hint {
                 let tracker = burst_trackers
@@ -798,7 +813,14 @@ pub(crate) fn process_events(
                 // The path disappeared after the batch observation. Converge to
                 // current disk truth without serially sleeping in the event lane;
                 // any later create hint or periodic reconciliation can re-admit it.
-                shared.remove_file_at_generation(&pending.relative_path, expected_gen);
+                let fence = shared.publication_fence();
+                if fence.project_generation == expected_gen {
+                    let _ = shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                        &pending.relative_path,
+                        &pending.absolute_path,
+                        fence,
+                    );
+                }
             }
         }
 
@@ -2296,13 +2318,18 @@ mod tests {
         let project = TempDir::new().unwrap();
         std::fs::write(project.path().join("main.rs"), b"fn main() {}\n").unwrap();
         let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
-        let generation_before = shared.published_state().generation;
+        let published_before = shared.published_generation();
 
         assert_eq!(reconcile_stale_files(project.path(), &shared), 0);
         assert_eq!(
             shared.published_state().generation,
-            generation_before,
+            published_before.health.generation,
             "an unchanged Complete observation cannot publish a content generation"
+        );
+        assert_eq!(
+            shared.published_generation().publication_generation,
+            published_before.publication_generation,
+            "an unchanged Complete observation cannot mint a publication generation"
         );
         assert_eq!(
             shared.scout_plan().expect("complete plan").coverage,
@@ -2643,13 +2670,17 @@ mod tests {
             .clone();
         let publication_gen = shared.published_state().generation;
 
-        assert!(shared.publish_terminal_disposition_at_generation(
-            relative_path,
-            scouted,
-            FileDisposition::AbortedCircuitBreaker,
-            expected_gen,
-            publication_gen,
-        ));
+        assert!(
+            shared
+                .publish_terminal_disposition_at_generation(
+                    relative_path,
+                    scouted,
+                    FileDisposition::AbortedCircuitBreaker,
+                    expected_gen,
+                    publication_gen,
+                )
+                .is_some()
+        );
         assert_eq!(
             shared.scout_plan().expect("degraded plan").coverage,
             crate::domain::CoverageStatus::Degraded
