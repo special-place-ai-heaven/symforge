@@ -1,0 +1,8 @@
+#![allow(dead_code)]
+
+fn require_forbidden_impl<T: {{BOUND}}>() {}
+
+fn main() {
+    require_forbidden_impl::<{{SUBJECT}}>();
+}
+

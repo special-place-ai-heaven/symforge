@@ -1,0 +1,19 @@
+[package]
+name = "symforge-public-api-v11-compile-fail"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["server"]
+cbm-spike = ["symforge/cbm-spike"]
+embed = ["symforge/embed"]
+server = ["symforge/server"]
+
+[dependencies]
+serde = { version = "1", default-features = false }
+symforge = { path = "../../../..", default-features = false }
+
+[lib]
+path = "src/lib.rs"
+

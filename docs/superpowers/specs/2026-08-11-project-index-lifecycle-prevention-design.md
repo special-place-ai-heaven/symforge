@@ -700,8 +700,9 @@ NonCurrentWork =
   | RetryWait { cause, attempt, retry_at }
 ```
 
-Only `Current` admits a strict generation query. `Refreshing` and `Blocked` retain an
-immutable verified generation without calling it Current. This accepts the useful
+Only `Current` admits a strict generation query. `Refreshing` retains exactly one
+immutable verified generation without calling it Current; `Blocked` retains zero or
+one, so cold failure remains representable. This accepts the useful
 part of the three-state proposal—illegal readiness combinations become
 unrepresentable—without losing retained-generation, observer, mutation, and retry
 evidence. `Current` has no separately published binding or mutable observer side field: its
@@ -1477,7 +1478,7 @@ roots and lightweight epochs, drops the project snapshot, and acquires no lifecy
 lock. The ranking Adapter may then use a SQLite read transaction or session-version
 lock but never a lifecycle lock.
 
-Close/rebind is `Freeze -> Drain -> Install`:
+Revocation is `Freeze -> Drain`, followed by `Install` only for rebind/replacement:
 
 1. **Freeze** acquires only the publication writer, validates that the slot is `Live`,
    fills its root-agnostic precharged `RevocationPublicationPackage` from the **latest**
@@ -1507,9 +1508,11 @@ Close/rebind is `Freeze -> Drain -> Install`:
    registration. Sealing/refunding never occurs under the publication writer. Already-
    `InFlight` permits remain in the waited predecessor set until their destructive
    authority is terminal.
-3. **Install** reserves/charges successor observer state and atomically installs one
-   never-reused slot/binding only after drain. A capacity refusal leaves no half-
-   installed successor.
+3. **Install**, when the operation is rebind/replacement, reserves/charges successor
+   observer state and atomically installs one never-reused slot/binding only after
+   drain. A capacity refusal leaves no half-installed successor. Source/project close
+   instead terminalizes the revoked registration; only a later explicit reopen may
+   mint an incomparable successor after the close receipt is terminal.
 
 A registered unit may trigger Freeze or observer/binding/mutation rollover, but it may
 never synchronously wait on a Drain set containing its own registration. The trigger
@@ -1517,9 +1520,10 @@ may close ingress and publish non-Current, then hands an already-registered cont
 ticket to the lifecycle supervisor and terminalizes (or atomically transfers) its own
 registration. That precharged lifecycle-owner/reaper control authority is explicitly
 outside the predecessor Drain set; it cannot publish successor authority before the
-set reaches zero, but Drain never waits on the supervisor itself. Only that supervisor begins Drain/Install. This applies to overflow at
-`MAX`, physical-root replacement discovered inside a watcher callback, retry-driven
-rebind, and source/project close from managed work.
+set reaches zero, but Drain never waits on the supervisor itself. Only that supervisor
+begins Drain and, when requested by rebind/replacement, Install. This applies to
+overflow at `MAX`, physical-root replacement discovered inside a watcher callback,
+retry-driven rebind, and source/project close from managed work.
 
 If per-source drain progress must publish, it takes that accumulator then the writer
 and releases both before the next source. It is forbidden to acquire an accumulator
@@ -1550,9 +1554,10 @@ failure, or rollback after any side effect remains non-Current until verified
 promotion. A terminal proof that **no side effect began** permits the cheaper no-op
 verification candidate, but never direct restoration: it must validate the latest
 observer cut and monotonic mutation epoch and publish a fresh safety package.
-Close/rebind cannot install a successor while any publication-capable/InFlight permit
-remains in the predecessor Drain set. A revoked Granted deallocation-only handle may
-outlive the tombstone but cannot start, write, or publish.
+Close cannot terminalize, and rebind/replacement cannot install a successor, while any
+publication-capable/InFlight permit remains in the predecessor Drain set. A revoked
+Granted deallocation-only handle may outlive the tombstone but cannot start, write, or
+publish.
 
 Three operations are distinct:
 
@@ -2067,11 +2072,13 @@ Default policy:
 - Any SymForge-owned source mutation publishes `Refreshing` before its first repository
   disk side effect. Strict reads and checkpoints therefore cannot observe changed
   bytes while the old generation is still labeled Current.
-- `Refreshing`/`Blocked`: the retained verified generation remains internal recovery
-  material. Existing MCP, HTTP, resource, prompt, hook, and embed consumers do not
-  silently use it.
-- Negative/global absence claims always require `Current` complete generation
-  coverage. Disk observations can never establish them.
+- `Refreshing` retains exactly one verified generation; `Blocked` may retain zero or
+  one. Any retained generation remains internal recovery material. Existing MCP,
+  HTTP, resource, prompt, hook, and embed consumers do not silently use it.
+- Generation- or repository-wide negative/global absence claims always require
+  `Current` complete generation coverage. A final-parent-backed disk `PathMissing`
+  receipt may establish only path-local absence at its observation time; it can never
+  establish generation membership, completeness, or repository-wide absence.
 - Explicit worktree/Git tools may return typed observation/comparison/derivation
   claims; they
   may not borrow generation currentness or completeness.
@@ -2327,7 +2334,8 @@ usable. V11 proof is never interpreted as v10 authority.
 | Loader panic/cancellation | Lifecycle owner observes completion and schedules retry or Blocked; task-owned capacity releases only after actual allocations drop. |
 | Mutation permit panic/drop/failure after any side effect | Remain non-Current, retain tracked authority until terminal drop, and require verified candidate promotion; never infer rollback from bytes. |
 | Retarget proposal failure | Leave the existing session binding, observer, and Current generation untouched. |
-| Project rebind/close | Freeze gates, drain destructive/publication authority and callbacks, then install one never-reused successor. |
+| Project rebind | Freeze gates, drain destructive/publication authority and callbacks, then install one never-reused successor. |
+| Source/project close | Freeze gates, drain destructive/publication authority and callbacks, and terminalize without a successor; a later explicit reopen may mint one incomparable incarnation only after the close receipt is terminal. |
 | Same-path directory replacement | Immediately freeze old authority; drain before successor installation and never perform a path-based old-root write. |
 | Stale capacity grant/callback after revocation | Reject immutable slot/binding identity and refund exactly once outside lifecycle locks. |
 

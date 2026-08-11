@@ -16,7 +16,10 @@
 /mcps/
 
 npm/*.tgz
-.env
+.env*
+*.log
+*.py[cod]
+node_modules/
 spacetime/*/target/
 __pycache__/
 

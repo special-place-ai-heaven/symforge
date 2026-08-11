@@ -1,0 +1,18 @@
+[package]
+name = "symforge-public-api-v11-dependent-positive"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["server"]
+cbm-spike = ["symforge/cbm-spike"]
+embed = ["symforge/embed"]
+server = ["symforge/server"]
+
+[dependencies]
+symforge = { path = "../../../..", default-features = false }
+
+[lib]
+path = "src/lib.rs"
+

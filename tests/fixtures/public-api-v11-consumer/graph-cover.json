@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "kind": "symforge.public_api_v11_graph_cover_input",
+  "status": "pre_activation_required",
+  "graph_projections": {
+    "embed-v11": {
+      "included_modules": [
+        "symforge",
+        "symforge::embed"
+      ],
+      "excluded_modules": [
+        "symforge::server_api"
+      ]
+    },
+    "server-embed-v11": {
+      "included_modules": [
+        "symforge",
+        "symforge::embed",
+        "symforge::server_api"
+      ],
+      "excluded_modules": []
+    },
+    "server-v11": {
+      "included_modules": [
+        "symforge",
+        "symforge::server_api"
+      ],
+      "excluded_modules": [
+        "symforge::embed"
+      ]
+    }
+  },
+  "feature_vectors": [
+    {
+      "id": "embed",
+      "default_features": false,
+      "requested": ["embed"],
+      "resolved": ["embed"],
+      "disabled": ["cbm-spike", "server"]
+    },
+    {
+      "id": "embed-cbm-spike",
+      "default_features": false,
+      "requested": ["cbm-spike", "embed"],
+      "resolved": ["cbm-spike", "embed"],
+      "disabled": ["server"]
+    },
+    {
+      "id": "server",
+      "default_features": true,
+      "requested": ["server"],
+      "resolved": ["server"],
+      "disabled": ["cbm-spike", "embed"]
+    },
+    {
+      "id": "server-cbm-spike",
+      "default_features": true,
+      "requested": ["cbm-spike", "server"],
+      "resolved": ["cbm-spike", "server"],
+      "disabled": ["embed"]
+    },
+    {
+      "id": "server-embed",
+      "default_features": true,
+      "requested": ["embed", "server"],
+      "resolved": ["embed", "server"],
+      "disabled": ["cbm-spike"]
+    },
+    {
+      "id": "server-embed-cbm-spike",
+      "default_features": true,
+      "requested": ["cbm-spike", "embed", "server"],
+      "resolved": ["cbm-spike", "embed", "server"],
+      "disabled": []
+    }
+  ],
+  "targets": [
+    {
+      "id": "aarch64-apple-darwin",
+      "arch": "aarch64",
+      "os": "macos",
+      "env": "",
+      "family": ["unix"],
+      "vendor": "apple",
+      "pointer_width": 64,
+      "endian": "little",
+      "atomic_widths": ["128", "16", "32", "64", "8", "ptr"]
+    },
+    {
+      "id": "x86_64-apple-darwin",
+      "arch": "x86_64",
+      "os": "macos",
+      "env": "",
+      "family": ["unix"],
+      "vendor": "apple",
+      "pointer_width": 64,
+      "endian": "little",
+      "atomic_widths": ["128", "16", "32", "64", "8", "ptr"]
+    },
+    {
+      "id": "x86_64-pc-windows-msvc",
+      "arch": "x86_64",
+      "os": "windows",
+      "env": "msvc",
+      "family": ["windows"],
+      "vendor": "pc",
+      "pointer_width": 64,
+      "endian": "little",
+      "atomic_widths": ["128", "16", "32", "64", "8", "ptr"]
+    },
+    {
+      "id": "x86_64-unknown-linux-gnu",
+      "arch": "x86_64",
+      "os": "linux",
+      "env": "gnu",
+      "family": ["unix"],
+      "vendor": "unknown",
+      "pointer_width": 64,
+      "endian": "little",
+      "atomic_widths": ["16", "32", "64", "8", "ptr"]
+    },
+    {
+      "id": "x86_64-unknown-linux-musl",
+      "arch": "x86_64",
+      "os": "linux",
+      "env": "musl",
+      "family": ["unix"],
+      "vendor": "unknown",
+      "pointer_width": 64,
+      "endian": "little",
+      "atomic_widths": ["16", "32", "64", "8", "ptr"]
+    }
+  ],
+  "cells": [
+    {"id": "aarch64-apple-darwin__embed", "target": "aarch64-apple-darwin", "feature_vector": "embed", "expected_graph": "embed-v11"},
+    {"id": "aarch64-apple-darwin__embed-cbm-spike", "target": "aarch64-apple-darwin", "feature_vector": "embed-cbm-spike", "expected_graph": "embed-v11"},
+    {"id": "aarch64-apple-darwin__server", "target": "aarch64-apple-darwin", "feature_vector": "server", "expected_graph": "server-v11"},
+    {"id": "aarch64-apple-darwin__server-cbm-spike", "target": "aarch64-apple-darwin", "feature_vector": "server-cbm-spike", "expected_graph": "server-v11"},
+    {"id": "aarch64-apple-darwin__server-embed", "target": "aarch64-apple-darwin", "feature_vector": "server-embed", "expected_graph": "server-embed-v11"},
+    {"id": "aarch64-apple-darwin__server-embed-cbm-spike", "target": "aarch64-apple-darwin", "feature_vector": "server-embed-cbm-spike", "expected_graph": "server-embed-v11"},
+    {"id": "x86_64-apple-darwin__embed", "target": "x86_64-apple-darwin", "feature_vector": "embed", "expected_graph": "embed-v11"},
+    {"id": "x86_64-apple-darwin__embed-cbm-spike", "target": "x86_64-apple-darwin", "feature_vector": "embed-cbm-spike", "expected_graph": "embed-v11"},
+    {"id": "x86_64-apple-darwin__server", "target": "x86_64-apple-darwin", "feature_vector": "server", "expected_graph": "server-v11"},
+    {"id": "x86_64-apple-darwin__server-cbm-spike", "target": "x86_64-apple-darwin", "feature_vector": "server-cbm-spike", "expected_graph": "server-v11"},
+    {"id": "x86_64-apple-darwin__server-embed", "target": "x86_64-apple-darwin", "feature_vector": "server-embed", "expected_graph": "server-embed-v11"},
+    {"id": "x86_64-apple-darwin__server-embed-cbm-spike", "target": "x86_64-apple-darwin", "feature_vector": "server-embed-cbm-spike", "expected_graph": "server-embed-v11"},
+    {"id": "x86_64-pc-windows-msvc__embed", "target": "x86_64-pc-windows-msvc", "feature_vector": "embed", "expected_graph": "embed-v11"},
+    {"id": "x86_64-pc-windows-msvc__embed-cbm-spike", "target": "x86_64-pc-windows-msvc", "feature_vector": "embed-cbm-spike", "expected_graph": "embed-v11"},
+    {"id": "x86_64-pc-windows-msvc__server", "target": "x86_64-pc-windows-msvc", "feature_vector": "server", "expected_graph": "server-v11"},
+    {"id": "x86_64-pc-windows-msvc__server-cbm-spike", "target": "x86_64-pc-windows-msvc", "feature_vector": "server-cbm-spike", "expected_graph": "server-v11"},
+    {"id": "x86_64-pc-windows-msvc__server-embed", "target": "x86_64-pc-windows-msvc", "feature_vector": "server-embed", "expected_graph": "server-embed-v11"},
+    {"id": "x86_64-pc-windows-msvc__server-embed-cbm-spike", "target": "x86_64-pc-windows-msvc", "feature_vector": "server-embed-cbm-spike", "expected_graph": "server-embed-v11"},
+    {"id": "x86_64-unknown-linux-gnu__embed", "target": "x86_64-unknown-linux-gnu", "feature_vector": "embed", "expected_graph": "embed-v11"},
+    {"id": "x86_64-unknown-linux-gnu__embed-cbm-spike", "target": "x86_64-unknown-linux-gnu", "feature_vector": "embed-cbm-spike", "expected_graph": "embed-v11"},
+    {"id": "x86_64-unknown-linux-gnu__server", "target": "x86_64-unknown-linux-gnu", "feature_vector": "server", "expected_graph": "server-v11"},
+    {"id": "x86_64-unknown-linux-gnu__server-cbm-spike", "target": "x86_64-unknown-linux-gnu", "feature_vector": "server-cbm-spike", "expected_graph": "server-v11"},
+    {"id": "x86_64-unknown-linux-gnu__server-embed", "target": "x86_64-unknown-linux-gnu", "feature_vector": "server-embed", "expected_graph": "server-embed-v11"},
+    {"id": "x86_64-unknown-linux-gnu__server-embed-cbm-spike", "target": "x86_64-unknown-linux-gnu", "feature_vector": "server-embed-cbm-spike", "expected_graph": "server-embed-v11"},
+    {"id": "x86_64-unknown-linux-musl__embed", "target": "x86_64-unknown-linux-musl", "feature_vector": "embed", "expected_graph": "embed-v11"},
+    {"id": "x86_64-unknown-linux-musl__embed-cbm-spike", "target": "x86_64-unknown-linux-musl", "feature_vector": "embed-cbm-spike", "expected_graph": "embed-v11"}
+  ],
+  "graph_equivalence_pairs": [
+    ["embed", "embed-cbm-spike"],
+    ["server", "server-cbm-spike"],
+    ["server-embed", "server-embed-cbm-spike"]
+  ],
+  "completeness_sentinels": [
+    {"id": "target-only", "source": "all-cfg/src/lib.rs", "required_symbols": ["Aarch64Only", "LinuxOnly", "MacosOnly", "WindowsOnly"]},
+    {"id": "negative-cfg", "source": "all-cfg/src/lib.rs", "required_symbols": ["NoAtomic128", "NotServer", "PureEmbed"]},
+    {"id": "trait-impl", "source": "all-cfg/src/lib.rs", "required_symbols": ["CompletenessTrait for CompletenessSubject"]},
+    {"id": "associated-item", "source": "all-cfg/src/lib.rs", "required_symbols": ["CompletenessTrait::MARKER", "CompletenessTrait::Output", "CompletenessTrait::apply"]},
+    {"id": "auto-trait", "source": "all-cfg/src/lib.rs", "required_symbols": ["CompletenessAutoTraits", "CompletenessNotSendSync"]},
+    {"id": "macro-export", "source": "all-cfg/src/lib.rs", "required_symbols": ["completeness_exported_macro"]}
+  ],
+  "proof_facts": {
+    "assignment_proof_sha256": null,
+    "predicate_inventory_sha256": null,
+    "rustdoc_graph_set_sha256": null
+  }
+}

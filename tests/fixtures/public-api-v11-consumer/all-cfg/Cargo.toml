@@ -1,0 +1,15 @@
+[package]
+name = "symforge-public-api-v11-all-cfg-completeness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["server"]
+cbm-spike = []
+embed = []
+server = []
+
+[lib]
+path = "src/lib.rs"
+

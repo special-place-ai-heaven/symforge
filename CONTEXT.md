@@ -278,7 +278,7 @@ restart. It may affect ordering only; it
 cannot establish source truth, readiness, or absence.
 
 **Atomic authority** — The provenance of one primitive **source-truth** fact: `Generation`,
-`DiskObservation` (bytes or metadata), `WorktreeScopeObservation` (one complete
+`DiskObservation` (bytes, metadata, or final-parent-backed `PathMissing`), `WorktreeScopeObservation` (one complete
 root-bound scan interval), or `GitObservation` (object membership or non-membership).
 Generation authority includes the full never-reused binding authority. It never
 silently changes lanes.
@@ -320,10 +320,12 @@ proves which consistent set was approved. Any coordinated rewrite therefore requ
 a new reviewed approval record rather than passing by rewriting its own anchor.
 
 **Disk observation** — One root-bound receipt containing binding/physical-root
-identity, path, observation time, and either stable-read byte identity or metadata
-evidence from a beneath-confined pinned file/final-parent handle. It may report the
-bytes or facts actually observed, but never generation membership, repository
-completeness, or repository-wide absence. Path-only fallback is not this authority.
+identity, path, observation time, and either stable-read byte identity, metadata, or
+`PathMissing` evidence from a beneath-confined pinned file/final-parent handle.
+`PathMissing` proves only that named path was absent from that validated parent at the
+observation time. A disk receipt may report the bytes or facts actually observed, but
+never generation membership, repository completeness, or repository-wide absence.
+Path-only fallback is not this authority.
 
 **Worktree scope observation** — One binding/root-bound, policy-versioned receipt for
 a complete authoritative enumeration performed over a named scan interval. It proves

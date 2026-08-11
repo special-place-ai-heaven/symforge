@@ -1,9 +1,133 @@
 # Feature Specification: Repository Knowledge Index
 
-**Feature Branch**: `feat/repository-knowledge-index`
+**Feature Branch**: `design/project-activation-prevention`
 **Created**: 2026-07-16
-**Status**: Frozen — scoped adversarial verification passed 2026-07-17
+**Status**: V11 refreeze candidate — lifecycle-prevention design cleared 2026-08-11; implementation remains gated by the refreeze approval record
 **Input**: User requirement for a live, in-memory, repository-wide knowledge retrieval lane that remains separate from code intelligence and cannot be stalled by pathological files.
+
+## V11 lifecycle-prevention amendment
+
+This refreeze supersedes the V10 publication/readiness semantics wherever they
+conflict with the rules below. Historical review receipts remain evidence of the
+work performed, but they do not authorize a V11 implementation.
+
+1. `Current` is the only generation-queryable source state. `Loading` retains no
+   generation; `Refreshing` retains exactly one verified generation, while `Blocked`
+   and `Stopping` may retain zero or one. Any retained `VerifiedGeneration` is
+   immutable recovery evidence and never a public degraded or last-valid query lane.
+2. Cold placeholders, snapshot seeds, candidates, capacity-refused attempts, and
+   failed observations cannot mint query authority. They expose a closed
+   `SourceRefusal` with safe diagnostics until one complete generation promotes.
+3. Promotion requires a complete canonical manifest and complete certificates for
+   every advertised strict scope. `Unreadable`, `UnstableDuringRead`,
+   `AbortedCircuitBreaker`, `ParseStatus::Failed`, strict-scope `PartialParse`, an
+   observer gap, overdue proof, incomplete discovery, or truncated required
+   derivation rejects and discards the candidate; required truncation remains
+   bounded attempt-only evidence, is never queryable, and never mutates the retained
+   generation.
+4. Circuit-breaker and resource-admission failures produce bounded
+   `AttemptAccounting`, cancel/discard the candidate, and publish non-current work
+   state. Attempt data cannot populate committed manifest, digest, coverage, or
+   source-truth fields.
+5. Every generation-backed MCP tool, resource, prompt, hook, sidecar route, CCR,
+   checkpoint, snapshot read, and V11 embed operation acquires strict leases through
+   the same lifecycle Interface. A complete no-match claim requires one `Current`
+   lease for every source in its sealed selection receipt. Pure `DiskObservation`,
+   complete `WorktreeScopeObservation`, `GitObservation`, and runtime health remain
+   independently authoritative while a source is non-Current. `DiskObservation` may
+   prove path-local `PathMissing`, `WorktreeScopeObservation` may prove completeness
+   of its one sealed declared scope/interval, and `GitObservation` may prove
+   `NotInTree` for one exact tree. None may claim generation membership, generation
+   completeness, or unqualified repository-wide absence. A mixed lane requires one
+   operation-specific, identity-compatible `ClaimContext` naming every authority
+   input.
+6. `authority_scope` is a `KnowledgeVoiceFilter` inside the selected current
+   generation. It cannot select generation consistency; the wire value `current`
+   means the current-implementation voice, not lifecycle `Current`.
+7. Persistence health is orthogonal to source truth: a durability failure alone
+   does not revoke a valid `Current` generation. Missing/gapped observation,
+   incomplete baseline, unknown ordering, or an overdue verification obligation
+   does revoke strict acquisition synchronously.
+8. V11 activates once, across every entry path, only after the refreeze manifest,
+   detached attestation, externally anchored approval, closed public-API manifest,
+   causal RED oracles, capacity proof, and `ObservedRefreshGateV1` pass. No
+   default-on refusal-per-edit intermediate or legacy/raw embed fallback ships.
+
+Every SymForge-owned repository-content write, including curation and root-ignore
+hygiene, obtains one non-cloneable `SourceMutationPermit`. Grant publishes
+non-Current before any side effect; all destructive path resolution and I/O is
+component-confined and handle-relative through the permit's pinned
+`PhysicalRootLease`. Commit, failure, rollback, and a valid no-side-effect proof can
+return the binding to `Current` only through a fresh complete candidate at the latest
+observer cut. State-directory persistence writes remain outside source-content
+mutation authority and do not revoke `Current` by themselves. A cold/pending
+`index_folder`, project-aware init, or restart path is read-only and cannot mint a
+permit: it must first promote one complete Current generation. Only a fresh permit
+granted after that promotion may authorize pre-image retry/cleanup/probe or source-
+byte I/O. If recovery observes the exact post-image, finalizing its completion record
+under `ProjectStateDir` is persistence-only and requires no source permit.
+
+### Amendment traceability clauses
+
+- **F020-V11-A01 — runtime failure, not degraded generation**: Failure publishes a
+  closed non-current runtime state; retained generation bytes and identity do not
+  change. Regression: `F020-V11-R01`.
+- **F020-V11-A02 — cold start is nonqueryable**: `retained=None` plus a placeholder,
+  seed, refusal, or build cannot grant a lease. Regression: `F020-V11-R02`.
+- **F020-V11-A03 — generation consumers are strict-current**: Every existing
+  generation-backed surface uses the same strict acquisition Interface. Health and
+  pure disk/worktree-scope/Git observations use their own typed authority, including
+  legal path-local `PathMissing`, sealed-scope completeness, and exact-tree
+  `NotInTree`; every mixed response uses a compatible `ClaimContext`. Regression:
+  `F020-V11-R03`.
+- **F020-V11-A04 — promotion completeness matrix**: Every observation and artifact
+  required by the advertised strict scope must be complete. Regression:
+  `F020-V11-R04`.
+- **F020-V11-A05 — certificates never authorize partial promotion**: A capability
+  certificate attests one complete generation or the capability is not advertised.
+  Regression: `F020-V11-R05`.
+- **F020-V11-A06 — circuit-breaker candidate discard**: A trip cancels and discards
+  the candidate without a canonical manifest. Regression: `F020-V11-R06`.
+- **F020-V11-A07 — trust-first availability**: One bad file may make the source
+  unavailable, but cannot publish partial, stale, or mixed state. Regression:
+  `F020-V11-R07`.
+- **F020-V11-A08 — attempt accounting is noncanonical**: Aborted/refused attempts
+  expose bounded diagnostics with no manifest/digest/completeness authority.
+  Regression: `F020-V11-R08`.
+- **F020-V11-A09 — partial parse is not strict code truth**: `PartialParse` and
+  `Failed` remain attempt diagnostics and cannot promote strict code scope.
+  Regression: `F020-V11-R09`.
+- **F020-V11-A10 — derived work is promotion-bound**: Required temporal, bridge,
+  authority, and mental-model artifacts complete inside the candidate. Regression:
+  `F020-V11-R10`.
+- **F020-V11-A11 — required truncation blocks promotion**: Required derived
+  truncation discards the candidate, remains attempt-only, and is never queryable,
+  cached, persisted, or CCR-addressable. Truncation is permitted only when rendering
+  a response after a complete lease. Regression: `F020-V11-R11`.
+- **F020-V11-A12 — protected-root readiness survives**: An authorized protected root
+  may reach Current through user-local/memory-only placement with zero state/probe I/O
+  beneath the source root. Regression: `F020-V11-R12`.
+- **F020-V11-A13 — no-match needs an all-Current selection**: Global absence requires
+  a sealed selection/generation bijection; otherwise return per-source refusal.
+  Regression: `F020-V11-R13`.
+- **F020-V11-A14 — first contact needs Current evidence**: A map/orientation cannot
+  omit an unavailable selected source or convert it into missing-role evidence.
+  Regression: `F020-V11-R14`.
+- **F020-V11-A15 — manifest equality is committed-only**: SC-002 applies only to a
+  promoted Current manifest; attempt accounting has its own invariant. Regression:
+  `F020-V11-R15`.
+- **F020-V11-A16 — health separates truth from attempts**: Committed-generation and
+  attempt-diagnostic fields cannot populate one another. Regression:
+  `F020-V11-R16`.
+- **F020-V11-A17 — durability is orthogonal, observation is not**: Persistence-only
+  failure preserves Current; gap/unknown/overdue observation revokes it. Regression:
+  `F020-V11-R17`.
+- **F020-V11-A18 — observed refresh activation gate**: Delta equivalence, latency,
+  convergence, and charged peak residency pass in the indivisible activation cut.
+  Regressions: `F020-V11-R18A`, `F020-V11-R18B`, `F020-V11-R18C`.
+- **F020-V11-A19 — strict refusal plus voice-only authority scope**: The four public
+  contracts use `SourceRefusal`; `authority_scope` is only `KnowledgeVoiceFilter`.
+  Regressions: `F020-V11-R19A`, `F020-V11-R19B`.
 
 ## Problem statement
 
@@ -68,8 +192,13 @@ current code evidence.
   accessible project without restarting the harness.
 - Explicit `index_folder` binding and project-aware init idempotently add canonical
   `/.symforge/` only when a normal repository root already has `.gitignore`. They
-  never create it. Automatic startup, scout, watcher, and reconciliation remain
-  read-only; all indexing hard-excludes runtime state regardless of ignore hygiene.
+  never create it. Cold admission, observer installation, discovery, and first
+  candidate construction are read-only and must promote a complete Current generation
+  before ignore hygiene may request a fresh `SourceMutationPermit`. The write-capable
+  phase then publishes non-Current before side effects and returns through a fresh
+  candidate even when final revalidation proves no write occurred. Automatic startup,
+  scout, watcher, and reconciliation remain read-only; all indexing hard-excludes
+  runtime state regardless of ignore hygiene.
 
 ## User Scenarios & Testing
 
@@ -82,7 +211,7 @@ or parse them, and still indexes the useful source and knowledge.
 
 **Independent Test**: Create a sparse artifact larger than the existing global
 byte limit beside one Rust file and one README. Instrument content reads. Indexing
-must reach Ready, the artifact must receive exactly one hard-skip/catalog-only
+must reach lifecycle `Current`, the artifact must receive exactly one hard-skip/catalog-only
 disposition with zero full reads and zero admitted-byte charge, and both useful
 files must be queryable in their respective scopes.
 
@@ -94,18 +223,19 @@ files must be queryable in their respective scopes.
    admitted-byte ceiling, **Then** only catalog entry/metadata ceilings apply; file
    payload sizes consume no catalog-metadata or admitted-byte budget.
 3. **Given** a content-ingest candidate over the admitted-byte ceiling, **When**
-   the scout finalizes the manifest, **Then** the next generation is refused or
-   degraded explicitly while the previous valid generation remains intact.
+   admission accounts the candidate, **Then** no canonical manifest is minted,
+   the candidate is discarded, strict acquisition is refused with a typed capacity
+   cause, and any retained verified generation remains byte-identical and non-current.
 4. **Given** unavailable metadata, **When** the scout evaluates a path, **Then**
    size never defaults to zero; the path receives an explicit unavailable issue.
 5. **Given** a repository over the catalog-entry ceiling, **When** scouting
-   reaches the bound, **Then** the candidate generation is refused/degraded with
-   incomplete coverage and the previous valid generation remains intact; a
-   truncated manifest is never labeled complete.
+   reaches the bound, **Then** attempt accounting records the refusal, no candidate
+   generation or truncated manifest can promote, and any retained verified
+   generation remains internal and non-current.
 6. **Given** paths or diagnostics whose bounded descriptors would exceed the
    catalog-metadata ceiling, **When** scouting reaches the bound, **Then** the
-   observation is refused/degraded exactly like an entry-ceiling failure; it never
-   publishes partial coverage as a canonical manifest.
+   observation is refused exactly like an entry-ceiling failure; it never publishes
+   partial coverage as a canonical manifest or a degraded generation.
 7. **Given** an LLM harness launched from a home/profile, filesystem root, or OS
    directory, **When** startup root resolution runs, **Then** no scout/watcher/
    snapshot/candidate-root or per-project state creation begins; SymForge stays
@@ -131,26 +261,33 @@ files must be queryable in their respective scopes.
 
 ### User Story 2 — Every in-scope file has an explainable disposition (Priority: P0 — TRUST)
 
-An operator can account for every path SymForge saw, including indexed content,
-metadata-only files, hard skips, unreadable files, unstable files, and work
-aborted by the parser circuit breaker. No walker/read/parser failure silently
-removes a path from health or recovery state.
+An operator can account for every path SymForge saw. A promoted manifest contains
+only indexed content and complete metadata-only/hard-skip terminal dispositions;
+unreadable, unstable, partial/failed parse, and circuit-breaker-aborted paths appear
+only in bounded attempt health. No walker/read/parser failure silently disappears or
+enters committed-generation equality.
 
-**Independent Test**: Build a fixture containing one file for each terminal state,
-inject a walk/read failure, and trip the circuit breaker. Assert one and only one
-    terminal disposition per path in a complete observation and the published
-    health equality:
+**Independent Test**: Build a fixture containing one file for each promotable
+terminal disposition and assert one and only one disposition per path in a complete
+promoted observation:
 
 ```text
-indexed + metadata_only + hard_skip + unreadable + unstable + aborted
+indexed + metadata_only + hard_skip
     == discovered_catalog_entries
 ```
 
+Separately inject walk/read instability, partial/failed parse, and a circuit-breaker
+trip; assert the candidate is discarded and each path remains in bounded
+`AttemptAccounting` with no committed manifest, digest, equality, or query authority.
+
 **Acceptance Scenarios**:
 
-1. Walker errors create bounded diagnostics and degraded coverage, never omission.
-2. Read failures become `Unreadable`; they do not disappear through `filter_map`.
-3. Parse results after a circuit-breaker trip become `AbortedCircuitBreaker`.
+1. Walker errors create bounded attempt diagnostics and prevent candidate promotion;
+   they never become omissions or committed degraded coverage.
+2. Read failures become attempt disposition `Unreadable`, prevent strict-scope
+   promotion, and do not disappear through `filter_map`.
+3. Parse results after a circuit-breaker trip become bounded attempt disposition
+   `AbortedCircuitBreaker`; the candidate and its would-be manifest are discarded.
 4. Canonical path ordering uses `(case-folded path, exact original path bytes)`;
    case-fold collisions remain distinct, receive a bounded issue, and never fail
    the unrelated repository. A path unsafe for a platform is catalog-only with
@@ -184,8 +321,10 @@ must not return Markdown section symbols/content for that query.
 4. Prose never appears in code-scoped symbol/reference answers.
 5. Results are bounded/diversified and retain provenance when output is truncated
    or moved behind CCR retrieval.
-6. No-match distinguishes complete no-evidence, degraded coverage, and evidence
-   withheld by security policy.
+6. A no-match result is `no_evidence_complete` only when a sealed selection receipt
+   has one `Current` lease for every selected source. Any non-current selected source
+   returns `SourceRefusal::SelectionUnavailable`; security withholding remains a
+   distinct, explicitly attributed outcome and cannot establish absence.
 
 ---
 
@@ -213,28 +352,36 @@ disappear. No stale result may claim complete/current coverage between changes.
    policy/topology changes trigger full manifest reconciliation.
 6. Reconciliation discovers creates/deletes/renames and is idempotent for equal
    complete canonical manifests.
-7. Degraded coverage schedules bounded reconciliation with backoff until it
-   converges to Complete or remains explicitly degraded; equal entry digests do
-   not suppress recovery while coverage is degraded. A later watcher overflow,
-   access-state change, policy/topology change, or other uncertainty signal always
-   re-triggers repair; explicit degradation is never a silent permanent stop.
-8. A failed observation may retain last-valid bytes only behind a degraded wrapper
-   with distinct publication/content generations; it cannot serve them as current.
+7. Incomplete observation publishes a non-current work state and schedules bounded
+   supervised reconciliation with backoff; equal entry digests do not suppress the
+   required proof. A later watcher overflow, access-state change, policy/topology
+   change, or uncertainty signal always re-triggers authoritative observation.
+8. A failed generation- or candidate-critical observation leaves any retained verified
+   generation byte-identical and internal. Every generation-backed public consumer
+   receives `SourceRefusal` until a complete successor generation promotes. Pure
+   root-bound disk, complete worktree-scope, Git, and runtime-health observations
+   remain available only under their own non-generation authority; their own failure
+   returns typed refusal without changing lifecycle state unless it independently
+   proves observer-seam invalidation.
 
 ---
 
 ### User Story 5 — Restart and recovery preserve the same truth (Priority: P0 — RECOVERY)
 
-SymForge may load a local snapshot to reduce work, but it does not report Ready
+SymForge may load a local snapshot to reduce work, but it does not publish `Current`
 until the current repository/source identity, scope, and admitted content have been
 verified. A
 snapshot round trip preserves catalog dispositions, targets, knowledge results,
 and source identity. Corrupt or incompatible state is quarantined.
 
-**Independent Test**: Index Tier-1, metadata-only, hard-skip, generic prose, and
-unreadable fixture paths; checkpoint; restart; verify unchanged disk. Before and
-after state must have the same canonical manifest and query results. Verification
-must not fully read the metadata-terminal artifacts.
+**Independent Test**: Index Tier-1, metadata-only, hard-skip, and generic prose
+fixtures whose required reads all succeed; checkpoint, restart, and verify unchanged
+disk. Before and after state must have the same canonical manifest and query results.
+Verification must not fully read metadata-terminal artifacts. Separately make one
+required path unreadable during source build or snapshot verification: the candidate
+must be discarded, any retained generation stays internal/non-current, and strict
+acquisition refuses. Restore access and prove bounded re-observation promotes a fresh
+complete candidate with source-build/snapshot parity.
 
 **Acceptance Scenarios**:
 
@@ -247,10 +394,15 @@ must not fully read the metadata-terminal artifacts.
 4. Verification uses the shared scout/admission/stable-read pipeline.
 5. Replacing a repository at the same path rejects/quarantines the prior snapshot
    rather than inheriting it through an unchanged placement key.
-6. A verifier captured for source/generation A cannot mutate source/generation B.
-7. Failed rebuild/verification leaves the last valid published generation intact.
-8. Readers observe one consistent root/generation across live content, catalog,
-   knowledge, health, and outline.
+6. A verifier captured with `SourcePublicationToken` and `GenerationAuthority` for A
+   cannot mutate B even when their numeric diagnostic epochs are equal. Numeric
+   binding/publication/content/project epochs are health evidence only and never a
+   verifier fence.
+7. Failed rebuild/verification leaves the retained verified generation intact and
+   non-current; strict acquisition refuses until a complete successor promotes.
+8. Readers capture one `ProjectRuntimePublication` root and the exact selected
+   `GenerationAuthority` values across live content, catalog, knowledge, health, and
+   outline; no second ArcSwap or diagnostic counter participates.
 
 ---
 
@@ -276,10 +428,12 @@ both sources without duplicate parsing, and rank the current worktree first.
 5. Ref movement/topology changes reconcile source mappings deterministically.
 6. Reflogs, stashes, deleted refs, submodule contents, and remote-only refs are
    out of v1 scope and reported as such.
-7. Each source owns an immutable manifest/generation. An all-source query snapshots
-   the existing project/worktree registry and captures each selected immutable
-   source set at query start; it reports coverage, digest, and generation per
-   source, with overall coverage equal to the worst member.
+7. Each source owns an immutable manifest/generation. A generation-backed all-source
+   query acquires one sealed selection with an exact bijection to `Current`
+   generation leases; any non-Current member returns `SourceRefusal` and no partial
+   aggregate. A pure Git-object observation may still succeed independently with
+   `GitObservation`, but it cannot establish generation membership/completeness or
+   repository-wide absence; exact-tree `NotInTree` remains legal.
 8. Local-ref ingestion is P1 and independently bounded. Failure or memory pressure
    in that lane cannot block current-worktree P0 readiness.
 
@@ -321,9 +475,10 @@ plans, and handoffs. Every item is exact source evidence, not a generated summar
 **Independent Test**: On this repository, one bounded `get_repo_map`/`ask`
 orientation call returns the AGENTS architecture/mission, ownership/governance
 artifacts when present, current SpecKit/plan entry points, recovery invariants, and
-existing code hotspot signals with file/line/source/generation pointers. It also
-states unavailable/degraded sources and facets with no declared evidence; it does
-not invent owners, active status, or architecture conclusions.
+existing code hotspot signals with file/line/source/generation pointers. It refuses
+with per-source evidence when any selected source is non-current; from a complete
+Current selection it may state facets with no declared evidence but does not invent
+owners, active status, or architecture conclusions.
 
 **Acceptance Scenarios**:
 
@@ -337,8 +492,9 @@ not invent owners, active status, or architecture conclusions.
    status/ownership is `unknown`, never inferred.
 5. Divergent worktree/ref variants remain separate cards. “Conflict” means
    multiple source variants, not a semantic claim that one is wrong.
-6. Coverage, withheld/unreadable counts, freshness, and missing-role evidence are
-   visible in the same bounded response.
+6. Coverage and policy-withheld counts are visible in the same bounded response only
+   from a complete Current selection. Attempt/unreadable diagnostics appear in a
+   `SourceRefusal`, never as missing-role evidence in a successful orientation.
 7. Building the outline stores references to existing indexed spans/content; it
    never persists generated summaries or duplicate document bodies.
 8. The bridge resolves only explicit source evidence—repository links/paths,
@@ -385,8 +541,8 @@ historical scope can still retrieve them.
 4. Explicitly archived/superseded and code-diverged current-implementation units
    are excluded from default current voice. Intent remains visible but labeled;
    history requires an explicit authority scope.
-5. `review_knowledge` returns document/source/content generation, last-change
-   evidence and history coverage, relevant code changes, exact bridge anchors,
+5. `review_knowledge` returns the document/source `GenerationAuthority` and content
+   identity, last-change evidence and history coverage, relevant code changes, exact bridge anchors,
    inbound links, confidence basis, and the smallest proposed action.
 6. Remediation actions are `keep`, `update`, `relabel_intent`, `merge`,
    `mark_superseded`, `archive`, `deletion_candidate`, or `needs_review`. Age alone
@@ -401,11 +557,15 @@ historical scope can still retrieve them.
    current manifest and per-file hashes, an idempotency key, and current-worktree
    routing. It is available only with durable per-project replay and atomic durable
    ledger replacement; it never mutates a local ref or another worktree implicitly.
+   The write-capable phase must hold one `SourceMutationPermit`, publish non-Current
+   before I/O, and perform confined handle-relative replacement through that
+   permit's pinned root.
 10. Archive/supersede apply changes only the repo policy ledger. Physical move or
     deletion is proposal-only in this feature and requires a separate user-approved
     repository edit outside the hygiene tool.
 11. The evidence bridge, authority view, and reverse backlinks rebuild inside the
-    same atomic source publication as code and knowledge changes.
+    same complete successor candidate as code and knowledge changes. Commit, failure,
+    rollback, and no-side-effect terminal paths cannot restore `Current` directly.
 12. A `symforge-knowledge-hygiene` prompt exposes the read-review-approve-apply
     workflow to agents and users; it cannot silently cross the approval boundary.
 
@@ -448,12 +608,12 @@ historical scope can still retrieve them.
   admitted-content bytes MUST be independent; metadata-terminal payload sizes MUST
   consume zero admitted bytes and only bounded path/descriptor metadata. Exhausting
   the catalog-entry or catalog-metadata budget MUST abort the candidate observation
-  before a `RepositoryManifest` exists; no partial manifest may publish. A previously
-  valid generation remains queryable only behind the degraded wrapper of FR-009,
-  while cold start remains non-Ready with a typed capacity reason and zero queryable
-  partial generation. The exact reasons are `CatalogEntryCapacityExceeded` and
-  `CatalogMetadataCapacityExceeded`; budget-attempt issues never form a published
-  partial manifest.
+  before a `RepositoryManifest` exists; no partial manifest may publish. A retained
+  verified generation remains byte-identical and non-current, while cold start stays
+  non-queryable. Strict acquisition returns a typed capacity refusal. The exact
+  reasons are `CatalogEntryCapacityExceeded` and
+  `CatalogMetadataCapacityExceeded`; budget-attempt issues remain bounded
+  `AttemptAccounting` and never form a published manifest.
 - **FR-005**: Bounded probe and full-read ceilings MUST be explicit and enforced
   before allocation/read; a read larger than the total in-flight budget MUST become
   terminal `HardSkip(PerFileCeiling)`. No archive/model/database deserialization is allowed.
@@ -461,45 +621,56 @@ historical scope can still retrieve them.
   bytes receive a computed hash and become queryable. Filesystem admission MUST
   compare two bounded reads/hashes (second pass may stream) plus stable metadata,
   retrying finitely before `UnstableDuringRead`.
-- **FR-007**: Walker/read/parser/circuit-breaker failures MUST remain accounted for
-  with bounded non-sensitive diagnostics. Canonical parse status MUST be the closed
+- **FR-007**: Walker/read/parser/circuit-breaker failures MUST remain in bounded,
+  non-sensitive attempt accounting. Canonical parse status MUST be the closed
   `Parsed`/`PartialParse`/`Failed` enum; diagnostic text is operational only and
-  cannot enter the manifest digest. Circuit breakers MUST be scoped per source,
-  ingestion lane, and stage; a trip degrades only that scope and schedules repair.
-- **FR-008**: A complete generation MUST atomically publish live content, catalog,
-  code/knowledge targets, derived search state, health, outline, source identity,
-  captured source version (including closed working-tree state), and project
-  generation. Every lane MUST commit under one per-`ProjectInstance` writer boundary,
-  copy the current source map under that lock, replace only its own source entry, and
-  swap once. A long off-lock build whose own source base changed MUST rebase/retry or
-  abort; another source's registry swap MUST NOT invalidate or starve it. P1-only
-  publication MUST NOT advance the current worktree's publication/content/project
-  generations. No lane may check-then-swap stale map state.
-- **FR-009**: A failed next content build MUST NOT modify the previous valid
-  content generation. It MUST atomically publish a degraded freshness wrapper that
-  references last-valid content, advances only publication generation, and cannot
-  label that evidence current.
+  cannot enter the manifest digest. `Unreadable`, `UnstableDuringRead`,
+  `AbortedCircuitBreaker`, `Failed`, or strict-code-scope `PartialParse` rejects and
+  discards the candidate. Circuit breakers remain scoped for cancellation and
+  diagnosis, but no aborted scope may publish a degraded generation.
+- **FR-008**: `ArcSwap<ProjectRuntimePublication>` MUST be the sole query/publication
+  root. One immutable whole-project root contains membership plus every source's
+  closed runtime state; a complete source generation contains live content, catalog,
+  code/knowledge targets, derived search state, health evidence, outline, source
+  identity, and captured source version (including closed working-tree state). Every
+  lane prepares a sealed source delta off-lock, then under the one per-
+  `ProjectInstance` writer exact-matches its expected source publication against the
+  latest whole root, patches only that source entry, preserves every latest sibling,
+  mints a new never-reused `ProjectRuntimePublication` identity, and performs one
+  ArcSwap store. A long build whose own source base changed MUST rebase/retry or abort;
+  an unrelated sibling update MUST NOT invalidate it. Updating a P1 sibling therefore
+  advances the whole-project publication identity while leaving the unchanged current
+  worktree's exact `GenerationAuthority` untouched. Numeric publication/content/
+  project generations and epochs are diagnostic only and MUST NOT fence, authorize,
+  or identify publication. No lane may read or swap a second public root, compose a
+  hybrid view, or check-then-swap stale map state.
+- **FR-009**: A failed next build MUST NOT modify the retained verified generation.
+  The lifecycle owner MUST publish a closed non-current runtime state with bounded
+  attempt diagnostics and `SourceRefusal`; retained content remains internal and no
+  public consumer may acquire or label it as current.
 - **FR-010**: Watcher single-path updates MUST use the shared scout/admission/read
   logic and MUST update/remove all lanes atomically.
 - **FR-011**: Reconciliation MUST diff complete manifests, not only Tier-1 paths,
-  and MUST be authoritative after missed/ambiguous watcher state. Degraded walks
-  MUST retry with bounded backoff and cannot use equal-digest as a no-op. Any
-  `Unreadable`/`UnstableDuringRead` entry makes coverage Degraded and retains a
-  bounded re-observation trigger until it is replaced by a stable disposition. A
-  later uncertainty signal MUST restart repair even after bounded backoff has
-  settled into explicit degradation.
+  and MUST be authoritative after missed/ambiguous watcher state. Incomplete walks
+  publish non-current work state, retry under lifecycle-owned bounded supervision,
+  and cannot use equal-digest as a no-op. An `Unreadable` or
+  `UnstableDuringRead` observation prevents promotion and retains an independent
+  re-observation trigger. A later uncertainty signal MUST restart repair; no bounded
+  retry exhaustion may silently convert incomplete evidence into Current.
 - **FR-012**: Snapshots MUST persist/restore the canonical manifest and dispositions,
   and verification MUST use shared policy with source/generation fencing. Each
   candidate MUST carry and verify a strong `SnapshotSourceIdentity` comprising
   project, repository, stable source location, source version, manifest digest,
   indexed-content digest, and available Git-history fingerprint. Path placement or
-  `ProjectId` alone MUST NOT authorize Ready, overwrite, or restore; a different
+  `ProjectId` alone MUST NOT authorize lifecycle `Current`, overwrite, or restore; a different
   repository at the same path is foreign state. Source version MUST represent
   working-tree state as `Clean`, `Dirty`, `NotApplicable`, or `Unknown`; no branch,
   timestamp, or state flag may substitute for the exact manifest/content digests.
-  A background verifier commit MUST also match its captured base publication,
-  content, and project generations; a newer source publication forces rebase/retry
-  or abort.
+  A background verifier commit MUST exact-match its opaque captured
+  `SourcePublicationToken` and `GenerationAuthority`; a newer or different source
+  publication forces rebase/retry or abort. Numeric binding, observer, publication,
+  content, project, or runtime epochs are diagnostic health evidence only and MUST
+  NOT authorize verifier adoption, overwrite, or publication.
 - **FR-013**: Markdown/prose MUST be excluded from code search/symbol scopes.
 - **FR-014**: Safe textual content MUST be searchable through one
   `search_knowledge` full-surface read tool with exact provenance. Search hits MUST
@@ -514,11 +685,23 @@ historical scope can still retrieve them.
   after the existing facade decode/mapping reliability gate passes.
 - **FR-016**: Knowledge ranking MUST be deterministic, source-aware, diversified,
   and must not bump frecency.
-- **FR-017**: Results MUST expose generation and coverage/freshness state and MUST
-  never label unverifiable evidence current/full. Every per-source response envelope
-  MUST carry the captured source identity and source version, including closed
-  working-tree state. Per source, publication and content generations MUST be
-  distinct when last-valid content is retained after a failed observation.
+- **FR-017**: Every successful result carrying `GenerationAuthority`, or deriving any
+  fact from generation structure, MUST be built from a sealed Current lease and carry
+  its complete generation, binding, source, scope, operation, and provenance
+  identities. A non-current source MUST return the closed `SourceRefusal` envelope
+  for that generation-backed operation instead of a stale/degraded success. Retained
+  generations and attempt diagnostics remain visible only through bounded health and
+  recovery evidence that cannot be mistaken for query authority. Pure root-bound
+  `DiskObservation`, complete `WorktreeScopeObservation`, `GitObservation`, and
+  runtime health do not require Current and remain independently authoritative within
+  their closed authority: disk may prove path-local `PathMissing` from its retained
+  final-parent handle, a sealed worktree-scope receipt may prove completeness for its
+  declared scope/interval, and Git may prove `NotInTree` for one exact tree. These
+  authorities MUST NOT claim generation membership, generation completeness, or
+  unqualified repository-wide absence. Any response combining them with generation
+  structure MUST be constructed from one identity-compatible operation
+  `ClaimContext` that names every authority input and refuses a cross-root/rebind
+  mixture.
 - **FR-018**: Sensitive-path entries MUST remain catalog-counted with a typed
   `SensitivePath` reason and no content bytes. Detector-positive files use typed
   `SensitiveContent`, lose every content target, and persist only safe rule IDs and
@@ -531,10 +714,14 @@ historical scope can still retrieve them.
    version. Source mappings and every source-derived authority field remain distinct.
 - **FR-020**: Indexing MUST perform no network fetch and MUST not trigger Git LFS
   object materialization.
-- **FR-021**: Health MUST expose the manifest accounting equality, bytes by stage,
-  dispositions/reasons, retry/reconciliation state, and snapshot verification.
+- **FR-021**: Health MUST expose committed-generation evidence separately from
+  bounded attempt accounting: bytes by stage, safe causes, retry/reconciliation
+  state, snapshot verification, and runtime work state. Attempt fields MUST NOT
+  populate committed digest, equality, coverage, or source-truth fields.
 - **FR-022**: Existing code-intelligence behavior for admitted source files MUST
-  remain compatible unless the old behavior incorrectly treated prose as code.
+  remain compatible unless it treated prose as code or served `PartialParse`/
+  `Failed` evidence as a complete strict code scope. Those parse outcomes remain
+  candidate diagnostics until a separately reviewed capability contract exists.
 - **FR-023**: A recognized working-tree Git LFS pointer MUST be catalog-only with
   typed `LfsPointer` reason and bounded declared OID/size metadata; pointer text
   MUST NOT enter knowledge search.
@@ -565,21 +752,21 @@ historical scope can still retrieve them.
   modification hints, Git first-seen/last-touch commits, working-tree changes, and
   relevant code changes since the document. Every timestamp/history answer MUST
   expose provenance and coverage (including shallow/window-limited/unavailable).
-  Every async job and coalesced pending-latest marker MUST capture the live content
-  generation and exact source-version commit/tip at scheduling. A completion is
-  accepted only when its analyzed target equals that marker and the current live
-  target. Stale results MUST be rejected and coalesced into one bounded latest-state
-  recomputation. Accepted derived-only publication MUST carry that exact commit/tip
-  consistently in the bundle, manifest, temporal snapshot, and response envelope
-  while content generation and manifest/content digests remain unchanged.
+  Temporal artifacts required by an advertised strict scope MUST be built and
+  verified inside the isolated candidate and committed only with that generation's
+  completeness certificate. A stale async completion is discarded and coalesced
+  into bounded successor work; it cannot mutate a Current generation in place or
+  publish an independently current derived root.
 - **FR-032**: Code disagreement with a declared normative/intent unit MUST be an
   implementation gap. Only current-implementation claims may become code-diverged;
   explicit archived/superseded units and proven divergent units have no default
   current voice, while intent remains separately labeled and retrievable.
-- **FR-033**: `search_knowledge` MUST accept an optional authority scope. Its
-  `default` MUST include current, declared intent, review-required, and unknown
-  evidence with labels, while excluding suppressed/history-only units; explicit
-  history/all scopes MAY retrieve non-current evidence without promoting it.
+- **FR-033**: `search_knowledge` MUST accept an optional wire `authority_scope`,
+  parsed internally as `KnowledgeVoiceFilter`. Its `default` MUST include the
+  current-implementation voice, declared intent, review-required, and unknown
+  evidence with labels while excluding suppressed/history-only units; explicit
+  history/all values select voices inside the same Current generation. This filter
+  MUST NOT select lifecycle consistency or authorize a retained generation.
 - **FR-034**: One read-only full-surface `review_knowledge` tool MUST return bounded,
   deterministic remediation dossiers with exact knowledge/code anchors, temporal
   evidence, backlinks, rule IDs, uncertainty, and proposed actions. It MUST NOT
@@ -610,15 +797,27 @@ historical scope can still retrieve them.
   and MUST NOT participate in source-sameness comparison or block same-key/same-hash
   terminal replay. A failed continuity proof MUST return a typed foreign-source
   conflict, quarantine attributable intent, write nothing, and never report the
-  foreign result as applied. The ledger writer MUST use guarded temp `write_all`, file
-  `sync_all`, atomic replace, and durable parent-directory commit under a tested
-  platform contract, then durably mark completion. Recovery MUST finalize an observed
-  exact post-image, retry only an
-  unchanged exact pre-image, and refuse any third state as a typed conflict. Apply
+  foreign result as applied. Before any source-content side effect, apply MUST obtain
+  one non-cloneable `SourceMutationPermit`; permit grant invalidates prior candidates
+  and publishes non-Current. Every path component MUST resolve no-follow/reparse-safe
+  beneath the permit's pinned `PhysicalRootLease`, and temp creation, `write_all`,
+  `sync_all`, and atomic replacement MUST operate through the validated final-parent
+  handle rather than a recaptured/raw path. The ledger writer MUST durably commit the
+  parent directory under the tested platform contract, then mark completion. On cold
+  restart, recovery may inspect durable intent read-only but MUST first promote a
+  complete Current generation from the observed source. An exact pre-image retry, any
+  source cleanup/probe, or source-byte write then requires a fresh
+  `SourceMutationPermit`; it cannot borrow pending-startup authority. An observed exact
+  post-image requires only completion finalization inside `ProjectStateDir`, which is
+  persistence-only and MUST NOT acquire a source permit or make the source
+  non-Current. Recovery MUST refuse any third source state as a typed conflict. Apply
   capability MUST be unavailable unless durable per-project replay and that complete
   tested file-plus-parent atomic-durability contract are available; no best-effort
   weakening is allowed. Preview/review remain usable. A
-  completed update MUST be watcher/reconciliation visible.
+  completed update MUST schedule a fresh complete candidate. Failure, rollback, drop,
+  or any side effect remains non-Current until verified promotion; even a valid
+  no-side-effect proof returns through a fresh verification/no-op candidate at the
+  latest observer cut and cannot restore Current directly.
   The platform contract is normative: Unix requires same-directory replacement plus
   parent-directory sync; Windows requires temp `FlushFileBuffers` plus write-through
   same-directory replacement. Only after normal-current-worktree, writable-source,
@@ -633,12 +832,14 @@ historical scope can still retrieve them.
   dirty-state preconditions for a later user-approved repository edit; no review or
   archive action may imply deletion.
 - **FR-039**: Knowledge roles, bridge links, temporal/authority evidence, and reverse
-  backlinks MUST be derived from one captured source generation, rebuilt/published
-  atomically, and independently bounded with explicit truncated coverage. Hash-valid
-  suppression/proven-divergence evidence has reserved priority; if a limit still
-  cannot represent it, affected units fail closed to voice `Suppressed`, remain out
-  of default/current, stay retrievable through history/all, and expose canonical
-  skipped-suppression IDs plus truncated coverage.
+  backlinks required by an advertised scope MUST be derived inside one isolated
+  candidate from one source cut, included in its sealed artifact set, and promoted
+  atomically with the generation. Truncation is permitted only for non-required
+  output rendering. If a required bridge, authority, backlink, or suppression proof
+  cannot be represented completely, the candidate is discarded and the truncation
+  remains bounded attempt-only evidence with no query/cache/CCR/snapshot identity;
+  the retained generation is unchanged and strict acquisition refuses while recovery
+  proceeds.
 - **FR-040**: Existing orientation/context surfaces MUST expose bounded authority
   evidence: `get_repo_map` and `ask` show current/intent/hygiene summaries,
   `get_file_context`/`get_symbol_context` show exact knowledge backlinks, and the
@@ -660,17 +861,25 @@ historical scope can still retrieve them.
   project-selection guidance. It MUST NOT silently choose an unrelated source,
   start a project watcher, create candidate-root/per-project state, or advertise
   complete no-evidence. The same live process MUST accept a later valid
-  `index_folder` request and transition from unbound to Ready without retaining the
+  `index_folder` request and transition from unbound to lifecycle `Current` without retaining the
   earlier root/state error.
-- **FR-043**: One shared ignore-hygiene operation MUST run after a successful explicit
-  normal `index_folder` binding and during project-aware `symforge init`, after a
-  repository-mutation capability check. When root `.gitignore` exists
+- **FR-043**: One shared ignore-hygiene operation MUST run only after an explicit
+  normal `index_folder` or project-aware `symforge init` has completed read-only cold
+  admission/observation and promoted one complete Current generation. Pending startup
+  cannot mutate or grant a permit. After a repository-mutation capability check, the
+  write-capable phase MUST obtain a fresh
+  non-cloneable `SourceMutationPermit`, publish non-Current before side effects, and
+  use the permit's pinned `PhysicalRootLease` plus component-by-component no-follow/
+  reparse-safe, final-parent-handle-relative I/O. When root `.gitignore` exists
   and does not effectively ignore root `.symforge/`, the operation MUST append canonical
   `/.symforge/` idempotently with
   a guarded atomic write while preserving existing bytes/line-ending style. When
   `.gitignore` is absent, the operation MUST do nothing and MUST NOT create it. A
-  permission/race failure MUST be reported but MUST NOT roll back or disable the
-  already valid live index.
+  permission/race failure MUST be reported and MUST NOT corrupt or roll back the
+  retained generation. Once a permit has been granted, success, refusal, concurrent
+  guard failure, or a proven no-side-effect no-op can return to `Current` only through
+  a fresh complete candidate at the latest observer cut; no terminal path directly
+  restores the prior publication.
 - **FR-044**: Automatic startup, scout, watcher, reconciliation, verification, and
   ref ingestion MUST NOT mutate `.gitignore`. Every source path MUST hard-exclude
   `.symforge/` independently of Git ignore state. Health/tool receipts MUST report
@@ -709,8 +918,11 @@ historical scope can still retrieve them.
   already-live protected project only after its own matching direct request succeeds.
 - **FR-049**: Placement is stable for a project-instance lifetime. A later snapshot,
   quarantine, checkpoint, or state-write failure MUST degrade persistence health
-  without changing source identity or live query readiness. `Ready` MUST report
-  query readiness independently from durability and watcher freshness. Durable
+  without changing source identity or, by itself, revoking a valid Current
+  generation. Query readiness remains independent from durability but depends on
+  complete live observation: an absent/gapped observer, incomplete baseline,
+  unknown ordering, scope-dirty marker, or overdue verification obligation MUST
+  synchronously make strict acquisition non-current and return `SourceRefusal`. Durable
   cross-restart `index_folder` idempotency uses global control state; when unavailable
   replay remains process-local and is labeled non-durable. A stored completion
   receipt is historical evidence, not a live postcondition: same-key/same-hash replay
@@ -744,8 +956,11 @@ historical scope can still retrieve them.
   cannot be established. Export is allowed only for a normal writable
   current project with repository-mutation capability; explicit-protected,
   read-only, user-local-only, and memory-only bindings MUST refuse before artifact
-  or `.gitattributes` mutation. Feature 020 does not silently relocate or retire the
-  compatibility artifact.
+  or `.gitattributes` mutation. Any required `.gitattributes` repository-content
+  write MUST use `SourceMutationPermit` and the same pre-write non-Current,
+  handle-relative confinement, and fresh-candidate terminal rules as FR-037/FR-043;
+  writing the excluded team artifact itself remains a persistence operation. Feature
+  020 does not silently relocate or retire the compatibility artifact.
 - **FR-052**: Persistence-only tools MUST distinguish unavailability from transport
   failure. In user-local failure or memory-only mode, `checkpoint_now` MUST return a
   successful typed tool result with `applied=false` and a reason-bearing unavailable
@@ -760,12 +975,17 @@ historical scope can still retrieve them.
   and hand-off, then releases when ownership transfers into the staged index.
   Staged/indexed residency is governed separately by the admitted-content ceiling;
   an in-flight budget smaller than that ceiling is legal and MUST NOT deadlock.
-- **NFR-003 Availability**: One bad file cannot poison unrelated code/knowledge;
-  incomplete coverage is explicit.
+- **NFR-003 Availability and trust**: One bad file cannot publish partial, stale, or
+  mixed state. An observation-critical failure blocks candidate promotion and
+  strict-current acquisition; any retained verified generation remains immutable
+  and internal while the lifecycle exposes explicit recovery work/refusal evidence.
 - **NFR-004 Recovery**: Crash/corruption leaves either the previous valid generation
   or an explicit source rebuild path.
-- **NFR-005 Latency**: Cold-start scout/verification latency is acceptable for
-  correctness; optimization may not weaken readiness/freshness guarantees.
+- **NFR-005 Latency**: V11 defines no independent cold-start SLO: a cold source stays
+  responsive for protocol/health but generation-nonqueryable until complete
+  promotion, however long correctness requires. After an observed edit, visibility
+  and convergence MUST meet `ObservedRefreshGateV1`/SC-024; optimization may not
+  weaken authority, completeness, or freshness guarantees.
 - **NFR-006 Security**: For secret-policy version V, no byte range detected by V
   may be published, persisted, logged, analyzed, cached, or emitted. Detection is
   pure/local/deterministic/bounded and failure is closed.
@@ -778,16 +998,26 @@ historical scope can still retrieve them.
 ## Success Criteria
 
 - **SC-001**: Sparse artifacts larger than the old global byte cap do not prevent
-  Ready and receive zero full reads in instrumented tests.
-- **SC-002**: The terminal-disposition equality holds for every fixture and real
-  repository index, including injected failures.
+  lifecycle `Current` and receive zero full reads in instrumented tests.
+- **SC-002**: The terminal-disposition equality holds for every promoted Current
+  generation. Injected aborted/refused attempts satisfy their separate bounded
+  attempt-accounting invariant and cannot claim canonical manifest equality.
 - **SC-003**: Watcher/reconciliation tests recover missed create/delete/rename and
-  catalog-only changes with zero silent stale results.
-- **SC-004**: Snapshot/source builds return the same logical manifest and knowledge
-  answers for unchanged sources; replacing a repository at the same path fails
-  strong source-identity verification and cannot publish or overwrite from the old
-  snapshot.
-- **SC-005**: Concurrent publication stress observes zero mixed-generation bundles.
+  catalog-only changes with zero silent stale results; from first invalidation until
+  complete promotion, every generation-backed strict consumer refuses rather than
+  serving retained evidence as current. Pure observation and health claims retain
+  only their own authority.
+- **SC-004**: Successful snapshot/source builds over fully readable required inputs
+  return the same logical manifest and knowledge answers for unchanged sources.
+  Injected unreadable/unstable/failed/partial inputs discard the candidate, remain
+  attempt-only, and recover only through a fresh complete candidate after access is
+  restored. Replacing a repository at the same path fails opaque-token and strong
+  source-identity verification and cannot publish or overwrite from the old snapshot.
+- **SC-005**: Concurrent publication stress observes zero mixed-generation bundles
+  from the sole `ArcSwap<ProjectRuntimePublication>` root. Every sibling update mints
+  a new project-runtime publication identity while each unchanged source retains its
+  exact `GenerationAuthority`; numeric diagnostic generations cannot authorize a
+  store or reproduce a hybrid view.
 - **SC-006**: Real-repository knowledge corpus queries find the correct source
    pointer in one call; the corpus median returned-token count is at least 50% lower
    than the recorded broad-discovery-plus-direct-read baseline.
@@ -797,12 +1027,13 @@ historical scope can still retrieve them.
   blobs without network/LFS materialization.
 - **SC-009**: Runtime-assembled secret-safety canaries emit no value in output,
   logs, analytics, diagnostics, CCR, or serialized snapshots; policy mismatch
-  forces re-scout before Ready.
+  forces re-scout before lifecycle `Current`.
 - **SC-010**: Formatting, Clippy, focused suites, serial all-target tests, and the
   exact CI embed gate pass before completion.
-- **SC-011**: One bounded first-contact call returns source-cited entry points for
-  every declared knowledge role present plus explicit unknown/degraded roles, with
-  no unsupported ownership/status/architecture assertion.
+- **SC-011**: From an all-Current sealed selection, one bounded first-contact call
+  returns source-cited entry points for every declared knowledge role plus explicit
+  unknown roles. If any selected source is non-current, the call returns a typed
+  per-source refusal and no partial orientation or absence claim.
 - **SC-012**: Bridge fixtures resolve exact path/unique-symbol links in both
   directions, expose ambiguous/missing links without guessing, and remove/repair
   backlinks atomically after source changes.
@@ -818,7 +1049,13 @@ historical scope can still retrieve them.
   silently suppressed. Crash injection after intent sync, temp write, file sync,
   atomic replace, and completion recording recovers only the exact pre/post states;
   any third state conflicts, and absent durable replay/atomic durability disables
-  apply while preview remains available.
+  apply while preview remains available. Every repository-content write is confined
+  through a `SourceMutationPermit`; permit grant makes the source non-Current before
+  I/O, and every terminal path—including a no-side-effect proof—requires a fresh
+  complete candidate before Current returns. Cold recovery first promotes Current
+  read-only; exact-pre-image retry/cleanup/probe/source bytes require a fresh permit,
+  while exact-post-image completion finalization in `ProjectStateDir` is persistence-
+  only and does not revoke Current.
 - **SC-016**: Attempted move/delete input to `curate_knowledge` is rejected; deletion
   candidates remain evidence-only and include every protected-role, backlink,
   uniqueness, dirty-state, and source-ownership blocker.
@@ -827,13 +1064,16 @@ historical scope can still retrieve them.
   container candidates unbound before any source walk/candidate-root/per-project
   state write, while ordinary nested project roots remain accepted. Unsafe harness
   startup stays responsive and a later accessible `index_folder` request reaches
-  Ready in the same process.
+  lifecycle `Current` in the same process.
 - **SC-018**: Explicit normal `index_folder` and project-aware init fixtures prove
   a missing root rule in an existing `.gitignore` is added once, equivalent rules are
   no-ops, CRLF/LF/BOM/no-final-newline bytes are preserved except for the bounded
-  append, concurrent change refuses without disabling the live index, and absent
-  `.gitignore` remains absent; automatic paths never mutate and indexing never
-  admits `.symforge/`.
+  append, concurrent change refuses without corrupting the retained generation, and
+  absent `.gitignore` remains absent; automatic paths never mutate and indexing never
+  admits `.symforge/`. Cold/pending startup remains read-only until a complete Current
+  generation promotes; only then may a fresh `SourceMutationPermit` publish
+  non-Current and perform confined handle-relative I/O. Current returns only through
+  a fresh candidate for successful and no-side-effect outcomes.
 - **SC-019**: An explicit System32/protected-root fixture with
   `allow_protected_root=true` reaches a queryable live index and records user-local
   or memory-only placement while an instrumented filesystem proves zero state or
@@ -861,6 +1101,22 @@ historical scope can still retrieve them.
   receipt never substitutes for a live binding/session membership: replay with the
   same key and hash re-establishes the postcondition or returns successful typed
   `applied=false`/`live_postcondition_unavailable`, while a changed request conflicts.
+- **SC-024**: `ObservedRefreshGateV1` passes on the pinned SymForge and maximum-
+  admitted calibration corpora: completed write burst to first strict lease carrying
+  that byte identity is at most 2 seconds p95, 5 seconds maximum, and 1.25 times the
+  recorded baseline p95; delta output is equivalent to a clean full rebuild, a
+  single-path hint does not request a full candidate unless `Gapped`/`ScopeDirty`,
+  and peak retained-plus-candidate residency stays within its pre-granted vector plus
+  declared scratch/headroom.
+- **SC-025**: Process-capacity campaigns prove all runtimes, active/candidate/retired
+  generations, query/output leases, snapshot stages, observers, journals, parser
+  workers, and blocking tasks remain in one conserved capacity domain; cancellation,
+  resize, panic, sharing, shutdown, and reincarnation never refund live residency.
+- **SC-026**: One attested V11 activation makes every daemon, stdio, serve, embed,
+  snapshot, watcher, edit, CCR/cache, resource, prompt, hook, and sidecar entry path
+  use the closed lifecycle/query/claim Interfaces. The generated public-API graph has
+  no legacy constructor, mutator, raw `LiveIndex`, or authority-forging export, and
+  no user-selectable fallback can reactivate V10 publication semantics.
 
 ## Assumptions
 

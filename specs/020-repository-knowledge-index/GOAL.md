@@ -1,29 +1,55 @@
 # Goal — SymForge Repository Knowledge Index
 
 ```text
-/goal complete SpecKit 020 and ship its implementation until every RED/GREEN/VERIFY gate, adversarial review, safety invariant, and publication check is green, without merging prose into code intelligence, serving stale/unsafe evidence, leaking secrets, opening visible Windows child windows, or committing unrelated user work
+/goal refreeze Feature 020 for the v11 preventive lifecycle and ship it only after strict-Current generation authority, typed independent observation authority, complete candidate promotion, closed SourceRefusal behavior, ObservedRefreshGateV1, adversarial review, safety invariants, and the one-way activation cut are proven green, without merging prose into code intelligence, serving retained/partial state as current, leaking secrets, opening visible Windows child windows, or committing unrelated user work
 ```
 
 ## Start here
 
-Work in `E:\project\symforge` on branch
-`feat/repository-knowledge-index`.
+Perform the refreeze in the controlled SymForge checkout on
+`design/project-activation-prevention`. The old `E:\project\symforge` /
+`feat/repository-knowledge-index` instructions describe the completed v10 campaign;
+they are historical receipts, not authority for v11 implementation.
 
 Read, in order:
 
 1. `AGENTS.md`
-2. `tasks/lessons.md`
-3. `specs/020-repository-knowledge-index/HANDOVER-2026-07-22.md`
-4. `tasks/todo.md`
-5. the canonical SpecKit files linked by that handover
+2. `CONTEXT.md`
+3. `docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md`
+4. `docs/reviews/REVIEW-FINDINGS-claude-fable-project-index-lifecycle-prevention-round2-2026-08-11.md`
+5. the canonical Feature 020 SpecKit and contracts
+6. `tasks/lessons.md` and `tasks/todo.md`
 
-Do not restart discovery or re-litigate settled product boundaries. The handover is
-the current campaign state; the SpecKit is the implementation authority.
+The round-two lifecycle review is **CLEAR** with no P0/P1/P2 finding. Do not restart
+broad discovery or re-litigate its settled product boundaries. The design is cleared
+for refreeze, but implementation and PreventiveV1 activation remain unauthorized
+until the prerequisite below is complete.
+
+## V11 refreeze prerequisite
+
+Before Slice 0 or any production-reachable preventive implementation:
+
+1. Create `REFREEZE-MANIFEST-v11.md` and classify every Feature 020 artifact plus
+   bound `CONTEXT.md`; map every lifecycle amendment to its replaced clause,
+   contract, task, and regression ID.
+2. Create the detached refreeze attestation and obtain the signed, append-only
+   `RefreezeApprovalRecordV11` outside the mutable repository tree for the exact
+   commit/tree. The checked-in material is not its own trust anchor.
+3. Create and attest `contracts/public-api-v11.json`, including the closed supported
+   target/cfg/feature domain and the complete v10 `keep | replace | remove` map.
+4. Run the manifest-aware replacement validator and cross-artifact analysis. Any
+   unclassified file, unmapped clause, hash drift, or remaining permission to serve
+   degraded/last-verified state blocks implementation.
+
+Existing v10 RED/GREEN/VERIFY receipts remain useful historical evidence. A receipt
+whose oracle expected degraded publication, a last-valid wrapper, partial promotion,
+or public retained-generation reads is preserved but explicitly **superseded for
+v11**; it cannot satisfy a preventive acceptance gate.
 
 ## Objective
 
-Ship a live, local-first repository-knowledge lane alongside SymForge's existing
-code-intelligence lane:
+Refreeze and ship the live, local-first repository-knowledge lane inside the v11
+preventive project/source lifecycle:
 
 - catalog the whole repository safely;
 - index admitted text-centric knowledge with exact source/file/line/span/content
@@ -34,19 +60,72 @@ code-intelligence lane:
 - detect documentation divergence through typed, code-backed evidence without
   erasing intent, governance, north-star, security, or history material;
 - expose review/remediation and guarded cleanup without silent mutation or deletion.
+- make lifecycle `Current` the sole source of generation-backed query authority;
+- keep pure `DiskObservation`, `WorktreeScopeObservation`, and `GitObservation`
+  independently authoritative without pretending they are generation evidence, and
+  require identity-compatible `ClaimContext` for every mixed-authority derivation;
+  allow only each observation authority's native negative/completeness claim—path-
+  local `PathMissing`, completeness of one sealed worktree scope/interval, or
+  `NotInTree` for one exact Git tree—never an unqualified generation/repository claim;
+- keep `Loading` generation-free, keep the one verified generation retained by
+  `Refreshing` internal, and keep the optional retained generation in `Blocked` or
+  `Stopping` explicitly non-current;
+- keep a cold placeholder nonqueryable and outside active publication authority;
+- promote only one complete, source-bound, root-bound, fully verified generation;
+- return the closed `SourceRefusal` algebra whenever a generation-backed selection is
+  not Current instead of wrapping or partially serving degraded evidence; health and
+  pure observation lanes retain their own typed, non-generation authority;
+- activate PreventiveV1 process-wide and indivisibly across daemon, stdio, serve,
+  embed, snapshot, observer, mutation, local-ref, cache/CCR, and derived lanes.
 
 ## Measurable completion criteria
 
-- [x] The four remaining blockers in the handover are resolved consistently across
-  `spec.md`, `plan.md`, `data-model.md`, `tasks.md`, contracts, and quickstart.
-- [x] Local link, identifier, acceptance-traceability, contradiction, and checklist
-  checks pass.
-- [x] Fresh independent Architect, Skeptic, and Minimalist review is completed;
-  every accepted HIGH/MEDIUM finding is resolved and rejected findings carry
-  concrete evidence.
-- [x] SpecKit status is frozen only after the review gate passes.
-- [ ] Gates `A -> B -> C -> D -> E -> F -> G -> H -> I -> J -> K -> L -> M` in
-  `tasks.md` complete in order.
+- [x] The v10 Feature 020 design/review receipts are preserved as historical evidence.
+- [x] The v11 lifecycle-prevention design passed external round-two review with no
+  P0/P1/P2 finding.
+- [ ] Every Feature 020 artifact is classified and every one of the nineteen v11
+  amendments is closed by the hash-pinned refreeze manifest.
+- [ ] The detached attestation, external `RefreezeApprovalRecordV11`, and canonical
+  `public-api-v11.json` allowlist validate for the exact activation commit/tree.
+- [ ] Every prior Gate `A -> B -> C -> D -> E -> F -> G -> H -> I -> J -> K -> L -> M`
+  receipt is classified as supporting evidence, historical, or superseded; no v10
+  degraded-publication oracle is reused as v11 proof.
+- [ ] A cold start exposes responsive protocol/health surfaces but no queryable
+  placeholder, empty success, or generation claim before complete promotion.
+- [ ] Only `Current(VerifiedGeneration)` can grant a generation query lease; retained
+  state in Refreshing/Blocked remains internal and non-current. Pure disk, complete
+  worktree-scope, Git, and runtime-health evidence remains available through its own
+  authority. It may express its native path/scope/tree negative proof, but cannot
+  establish generation membership, generation completeness, or unqualified
+  repository-wide absence.
+- [ ] Incomplete observation, capacity refusal, parse failure, snapshot mismatch,
+  selection failure, and revoked authority return typed `SourceRefusal` evidence and
+  never publish a degraded wrapper.
+- [ ] Candidate promotion proves the canonical manifest, source/root/binding,
+  observation cut, bytes, every advertised query scope, and all required derived
+  certificates complete in one atomic authority.
+- [ ] `ArcSwap<ProjectRuntimePublication>` is the sole query/publication root. Every
+  source or membership commit mints a new project-runtime publication identity while
+  preserving every unchanged sibling's exact `GenerationAuthority`; numeric
+  generations/epochs are diagnostic only.
+- [ ] Required derived truncation discards the candidate and remains bounded
+  attempt-only evidence; no query, cache, CCR, snapshot, or response can observe the
+  incomplete derived artifact. Only rendering after a complete lease may truncate.
+- [ ] Every SymForge-owned repository-content write uses one non-cloneable
+  `SourceMutationPermit`, publishes non-Current before side effects, performs
+  component-confined handle-relative I/O through its pinned `PhysicalRootLease`, and
+  returns through a fresh verified candidate even when no side effect occurred.
+- [ ] Cold `index_folder`, project-aware init, and restart recovery remain read-only
+  until a complete Current generation promotes. Only then may a fresh mutation permit
+  authorize a pre-image retry, cleanup, probe, or source-byte write. Exact post-image
+  completion finalization inside `ProjectStateDir` is persistence-only and does not
+  acquire source mutation authority.
+- [ ] `ObservedRefreshGateV1` passes its pinned delta-vs-clean-full equivalence,
+  latency, burst convergence, and retained-plus-candidate memory gates before public
+  enablement.
+- [ ] The one process-wide `LegacyOpen -> LegacyClosing -> PreventiveV1Open`
+  activation drains legacy query/cache/CCR/finalization registrations, invalidates
+  v10 state, and proves no simultaneous publication authority or fallback remains.
 - [ ] Every behavior change has observed RED evidence, minimal GREEN implementation,
   and the gate's VERIFY evidence.
 - [ ] Existing code-intelligence behavior and the full shipped MCP surface remain
@@ -62,7 +141,6 @@ code-intelligence lane:
 - [ ] Formatting, lint, focused/full tests, platform gates, adversarial code review,
   staged-diff review, and repository status are clean.
 - [ ] `tasks/todo.md` contains the final evidence/review receipt.
-- [ ] Only then: commit and push `feat/repository-knowledge-index`.
 
 ## Tagged constraints
 
@@ -72,10 +150,31 @@ code-intelligence lane:
   snapshots when permitted, deterministic source rebuild otherwise.
 - `[separation]` Shared scout/catalog; separate code and knowledge targets/query
   scopes; prose never appears in code intelligence.
-- `[identity]` Every result is source-local and generation-pinned with exact safe
-  path, line/span, and content/object identity.
-- `[freshness]` One captured immutable source set per call; stale off-lock work is
-  rejected; degraded evidence is labeled and never promoted to current.
+- `[identity]` Every source-truth claim has exactly one typed atomic authority.
+  Generation claims are source-local and generation-pinned; disk, complete worktree-
+  scope, and Git claims retain their own exact observation identity. Mixed claims
+  name every input and can be built only from an identity-compatible `ClaimContext`.
+  Observation-native `PathMissing`, sealed-scope completeness, and exact-tree
+  `NotInTree` remain legal without becoming generation/repository-wide claims.
+- `[freshness]` One captured immutable source set per generation-backed call; stale
+  off-lock work is rejected; lifecycle `Current` is the only generation-queryable
+  state. Pure observation and health lanes remain independently authoritative and
+  never borrow generation semantics. There is no active degraded generation and no
+  public retained-generation fallback in v11.
+- `[lifecycle]` Cold placeholders and candidates are nonqueryable. Loading,
+  Refreshing, Blocked, and Stopping may retain recovery material internally but can
+  grant no generation-current claim.
+- `[promotion]` Promotion is one atomic publication of a complete verified generation
+  with source/root/binding authority, complete manifest and observations, and every
+  certificate required by the advertised strict scope. The sole public root is one
+  whole `ProjectRuntimePublication`; updating a sibling creates a new project-root
+  identity without changing an unaffected source's `GenerationAuthority`.
+- `[refusal]` Any generation-backed selected non-Current source yields
+  `SourceRefusal` with exact selection/source evidence; multi-source refusal preserves
+  an exact selected-source bijection and never silently omits a failing member.
+- `[activation]` V11 is a breaking, process-wide lifecycle boundary. PreventiveV1
+  activates indivisibly only after refreeze approval and `ObservedRefreshGateV1`;
+  there is no request-, source-, or environment-selectable legacy fallback.
 - `[admission]` Bound metadata, sniff, per-file, resident-content, and derived-state
   budgets independently. Rejected huge files are never fully read or hashed.
 - `[protected-roots]` Automatic home/OS/drive/filesystem/broad-root indexing is
@@ -84,8 +183,15 @@ code-intelligence lane:
   direct and CCR paths. Never echo a matched value.
 - `[authority]` Code governs checked current behavior only; intent/governance/history
   retain separately labeled voice. Time alone never archives or deletes.
-- `[mutation]` Review is read-only. Curation is explicit, idempotent, durable,
-  guarded, crash-recoverable, and user-visible.
+- `[mutation]` Review is read-only. Every repository-content write—including
+  curation and root-ignore hygiene—requires a non-cloneable
+  `SourceMutationPermit`, becomes non-Current before I/O, and uses confined
+  handle-relative operations through the permit's pinned root. Commit, failure,
+  rollback, and a valid no-side-effect proof can restore `Current` only through a
+  fresh complete candidate. Curation remains explicit, idempotent, durable,
+  crash-recoverable, and user-visible. Pending cold startup is read-only; source-
+  content recovery requires Current plus a fresh permit, while exact post-image
+  `ProjectStateDir` finalization is persistence-only.
 - `[simplicity]` Deterministic structural/lexical retrieval first. No speculative
   sidecar, database, parser framework, or abstraction.
 - `[process]` Preserve unrelated working-tree changes. Use `apply_patch` for edits.
@@ -96,7 +202,8 @@ code-intelligence lane:
 
 ## Execution loop
 
-For each gate in `tasks.md`:
+First complete and validate the V11 refreeze prerequisite. Then, for each preventive
+slice/gate in the refrozen `tasks.md`:
 
 1. Re-read the gate contract and affected frozen requirements.
 2. Write the narrowest named RED test.
@@ -104,11 +211,12 @@ For each gate in `tasks.md`:
 4. Inspect shared callers and existing helpers; fix the root once.
 5. Implement the minimum GREEN change.
 6. Run focused tests, affected existing suites, and the gate's VERIFY checks.
-7. Inspect impact, state ownership, generation fencing, and failure behavior.
+7. Inspect impact, lifecycle ownership, atomic source/root/binding authority,
+   complete-promotion proof, and failure behavior.
 8. Update `tasks/todo.md` with commands, outcomes, and limitations.
 9. Continue only while the tree compiles and the prior gate remains green.
-10. If code contradicts the frozen contract, stop and re-plan rather than weakening
-    the requirement silently.
+10. If code contradicts the refrozen contract, stop and re-plan rather than weakening
+    strict Current, inventing a degraded wrapper, or exposing retained state.
 
 ## Specialist routing
 
@@ -123,13 +231,14 @@ then, apply each persona locally in the main runner.
 | Correctness review | `code-reviewer` read-only | Review frozen-spec deltas and implementation diff for regressions/missing tests. |
 | Security review | `security-reviewer` read-only | Check admission, secret containment, path/root safety, output/CCR, and curation. |
 | Verification | `test-runner` | Run exact gate commands, interpret failures, and preserve test intent. |
-| Integration | `git-master` | Final staged-scope audit, intentional commit, push, and CI receipt only. |
+| Integration | `git-master` | Final staged-scope audit and landing-readiness receipt only. |
 
 When delegation becomes safe, use these exact dispatch forms:
 
 ```text
 Spawn `agent_type="rust-pro"` with: implement only Gate <X> in
-E:\project\symforge from the frozen SpecKit; own <files>; preserve all prior gates;
+C:\AI_STUFF\PROGRAMMING\symforge on `design/project-activation-prevention` from the
+refrozen SpecKit; own <files>; preserve all prior gates;
 return diff plus RED/GREEN/VERIFY evidence.
 
 Spawn `agent_type="code-reviewer"` read-only with: review the Gate <X> diff and its
@@ -150,6 +259,9 @@ accepting its result.
 ## Terminal condition
 
 Do not stop at “spec complete,” “implementation compiles,” or “tests mostly green.”
-This goal ends only when the frozen SpecKit is implemented, all required evidence is
-green, accepted reviews are resolved, no unsafe process remains, the exact staged
-scope is approved, and the authorized commit/push succeeds.
+This goal ends only when the V11 refreeze is externally approved, the refrozen
+SpecKit is implemented, every complete-promotion and `SourceRefusal` invariant is
+green, `ObservedRefreshGateV1` passes, the indivisible PreventiveV1 activation proves
+no simultaneous legacy authority or fallback, accepted reviews are resolved, no
+unsafe process remains, the exact staged scope is approved, and the authorized
+landing handoff is ready.

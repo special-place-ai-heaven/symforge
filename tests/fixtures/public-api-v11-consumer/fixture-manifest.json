@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "kind": "symforge.public_api_v11_consumer_fixture",
+  "status": "pre_activation_inputs_only",
+  "source_contract": {
+    "path": "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
+    "schema_version": 1,
+    "sha256": "c9594c8a33d6916ad0455feefa8404c93a0f541c857a15af9ac5bf8b1bed9b3e"
+  },
+  "coverage": {
+    "supported_cells": 26,
+    "supported_targets": 5,
+    "supported_feature_vectors": 6,
+    "graph_projections": 3,
+    "public_modules": 3,
+    "public_exports": 31,
+    "public_items": 29,
+    "inherent_associated_items": 34,
+    "direct_trait_impls": 17,
+    "negative_assertions": 12,
+    "atomic_compile_fail_probes": 71,
+    "graph_equivalence_pairs": 3
+  },
+  "closed_evidence_mapping": {
+    "case_catalog": "compile-fail/cases.json",
+    "closed": true,
+    "non_exhaustive_assertions": [
+      {
+        "assertion_id": "authority-types-01-not-deserialize",
+        "required_exhaustive_evidence": "public_item_graph",
+        "required_probe_completeness": "non_exhaustive"
+      }
+    ],
+    "unlisted_non_exhaustive_assertion": "reject",
+    "unsupported_exhaustive_evidence": "reject"
+  },
+  "inputs": [
+    "README.md",
+    "all-cfg/Cargo.toml",
+    "all-cfg/src/lib.rs",
+    "compile-fail/Cargo.toml",
+    "compile-fail/cases.json",
+    "compile-fail/src/lib.rs",
+    "compile-fail/templates/impl_family_absent.rs.in",
+    "compile-fail/templates/path_absent.rs.in",
+    "compile-fail/templates/trait_absent.rs.in",
+    "dependent-positive/Cargo.toml",
+    "dependent-positive/src/lib.rs",
+    "graph-cover.json"
+  ],
+  "pre_activation_facts": {
+    "all_cfg_inventory_sha256": null,
+    "assignment_proof_sha256": null,
+    "dependent_positive_compile_result": null,
+    "generated_rustdoc_graph_set_sha256": null,
+    "negative_case_results_sha256": null,
+    "observed_v10_atom_set_sha256": null,
+    "predicate_inventory_sha256": null,
+    "rustc_cfg_sha256_by_target": null
+  },
+  "limitations": [
+    "The current product crate does not expose the V11 API; these are inputs, not passing compiler evidence.",
+    "Impl-family rules are exhaustive only in the future public-item graph comparison; compile-fail templates use a distinct local Probe type as a non-reflexive external-consumer witness.",
+    "The checked-in corpus has no self-authorizing generator or verifier; the frozen contract and externally approved target remain authoritative."
+  ]
+}
