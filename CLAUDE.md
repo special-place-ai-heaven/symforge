@@ -22,6 +22,31 @@ only when every disjunct is, and `not(..)` never. An earlier amendment matched o
 literal `#[cfg(test)]`, which forced a stacked-attribute workaround; that is no longer
 needed and the plain `all` form is the supported spelling.
 
+### Long builds must not run through the Bash tool (as_of 2026-08-12)
+
+The Bash tool's `timeout` maxes at **600000 ms**, and `run_in_background` is subject
+to the same ceiling. A cold `cargo test --all-targets` here takes ~25 minutes, so it
+is killed at 10 -- **mid-write**. That is not a lost result, it is a corrupted
+`target/`: one kill produced `error[E0786]: found invalid metadata files`, the next a
+rustc `internal compiler error: no type-dependent def for method call`, the next
+`error[E0463]: can't find crate for symforge`. Each looks like a code failure and none
+of them is one.
+
+Run anything that can exceed ten minutes through Terminal Commander instead
+(`run_and_watch`, then poll `command_status` by `job_id`). Its daemon owns the
+process, so the job's lifetime is independent of the tool call. Interleaving feature
+sets in one target dir (`--all-targets` then `--no-default-features --features embed`)
+causes the same `E0786` without any kill; run them one at a time.
+
+Recovery, cheapest first: delete `target/debug/incremental`; then
+`cargo clean -p symforge`; then a full `cargo clean`. Do not diagnose a rustc ICE or a
+missing-crate error as a code defect until the build directory is known clean.
+
+### Windows build cache (disk)
+
+- Artifacts: repo `.cargo/config.toml` sets `target-dir = "target"`, i.e. artifacts land **beside the checkout, on whatever drive the repo is on** (gitignored). The comment in that file and this line both used to say "on **E:**", which was only ever true while the checkout lived there; as_of 2026-08-12 the repo is on **C:** with no E: drive present, and `target/` had reached **180 GB** on C:. Do **not** pass `CARGO_TARGET_DIR=...` on the command line (older handoffs suggested `C:/symforge-target` — that filled **C:**).
+- **Agent discipline**: OK to run full `cargo` gates locally; **clean up after yourself** — when you finish a heavy local session (`test --all-targets`, `build --release`), run `cargo clean` before ending so debug artifacts do not accumulate. If `target/debug` is already large before your gate, `cargo clean` first.
+
 ## CI Gates
 
 - PR and push CI run version sync, `cargo fmt --check`,
