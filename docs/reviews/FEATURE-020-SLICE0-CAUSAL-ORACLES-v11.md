@@ -170,8 +170,8 @@ any production byte to `src/watcher/mod.rs` or `src/live_index/store.rs` still f
 
 ## T015–T017 — observed RED positive controls
 
-`tests/project_index_lifecycle_slice0_controls.rs`, run with
-`cargo test --test project_index_lifecycle_slice0_controls -- --ignored --test-threads=1`.
+`tests/project_index_lifecycle_slice0.rs`, run with
+`cargo test --test project_index_lifecycle_slice0 -- --ignored --test-threads=1`.
 Each fails for the reason its name states:
 
 | Control | Defect | Observed | Task |
@@ -182,7 +182,7 @@ Each fails for the reason its name states:
 | `observer_replacement_gap_is_latched_as_non_current` | 2.6 readiness rederived from present state | `Degraded{[ObservationFailed, ReconciliationPending]}` → `Current` after a reload that proved nothing | T016 |
 | `old_observer_delivery_after_promotion_is_not_current` | 2.8 no observer token or epoch | a pre-promotion delivery applied to the promoted generation, still `Current` | T016 |
 | `watcher_mutation_during_candidate_build_is_not_discarded` | 2.7 / 2.9 no candidate isolation | observer mutation destroyed by the swap, publication reports success | T016 |
-| `publication_of_one_source_preserves_sibling_latest` | FR-008 / FR-009 / SC-005 partial publication | sibling B's latest dropped by source A's whole-index swap | T017 |
+| `whole_project_publication_preserves_latest_siblings` | FR-008 / FR-009 / SC-005 partial publication | sibling B's latest dropped by source A's whole-index swap | T017 |
 
 Each carries `#[ignore]` naming the slice that must remove it, so a deliberately
 RED control does not turn `main` red and the fix's acceptance is the control
@@ -337,17 +337,107 @@ specifies, and the 2.4 single-flight control lands as a unit test in
 `src/daemon.rs::tests`. Both were verified against the amended census, and adding a
 production line to the same files was verified to still fail.
 
-**Contradiction 2 is worked around, deliberately.** Slice 0's integration controls
-live in `tests/project_index_lifecycle_slice0_controls.rs`, leaving the catalog's
-reserved `tests/project_index_lifecycle_slice0.rs` unwritten so `TEST-PUBLICATION`
-stays dormant until the slice that can make it pass. The control that would have
-carried that name is `publication_of_one_source_preserves_sibling_latest`, renamed so
-no reader mistakes it for the catalog case being satisfied.
+**Contradiction 2 was fixed by the same amendment.** Making `#[ignore]` resolvable
+for planned cases is exactly what it needed: `TEST-PUBLICATION` now lives at its
+catalog-reserved target,
+`tests/project_index_lifecycle_slice0.rs::whole_project_publication_preserves_latest_siblings`,
+carrying `#[ignore]` and failing for its stated reason, and the checker resolves it.
+An interim workaround put the controls in a `..._controls.rs` file with the case
+renamed; that is reverted, since the reason for it no longer exists.
 
-That second one is a real remaining inconsistency in the frozen corpus, not a solved
-problem: a `planned_exact` case cannot simultaneously be present, RED, and green in
-CI. It is left for the T021 adversarial review to rule on, since unlike the first it
-does not block any Slice 0 work.
+## T018 — three of six controls are observable pre-V11
+
+T018 names six: same-path physical-root replacement, multi-loader close/rebind
+ordering, query/capacity starvation, charge conservation, raw embed bypass, and live
+V10 snapshot writers. Three are observable through surfaces that exist today and are
+landed as RED controls:
+
+| Control | Defect | Observed |
+|---|---|---|
+| `same_path_root_replacement_is_not_silently_adopted` | delete/recreate ABA at one path | freshness `Current` → `Current`; nothing records that the identity changed |
+| `configured_capacity_bounds_the_process_not_each_load` | 2.5 per-load ceilings used as aggregate admission | **20 files admitted against a configured ceiling of 10** |
+| `snapshot_seed_is_not_queryable_before_verification` | 2.11 snapshot restoration bypasses candidate isolation | a restored, unverified snapshot answers queries for a file already changed on disk |
+
+The other three are **not** written, because no assertion about them can be
+non-vacuous against V10:
+
+- **Multi-loader close/rebind ordering.** The property is that no window exists in
+  which a closed binding's index is still reachable under its successor. V10 has no
+  binding epoch or incarnation to observe, so the only reachable signal is content,
+  and content is identical either side of a correct handoff. The T014 oracle already
+  covers the one case that *is* observable — a stale root-A mutation reaching root B.
+- **Charge conservation.** Requires a capacity ledger with reserve/charge/refund
+  accounting. V10's `InflightByteBudget` is constructed per load and dropped with it;
+  there is nothing to conserve across operations and no accessor that could witness a
+  double refund. The capacity control above measures the aggregate consequence, which
+  is the part V10 can show.
+- **Raw embed bypass.** The `symforge::embed` surface is the V11 public API that
+  Slice 4 introduces; `Cargo.toml` declares `embed = []` today, an empty feature with
+  no `EmbeddedSourceHandle` to bypass. A control here would assert against types that
+  do not exist.
+
+Writing weak versions of these three would produce exactly the vacuous passes this
+slice exists to catch — three of the ten controls attempted here initially passed for
+unrelated reasons, and each had to be chased down. They belong to the slices that
+introduce the surfaces they need: close/rebind and charge conservation to Slice 2's
+registry and capacity work, raw embed bypass to Slice 4's activation cut.
+
+## T019–T021 — status
+
+### T019 materializes only Slice 0's own stubs
+
+The task says to materialize RED stubs from the acceptance-oracles contract "at their
+declared target slices". Every `planned_exact` case in the traceability catalog except
+two carries `introduced_slice: 4`, and its target names V11 types — `CandidateHandle`,
+`ProjectQueryLease`, `CapacityPermit`, `EmbeddedSourceHandle` — that do not exist yet.
+Creating those files now would not compile, so "at their declared target slices" is
+read as *when that slice arrives*, not *all of them now*.
+
+Slice 0's two are done: `TEST-OPAQUE-PATH-INHERITED` resolves to the existing
+`src/discovery/mod.rs:4169`, and `TEST-PUBLICATION` is materialized at its reserved
+target as `whole_project_publication_preserves_latest_siblings`.
+
+### T020 was largely built by T008
+
+`--require-materialized --evidence <path>` already exists in the checker
+(`scripts/validate-lifecycle-oracle-traceability.cjs:344-361`), and its
+code-owned resolvers already require every planned Rust case and benchmark
+registration to exist and every T078–T089 receipt to bind the same release tree. The
+rejections T020 enumerates — missing requirement row, missing implementation owner,
+missing executable-or-inherited test, an oracle mislabeled as executed, an unmapped
+invariant — are covered by the self-test's fail-closed cases, now 101 of them
+including the two added by the refreeze amendment.
+
+What T020 adds here is running it against Slice 0's own execution evidence, which is
+what the artifact below provides.
+
+### T021 — bounded CI artifact
+
+`scripts/slice0-oracle-artifact.cjs` produces `CI-SLICE0`
+(`target/ci/lifecycle-v11/slice-0-oracle-contract.json`): one deterministic JSON
+record per case — case name, target, exact command, expected outcome, observed
+outcome, and a single bounded reason line capped at 512 bytes. That satisfies
+`BOUND-ARTIFACT`, "one deterministic JSON record per case ... no unbounded logs or
+repository bytes"; a raw `cargo test` log would satisfy neither half.
+
+It is fail-closed in the direction that actually matters for this slice. A control
+that **stops** failing exits non-zero, because that means either a fix landed without
+its owning slice removing the `#[ignore]`, or the control has gone vacuous. Green is
+not the success signal in Slice 0; *the expected failures still being the expected
+failures* is.
+
+**Not wired into CI.** `.github/workflows/ci.yml` is in `FROZEN_PATHS`, so adding a
+step that runs this producer requires another refreeze amendment and signature. The
+producer is complete and runnable today; the wiring is deferred with the other
+amendment-shaped items below.
+
+### The adversarial architecture review is not self-certifiable
+
+T021 also requires an adversarial architecture review before Slice 1. That is an
+independent-reviewer gate by construction: the author of Slice 0 recording that Slice 0
+passed review would be precisely the "the thing that reports is not the thing that
+knows" failure `CLAUDE.md` makes binding. It is left open, and it is the one Slice 0
+item that cannot be closed by writing code.
 
 ### Known gap in the amended stripper
 

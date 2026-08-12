@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use symforge::daemon::{OpenProjectRequest, spawn_daemon};
 use symforge::domain::FreshnessStatus;
 use symforge::live_index::LiveIndex;
+use symforge::live_index::store::SnapshotVerifyState;
 use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
 use tempfile::TempDir;
 
@@ -619,7 +620,7 @@ fn watcher_mutation_during_candidate_build_is_not_discarded() {
 /// Sibling B's latest must survive source A's publication.
 #[test]
 #[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005; remove this attribute in Slice 4 (T053-T073) when one whole-project root is the sole publication unit"]
-fn publication_of_one_source_preserves_sibling_latest() {
+fn whole_project_publication_preserves_latest_siblings() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
         // Two sibling sources under one project root. A is large enough that
@@ -706,6 +707,201 @@ fn publication_of_one_source_preserves_sibling_latest() {
              B's latest generation, then reported success. One whole-project \
              immutable root must carry the latest of every sibling, and a partial \
              source generation must never be the query-visible publication"
+        );
+    });
+}
+
+/// Design defect 2.11 — snapshot restoration bypasses candidate isolation.
+///
+/// Startup deserializes a checkpoint straight into the shared live index and
+/// verifies it asynchronously, so the snapshot's contents are query-visible
+/// while `SnapshotVerifyState` is still `Pending`. Any edit made while the
+/// process was down is served as current until verification happens to catch
+/// up.
+///
+/// A snapshot is a seed, not a publication: nothing from it may answer a query
+/// before its identity and completeness are re-proved.
+#[test]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.11; remove this attribute in Slice 4 (T053-T073) when a snapshot seeds a candidate instead of a publication"]
+fn snapshot_seed_is_not_queryable_before_verification() {
+    run_daemon_test(async {
+        let project = TempDir::new().expect("project dir");
+        write_project_files(project.path(), "snap", 6);
+        let tracked = project.path().join("src").join("snap_0.rs");
+
+        // `index_folder` is the path that persists the published generation as
+        // an atomic snapshot; a plain session open does not checkpoint.
+        let pfx = "slice0-snapshot-";
+        let auth_token = [pfx, "to", "ken"].concat();
+        let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
+        let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let opened = daemon
+            .state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "slice0-snapshot".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .expect("open project");
+        let indexed = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{}/v1/sessions/{}/tools/index_folder",
+                daemon.port, opened.session_id
+            ))
+            .bearer_auth(&auth_token)
+            .json(&serde_json::json!({ "path": project.path().display().to_string() }))
+            .send()
+            .await
+            .expect("call daemon index_folder")
+            .text()
+            .await
+            .expect("index_folder body");
+        assert!(
+            indexed.starts_with("Indexed "),
+            "precondition: index_folder must succeed so a checkpoint is written, got: {indexed}"
+        );
+        let _ = daemon.shutdown_tx.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // The offline edit: the process is down, so no observer sees this.
+        std::fs::write(&tracked, b"pub fn snap_0() -> usize { 424242 }\n").expect("offline edit");
+
+        // Restart: the snapshot is restored and verification is asynchronous.
+        let Some(restored) = symforge::live_index::persist::load_snapshot_for_root(project.path())
+        else {
+            panic!("precondition: opening the project must have written a checkpoint");
+        };
+        let (live, _signals) =
+            symforge::live_index::persist::snapshot_to_live_index_with_code_signals(
+                restored,
+                project.path(),
+            );
+        let seeded = symforge::live_index::SharedIndexHandle::shared(live);
+
+        let verify_state = seeded.read().snapshot_verify_state();
+        let served = seeded.read().get_file("src/snap_0.rs").is_some();
+
+        assert!(
+            !matches!(verify_state, SnapshotVerifyState::Completed(_)),
+            "precondition: a freshly restored snapshot must still be awaiting \n             verification, observed {verify_state:?}"
+        );
+        assert!(
+            !served,
+            "a snapshot restored but not yet verified ({verify_state:?}) answered a \n             query for src/snap_0.rs, whose bytes on disk had already changed \n             underneath it. A seed must not be query-visible until its identity \n             and completeness are re-proved"
+        );
+    });
+}
+
+/// Design defect 2.5 — capacity controls do not reserve process capacity.
+///
+/// Every load builds its own `InflightByteBudget` whose ceiling is that
+/// candidate's own planned bytes, so the configured limit is enforced per
+/// project rather than per process. Two projects open together each admit up to
+/// the whole ceiling, and the process holds twice what was configured — before
+/// counting a retained generation, a replacement candidate, or a watcher
+/// backlog.
+///
+/// A configured ceiling must bound the process, not each load in isolation.
+#[test]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5; remove this attribute in Slice 2 (T030-T040) when capacity is a process-wide reservation"]
+fn configured_capacity_bounds_the_process_not_each_load() {
+    run_daemon_test(async {
+        const CEILING: usize = 10;
+        let first = TempDir::new().expect("project one");
+        let second = TempDir::new().expect("project two");
+        write_project_files(first.path(), "cap_a", CEILING);
+        write_project_files(second.path(), "cap_b", CEILING);
+        let _cap = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", &CEILING.to_string());
+
+        let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let mut opened = Vec::new();
+        for (index, root) in [first.path(), second.path()].into_iter().enumerate() {
+            opened.push(
+                daemon
+                    .state
+                    .open_project_session(OpenProjectRequest {
+                        project_root: root.display().to_string(),
+                        client_name: format!("slice0-capacity-{index}"),
+                        pid: Some(std::process::id()),
+                    })
+                    .expect("open project"),
+            );
+        }
+
+        let admitted: usize = daemon
+            .state
+            .list_projects()
+            .iter()
+            .filter_map(|summary| daemon.state.project_health(&summary.project_id))
+            .map(|health| health.file_count)
+            .sum();
+        let projects = daemon.state.list_projects().len();
+        let _ = daemon.shutdown_tx.send(());
+
+        assert_eq!(
+            projects, 2,
+            "precondition: both projects must be open for this to measure an \
+             aggregate at all"
+        );
+        assert!(
+            admitted <= CEILING,
+            "two projects admitted {admitted} files against a configured ceiling \
+             of {CEILING}. The ceiling is applied per load, so every additional \
+             project multiplies what the process actually holds; it must bound \
+             the process instead"
+        );
+    });
+}
+
+/// Design defect 2.8 / same-path physical-root replacement.
+///
+/// A root deleted and recreated at the same path is a different physical root,
+/// but V10 identifies roots by path alone. Nothing records that the identity
+/// under that path changed, so a publication built against the replacement is
+/// reported exactly as one built against the original — the classic
+/// delete/recreate ABA.
+///
+/// As with the observer-gap control, the assertion is that the replacement
+/// survives a subsequent clean publication: V10's freshness is a pure function
+/// of present state, so a transient non-Current proves nothing.
+#[test]
+#[ignore = "Feature 020 Slice 0 RED control for same-path physical-root replacement; remove this attribute in Slice 1 (T022-T029) when physical root identity is canonical and fenced"]
+fn same_path_root_replacement_is_not_silently_adopted() {
+    run_daemon_test(async {
+        let parent = TempDir::new().expect("parent dir");
+        let root = parent.path().join("project");
+        std::fs::create_dir_all(&root).expect("create root");
+        write_project_files(&root, "before", 6);
+        let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "3600");
+
+        let index = LiveIndex::load(&root).expect("load original root");
+        assert!(
+            index.read().get_file("src/before_0.rs").is_some(),
+            "precondition: the original root is indexed"
+        );
+
+        // Delete the whole root and recreate a different project at the same
+        // path: same path, different physical root.
+        std::fs::remove_dir_all(&root).expect("remove original root");
+        std::fs::create_dir_all(&root).expect("recreate root");
+        write_project_files(&root, "after", 6);
+
+        index.reload(&root).expect("reload the replacement");
+        let after_replacement = (*index.freshness_status()).clone();
+        index.reload(&root).expect("ordinary clean reload");
+        let after_clean_publication = (*index.freshness_status()).clone();
+
+        assert!(
+            index.read().get_file("src/after_0.rs").is_some(),
+            "precondition: the replacement's content must be indexed"
+        );
+        assert!(
+            !matches!(after_clean_publication, FreshnessStatus::Current),
+            "a root deleted and recreated at the same path was adopted with no \
+             durable record that the identity changed: freshness went from \
+             {after_replacement:?} to {after_clean_publication:?}. Same-path \
+             replacement must fence the prior incarnation rather than be \
+             indistinguishable from a reindex of the same root"
         );
     });
 }
