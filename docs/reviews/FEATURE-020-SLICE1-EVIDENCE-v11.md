@@ -129,6 +129,44 @@ Slice 4 activation, and T023 already records that production writer integration
 is Slice 4 work. Binding the watcher to a permit type whose runtime does not
 exist would be scaffolding, not prevention.
 
+### The Slice 0 control it answers is reclassified, not deleted
+
+T014's oracle
+`generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b` was
+RED by construction and `#[ignore]`d so a deliberate RED could not turn `main`
+red. It passes now, so the attribute is gone and it runs in the default suite,
+where a regression turns CI red instead of waiting for someone to pass
+`--ignored`.
+
+It stays on the Slice 0 roster in `scripts/slice0-oracle-artifact.cjs`, now as
+`resolved`: the producer still runs it and asserts it **passes**. The roster is
+still 12 controls — 11 red, 1 resolved-green — and every case now records its own
+expected outcome, with the resolved one naming the slice and task that resolved
+it, so the artifact carries the RED→GREEN transition rather than going quiet
+about a case that used to be evidence. Deleting the case instead would have removed the only guard
+against this defect returning; the producer's fail-closed roster check refuses
+that, which is what forced the reclassification rather than leaving it to be
+remembered.
+
+Note the fix is **not** the commit reordering the oracle's own prose predicted.
+`reload_for_binding_with_exclusions` still does `project_generation.fetch_add`
+before `swap_and_publish`, so the mid-commit window still exists; what changed is
+that nothing samples it. The oracle asserted the consequence rather than the
+intermediate value, which is exactly why it stayed valid under the fix that
+actually landed.
+
+**Probing that guard found a defect in the producer itself.** Re-`#[ignore]`ing a
+resolved control did fail closed — with `no cases parsed`, which is the error
+that means a *build* failure. libtest prints `ignored, {reason}` for a reasoned
+`#[ignore]`, and the case regex anchored the outcome at end-of-line, so a
+silenced control parsed as no case at all. Fail-closed with the wrong cause is
+the house failure mode in miniature: the message named something the run had not
+observed. The regex now accepts the reason suffix, and the two regression
+directions were then observed directly against a mutated copy of the producer —
+`observed ignored, expected green` for a re-silenced control, and
+`observed failed, expected green` (with its bounded reason line) for one that
+regresses.
+
 ## Defects found by self-review, after the oracles were green
 
 The oracles were green and the sweep had confirmed eight guards when a read-back

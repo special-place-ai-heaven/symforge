@@ -3338,32 +3338,42 @@ mod tests {
     /// Feature 020 Slice 0 causal oracle (T014) for design defect 2.8, "root
     /// and generation authority can split".
     ///
-    /// [`effective_fence_generation`]'s contract comment asserts that reload
-    /// "publishes the new live index (with its new `indexed_root`) BEFORE
-    /// bumping the generation", which is what makes adopting an advanced
+    /// [`effective_fence_generation`]'s V10 contract comment asserted that
+    /// reload "publishes the new live index (with its new `indexed_root`)
+    /// BEFORE bumping the generation", which is what made adopting an advanced
     /// generation safe: a retarget would show a different `indexed_root` and be
     /// kept stale. `reload_for_binding_with_exclusions` does the opposite —
     /// `project_generation.fetch_add` runs first and `swap_and_publish` runs
     /// after — so there is a window under the write lock where the generation
-    /// is already the new one and the published root is still A.
+    /// counter is already the new one and the published root is still A.
     ///
-    /// A root-A watcher that samples the fence inside that window sees
-    /// `indexed_root == A`, concludes "same-project reload", and adopts the
-    /// advanced generation. Once root B is published that adopted value equals
-    /// the current generation, so the store's under-lock fence accepts the
-    /// mutation and the root-A reconcile removes root B's files.
+    /// A root-A watcher that sampled the counter and the root separately inside
+    /// that window saw `indexed_root == A`, concluded "same-project reload", and
+    /// adopted the advanced generation. Once root B was published that adopted
+    /// value equalled the current generation, so the store's under-lock fence
+    /// accepted the mutation and the root-A reconcile removed root B's files.
     ///
     /// The oracle asserts the consequence rather than the intermediate value,
     /// so it stays valid under either fix (reordering the commit, or binding
     /// root and generation into one authority): whatever a mid-commit observer
     /// walks away with must not authorize a root-A reindex against root B.
     ///
-    /// RED by design and therefore ignored, like the other out-of-gate suites
-    /// in this repo: the defect it names is fixed in Slice 1, and the fix's
-    /// acceptance is this test passing without the attribute. Run it with
-    /// `cargo test --lib watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture --ignored`.
+    /// RED in Slice 0 by design; GREEN since Slice 1 (T028), which is why the
+    /// `#[ignore]` is gone. The fix was not reordering the commit — the
+    /// `fetch_add`-then-`swap_and_publish` ordering above is unchanged — but
+    /// binding root and generation into one authority: the fence now reads a
+    /// single `Arc<PublishedGeneration>` whose `project_generation` was captured
+    /// under the same write lock as the `live` it carries, so a mid-commit
+    /// observer sees the PREVIOUS publication whole and adopts nothing from it.
+    ///
+    /// A resolved control belongs in the default suite, where a regression turns
+    /// CI red instead of hiding behind an attribute.
+    /// `scripts/slice0-oracle-artifact.cjs` keeps it on the Slice 0 roster and
+    /// now asserts that it PASSES, so both directions are guarded: re-adding the
+    /// attribute and deleting the test are each a roster change, not a silent
+    /// loss. Run it with
+    /// `cargo test --lib watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture`.
     #[test]
-    #[ignore = "Feature 020 Slice 0 RED oracle for design defect 2.8; remove this attribute in Slice 1 (T022-T029) when one authority binds root and generation"]
     fn generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b() {
         let project_a = TempDir::new().unwrap();
         let project_b = TempDir::new().unwrap();
