@@ -2407,6 +2407,10 @@ impl SharedIndexHandle {
         self.project_state_dir
             .store(project_state_dir.map(Arc::new));
         self.project_generation.fetch_add(1, Ordering::AcqRel);
+        // Deterministic test observation point: the generation has advanced but
+        // the previous root is still published (no-op in release).
+        #[cfg(test)]
+        reload_mid_commit::fire();
         // Path-keyed pre-update snapshots belong to the previous project
         // generation. Clear them under the same writer lock as the retarget so
         // a late impact request cannot consume a replacement project's state.
@@ -3515,6 +3519,59 @@ impl Drop for SharedIndexWriteGuard<'_> {
         }
     }
 }
+
+/// Test-only interleave hook for the Feature 020 T014 root/generation split
+/// oracle.
+///
+/// Installed by the watcher oracle to observe the reload window that
+/// [`SharedIndexHandle::reload_for_binding_with_exclusions`] opens between
+/// advancing `project_generation` and publishing the new live root. It fires
+/// INSIDE the write lock, strictly AFTER the generation advance and strictly
+/// BEFORE the root publication, so an observer sees the new generation paired
+/// with the old root deterministically (no sleep, no extra thread). It is
+/// compiled out of release builds.
+#[cfg(test)]
+mod reload_mid_commit {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// RAII guard that uninstalls the hook on drop so tests cannot leak it
+    /// across the thread-local into a sibling test on the same thread.
+    pub(crate) struct MidCommitGuard;
+
+    impl Drop for MidCommitGuard {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Install a callback fired at the next reload mid-commit point.
+    ///
+    /// The hook is consumed on first fire (see [`fire`]), so a later reload on
+    /// the same thread does not re-trigger it: exactly one observation lands in
+    /// the window.
+    pub(crate) fn install(hook: impl Fn() + 'static) -> MidCommitGuard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        MidCommitGuard
+    }
+
+    /// Fire the installed hook if one is present, consuming it first so a
+    /// re-entrant reload does not fire it again.
+    pub(crate) fn fire() {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use reload_mid_commit::install as install_reload_mid_commit_hook;
 
 /// Thread-safe shared handle to the index.
 pub type SharedIndex = Arc<SharedIndexHandle>;

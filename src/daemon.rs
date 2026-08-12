@@ -5899,6 +5899,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use once_cell::sync::Lazy;
@@ -9211,6 +9212,80 @@ mod tests {
             .expect("A reload thread")
             .expect("A reload result");
         reader.join().expect("B reader thread");
+    }
+
+    /// Feature 020 Slice 0 causal control for design defect 2.4 — project
+    /// loading is not single-flight.
+    ///
+    /// `ensure_project_slot_for_session_with` reads the project map, runs the
+    /// complete load OUTSIDE the map lock, and only then calls
+    /// `entry.or_insert`. Concurrent first opens of one root therefore each
+    /// build a full `ProjectInstance`; `or_insert` keeps one and drops the rest
+    /// after they have already paid their I/O, parse, and memory cost.
+    ///
+    /// The waste leaves no other trace: the loser is never activated, so it
+    /// starts no watcher and appears in no listing or health response. That is
+    /// why the loader is counted here rather than asserted about indirectly.
+    /// The closure is production's own — `ProjectInstance::load`, exactly as
+    /// `ensure_project_slot_for_session` supplies it — so this counts real
+    /// loads, not a stand-in.
+    ///
+    /// One first open must cost exactly one cold load, however many sessions
+    /// race for it.
+    #[test]
+    #[ignore = "Feature 020 Slice 0 RED control for design defect 2.4; remove this attribute in Slice 2 (T030-T040) when project admission is single-flight"]
+    fn concurrent_first_open_performs_exactly_one_cold_load() {
+        let project = project_dir("symforge-slot-single-flight");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn single_flight() {}\n",
+        )
+        .expect("write source");
+        let canonical_root = project.path().to_path_buf();
+        let state = Arc::new(DaemonState::new());
+        let project_id = "project-single-flight";
+
+        const RACERS: usize = 4;
+        let loads = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(RACERS));
+        let racers: Vec<_> = (0..RACERS)
+            .map(|racer| {
+                let state = Arc::clone(&state);
+                let loads = Arc::clone(&loads);
+                let start = Arc::clone(&start);
+                let root = canonical_root.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    state.ensure_project_slot_for_session_with(
+                        &format!("session-{racer}"),
+                        project_id,
+                        || {
+                            loads.fetch_add(1, Ordering::AcqRel);
+                            ProjectInstance::load(&root)
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let slots: Vec<_> = racers
+            .into_iter()
+            .map(|racer| racer.join().expect("racer thread").expect("slot"))
+            .collect();
+
+        for slot in &slots {
+            assert!(
+                Arc::ptr_eq(slot, &slots[0]),
+                "precondition: every racer must join the one authoritative slot"
+            );
+        }
+        assert_eq!(
+            loads.load(Ordering::Acquire),
+            1,
+            "{RACERS} concurrent first opens of one root must perform exactly one \
+             cold load; every extra load is a complete project index built, paid \
+             for, and discarded by `or_insert`"
+        );
     }
 
     #[test]
