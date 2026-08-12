@@ -78,10 +78,10 @@ pub fn apply(
     steps.push(TransitionStep::Freeze);
 
     // Drain: an outstanding permit must have ended by some terminal path.
-    if let Some(signal) = outstanding {
-        if !signal.has_ended() {
-            return Err(AuthorityRefusal::OutstandingPermit);
-        }
+    if let Some(signal) = outstanding
+        && !signal.has_ended()
+    {
+        return Err(AuthorityRefusal::OutstandingPermit);
     }
     steps.push(TransitionStep::Drain);
 

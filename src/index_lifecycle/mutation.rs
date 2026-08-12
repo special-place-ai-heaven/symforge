@@ -5,8 +5,8 @@
 //! generation, binding, epoch, and root must belong to the same authority. No
 //! consumer compares one field and infers the rest.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::authority::{
     AuthorityRefusal, CurrentMutationGrantAuthority, MutationAuthority, NonCurrentPublicationProof,

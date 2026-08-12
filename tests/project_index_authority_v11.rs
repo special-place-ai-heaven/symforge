@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use symforge::index_lifecycle::authority::{
     AuthorityRefusal, BindingAuthority, CandidateAuthority, CurrentPublication, GenerationIdentity,
-    MutationGrantInput, ObserverToken, PhaseName, Provenance, PublicationIdentity, SnapshotIdentity,
-    SourceRuntime,
+    MutationGrantInput, ObserverToken, PhaseName, Provenance, PublicationIdentity,
+    SnapshotIdentity, SourceRuntime,
 };
 use symforge::index_lifecycle::mutation::{
     NoSideEffectProof, PermitDrainSignal, SourceMutationPermit, Termination,
@@ -44,9 +44,17 @@ fn grant_requires_the_exact_live_current_publication() {
             live,
         }
     );
-    assert_eq!(runtime.mutation_epoch().get(), 0, "refusal advanced the epoch");
+    assert_eq!(
+        runtime.mutation_epoch().get(),
+        0,
+        "refusal advanced the epoch"
+    );
     assert_eq!(runtime.permits_issued(), 0, "refusal recorded a permit");
-    assert_eq!(runtime.phase(), PhaseName::Current, "refusal moved the phase");
+    assert_eq!(
+        runtime.phase(),
+        PhaseName::Current,
+        "refusal moved the phase"
+    );
 
     // Positive: the exact live publication grants, so the negative above is
     // rejecting provenance rather than rejecting everything.
@@ -172,7 +180,10 @@ fn strict_queryability_is_closed_over_retained_generations() {
         SourceRuntime::stopping(Some(accounted)).retained_generation(),
         Some(accounted)
     );
-    assert_eq!(SourceRuntime::stopping(Some(accounted)).live_publication(), None);
+    assert_eq!(
+        SourceRuntime::stopping(Some(accounted)).live_publication(),
+        None
+    );
 }
 
 #[test]
@@ -192,7 +203,10 @@ fn granting_publishes_non_current_before_the_permit_exists() {
     );
     assert_eq!(runtime.live_publication(), None);
     assert_eq!(runtime.mutation_epoch().get(), 1);
-    assert_eq!(grant.published_non_current().epoch(), runtime.mutation_epoch());
+    assert_eq!(
+        grant.published_non_current().epoch(),
+        runtime.mutation_epoch()
+    );
 
     let drain = Arc::new(PermitDrainSignal::new());
     let published = grant.published_non_current().publication();
@@ -219,8 +233,12 @@ fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
         .expect("live Current must grant");
 
     // Negative: the authority names root A, so pairing it with root B refuses.
-    let refusal = SourceMutationPermit::grant(grant, Arc::clone(&lease_b), Arc::new(PermitDrainSignal::new()))
-        .expect_err("an authority for root A must not pair with a lease on root B");
+    let refusal = SourceMutationPermit::grant(
+        grant,
+        Arc::clone(&lease_b),
+        Arc::new(PermitDrainSignal::new()),
+    )
+    .expect_err("an authority for root A must not pair with a lease on root B");
     assert_eq!(refusal, AuthorityRefusal::WholeAuthorityMismatch);
 
     // Positive: the same shape with the matching lease succeeds, so the refusal
@@ -229,8 +247,12 @@ fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
-    SourceMutationPermit::grant(grant, Arc::clone(&lease), Arc::new(PermitDrainSignal::new()))
-        .expect("an authority paired with its own lease must produce a permit");
+    SourceMutationPermit::grant(
+        grant,
+        Arc::clone(&lease),
+        Arc::new(PermitDrainSignal::new()),
+    )
+    .expect("an authority paired with its own lease must produce a permit");
     drop(lease_a);
 }
 
@@ -254,7 +276,9 @@ fn a_permit_is_terminal_once_it_ends() {
 
     // Negative: it cannot be driven again afterwards.
     assert_eq!(
-        permit.start_side_effect().expect_err("a terminal permit must refuse"),
+        permit
+            .start_side_effect()
+            .expect_err("a terminal permit must refuse"),
         AuthorityRefusal::PermitAlreadyTerminal
     );
     assert_eq!(
@@ -328,8 +352,12 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
     let grant_b = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live_b))
         .expect("root B grants");
-    let stale = SourceMutationPermit::grant(grant_b, Arc::clone(&lease_a), Arc::new(PermitDrainSignal::new()))
-        .expect_err("a lease on the replaced root must not accept root B's authority");
+    let stale = SourceMutationPermit::grant(
+        grant_b,
+        Arc::clone(&lease_a),
+        Arc::new(PermitDrainSignal::new()),
+    )
+    .expect_err("a lease on the replaced root must not accept root B's authority");
     assert_eq!(stale, AuthorityRefusal::WholeAuthorityMismatch);
     assert!(!lease_a.is_live(), "installing root B must revoke root A");
     assert!(lease_b.is_live(), "root B must be installed");

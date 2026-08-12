@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use symforge::index_lifecycle::physical_root::{
-    replace_beneath, PhysicalRootLease, ReplacementStep, RootRefusal,
+    PhysicalRootLease, ReplacementStep, RootRefusal, replace_beneath,
 };
 
 #[test]
@@ -131,8 +131,7 @@ fn a_link_component_is_refused_rather_than_followed() {
         .expect("a real directory component resolves");
 
     // Negative: a symlinked directory component is refused, not followed.
-    std::os::unix::fs::symlink(outside.path(), root.path().join("escape"))
-        .expect("create symlink");
+    std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).expect("create symlink");
     let refusal = lease
         .resolve_beneath(Path::new("escape/secret.txt"))
         .expect_err("a symlinked component must not be followed");

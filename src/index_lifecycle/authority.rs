@@ -573,7 +573,9 @@ impl SourceRuntime {
         let live = match &self.phase {
             SourcePhase::Current(publication) => publication.clone(),
             other => {
-                return Err(AuthorityRefusal::PhaseNotCurrent { phase: other.name() });
+                return Err(AuthorityRefusal::PhaseNotCurrent {
+                    phase: other.name(),
+                });
             }
         };
 

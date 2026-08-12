@@ -24,7 +24,7 @@ MUTATIONS=(
   # `if false` or an empty statement leaves an unused parameter, and this crate
   # denies warnings, so the build fails for a reason unrelated to the guard --
   # which reads as "uncompilable" and proves nothing.
-  "transition-drain|$TRANSITION|if !signal.has_ended() {|if signal.has_ended() && false {|transition refuses to install over a live permit"
+  "transition-drain|$TRANSITION|&& !signal.has_ended()|&& signal.has_ended() && false|transition refuses to install over a live permit"
   "install-revokes|$TRANSITION|outgoing.revoke();|let _ = &outgoing;|install revokes the outgoing root lease"
   "permit-terminality|$MUTATION|if matches!(self.state, PermitState::Terminal(_)) {|if false {|a terminal permit refuses a second termination"
   "drop-drains|$MUTATION|self.drain.record(Termination::Drained);||a dropped permit reports Drained"
