@@ -280,6 +280,19 @@ code review alone.
 
 ## Known limits carried forward
 
+- **The authority oracles lease the bare shared temp directory.**
+  `current_source()` in `tests/project_index_authority_v11.rs` takes a lease on
+  `std::env::temp_dir()` rather than a `tempfile::tempdir()`, and two tests write
+  real files into it (`slice1-own-write.txt`, `slice1-commit-probe.txt`) that are
+  never removed. On the ephemeral single-user CI runner this is harmless and CI
+  demonstrates it. On a shared or long-lived machine, a probe file owned by
+  another user makes the final `rename` fail under the sticky bit, and the test
+  then fails for a reason unrelated to the property under test — the vacuous-pass
+  problem in reverse. Every sibling test already uses `tempfile::tempdir()`.
+  Deliberately not changed while landing this slice, to avoid test churn on a
+  branch that has already burned eight CI runs; it is a latent flake, not a
+  current failure.
+
 - **TOCTOU in root confinement.** Components are checked with
   `symlink_metadata` before the open, so a link swapped in between check and
   open is not excluded. Closing this needs handle-relative I/O (`openat`, or
