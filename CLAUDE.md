@@ -7,7 +7,7 @@
 
 ### Windows build cache (disk)
 
-- Artifacts: repo `.cargo/config.toml` → `target/` on **E:** (gitignored). Do **not** pass `CARGO_TARGET_DIR=...` on the command line (older handoffs suggested `C:/symforge-target` — that filled **C:**).
+- Artifacts: repo `.cargo/config.toml` sets `target-dir = "target"`, i.e. artifacts land **beside the checkout, on whatever drive the repo is on** (gitignored). The comment in that file and this line both used to say "on **E:**", which was only ever true while the checkout lived there; as_of 2026-08-12 the repo is on **C:** with no E: drive present, and `target/` had reached **180 GB** on C:. Do **not** pass `CARGO_TARGET_DIR=...` on the command line (older handoffs suggested `C:/symforge-target` — that filled **C:**).
 - **Agent discipline**: OK to run full `cargo` gates locally; **clean up after yourself** — when you finish a heavy local session (`test --all-targets`, `build --release`), run `cargo clean` before ending so debug artifacts do not accumulate. If `target/debug` is already large before your gate, `cargo clean` first.
 
 ## CI Gates
