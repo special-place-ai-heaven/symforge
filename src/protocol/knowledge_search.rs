@@ -1296,4 +1296,39 @@ mod tests {
             "no hit may be formatted under unsafe source provenance"
         );
     }
+
+    #[test]
+    fn unknown_lifecycle_units_remain_visible_at_default_authority_scope() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("docs")).expect("docs");
+        std::fs::write(
+            project.path().join("docs").join("notes.md"),
+            "# Notes\nXylophone lifecycle canary with no declared status.\n",
+        )
+        .expect("undeclared document");
+        let shared = LiveIndex::load(project.path()).expect("load generation");
+        let current = shared.published_source_set().current_generation();
+
+        let default_output = search_current(&current, &input("xylophone lifecycle canary"));
+        assert!(
+            default_output.contains("docs/notes.md"),
+            "default authority_scope must still surface an unevidenced unit: {default_output}"
+        );
+        assert!(
+            default_output.contains("lifecycle=unknown"),
+            "the hit must report the lifecycle that was actually observed: {default_output}"
+        );
+        assert!(
+            default_output.contains("voice=unknown"),
+            "an unevidenced lifecycle must not be consumed as voice=current: {default_output}"
+        );
+
+        let mut history = input("xylophone lifecycle canary");
+        history.authority_scope = Some(KnowledgeAuthorityScope::History);
+        let history_output = search_current(&current, &history);
+        assert!(
+            !history_output.contains("docs/notes.md"),
+            "history scope must not surface an Unknown-voice unit, or the default-scope hit is unfiltered: {history_output}"
+        );
+    }
 }

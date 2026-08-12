@@ -156,6 +156,10 @@ async fn exact_hit_and_complete_no_match_preserve_captured_provenance() {
 
     assert!(hit.contains("docs/recovery.md:3"), "exact path/line: {hit}");
     assert!(
+        hit.contains("lifecycle=unknown") && hit.contains("voice=unknown"),
+        "an undeclared unit must stay visible at default scope as unknown, not as invented active/current: {hit}"
+    );
+    assert!(
         hit.contains("Recovery > Persistence boundaries"),
         "heading breadcrumb: {hit}"
     );
