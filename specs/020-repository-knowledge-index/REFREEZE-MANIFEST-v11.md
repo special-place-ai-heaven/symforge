@@ -1105,7 +1105,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/data-model.md",
       "scope": "feature",
-      "sha256": "03c0433ad340d7666a0c9ca779cb1af4f466acf7a9d86f5e5f4a5c22ec0c6f46",
+      "sha256": "acf421dfb6d6ca3354a25b097eecf82b4f275a9799f48bc3509dfb61b8e34371",
       "superseded_by": []
     },
     {

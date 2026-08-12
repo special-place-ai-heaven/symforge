@@ -660,7 +660,10 @@ pub struct VerificationScopeReceipt {
 ///  + ceil(verification_entries / RESERVED_VERIFICATION_ENTRIES_PER_SECOND)`
 /// seconds, compared directly against `DEFAULT_MAX_COMPLETE_VERIFICATION_PASS`.
 /// The default ceilings cap it at 512 + 200 = 712 seconds, so that constant is a
-/// ceiling the defaults never reach.
+/// ceiling the defaults never reach. Its private constructor computes `bound` from
+/// `verification_bytes` and `verification_entries` at the reserved service floors;
+/// `bound` is never separately settable, so the value the admission gate trusts
+/// cannot disagree with the operands it was derived from.
 pub struct VerificationWorkBound {
     pub scope_receipt: VerificationScopeReceiptId,
     pub verification_bytes: u64,
