@@ -14,38 +14,17 @@ planned and unexecuted.
 <!-- SYMFORGE V10 AUTHORITY RETIREMENT V11 JSON START -->
 ```json
 {
-  "kind": "symforge.v10_authority_retirement.v11",
-  "schema_version": 1,
-  "status": "planned_not_executed",
-  "slice4_owner": {
-    "slice": 4,
-    "tasks": ["T064", "T065", "T066", "T067"]
-  },
-  "preactivation_closure": {
-    "writers": {
-      "paths": ["src/cli/init.rs", "src/gitignore_hygiene.rs", "src/live_index/persist.rs", "src/live_index/single_file.rs", "src/protocol/edit.rs", "src/protocol/edit_tools.rs", "src/protocol/knowledge_curation.rs", "src/protocol/tools.rs"],
-      "digest": "e2e4120433514d9c0ea3ad366c26ef14a50bac5950ec7fe4f361c8e3a5ac00ae"
-    },
-    "callbacks": {
-      "paths": ["src/daemon.rs", "src/live_index/git_temporal.rs", "src/live_index/persist.rs", "src/main.rs", "src/protocol/edit_hooks.rs", "src/protocol/knowledge_curation.rs", "src/server/serve.rs", "src/watcher/mod.rs"],
-      "digest": "0338146c8ee23d07abc28a2bae09aee740d854ec1a24370e22b77bc83bb80216"
-    },
-    "publication_roots": {
-      "paths": ["src/daemon.rs", "src/live_index/store.rs", "src/protocol/mod.rs", "src/server/mod.rs", "src/sidecar/mod.rs"],
-      "digest": "6f2e24f4c15e6fd58d97b5ebaefff228700e7ca7d52bfa87451e71acbd47cf1d"
-    },
-    "cache": {
-      "paths": ["src/daemon.rs", "src/protocol/knowledge_curation.rs", "src/protocol/session.rs", "src/sidecar/mod.rs", "src/worktree.rs"],
-      "digest": "554deb77a982c03738e20f22a3d43424a05500367226b9de28bf75fc084cdd99"
-    },
-    "ccr": {
-      "paths": ["src/protocol/ccr.rs"],
-      "digest": "d6bb6ecb8e64f955f796d0851901f21cfe8b96b99f83b1d7c7f392f08afff9e8"
-    }
-  },
   "entries": [
     {
+      "assertions": [
+        "Every repository-source byte writer obtains a current SourceMutationPermit before I/O",
+        "No writer mutates a V10 SharedIndex or publishes directly",
+        "Gitignore hygiene is source-authorized while ProjectStateDir and post-image team-artifact state writes remain permit-free"
+      ],
       "category": "writers",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "route_all_repository-source writes through mutation intent and V11 reconciliation; remove direct index publication",
+      "executed": false,
       "members": [
         "src/cli/init.rs::run_init_with_paths",
         "src/gitignore_hygiene.rs::atomic_replace",
@@ -73,17 +52,28 @@ planned and unexecuted.
         "src/protocol/knowledge_curation.rs::durable_replace_io",
         "src/protocol/tools.rs::SymForgeServer::curate_knowledge"
       ],
-      "production_seams": ["src/index_lifecycle/mutation.rs::SourceMutationPermit", "src/index_lifecycle/runtime.rs::ProjectIndexRuntime"],
-      "slice4_owner_tasks": ["T064", "T065", "T067"],
-      "disposition": "route_all_repository-source writes through mutation intent and V11 reconciliation; remove direct index publication",
+      "production_seams": [
+        "src/index_lifecycle/mutation.rs::SourceMutationPermit",
+        "src/index_lifecycle/runtime.rs::ProjectIndexRuntime"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Every repository-source byte writer obtains a current SourceMutationPermit before I/O", "No writer mutates a V10 SharedIndex or publishes directly", "Gitignore hygiene is source-authorized while ProjectStateDir and post-image team-artifact state writes remain permit-free"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T064",
+        "T065",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "No callback holds publication authority",
+        "Every callback carries current project and source incarnations",
+        "Late V10 callbacks are unreachable after the activation cut"
+      ],
       "category": "callbacks",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "register callbacks with a source-slot incarnation and revoke them before tombstone retirement",
+      "executed": false,
       "members": [
         "src/daemon.rs::bootstrap_project_index::background_verify spawn",
         "src/daemon.rs::spawn_local_ref_reconcile",
@@ -100,17 +90,28 @@ planned and unexecuted.
         "src/watcher/mod.rs::restart_watcher",
         "src/watcher/mod.rs::start_watcher"
       ],
-      "production_seams": ["src/index_lifecycle/observer.rs::ObserverHandoff", "src/index_lifecycle/supervisor.rs::SourceSupervisor"],
-      "slice4_owner_tasks": ["T064", "T065", "T067"],
-      "disposition": "register callbacks with a source-slot incarnation and revoke them before tombstone retirement",
+      "production_seams": [
+        "src/index_lifecycle/observer.rs::ObserverHandoff",
+        "src/index_lifecycle/supervisor.rs::SourceSupervisor"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["No callback holds publication authority", "Every callback carries current project and source incarnations", "Late V10 callbacks are unreachable after the activation cut"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T064",
+        "T065",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Only ProjectPublicationRoot is query-visible",
+        "No bare SharedIndex is stored in daemon, protocol, server, sidecar, or embed state",
+        "Partial source generations cannot be published"
+      ],
       "category": "publication_roots",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "replace every V10 root with the sole immutable whole-project publication root",
+      "executed": false,
       "members": [
         "src/daemon.rs::ProjectInstance::index",
         "src/daemon.rs::SessionRuntime::index",
@@ -122,17 +123,27 @@ planned and unexecuted.
         "src/server/mod.rs::ServerRuntime::index",
         "src/sidecar/mod.rs::SidecarState::index"
       ],
-      "production_seams": ["src/index_lifecycle/runtime.rs::ProjectIndexRuntime", "src/index_lifecycle/runtime.rs::ProjectPublicationRoot"],
-      "slice4_owner_tasks": ["T066", "T067"],
-      "disposition": "replace every V10 root with the sole immutable whole-project publication root",
+      "production_seams": [
+        "src/index_lifecycle/runtime.rs::ProjectIndexRuntime",
+        "src/index_lifecycle/runtime.rs::ProjectPublicationRoot"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Only ProjectPublicationRoot is query-visible", "No bare SharedIndex is stored in daemon, protocol, server, sidecar, or embed state", "Partial source generations cannot be published"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "A cache miss never falls back to a V10 authority",
+        "A cache hit is fenced to the leased publication",
+        "Retarget and publication swap invalidate stale cache entries deterministically"
+      ],
       "category": "cache",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "make caches generation-keyed, non-authoritative projections of a pinned V11 publication or remove them",
+      "executed": false,
       "members": [
         "src/daemon.rs::DaemonState::bases",
         "src/daemon.rs::ProjectInstance::symbol_cache",
@@ -144,34 +155,55 @@ planned and unexecuted.
         "src/sidecar/mod.rs::SidecarState::symbol_cache",
         "src/worktree.rs::WorktreeCache"
       ],
-      "production_seams": ["src/index_lifecycle/query.rs::ProjectQueryLease", "src/index_lifecycle/runtime.rs::ProjectPublicationRoot"],
-      "slice4_owner_tasks": ["T066", "T067"],
-      "disposition": "make caches generation-keyed, non-authoritative projections of a pinned V11 publication or remove them",
+      "production_seams": [
+        "src/index_lifecycle/query.rs::ProjectQueryLease",
+        "src/index_lifecycle/runtime.rs::ProjectPublicationRoot"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["A cache miss never falls back to a V10 authority", "A cache hit is fenced to the leased publication", "Retarget and publication swap invalidate stale cache entries deterministically"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "CCR cannot originate truth or extend a lease",
+        "CCR handles encode the source publication identity",
+        "Evicted or foreign generations return typed unavailability"
+      ],
       "category": "ccr",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "retain CCR only as a generation-bound rendering cache downstream of a V11 query lease",
+      "executed": false,
       "members": [
         "src/protocol/ccr.rs::CcrStore",
         "src/protocol/ccr.rs::apply_ccr_overflow",
         "src/protocol/ccr.rs::enforce_token_budget_with_ccr",
         "src/protocol/ccr.rs::rewrite_footer_for_symforge_facade"
       ],
-      "production_seams": ["src/index_lifecycle/query.rs::ProjectQueryLease", "src/protocol/read_gate.rs::ReadGate"],
-      "slice4_owner_tasks": ["T066", "T067"],
-      "disposition": "retain CCR only as a generation-bound rendering cache downstream of a V11 query lease",
+      "production_seams": [
+        "src/index_lifecycle/query.rs::ProjectQueryLease",
+        "src/protocol/read_gate.rs::ReadGate"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["CCR cannot originate truth or extend a lease", "CCR handles encode the source publication identity", "Evicted or foreign generations return typed unavailability"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Snapshot load never publishes directly",
+        "Compatibility and source identity are re-proved before promotion",
+        "Protected placement first selects deterministic user-local state fallback",
+        "Only memory-only placement or failed user-local fallback produces typed checkpoint unavailability"
+      ],
       "category": "snapshot",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "demote restore to private candidate seed and route checkpointing through the typed V11 state owner with protected-root user-local fallback",
+      "executed": false,
       "members": [
         "src/live_index/persist.rs::IndexSnapshot",
         "src/live_index/persist.rs::background_verify",
@@ -187,17 +219,30 @@ planned and unexecuted.
         "src/live_index/persist.rs::snapshot_to_live_index",
         "src/live_index/persist.rs::snapshot_to_live_index_with_code_signals"
       ],
-      "production_seams": ["src/index_lifecycle/verification.rs::VerificationRecord", "src/live_index/persist.rs::IndexSnapshot"],
-      "slice4_owner_tasks": ["T065", "T067"],
-      "disposition": "demote restore to private candidate seed and route checkpointing through the typed V11 state owner with protected-root user-local fallback",
+      "production_seams": [
+        "src/index_lifecycle/verification.rs::VerificationRecord",
+        "src/live_index/persist.rs::IndexSnapshot"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Snapshot load never publishes directly", "Compatibility and source identity are re-proved before promotion", "Protected placement first selects deterministic user-local state fallback", "Only memory-only placement or failed user-local fallback produces typed checkpoint unavailability"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T065",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Every source-derived union member selects exactly one of GenerationLeased, DiskObserved, WorktreeScopeObserved, GitObserved, RuntimeHealthObserved, MutationPermitted, StateWriteAuthorized, or Refused",
+        "Full contains exactly 39 tools, Compact contains exactly status, symforge, and symforge_edit, and their unique union contains exactly 40",
+        "Only GenerationLeased acquires a ProjectQueryLease and only repository-source MutationPermitted operations acquire a SourceMutationPermit",
+        "RuntimeHealthObserved keeps committed-generation fields separate from bounded attempt and runtime-work fields",
+        "No tool retains direct V10 index access",
+        "The compact facade does not weaken authority checks"
+      ],
       "category": "tools",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "route the source-derived full-39 and compact-3 profiles, whose unique union is 40 tools, through exactly one typed V11 authority branch",
+      "executed": false,
       "members": [
         "analyze_file_impact",
         "ask",
@@ -240,17 +285,30 @@ planned and unexecuted.
         "validate_file_syntax",
         "what_changed"
       ],
-      "production_seams": ["src/index_lifecycle/mutation.rs::SourceMutationPermit", "src/index_lifecycle/public_api.rs::V11PublicApi", "src/index_lifecycle/query.rs::ProjectQueryLease"],
-      "slice4_owner_tasks": ["T066", "T067"],
-      "disposition": "route the source-derived full-39 and compact-3 profiles, whose unique union is 40 tools, through exactly one typed V11 authority branch",
+      "production_seams": [
+        "src/index_lifecycle/mutation.rs::SourceMutationPermit",
+        "src/index_lifecycle/public_api.rs::V11PublicApi",
+        "src/index_lifecycle/query.rs::ProjectQueryLease"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Every source-derived union member selects exactly one of GenerationLeased, DiskObserved, WorktreeScopeObserved, GitObserved, RuntimeHealthObserved, MutationPermitted, StateWriteAuthorized, or Refused", "Full contains exactly 39 tools, Compact contains exactly status, symforge, and symforge_edit, and their unique union contains exactly 40", "Only GenerationLeased acquires a ProjectQueryLease and only repository-source MutationPermitted operations acquire a SourceMutationPermit", "RuntimeHealthObserved keeps committed-generation fields separate from bounded attempt and runtime-work fields", "No tool retains direct V10 index access", "The compact facade does not weaken authority checks"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Generation-backed resources use GenerationLeased and pin one V11 publication",
+        "Pure disk, worktree-scope, git, and runtime-health resources use their lease-free observed branches with typed provenance",
+        "RuntimeHealthObserved resources cannot mix attempt-only fields into committed-generation truth",
+        "Static catalog resources cannot disclose raw runtime state",
+        "Template expansion preserves the selected branch and never upgrades an observation into Current"
+      ],
       "category": "resources",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "classify every static resource and resource template into its exact V11 generation, disk, worktree, git, state, or refusal branch",
+      "executed": false,
       "members": [
         "symforge://file/content",
         "symforge://file/context",
@@ -263,17 +321,27 @@ planned and unexecuted.
         "symforge://symbol/detail",
         "symforge://tools/catalog"
       ],
-      "production_seams": ["src/index_lifecycle/query.rs::ProjectQueryLease", "src/protocol/read_gate.rs::ReadGate"],
-      "slice4_owner_tasks": ["T066", "T067"],
-      "disposition": "classify every static resource and resource template into its exact V11 generation, disk, worktree, git, state, or refusal branch",
+      "production_seams": [
+        "src/index_lifecycle/query.rs::ProjectQueryLease",
+        "src/protocol/read_gate.rs::ReadGate"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Generation-backed resources use GenerationLeased and pin one V11 publication", "Pure disk, worktree-scope, git, and runtime-health resources use their lease-free observed branches with typed provenance", "RuntimeHealthObserved resources cannot mix attempt-only fields into committed-generation truth", "Static catalog resources cannot disclose raw runtime state", "Template expansion preserves the selected branch and never upgrades an observation into Current"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Generation-backed prompt context uses GenerationLeased while pure observation context remains lease-free",
+        "Prompt aliases cannot reach V10 caches or upgrade observations into Current",
+        "Unavailable context selects Refused rather than silently empty success"
+      ],
       "category": "prompts",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "route prompt context through the exact typed V11 branch; static prompt text carries no publication authority",
+      "executed": false,
       "members": [
         "symforge-admin",
         "symforge-architecture",
@@ -284,17 +352,28 @@ planned and unexecuted.
         "symforge-review",
         "symforge-triage"
       ],
-      "production_seams": ["src/index_lifecycle/query.rs::ProjectQueryLease", "src/protocol/read_gate.rs::ReadGate"],
-      "slice4_owner_tasks": ["T066", "T067"],
-      "disposition": "route prompt context through the exact typed V11 branch; static prompt text carries no publication authority",
+      "production_seams": [
+        "src/index_lifecycle/query.rs::ProjectQueryLease",
+        "src/protocol/read_gate.rs::ReadGate"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Generation-backed prompt context uses GenerationLeased while pure observation context remains lease-free", "Prompt aliases cannot reach V10 caches or upgrade observations into Current", "Unavailable context selects Refused rather than silently empty success"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Generation-backed endpoints use GenerationLeased; disk, worktree-scope, git, runtime-health, mutation, and state endpoints use only their matching typed branch",
+        "RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state",
+        "Caller-root mismatch selects Refused and cannot fall through to V10",
+        "Workflow aliases are thin aliases over the same branch selector"
+      ],
       "category": "sidecar",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "route standalone and daemon-proxied sidecar endpoints through the same typed V11 branch selector and root guard",
+      "executed": false,
       "members": [
         "GET /health",
         "GET /impact",
@@ -321,41 +400,86 @@ planned and unexecuted.
         "GET /workflows/search-hit-expansion",
         "GET /workflows/source-read"
       ],
-      "production_seams": ["src/index_lifecycle/public_api.rs::V11PublicApi", "src/index_lifecycle/query.rs::ProjectQueryLease"],
-      "slice4_owner_tasks": ["T064", "T066", "T067"],
-      "disposition": "route standalone and daemon-proxied sidecar endpoints through the same typed V11 branch selector and root guard",
+      "production_seams": [
+        "src/index_lifecycle/public_api.rs::V11PublicApi",
+        "src/index_lifecycle/query.rs::ProjectQueryLease"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Generation-backed endpoints use GenerationLeased; disk, worktree-scope, git, runtime-health, mutation, and state endpoints use only their matching typed branch", "RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state", "Caller-root mismatch selects Refused and cannot fall through to V10", "Workflow aliases are thin aliases over the same branch selector"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T064",
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Read, Grep, SessionStart, PromptSubmit, and PreTool select GenerationLeased only for generation-backed context and otherwise retain their exact disk, worktree, git, runtime-health, state, or refusal branch",
+        "Edit and Write notifications cannot publish, mint a SourceMutationPermit, or bypass mutation authority",
+        "Fallback output carries no false Current claim and cannot upgrade a pure observation"
+      ],
       "category": "hooks",
-      "members": ["hook:Edit", "hook:Grep", "hook:PreTool", "hook:PromptSubmit", "hook:Read", "hook:SessionStart", "hook:Write"],
-      "production_seams": ["src/index_lifecycle/activation.rs::ActivationCut", "src/index_lifecycle/mutation.rs::SourceMutationPermit", "src/index_lifecycle/query.rs::ProjectQueryLease"],
-      "slice4_owner_tasks": ["T064", "T066", "T067"],
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
       "disposition": "route all seven hook classes through root-bound typed V11 sidecar or daemon ingress; fail open only without claiming Current evidence",
+      "executed": false,
+      "members": [
+        "hook:Edit",
+        "hook:Grep",
+        "hook:PreTool",
+        "hook:PromptSubmit",
+        "hook:Read",
+        "hook:SessionStart",
+        "hook:Write"
+      ],
+      "production_seams": [
+        "src/index_lifecycle/activation.rs::ActivationCut",
+        "src/index_lifecycle/mutation.rs::SourceMutationPermit",
+        "src/index_lifecycle/query.rs::ProjectQueryLease"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Read, Grep, SessionStart, PromptSubmit, and PreTool select GenerationLeased only for generation-backed context and otherwise retain their exact disk, worktree, git, runtime-health, state, or refusal branch", "Edit and Write notifications cannot publish, mint a SourceMutationPermit, or bypass mutation authority", "Fallback output carries no false Current claim and cannot upgrade a pure observation"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T064",
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "Neither alias is advertised as an additional tool",
+        "detect_changes delegates to detect_impact and returns GitObserved for committed-ref diffs or WorktreeScopeObserved for worktree diffs",
+        "detect_changes never acquires a ProjectQueryLease or upgrades observation evidence to GenerationLeased",
+        "trace_symbol cannot reach V10 symbol caches and uses GenerationLeased only for a complete Current publication"
+      ],
       "category": "compatibility_aliases",
-      "members": ["detect_changes", "trace_symbol"],
-      "production_seams": ["src/index_lifecycle/activation.rs::ActivationCut", "src/index_lifecycle/public_api.rs::V11PublicApi"],
-      "slice4_owner_tasks": ["T066", "T067"],
-      "disposition": "route trace_symbol through V11 generation authority and route detect_changes to detect_impact as typed Git/worktree observation, or retire either alias",
-      "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
       "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["Neither alias is advertised as an additional tool", "detect_changes delegates to detect_impact and returns GitObserved for committed-ref diffs or WorktreeScopeObserved for worktree diffs", "detect_changes never acquires a ProjectQueryLease or upgrades observation evidence to GenerationLeased", "trace_symbol cannot reach V10 symbol caches and uses GenerationLeased only for a complete Current publication"],
-      "status": "planned_not_executed",
-      "executed": false
+      "disposition": "route trace_symbol through V11 generation authority and route detect_changes to detect_impact as typed Git/worktree observation, or retire either alias",
+      "executed": false,
+      "members": [
+        "detect_changes",
+        "trace_symbol"
+      ],
+      "production_seams": [
+        "src/index_lifecycle/activation.rs::ActivationCut",
+        "src/index_lifecycle/public_api.rs::V11PublicApi"
+      ],
+      "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
+      "slice4_owner_tasks": [
+        "T066",
+        "T067"
+      ],
+      "status": "planned_not_executed"
     },
     {
+      "assertions": [
+        "The member set exactly equals all remove/replace V10 migration atoms",
+        "No forbidden raw module, state, parser, snapshot, search, mutation, STEL, Git, or deep re-export remains public",
+        "The observed public graph equals the frozen V11 graph in every supported configuration cell"
+      ],
       "category": "raw_embed",
+      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
+      "disposition": "remove or replace exactly as frozen by every migration_v10 category whose decision is remove or replace",
+      "executed": false,
       "members": [
         "symforge::analytics",
         "symforge::capability",
@@ -437,16 +561,84 @@ planned and unexecuted.
         "symforge::watcher_state",
         "symforge::worktree"
       ],
-      "production_seams": ["src/index_lifecycle/embedded.rs::EmbeddedSourceHandle", "src/index_lifecycle/process_runtime.rs::ProcessIndexRuntime", "src/index_lifecycle/public_api.rs::V11PublicApi"],
-      "slice4_owner_tasks": ["T067"],
-      "disposition": "remove or replace exactly as frozen by every migration_v10 category whose decision is remove or replace",
+      "production_seams": [
+        "src/index_lifecycle/embedded.rs::EmbeddedSourceHandle",
+        "src/index_lifecycle/process_runtime.rs::ProcessIndexRuntime",
+        "src/index_lifecycle/public_api.rs::V11PublicApi"
+      ],
       "retirement_test": "tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch",
-      "command": "cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact",
-      "assertions": ["The member set exactly equals all remove/replace V10 migration atoms", "No forbidden raw module, state, parser, snapshot, search, mutation, STEL, Git, or deep re-export remains public", "The observed public graph equals the frozen V11 graph in every supported configuration cell"],
-      "status": "planned_not_executed",
-      "executed": false
+      "slice4_owner_tasks": [
+        "T067"
+      ],
+      "status": "planned_not_executed"
     }
-  ]
+  ],
+  "kind": "symforge.v10_authority_retirement.v11",
+  "preactivation_closure": {
+    "cache": {
+      "digest": "19eb9a74bf4de8c6ff2c2d6aeb3e1ada24597491fd24856b02f5794f5e41e061",
+      "paths": [
+        "src/daemon.rs",
+        "src/protocol/knowledge_curation.rs",
+        "src/protocol/session.rs",
+        "src/sidecar/mod.rs",
+        "src/worktree.rs"
+      ]
+    },
+    "callbacks": {
+      "digest": "4b6a5fc9cc3d37df50cf25287c36c4330742d6ebb5a2fd327a95196a2507b124",
+      "paths": [
+        "src/daemon.rs",
+        "src/live_index/git_temporal.rs",
+        "src/live_index/persist.rs",
+        "src/main.rs",
+        "src/protocol/edit_hooks.rs",
+        "src/protocol/knowledge_curation.rs",
+        "src/server/serve.rs",
+        "src/watcher/mod.rs"
+      ]
+    },
+    "ccr": {
+      "digest": "8ad77748b8fd9e6eb31853cc9615730fc632a890898321deb915546e384ad246",
+      "paths": [
+        "src/protocol/ccr.rs"
+      ]
+    },
+    "publication_roots": {
+      "digest": "f09e746dd8b3a5354284d5fd1c403b1ee962005d96bb9c749d58fbce0fb7ce90",
+      "paths": [
+        "src/daemon.rs",
+        "src/live_index/store.rs",
+        "src/protocol/mod.rs",
+        "src/server/mod.rs",
+        "src/sidecar/mod.rs"
+      ]
+    },
+    "writers": {
+      "digest": "4d5a2dbbcff42cf673bb4e1baf555d6c25dfb17ee851a5a9a085cf92c53e03f5",
+      "paths": [
+        "src/cli/init.rs",
+        "src/gitignore_hygiene.rs",
+        "src/live_index/persist.rs",
+        "src/live_index/single_file.rs",
+        "src/protocol/edit.rs",
+        "src/protocol/edit_tools.rs",
+        "src/protocol/knowledge_curation.rs",
+        "src/protocol/tools.rs"
+      ]
+    }
+  },
+  "schema_version": 1,
+  "slice4_owner": {
+    "slice": 4,
+    "tasks": [
+      "T064",
+      "T065",
+      "T066",
+      "T067"
+    ]
+  },
+  "status": "planned_not_executed"
 }
 ```
 <!-- SYMFORGE V10 AUTHORITY RETIREMENT V11 JSON END -->

@@ -26,7 +26,7 @@ This detached attestation binds the refreeze manifest to the exact baseline, des
   "kind": "symforge-feature-020-refreeze-attestation",
   "manifest": {
     "path": "specs/020-repository-knowledge-index/REFREEZE-MANIFEST-v11.md",
-    "sha256": "a1915ce1bcd1f769fd0e1da7296bd2ce5b364eb2f4775798b7e8c71d75436671"
+    "sha256": "1858b4c5ea334216f248820aabff9851d1ac1945896611b1a2500c11b96a730e"
   },
   "public_api": {
     "canonical_sha256": "c45f3cd3f77e5690ad1dcd2e5fc7e39e30d52df38fa564d7b663e1c95823a7da",

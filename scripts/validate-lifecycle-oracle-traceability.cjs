@@ -308,7 +308,7 @@ const FROZEN_DIGESTS = {
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "3310ec039003c6ac3c441dc73ac59f5f77d2137ce532eca06d3766abd9b931fe",
+    hash: "35d27c8785291b156de2967100417115c09862e073e1404a72f00cf96269f1cb",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -775,27 +775,32 @@ function seamPath(seam) {
   return typeof seam === "string" ? seam.split("::", 1)[0] : "";
 }
 
-function maskRustCommentsAndLiterals(source) {
-  const chars = source.split("");
+/// Classify every character as `code`, `comment`, or `literal`.
+///
+/// One walker, two consumers: the mask below and the canonical release form.
+/// Duplicating this state machine is how a subtle lexer bug gets fixed in one
+/// place and not the other.
+function rustCharacterKinds(source) {
+  const kinds = new Array(source.length).fill("code");
   let index = 0;
   let state = "code";
   let blockDepth = 0;
   let rawTerminator = "";
-  const mask = (at) => {
-    if (chars[at] !== "\n" && chars[at] !== "\r") chars[at] = " ";
+  const set = (at, kind) => {
+    if (at < kinds.length) kinds[at] = kind;
   };
   while (index < source.length) {
     if (state === "code") {
       if (source.startsWith("//", index)) {
-        mask(index);
-        mask(index + 1);
+        set(index, "comment");
+        set(index + 1, "comment");
         index += 2;
         state = "line_comment";
         continue;
       }
       if (source.startsWith("/*", index)) {
-        mask(index);
-        mask(index + 1);
+        set(index, "comment");
+        set(index + 1, "comment");
         index += 2;
         blockDepth = 1;
         state = "block_comment";
@@ -803,21 +808,21 @@ function maskRustCommentsAndLiterals(source) {
       }
       const raw = /^(?:br|r)(#*)"/u.exec(source.slice(index));
       if (raw) {
-        for (let offset = 0; offset < raw[0].length; offset += 1) mask(index + offset);
+        for (let offset = 0; offset < raw[0].length; offset += 1) set(index + offset, "literal");
         index += raw[0].length;
         rawTerminator = `"${raw[1]}`;
         state = "raw_string";
         continue;
       }
       if (source[index] === '"') {
-        mask(index);
+        set(index, "literal");
         index += 1;
         state = "string";
         continue;
       }
       const character = /^'(?:\\.|[^'\\\r\n])'/u.exec(source.slice(index));
       if (character) {
-        for (let offset = 0; offset < character[0].length; offset += 1) mask(index + offset);
+        for (let offset = 0; offset < character[0].length; offset += 1) set(index + offset, "literal");
         index += character[0].length;
         continue;
       }
@@ -825,55 +830,62 @@ function maskRustCommentsAndLiterals(source) {
       continue;
     }
     if (state === "line_comment") {
-      if (source[index] === "\n" || source[index] === "\r") {
-        state = "code";
-      } else {
-        mask(index);
-      }
+      if (source[index] === "\n" || source[index] === "\r") state = "code";
+      else set(index, "comment");
       index += 1;
       continue;
     }
     if (state === "block_comment") {
       if (source.startsWith("/*", index)) {
-        mask(index);
-        mask(index + 1);
+        set(index, "comment");
+        set(index + 1, "comment");
         blockDepth += 1;
         index += 2;
       } else if (source.startsWith("*/", index)) {
-        mask(index);
-        mask(index + 1);
+        set(index, "comment");
+        set(index + 1, "comment");
         blockDepth -= 1;
         index += 2;
         if (blockDepth === 0) state = "code";
       } else {
-        mask(index);
+        set(index, "comment");
         index += 1;
       }
       continue;
     }
     if (state === "raw_string") {
       if (source.startsWith(rawTerminator, index)) {
-        for (let offset = 0; offset < rawTerminator.length; offset += 1) mask(index + offset);
+        for (let offset = 0; offset < rawTerminator.length; offset += 1) set(index + offset, "literal");
         index += rawTerminator.length;
         state = "code";
       } else {
-        mask(index);
+        set(index, "literal");
         index += 1;
       }
       continue;
     }
     if (source[index] === "\\") {
-      mask(index);
-      if (index + 1 < source.length) mask(index + 1);
+      set(index, "literal");
+      if (index + 1 < source.length) set(index + 1, "literal");
       index += 2;
     } else if (source[index] === '"') {
-      mask(index);
+      set(index, "literal");
       index += 1;
       state = "code";
     } else {
-      mask(index);
+      set(index, "literal");
       index += 1;
     }
+  }
+  return kinds;
+}
+
+function maskRustCommentsAndLiterals(source) {
+  const kinds = rustCharacterKinds(source);
+  const chars = source.split("");
+  for (let index = 0; index < chars.length; index += 1) {
+    if (kinds[index] === "code") continue;
+    if (chars[index] !== "\n" && chars[index] !== "\r") chars[index] = " ";
   }
   return chars.join("");
 }
@@ -1015,7 +1027,7 @@ function sourceAnchorResolves(anchor) {
   return sourceAnchorResolvesText(anchor, source);
 }
 
-function rustNamedCaseBodyInSource(symbolPath, source) {
+function rustNamedCaseBodyInSource(symbolPath, source, allowIgnored = false) {
   if (typeof symbolPath !== "string" || typeof source !== "string") return null;
   const code = maskRustCommentsAndLiterals(source);
   const caseName = symbolPath.split("::").at(-1);
@@ -1030,7 +1042,13 @@ function rustNamedCaseBodyInSource(symbolPath, source) {
     const attributes = /(?:#\s*\[[^\]]*\]\s*)+$/u.exec(prefix);
     if (attributes &&
         /#\s*\[\s*(?:test\b|(?:tokio|async_std|actix_rt)::test\b)/u.test(attributes[0]) &&
-        !/#\s*\[\s*(?:ignore\b|cfg_attr\b)/u.test(attributes[0]) &&
+        // `cfg_attr` can add `ignore` conditionally, so it is never resolvable.
+        // A literal `ignore` is resolvable only where the case is PLANNED: a
+        // Slice 0 positive control is RED by construction and must be kept out
+        // of the default suite, but an executed receipt claiming `passed` can
+        // never come from an ignored case, so that path stays strict.
+        !/#\s*\[\s*cfg_attr\b/u.test(attributes[0]) &&
+        (allowIgnored || !/#\s*\[\s*ignore\b/u.test(attributes[0])) &&
         ![...attributes[0].matchAll(/#\s*\[\s*cfg\s*\(([^)]*)\)\s*\]/gu)].some((cfg) => cfg[1].trim() !== "test")) {
       const modules = moduleIntervals
         .filter((interval) => interval.open < match.index && match.index < interval.close)
@@ -1042,12 +1060,12 @@ function rustNamedCaseBodyInSource(symbolPath, source) {
   return null;
 }
 
-function rustNamedCaseExistsInSource(symbolPath, source) {
-  return rustNamedCaseBodyInSource(symbolPath, source) !== null;
+function rustNamedCaseExistsInSource(symbolPath, source, allowIgnored = false) {
+  return rustNamedCaseBodyInSource(symbolPath, source, allowIgnored) !== null;
 }
 
-function rustNamedCaseIsNonEmptyInSource(symbolPath, source) {
-  const body = rustNamedCaseBodyInSource(symbolPath, source);
+function rustNamedCaseIsNonEmptyInSource(symbolPath, source, allowIgnored = false) {
+  const body = rustNamedCaseBodyInSource(symbolPath, source, allowIgnored);
   return typeof body === "string" && /[A-Za-z0-9_]/u.test(body);
 }
 
@@ -1279,9 +1297,9 @@ function validateTrace(trace, taskCatalog) {
       } catch {
         plannedSource = null;
       }
-      if (typeof plannedSource === "string" && !rustNamedCaseExistsInSource(target.symbolPath, plannedSource)) {
+      if (typeof plannedSource === "string" && !rustNamedCaseExistsInSource(target.symbolPath, plannedSource, true)) {
         fail("PLANNED_TEST_CASE_MISSING", `${context}: ${test.target}`);
-      } else if (typeof plannedSource === "string" && !rustNamedCaseIsNonEmptyInSource(target.symbolPath, plannedSource)) {
+      } else if (typeof plannedSource === "string" && !rustNamedCaseIsNonEmptyInSource(target.symbolPath, plannedSource, true)) {
         fail("PLANNED_TEST_CASE_EMPTY", `${context}: ${test.target}`);
       }
     }
@@ -2174,8 +2192,103 @@ function validateRetirementSourceInventory(retirement, sourceMap) {
   }
 }
 
+/// Remove every `#[cfg(test)]`-attributed item or statement.
+///
+/// The census exists to freeze V10 *authority* while V11 is built beside it, so
+/// what it must pin is the source as the release build sees it. Test-only code
+/// is compiled out and changes no shipped behaviour, and freezing it as well
+/// made the retirement contract forbid the very edits `tasks.md` T014 requires.
+/// Production additions to a censused file still move the digest, which is the
+/// property the two closure self-tests assert.
+///
+/// Offsets come from the masked source so a `;` or brace inside a comment or
+/// string literal cannot terminate an item early; the cut is applied to the
+/// original bytes at those same offsets.
+function stripCfgTestItems(source) {
+  const masked = maskRustCommentsAndLiterals(source);
+  const cuts = [];
+  for (const match of masked.matchAll(/#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]/gu)) {
+    const start = match.index;
+    let index = start + match[0].length;
+    let nesting = 0;
+    let end = -1;
+    while (index < masked.length) {
+      const character = masked[index];
+      if (character === "(" || character === "[") nesting += 1;
+      else if (character === ")" || character === "]") nesting -= 1;
+      else if (nesting === 0 && character === ";") {
+        end = index + 1;
+        break;
+      } else if (nesting === 0 && character === "{") {
+        let depth = 0;
+        let scan = index;
+        for (; scan < masked.length; scan += 1) {
+          if (masked[scan] === "{") depth += 1;
+          else if (masked[scan] === "}") {
+            depth -= 1;
+            if (depth === 0) {
+              scan += 1;
+              break;
+            }
+          }
+        }
+        end = scan;
+        break;
+      }
+      index += 1;
+    }
+    // No line-framing heuristics: whatever whitespace the cut leaves behind is
+    // erased by `canonicalReleaseSource`, so where a removed item's blank lines
+    // went is not observable in the digest.
+    cuts.push([start, end === -1 ? masked.length : end]);
+  }
+  if (cuts.length === 0) return source;
+  cuts.sort((left, right) => left[0] - right[0]);
+  let result = "";
+  let cursor = 0;
+  for (const [start, end] of cuts) {
+    // A nested attribute inside an already-cut item is already removed.
+    if (start < cursor) {
+      cursor = Math.max(cursor, end);
+      continue;
+    }
+    result += source.slice(cursor, start);
+    cursor = end;
+  }
+  return result + source.slice(cursor);
+}
+
+/// Reduce source to the code a release build compiles, in a canonical form.
+///
+/// Comments are dropped and runs of code whitespace collapse to a single space,
+/// while string and character literals are emitted verbatim: their contents are
+/// behaviour, so a change inside one must still move the digest. A comment
+/// between two tokens becomes a separator rather than vanishing, so `a/*x*/b`
+/// cannot canonicalize to `ab`.
+///
+/// Digesting this form rather than edited text is what makes the census
+/// position-independent. Reformatting, re-wrapping a doc comment, or moving a
+/// stripped test item's surrounding blank lines are all invisible; adding,
+/// removing, or altering a single production token is not.
+function canonicalReleaseSource(source) {
+  const kinds = rustCharacterKinds(source);
+  let result = "";
+  let pendingSeparator = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const kind = kinds[index];
+    if (kind === "comment" || (kind === "code" && /\s/u.test(source[index]))) {
+      pendingSeparator = true;
+      continue;
+    }
+    if (pendingSeparator && result.length > 0) result += " ";
+    pendingSeparator = false;
+    result += source[index];
+  }
+  return result;
+}
+
 function normalizeRetirementClosureSource(source) {
-  return source.replace(/\r\n/gu, "\n");
+  return canonicalReleaseSource(stripCfgTestItems(source.replace(/\r\n/gu, "\n")));
 }
 
 function validateRetirementClosure(retirement, sourceMap) {
