@@ -3575,12 +3575,6 @@ mod reload_mid_commit {
 // "server")]`. Under `--no-default-features --features embed` the lib tests
 // still compile, so a bare `#[cfg(test)]` here is an unused import and the
 // embed build denies warnings.
-//
-// Written as two stacked attributes rather than `cfg(all(test, feature =
-// "server"))`, which is equivalent to rustc but not to the retirement census:
-// its stripper recognises a literal `#[cfg(test)]` and would treat the `all`
-// form as production code. Leading with `#[cfg(test)]` keeps the whole item
-// test-only in the census's eyes as well as the compiler's.
 #[cfg(all(test, feature = "server"))]
 pub(crate) use reload_mid_commit::install as install_reload_mid_commit_hook;
 

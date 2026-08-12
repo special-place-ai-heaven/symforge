@@ -56,7 +56,28 @@ const SUITES = [
   },
 ];
 
+const NEWLINE = String.fromCharCode(10);
 const MAX_REASON_BYTES = 512;
+
+// The exact Slice 0 roster. Without it the producer only checks that the cases it
+// HAPPENS to parse are still failing, so deleting or renaming a control leaves the
+// rest red and the artifact still reports "expected_failures_preserved" -- success
+// claimed for a roster it never measured. Removing a control is a deliberate act
+// belonging to the slice that fixes its defect, so that slice must edit this list too.
+const EXPECTED_CASES = [
+  "capacity_refused_open_creates_no_slot_and_no_watcher",
+  "configured_capacity_bounds_the_process_not_each_load",
+  "daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
+  "empty_placeholder_publication_refuses_watcher_mutation",
+  "failed_reload_retains_the_recovery_observer",
+  "observer_replacement_gap_is_latched_as_non_current",
+  "old_observer_delivery_after_promotion_is_not_current",
+  "same_path_root_replacement_is_not_silently_adopted",
+  "snapshot_seed_is_not_queryable_before_verification",
+  "watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
+  "watcher_mutation_during_candidate_build_is_not_discarded",
+  "whole_project_publication_preserves_latest_siblings",
+];
 
 function git(...args) {
   const result = spawnSync(GIT, args, { cwd: repositoryRoot, encoding: "utf8", shell: false });
@@ -107,6 +128,10 @@ function runSuite(suite) {
 
 const cases = SUITES.flatMap(runSuite).sort((left, right) => left.case.localeCompare(right.case));
 const unexpected = cases.filter((entry) => entry.observed !== "failed");
+const observedNames = cases.map((entry) => entry.case).sort();
+const expectedNames = [...EXPECTED_CASES].sort();
+const missing = expectedNames.filter((name) => !observedNames.includes(name));
+const extra = observedNames.filter((name) => !expectedNames.includes(name));
 
 const artifact = {
   kind: "symforge.lifecycle.v11.slice0_oracle_contract",
@@ -115,8 +140,14 @@ const artifact = {
   release_commit: git("rev-parse", "--verify", "HEAD"),
   release_tree: git("rev-parse", "--verify", "HEAD^{tree}"),
   case_count: cases.length,
+  expected_case_count: EXPECTED_CASES.length,
+  missing_cases: missing,
+  unexpected_cases: extra,
   cases,
-  status: unexpected.length === 0 ? "expected_failures_preserved" : "unexpected_outcome",
+  status:
+    unexpected.length === 0 && missing.length === 0 && extra.length === 0
+      ? "expected_failures_preserved"
+      : "unexpected_outcome",
 };
 
 fs.mkdirSync(path.join(repositoryRoot, path.dirname(ARTIFACT)), { recursive: true });
@@ -126,7 +157,13 @@ fs.writeFileSync(
   "utf8",
 );
 
-if (unexpected.length > 0) {
+for (const name of missing) {
+  process.stderr.write(`ERROR SLICE0_ORACLE_MISSING: ${name} was not run` + NEWLINE);
+}
+for (const name of extra) {
+  process.stderr.write(`ERROR SLICE0_ORACLE_EXTRA: ${name} is not in the expected roster` + NEWLINE);
+}
+if (unexpected.length > 0 || missing.length > 0 || extra.length > 0) {
   for (const entry of unexpected) {
     process.stderr.write(
       `ERROR SLICE0_ORACLE_UNEXPECTED: ${entry.case} observed ${entry.observed}, expected red\n`,
@@ -134,7 +171,8 @@ if (unexpected.length > 0) {
   }
   process.stderr.write(
     "A Slice 0 positive control that stops failing is either a fix landed without its " +
-      "owning slice removing #[ignore], or a control gone vacuous. Both need review.\n",
+      "owning slice removing #[ignore], or a control gone vacuous. A control that "
+      + "disappears from the roster is a lost positive control. All need review.\n",
   );
   process.exitCode = 1;
 } else {

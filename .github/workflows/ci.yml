@@ -80,6 +80,7 @@ jobs:
 
       - name: Test and verify Feature 020 V11 lifecycle traceability
         run: |
+          node scripts/validate-lifecycle-oracle-traceability.norm.test.cjs
           node scripts/validate-lifecycle-oracle-traceability.test.cjs
           node scripts/validate-lifecycle-oracle-traceability.cjs
 

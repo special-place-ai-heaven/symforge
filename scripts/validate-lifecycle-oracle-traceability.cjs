@@ -308,7 +308,7 @@ const FROZEN_DIGESTS = {
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "6e1d1ead522ec11170d55f600888da43d3187497343fc69ad58dbfea48a82bea",
+    hash: "6da0f3adc4a4673c9be00af811b5f3fd2cb39b15d7e9fd6067db7d97634f1e27",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -2293,7 +2293,17 @@ function stripCfgTestItems(source) {
       index = first.end;
       continue;
     }
-    // Consume the attributed item: a balanced brace block, or through `;`.
+    // Consume exactly the attributed construct, and nothing past it.
+    //
+    // An item ends at `;` or at a balanced `{…}` block. A struct field, enum
+    // variant, or match arm ends at `,` instead, and the LAST member of a body
+    // ends at the enclosing `}` with no separator at all. Scanning only for `;`
+    // and `{` therefore ran straight through comma-separated members and out of
+    // the enclosing block, deleting production siblings and following items from
+    // the census: `pub struct S { #[cfg(test)] t: u8, prod: u8, } fn keep() {}`
+    // reduced to `pub struct S {`, so renaming `prod` did not move the digest.
+    // That is the exact drift the census exists to detect, so the scan is
+    // bounded by all three terminators and by the enclosing brace.
     let scan = cursor;
     let nesting = 0;
     let end = -1;
@@ -2301,8 +2311,13 @@ function stripCfgTestItems(source) {
       const character = masked[scan];
       if (character === "(" || character === "[") nesting += 1;
       else if (character === ")" || character === "]") nesting -= 1;
-      else if (nesting === 0 && character === ";") {
+      else if (nesting === 0 && (character === ";" || character === ",")) {
         end = scan + 1;
+        break;
+      } else if (nesting === 0 && character === "}") {
+        // The enclosing body closed first: this was its final member, which owns
+        // no separator. Stop before the brace so the body itself survives.
+        end = scan;
         break;
       } else if (nesting === 0 && character === "{") {
         let depth = 0;
@@ -2318,6 +2333,11 @@ function stripCfgTestItems(source) {
           }
         }
         end = block;
+        // A block-bodied member (`#[cfg(test)] 0 => { … },`) still owns the
+        // comma that follows it.
+        let after = end;
+        while (after < masked.length && /\s/u.test(masked[after])) after += 1;
+        if (masked[after] === ",") end = after + 1;
         break;
       }
       scan += 1;

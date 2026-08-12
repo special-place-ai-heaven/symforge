@@ -576,7 +576,7 @@ planned and unexecuted.
   "kind": "symforge.v10_authority_retirement.v11",
   "preactivation_closure": {
     "cache": {
-      "digest": "19eb9a74bf4de8c6ff2c2d6aeb3e1ada24597491fd24856b02f5794f5e41e061",
+      "digest": "0cc3a6fd161a93b764e2db0e8528f61cedb50ac31caeff4289231bcc0f1eb63b",
       "paths": [
         "src/daemon.rs",
         "src/protocol/knowledge_curation.rs",
@@ -586,7 +586,7 @@ planned and unexecuted.
       ]
     },
     "callbacks": {
-      "digest": "4b6a5fc9cc3d37df50cf25287c36c4330742d6ebb5a2fd327a95196a2507b124",
+      "digest": "ee553c22236eb8a1d641d3b60a1573b93cba72b955f80c854136f41166f0e0c1",
       "paths": [
         "src/daemon.rs",
         "src/live_index/git_temporal.rs",
@@ -605,7 +605,7 @@ planned and unexecuted.
       ]
     },
     "publication_roots": {
-      "digest": "3f81dbb8cb3a7a1a625e41660e520f4af455b11424e50a4f6aead8e81fa3e152",
+      "digest": "e37555add0073b6bafb1e023591d2b1ca623698785ad198f2d9b793ab761e82d",
       "paths": [
         "src/daemon.rs",
         "src/live_index/store.rs",
@@ -615,7 +615,7 @@ planned and unexecuted.
       ]
     },
     "writers": {
-      "digest": "4d5a2dbbcff42cf673bb4e1baf555d6c25dfb17ee851a5a9a085cf92c53e03f5",
+      "digest": "1085e716eff8e852d638466d34d63848a6444493a12af5d80480a7ae92b8e4a4",
       "paths": [
         "src/cli/init.rs",
         "src/gitignore_hygiene.rs",
