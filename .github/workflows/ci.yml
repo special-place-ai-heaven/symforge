@@ -59,6 +59,22 @@ jobs:
           SYMFORGE_REQUIRE_SSHSIG: '1'
         run: python -m unittest discover -s execution -p 'test_*.py'
 
+      - name: Verify every text blob in the index is LF
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Six release-gating assertions compare a worktree read against a hash
+          # taken over blob bytes. They are latent on these runners because Linux
+          # checks out LF regardless, so a CRLF blob entering the index would go
+          # unnoticed here and break every Windows checkout. The index census is
+          # platform-independent, so it is checkable from ubuntu.
+          offenders="$(git ls-files --eol | grep -vE '^i/(lf|-text|none)' || true)"
+          if [[ -n "$offenders" ]]; then
+            echo "::error::These blobs are not LF in the index:"
+            printf '%s\n' "$offenders"
+            exit 1
+          fi
+
       - name: Verify Feature 020 V11 refreeze integrity
         run: python execution/refreeze_v11.py verify-internal --target-ref HEAD
 

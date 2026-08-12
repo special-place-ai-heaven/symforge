@@ -868,6 +868,7 @@ jobs:
             scripts/validate-lifecycle-oracle-traceability.cjs
             scripts/validate-lifecycle-oracle-traceability.test.cjs
             specs/020-repository-knowledge-index
+            tests/fixtures/public-api-v11-consumer
           )
           if ! "$TRUSTED_GIT" diff --quiet --no-ext-diff --no-textconv \
             "$APPROVED_TARGET^{tree}" \
