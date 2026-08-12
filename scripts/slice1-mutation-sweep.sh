@@ -47,7 +47,7 @@ MUTATIONS=(
   # The two defects three independent reviews found. Both were live while every
   # gate this slice had was green, so both earn a permanent guard.
   "commit-receipt-lease|$MUTATION|if receipt.lease() != self.lease.identity() {|if receipt.lease() != receipt.lease() {|commit refuses a receipt from another lease"
-  "drain-arms-on-grant|$MUTATION|drain.arm();|let _ = &drain;|a signal reports outstanding once a permit is attached"
+  "drain-arms-on-grant|$MUTATION|drain.arm();|if false { drain.arm(); }|a signal reports outstanding once a permit is attached"
 )
 
 # Batches of four keep each run inside the tool's wall-clock ceiling.
