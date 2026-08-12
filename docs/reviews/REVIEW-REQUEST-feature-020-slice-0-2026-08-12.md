@@ -7,8 +7,16 @@ Review a body of work that landed across five pull requests on
 the author of this work also wrote every test that guards it, so nothing here has
 had an independent reader.
 
-**Return the complete contents of this file back to me, unchanged, with one new
-section appended at the end titled `## Recommendations`.**
+**Deliverable: one complete Markdown file.** Reproduce the entire contents of this
+file unchanged, then append one new section at the end titled `## Recommendations`.
+
+**Name the file** `REVIEW-FINDINGS-<your-model-name>-feature-020-slice-0-2026-08-12.md`,
+substituting your own model name in lowercase with hyphens — for example
+`REVIEW-FINDINGS-gpt-5-feature-020-slice-0-2026-08-12.md` or
+`REVIEW-FINDINGS-gemini-3-pro-feature-020-slice-0-2026-08-12.md`. Several models are
+reviewing this independently, so the filename is what keeps their findings distinct.
+
+State your model name and the date at the top of your `## Recommendations` section.
 
 In that section, for each issue you find, give:
 
