@@ -100,14 +100,39 @@ function reasonFor(output, caseName) {
   return null;
 }
 
+// A test binary that aborts mid-suite (double panic, OOM, `abort`) still prints
+// the results it reached, so parsing alone would yield a silent subset that every
+// remaining case "preserves". And the notify-thread leak this slice fixed is
+// exactly a binary that never exits, which without a timeout burns the runner's
+// whole budget instead of failing with evidence. Both are checked here.
+const SUITE_TIMEOUT_MS = 30 * 60 * 1000;
+
 function runSuite(suite) {
   const result = spawnSync(CARGO, suite.args, {
     cwd: repositoryRoot,
     encoding: "utf8",
     shell: false,
     maxBuffer: 64 * 1024 * 1024,
+    timeout: SUITE_TIMEOUT_MS,
   });
   const output = `${result.stdout || ""}${result.stderr || ""}`;
+  if (result.error && result.error.code === "ETIMEDOUT") {
+    throw new Error(`timed out after ${SUITE_TIMEOUT_MS} ms: ${suite.args.join(" ")}`);
+  }
+  if (result.error) {
+    throw new Error(`could not run: ${suite.args.join(" ")}: ${result.error.message}`);
+  }
+  if (result.signal) {
+    throw new Error(`killed by ${result.signal}: ${suite.args.join(" ")}`);
+  }
+  // Every control is RED, so a suite of them must exit non-zero. Exit 0 means
+  // either nothing ran or they stopped failing; the roster check below names
+  // which, but the run itself is already not what this artifact assumes.
+  if (result.status === 0) {
+    throw new Error(
+      `exited 0 with no failing case, so nothing was preserved: ${suite.args.join(" ")}`,
+    );
+  }
   const cases = [];
   for (const match of output.matchAll(/^test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)$/gmu)) {
     const [, caseName, outcome] = match;

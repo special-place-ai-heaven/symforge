@@ -3,11 +3,25 @@
 This is the closed V10 authority and ingress retirement inventory. Slice 4 owns
 the final cut: every member below must either route through the V11 runtime or
 be unreachable before Preventive V1 is exposed. Absence from this inventory is
-not permission to survive. Before activation, the byte census below closes the five
-authority-bearing source categories against unlisted additions. Each source blob is
-decoded as UTF-8 and only CRLF pairs are normalized to LF before hashing, so an
-otherwise byte-identical LF or CRLF checkout has the same census; no other byte or
-Unicode normalization is permitted. After activation, the executed Slice 4
+not permission to survive. Before activation, the census below closes the five
+authority-bearing source categories against unlisted additions.
+
+The census hashes a canonical release form, not raw bytes. Each source blob is decoded
+as UTF-8; CRLF pairs are normalized to LF; every item or statement gated by a
+test-only `cfg` predicate is removed; comments are dropped; and runs of whitespace
+between code tokens collapse to a single space. String and character literals are
+emitted verbatim, because their contents are behaviour. A `cfg` predicate counts as
+test-only when it is `test`, or an `all(..)` with a test-only conjunct, or an
+`any(..)` whose disjuncts are all test-only; `not(..)` and unrecognised shapes never
+count, so an unknown predicate keeps its item in the census.
+
+The property this preserves is that **any change to the code a release build compiles
+moves the digest**, while changes that the release build never sees -- test-only
+items, comments, formatting, line endings -- do not. Hashing raw bytes was the
+original rule and made the census forbid the test-only edits `tasks.md` requires of
+Slice 0; it was amended for that reason, and the amendment is guarded by a normalizer
+equivalence suite plus a structural check that rejects any file whose normalized form
+has unbalanced delimiters. After activation, the executed Slice 4
 reachability cases replace the preactivation census. All retirement evidence is
 planned and unexecuted.
 
@@ -576,7 +590,7 @@ planned and unexecuted.
   "kind": "symforge.v10_authority_retirement.v11",
   "preactivation_closure": {
     "cache": {
-      "digest": "0cc3a6fd161a93b764e2db0e8528f61cedb50ac31caeff4289231bcc0f1eb63b",
+      "digest": "4eb220e86cfaf41762f5c920a43157e9f92914cf062fed3102ed05cba5c18a38",
       "paths": [
         "src/daemon.rs",
         "src/protocol/knowledge_curation.rs",
@@ -586,7 +600,7 @@ planned and unexecuted.
       ]
     },
     "callbacks": {
-      "digest": "ee553c22236eb8a1d641d3b60a1573b93cba72b955f80c854136f41166f0e0c1",
+      "digest": "557ccba66d7fc432d6d270fbebd9e4ddc4e9c0cf13b7bf341c5fbb4ff76516c1",
       "paths": [
         "src/daemon.rs",
         "src/live_index/git_temporal.rs",
@@ -615,7 +629,7 @@ planned and unexecuted.
       ]
     },
     "writers": {
-      "digest": "1085e716eff8e852d638466d34d63848a6444493a12af5d80480a7ae92b8e4a4",
+      "digest": "5137cd7b059a2857b4db4b9c8a1a3c4ded4702422018da948d132709733af7dd",
       "paths": [
         "src/cli/init.rs",
         "src/gitignore_hygiene.rs",

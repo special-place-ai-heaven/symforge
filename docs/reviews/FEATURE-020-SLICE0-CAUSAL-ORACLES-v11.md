@@ -467,6 +467,64 @@ these controls — every one is `#[ignore]`d precisely so a deliberate RED does 
 `main` red — so without this step Slice 0's evidence would exist only on a developer's
 machine.
 
+## Independent adversarial review (T021)
+
+Three models reviewed this slice against
+`docs/reviews/REVIEW-REQUEST-feature-020-slice-0-2026-08-12.md`:
+`cursor-grok-4-5`, `composer`, and `kimi-k3`. Their findings are recorded verbatim
+beside it. Every green gate this slice had was green while the BLOCKER below was
+live, which is the argument for the review having happened at all.
+
+### Accepted and fixed
+
+| Finding | Reviewer | Resolution |
+|---|---|---|
+| Census over-strips past `#[cfg(test)]` members (BLOCKER) | grok, kimi | item scan now bounded by `,`, `;`, a balanced block, and the enclosing `}` |
+| Over-strip leaves unbalanced source, unchecked | kimi | `RETIREMENT_CLOSURE_UNBALANCED` structural gate; fires 3× against the old stripper |
+| `#[cfg(test)] let … if/else` strands the `else` arm | kimi | cut now consumes `else` / `else if` chains and the terminator |
+| Contract prose still claims raw-byte hashing | kimi | preamble rewritten to describe the canonical release form |
+| Materialized receipt accepts exit 0 on an ignored case | composer | `expect_case` requires libtest to report the case as run; `case_ignored` is a distinct refusal |
+| Artifact reports preservation without a roster | grok, kimi | exact 12-case roster pinned; `SLICE0_ORACLE_MISSING` / `_EXTRA` |
+| Producer ignores exit status, signal, timeout | kimi | all three checked; a suite of RED controls exiting 0 is an error |
+| Placeholder control passes if the watcher never ran | composer | a sibling watcher must admit its own edit first |
+| `rebuild_failed` accepts any failure body | kimi | must match the capacity-refusal signature |
+| Capacity precondition contradicts the sibling's fix shape | kimi | a refused second open now counts as the bound being honoured |
+| Stale comment claiming `all(test, …)` is unsupported | grok | removed |
+
+The live trigger kimi found is worth recording precisely: in
+`src/protocol/knowledge_curation.rs` the cut from a `#[cfg(test)]` struct field ran
+through the struct's closing brace and consumed the entire production enum
+`CurationWriteStage`, which is referenced from four production call sites. A planted
+production mutation there left the checker green. Three censused files were affected:
+`single_file.rs` (476 bytes), `knowledge_curation.rs` (294), `store.rs` (101).
+
+### Rejected, with reasoning
+
+**`#[cfg_attr(test, …)]` should be treated as test-only** (composer, MINOR).
+It must not be. `cfg_attr` conditionally applies an *attribute*; it does not gate
+compilation. `#[cfg_attr(test, ignore)] fn helper()` **ships in release**, so
+stripping it would hide production code from the census — reintroducing the exact
+defect the BLOCKER fix closes. The current conservative handling is correct.
+
+### Accepted, deferred with rationale
+
+**Timing-raced preconditions** (grok, MAJOR; kimi concurs in part). Two controls
+gate their assertion on a `sleep`-bounded race window
+(`watcher_mutation_during_candidate_build_is_not_discarded`,
+`whole_project_publication_preserves_latest_siblings`). Both already assert the
+window was entered as an *observed* fact rather than assuming it, so a miss fails
+loudly on the precondition instead of passing silently — but a slow runner could
+still let the mutation land after the swap and read as a fix. A deterministic seam
+like the T014 mid-commit hook is the right answer and is now permitted by the
+amended census; it is Slice 1 work, tracked here rather than rushed.
+
+**Snapshot control exercises the primitive, not the MCP query path** (composer,
+MINOR). `snapshot_seed_is_not_queryable_before_verification` probes
+`get_file` on the rehydrated handle, which is the publication primitive both
+`daemon.rs` and `main.rs` use. A Slice 4 fix that gates only `read_gate.rs` would
+pass this while clients still see unverified bytes. Extending it to a daemon
+round-trip belongs with the Slice 4 activation work that introduces that gate.
+
 ## Scope note
 
 Two Slice 0 tests are introduced (`TEST-OPAQUE-PATH-INHERITED`, `TEST-PUBLICATION`)

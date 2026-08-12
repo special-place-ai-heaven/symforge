@@ -308,7 +308,7 @@ const FROZEN_DIGESTS = {
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "6da0f3adc4a4673c9be00af811b5f3fd2cb39b15d7e9fd6067db7d97634f1e27",
+    hash: "e2f2c262fa640f1ba4e50da9b1bf9280aeaba5639e29a8b3e8f6495d0018cbe8",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -2333,11 +2333,42 @@ function stripCfgTestItems(source) {
           }
         }
         end = block;
-        // A block-bodied member (`#[cfg(test)] 0 => { … },`) still owns the
-        // comma that follows it.
+        // A block does not always end the construct. `#[cfg(test)] let r = if c
+        // { a } else { b };` continues through the whole else-chain and only
+        // then hits its `;`; stopping at the first block strands ` else { b };`
+        // in the canonical form, so test-only code stays in the digest and
+        // test-only edits move it -- the opposite of what the amendment exists
+        // for. Consume any `else` / `else if` chain, then the terminator.
+        for (;;) {
+          let probe = end;
+          while (probe < masked.length && /\s/u.test(masked[probe])) probe += 1;
+          if (!/^else\b/u.test(masked.slice(probe, probe + 5))) break;
+          probe += 4;
+          // Skip an `else if <cond>` head; the block below is consumed either way.
+          while (probe < masked.length && masked[probe] !== "{" && masked[probe] !== ";") probe += 1;
+          if (masked[probe] !== "{") {
+            end = probe;
+            break;
+          }
+          let chainDepth = 0;
+          let chain = probe;
+          for (; chain < masked.length; chain += 1) {
+            if (masked[chain] === "{") chainDepth += 1;
+            else if (masked[chain] === "}") {
+              chainDepth -= 1;
+              if (chainDepth === 0) {
+                chain += 1;
+                break;
+              }
+            }
+          }
+          end = chain;
+        }
+        // A block-bodied member (`#[cfg(test)] 0 => { … },`) or a statement
+        // (`… };`) still owns the separator that follows it.
         let after = end;
         while (after < masked.length && /\s/u.test(masked[after])) after += 1;
-        if (masked[after] === ",") end = after + 1;
+        if (masked[after] === "," || masked[after] === ";") end = after + 1;
         break;
       }
       scan += 1;
@@ -2393,6 +2424,35 @@ function normalizeRetirementClosureSource(source) {
   return canonicalReleaseSource(stripCfgTestItems(source.replace(/\r\n/gu, "\n")));
 }
 
+/// Reject a normalized source whose delimiters no longer balance.
+///
+/// Every known over-strip defect leaves the survivor unbalanced: the census cut
+/// ran past its construct and swallowed a closing brace, taking production code
+/// with it. A single-file example shipped undetected -- the cut through a
+/// `#[cfg(test)]` struct field consumed the struct's closing brace and an entire
+/// production enum, and every gate stayed green because the digest was RECORDED
+/// with that hole. Balance is a cheap structural invariant that no correct strip
+/// can break, so it catches the whole class rather than the instances the case
+/// matrix happens to enumerate.
+function normalizedSourceIsBalanced(normalized) {
+  const kinds = rustCharacterKinds(normalized);
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  for (let index = 0; index < normalized.length; index += 1) {
+    if (kinds[index] !== "code") continue;
+    const character = normalized[index];
+    if (character === "(") round += 1;
+    else if (character === ")") round -= 1;
+    else if (character === "[") square += 1;
+    else if (character === "]") square -= 1;
+    else if (character === "{") curly += 1;
+    else if (character === "}") curly -= 1;
+    if (round < 0 || square < 0 || curly < 0) return false;
+  }
+  return round === 0 && square === 0 && curly === 0;
+}
+
 function validateRetirementClosure(retirement, sourceMap) {
   const closure = retirement && retirement.preactivation_closure;
   if (!exactKeys(closure, RETIREMENT_CLOSURE_CATEGORIES, "retirement.preactivation_closure")) return;
@@ -2417,7 +2477,15 @@ function validateRetirementClosure(retirement, sourceMap) {
         fail("RETIREMENT_CLOSURE_MISMATCH", `${category}: missing ${relativePath}`);
         continue;
       }
-      blobHashes[relativePath] = sha256Bytes(Buffer.from(normalizeRetirementClosureSource(source), "utf8"));
+      const normalized = normalizeRetirementClosureSource(source);
+      if (!normalizedSourceIsBalanced(normalized)) {
+        fail(
+          "RETIREMENT_CLOSURE_UNBALANCED",
+          `${category}: ${relativePath} does not survive normalization with balanced delimiters, ` +
+            "so the census cut consumed more than the construct it targeted",
+        );
+      }
+      blobHashes[relativePath] = sha256Bytes(Buffer.from(normalized, "utf8"));
     }
     const actualDigest = canonicalDigest(`symforge.lifecycle.v11.retirement.closure.${category}`, blobHashes);
     if (!validSha256(record.digest) || record.digest !== actualDigest) {
@@ -3286,6 +3354,20 @@ function runVerifiedCommand(spec, runtime = {}) {
   if (result && result.error) return { ok: false, reason: result.error.code === "ETIMEDOUT" ? "timeout" : "spawn_error" };
   if (!result || result.signal !== null && result.signal !== undefined) return { ok: false, reason: "signal" };
   if (result.status !== 0) return { ok: false, reason: "nonzero" };
+  // Exit 0 is not proof the named case RAN. `cargo test <case> -- --exact` exits 0
+  // for an ignored-only run ("0 passed; 0 failed; 1 ignored"), so a receipt written
+  // on exit code alone claims execution evidence the runner never observed -- the
+  // reporting invariant, in the one path that gates a release. When the caller
+  // names the case, require libtest to have reported it as run.
+  if (typeof spec.expect_case === "string" && spec.expect_case !== "") {
+    const combined = `${stdout.toString("utf8")}${stderr.toString("utf8")}`;
+    const line = new RegExp(
+      "^test " + escapeRegExp(spec.expect_case) + "(?: - [^\\n]*)? \\.\\.\\. (ok|FAILED|ignored)$",
+      "mu",
+    ).exec(combined);
+    if (!line) return { ok: false, reason: "case_not_reported" };
+    if (line[1] === "ignored") return { ok: false, reason: "case_ignored" };
+  }
   if (!isObject(after) || !after.clean || after.commit !== before.commit || after.tree !== before.tree) {
     return { ok: false, reason: "tree_changed" };
   }
@@ -3314,6 +3396,16 @@ function materializedCommandSpec(testId, test, command, evidence, receiptPath, a
     return null;
   }
   return {
+    // libtest prints the case under its in-binary path: the symbol path for an
+    // integration test, module-qualified for a lib test. Benchmarks do not report
+    // this way, so they carry no expectation.
+    expect_case: test.kind.includes("benchmark")
+      ? null
+      : parsed.area === "src"
+        ? (sourceModulePath(parsed.file) === ""
+            ? parsed.symbolPath
+            : `${sourceModulePath(parsed.file)}::${parsed.symbolPath}`)
+        : parsed.symbolPath,
     program: cargoExecutable,
     args,
     timeout_ms: test.kind.includes("benchmark") ? 3_600_000 : 1_800_000,
