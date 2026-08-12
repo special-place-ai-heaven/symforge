@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.1.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.1.0...v10.1.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **feature-020:** amend the V11 refreeze so Slice 0 is executable ([#555](https://github.com/special-place-ai-heaven/symforge/issues/555)) ([9aaac47](https://github.com/special-place-ai-heaven/symforge/commit/9aaac472953784662da8c60f45162026db1a3a54))
+
 ## [10.1.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.4...v10.1.0) (2026-08-12)
 
 
