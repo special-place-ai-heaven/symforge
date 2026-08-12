@@ -48,6 +48,38 @@ def system_executable(name: str) -> Path:
 
 
 SYSTEM_GIT_EXECUTABLE = system_executable("git")
+
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+
+
+def repository_blob(path: str) -> bytes:
+    """Read a tracked file from this repository's git objects, not the worktree.
+
+    Everything these fixtures are checked against is pinned over blob bytes. Seeding
+    from the worktree instead made the suite correct only while a checkout stayed
+    normalized, and when it did not the symptom was 19 Windows-only failures that CI
+    could never see, because on Linux the worktree happens to equal the blob. The
+    verifier under test reads blobs on every path; so does this.
+    """
+    result = subprocess.run(
+        [
+            str(SYSTEM_GIT_EXECUTABLE),
+            "--no-replace-objects",
+            "cat-file",
+            "blob",
+            f"HEAD:{path}",
+        ],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cannot read {path!r} from HEAD: {result.stderr.decode(errors='replace')}"
+        )
+    return result.stdout
+
+
 _discovered_ssh_keygen = shutil.which("ssh-keygen")
 REAL_SSH_KEYGEN_EXECUTABLE = (
     Path(_discovered_ssh_keygen).resolve()
@@ -136,10 +168,9 @@ class RefreezeFixture:
         self.git("config", "user.name", "Refreeze Test")
         self.git("config", "core.autocrlf", "false")
 
-        repository_root = Path(__file__).resolve().parent.parent
         self.write(
             RELEASE_EVIDENCE_REQUIREMENTS_PATH,
-            (repository_root / RELEASE_EVIDENCE_REQUIREMENTS_PATH).read_bytes(),
+            repository_blob(RELEASE_EVIDENCE_REQUIREMENTS_PATH),
         )
         baseline_lines = [f"baseline clause {index}\n" for index in range(1, 20)]
         self.write(f"{FEATURE_ROOT}/spec.md", "".join(baseline_lines).encode())
@@ -224,16 +255,16 @@ class RefreezeFixture:
             ).encode(),
         )
 
-        api_bytes = (repository_root / API_PATH).read_bytes()
+        api_bytes = repository_blob(API_PATH)
         self.api = json.loads(api_bytes)
         for corpus_entry in self.api["configuration_domain"]["cover"][
             "input_corpus"
         ]:
             corpus_path = corpus_entry["path"]
-            self.write(corpus_path, (repository_root / corpus_path).read_bytes())
+            self.write(corpus_path, repository_blob(corpus_path))
         self.write(
             FIXTURE_MANIFEST_PATH,
-            (repository_root / FIXTURE_MANIFEST_PATH).read_bytes(),
+            repository_blob(FIXTURE_MANIFEST_PATH),
         )
         self.write(API_PATH, api_bytes)
 

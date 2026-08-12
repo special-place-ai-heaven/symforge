@@ -868,6 +868,7 @@ jobs:
             scripts/validate-lifecycle-oracle-traceability.cjs
             scripts/validate-lifecycle-oracle-traceability.test.cjs
             specs/020-repository-knowledge-index
+            tests/fixtures/public-api-v11-consumer
           )
           if ! "$TRUSTED_GIT" diff --quiet --no-ext-diff --no-textconv \
             "$APPROVED_TARGET^{tree}" \
@@ -1949,6 +1950,12 @@ jobs:
     needs:
       - resolve-release-ref
       - gate-release-ref
+    # feature-020-v11-gate is skipped in pre-activation, and a skip propagates
+    # transitively through needs. gate-release-ref survives it via always() and
+    # already hard-fails unless the phase-appropriate result held, so every job
+    # below it must name a status function to stop inheriting that skip, and must
+    # then restate the success it would otherwise have got implicitly.
+    if: ${{ !cancelled() && needs.resolve-release-ref.result == 'success' && needs.gate-release-ref.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -2216,7 +2223,7 @@ jobs:
     needs:
       - prepare-release
       - gate-release-ref
-    if: needs.prepare-release.outputs.release_created == 'true'
+    if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
     strategy:
       matrix:
         include:
@@ -2276,7 +2283,7 @@ jobs:
       - prepare-release
       - gate-release-ref
       - build
-    if: needs.prepare-release.outputs.release_created == 'true'
+    if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2385,7 +2392,7 @@ jobs:
       - gate-release-ref
       - build
       - build-npm-package
-    if: needs.prepare-release.outputs.release_created == 'true'
+    if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.build-npm-package.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -2417,7 +2424,7 @@ jobs:
       - build
       - build-npm-package
       - upload-release-assets
-    if: needs.prepare-release.outputs.release_created == 'true'
+    if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.build-npm-package.result == 'success' && needs.upload-release-assets.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     environment: cargo-publish
     steps:
@@ -2449,7 +2456,7 @@ jobs:
       - gate-release-ref
       - build-npm-package
       - upload-release-assets
-    if: needs.prepare-release.outputs.release_created == 'true'
+    if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build-npm-package.result == 'success' && needs.upload-release-assets.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     environment: npm-publish
     steps:

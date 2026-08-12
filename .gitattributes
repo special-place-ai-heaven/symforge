@@ -1,3 +1,13 @@
+# Every blob in this repo is already LF (1054 text files, 0 crlf/mixed), and a
+# growing number of consumers pin a sha256 over those blob bytes: the refreeze
+# manifest inventory, public-api-v11.json's input_corpus, the retirement closure
+# census, and release.yml's pinned_blob. Some read git objects, but the refreeze
+# test fixtures copy the WORKTREE -- so on a CRLF checkout the two disagree and
+# 19 tests fail on Windows while CI stays green. Pinning LF repo-wide makes
+# worktree == blob everywhere and closes that class; git skips binary files on
+# its own. This changes no committed byte.
+* text=auto eol=lf
+
 # Tool-correctness harness fixtures: byte-exact snapshots (get_symbol byte
 # counts, get_file_context token estimates) must be platform-stable. Without
 # this, core.autocrlf checks these out as CRLF on Windows and LF on Linux, so
