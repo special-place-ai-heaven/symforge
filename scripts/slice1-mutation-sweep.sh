@@ -24,7 +24,11 @@ MUTATIONS=(
   # `if false` or an empty statement leaves an unused parameter, and this crate
   # denies warnings, so the build fails for a reason unrelated to the guard --
   # which reads as "uncompilable" and proves nothing.
-  "transition-drain|$TRANSITION|&& !signal.has_ended()|&& signal.has_ended() && false|transition refuses to install over a live permit"
+  # Both drain checks are reverted together (expect=2). Reverting only the
+  # precondition leaves the post-freeze re-observation to catch it, and vice
+  # versa, so a single-site mutation would report "caught" while proving only
+  # that one of two redundant checks fires.
+  "transition-drain|$TRANSITION|if !outstanding.has_ended() {|if outstanding.has_ended() {|transition refuses to install over a live permit|2"
   "install-revokes|$TRANSITION|outgoing.revoke();|let _ = &outgoing;|install revokes the outgoing root lease"
   "permit-terminality|$MUTATION|if matches!(self.state, PermitState::Terminal(_)) {|if false {|a terminal permit refuses a second termination"
   "drop-drains|$MUTATION|self.drain.record(Termination::Drained);||a dropped permit reports Drained"
@@ -39,7 +43,7 @@ MUTATIONS=(
   # effect no test can see. The label is described as what it is.
   "temp-first-label|$PHYSICAL|steps.push(ReplacementStep::TempCreated);|steps.push(ReplacementStep::Replaced);|the receipt's recorded temp-before-replace order is load-bearing"
   "epoch-monotonic|$AUTHORITY|self.mutation_epoch = self.mutation_epoch.advanced();|let _ = self.mutation_epoch.advanced();|the mutation epoch is monotonic across freeze"
-  "proof-names-stored|$AUTHORITY|let publication = self.freeze();|let publication = { self.freeze(); PublicationIdentity::fresh() };|the non-Current proof names the stored publication"
+  "proof-names-stored|$AUTHORITY|.expect(\"a Current source always has a publication to freeze\")|.and(Some(PublicationIdentity::fresh())).expect(\"mutated\")|the non-Current proof names the stored publication"
 )
 
 # Batches of four keep each run inside the tool's wall-clock ceiling.
@@ -64,29 +68,38 @@ if [[ -n "$DIRTY" ]]; then
   exit 1
 fi
 
+STALE=0
+
 restore() {
   git checkout -- "$AUTHORITY" "$MUTATION" "$TRANSITION" "$PHYSICAL" 2>/dev/null
 }
 trap restore EXIT
 
 for entry in "${SELECTED[@]}"; do
-  IFS='|' read -r id file needle replacement description <<<"$entry"
+  IFS='|' read -r id file needle replacement description expect <<<"$entry"
+  expect="${expect:-1}"
 
+  # A literal that no longer matches means the guard silently lost its coverage,
+  # which is the very failure this sweep exists to detect. Report it as a
+  # failure, not as a skip: a refactor that renames a guard must not quietly
+  # remove it from the evidence.
   if ! grep -qF -- "$needle" "$file"; then
-    echo "SWEEP $id: SKIPPED (guard literal not found in $file)"
+    echo "SWEEP $id: *** LITERAL NOT FOUND *** in $file -- this guard is UNVERIFIED"
+    STALE=1
     continue
   fi
 
   python -c "
 import sys
-path, needle, replacement = sys.argv[1], sys.argv[2], sys.argv[3]
+path, needle, replacement, expect = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 with open(path, encoding='utf-8') as handle:
     source = handle.read()
-if source.count(needle) != 1:
-    raise SystemExit(f'guard literal is not unique in {path} ({source.count(needle)} matches)')
+found = source.count(needle)
+if found != expect:
+    raise SystemExit(f'guard literal appears {found} times in {path}, expected {expect}')
 with open(path, 'w', encoding='utf-8', newline='') as handle:
     handle.write(source.replace(needle, replacement))
-" "$file" "$needle" "$replacement" || { echo "SWEEP $id: SETUP FAILED"; restore; continue; }
+" "$file" "$needle" "$replacement" "$expect" || { echo "SWEEP $id: SETUP FAILED"; restore; STALE=1; continue; }
 
   output="$(cargo test --test project_index_authority_v11 --test physical_root_lease_v11 \
     -- --test-threads=1 2>&1)"
@@ -110,3 +123,7 @@ with open(path, 'w', encoding='utf-8', newline='') as handle:
 
   restore
 done
+
+# Exit non-zero when any guard went unverified, so a stale literal cannot be
+# mistaken for a clean run by anything reading the exit status.
+exit "$STALE"
