@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.1.1...v10.2.0) (2026-08-12)
+
+
+### Features
+
+* **feature-020:** Slice 1 atomic mutation authority ([#560](https://github.com/special-place-ai-heaven/symforge/issues/560)) ([7966c9f](https://github.com/special-place-ai-heaven/symforge/commit/7966c9f863bf25e086be7bc496cc3bd03a5ec8cf))
+
 ## [10.1.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.1.0...v10.1.1) (2026-08-12)
 
 
