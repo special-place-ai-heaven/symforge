@@ -7,7 +7,6 @@
 pub mod domain;
 pub mod git;
 pub mod hash;
-pub mod index_lifecycle;
 pub mod knowledge;
 pub mod live_index;
 pub mod parsing;

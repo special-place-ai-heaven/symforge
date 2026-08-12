@@ -5,9 +5,56 @@
 
 use std::path::Path;
 
-use symforge::index_lifecycle::physical_root::{
+use symforge::live_index::index_lifecycle::physical_root::{
     PhysicalRootLease, ReplacementStep, RootRefusal, replace_beneath,
 };
+
+/// TEST-PHYSICAL-ROOT (T023). The name is pinned by
+/// `contracts/lifecycle-oracle-traceability-v11.md` as a `planned_exact`
+/// target; do not rename it without amending that contract.
+///
+/// "Stable" means the identity follows the lease, not the path: two leases on
+/// the same directory are different roots, one lease keeps its identity for
+/// life, and revocation does not recycle an identity onto a successor.
+#[test]
+fn canonical_physical_root_identity_is_stable() {
+    let root = tempfile::tempdir().expect("temp root");
+
+    let lease = PhysicalRootLease::take(root.path());
+    let identity = lease.identity();
+
+    // Stable for the life of the lease, and unchanged by revocation: a permit
+    // holding this identity must not silently start matching a successor.
+    assert_eq!(lease.identity(), identity);
+    assert_eq!(lease.root(), root.path());
+    lease.revoke();
+    assert_eq!(
+        lease.identity(),
+        identity,
+        "revocation recycled the root identity"
+    );
+
+    // A second lease on the SAME directory is a different root. Path equality
+    // is not root identity; that is what stops a rebind from being mistaken for
+    // the binding it replaced.
+    let successor = PhysicalRootLease::take(root.path());
+    assert_ne!(
+        successor.identity(),
+        identity,
+        "a successor lease reused its predecessor's identity"
+    );
+    assert_eq!(successor.root(), lease.root());
+    assert!(successor.is_live());
+    assert!(!lease.is_live());
+
+    // Distinct directories are distinct roots, so the identity is not derived
+    // from the path either.
+    let elsewhere = tempfile::tempdir().expect("other root");
+    assert_ne!(
+        PhysicalRootLease::take(elsewhere.path()).identity(),
+        successor.identity()
+    );
+}
 
 #[test]
 fn resolution_stays_beneath_the_leased_root() {

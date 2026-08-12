@@ -600,7 +600,7 @@ planned and unexecuted.
       ]
     },
     "callbacks": {
-      "digest": "557ccba66d7fc432d6d270fbebd9e4ddc4e9c0cf13b7bf341c5fbb4ff76516c1",
+      "digest": "48938137b3150288eeac6892ee31b6e7a9d2f3d59262efd26c0f66a7a97e8b22",
       "paths": [
         "src/daemon.rs",
         "src/live_index/git_temporal.rs",

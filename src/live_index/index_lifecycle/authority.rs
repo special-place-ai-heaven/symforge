@@ -86,13 +86,13 @@ impl MutationEpoch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingAuthority {
     identity: BindingIdentity,
-    physical_root: crate::index_lifecycle::physical_root::PhysicalRootIdentity,
+    physical_root: crate::live_index::index_lifecycle::physical_root::PhysicalRootIdentity,
 }
 
 impl BindingAuthority {
     /// Bind a source to a physical root under a fresh never-reused identity.
     pub fn bind(
-        physical_root: crate::index_lifecycle::physical_root::PhysicalRootIdentity,
+        physical_root: crate::live_index::index_lifecycle::physical_root::PhysicalRootIdentity,
     ) -> Self {
         Self {
             identity: BindingIdentity::fresh(),
@@ -106,7 +106,9 @@ impl BindingAuthority {
     }
 
     /// The physical root this binding authorizes, and no other.
-    pub fn physical_root(&self) -> crate::index_lifecycle::physical_root::PhysicalRootIdentity {
+    pub fn physical_root(
+        &self,
+    ) -> crate::live_index::index_lifecycle::physical_root::PhysicalRootIdentity {
         self.physical_root
     }
 }

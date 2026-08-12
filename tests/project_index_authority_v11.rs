@@ -8,16 +8,16 @@
 
 use std::sync::Arc;
 
-use symforge::index_lifecycle::authority::{
+use symforge::live_index::index_lifecycle::authority::{
     AuthorityRefusal, BindingAuthority, CandidateAuthority, CurrentPublication, GenerationIdentity,
     MutationGrantInput, ObserverToken, PhaseName, Provenance, PublicationIdentity,
     SnapshotIdentity, SourceRuntime,
 };
-use symforge::index_lifecycle::mutation::{
+use symforge::live_index::index_lifecycle::mutation::{
     NoSideEffectProof, PermitDrainSignal, SourceMutationPermit, Termination,
 };
-use symforge::index_lifecycle::physical_root::PhysicalRootLease;
-use symforge::index_lifecycle::transition::{self, TransitionKind, TransitionStep};
+use symforge::live_index::index_lifecycle::physical_root::PhysicalRootLease;
+use symforge::live_index::index_lifecycle::transition::{self, TransitionKind, TransitionStep};
 
 /// A source that is `Current` on a fresh root, plus the lease that root is on.
 fn current_source() -> (SourceRuntime, Arc<PhysicalRootLease>, PublicationIdentity) {
@@ -26,6 +26,90 @@ fn current_source() -> (SourceRuntime, Arc<PhysicalRootLease>, PublicationIdenti
     let publication = CurrentPublication::promote(binding, ObserverToken::fresh());
     let identity = publication.publication();
     (SourceRuntime::current(publication), lease, identity)
+}
+
+/// TEST-MUTATION-AUTHORITY (T022). The name is pinned by
+/// `contracts/lifecycle-oracle-traceability-v11.md` as a `planned_exact`
+/// target; do not rename it without amending that contract.
+///
+/// Exactness and terminality are one property, not two: an authority that is
+/// exact but reusable, or terminal but loosely matched, still admits a second
+/// mutation the source never authorized.
+#[test]
+fn mutation_authority_is_exact_and_terminal() {
+    let (mut runtime, lease, live) = current_source();
+
+    // Exact: the authority names this publication, generation, binding and
+    // epoch as one whole.
+    let grant = runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    let authority = grant.authority();
+    assert_eq!(authority.publication(), live);
+    assert_eq!(authority.epoch(), runtime.mutation_epoch());
+    assert_eq!(authority.binding().physical_root(), lease.identity());
+    assert_eq!(Some(authority.generation()), runtime.retained_generation());
+
+    // Exact: the source cannot grant a second authority while the first is
+    // outstanding, because granting already moved it off Current.
+    assert_eq!(
+        runtime
+            .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+            .expect_err("a non-Current source must not grant again"),
+        AuthorityRefusal::PhaseNotCurrent {
+            phase: PhaseName::Refreshing
+        }
+    );
+    assert_eq!(
+        runtime.permits_issued(),
+        1,
+        "a refused grant issued a permit"
+    );
+
+    // Terminal: the permit drives once and then refuses every path.
+    let drain = Arc::new(PermitDrainSignal::new());
+    let mut permit = SourceMutationPermit::grant(grant, Arc::clone(&lease), Arc::clone(&drain))
+        .expect("grant must produce a permit");
+    permit
+        .start_side_effect()
+        .expect("a granted permit may act");
+    let ticket = permit
+        .commit(replace_beneath_temp(&lease))
+        .expect("an in-flight permit commits");
+    assert_eq!(ticket.termination(), Termination::Committed);
+    assert_eq!(ticket.epoch(), authority_epoch(&runtime));
+    assert!(permit.is_terminal());
+    assert_eq!(drain.termination(), Some(Termination::Committed));
+
+    for refusal in [
+        permit
+            .start_side_effect()
+            .expect_err("terminal refuses restart"),
+        permit
+            .no_side_effect(NoSideEffectProof::observed())
+            .expect_err("terminal refuses a second termination"),
+    ] {
+        assert_eq!(refusal, AuthorityRefusal::PermitAlreadyTerminal);
+    }
+}
+
+/// The epoch the source is standing on, for comparison against a ticket.
+fn authority_epoch(
+    runtime: &SourceRuntime,
+) -> symforge::live_index::index_lifecycle::authority::MutationEpoch {
+    runtime.mutation_epoch()
+}
+
+/// A real write receipt produced beneath the permit's own lease.
+fn replace_beneath_temp(
+    lease: &PhysicalRootLease,
+) -> symforge::live_index::index_lifecycle::physical_root::WriteReceipt {
+    symforge::live_index::index_lifecycle::physical_root::replace_beneath(
+        lease,
+        std::path::Path::new("slice1-commit-probe.txt"),
+        b"committed",
+    )
+    .expect("a live lease replaces beneath its own root")
 }
 
 #[test]

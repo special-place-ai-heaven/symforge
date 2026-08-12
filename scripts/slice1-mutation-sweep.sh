@@ -11,10 +11,10 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 
-AUTHORITY=src/index_lifecycle/authority.rs
-MUTATION=src/index_lifecycle/mutation.rs
-TRANSITION=src/index_lifecycle/transition.rs
-PHYSICAL=src/index_lifecycle/physical_root.rs
+AUTHORITY=src/live_index/index_lifecycle/authority.rs
+MUTATION=src/live_index/index_lifecycle/mutation.rs
+TRANSITION=src/live_index/index_lifecycle/transition.rs
+PHYSICAL=src/live_index/index_lifecycle/physical_root.rs
 
 # id | file | literal to replace | replacement | guard description
 MUTATIONS=(
