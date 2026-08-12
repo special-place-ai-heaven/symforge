@@ -3354,19 +3354,22 @@ function runVerifiedCommand(spec, runtime = {}) {
   if (result && result.error) return { ok: false, reason: result.error.code === "ETIMEDOUT" ? "timeout" : "spawn_error" };
   if (!result || result.signal !== null && result.signal !== undefined) return { ok: false, reason: "signal" };
   if (result.status !== 0) return { ok: false, reason: "nonzero" };
-  // Exit 0 is not proof the named case RAN. `cargo test <case> -- --exact` exits 0
-  // for an ignored-only run ("0 passed; 0 failed; 1 ignored"), so a receipt written
-  // on exit code alone claims execution evidence the runner never observed -- the
-  // reporting invariant, in the one path that gates a release. When the caller
-  // names the case, require libtest to have reported it as run.
-  if (typeof spec.expect_case === "string" && spec.expect_case !== "") {
+  // Exit 0 is not proof the case RAN. `cargo test <case> -- --exact` exits 0 for
+  // an ignored-only run ("0 passed; 0 failed; 1 ignored"), so a receipt written on
+  // exit code alone claims execution evidence the runner never observed -- the
+  // reporting invariant, in the one path that gates a release.
+  //
+  // The filter is `--exact`, so no case other than the requested one can run.
+  // That makes the property checkable without re-deriving the case name: at least
+  // one case must have been reported as run, and none may have been reported
+  // ignored. Matching on a name would be a second derivation of a fact the argv
+  // already fixes, and those two rules drift.
+  if (spec.expect_execution) {
     const combined = `${stdout.toString("utf8")}${stderr.toString("utf8")}`;
-    const line = new RegExp(
-      "^test " + escapeRegExp(spec.expect_case) + "(?: - [^\\n]*)? \\.\\.\\. (ok|FAILED|ignored)$",
-      "mu",
-    ).exec(combined);
-    if (!line) return { ok: false, reason: "case_not_reported" };
-    if (line[1] === "ignored") return { ok: false, reason: "case_ignored" };
+    if (/^test .* \.\.\. ignored$/mu.test(combined)) return { ok: false, reason: "case_ignored" };
+    if (!/^test .* \.\.\. (?:ok|FAILED)$/mu.test(combined)) {
+      return { ok: false, reason: "case_not_reported" };
+    }
   }
   if (!isObject(after) || !after.clean || after.commit !== before.commit || after.tree !== before.tree) {
     return { ok: false, reason: "tree_changed" };
@@ -3396,16 +3399,12 @@ function materializedCommandSpec(testId, test, command, evidence, receiptPath, a
     return null;
   }
   return {
-    // libtest prints the case under its in-binary path: the symbol path for an
-    // integration test, module-qualified for a lib test. Benchmarks do not report
-    // this way, so they carry no expectation.
-    expect_case: test.kind.includes("benchmark")
-      ? null
-      : parsed.area === "src"
-        ? (sourceModulePath(parsed.file) === ""
-            ? parsed.symbolPath
-            : `${sourceModulePath(parsed.file)}::${parsed.symbolPath}`)
-        : parsed.symbolPath,
+    // The filter argv already carries the exact name cargo is told to run, and
+    // libtest echoes that name. Re-deriving it from the target instead would be a
+    // second naming rule that can drift from the first -- it did, for the one
+    // module-qualified lib case. Benchmarks do not report per-case, so they carry
+    // no expectation.
+    expect_execution: !test.kind.includes("benchmark"),
     program: cargoExecutable,
     args,
     timeout_ms: test.kind.includes("benchmark") ? 3_600_000 : 1_800_000,

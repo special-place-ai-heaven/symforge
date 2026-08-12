@@ -366,6 +366,17 @@ function buildPositiveMaterializedFixture(root) {
     'const output = process.env.SYMFORGE_LIFECYCLE_COMMAND_RECEIPT;',
     'fs.mkdirSync(path.dirname(output), { recursive: true });',
     'fs.writeFileSync(output, JSON.stringify(receipt) + "\\n");',
+    // A real `cargo test` reports each case libtest ran, and the runner now
+    // requires that line: exit 0 alone is satisfied by an ignored-only run, so a
+    // receipt written on exit code was claiming execution nobody observed. The
+    // stub must therefore emit what libtest emits, or it would be testing a
+    // laxer contract than production uses.
+    'const argv = String(process.env.SYMFORGE_LIFECYCLE_COMMAND || "").trim().split(/\s+/);',
+    'const separator = argv.indexOf("--");',
+    'const fromCommand = separator > 0 ? argv[separator - 1] : "";',
+    'const fromTarget = String(process.env.SYMFORGE_LIFECYCLE_TARGET || "").split("::").slice(1).join("::");',
+    'const reported = [fromCommand, fromTarget].filter((name, index, all) => name !== "" && all.indexOf(name) === index);',
+    'for (const name of reported) process.stdout.write("test " + name + " ... ok" + String.fromCharCode(10));',
     "",
   ].join("\n");
   writeFixtureFile(root, "test", fakeCommandScript);
