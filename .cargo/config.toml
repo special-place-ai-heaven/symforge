@@ -1,3 +1,5 @@
-# Build artifacts stay with the repo on E: (see CLAUDE.md § Windows build cache).
+# Build artifacts stay beside the checkout, on whatever drive the repo is on
+# (see CLAUDE.md, Windows build cache). Not a fixed drive: this said "on E:" while
+# the checkout lived there, which went stale when it moved.
 [build]
 target-dir = "target"
