@@ -5,12 +5,15 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
+import tempfile
 import unittest
 import uuid
 from copy import deepcopy
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import Callable
 from unittest.mock import patch
 
 import refreeze_v11
@@ -23,6 +26,9 @@ DESIGN_PATH = (
     "docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md"
 )
 API_PATH = f"{FEATURE_ROOT}/contracts/public-api-v11.json"
+FIXTURE_MANIFEST_PATH = (
+    "tests/fixtures/public-api-v11-consumer/fixture-manifest.json"
+)
 CONTEXT_PATH = "CONTEXT.md"
 MANIFEST_START = "<!-- SYMFORGE FEATURE020 REFREEZE V11 JSON START -->"
 MANIFEST_END = "<!-- SYMFORGE FEATURE020 REFREEZE V11 JSON END -->"
@@ -39,7 +45,15 @@ def system_executable(name: str) -> Path:
 
 
 SYSTEM_GIT_EXECUTABLE = system_executable("git")
-SYSTEM_SSH_KEYGEN_EXECUTABLE = system_executable("ssh-keygen")
+_discovered_ssh_keygen = shutil.which("ssh-keygen")
+REAL_SSH_KEYGEN_EXECUTABLE = (
+    Path(_discovered_ssh_keygen).resolve()
+    if _discovered_ssh_keygen is not None
+    else None
+)
+SYSTEM_SSH_KEYGEN_EXECUTABLE = (
+    REAL_SSH_KEYGEN_EXECUTABLE or SYSTEM_GIT_EXECUTABLE
+)
 
 REQUIRED_NORMATIVE_PATHS = [
     CONTEXT_PATH,
@@ -98,11 +112,14 @@ def compute_amendment_set_id(amendments: list[dict[str, object]]) -> str:
 
 
 class RefreezeFixture:
+    created_directories: list[Path] = []
+
     def __init__(self) -> None:
         temp_root = Path(__file__).resolve().parent.parent / ".tmp" / "execution-tests"
         temp_root.mkdir(parents=True, exist_ok=True)
         self.root = temp_root / f"refreeze-{uuid.uuid4().hex}"
         self.root.mkdir()
+        self.created_directories.append(self.root)
         self.git("init")
         self.git("config", "user.email", "refreeze-test@example.invalid")
         self.git("config", "user.name", "Refreeze Test")
@@ -164,6 +181,25 @@ class RefreezeFixture:
                 contract_path,
                 "".join(f"# {slug}\n\n" for slug in sorted(slugs)).encode(),
             )
+        acceptance_path = (
+            f"{FEATURE_ROOT}/contracts/lifecycle-acceptance-oracles-v11.md"
+        )
+        regression_ids = sorted(
+            {
+                regression_id
+                for mapping in refreeze_v11.EXPECTED_AMENDMENT_MAPPINGS.values()
+                for regression_id in mapping["regression_ids"]
+            }
+        )
+        self.write(
+            acceptance_path,
+            self.read(acceptance_path)
+            + b"## V11 amendment regression bindings\n\n"
+            + "".join(
+                f"- Regression: `{regression_id}` — fixture oracle binding.\n"
+                for regression_id in regression_ids
+            ).encode(),
+        )
         self.write(
             f"{FEATURE_ROOT}/tasks.md",
             "".join(
@@ -180,6 +216,10 @@ class RefreezeFixture:
         ]:
             corpus_path = corpus_entry["path"]
             self.write(corpus_path, (repository_root / corpus_path).read_bytes())
+        self.write(
+            FIXTURE_MANIFEST_PATH,
+            (repository_root / FIXTURE_MANIFEST_PATH).read_bytes(),
+        )
         self.write(API_PATH, api_bytes)
 
         amendments: list[dict[str, object]] = []
@@ -326,6 +366,12 @@ class RefreezeFixture:
         self.api = deepcopy(api)
         api_bytes = json.dumps(self.api, indent=2, sort_keys=True).encode() + b"\n"
         self.write(API_PATH, api_bytes)
+        fixture_manifest = json.loads(self.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["source_contract"]["sha256"] = sha256(api_bytes)
+        self.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
         manifest = deepcopy(self.manifest)
         manifest["public_api"] = {
             "canonical_sha256": sha256(canonical_json(self.api)),
@@ -343,6 +389,7 @@ class RefreezeFixture:
     ) -> tuple[dict[str, object], Path, Path, Path, str]:
         trust_root = self.root.parent / f"refreeze-trust-{uuid.uuid4().hex}"
         trust_root.mkdir()
+        self.created_directories.append(trust_root)
         release_identity = "release-ci@example.invalid"
         approval = {
             "approved_at": "2026-08-11T12:00:00Z",
@@ -406,6 +453,40 @@ class RefreezeFixture:
 
 
 class RefreezeV11Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        marker = len(RefreezeFixture.created_directories)
+        self.addCleanup(self.cleanup_fixture_directories, marker)
+
+    def cleanup_fixture_directories(self, marker: int) -> None:
+        created = RefreezeFixture.created_directories[marker:]
+        del RefreezeFixture.created_directories[marker:]
+
+        def remove_readonly(
+            function: Callable[[str], object],
+            path: str,
+            _error: object,
+        ) -> None:
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+
+        for path in reversed(created):
+            if path.exists():
+                shutil.rmtree(path, onerror=remove_readonly)
+
+    def assert_internal_error(
+        self,
+        fixture: RefreezeFixture,
+        target: str,
+        expected_code: str,
+    ) -> None:
+        with self.assertRaises(refreeze_v11.RefreezeError) as error:
+            refreeze_v11.verify_internal(
+                fixture.root,
+                target,
+                git_executable=SYSTEM_GIT_EXECUTABLE,
+            )
+        self.assertEqual(error.exception.code, expected_code)
+
     def test_verify_internal_accepts_exact_committed_refreeze(self) -> None:
         fixture = RefreezeFixture()
 
@@ -420,6 +501,15 @@ class RefreezeV11Tests(unittest.TestCase):
         )
 
         self.assertEqual(status, 0)
+
+    def test_fixture_directories_are_removed_by_test_cleanup(self) -> None:
+        fixture = RefreezeFixture()
+        fixture_root = fixture.root
+        self.assertTrue(fixture_root.is_dir())
+
+        self.doCleanups()
+
+        self.assertFalse(fixture_root.exists())
 
     def test_verify_internal_rejects_an_unclassified_feature_file(self) -> None:
         fixture = RefreezeFixture()
@@ -757,6 +847,34 @@ class RefreezeV11Tests(unittest.TestCase):
 
         self.assertEqual(status, 1)
 
+    def test_verify_internal_rejects_replaced_clause_still_present_at_target(
+        self,
+    ) -> None:
+        fixture = RefreezeFixture()
+        manifest = deepcopy(fixture.manifest)
+        spec_path = f"{FEATURE_ROOT}/spec.md"
+        fixture.write(
+            spec_path,
+            fixture.read(spec_path) + b"baseline clause 1\n",
+        )
+        spec_entry = next(
+            item for item in manifest["inventory"] if item["path"] == spec_path
+        )
+        spec_entry["sha256"] = sha256(fixture.read(spec_path))
+        target = fixture.reseal_manifest(manifest)
+
+        with self.assertRaises(refreeze_v11.RefreezeError) as error:
+            refreeze_v11.verify_internal(
+                fixture.root,
+                target,
+                git_executable=SYSTEM_GIT_EXECUTABLE,
+            )
+
+        self.assertEqual(
+            error.exception.code,
+            "AMENDMENT_REPLACED_CLAUSE_STILL_PRESENT",
+        )
+
     def test_verify_internal_rejects_clause_mapping_outside_normative_artifacts(
         self,
     ) -> None:
@@ -1006,6 +1124,70 @@ class RefreezeV11Tests(unittest.TestCase):
         )
 
         self.assertEqual(status, 1)
+
+    def test_verify_internal_rejects_fixture_manifest_api_hash_drift(self) -> None:
+        fixture = RefreezeFixture()
+        fixture_manifest = json.loads(fixture.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["source_contract"]["sha256"] = "0" * 64
+        fixture.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        target = fixture.commit_all("drift fixture manifest source contract")
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "FIXTURE_MANIFEST_SOURCE_CONTRACT_INVALID",
+        )
+
+    def test_verify_internal_rejects_fixture_manifest_coverage_drift(self) -> None:
+        fixture = RefreezeFixture()
+        fixture_manifest = json.loads(fixture.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["coverage"]["supported_cells"] += 1
+        fixture.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        target = fixture.commit_all("drift fixture manifest coverage")
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "FIXTURE_MANIFEST_COVERAGE_INVALID",
+        )
+
+    def test_verify_internal_requires_compile_fail_expected_error_codes(self) -> None:
+        fixture = RefreezeFixture()
+        cases_path = (
+            "tests/fixtures/public-api-v11-consumer/compile-fail/cases.json"
+        )
+        case_catalog = json.loads(fixture.read(cases_path))
+        del case_catalog["trait_absent_groups"][0]["expected_error_codes"]
+        case_bytes = json.dumps(case_catalog, indent=2, sort_keys=True).encode() + b"\n"
+        fixture.write(cases_path, case_bytes)
+
+        api = deepcopy(fixture.api)
+        corpus_entry = next(
+            item
+            for item in api["configuration_domain"]["cover"]["input_corpus"]
+            if item["path"] == cases_path
+        )
+        corpus_entry["sha256"] = sha256(case_bytes)
+        future_api_bytes = json.dumps(api, indent=2, sort_keys=True).encode() + b"\n"
+        fixture_manifest = json.loads(fixture.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["source_contract"]["sha256"] = sha256(future_api_bytes)
+        fixture.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        target = fixture.replace_public_api(api)
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "API_COMPILE_FAIL_EXPECTED_ERROR_CODES_INVALID",
+        )
 
     def test_verify_internal_rejects_minimal_vacuous_public_api(self) -> None:
         fixture = RefreezeFixture()
@@ -2775,18 +2957,19 @@ class RefreezeV11Tests(unittest.TestCase):
     def test_verify_internal_requires_v10_crate_root_mapping(self) -> None:
         fixture = RefreezeFixture()
         api = deepcopy(fixture.api)
-        api["migration_v10"]["categories"] = [
+        root_category = next(
             item
             for item in api["migration_v10"]["categories"]
-            if item["id"] != "v10-00-crate-root"
-        ]
+            if item["id"] == "v10-00-crate-root"
+        )
+        root_category["covers_descendants"] = True
         target = fixture.replace_public_api(api)
 
-        status = refreeze_v11.main(
-            ["--root", str(fixture.root), "verify-internal", "--target-ref", target]
+        self.assert_internal_error(
+            fixture,
+            target,
+            "API_V10_ROOT_MAPPING_INVALID",
         )
-
-        self.assertEqual(status, 1)
 
     def test_verify_internal_rejects_overlapping_v10_migration_atoms(self) -> None:
         fixture = RefreezeFixture()
@@ -2939,45 +3122,68 @@ class RefreezeV11Tests(unittest.TestCase):
     def test_verify_internal_rejects_unresolved_requirement_mapping(self) -> None:
         fixture = RefreezeFixture()
         manifest = deepcopy(fixture.manifest)
-        manifest["amendments"][0]["requirement_ids"] = ["FR-999"]
-        target = fixture.reseal_manifest(manifest)
-
-        status = refreeze_v11.main(
-            ["--root", str(fixture.root), "verify-internal", "--target-ref", target]
-        )
-
-        self.assertEqual(status, 1)
-
-    def test_verify_internal_rejects_ambiguous_requirement_definition(self) -> None:
-        fixture = RefreezeFixture()
-        manifest = deepcopy(fixture.manifest)
         goal_path = f"{FEATURE_ROOT}/GOAL.md"
-        fixture.write(goal_path, b"**F020-V11-A01** duplicate definition\n")
+        fixture.write(
+            goal_path,
+            fixture.read(goal_path).replace(
+                b"**FR-009**: fixture definition.\n",
+                b"",
+            ),
+        )
         goal_entry = next(
             item for item in manifest["inventory"] if item["path"] == goal_path
         )
         goal_entry["sha256"] = sha256(fixture.read(goal_path))
         target = fixture.reseal_manifest(manifest)
 
-        status = refreeze_v11.main(
-            ["--root", str(fixture.root), "verify-internal", "--target-ref", target]
+        self.assert_internal_error(
+            fixture,
+            target,
+            "AMENDMENT_REQUIREMENT_UNRESOLVED",
         )
 
-        self.assertEqual(status, 1)
+    def test_verify_internal_rejects_ambiguous_requirement_definition(self) -> None:
+        fixture = RefreezeFixture()
+        manifest = deepcopy(fixture.manifest)
+        goal_path = f"{FEATURE_ROOT}/GOAL.md"
+        fixture.write(
+            goal_path,
+            fixture.read(goal_path) + b"**F020-V11-A01** duplicate definition\n",
+        )
+        goal_entry = next(
+            item for item in manifest["inventory"] if item["path"] == goal_path
+        )
+        goal_entry["sha256"] = sha256(fixture.read(goal_path))
+        target = fixture.reseal_manifest(manifest)
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "AMENDMENT_REQUIREMENT_UNRESOLVED",
+        )
 
     def test_verify_internal_rejects_unresolved_contract_heading(self) -> None:
         fixture = RefreezeFixture()
         manifest = deepcopy(fixture.manifest)
-        manifest["amendments"][0]["contract_clause_ids"] = [
-            "contracts/source-binding-and-state.md#missing-heading"
-        ]
+        contract_path = f"{FEATURE_ROOT}/contracts/source-binding-and-state.md"
+        fixture.write(
+            contract_path,
+            fixture.read(contract_path).replace(
+                b"# v11-lifecycle-amendment\n\n",
+                b"",
+            ),
+        )
+        contract_entry = next(
+            item for item in manifest["inventory"] if item["path"] == contract_path
+        )
+        contract_entry["sha256"] = sha256(fixture.read(contract_path))
         target = fixture.reseal_manifest(manifest)
 
-        status = refreeze_v11.main(
-            ["--root", str(fixture.root), "verify-internal", "--target-ref", target]
+        self.assert_internal_error(
+            fixture,
+            target,
+            "AMENDMENT_CONTRACT_REFERENCE_UNRESOLVED",
         )
-
-        self.assertEqual(status, 1)
 
     def test_verify_internal_rejects_ambiguous_contract_heading(self) -> None:
         fixture = RefreezeFixture()
@@ -2993,38 +3199,63 @@ class RefreezeV11Tests(unittest.TestCase):
         contract_entry["sha256"] = sha256(fixture.read(contract_path))
         target = fixture.reseal_manifest(manifest)
 
-        status = refreeze_v11.main(
-            ["--root", str(fixture.root), "verify-internal", "--target-ref", target]
+        self.assert_internal_error(
+            fixture,
+            target,
+            "AMENDMENT_CONTRACT_REFERENCE_UNRESOLVED",
         )
-
-        self.assertEqual(status, 1)
 
     def test_verify_internal_rejects_unresolved_plan_task(self) -> None:
         fixture = RefreezeFixture()
         manifest = deepcopy(fixture.manifest)
-        manifest["amendments"][0]["plan_task_ids"] = ["T999"]
+        tasks_path = f"{FEATURE_ROOT}/tasks.md"
+        fixture.write(
+            tasks_path,
+            b"".join(
+                line
+                for line in fixture.read(tasks_path).splitlines(keepends=True)
+                if not line.startswith(b"- [ ] T003 ")
+            ),
+        )
+        tasks_entry = next(
+            item for item in manifest["inventory"] if item["path"] == tasks_path
+        )
+        tasks_entry["sha256"] = sha256(fixture.read(tasks_path))
         target = fixture.reseal_manifest(manifest)
 
-        status = refreeze_v11.main(
-            ["--root", str(fixture.root), "verify-internal", "--target-ref", target]
+        self.assert_internal_error(
+            fixture,
+            target,
+            "AMENDMENT_TASK_UNRESOLVED",
         )
-
-        self.assertEqual(status, 1)
 
     def test_verify_internal_rejects_unresolved_regression_id(self) -> None:
         fixture = RefreezeFixture()
         manifest = deepcopy(fixture.manifest)
-        manifest["amendments"][0]["regression_ids"] = ["F020-V11-R99"]
-        manifest["amendment_set_id"] = compute_amendment_set_id(
-            manifest["amendments"]
+        acceptance_path = (
+            f"{FEATURE_ROOT}/contracts/lifecycle-acceptance-oracles-v11.md"
         )
+        fixture.write(
+            acceptance_path,
+            b"".join(
+                line
+                for line in fixture.read(acceptance_path).splitlines(keepends=True)
+                if b"F020-V11-R01" not in line
+            ),
+        )
+        acceptance_entry = next(
+            item
+            for item in manifest["inventory"]
+            if item["path"] == acceptance_path
+        )
+        acceptance_entry["sha256"] = sha256(fixture.read(acceptance_path))
         target = fixture.reseal_manifest(manifest)
 
-        status = refreeze_v11.main(
-            ["--root", str(fixture.root), "verify-internal", "--target-ref", target]
+        self.assert_internal_error(
+            fixture,
+            target,
+            "AMENDMENT_REGRESSION_UNRESOLVED",
         )
-
-        self.assertEqual(status, 1)
 
     def test_verify_approval_rejects_an_old_record_for_a_successor_target(self) -> None:
         fixture = RefreezeFixture()
@@ -3483,13 +3714,127 @@ class RefreezeV11Tests(unittest.TestCase):
         argv = run.call_args.args[0]
         kwargs = run.call_args.kwargs
         self.assertEqual(
-            argv[0:4],
-            [str(SYSTEM_SSH_KEYGEN_EXECUTABLE), "-Y", "verify", "-f"],
+            argv,
+            [
+                str(SYSTEM_SSH_KEYGEN_EXECUTABLE),
+                "-Y",
+                "verify",
+                "-f",
+                "external.allowed_signers",
+                "-I",
+                "release-ci@example.invalid",
+                "-n",
+                "symforge-feature-020-refreeze-v11",
+                "-s",
+                "external.sshsig",
+            ],
         )
         self.assertEqual(kwargs["input"], b"canonical approval bytes")
         self.assertIs(kwargs["shell"], False)
         self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+
+    @unittest.skipIf(
+        REAL_SSH_KEYGEN_EXECUTABLE is None,
+        "trusted ssh-keygen executable unavailable",
+    )
+    def test_sshsig_real_ed25519_round_trip_fails_closed(self) -> None:
+        ssh_keygen = REAL_SSH_KEYGEN_EXECUTABLE
+        self.assertIsNotNone(ssh_keygen)
+        assert ssh_keygen is not None
+        approval_bytes = b"canonical approval bytes for a real SSHSIG round trip"
+        release_identity = "release-ci@example.invalid"
+
+        with tempfile.TemporaryDirectory(prefix="symforge-sshsig-") as temp:
+            trust_root = Path(temp)
+            private_key = trust_root / "approval-key"
+            generate = subprocess.run(
+                [
+                    str(ssh_keygen),
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-f",
+                    str(private_key),
+                ],
+                check=False,
+                capture_output=True,
+                shell=False,
+                timeout=15,
+            )
+            self.assertEqual(generate.returncode, 0)
+            allowed_signers = trust_root / "allowed_signers"
+            public_key = private_key.with_suffix(".pub").read_bytes().strip()
+            allowed_signers.write_bytes(
+                release_identity.encode("ascii") + b" " + public_key + b"\n"
+            )
+
+            def sign(name: str, namespace: str) -> Path:
+                payload = trust_root / name
+                payload.write_bytes(approval_bytes)
+                signed = subprocess.run(
+                    [
+                        str(ssh_keygen),
+                        "-Y",
+                        "sign",
+                        "-f",
+                        str(private_key),
+                        "-n",
+                        namespace,
+                        str(payload),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    shell=False,
+                    timeout=15,
+                )
+                self.assertEqual(signed.returncode, 0)
+                return Path(f"{payload}.sig")
+
+            signature = sign("approval.json", refreeze_v11.SIGNATURE_NAMESPACE)
+            wrong_namespace_signature = sign(
+                "wrong-namespace.json",
+                f"{refreeze_v11.SIGNATURE_NAMESPACE}-wrong",
+            )
+
+            self.assertTrue(
+                refreeze_v11.verify_sshsig(
+                    approval_bytes,
+                    ssh_keygen_executable=ssh_keygen,
+                    signature=signature,
+                    allowed_signers=allowed_signers,
+                    release_identity=release_identity,
+                )
+            )
+            self.assertFalse(
+                refreeze_v11.verify_sshsig(
+                    approval_bytes + b" tampered",
+                    ssh_keygen_executable=ssh_keygen,
+                    signature=signature,
+                    allowed_signers=allowed_signers,
+                    release_identity=release_identity,
+                )
+            )
+            self.assertFalse(
+                refreeze_v11.verify_sshsig(
+                    approval_bytes,
+                    ssh_keygen_executable=ssh_keygen,
+                    signature=wrong_namespace_signature,
+                    allowed_signers=allowed_signers,
+                    release_identity=release_identity,
+                )
+            )
+            self.assertFalse(
+                refreeze_v11.verify_sshsig(
+                    approval_bytes,
+                    ssh_keygen_executable=ssh_keygen,
+                    signature=signature,
+                    allowed_signers=allowed_signers,
+                    release_identity="unknown-release@example.invalid",
+                )
+            )
 
     def test_cli_failure_never_echoes_external_record_material(self) -> None:
         fixture = RefreezeFixture()

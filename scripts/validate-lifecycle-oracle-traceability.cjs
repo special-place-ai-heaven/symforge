@@ -56,6 +56,31 @@ const EXPECTED_ACCEPTANCE_ORACLES = new Map([
   ["ORACLE-EMBED-FOUNDATION", ["embed_foundation", 2, "TEST-EMBED-FOUNDATION"]],
 ]);
 
+const EXPECTED_AMENDMENT_REGRESSION_BINDINGS = new Map([
+  ["F020-V11-R01", "ORACLE-VERIFICATION-COMPLETE-CANDIDATE"],
+  ["F020-V11-R02", "ORACLE-SNAPSHOT-UNTRUSTED-SEED"],
+  ["F020-V11-R03", "ORACLE-INGRESS-CLOSED-SURFACE"],
+  ["F020-V11-R04", "ORACLE-VERIFICATION-COMPLETE-CANDIDATE"],
+  ["F020-V11-R05", "ORACLE-VERIFICATION-COMPLETE-CANDIDATE"],
+  ["F020-V11-R06", "ORACLE-VERIFICATION-COMPLETE-CANDIDATE"],
+  ["F020-V11-R07", "ORACLE-VERIFICATION-COMPLETE-CANDIDATE"],
+  ["F020-V11-R08", "ORACLE-HEALTH-COMMITTED-VS-ATTEMPT"],
+  ["F020-V11-R09", "ORACLE-VERIFICATION-COMPLETE-CANDIDATE"],
+  ["F020-V11-R10", "ORACLE-KNOWLEDGE-CURRENT-PROJECTION"],
+  ["F020-V11-R11", "ORACLE-KNOWLEDGE-CURRENT-PROJECTION"],
+  ["F020-V11-R12", "ORACLE-REGISTRY-IDENTITY-ABA"],
+  ["F020-V11-R13", "ORACLE-QUERY-ATOMIC-LEASE"],
+  ["F020-V11-R14", "ORACLE-KNOWLEDGE-CURRENT-PROJECTION"],
+  ["F020-V11-R15", "ORACLE-VERIFICATION-COMPLETE-CANDIDATE"],
+  ["F020-V11-R16", "ORACLE-HEALTH-COMMITTED-VS-ATTEMPT"],
+  ["F020-V11-R17", "ORACLE-ROLLING-VERIFICATION-COVERAGE"],
+  ["F020-V11-R18A", "ORACLE-MIGRATION-DELTA-EQUIVALENCE"],
+  ["F020-V11-R18B", "ORACLE-PERFORMANCE-OBSERVED-REFRESH"],
+  ["F020-V11-R18C", "ORACLE-CAPACITY-RUNTIME-INTEGRATION"],
+  ["F020-V11-R19A", "ORACLE-QUERY-ATOMIC-LEASE"],
+  ["F020-V11-R19B", "ORACLE-KNOWLEDGE-CURRENT-PROJECTION"],
+]);
+
 const RETIREMENT_CATEGORIES = [
   "writers",
   "callbacks",
@@ -71,6 +96,7 @@ const RETIREMENT_CATEGORIES = [
   "compatibility_aliases",
   "raw_embed",
 ];
+const RETIREMENT_CLOSURE_CATEGORIES = ["writers", "callbacks", "publication_roots", "cache"];
 
 const EXPECTED_COMPATIBILITY_ALIASES = ["detect_changes", "trace_symbol"];
 
@@ -251,19 +277,19 @@ const EXPECTED_PROMPTS = [
 const FROZEN_DIGESTS = {
   catalogs: {
     domain: "symforge.lifecycle.v11.trace.catalogs",
-    hash: "3e6eacd2cd74f585db8505cb77184b7ca9405da45621925ba9ad88119a5edcb5",
+    hash: "bb7c1c6dc1c31f33db50b179d42c7e248c44d97d7da954a52a29e6063266eb32",
   },
   requirement_rows: {
     domain: "symforge.lifecycle.v11.trace.requirement_rows",
-    hash: "b025716a4304bd4ae1ee20a236444b9de61d2b31243d394154324cb185d464da",
+    hash: "2bae235c749d0f83394f5dff9d4485c0e8985a9b1d0ccfaed6936998c43107e0",
   },
   invariants: {
     domain: "symforge.lifecycle.v11.trace.invariants",
-    hash: "173fe8b02013b1b6cedfa5001a8bf0f26d1c843b5cbea9b9f0f5de01f6d97448",
+    hash: "d15af22fa059f120f3c0216db9868717bc8bd9b3119cb24de836a3c8876a398e",
   },
   state_models: {
     domain: "symforge.lifecycle.v11.trace.state_models",
-    hash: "fa33cc96d32ecae5dcc0f501cfdc34747a85f5fdc6378c62710c4978bf274a98",
+    hash: "7293af9fdf456a51dcf678be233f7930fbe1cbc999d3f16e573b6266f0cca659",
   },
   release_validation: {
     domain: "symforge.lifecycle.v11.trace.release_validation",
@@ -271,11 +297,11 @@ const FROZEN_DIGESTS = {
   },
   acceptance_oracles: {
     domain: "symforge.lifecycle.v11.acceptance.oracles",
-    hash: "d6851d836e641a660e3688330dce2a80fa4024d0b609b5828bd2bd55dead7ea8",
+    hash: "a6895de307fd2f24a82abf40cc2bc79113d2a0c4fe56168423eac4adc63cd1fb",
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "de154553a10bc530e78b33d19ca9d32581952d3d2b3db2689ca1367aafa074b9",
+    hash: "6eb8113adf2ce0f23af460982dde5eef44d0e92bb3dfa6610692ccd4f619cee4",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -499,7 +525,12 @@ function parseSentinel(relativePath, heading, start, end) {
     return null;
   }
   try {
-    return JSON.parse(match[1]);
+    const parsed = JSON.parse(match[1]);
+    if (!isObject(parsed)) {
+      fail("SENTINEL_ROOT_INVALID", `${relativePath}: sentinel root must be an object`);
+      return null;
+    }
+    return parsed;
   } catch (error) {
     fail("JSON_PARSE", `${relativePath}: ${error.message}`);
     return null;
@@ -1372,6 +1403,34 @@ function validateTrace(trace, taskCatalog) {
   if (uniqueTasks.size < 20 || uniqueTests.size < 15) fail("TRACE_MAPPING_DEGENERATE", `tasks=${uniqueTasks.size}, tests=${uniqueTests.size}`);
 }
 
+function validateAmendmentRegressionBindings(oracles) {
+  const text = readText(ACCEPTANCE_PATH);
+  if (text === null) return;
+  const bindingLines = text.split(/\r?\n/u).filter((line) => line.startsWith("- Regression:"));
+  const pattern = /^- Regression: `([A-Z0-9-]+)` — `(ORACLE-[A-Z0-9-]+)`; test `([^`]+)`; command `([^`]+)`\.$/u;
+  const byOracle = new Map(oracles.filter(isObject).map((oracle) => [oracle.oracle_id, oracle]));
+  const seen = new Set();
+  for (const line of bindingLines) {
+    const match = pattern.exec(line);
+    if (!match) {
+      fail("AMENDMENT_REGRESSION_BINDING_INVALID", line);
+      continue;
+    }
+    const [, regressionId, oracleId, test, command] = match;
+    const oracle = byOracle.get(oracleId);
+    if (seen.has(regressionId) || EXPECTED_AMENDMENT_REGRESSION_BINDINGS.get(regressionId) !== oracleId ||
+        !isObject(oracle) || oracle.test !== test || oracle.command !== command) {
+      fail("AMENDMENT_REGRESSION_BINDING_INVALID", regressionId);
+    }
+    seen.add(regressionId);
+  }
+  const expectedIds = [...EXPECTED_AMENDMENT_REGRESSION_BINDINGS.keys()];
+  const actualIds = [...seen].sort();
+  if (JSON.stringify(actualIds) !== JSON.stringify([...expectedIds].sort()) || bindingLines.length !== expectedIds.length) {
+    fail("AMENDMENT_REGRESSION_BINDING_INVALID", `expected=${expectedIds.length}, actual=${bindingLines.length}`);
+  }
+}
+
 function validateAcceptance(acceptance, trace, taskCatalog) {
   if (!acceptance) return;
   const taskIds = taskCatalog.ids;
@@ -1446,6 +1505,7 @@ function validateAcceptance(acceptance, trace, taskCatalog) {
     validatePlanned(oracle, context, true);
   }
   for (const [oracleId] of EXPECTED_ACCEPTANCE_ORACLES) if (!oracleIds.has(oracleId)) fail("ORACLE_ID_MISSING", oracleId);
+  validateAmendmentRegressionBindings(oracles);
   for (const [category, expectedCount] of expectedCategoryCounts) {
     const count = categoryCounts.get(category) || 0;
     if (count !== expectedCount) fail("ORACLE_CATEGORY_COUNT", `${category}: ${count}`);
@@ -1501,6 +1561,49 @@ function validateAcceptance(acceptance, trace, taskCatalog) {
   ];
   if (!isObject(health) || JSON.stringify(health.requirement_ids) !== JSON.stringify(["FR-021"]) || JSON.stringify(health.implementation_tasks) !== JSON.stringify(["T056", "T063"]) || JSON.stringify(health.assertions) !== JSON.stringify(expectedHealthAssertions)) {
     fail("HEALTH_ORACLE_INVALID", "FR-021 health must keep committed-generation truth separate from bounded attempt and runtime-work evidence");
+  }
+  const expectedObserverModel = ["Unregistered", "Registering", "Replaying", "Live", "GapLatched", "OverflowLatched", "VerificationOverdueLatched", "Stopped"];
+  const observerModel = trace && trace.catalogs && trace.catalogs.state_models && trace.catalogs.state_models["MODEL-OBSERVER"];
+  const rollingVerification = oracles.find((oracle) => isObject(oracle) && oracle.oracle_id === "ORACLE-ROLLING-VERIFICATION-COVERAGE");
+  const expectedOverdueSemantics = {
+    requirement_ids: ["FR-011", "FR-031", "FR-039", "FR-049", "FR-052", "SC-003", "SC-004", "SC-009"],
+    implementation_tasks: ["T055", "T062", "T063", "T065"],
+    preconditions: [
+      "A Current root carries a complete VerificationRecord and a monotonic verification_deadline exactly 15 minutes after that record completed",
+      "The monotonic clock, rolling cursor, observer health, strict-lease linearization, and independently corruptible scopes are controllable",
+    ],
+    actions: [
+      "Advance rolling verification through partial, cancelled, resumed, restarted, and complete whole-declared-scope passes",
+      "Pause strict acquisition immediately before, exactly at, and after verification_deadline",
+      "Inject source drift, corruption, observer gaps, publication replacement, and snapshot quarantine at each cursor boundary",
+    ],
+    assertions: [
+      "Coverage records exactly the scopes and generation actually checked",
+      "Only a complete whole-declared-scope VerificationRecord bound to the exact project slot, source slot, generation digest, observer cut, policy version, and declared scope advances verification_deadline",
+      "Partial progress, cancellation, retry, cursor resume, persistence, and restart never extend or reconstruct verification_deadline",
+      "At or after verification_deadline without a newer exact-bound complete record, VerificationOverdueLatched becomes non-Current before any strict lease linearizes and returns SourceRefusal",
+      "Any mismatch or observer uncertainty revokes Current before further strict answers",
+      "Resume never skips unverified work or attaches an old cursor to a new incarnation",
+    ],
+    positive_control: "A complete exact-bound pass before the deadline publishes its VerificationRecord and advances the next deadline by exactly 15 minutes.",
+    negative_controls: [
+      "An infinite, disabled, reconstructed, or partial-progress-extended deadline is rejected",
+      "A strict lease at or after an unmet deadline is refused even when retained bytes remain readable",
+      "A corrupted or changed scope prevents a complete verification record",
+      "A cursor from a prior root, project, or source incarnation is rejected",
+    ],
+    bounds: [
+      "MAX_CURRENT_UNVERIFIED_AGE is exactly 15 minutes and cannot be infinite, disabled, or configured upward",
+      "The fixture scopes, cursor states, clock cuts, and injected failures are finite",
+    ],
+    fairness: [
+      "A continuously Current root receives every bounded verification slice before its fixed deadline or becomes synchronously non-Current",
+      "An overdue source cannot starve its fresh complete re-verification behind new strict leases",
+    ],
+  };
+  if (JSON.stringify(observerModel) !== JSON.stringify(expectedObserverModel) || !isObject(rollingVerification) ||
+      Object.entries(expectedOverdueSemantics).some(([key, expected]) => JSON.stringify(rollingVerification[key]) !== JSON.stringify(expected))) {
+    fail("OVERDUE_VERIFICATION_ORACLE_INVALID", "the finite deadline, overdue latch, exact-bound refresh, and strict-refusal oracle must remain closed");
   }
   const capacity = oracles.find((oracle) => isObject(oracle) && oracle.oracle_id === "ORACLE-CAPACITY-PHYSICAL-OWNERSHIP");
   const expectedCapacitySemantics = {
@@ -2056,6 +2159,39 @@ function validateRetirementSourceInventory(retirement, sourceMap) {
   }
 }
 
+function validateRetirementClosure(retirement, sourceMap) {
+  const closure = retirement && retirement.preactivation_closure;
+  if (!exactKeys(closure, RETIREMENT_CLOSURE_CATEGORIES, "retirement.preactivation_closure")) return;
+  const entries = new Map((Array.isArray(retirement.entries) ? retirement.entries : [])
+    .filter(isObject).map((entry) => [entry.category, entry]));
+  for (const category of RETIREMENT_CLOSURE_CATEGORIES) {
+    const record = closure[category];
+    const context = `retirement.preactivation_closure.${category}`;
+    if (!exactKeys(record, ["paths", "digest"], context)) continue;
+    const members = entries.has(category) && Array.isArray(entries.get(category).members) ? entries.get(category).members : [];
+    const expectedPaths = [...new Set(members.filter((member) => typeof member === "string" && member.startsWith("src/"))
+      .map(seamPath))].sort();
+    const paths = stringArray(record.paths, `${context}.paths`);
+    if (JSON.stringify(paths) !== JSON.stringify(expectedPaths)) {
+      fail("RETIREMENT_CLOSURE_MISMATCH", `${category}: closure paths must equal every member-owned source path`);
+      continue;
+    }
+    const blobHashes = {};
+    for (const relativePath of paths) {
+      const source = sourceMap.get(relativePath);
+      if (typeof source !== "string") {
+        fail("RETIREMENT_CLOSURE_MISMATCH", `${category}: missing ${relativePath}`);
+        continue;
+      }
+      blobHashes[relativePath] = sha256Bytes(Buffer.from(source, "utf8"));
+    }
+    const actualDigest = canonicalDigest(`symforge.lifecycle.v11.retirement.closure.${category}`, blobHashes);
+    if (!validSha256(record.digest) || record.digest !== actualDigest) {
+      fail("RETIREMENT_CLOSURE_MISMATCH", `${category}: preactivation source census changed`);
+    }
+  }
+}
+
 function expectedRawEmbedAtoms() {
   const text = readText(PUBLIC_API_PATH);
   if (text === null) return [];
@@ -2134,13 +2270,16 @@ function validateFrozenContracts(trace, acceptance, retirement) {
   }
   if (isObject(retirement)) {
     const entries = Array.isArray(retirement.entries) ? retirement.entries.filter(isObject) : [];
-    const records = Object.fromEntries(entries.map((entry) => [entry.category, {
-      members: entry.members,
-      disposition: entry.disposition,
-      assertions: entry.assertions,
-      status: entry.status,
-      executed: entry.executed,
-    }]));
+    const records = {
+      preactivation_closure: retirement.preactivation_closure,
+      entries: Object.fromEntries(entries.map((entry) => [entry.category, {
+        members: entry.members,
+        disposition: entry.disposition,
+        assertions: entry.assertions,
+        status: entry.status,
+        executed: entry.executed,
+      }])),
+    };
     const edges = {
       slice4_owner: retirement.slice4_owner,
       entries: Object.fromEntries(entries.map((entry) => [entry.category, {
@@ -2167,7 +2306,7 @@ function validateRetirement(retirement, taskCatalog) {
   const ordinaryLifecycle = cli.requireMaterialized
     ? null
     : ordinaryRetirementLifecycle(ordinarySourceMap, ordinaryManifest);
-  exactKeys(retirement, ["kind", "schema_version", "status", "slice4_owner", "entries"], "retirement");
+  exactKeys(retirement, ["kind", "schema_version", "status", "slice4_owner", "preactivation_closure", "entries"], "retirement");
   if (retirement.kind !== "symforge.v10_authority_retirement.v11") fail("KIND_INVALID", "retirement.kind");
   if (retirement.schema_version !== 1) fail("SCHEMA_VERSION_INVALID", "retirement.schema_version");
   validatePlanned(retirement, "retirement", false);
@@ -2225,7 +2364,10 @@ function validateRetirement(retirement, taskCatalog) {
   if (byCategory.has("prompts")) exactArray(byCategory.get("prompts").members, EXPECTED_PROMPTS, "RETIREMENT_PROMPTS_MISMATCH", "prompts");
   if (byCategory.has("compatibility_aliases")) exactArray(byCategory.get("compatibility_aliases").members, EXPECTED_COMPATIBILITY_ALIASES, "RETIREMENT_ALIASES_MISMATCH", "compatibility_aliases");
   if (byCategory.has("raw_embed")) exactArray(byCategory.get("raw_embed").members, expectedRawEmbedAtoms(), "RETIREMENT_RAW_EMBED_MISMATCH", "raw_embed");
-  if (ordinaryLifecycle === "preactivation") validateRetirementSourceInventory(retirement, ordinarySourceMap);
+  if (ordinaryLifecycle === "preactivation") {
+    validateRetirementSourceInventory(retirement, ordinarySourceMap);
+    validateRetirementClosure(retirement, ordinarySourceMap);
+  }
   if (ordinaryLifecycle === "postactivation") validatePostactivationRetirement(ordinarySourceMap, ordinaryManifest);
   const aliases = byCategory.get("compatibility_aliases");
   const expectedAliasAssertions = [
@@ -2427,7 +2569,9 @@ function validateApprovedRefreeze(evidence, retirement, releaseCommit) {
       fail("PREACTIVATION_SOURCE_ANCHOR_UNRESOLVED", anchor);
     }
   }
-  validateRetirementSourceInventory(retirement, gitRustSourceMap(commit));
+  const approvedSourceMap = gitRustSourceMap(commit);
+  validateRetirementSourceInventory(retirement, approvedSourceMap);
+  validateRetirementClosure(retirement, approvedSourceMap);
 }
 
 const ORACLE_RESULT_FIELDS = [

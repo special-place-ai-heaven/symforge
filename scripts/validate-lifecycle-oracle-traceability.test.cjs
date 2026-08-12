@@ -80,6 +80,18 @@ function mutateSentinel(root, relativePath, start, end, mutate) {
   fs.writeFileSync(file, `${text.slice(0, startAt)}${replacement}${text.slice(endAt + end.length)}`, "utf8");
 }
 
+function replaceSentinelJson(root, relativePath, start, end, json) {
+  const file = path.join(root, relativePath);
+  const text = fs.readFileSync(file, "utf8");
+  const startAt = text.indexOf(start);
+  const endAt = text.indexOf(end);
+  if (startAt === -1 || endAt === -1 || endAt <= startAt) {
+    throw new Error(`sentinel missing in ${relativePath}`);
+  }
+  const replacement = `${start}\n\`\`\`json\n${json}\n\`\`\`\n${end}`;
+  fs.writeFileSync(file, `${text.slice(0, startAt)}${replacement}${text.slice(endAt + end.length)}`, "utf8");
+}
+
 function runChecker(root, extraArgs = [], extraEnv = {}) {
   return childProcess.spawnSync(process.execPath, [checker, "--root", root, ...extraArgs], {
     cwd: repositoryRoot,
@@ -590,6 +602,43 @@ function buildPositiveMaterializedFixture(root) {
 }
 
 const cases = [
+  {
+    name: "falsy sentinel root",
+    expected: "ERROR SENTINEL_ROOT_INVALID:",
+    mutate(root) {
+      replaceSentinelJson(root, tracePath, traceStart, traceEnd, "null");
+    },
+  },
+  {
+    name: "verification obligation interval may be infinite",
+    expected: "ERROR OVERDUE_VERIFICATION_ORACLE_INVALID:",
+    mutate(root) {
+      mutateSentinel(root, acceptancePath, acceptanceStart, acceptanceEnd, (acceptance) => {
+        const oracle = acceptance.oracles.find((item) => item.oracle_id === "ORACLE-ROLLING-VERIFICATION-COVERAGE");
+        oracle.bounds = ["The verification interval may be infinite or disabled while Current remains queryable"];
+      });
+    },
+  },
+  {
+    name: "new writer in a retirement-owned source file",
+    expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    mutate(root) {
+      fs.appendFileSync(
+        path.join(root, "src/protocol/edit.rs"),
+        "\npub fn unretired_writer(path: &std::path::Path) { std::fs::write(path, b\"unretired\").unwrap(); }\n",
+        "utf8",
+      );
+    },
+  },
+  {
+    name: "amendment regression binding drifts from its executable oracle",
+    expected: "ERROR AMENDMENT_REGRESSION_BINDING_INVALID:",
+    mutate(root) {
+      const file = path.join(root, acceptancePath);
+      const text = fs.readFileSync(file, "utf8");
+      fs.writeFileSync(file, text.replace("Regression: `F020-V11-R19B`", "Regression: `F020-V11-R19C`"), "utf8");
+    },
+  },
   {
     name: "missing requirement",
     expected: "ERROR TRACE_REQUIREMENT_MISSING:",

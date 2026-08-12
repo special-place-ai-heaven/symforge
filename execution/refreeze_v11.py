@@ -25,6 +25,12 @@ DESIGN_PATH = (
     "docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md"
 )
 API_PATH = f"{FEATURE_ROOT}/contracts/public-api-v11.json"
+FIXTURE_MANIFEST_PATH = (
+    "tests/fixtures/public-api-v11-consumer/fixture-manifest.json"
+)
+COMPILE_FAIL_CASES_PATH = (
+    "tests/fixtures/public-api-v11-consumer/compile-fail/cases.json"
+)
 CONTEXT_PATH = "CONTEXT.md"
 
 MANIFEST_START = "<!-- SYMFORGE FEATURE020 REFREEZE V11 JSON START -->"
@@ -947,6 +953,172 @@ def _validate_path_hash(
     return item
 
 
+def _validate_compile_fail_cases(
+    git: GitObjects,
+    commit: str,
+) -> tuple[int, int]:
+    case_catalog = _closed_object(
+        _parse_json_bytes(git.read_blob(commit, COMPILE_FAIL_CASES_PATH)),
+        frozenset(
+            {
+                "schema_version",
+                "kind",
+                "status",
+                "materialization_rule",
+                "trait_absent_groups",
+                "impl_family_absent_groups",
+                "path_absent_groups",
+                "graph_only_assertions",
+                "expected_results_sha256",
+            }
+        ),
+        "API_COMPILE_FAIL_CASE_CATALOG_INVALID",
+    )
+    _exact(case_catalog["schema_version"], 1, "API_COMPILE_FAIL_CASE_CATALOG_INVALID")
+    _exact(
+        case_catalog["kind"],
+        "symforge.public_api_v11_compile_fail_cases",
+        "API_COMPILE_FAIL_CASE_CATALOG_INVALID",
+    )
+    _exact(
+        case_catalog["status"],
+        "pre_activation_inputs_only",
+        "API_COMPILE_FAIL_CASE_CATALOG_INVALID",
+    )
+    _exact(
+        case_catalog["materialization_rule"],
+        "Expand every subject/path in every group to an independent temporary "
+        "dependent crate; one compiler invocation per atomic case; accept a "
+        "failure only when its primary Rust diagnostic code is listed in that "
+        "group's expected_error_codes.",
+        "API_COMPILE_FAIL_MATERIALIZATION_RULE_INVALID",
+    )
+
+    atomic_probe_count = 0
+    for field, subject_field, expected_codes in (
+        ("trait_absent_groups", "subjects", ["E0277"]),
+        ("impl_family_absent_groups", "subjects", ["E0277"]),
+        ("path_absent_groups", "paths", ["E0432", "E0603"]),
+    ):
+        groups = _api_nonempty_list(
+            case_catalog[field], "API_COMPILE_FAIL_CASE_CATALOG_INVALID"
+        )
+        for group in groups:
+            if (
+                not isinstance(group, dict)
+                or group.get("expected_error_codes") != expected_codes
+            ):
+                raise RefreezeError("API_COMPILE_FAIL_EXPECTED_ERROR_CODES_INVALID")
+            subjects = group.get(subject_field)
+            if (
+                not isinstance(subjects, list)
+                or not subjects
+                or any(not isinstance(subject, str) or not subject for subject in subjects)
+            ):
+                raise RefreezeError("API_COMPILE_FAIL_CASE_CATALOG_INVALID")
+            atomic_probe_count += len(subjects)
+
+    graph_equivalence_pair_count = 0
+    graph_assertions = _api_nonempty_list(
+        case_catalog["graph_only_assertions"],
+        "API_COMPILE_FAIL_CASE_CATALOG_INVALID",
+    )
+    for assertion in graph_assertions:
+        pairs = assertion.get("pairs") if isinstance(assertion, dict) else None
+        if (
+            not isinstance(pairs, list)
+            or not pairs
+            or any(
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or any(not isinstance(item, str) or not item for item in pair)
+                for pair in pairs
+            )
+        ):
+            raise RefreezeError("API_COMPILE_FAIL_CASE_CATALOG_INVALID")
+        graph_equivalence_pair_count += len(pairs)
+    return atomic_probe_count, graph_equivalence_pair_count
+
+
+def _validate_fixture_manifest(
+    git: GitObjects,
+    commit: str,
+    *,
+    api: dict[str, object],
+    api_raw_digest: str,
+) -> None:
+    fixture_manifest = _closed_object(
+        _parse_json_bytes(git.read_blob(commit, FIXTURE_MANIFEST_PATH)),
+        frozenset(
+            {
+                "schema_version",
+                "kind",
+                "status",
+                "source_contract",
+                "coverage",
+                "closed_evidence_mapping",
+                "inputs",
+                "pre_activation_facts",
+                "limitations",
+            }
+        ),
+        "FIXTURE_MANIFEST_SHAPE_INVALID",
+    )
+    source_contract = _closed_object(
+        fixture_manifest["source_contract"],
+        frozenset({"path", "schema_version", "sha256"}),
+        "FIXTURE_MANIFEST_SOURCE_CONTRACT_INVALID",
+    )
+    if source_contract != {
+        "path": API_PATH,
+        "schema_version": 1,
+        "sha256": api_raw_digest,
+    }:
+        raise RefreezeError("FIXTURE_MANIFEST_SOURCE_CONTRACT_INVALID")
+    _exact(fixture_manifest["schema_version"], 1, "FIXTURE_MANIFEST_SHAPE_INVALID")
+    _exact(
+        fixture_manifest["kind"],
+        "symforge.public_api_v11_consumer_fixture",
+        "FIXTURE_MANIFEST_SHAPE_INVALID",
+    )
+    _exact(
+        fixture_manifest["status"],
+        "pre_activation_inputs_only",
+        "FIXTURE_MANIFEST_SHAPE_INVALID",
+    )
+    atomic_probe_count, graph_equivalence_pair_count = _validate_compile_fail_cases(
+        git,
+        commit,
+    )
+    configuration = api["configuration_domain"]
+    graph = api["expected_graph"]
+    expected_coverage = {
+        "supported_cells": len(configuration["cells"]),
+        "supported_targets": len(configuration["targets"]),
+        "supported_feature_vectors": len(configuration["feature_vectors"]),
+        "graph_projections": len(graph["graph_projections"]),
+        "public_modules": len(graph["modules"]),
+        "public_exports": len(graph["exports"]),
+        "public_items": len(graph["items"]),
+        "inherent_associated_items": sum(
+            len(item["associated_items"])
+            for item in graph["impls"]
+            if item["trait"] is None
+        ),
+        "direct_trait_impls": len(graph["trait_impls"]),
+        "negative_assertions": len(api["negative_assertions"]),
+        "atomic_compile_fail_probes": atomic_probe_count,
+        "graph_equivalence_pairs": graph_equivalence_pair_count,
+    }
+    coverage = _closed_object(
+        fixture_manifest["coverage"],
+        frozenset(expected_coverage),
+        "FIXTURE_MANIFEST_COVERAGE_INVALID",
+    )
+    if coverage != expected_coverage:
+        raise RefreezeError("FIXTURE_MANIFEST_COVERAGE_INVALID")
+
+
 def _validate_api(
     git: GitObjects, commit: str, value: object
 ) -> dict[str, object]:
@@ -1044,6 +1216,12 @@ def _validate_api(
         raise RefreezeError("API_INPUT_CORPUS_ORDER_INVALID")
     if input_corpus_role_counts != expected_input_corpus_role_counts:
         raise RefreezeError("API_INPUT_CORPUS_ROLE_CARDINALITY_INVALID")
+    _validate_fixture_manifest(
+        git,
+        commit,
+        api=api,
+        api_raw_digest=raw_digest,
+    )
     if _sha256(_canonical_json(api)) != canonical_digest:
         raise RefreezeError("API_CANONICAL_HASH_MISMATCH")
     return item
@@ -2308,7 +2486,6 @@ def _validate_api_contract(api: dict[str, object]) -> None:
     expected_introduced_v11_atoms = (
         v11_atom_universe
         - set(kept_v11_atoms)
-        - (associated_atom_paths & mapped_v11_atom_set)
     )
     if set(introduced_v11_atoms) != expected_introduced_v11_atoms:
         raise RefreezeError("API_MIGRATION_INTRODUCED_ATOMS_INVALID")
@@ -2508,9 +2685,7 @@ def _validate_mapping_references(
             git.read_blob(target_commit, path), "REGRESSION_DOCUMENT_UTF8_REQUIRED"
         )
         for path in (
-            f"{FEATURE_ROOT}/spec.md",
-            f"{FEATURE_ROOT}/tasks.md",
-            f"{FEATURE_ROOT}/quickstart.md",
+            f"{FEATURE_ROOT}/contracts/lifecycle-acceptance-oracles-v11.md",
         )
     ]
     heading_cache: dict[str, list[str]] = {}
@@ -2597,6 +2772,14 @@ def _validate_amendments(
             )
             for clause in replaced_raw
         ]
+        for clause in replaced:
+            replaced_bytes = _clause_bytes(
+                git.read_blob(baseline_commit, clause["path"]),
+                clause["start_line"],
+                clause["end_line"],
+            )
+            if replaced_bytes in git.read_blob(target_commit, clause["path"]):
+                raise RefreezeError("AMENDMENT_REPLACED_CLAUSE_STILL_PRESENT")
         replacements = [
             _validate_clause(
                 git,

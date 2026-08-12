@@ -28,20 +28,178 @@ jobs:
     outputs:
       release_ref: ${{ steps.resolve.outputs.release_ref }}
       tag_name: ${{ steps.resolve.outputs.tag_name }}
+      lifecycle_gate_active: ${{ steps.lifecycle-requirements.outputs.active }}
+      lifecycle_requirements_sha256: ${{ steps.lifecycle-requirements.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      - id: lifecycle-requirements
+        name: Validate committed Feature 020 lifecycle release requirements
+        shell: bash
+        env:
+          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          python -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          REQUIREMENTS_PATH = ".github/release-evidence-requirements-v11.json"
+          EXPECTED_FIELDS = {
+              "kind",
+              "phase",
+              "required_oracle_receipts",
+              "required_review_documents",
+              "required_task_receipts",
+              "schema_version",
+          }
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+          def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("lifecycle release requirements contain a duplicate key")
+                  result[key] = value
+              return result
+
+          def reject_json_constant(_: str) -> object:
+              fail("lifecycle release requirements contain a non-finite number")
+
+          workflow_commit = os.environ["WORKFLOW_COMMIT"]
+          if not re.fullmatch(r"[0-9a-f]{40}", workflow_commit):
+              fail("the executing workflow commit is unavailable or malformed")
+          environment = {
+              key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+          }
+          environment.update(
+              {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+          )
+
+          def git(*arguments: str) -> bytes:
+              completed = subprocess.run(
+                  ["git", *arguments],
+                  env=environment,
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  shell=False,
+                  check=False,
+              )
+              if completed.returncode != 0:
+                  fail("cannot read the committed lifecycle release requirements")
+              return completed.stdout
+
+          if git("rev-parse", "--verify", f"{workflow_commit}^{{commit}}") != (
+              workflow_commit + "\n"
+          ).encode("ascii"):
+              fail("the executing workflow commit is not canonical")
+          tree_entry = git("ls-tree", "-z", workflow_commit, "--", REQUIREMENTS_PATH)
+          expected_entry = re.compile(
+              rb"100644 blob [0-9a-f]{40}\t"
+              + re.escape(REQUIREMENTS_PATH.encode("ascii"))
+              + rb"\x00"
+          )
+          if expected_entry.fullmatch(tree_entry) is None:
+              fail("the lifecycle release requirements are absent or not a regular file")
+          blob = git("cat-file", "blob", f"{workflow_commit}:{REQUIREMENTS_PATH}")
+          try:
+              requirements = json.loads(
+                  blob.decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_pairs,
+                  parse_constant=reject_json_constant,
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+              raise SystemExit("lifecycle release requirements are not strict UTF-8 JSON") from error
+          if (
+              not isinstance(requirements, dict)
+              or set(requirements) != EXPECTED_FIELDS
+              or requirements.get("kind")
+              != "symforge.lifecycle_release_evidence_requirements.v11"
+              or not isinstance(requirements.get("schema_version"), int)
+              or isinstance(requirements.get("schema_version"), bool)
+              or requirements.get("schema_version") != 1
+              or requirements.get("phase") not in ("pre_activation", "active")
+          ):
+              fail("lifecycle release requirements have an invalid closed schema")
+
+          def validate_paths(name: str, pattern: str) -> list[str]:
+              values = requirements.get(name)
+              if (
+                  not isinstance(values, list)
+                  or any(not isinstance(value, str) for value in values)
+                  or values != sorted(values)
+                  or len(values) != len(set(values))
+                  or any(re.fullmatch(pattern, value) is None for value in values)
+              ):
+                  fail(f"{name} is not a sorted, unique, closed path set")
+              return values
+
+          oracle_receipts = validate_paths(
+              "required_oracle_receipts",
+              r"target/ci/lifecycle-v11/[a-z0-9][a-z0-9._-]*\.json",
+          )
+          review_documents = validate_paths(
+              "required_review_documents",
+              r"docs/reviews/[A-Za-z0-9][A-Za-z0-9._-]*\.md",
+          )
+          task_receipts = validate_paths(
+              "required_task_receipts",
+              r"target/ci/lifecycle-v11/task-T[0-9]{3}\.json",
+          )
+          if set(oracle_receipts) & set(task_receipts):
+              fail("lifecycle receipt categories overlap")
+          reserved_receipts = {
+              "target/ci/lifecycle-v11/refreeze-approval-result.json",
+              "target/ci/lifecycle-v11/release-evidence.json",
+              "target/ci/lifecycle-v11/task-T089.json",
+          }
+          if reserved_receipts & (set(oracle_receipts) | set(task_receipts)):
+              fail("pre-approval requirements contain causally premature evidence")
+          phase = requirements["phase"]
+          declared_sets = (oracle_receipts, review_documents, task_receipts)
+          if phase == "pre_activation" and any(declared_sets):
+              fail("pre-activation lifecycle requirements must declare zero evidence")
+          if phase == "active" and not all(declared_sets):
+              fail("active lifecycle requirements must declare every closed evidence set")
+          if phase == "active" and review_documents != [
+              "docs/reviews/FEATURE-020-V11-RELEASE-GATE.md"
+          ]:
+              fail("active lifecycle requirements do not close the release-gate review")
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8", newline="\n") as handle:
+              handle.write(f"active={'true' if phase == 'active' else 'false'}\n")
+              handle.write(f"sha256={hashlib.sha256(blob).hexdigest()}\n")
+          PY
+
       - id: resolve
         name: Resolve immutable release candidate
         shell: bash
         env:
           MANUAL_TAG: ${{ inputs.tag }}
+          WORKFLOW_EVENT: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           git fetch --tags --force
+          git fetch --no-tags --force origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+
+          if [[ "$WORKFLOW_EVENT" == "workflow_dispatch" \
+              && "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            echo "::error::Manual release dispatch must run from refs/heads/main."
+            exit 1
+          fi
 
           CANONICAL_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
           if [[ -n "$MANUAL_TAG" ]]; then
@@ -53,6 +211,10 @@ jobs:
               echo "::error::Manual rebuild tag does not resolve to a commit."
               exit 1
             }
+            if ! git merge-base --is-ancestor "$RELEASE_REF" "refs/remotes/origin/main"; then
+              echo "::error::Manual rebuild tag is not reachable from origin/main."
+              exit 1
+            fi
             echo "tag_name=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
           else
             RELEASE_REF="$(git rev-parse --verify --end-of-options "${GITHUB_SHA}^{commit}" 2>/dev/null)" || {
@@ -97,9 +259,11 @@ jobs:
         run: python -m unittest discover -s execution -p 'test_*.py'
 
       - name: Verify Feature 020 V11 refreeze integrity
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
         run: python execution/refreeze_v11.py verify-internal --target-ref HEAD
 
       - name: Test and verify Feature 020 V11 lifecycle traceability
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
         run: |
           node scripts/validate-lifecycle-oracle-traceability.test.cjs
           node scripts/validate-lifecycle-oracle-traceability.cjs
@@ -156,20 +320,62 @@ jobs:
       # absent here: it can only be assembled after the external approval below
       # has actually been verified against the approved ancestor.
       - name: Require code-owned Feature 020 V11 pre-approval evidence
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
         shell: bash
+        env:
+          EXPECTED_REQUIREMENTS_SHA256: ${{ needs.resolve-release-ref.outputs.lifecycle_requirements_sha256 }}
         run: |
           set -euo pipefail
           python -I - <<'PY'
+          import hashlib
+          import json
           import os
           import sys
           from pathlib import Path
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
           bundle = workspace / "target/ci/lifecycle-v11"
+          requirements_path = workspace / ".github/release-evidence-requirements-v11.json"
 
           def fail(message: str) -> None:
               print(f"::error::{message}", file=sys.stderr)
               raise SystemExit(1)
+
+          def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("The lifecycle release requirements contain a duplicate key.")
+                  result[key] = value
+              return result
+
+          if not requirements_path.is_file() or requirements_path.is_symlink():
+              fail("The lifecycle release requirements are unavailable or unsafe.")
+          requirements_bytes = requirements_path.read_bytes()
+          if (
+              hashlib.sha256(requirements_bytes).hexdigest()
+              != os.environ["EXPECTED_REQUIREMENTS_SHA256"]
+          ):
+              fail("The lifecycle release requirements differ from the executing workflow.")
+          try:
+              requirements = json.loads(
+                  requirements_bytes.decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_pairs,
+                  parse_constant=lambda _: fail(
+                      "The lifecycle release requirements contain a non-finite number."
+                  ),
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+              raise SystemExit(
+                  "The lifecycle release requirements are not strict UTF-8 JSON."
+              ) from error
+          if not isinstance(requirements, dict) or requirements.get("phase") != "active":
+              fail("The lifecycle release requirements are not active.")
+          task_receipts = requirements.get("required_task_receipts")
+          oracle_receipts = requirements.get("required_oracle_receipts")
+          if not isinstance(task_receipts, list) or not isinstance(oracle_receipts, list):
+              fail("The lifecycle release receipt sets are malformed.")
+          expected_files = set(task_receipts) | set(oracle_receipts)
 
           if not bundle.is_dir() or bundle.is_symlink() or bundle.resolve() != bundle:
               fail("The code-owned pre-approval evidence directory is unavailable or unsafe.")
@@ -180,10 +386,13 @@ jobs:
               if path.is_symlink():
                   fail("The code-owned pre-approval evidence bundle contains a symbolic link.")
 
-          for task_id in range(78, 89):
-              receipt = bundle / f"task-T{task_id:03d}.json"
-              if not receipt.is_file() or receipt.is_symlink():
-                  fail(f"The code-owned T{task_id:03d} result is unavailable.")
+          actual_files = {
+              path.relative_to(workspace).as_posix()
+              for path in bundle.rglob("*")
+              if path.is_file()
+          }
+          if actual_files != expected_files:
+              fail("The code-owned pre-approval evidence does not match the closed requirements.")
 
           for name in (
               "refreeze-approval-result.json",
@@ -196,6 +405,7 @@ jobs:
           PY
 
       - name: Upload code-owned Feature 020 V11 pre-approval evidence
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: feature-020-v11-preapproval-evidence
@@ -203,10 +413,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  gate-release-ref:
+  feature-020-v11-gate:
     needs:
       - resolve-release-ref
       - verify-release-ref
+    if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
     runs-on: ubuntu-latest
     environment: feature-020-v11-release-approval
     permissions:
@@ -300,20 +511,58 @@ jobs:
       - name: Revalidate the downloaded pre-approval evidence boundary
         shell: bash
         env:
+          EXPECTED_REQUIREMENTS_SHA256: ${{ needs.resolve-release-ref.outputs.lifecycle_requirements_sha256 }}
           TRUSTED_PYTHON: ${{ steps.trusted-tools.outputs.python }}
         run: |
           set -euo pipefail
           "$TRUSTED_PYTHON" -I - <<'PY'
+          import hashlib
+          import json
           import os
           import sys
           from pathlib import Path
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
           bundle = workspace / "target/ci/lifecycle-v11"
+          requirements_path = workspace / ".github/release-evidence-requirements-v11.json"
 
           def fail(message: str) -> None:
               print(f"::error::{message}", file=sys.stderr)
               raise SystemExit(1)
+
+          def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("Downloaded requirements contain a duplicate key.")
+                  result[key] = value
+              return result
+
+          if not requirements_path.is_file() or requirements_path.is_symlink():
+              fail("The lifecycle release requirements are unavailable or unsafe.")
+          requirements_bytes = requirements_path.read_bytes()
+          if (
+              hashlib.sha256(requirements_bytes).hexdigest()
+              != os.environ["EXPECTED_REQUIREMENTS_SHA256"]
+          ):
+              fail("The lifecycle release requirements differ from the executing workflow.")
+          try:
+              requirements = json.loads(
+                  requirements_bytes.decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_pairs,
+                  parse_constant=lambda _: fail(
+                      "Downloaded requirements contain a non-finite number."
+                  ),
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+              raise SystemExit("Downloaded requirements are not strict UTF-8 JSON.") from error
+          if not isinstance(requirements, dict) or requirements.get("phase") != "active":
+              fail("The lifecycle release requirements are not active.")
+          task_receipts = requirements.get("required_task_receipts")
+          oracle_receipts = requirements.get("required_oracle_receipts")
+          if not isinstance(task_receipts, list) or not isinstance(oracle_receipts, list):
+              fail("The lifecycle release receipt sets are malformed.")
+          expected_files = set(task_receipts) | set(oracle_receipts)
 
           if not bundle.is_dir() or bundle.is_symlink() or bundle.resolve() != bundle:
               fail("The downloaded pre-approval evidence directory is unavailable or unsafe.")
@@ -323,10 +572,13 @@ jobs:
           for path in bundle.rglob("*"):
               if path.is_symlink():
                   fail("The downloaded pre-approval evidence contains a symbolic link.")
-          for task_id in range(78, 89):
-              receipt = bundle / f"task-T{task_id:03d}.json"
-              if not receipt.is_file() or receipt.is_symlink():
-                  fail(f"The downloaded T{task_id:03d} result is unavailable.")
+          actual_files = {
+              path.relative_to(workspace).as_posix()
+              for path in bundle.rglob("*")
+              if path.is_file()
+          }
+          if actual_files != expected_files:
+              fail("Downloaded evidence does not match the closed requirements.")
           for name in (
               "refreeze-approval-result.json",
               "task-T089.json",
@@ -600,10 +852,12 @@ jobs:
           fi
 
           FROZEN_PATHS=(
+            .github/release-evidence-requirements-v11.json
             .github/workflows/ci.yml
             .github/workflows/release.yml
             CONTEXT.md
             docs/reviews/FEATURE-020-REFREEZE-ATTESTATION-v11.md
+            docs/reviews/FEATURE-020-V11-RELEASE-GATE.md
             docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md
             execution/refreeze_v11.py
             execution/test_refreeze_v11.py
@@ -908,7 +1162,8 @@ jobs:
           CHECKER_PATH = "scripts/validate-lifecycle-oracle-traceability.cjs"
           WORKFLOW_PATH = ".github/workflows/release.yml"
           VERIFIER_PATH = "execution/refreeze_v11.py"
-          REVIEW_PATH = "docs/reviews/FEATURE-020-V11-RELEASE-GATE.md"
+          REQUIREMENTS_PATH = ".github/release-evidence-requirements-v11.json"
+          RELEASE_GATE_REVIEW_PATH = "docs/reviews/FEATURE-020-V11-RELEASE-GATE.md"
           APPROVAL_PATH = "target/ci/lifecycle-v11/refreeze-approval-result.json"
           TASK_PATH = "target/ci/lifecycle-v11/task-T089.json"
           EVIDENCE_PATH = "target/ci/lifecycle-v11/release-evidence.json"
@@ -1117,6 +1372,72 @@ jobs:
           release_tree = git_text(["rev-parse", "--verify", "HEAD^{tree}"])
           if release_commit != expected_release:
               fail("the finalizer is not running at the gated release commit")
+          requirements = parse_json_bytes(
+              pinned_blob(release_commit, REQUIREMENTS_PATH),
+              "lifecycle release requirements",
+          )
+          requirements_fields = {
+              "kind",
+              "phase",
+              "required_oracle_receipts",
+              "required_review_documents",
+              "required_task_receipts",
+              "schema_version",
+          }
+          if (
+              not isinstance(requirements, dict)
+              or set(requirements) != requirements_fields
+              or requirements.get("kind")
+              != "symforge.lifecycle_release_evidence_requirements.v11"
+              or not isinstance(requirements.get("schema_version"), int)
+              or isinstance(requirements.get("schema_version"), bool)
+              or requirements.get("schema_version") != 1
+              or requirements.get("phase") != "active"
+          ):
+              fail("the lifecycle release requirements are not an active closed schema")
+
+          def closed_paths(name: str, pattern: str) -> list[str]:
+              values = requirements.get(name)
+              if (
+                  not isinstance(values, list)
+                  or not values
+                  or any(not isinstance(value, str) for value in values)
+                  or values != sorted(values)
+                  or len(values) != len(set(values))
+                  or any(re.fullmatch(pattern, value) is None for value in values)
+              ):
+                  fail(f"the active {name} set is not closed")
+              return values
+
+          required_oracle_receipts = closed_paths(
+              "required_oracle_receipts",
+              r"target/ci/lifecycle-v11/[a-z0-9][a-z0-9._-]*\.json",
+          )
+          required_review_documents = closed_paths(
+              "required_review_documents",
+              r"docs/reviews/[A-Za-z0-9][A-Za-z0-9._-]*\.md",
+          )
+          if required_review_documents != [RELEASE_GATE_REVIEW_PATH]:
+              fail("the active review set does not close the release-gate review")
+          required_task_receipts = closed_paths(
+              "required_task_receipts",
+              r"target/ci/lifecycle-v11/task-T[0-9]{3}\.json",
+          )
+          expected_task_receipts = [
+              f"target/ci/lifecycle-v11/task-T{task_number:03d}.json"
+              for task_number in range(78, 89)
+          ]
+          if required_task_receipts != expected_task_receipts:
+              fail("the active task receipt set does not close T078 through T088")
+          expected_initial_files = {
+              value.removeprefix("target/ci/lifecycle-v11/")
+              for value in (*required_task_receipts, *required_oracle_receipts)
+          }
+          expected_initial_files.add(
+              APPROVAL_PATH.removeprefix("target/ci/lifecycle-v11/")
+          )
+          if initial_files != expected_initial_files:
+              fail("the T089 input bundle differs from the active closed requirements")
           approved_commit = git_text(["rev-parse", "--verify", f"{expected_approved}^{{commit}}"])
           approved_tree = git_text(["rev-parse", "--verify", f"{expected_approved}^{{tree}}"])
           if approved_commit != expected_approved or approved_tree != expected_approved_tree:
@@ -1260,6 +1581,8 @@ jobs:
               mapped.sort()
               if not mapped:
                   fail("a frozen requirement has no acceptance oracle")
+          if sorted(artifact_paths) != required_oracle_receipts:
+              fail("the active oracle receipt set differs from the frozen acceptance contract")
 
           requirement_receipts = [
               {
@@ -1363,14 +1686,17 @@ jobs:
           )
           if len(declarations) != 1:
               fail("the frozen T089 task declaration is not exact")
-          review_blob = pinned_blob(release_commit, REVIEW_PATH)
+          review_results = [
+              {
+                  "path": review_path,
+                  "sha256": sha256_bytes(pinned_blob(release_commit, review_path)),
+                  "status": "passed",
+              }
+              for review_path in required_review_documents
+          ]
           task_result = {
               "artifact_results": [
-                  {
-                      "path": REVIEW_PATH,
-                      "sha256": sha256_bytes(review_blob),
-                      "status": "passed",
-                  },
+                  *review_results,
                   {
                       "path": APPROVAL_PATH,
                       "sha256": expected_approval_sha256,
@@ -1399,9 +1725,14 @@ jobs:
           atomic_create(TASK_PATH, task_payload)
 
           task_receipts = []
-          for task_number in range(78, 90):
-              task_id = f"T{task_number:03d}"
-              artifact = f"target/ci/lifecycle-v11/task-{task_id}.json"
+          for artifact in (*required_task_receipts, TASK_PATH):
+              match = re.fullmatch(
+                  r"target/ci/lifecycle-v11/task-(T[0-9]{3})\.json",
+                  artifact,
+              )
+              if match is None:
+                  fail("a task receipt path is malformed")
+              task_id = match.group(1)
               task_receipts.append(
                   {
                       "artifact": artifact,
@@ -1446,7 +1777,7 @@ jobs:
               for path in bundle.rglob("*")
               if path.is_file()
           }
-          if final_files - initial_files != {"task-T089.json", "release-evidence.json"}:
+          if final_files != initial_files | {"task-T089.json", "release-evidence.json"}:
               fail("the inline T089 finalizer wrote outside its exact allowlist")
           for arguments in (
               ["diff", "--quiet", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
@@ -1462,9 +1793,7 @@ jobs:
           ):
               if run_git(arguments, allowed_codes=(0, 1)).returncode != 0:
                   fail("the release worktree changed during T089")
-          untracked = run_git(
-              ["ls-files", "--others", "--exclude-standard", "-z"]
-          ).stdout
+          untracked = run_git(["ls-files", "--others", "-z"]).stdout
           for entry in untracked.split(b"\0"):
               if not entry:
                   continue
@@ -1472,7 +1801,7 @@ jobs:
                   value = entry.decode("utf-8")
               except UnicodeDecodeError as error:
                   raise SystemExit("an untracked release path is not UTF-8") from error
-              if not value.startswith("target/ci/lifecycle-v11/"):
+              if not value.startswith("target/"):
                   fail("the release worktree has an unexpected untracked path")
           if (
               pinned_blob(release_commit, CHECKER_PATH) != checker_blob
@@ -1563,6 +1892,54 @@ jobs:
           path: target/ci/lifecycle-v11/
           if-no-files-found: error
           retention-days: 90
+
+  gate-release-ref:
+    needs:
+      - resolve-release-ref
+      - verify-release-ref
+      - feature-020-v11-gate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.gate.outputs.release_ref }}
+    steps:
+      - id: gate
+        name: Select the phase-appropriate release gate result
+        shell: bash
+        env:
+          FEATURE_GATE_RESULT: ${{ needs.feature-020-v11-gate.result }}
+          LIFECYCLE_GATE_ACTIVE: ${{ needs.resolve-release-ref.outputs.lifecycle_gate_active }}
+          RELEASE_REF: ${{ needs.resolve-release-ref.outputs.release_ref }}
+          VERIFY_RESULT: ${{ needs.verify-release-ref.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$VERIFY_RESULT" != "success" ]]; then
+            echo "::error::Release verification did not succeed."
+            exit 1
+          fi
+          case "$LIFECYCLE_GATE_ACTIVE" in
+            true)
+              if [[ "$FEATURE_GATE_RESULT" != "success" ]]; then
+                echo "::error::The active Feature 020 lifecycle release gate did not succeed."
+                exit 1
+              fi
+              ;;
+            false)
+              if [[ "$FEATURE_GATE_RESULT" != "skipped" ]]; then
+                echo "::error::The pre-activation Feature 020 lifecycle gate unexpectedly ran."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::The Feature 020 lifecycle gate phase is unavailable."
+              exit 1
+              ;;
+          esac
+          if [[ ! "$RELEASE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The phase-selected release commit is malformed."
+            exit 1
+          fi
+          echo "release_ref=$RELEASE_REF" >> "$GITHUB_OUTPUT"
 
   prepare-release:
     needs:
@@ -2036,6 +2413,7 @@ jobs:
       - upload-release-assets
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
+    environment: cargo-publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

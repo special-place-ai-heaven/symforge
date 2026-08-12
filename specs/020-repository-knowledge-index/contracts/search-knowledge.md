@@ -46,11 +46,13 @@ source-scope values implemented by its capability version; requesting an
 unavailable P1 scope is an explicit unsupported-scope error, never a complete
 no-evidence response.
 
-`authority_scope=default` includes current, intent, needs-review, and unknown units
-with exact labels; it excludes history-only/suppressed units. `current` excludes
-intent/history but keeps needs-review/unknown labeled so unclassified repositories
-do not become falsely silent. `intent` and `history` select those voices. `all`
-returns every security-permitted unit without promoting its authority.
+Every `authority_scope` value filters knowledge voice only; none selects or proves a
+lifecycle generation. `default` includes current, intent, needs-review, and unknown
+units with exact labels while excluding history-only/suppressed units. `current`
+excludes intent/history but keeps needs-review/unknown labeled so unclassified
+repositories do not become falsely silent. `intent` and `history` select only their
+named voices. `all` returns every security-permitted unit without promoting its
+authority.
 
 ## V11 lifecycle acquisition
 

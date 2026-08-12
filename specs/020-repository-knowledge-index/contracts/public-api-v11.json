@@ -270,7 +270,7 @@
         {
           "path": "tests/fixtures/public-api-v11-consumer/compile-fail/cases.json",
           "role": "compile-fail-case-catalog",
-          "sha256": "f955c1aba0e81644ec93d2f1250b0b2a2d7a5db7a669f276e84166db862f7d81"
+          "sha256": "befd16c4f9f34d141aa0d7881ae092383be501c935bdc86a82fb185324cc081c"
         },
         {
           "path": "tests/fixtures/public-api-v11-consumer/compile-fail/src/lib.rs",
@@ -3343,6 +3343,7 @@
       "symforge::embed::ClaimProvenance::kind_name",
       "symforge::embed::EmbeddedSourceHandle",
       "symforge::embed::EmbeddedSourceHandle::begin_close",
+      "symforge::embed::EmbeddedSourceHandle::request_refresh",
       "symforge::embed::EmbeddedSourceHandle::runtime_view",
       "symforge::embed::EmbeddedSourceHandle::search_symbols",
       "symforge::embed::EmbeddedSourceHandle::search_text",

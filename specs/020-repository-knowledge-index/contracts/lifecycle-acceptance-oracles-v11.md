@@ -459,19 +459,19 @@ assertions verbatim.
       "oracle_id": "ORACLE-ROLLING-VERIFICATION-COVERAGE",
       "category": "rolling_verification",
       "trace_test_id": "TEST-ROLLING-VERIFICATION",
-      "requirement_ids": ["FR-011", "FR-031", "FR-039", "FR-052", "SC-003", "SC-004", "SC-009"],
-      "implementation_tasks": ["T055", "T062", "T065"],
+      "requirement_ids": ["FR-011", "FR-031", "FR-039", "FR-049", "FR-052", "SC-003", "SC-004", "SC-009"],
+      "implementation_tasks": ["T055", "T062", "T063", "T065"],
       "target_slice": 4,
       "test": "tests/rolling_verification_v11.rs::rolling_passes_are_fair_resumable_and_fenced",
       "command": "cargo test --test rolling_verification_v11 rolling_passes_are_fair_resumable_and_fenced -- --exact",
       "production_seams": ["src/index_lifecycle/observer.rs::ObserverHealth", "src/index_lifecycle/verification.rs::RollingVerification", "src/index_lifecycle/verification.rs::VerificationRecord"],
-      "preconditions": ["A Current root, deterministic rolling cursor, observer health, and independently corruptible scopes exist"],
-      "actions": ["Advance, cancel, resume, and restart rolling verification", "Inject source drift, corruption, observer gaps, publication replacement, and snapshot quarantine at each cursor boundary"],
-      "assertions": ["Coverage records exactly the scopes and generation actually checked", "Any mismatch or observer uncertainty revokes Current before further strict answers", "Resume never skips unverified work or attaches an old cursor to a new incarnation"],
-      "positive_control": "A stable complete Current root eventually records full rolling coverage.",
-      "negative_controls": ["A corrupted or changed scope prevents a complete verification record", "A cursor from a prior root, project, or source incarnation is rejected"],
-      "bounds": ["The fixture scopes, cursor states, and injected failures are finite"],
-      "fairness": ["A continuously Current root eventually receives every bounded verification slice"],
+      "preconditions": ["A Current root carries a complete VerificationRecord and a monotonic verification_deadline exactly 15 minutes after that record completed", "The monotonic clock, rolling cursor, observer health, strict-lease linearization, and independently corruptible scopes are controllable"],
+      "actions": ["Advance rolling verification through partial, cancelled, resumed, restarted, and complete whole-declared-scope passes", "Pause strict acquisition immediately before, exactly at, and after verification_deadline", "Inject source drift, corruption, observer gaps, publication replacement, and snapshot quarantine at each cursor boundary"],
+      "assertions": ["Coverage records exactly the scopes and generation actually checked", "Only a complete whole-declared-scope VerificationRecord bound to the exact project slot, source slot, generation digest, observer cut, policy version, and declared scope advances verification_deadline", "Partial progress, cancellation, retry, cursor resume, persistence, and restart never extend or reconstruct verification_deadline", "At or after verification_deadline without a newer exact-bound complete record, VerificationOverdueLatched becomes non-Current before any strict lease linearizes and returns SourceRefusal", "Any mismatch or observer uncertainty revokes Current before further strict answers", "Resume never skips unverified work or attaches an old cursor to a new incarnation"],
+      "positive_control": "A complete exact-bound pass before the deadline publishes its VerificationRecord and advances the next deadline by exactly 15 minutes.",
+      "negative_controls": ["An infinite, disabled, reconstructed, or partial-progress-extended deadline is rejected", "A strict lease at or after an unmet deadline is refused even when retained bytes remain readable", "A corrupted or changed scope prevents a complete verification record", "A cursor from a prior root, project, or source incarnation is rejected"],
+      "bounds": ["MAX_CURRENT_UNVERIFIED_AGE is exactly 15 minutes and cannot be infinite, disabled, or configured upward", "The fixture scopes, cursor states, clock cuts, and injected failures are finite"],
+      "fairness": ["A continuously Current root receives every bounded verification slice before its fixed deadline or becomes synchronously non-Current", "An overdue source cannot starve its fresh complete re-verification behind new strict leases"],
       "ci_artifact": "target/ci/lifecycle-v11/slice-4-rolling-verification.json",
       "status": "planned_not_executed",
       "executed": false
@@ -522,3 +522,31 @@ assertions verbatim.
 }
 ```
 <!-- SYMFORGE LIFECYCLE ACCEPTANCE ORACLES V11 JSON END -->
+
+## V11 amendment regression bindings
+
+Each amendment regression is bound to one existing acceptance oracle and its exact
+executable case. The checker rejects missing, duplicate, unknown, or drifted bindings.
+
+- Regression: `F020-V11-R01` — `ORACLE-VERIFICATION-COMPLETE-CANDIDATE`; test `tests/index_candidate_lifecycle_v11.rs::closed_candidate_promotion_matrix`; command `cargo test --test index_candidate_lifecycle_v11 closed_candidate_promotion_matrix -- --exact`.
+- Regression: `F020-V11-R02` — `ORACLE-SNAPSHOT-UNTRUSTED-SEED`; test `tests/snapshot_v11_migration.rs::snapshot_seed_requires_complete_current_proof`; command `cargo test --test snapshot_v11_migration snapshot_seed_requires_complete_current_proof -- --exact`.
+- Regression: `F020-V11-R03` — `ORACLE-INGRESS-CLOSED-SURFACE`; test `tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch`; command `cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact`.
+- Regression: `F020-V11-R04` — `ORACLE-VERIFICATION-COMPLETE-CANDIDATE`; test `tests/index_candidate_lifecycle_v11.rs::closed_candidate_promotion_matrix`; command `cargo test --test index_candidate_lifecycle_v11 closed_candidate_promotion_matrix -- --exact`.
+- Regression: `F020-V11-R05` — `ORACLE-VERIFICATION-COMPLETE-CANDIDATE`; test `tests/index_candidate_lifecycle_v11.rs::closed_candidate_promotion_matrix`; command `cargo test --test index_candidate_lifecycle_v11 closed_candidate_promotion_matrix -- --exact`.
+- Regression: `F020-V11-R06` — `ORACLE-VERIFICATION-COMPLETE-CANDIDATE`; test `tests/index_candidate_lifecycle_v11.rs::closed_candidate_promotion_matrix`; command `cargo test --test index_candidate_lifecycle_v11 closed_candidate_promotion_matrix -- --exact`.
+- Regression: `F020-V11-R07` — `ORACLE-VERIFICATION-COMPLETE-CANDIDATE`; test `tests/index_candidate_lifecycle_v11.rs::closed_candidate_promotion_matrix`; command `cargo test --test index_candidate_lifecycle_v11 closed_candidate_promotion_matrix -- --exact`.
+- Regression: `F020-V11-R08` — `ORACLE-HEALTH-COMMITTED-VS-ATTEMPT`; test `tests/project_query_lease_v11.rs::committed_generation_and_attempt_health_are_separate`; command `cargo test --test project_query_lease_v11 committed_generation_and_attempt_health_are_separate -- --exact`.
+- Regression: `F020-V11-R09` — `ORACLE-VERIFICATION-COMPLETE-CANDIDATE`; test `tests/index_candidate_lifecycle_v11.rs::closed_candidate_promotion_matrix`; command `cargo test --test index_candidate_lifecycle_v11 closed_candidate_promotion_matrix -- --exact`.
+- Regression: `F020-V11-R10` — `ORACLE-KNOWLEDGE-CURRENT-PROJECTION`; test `tests/delta_full_rebuild_equivalence_v11.rs::knowledge_artifacts_match_clean_full_rebuild`; command `cargo test --test delta_full_rebuild_equivalence_v11 knowledge_artifacts_match_clean_full_rebuild -- --exact`.
+- Regression: `F020-V11-R11` — `ORACLE-KNOWLEDGE-CURRENT-PROJECTION`; test `tests/delta_full_rebuild_equivalence_v11.rs::knowledge_artifacts_match_clean_full_rebuild`; command `cargo test --test delta_full_rebuild_equivalence_v11 knowledge_artifacts_match_clean_full_rebuild -- --exact`.
+- Regression: `F020-V11-R12` — `ORACLE-REGISTRY-IDENTITY-ABA`; test `tests/project_registry_lifecycle_v11.rs::protected_membership_and_state_placement`; command `cargo test --test project_registry_lifecycle_v11 protected_membership_and_state_placement -- --exact`.
+- Regression: `F020-V11-R13` — `ORACLE-QUERY-ATOMIC-LEASE`; test `tests/project_query_lease_v11.rs::strict_selection_is_atomic_and_complete`; command `cargo test --test project_query_lease_v11 strict_selection_is_atomic_and_complete -- --exact`.
+- Regression: `F020-V11-R14` — `ORACLE-KNOWLEDGE-CURRENT-PROJECTION`; test `tests/delta_full_rebuild_equivalence_v11.rs::knowledge_artifacts_match_clean_full_rebuild`; command `cargo test --test delta_full_rebuild_equivalence_v11 knowledge_artifacts_match_clean_full_rebuild -- --exact`.
+- Regression: `F020-V11-R15` — `ORACLE-VERIFICATION-COMPLETE-CANDIDATE`; test `tests/index_candidate_lifecycle_v11.rs::closed_candidate_promotion_matrix`; command `cargo test --test index_candidate_lifecycle_v11 closed_candidate_promotion_matrix -- --exact`.
+- Regression: `F020-V11-R16` — `ORACLE-HEALTH-COMMITTED-VS-ATTEMPT`; test `tests/project_query_lease_v11.rs::committed_generation_and_attempt_health_are_separate`; command `cargo test --test project_query_lease_v11 committed_generation_and_attempt_health_are_separate -- --exact`.
+- Regression: `F020-V11-R17` — `ORACLE-ROLLING-VERIFICATION-COVERAGE`; test `tests/rolling_verification_v11.rs::rolling_passes_are_fair_resumable_and_fenced`; command `cargo test --test rolling_verification_v11 rolling_passes_are_fair_resumable_and_fenced -- --exact`.
+- Regression: `F020-V11-R18A` — `ORACLE-MIGRATION-DELTA-EQUIVALENCE`; test `tests/delta_full_rebuild_equivalence_v11.rs::every_edit_matches_clean_full_rebuild`; command `cargo test --test delta_full_rebuild_equivalence_v11 every_edit_matches_clean_full_rebuild -- --exact`.
+- Regression: `F020-V11-R18B` — `ORACLE-PERFORMANCE-OBSERVED-REFRESH`; test `benches/observed_refresh_gate_v1.rs::observed_refresh_gate_v1`; command `cargo bench --bench observed_refresh_gate_v1 -- observed_refresh_gate_v1`.
+- Regression: `F020-V11-R18C` — `ORACLE-CAPACITY-RUNTIME-INTEGRATION`; test `tests/process_capacity_pool_v11.rs::whole_runtime_capacity_is_conserved_under_activation`; command `cargo test --test process_capacity_pool_v11 whole_runtime_capacity_is_conserved_under_activation -- --exact`.
+- Regression: `F020-V11-R19A` — `ORACLE-QUERY-ATOMIC-LEASE`; test `tests/project_query_lease_v11.rs::strict_selection_is_atomic_and_complete`; command `cargo test --test project_query_lease_v11 strict_selection_is_atomic_and_complete -- --exact`.
+- Regression: `F020-V11-R19B` — `ORACLE-KNOWLEDGE-CURRENT-PROJECTION`; test `tests/delta_full_rebuild_equivalence_v11.rs::knowledge_artifacts_match_clean_full_rebuild`; command `cargo test --test delta_full_rebuild_equivalence_v11 knowledge_artifacts_match_clean_full_rebuild -- --exact`.

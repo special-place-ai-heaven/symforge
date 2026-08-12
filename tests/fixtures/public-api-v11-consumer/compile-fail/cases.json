@@ -2,13 +2,14 @@
   "schema_version": 1,
   "kind": "symforge.public_api_v11_compile_fail_cases",
   "status": "pre_activation_inputs_only",
-  "materialization_rule": "Expand every subject/path in every group to an independent temporary dependent crate; one compiler invocation per atomic case.",
+  "materialization_rule": "Expand every subject/path in every group to an independent temporary dependent crate; one compiler invocation per atomic case; accept a failure only when its primary Rust diagnostic code is listed in that group's expected_error_codes.",
   "trait_absent_groups": [
     {
       "assertion_id": "authority-types-01-not-deserialize",
       "template": "templates/trait_absent.rs.in",
       "feature_vector": "embed",
       "bound": "for<'de> serde::Deserialize<'de>",
+      "expected_error_codes": ["E0277"],
       "probe_completeness": "non_exhaustive",
       "exhaustive_evidence": "public_item_graph",
       "subjects": [
@@ -25,6 +26,7 @@
       "template": "templates/trait_absent.rs.in",
       "feature_vector": "embed",
       "bound": "core::default::Default",
+      "expected_error_codes": ["E0277"],
       "subjects": [
         "symforge::embed::AtomicAuthority",
         "symforge::embed::Claim<()>",
@@ -39,6 +41,7 @@
       "template": "templates/trait_absent.rs.in",
       "feature_vector": "embed",
       "bound": "core::clone::Clone",
+      "expected_error_codes": ["E0277"],
       "subjects": [
         "symforge::embed::EmbeddedSourceHandle"
       ]
@@ -48,6 +51,7 @@
       "template": "templates/trait_absent.rs.in",
       "feature_vector": "embed",
       "bound": "std::panic::RefUnwindSafe",
+      "expected_error_codes": ["E0277"],
       "subjects": [
         "symforge::embed::EmbeddedSourceHandle",
         "symforge::embed::ProcessIndexRuntime",
@@ -61,6 +65,7 @@
       "template": "templates/trait_absent.rs.in",
       "feature_vector": "embed",
       "bound": "std::panic::UnwindSafe",
+      "expected_error_codes": ["E0277"],
       "subjects": [
         "symforge::embed::EmbeddedSourceHandle",
         "symforge::embed::ProcessIndexRuntime",
@@ -77,6 +82,7 @@
       "template": "templates/impl_family_absent.rs.in",
       "feature_vector": "embed",
       "bound": "core::convert::From<Probe>",
+      "expected_error_codes": ["E0277"],
       "permitted_source": "Self",
       "probe_relation": "non_reflexive",
       "subjects": [
@@ -95,6 +101,7 @@
       "template": "templates/impl_family_absent.rs.in",
       "feature_vector": "embed",
       "bound": "core::convert::AsRef<Probe>",
+      "expected_error_codes": ["E0277"],
       "subjects": [
         "symforge::embed::EmbeddedSourceHandle",
         "symforge::embed::ProcessIndexRuntime"
@@ -107,6 +114,7 @@
       "template": "templates/impl_family_absent.rs.in",
       "feature_vector": "embed",
       "bound": "core::borrow::Borrow<Probe>",
+      "expected_error_codes": ["E0277"],
       "permitted_source": "Self",
       "probe_relation": "non_reflexive",
       "subjects": [
@@ -121,6 +129,7 @@
       "template": "templates/impl_family_absent.rs.in",
       "feature_vector": "embed",
       "bound": "core::ops::Deref",
+      "expected_error_codes": ["E0277"],
       "subjects": [
         "symforge::embed::EmbeddedSourceHandle",
         "symforge::embed::ProcessIndexRuntime"
@@ -133,6 +142,7 @@
       "assertion_id": "no-raw-crate-root-modules",
       "template": "templates/path_absent.rs.in",
       "feature_vector": "server-embed",
+      "expected_error_codes": ["E0432", "E0603"],
       "paths": [
         "symforge::analytics",
         "symforge::capability",
@@ -167,6 +177,7 @@
       "assertion_id": "no-raw-deep-embed-reexports",
       "template": "templates/path_absent.rs.in",
       "feature_vector": "embed",
+      "expected_error_codes": ["E0432", "E0603"],
       "paths": [
         "symforge::embed::domain",
         "symforge::embed::git",
@@ -178,6 +189,7 @@
       "assertion_id": "no-rust-health-api",
       "template": "templates/path_absent.rs.in",
       "feature_vector": "server-embed",
+      "expected_error_codes": ["E0432", "E0603"],
       "paths": [
         "symforge::health",
         "symforge::server_api::health"
@@ -187,6 +199,7 @@
       "assertion_id": "no-stel-public-api",
       "template": "templates/path_absent.rs.in",
       "feature_vector": "server-embed",
+      "expected_error_codes": ["E0432", "E0603"],
       "paths": [
         "symforge::embed::stel",
         "symforge::stel",

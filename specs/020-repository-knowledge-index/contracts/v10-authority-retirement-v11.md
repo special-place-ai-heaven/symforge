@@ -3,7 +3,10 @@
 This is the closed V10 authority and ingress retirement inventory. Slice 4 owns
 the final cut: every member below must either route through the V11 runtime or
 be unreachable before Preventive V1 is exposed. Absence from this inventory is
-not permission to survive. All retirement evidence is planned and unexecuted.
+not permission to survive. Before activation, the byte census below closes the four
+authority-bearing source categories against unlisted additions; after activation,
+their executed Slice 4 reachability cases replace the preactivation census. All
+retirement evidence is planned and unexecuted.
 
 <!-- SYMFORGE V10 AUTHORITY RETIREMENT V11 JSON START -->
 ```json
@@ -14,6 +17,24 @@ not permission to survive. All retirement evidence is planned and unexecuted.
   "slice4_owner": {
     "slice": 4,
     "tasks": ["T064", "T065", "T066", "T067"]
+  },
+  "preactivation_closure": {
+    "writers": {
+      "paths": ["src/cli/init.rs", "src/gitignore_hygiene.rs", "src/live_index/persist.rs", "src/live_index/single_file.rs", "src/protocol/edit.rs", "src/protocol/edit_tools.rs", "src/protocol/knowledge_curation.rs", "src/protocol/tools.rs"],
+      "digest": "9117d0f66dd138b33c84c008ce4ab43f8f6dc1724d5192105d68fd8fa7347ebb"
+    },
+    "callbacks": {
+      "paths": ["src/daemon.rs", "src/live_index/git_temporal.rs", "src/live_index/persist.rs", "src/main.rs", "src/protocol/edit_hooks.rs", "src/protocol/knowledge_curation.rs", "src/server/serve.rs", "src/watcher/mod.rs"],
+      "digest": "d90ed99bbff93ad10945276e1fd12c07f18e6eae29795c11ea2aebb8c9987024"
+    },
+    "publication_roots": {
+      "paths": ["src/daemon.rs", "src/live_index/store.rs", "src/protocol/mod.rs", "src/server/mod.rs", "src/sidecar/mod.rs"],
+      "digest": "27ba02d4ac620eea372f3fb0854a0f6de75c688d469804fcc5dd33b1dddd3a12"
+    },
+    "cache": {
+      "paths": ["src/daemon.rs", "src/protocol/knowledge_curation.rs", "src/protocol/session.rs", "src/sidecar/mod.rs", "src/worktree.rs"],
+      "digest": "c43a5e9ee857686d44b88481e21e19357be53655e418794bb1326ed61d2a9850"
+    }
   },
   "entries": [
     {

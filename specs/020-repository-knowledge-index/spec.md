@@ -47,7 +47,9 @@ work performed, but they do not authorize a V11 implementation.
 7. Persistence health is orthogonal to source truth: a durability failure alone
    does not revoke a valid `Current` generation. Missing/gapped observation,
    incomplete baseline, unknown ordering, or an overdue verification obligation
-   does revoke strict acquisition synchronously.
+   does revoke strict acquisition synchronously. A verification obligation becomes
+   overdue at the finite monotonic deadline defined by FR-049; partial progress,
+   cancellation, restart, and cursor resume cannot extend that deadline.
 8. V11 activates once, across every entry path, only after the refreeze manifest,
    detached attestation, externally anchored approval, closed public-API manifest,
    causal RED oracles, capacity proof, and `ObservedRefreshGateV1` pass. No
@@ -920,9 +922,19 @@ historical scope can still retrieve them.
   quarantine, checkpoint, or state-write failure MUST degrade persistence health
   without changing source identity or, by itself, revoking a valid Current
   generation. Query readiness remains independent from durability but depends on
-  complete live observation: an absent/gapped observer, incomplete baseline,
-  unknown ordering, scope-dirty marker, or overdue verification obligation MUST
-  synchronously make strict acquisition non-current and return `SourceRefusal`. Durable
+  complete live observation. Promotion and each later complete whole-declared-scope
+  verification pass set `verification_deadline = completion_monotonic + 15 minutes`
+  for the exact project-slot instance, source-slot instance, generation digest,
+  observer cut, policy version, and declared scope. A partial slice, cancellation,
+  retry, cursor resume, persistence failure, or process restart MUST NOT advance or
+  reconstruct that deadline; restart begins non-current until a fresh complete proof.
+  At or after the monotonic deadline, if no newer complete `VerificationRecord` is
+  bound to that exact identity tuple, the source supervisor MUST atomically latch
+  `VerificationOverdueLatched` before any strict lease can linearize. An
+  absent/gapped observer, incomplete baseline, unknown ordering, scope-dirty marker,
+  or that overdue latch MUST synchronously make strict acquisition non-current and
+  return `SourceRefusal`. Only a fresh complete exact-bound verification and
+  publication may clear the latch. Durable
   cross-restart `index_folder` idempotency uses global control state; when unavailable
   replay remains process-local and is labeled non-durable. A stored completion
   receipt is historical evidence, not a live postcondition: same-key/same-hash replay
@@ -1074,13 +1086,14 @@ historical scope can still retrieve them.
   generation promotes; only then may a fresh `SourceMutationPermit` publish
   non-Current and perform confined handle-relative I/O. Current returns only through
   a fresh candidate for successful and no-side-effect outcomes.
-- **SC-019**: An explicit System32/protected-root fixture with
-  `allow_protected_root=true` reaches a queryable live index and records user-local
-  or memory-only placement while an instrumented filesystem proves zero state or
-  durability-probe create/inspect/write/delete operations anywhere beneath the
-  protected source root, including `<protected-root>/.symforge`. A second session and
-  a restarted process receive no inherited membership; each succeeds only after its
-  own direct override request.
+- **SC-019**: An explicit System32/protected-root fixture reaches a queryable live
+  index only after its direct `allow_protected_root=true` request and records
+  user-local or memory-only placement. An instrumented filesystem proves zero
+  create, inspect, write, or delete operations for state or durability probes
+  anywhere beneath that protected source, including
+  `<protected-root>/.symforge`. Neither a second session nor a restarted process
+  inherits membership; each must independently complete the same direct override
+  request before it can join the live project.
 - **SC-020**: Injected project-local and user-local persistence failures leave live
   code and knowledge queries usable with explicit memory-only health;
   `checkpoint_now` returns a successful typed `applied=false` unavailable result,
