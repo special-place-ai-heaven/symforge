@@ -30,7 +30,7 @@ MUTATIONS=(
   "drop-drains|$MUTATION|self.drain.record(Termination::Drained);||a dropped permit reports Drained"
   "lease-revoked|$PHYSICAL|if !self.is_live() {|if false {|a revoked lease resolves nothing"
   "temp-first|$PHYSICAL|steps.push(ReplacementStep::TempCreated);|steps.push(ReplacementStep::Replaced);|replacement creates its temporary before replacing"
-  "epoch-monotonic|$AUTHORITY|self.mutation_epoch = self.mutation_epoch.advanced();|self.mutation_epoch = MutationEpoch::initial();|the mutation epoch is monotonic across freeze"
+  "epoch-monotonic|$AUTHORITY|self.mutation_epoch = self.mutation_epoch.advanced();|let _ = self.mutation_epoch.advanced();|the mutation epoch is monotonic across freeze"
   "proof-names-stored|$AUTHORITY|let publication = self.freeze();|let publication = { self.freeze(); PublicationIdentity::fresh() };|the non-Current proof names the stored publication"
 )
 
