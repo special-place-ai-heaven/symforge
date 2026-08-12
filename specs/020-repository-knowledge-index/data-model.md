@@ -637,6 +637,54 @@ pub struct CompletenessCertificate {
     pub optional_delta_proof_digest: Option<DeltaProofDigest>,
 }
 
+/// Sealed enumeration of everything one complete whole-declared-scope verification
+/// pass must check. Sealed at promotion and never widened in place: a scope change
+/// produces a new receipt, so a pass can never silently verify less than it claims.
+pub struct VerificationScopeReceipt {
+    pub receipt_id: VerificationScopeReceiptId,
+    pub project_slot: ProjectSlotInstanceId,
+    pub source_slot: SourceSlotInstanceId,
+    pub generation_digest: GenerationDigest,
+    pub observer_cut: ObservationCut,
+    pub policy_version: PolicyVersion,
+    pub catalog_entries: BTreeSet<CatalogEntryId>,
+    pub terminal_dispositions: BTreeMap<CatalogEntryId, FileDisposition>,
+    pub admitted_byte_ranges: BTreeMap<CatalogEntryId, AdmittedByteRange>,
+    pub discovery_obligations: BTreeSet<ScopeDiscoveryObligationId>,
+    pub required_artifacts: BTreeSet<RequiredArtifactId>,
+    pub required_certificates: BTreeSet<CompletenessCertificateId>,
+}
+
+/// Cost of the pass the receipt above describes. `bound_seconds` is
+/// `ceil(verification_bytes / RESERVED_VERIFICATION_BYTES_PER_SECOND)
+///  + ceil(verification_entries / RESERVED_VERIFICATION_ENTRIES_PER_SECOND)`.
+/// The default ceilings cap it at 512 + 200 = 712 seconds, so
+/// `DEFAULT_MAX_COMPLETE_VERIFICATION_PASS` is a ceiling the defaults never reach.
+pub struct VerificationWorkBound {
+    pub scope_receipt: VerificationScopeReceiptId,
+    pub verification_bytes: u64,
+    pub verification_entries: u64,
+    pub bound_seconds: u32,
+}
+
+/// Capacity actually reserved for the pass. Promotion to `Current` requires one;
+/// losing the reservation makes the source non-current rather than extending the
+/// deadline, so an unaffordable pass can never masquerade as a completed one.
+pub struct VerificationFeasibilityReceipt {
+    pub scope_receipt: VerificationScopeReceiptId,
+    pub work_bound: VerificationWorkBound,
+    pub reserved_bytes_per_second: u64,
+    pub reserved_entries_per_second: u64,
+    pub successor_start_deadline: MonotonicInstant,
+}
+
+pub const DEFAULT_MAX_VERIFICATION_BYTES: u64 = 17_179_869_184;
+pub const DEFAULT_MAX_VERIFICATION_ENTRIES: u64 = 200_000;
+pub const DEFAULT_MAX_COMPLETE_VERIFICATION_PASS_SECONDS: u32 = 720;
+pub const RESERVED_VERIFICATION_BYTES_PER_SECOND: u64 = 33_554_432;
+pub const RESERVED_VERIFICATION_ENTRIES_PER_SECOND: u64 = 1_000;
+pub const MAX_SUCCESSOR_VERIFICATION_START_SECONDS: u32 = 180;
+
 pub enum DeltaCause {
     Added,
     Modified,

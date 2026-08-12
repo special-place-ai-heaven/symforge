@@ -158,7 +158,10 @@ const EXPECTED_SEAMS = {
 const EXPECTED_PRODUCTION_SEAMS = new Set([
   ...Object.values(EXPECTED_SEAMS).flat(),
   "src/index_lifecycle/verification.rs::RollingVerification",
+  "src/index_lifecycle/verification.rs::VerificationFeasibilityReceipt",
   "src/index_lifecycle/verification.rs::VerificationRecord",
+  "src/index_lifecycle/verification.rs::VerificationScopeReceipt",
+  "src/index_lifecycle/verification.rs::VerificationWorkBound",
   "src/live_index/persist.rs::load_snapshot",
 ]);
 
@@ -301,7 +304,7 @@ const FROZEN_DIGESTS = {
   },
   acceptance_oracles: {
     domain: "symforge.lifecycle.v11.acceptance.oracles",
-    hash: "b429c0132a348feba633cff21313ad15a739cdbe3f913cb8d31d21a010d0c16a",
+    hash: "d1d47c59a3a23952e4e598e8c44b5f33778915a744c51d4c3b2ec58e07b84fec",
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
