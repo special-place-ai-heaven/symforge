@@ -308,7 +308,7 @@ const FROZEN_DIGESTS = {
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "35d27c8785291b156de2967100417115c09862e073e1404a72f00cf96269f1cb",
+    hash: "e2f2c262fa640f1ba4e50da9b1bf9280aeaba5639e29a8b3e8f6495d0018cbe8",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -2192,70 +2192,203 @@ function validateRetirementSourceInventory(retirement, sourceMap) {
   }
 }
 
-/// Remove every `#[cfg(test)]`-attributed item or statement.
+/// Does this `cfg` predicate compile ONLY under `cfg(test)`?
+///
+/// `test` is test-only. `all(..)` is test-only when any conjunct is, because
+/// every conjunct must hold. `any(..)` is test-only only when every disjunct is,
+/// because any one suffices. `not(..)` is never treated as test-only: `not(test)`
+/// is the exact opposite, and anything subtler is not worth guessing about a
+/// digest that gates a release.
+///
+/// Unknown shapes answer false, so an unrecognised predicate keeps its item in
+/// the census rather than silently removing production code from it.
+function cfgPredicateIsTestOnly(predicate) {
+  const text = predicate.trim();
+  if (text === "test") return true;
+  const call = /^(all|any|not)\s*\(([\s\S]*)\)$/u.exec(text);
+  if (!call) return false;
+  const [, name, inner] = call;
+  if (name === "not") return false;
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const character of inner) {
+    if (character === "(") depth += 1;
+    else if (character === ")") depth -= 1;
+    if (character === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  if (current.trim() !== "") parts.push(current);
+  const resolved = parts.map((part) => cfgPredicateIsTestOnly(part));
+  if (resolved.length === 0) return false;
+  return name === "all" ? resolved.some(Boolean) : resolved.every(Boolean);
+}
+
+/// Every `#[...]` attribute starting at `index`, as `{start, end, predicate}`.
+/// `predicate` is the text inside `cfg(...)`, or null for any other attribute.
+function rustAttributeAt(masked, index) {
+  if (!masked.startsWith("#", index)) return null;
+  let scan = index + 1;
+  while (scan < masked.length && /\s/u.test(masked[scan])) scan += 1;
+  if (masked[scan] !== "[") return null;
+  let depth = 0;
+  for (; scan < masked.length; scan += 1) {
+    if (masked[scan] === "[") depth += 1;
+    else if (masked[scan] === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        scan += 1;
+        break;
+      }
+    }
+  }
+  const body = masked.slice(index, scan);
+  const cfg = /^#\s*\[\s*cfg\s*\(([\s\S]*)\)\s*\]$/u.exec(body);
+  return { start: index, end: scan, predicate: cfg ? cfg[1] : null };
+}
+
+/// Remove every item or statement that compiles only under `cfg(test)`.
 ///
 /// The census exists to freeze V10 *authority* while V11 is built beside it, so
-/// what it must pin is the source as the release build sees it. Test-only code
-/// is compiled out and changes no shipped behaviour, and freezing it as well
-/// made the retirement contract forbid the very edits `tasks.md` T014 requires.
-/// Production additions to a censused file still move the digest, which is the
-/// property the two closure self-tests assert.
+/// what it must pin is the source the release build compiles. Test-only code is
+/// compiled out and changes no shipped behaviour; freezing it too made the
+/// retirement contract forbid the very edits `tasks.md` T014 requires.
+/// Production additions still move the digest, which is the property the closure
+/// self-tests assert.
+///
+/// A run of consecutive attributes is taken as a unit: if any of them is a
+/// test-only `cfg`, the whole run and its item go, so `#[derive(Debug)]
+/// #[cfg(test)] struct X;` does not leave a stray attribute behind.
 ///
 /// Offsets come from the masked source so a `;` or brace inside a comment or
-/// string literal cannot terminate an item early; the cut is applied to the
-/// original bytes at those same offsets.
+/// string literal cannot terminate an item early.
 function stripCfgTestItems(source) {
   const masked = maskRustCommentsAndLiterals(source);
   const cuts = [];
-  for (const match of masked.matchAll(/#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]/gu)) {
-    const start = match.index;
-    let index = start + match[0].length;
+  let index = 0;
+  while (index < masked.length) {
+    const first = rustAttributeAt(masked, index);
+    if (!first) {
+      index += 1;
+      continue;
+    }
+    // Collect the whole run of attributes that share this item.
+    const run = [first];
+    let cursor = first.end;
+    for (;;) {
+      while (cursor < masked.length && /\s/u.test(masked[cursor])) cursor += 1;
+      const next = rustAttributeAt(masked, cursor);
+      if (!next) break;
+      run.push(next);
+      cursor = next.end;
+    }
+    const testOnly = run.some(
+      (attribute) => attribute.predicate !== null && cfgPredicateIsTestOnly(attribute.predicate),
+    );
+    if (!testOnly) {
+      index = first.end;
+      continue;
+    }
+    // Consume exactly the attributed construct, and nothing past it.
+    //
+    // An item ends at `;` or at a balanced `{…}` block. A struct field, enum
+    // variant, or match arm ends at `,` instead, and the LAST member of a body
+    // ends at the enclosing `}` with no separator at all. Scanning only for `;`
+    // and `{` therefore ran straight through comma-separated members and out of
+    // the enclosing block, deleting production siblings and following items from
+    // the census: `pub struct S { #[cfg(test)] t: u8, prod: u8, } fn keep() {}`
+    // reduced to `pub struct S {`, so renaming `prod` did not move the digest.
+    // That is the exact drift the census exists to detect, so the scan is
+    // bounded by all three terminators and by the enclosing brace.
+    let scan = cursor;
     let nesting = 0;
     let end = -1;
-    while (index < masked.length) {
-      const character = masked[index];
+    while (scan < masked.length) {
+      const character = masked[scan];
       if (character === "(" || character === "[") nesting += 1;
       else if (character === ")" || character === "]") nesting -= 1;
-      else if (nesting === 0 && character === ";") {
-        end = index + 1;
+      else if (nesting === 0 && (character === ";" || character === ",")) {
+        end = scan + 1;
+        break;
+      } else if (nesting === 0 && character === "}") {
+        // The enclosing body closed first: this was its final member, which owns
+        // no separator. Stop before the brace so the body itself survives.
+        end = scan;
         break;
       } else if (nesting === 0 && character === "{") {
         let depth = 0;
-        let scan = index;
-        for (; scan < masked.length; scan += 1) {
-          if (masked[scan] === "{") depth += 1;
-          else if (masked[scan] === "}") {
+        let block = scan;
+        for (; block < masked.length; block += 1) {
+          if (masked[block] === "{") depth += 1;
+          else if (masked[block] === "}") {
             depth -= 1;
             if (depth === 0) {
-              scan += 1;
+              block += 1;
               break;
             }
           }
         }
-        end = scan;
+        end = block;
+        // A block does not always end the construct. `#[cfg(test)] let r = if c
+        // { a } else { b };` continues through the whole else-chain and only
+        // then hits its `;`; stopping at the first block strands ` else { b };`
+        // in the canonical form, so test-only code stays in the digest and
+        // test-only edits move it -- the opposite of what the amendment exists
+        // for. Consume any `else` / `else if` chain, then the terminator.
+        for (;;) {
+          let probe = end;
+          while (probe < masked.length && /\s/u.test(masked[probe])) probe += 1;
+          if (!/^else\b/u.test(masked.slice(probe, probe + 5))) break;
+          probe += 4;
+          // Skip an `else if <cond>` head; the block below is consumed either way.
+          while (probe < masked.length && masked[probe] !== "{" && masked[probe] !== ";") probe += 1;
+          if (masked[probe] !== "{") {
+            end = probe;
+            break;
+          }
+          let chainDepth = 0;
+          let chain = probe;
+          for (; chain < masked.length; chain += 1) {
+            if (masked[chain] === "{") chainDepth += 1;
+            else if (masked[chain] === "}") {
+              chainDepth -= 1;
+              if (chainDepth === 0) {
+                chain += 1;
+                break;
+              }
+            }
+          }
+          end = chain;
+        }
+        // A block-bodied member (`#[cfg(test)] 0 => { … },`) or a statement
+        // (`… };`) still owns the separator that follows it.
+        let after = end;
+        while (after < masked.length && /\s/u.test(masked[after])) after += 1;
+        if (masked[after] === "," || masked[after] === ";") end = after + 1;
         break;
       }
-      index += 1;
+      scan += 1;
     }
     // No line-framing heuristics: whatever whitespace the cut leaves behind is
     // erased by `canonicalReleaseSource`, so where a removed item's blank lines
     // went is not observable in the digest.
-    cuts.push([start, end === -1 ? masked.length : end]);
+    const cutEnd = end === -1 ? masked.length : end;
+    cuts.push([first.start, cutEnd]);
+    index = cutEnd;
   }
   if (cuts.length === 0) return source;
-  cuts.sort((left, right) => left[0] - right[0]);
   let result = "";
-  let cursor = 0;
+  let position = 0;
   for (const [start, end] of cuts) {
-    // A nested attribute inside an already-cut item is already removed.
-    if (start < cursor) {
-      cursor = Math.max(cursor, end);
-      continue;
-    }
-    result += source.slice(cursor, start);
-    cursor = end;
+    if (start < position) continue;
+    result += source.slice(position, start);
+    position = end;
   }
-  return result + source.slice(cursor);
+  return result + source.slice(position);
 }
 
 /// Reduce source to the code a release build compiles, in a canonical form.
@@ -2291,6 +2424,35 @@ function normalizeRetirementClosureSource(source) {
   return canonicalReleaseSource(stripCfgTestItems(source.replace(/\r\n/gu, "\n")));
 }
 
+/// Reject a normalized source whose delimiters no longer balance.
+///
+/// Every known over-strip defect leaves the survivor unbalanced: the census cut
+/// ran past its construct and swallowed a closing brace, taking production code
+/// with it. A single-file example shipped undetected -- the cut through a
+/// `#[cfg(test)]` struct field consumed the struct's closing brace and an entire
+/// production enum, and every gate stayed green because the digest was RECORDED
+/// with that hole. Balance is a cheap structural invariant that no correct strip
+/// can break, so it catches the whole class rather than the instances the case
+/// matrix happens to enumerate.
+function normalizedSourceIsBalanced(normalized) {
+  const kinds = rustCharacterKinds(normalized);
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  for (let index = 0; index < normalized.length; index += 1) {
+    if (kinds[index] !== "code") continue;
+    const character = normalized[index];
+    if (character === "(") round += 1;
+    else if (character === ")") round -= 1;
+    else if (character === "[") square += 1;
+    else if (character === "]") square -= 1;
+    else if (character === "{") curly += 1;
+    else if (character === "}") curly -= 1;
+    if (round < 0 || square < 0 || curly < 0) return false;
+  }
+  return round === 0 && square === 0 && curly === 0;
+}
+
 function validateRetirementClosure(retirement, sourceMap) {
   const closure = retirement && retirement.preactivation_closure;
   if (!exactKeys(closure, RETIREMENT_CLOSURE_CATEGORIES, "retirement.preactivation_closure")) return;
@@ -2315,7 +2477,15 @@ function validateRetirementClosure(retirement, sourceMap) {
         fail("RETIREMENT_CLOSURE_MISMATCH", `${category}: missing ${relativePath}`);
         continue;
       }
-      blobHashes[relativePath] = sha256Bytes(Buffer.from(normalizeRetirementClosureSource(source), "utf8"));
+      const normalized = normalizeRetirementClosureSource(source);
+      if (!normalizedSourceIsBalanced(normalized)) {
+        fail(
+          "RETIREMENT_CLOSURE_UNBALANCED",
+          `${category}: ${relativePath} does not survive normalization with balanced delimiters, ` +
+            "so the census cut consumed more than the construct it targeted",
+        );
+      }
+      blobHashes[relativePath] = sha256Bytes(Buffer.from(normalized, "utf8"));
     }
     const actualDigest = canonicalDigest(`symforge.lifecycle.v11.retirement.closure.${category}`, blobHashes);
     if (!validSha256(record.digest) || record.digest !== actualDigest) {
@@ -3184,6 +3354,23 @@ function runVerifiedCommand(spec, runtime = {}) {
   if (result && result.error) return { ok: false, reason: result.error.code === "ETIMEDOUT" ? "timeout" : "spawn_error" };
   if (!result || result.signal !== null && result.signal !== undefined) return { ok: false, reason: "signal" };
   if (result.status !== 0) return { ok: false, reason: "nonzero" };
+  // Exit 0 is not proof the case RAN. `cargo test <case> -- --exact` exits 0 for
+  // an ignored-only run ("0 passed; 0 failed; 1 ignored"), so a receipt written on
+  // exit code alone claims execution evidence the runner never observed -- the
+  // reporting invariant, in the one path that gates a release.
+  //
+  // The filter is `--exact`, so no case other than the requested one can run.
+  // That makes the property checkable without re-deriving the case name: at least
+  // one case must have been reported as run, and none may have been reported
+  // ignored. Matching on a name would be a second derivation of a fact the argv
+  // already fixes, and those two rules drift.
+  if (spec.expect_execution) {
+    const combined = `${stdout.toString("utf8")}${stderr.toString("utf8")}`;
+    if (/^test .* \.\.\. ignored$/mu.test(combined)) return { ok: false, reason: "case_ignored" };
+    if (!/^test .* \.\.\. (?:ok|FAILED)$/mu.test(combined)) {
+      return { ok: false, reason: "case_not_reported" };
+    }
+  }
   if (!isObject(after) || !after.clean || after.commit !== before.commit || after.tree !== before.tree) {
     return { ok: false, reason: "tree_changed" };
   }
@@ -3212,6 +3399,12 @@ function materializedCommandSpec(testId, test, command, evidence, receiptPath, a
     return null;
   }
   return {
+    // The filter argv already carries the exact name cargo is told to run, and
+    // libtest echoes that name. Re-deriving it from the target instead would be a
+    // second naming rule that can drift from the first -- it did, for the one
+    // module-qualified lib case. Benchmarks do not report per-case, so they carry
+    // no expectation.
+    expect_execution: !test.kind.includes("benchmark"),
     program: cargoExecutable,
     args,
     timeout_ms: test.kind.includes("benchmark") ? 3_600_000 : 1_800_000,

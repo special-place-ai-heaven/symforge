@@ -173,6 +173,27 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
             Arc::clone(&stop),
         ));
 
+        // `admitted == 0` is also true when the watcher never started or never
+        // reconciled, so without proof it ran this control cannot tell a correct
+        // refusal from a dead observer. A second root the watcher DOES own gives
+        // that proof: it must admit there while admitting nothing here.
+        let live = TempDir::new().expect("live project dir");
+        write_project_files(live.path(), "live", 4);
+        let witness = LiveIndex::load(live.path()).expect("load witness project");
+        let witness_stop = Arc::new(AtomicBool::new(false));
+        let witness_watcher = tokio::spawn(run_watcher_with_stop(
+            live.path().to_path_buf(),
+            witness.clone(),
+            Arc::new(parking_lot::Mutex::new(WatcherInfo::default())),
+            Arc::clone(&witness_stop),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        std::fs::write(
+            live.path().join("src").join("live_witness.rs"),
+            b"pub fn live_witness() {}\n",
+        )
+        .expect("write witness file");
+
         // Its first action is a full reconciliation, before any event queue.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut admitted = 0;
@@ -183,9 +204,29 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+        let witness_saw_its_own_edit = {
+            let mut seen = false;
+            let witness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < witness_deadline {
+                if witness.read().get_file("src/live_witness.rs").is_some() {
+                    seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            seen
+        };
         stop.store(true, Ordering::Release);
+        witness_stop.store(true, Ordering::Release);
         let _ = watcher.await;
+        let _ = witness_watcher.await;
 
+        assert!(
+            witness_saw_its_own_edit,
+            "precondition: the watcher machinery must be observing at all; a \
+             sibling watcher failed to admit its own edit, so zero admissions \
+             into the placeholder would prove nothing about publication semantics"
+        );
         assert_eq!(
             admitted, 0,
             "the watcher admitted {admitted} path(s) into a never-published empty \
@@ -260,7 +301,13 @@ fn failed_reload_retains_the_recovery_observer() {
                 .await
                 .expect("index_folder body")
         };
-        let rebuild_failed = !failed.starts_with("Indexed ");
+        // Any non-success body would satisfy a bare `!starts_with("Indexed ")`,
+        // so an auth rejection or a routing change would leave the old watcher
+        // alive, let the post-failure edit be observed, and pass this control
+        // with defect 2.10 fully present. Require the specific admission
+        // refusal this control induces.
+        let rebuild_failed = !failed.starts_with("Indexed ")
+            && (failed.contains("capacity") || failed.contains("too large to index"));
 
         // A new edit is the only thing a surviving observer would react to.
         std::fs::write(
@@ -838,17 +885,19 @@ fn configured_capacity_bounds_the_process_not_each_load() {
         let projects = daemon.state.list_projects().len();
         let _ = daemon.shutdown_tx.send(());
 
-        assert_eq!(
-            projects, 2,
-            "precondition: both projects must be open for this to measure an \
-             aggregate at all"
-        );
+        // Slice 2 may satisfy the process-wide bound either by admitting less
+        // or by refusing the second open outright -- which is exactly what the
+        // sibling refusal control demands. Requiring both projects open would
+        // keep this RED after a correct fix and misattribute the failure, so a
+        // refused second open counts as the bound being honoured.
+        let second_open_refused = projects < 2;
         assert!(
-            admitted <= CEILING,
+            second_open_refused || admitted <= CEILING,
             "two projects admitted {admitted} files against a configured ceiling \
-             of {CEILING}. The ceiling is applied per load, so every additional \
-             project multiplies what the process actually holds; it must bound \
-             the process instead"
+             of {CEILING} while both stayed open. The ceiling is applied per load, \
+             so every additional project multiplies what the process actually \
+             holds; it must bound the process -- either by admitting within the \
+             ceiling or by refusing the second open"
         );
     });
 }

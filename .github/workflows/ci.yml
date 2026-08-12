@@ -80,6 +80,7 @@ jobs:
 
       - name: Test and verify Feature 020 V11 lifecycle traceability
         run: |
+          node scripts/validate-lifecycle-oracle-traceability.norm.test.cjs
           node scripts/validate-lifecycle-oracle-traceability.test.cjs
           node scripts/validate-lifecycle-oracle-traceability.cjs
 
@@ -140,6 +141,25 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --all-targets -- --test-threads=1
+
+      # Slice 0's product is positive controls that MUST fail, so the step above
+      # cannot check them: it runs the default suite, where every control is
+      # `#[ignore]`d precisely so a deliberate RED does not turn main red. This
+      # runs them and preserves the outcome as the contract's bounded CI-SLICE0
+      # artifact -- one deterministic JSON record per case, no unbounded logs.
+      # It fails when a control STOPS failing, which means either a fix landed
+      # without its owning slice removing the attribute, or the control has gone
+      # vacuous.
+      - name: Preserve Feature 020 Slice 0 expected failures
+        run: node scripts/slice0-oracle-artifact.cjs
+
+      - name: Upload Slice 0 oracle contract
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feature-020-slice-0-oracle-contract
+          path: target/ci/lifecycle-v11/slice-0-oracle-contract.json
+          if-no-files-found: error
 
       - name: Build release binary
         run: cargo build --release

@@ -439,31 +439,91 @@ passed review would be precisely the "the thing that reports is not the thing th
 knows" failure `CLAUDE.md` makes binding. It is left open, and it is the one Slice 0
 item that cannot be closed by writing code.
 
-### Known gap in the amended stripper
+### The stripper gap is closed
 
-`normalizeRetirementClosureSource` recognises a literal `#[cfg(test)]` attribute. It
-does **not** recognise `#[cfg(all(test, feature = "…"))]`, which is equivalent to
-rustc and is the natural spelling when a test-only helper's consumer sits behind a
-feature gate — so the census reads such an item as production code and fails.
+An earlier amendment matched only a literal `#[cfg(test)]`, so
+`#[cfg(all(test, feature = "…"))]` — the natural spelling when a test-only helper's
+consumer sits behind a feature gate — was read as production code and moved the
+census. That forced a stacked-attribute workaround.
 
-Found immediately: the T014 hook's re-export has to be server-gated (its consumer is
-`src/watcher/mod.rs::tests`, and `watcher` is `#[cfg(feature = "server")]`, so under
-`--no-default-features --features embed` the bare `#[cfg(test)]` form is an unused
-import that `-D warnings` rejects). Writing that as `cfg(all(test, feature =
-"server"))` moved the `publication_roots` digest.
+The stripper now evaluates cfg predicates: `all(..)` is test-only when any conjunct
+is, `any(..)` only when every disjunct is, and `not(..)` never. Unknown shapes answer
+false, so an unrecognised predicate keeps its item **in** the census rather than
+silently removing production code from it. A run of consecutive attributes is taken
+as a unit, so `#[derive(Debug)] #[cfg(test)]` cannot strand a stray attribute.
 
-The workaround is exact and costs nothing: two stacked attributes, `#[cfg(test)]`
-first, then `#[cfg(feature = "…")]`. The cut runs from the first attribute to the
-item's terminator, so the second is absorbed with it. `CLAUDE.md` records this as the
-supported spelling.
+Twenty normalization cases cover it, and the negatives are the ones that matter:
+`not(test)`, `any(test, feature = "…")`, `cfg(feature)` alone, and an unrecognised
+predicate all still move the digest. Two of them are also fail-closed self-test cases,
+and the workaround has been reverted at its real call site in
+`src/live_index/store.rs` — the plain `all` spelling now passes with the digest
+unchanged, which is the proof that both spellings canonicalize identically.
 
-The proper fix is for the stripper to evaluate test-only cfg predicates — `test`, and
-`all(...)` with `test` as a conjunct, while correctly *rejecting* `any(test, …)` and
-`not(test)`, which are not test-only. That needs another refreeze amendment and
-signature, so it is deferred rather than done here; it blocks nothing while the
-stacked spelling is used.
+### The Slice 0 artifact is wired into CI
 
-Nothing was faked, weakened into a vacuous pass, or silently dropped.
+`.github/workflows/ci.yml` now runs `scripts/slice0-oracle-artifact.cjs` after the
+Rust suite and uploads `slice-0-oracle-contract.json`. The default suite cannot check
+these controls — every one is `#[ignore]`d precisely so a deliberate RED does not turn
+`main` red — so without this step Slice 0's evidence would exist only on a developer's
+machine.
+
+## Independent adversarial review (T021)
+
+Three models reviewed this slice against
+`docs/reviews/REVIEW-REQUEST-feature-020-slice-0-2026-08-12.md`:
+`cursor-grok-4-5`, `composer`, and `kimi-k3`. Their findings are recorded verbatim
+beside it. Every green gate this slice had was green while the BLOCKER below was
+live, which is the argument for the review having happened at all.
+
+### Accepted and fixed
+
+| Finding | Reviewer | Resolution |
+|---|---|---|
+| Census over-strips past `#[cfg(test)]` members (BLOCKER) | grok, kimi | item scan now bounded by `,`, `;`, a balanced block, and the enclosing `}` |
+| Over-strip leaves unbalanced source, unchecked | kimi | `RETIREMENT_CLOSURE_UNBALANCED` structural gate; fires 3× against the old stripper |
+| `#[cfg(test)] let … if/else` strands the `else` arm | kimi | cut now consumes `else` / `else if` chains and the terminator |
+| Contract prose still claims raw-byte hashing | kimi | preamble rewritten to describe the canonical release form |
+| Materialized receipt accepts exit 0 on an ignored case | composer | `expect_case` requires libtest to report the case as run; `case_ignored` is a distinct refusal |
+| Artifact reports preservation without a roster | grok, kimi | exact 12-case roster pinned; `SLICE0_ORACLE_MISSING` / `_EXTRA` |
+| Producer ignores exit status, signal, timeout | kimi | all three checked; a suite of RED controls exiting 0 is an error |
+| Placeholder control passes if the watcher never ran | composer | a sibling watcher must admit its own edit first |
+| `rebuild_failed` accepts any failure body | kimi | must match the capacity-refusal signature |
+| Capacity precondition contradicts the sibling's fix shape | kimi | a refused second open now counts as the bound being honoured |
+| Stale comment claiming `all(test, …)` is unsupported | grok | removed |
+
+The live trigger kimi found is worth recording precisely: in
+`src/protocol/knowledge_curation.rs` the cut from a `#[cfg(test)]` struct field ran
+through the struct's closing brace and consumed the entire production enum
+`CurationWriteStage`, which is referenced from four production call sites. A planted
+production mutation there left the checker green. Three censused files were affected:
+`single_file.rs` (476 bytes), `knowledge_curation.rs` (294), `store.rs` (101).
+
+### Rejected, with reasoning
+
+**`#[cfg_attr(test, …)]` should be treated as test-only** (composer, MINOR).
+It must not be. `cfg_attr` conditionally applies an *attribute*; it does not gate
+compilation. `#[cfg_attr(test, ignore)] fn helper()` **ships in release**, so
+stripping it would hide production code from the census — reintroducing the exact
+defect the BLOCKER fix closes. The current conservative handling is correct.
+
+### Accepted, deferred with rationale
+
+**Timing-raced preconditions** (grok, MAJOR; kimi concurs in part). Two controls
+gate their assertion on a `sleep`-bounded race window
+(`watcher_mutation_during_candidate_build_is_not_discarded`,
+`whole_project_publication_preserves_latest_siblings`). Both already assert the
+window was entered as an *observed* fact rather than assuming it, so a miss fails
+loudly on the precondition instead of passing silently — but a slow runner could
+still let the mutation land after the swap and read as a fix. A deterministic seam
+like the T014 mid-commit hook is the right answer and is now permitted by the
+amended census; it is Slice 1 work, tracked here rather than rushed.
+
+**Snapshot control exercises the primitive, not the MCP query path** (composer,
+MINOR). `snapshot_seed_is_not_queryable_before_verification` probes
+`get_file` on the rehydrated handle, which is the publication primitive both
+`daemon.rs` and `main.rs` use. A Slice 4 fix that gates only `read_gate.rs` would
+pass this while clients still see unverified bytes. Extending it to a daemon
+round-trip belongs with the Slice 4 activation work that introduces that gate.
 
 ## Scope note
 

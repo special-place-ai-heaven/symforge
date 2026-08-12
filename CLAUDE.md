@@ -15,15 +15,32 @@ every default-feature gate above passes. Run that exact command before pushing
 anything that adds a `#[cfg(test)]` helper. Found the slow way on 2026-08-12: green
 locally and on the `rust` job, red on `embed-build`.
 
-When such a helper's consumer is server-only, gate it as two stacked attributes —
-`#[cfg(test)]` then `#[cfg(feature = "server")]` — **not** as
-`#[cfg(all(test, feature = "server"))]`. The two are identical to rustc but not to the
-Feature 020 retirement census: its stripper (`normalizeRetirementClosureSource` in
-`scripts/validate-lifecycle-oracle-traceability.cjs`) recognises a literal
-`#[cfg(test)]` and would read the `all` form as production code, failing
-`RETIREMENT_CLOSURE_MISMATCH`. Leading with `#[cfg(test)]` keeps the item test-only for
-both. That stripper limitation is a known gap, recorded for the next refreeze
-amendment; until then the stacked form is the supported spelling.
+When such a helper's consumer is server-only, gate it on
+`#[cfg(all(test, feature = "server"))]`. The Feature 020 retirement census
+understands cfg predicates: `all(..)` is test-only when any conjunct is, `any(..)`
+only when every disjunct is, and `not(..)` never. An earlier amendment matched only a
+literal `#[cfg(test)]`, which forced a stacked-attribute workaround; that is no longer
+needed and the plain `all` form is the supported spelling.
+
+### Long builds must not run through the Bash tool (as_of 2026-08-12)
+
+The Bash tool's `timeout` maxes at **600000 ms**, and `run_in_background` is subject
+to the same ceiling. A cold `cargo test --all-targets` here takes ~25 minutes, so it
+is killed at 10 -- **mid-write**. That is not a lost result, it is a corrupted
+`target/`: one kill produced `error[E0786]: found invalid metadata files`, the next a
+rustc `internal compiler error: no type-dependent def for method call`, the next
+`error[E0463]: can't find crate for symforge`. Each looks like a code failure and none
+of them is one.
+
+Run anything that can exceed ten minutes through Terminal Commander instead
+(`run_and_watch`, then poll `command_status` by `job_id`). Its daemon owns the
+process, so the job's lifetime is independent of the tool call. Interleaving feature
+sets in one target dir (`--all-targets` then `--no-default-features --features embed`)
+causes the same `E0786` without any kill; run them one at a time.
+
+Recovery, cheapest first: delete `target/debug/incremental`; then
+`cargo clean -p symforge`; then a full `cargo clean`. Do not diagnose a rustc ICE or a
+missing-crate error as a code defect until the build directory is known clean.
 
 ### Windows build cache (disk)
 

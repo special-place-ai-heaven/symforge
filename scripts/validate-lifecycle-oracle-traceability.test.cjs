@@ -366,6 +366,17 @@ function buildPositiveMaterializedFixture(root) {
     'const output = process.env.SYMFORGE_LIFECYCLE_COMMAND_RECEIPT;',
     'fs.mkdirSync(path.dirname(output), { recursive: true });',
     'fs.writeFileSync(output, JSON.stringify(receipt) + "\\n");',
+    // A real `cargo test` reports each case libtest ran, and the runner now
+    // requires that line: exit 0 alone is satisfied by an ignored-only run, so a
+    // receipt written on exit code was claiming execution nobody observed. The
+    // stub must therefore emit what libtest emits, or it would be testing a
+    // laxer contract than production uses.
+    'const argv = String(process.env.SYMFORGE_LIFECYCLE_COMMAND || "").trim().split(/\s+/);',
+    'const separator = argv.indexOf("--");',
+    'const fromCommand = separator > 0 ? argv[separator - 1] : "";',
+    'const fromTarget = String(process.env.SYMFORGE_LIFECYCLE_TARGET || "").split("::").slice(1).join("::");',
+    'const reported = [fromCommand, fromTarget].filter((name, index, all) => name !== "" && all.indexOf(name) === index);',
+    'for (const name of reported) process.stdout.write("test " + name + " ... ok" + String.fromCharCode(10));',
     "",
   ].join("\n");
   writeFixtureFile(root, "test", fakeCommandScript);
@@ -660,6 +671,30 @@ const cases = [
       const match = /"[A-Za-z0-9 _.:-]{6,}"/u.exec(text);
       if (!match) throw new Error("no string literal available in the censused writer source");
       fs.writeFileSync(file, text.replace(match[0], match[0].slice(0, -1) + 'X"'), "utf8");
+    },
+  },
+  {
+    name: "cfg(not(test)) item added to a retirement-owned source file",
+    expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    mutate(root) {
+      // not(test) is the opposite of test-only: it ships. The census must see it.
+      fs.appendFileSync(
+        path.join(root, "src/protocol/edit.rs"),
+        ["", "#[cfg(not(test))]", "pub fn ships_in_release() {}", ""].join("\n"),
+        "utf8",
+      );
+    },
+  },
+  {
+    name: "cfg(any(test, feature)) item added to a retirement-owned source file",
+    expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    mutate(root) {
+      // any() needs only one disjunct, so a feature build compiles this.
+      fs.appendFileSync(
+        path.join(root, "src/protocol/ccr.rs"),
+        ["", '#[cfg(any(test, feature = "server"))]', "pub fn maybe_ships() {}", ""].join("\n"),
+        "utf8",
+      );
     },
   },
   {
@@ -1720,7 +1755,7 @@ try {
       "",
       "/// Test-only helper documented above its attribute, which is the",
       "/// idiomatic placement and must not move the census either.",
-      "#[cfg(test)]",
+      '#[cfg(all(test, feature = "server"))]',
       "mod census_equivalence_probe {",
       "    #[test]",
       "    fn probe() { assert!(true); }",
