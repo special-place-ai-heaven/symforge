@@ -20,19 +20,40 @@ PHYSICAL=src/index_lifecycle/physical_root.rs
 MUTATIONS=(
   "publication-identity|$AUTHORITY|if presented != live.publication() {|if false {|grant validates the exact live publication identity"
   "root-pairing|$MUTATION|if authority.binding().physical_root() != lease.identity() {|if false {|permit pairs a grant only with its own root lease"
-  "transition-drain|$TRANSITION|if !signal.has_ended() {|if false {|transition refuses to install over a live permit"
-  "install-revokes|$TRANSITION|outgoing.revoke();||install revokes the outgoing root lease"
+  # These two keep their binding in use on purpose. Replacing them with a bare
+  # `if false` or an empty statement leaves an unused parameter, and this crate
+  # denies warnings, so the build fails for a reason unrelated to the guard --
+  # which reads as "uncompilable" and proves nothing.
+  "transition-drain|$TRANSITION|if !signal.has_ended() {|if signal.has_ended() && false {|transition refuses to install over a live permit"
+  "install-revokes|$TRANSITION|outgoing.revoke();|let _ = &outgoing;|install revokes the outgoing root lease"
   "permit-terminality|$MUTATION|if matches!(self.state, PermitState::Terminal(_)) {|if false {|a terminal permit refuses a second termination"
   "drop-drains|$MUTATION|self.drain.record(Termination::Drained);||a dropped permit reports Drained"
   "lease-revoked|$PHYSICAL|if !self.is_live() {|if false {|a revoked lease resolves nothing"
   "temp-first|$PHYSICAL|steps.push(ReplacementStep::TempCreated);|steps.push(ReplacementStep::Replaced);|replacement creates its temporary before replacing"
+  "epoch-monotonic|$AUTHORITY|self.mutation_epoch = self.mutation_epoch.advanced();|self.mutation_epoch = MutationEpoch::initial();|the mutation epoch is monotonic across freeze"
+  "proof-names-stored|$AUTHORITY|let publication = self.freeze();|let publication = { self.freeze(); PublicationIdentity::fresh() };|the non-Current proof names the stored publication"
 )
 
+# Batches of four keep each run inside the tool's wall-clock ceiling.
 BATCH="${1:-1}"
-if [[ "$BATCH" == "1" ]]; then
-  SELECTED=("${MUTATIONS[@]:0:4}")
-else
-  SELECTED=("${MUTATIONS[@]:4:4}")
+OFFSET=$(( (BATCH - 1) * 4 ))
+SELECTED=("${MUTATIONS[@]:$OFFSET:4}")
+if [[ ${#SELECTED[@]} -eq 0 ]]; then
+  echo "SWEEP: batch $BATCH is empty (${#MUTATIONS[@]} mutations defined)"
+  exit 1
+fi
+
+# The sweep restores by discarding working-tree changes to these files, so any
+# uncommitted work in them would be destroyed. Refuse rather than eat it. This
+# is not hypothetical: a run with three uncommitted fixes in the tree reverted
+# all three, and the only surviving evidence was that the tests stopped
+# compiling.
+DIRTY="$(git status --porcelain -- "$AUTHORITY" "$MUTATION" "$TRANSITION" "$PHYSICAL")"
+if [[ -n "$DIRTY" ]]; then
+  echo "SWEEP: refusing to run with uncommitted changes in the files it mutates:"
+  echo "$DIRTY"
+  echo "SWEEP: commit or stash them first -- the restore step discards them."
+  exit 1
 fi
 
 restore() {
@@ -62,15 +83,21 @@ with open(path, 'w', encoding='utf-8', newline='') as handle:
   output="$(cargo test --test project_index_authority_v11 --test physical_root_lease_v11 \
     -- --test-threads=1 2>&1)"
 
-  if grep -qE "^error(\[|:)" <<<"$output"; then
-    echo "SWEEP $id: DID NOT COMPILE (guard removal is prevented by the type system)"
+  # Observed test failures are checked FIRST and outrank everything else.
+  # `cargo test` prints "error: test failed" on a failing run, so matching a
+  # leading "error:" and calling it a compile failure reports a conclusion the
+  # script never observed -- which is how the first version of this sweep
+  # mislabelled four caught guards as uncompilable.
+  failed="$(grep -E "^test .* \.\.\. FAILED$" <<<"$output" | sed 's/^test //; s/ \.\.\. FAILED$//' | paste -sd, -)"
+  if [[ -n "$failed" ]]; then
+    echo "SWEEP $id: caught by [$failed] -- $description"
+  elif grep -qE "could not compile|^error\[E" <<<"$output"; then
+    # Show WHY. A bare "did not compile" is unfalsifiable: it reads as evidence
+    # about the guard when it is usually evidence about the mutation.
+    reason="$(grep -E "^error(\[E[0-9]+\])?:" <<<"$output" | head -2 | paste -sd'; ' -)"
+    echo "SWEEP $id: DID NOT COMPILE -- $reason"
   else
-    failed="$(grep -E "^test .* \.\.\. FAILED$" <<<"$output" | sed 's/^test //; s/ \.\.\. FAILED$//' | paste -sd, -)"
-    if [[ -z "$failed" ]]; then
-      echo "SWEEP $id: *** NO TEST FAILED *** guard is not covered: $description"
-    else
-      echo "SWEEP $id: caught by [$failed] -- $description"
-    fi
+    echo "SWEEP $id: *** NO TEST FAILED *** guard is not covered: $description"
   fi
 
   restore

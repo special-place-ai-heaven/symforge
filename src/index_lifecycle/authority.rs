@@ -346,6 +346,7 @@ enum SourcePhase {
     Refreshing {
         retained: GenerationIdentity,
         binding: BindingAuthority,
+        publication: PublicationIdentity,
     },
     Blocked {
         retained: Option<GenerationIdentity>,
@@ -430,7 +431,11 @@ impl SourceRuntime {
     /// Start a source in `Refreshing`, retaining one generation.
     pub fn refreshing(binding: BindingAuthority, retained: GenerationIdentity) -> Self {
         Self {
-            phase: SourcePhase::Refreshing { retained, binding },
+            phase: SourcePhase::Refreshing {
+                retained,
+                binding,
+                publication: PublicationIdentity::fresh(),
+            },
             mutation_epoch: MutationEpoch::initial(),
             permits_issued: 0,
         }
@@ -504,6 +509,54 @@ impl SourceRuntime {
         }
     }
 
+    /// The identity of the publication this source currently stands on, when it
+    /// stands on one.
+    ///
+    /// `Blocked` and `Stopping` report their immutable phase without inventing a
+    /// publication identity they never stored.
+    pub fn published_identity(&self) -> Option<PublicationIdentity> {
+        match &self.phase {
+            SourcePhase::Current(publication) => Some(publication.publication()),
+            SourcePhase::Refreshing { publication, .. } => Some(*publication),
+            SourcePhase::Loading | SourcePhase::Blocked { .. } | SourcePhase::Stopping { .. } => {
+                None
+            }
+        }
+    }
+
+    /// Publish non-`Current`, advancing the mutation epoch, and return the
+    /// identity of the publication actually stored.
+    ///
+    /// Epoch and permit record are carried across, never reset: the epoch is
+    /// monotonic for the life of the source, so a reload or rebind cannot rewind
+    /// it and let a stale authority compare equal to a later one.
+    pub fn freeze(&mut self) -> PublicationIdentity {
+        let publication = PublicationIdentity::fresh();
+        self.mutation_epoch = self.mutation_epoch.advanced();
+        let (retained, binding) = match &self.phase {
+            SourcePhase::Current(current) => (current.generation(), current.binding().clone()),
+            SourcePhase::Refreshing {
+                retained, binding, ..
+            } => (*retained, binding.clone()),
+            SourcePhase::Loading | SourcePhase::Blocked { .. } | SourcePhase::Stopping { .. } => {
+                // Nothing queryable to retain; the phase is already non-Current.
+                return self.published_identity().unwrap_or(publication);
+            }
+        };
+        self.phase = SourcePhase::Refreshing {
+            retained,
+            binding,
+            publication,
+        };
+        publication
+    }
+
+    /// Install a new `Current` publication, preserving the monotonic epoch and
+    /// the permit record.
+    pub fn install(&mut self, publication: CurrentPublication) {
+        self.phase = SourcePhase::Current(publication);
+    }
+
     /// Request the one grant that can authorize a mutation permit.
     ///
     /// On refusal, neither the mutation epoch nor the permit record advances and
@@ -542,13 +595,11 @@ impl SourceRuntime {
 
         // Publish non-Current before the grant exists. Order is the invariant:
         // the source stops being queryable first, then a mutation is authorized.
-        let epoch = self.mutation_epoch.advanced();
-        let publication = PublicationIdentity::fresh();
-        self.mutation_epoch = epoch;
-        self.phase = SourcePhase::Refreshing {
-            retained: live.generation(),
-            binding: live.binding().clone(),
-        };
+        // `freeze` performs and records that publication, and the proof below
+        // names the identity it actually stored -- not a freshly minted one that
+        // nothing published.
+        let publication = self.freeze();
+        let epoch = self.mutation_epoch;
         self.permits_issued += 1;
 
         Ok(CurrentMutationGrantAuthority {

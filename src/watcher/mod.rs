@@ -246,27 +246,35 @@ pub(crate) fn freshen_file_if_stale(
 /// `spawn_gen` and the store's under-lock check rejects the now-foreign
 /// mutation (see `slipped_past_cancellation_fence_increments_counter`).
 ///
-/// Ordering: `reload` publishes the new live index (with its new
-/// `indexed_root`) BEFORE bumping the generation (`AcqRel`), and we read the
-/// generation before the live root, so a `spawn_gen`-equal read never pairs an
-/// old generation with a new root. The value returned here is only a *better
-/// guess* than the frozen snapshot — the store re-checks the generation under
-/// its write lock, so any residual race still rejects rather than corrupts.
+/// Authority is taken from ONE publication, never inferred from two samples
+/// (T028). This previously read `current_project_generation()` and then
+/// `read().indexed_root` as separate loads, so a reload landing between them
+/// could pair one publication's generation with another's root — the exact shape
+/// the Slice 0 oracle
+/// `generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b`
+/// describes. Both values now come from the same `Arc<PublishedGeneration>`, so
+/// the generation and the root it actually served cannot disagree.
+///
+/// The store still re-checks the generation under its write lock; that check is
+/// the commit-time gate, and this function no longer has to be a "better guess"
+/// to keep it sound.
 pub(crate) fn effective_fence_generation(
     shared: &SharedIndex,
     repo_root: &Path,
     spawn_gen: u64,
 ) -> u64 {
-    let current_gen = shared.current_project_generation();
+    let published = shared.published_generation();
+    let current_gen = published.project_generation;
     if current_gen == spawn_gen {
         return spawn_gen;
     }
-    // Generation advanced since spawn. Adopt it only if the live index still
-    // serves our repo_root (same-project reload); otherwise keep the stale
-    // spawn generation so the store fence rejects the foreign mutation.
+    // Generation advanced since spawn. Adopt it only if the publication that
+    // carries that generation ALSO serves our repo_root (same-project reload);
+    // otherwise keep the stale spawn generation so the store fence rejects the
+    // foreign mutation.
     let target = crate::live_index::store::normalize_root(repo_root);
-    let same_root = shared
-        .read()
+    let same_root = published
+        .live
         .indexed_root
         .as_deref()
         .map(crate::live_index::store::normalize_root)

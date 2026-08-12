@@ -158,6 +158,16 @@ impl SourceMutationPermit {
         &self.lease
     }
 
+    /// Proof that the source published non-`Current` before this permit existed.
+    ///
+    /// Holding a permit at all is the evidence, since the proof is constructible
+    /// only inside the grant path. It is exposed so a caller can name the exact
+    /// publication that made the source non-queryable rather than asserting that
+    /// one happened.
+    pub fn published_non_current(&self) -> &NonCurrentPublicationProof {
+        &self.published_non_current
+    }
+
     /// Whether the permit has reached a terminal state.
     pub fn is_terminal(&self) -> bool {
         matches!(self.state, PermitState::Terminal(_))
@@ -174,9 +184,15 @@ impl SourceMutationPermit {
             PermitState::Granted => {}
         }
 
-        if self.published_non_current.epoch() != self.authority.epoch() {
-            return Err(AuthorityRefusal::SideEffectBeforeNonCurrentPublication);
-        }
+        // There is deliberately no runtime comparison of the proof's epoch
+        // against the authority's here. Both are assigned from the same value
+        // inside `request_mutation_grant`, so such a check can never fail: it
+        // would read as ordering verification while verifying nothing, which is
+        // worse than no check because it implies an observation that is not
+        // being made. The ordering is enforced by construction instead --
+        // `NonCurrentPublicationProof` is constructible only inside the grant
+        // path, after the source has published non-`Current` -- so holding this
+        // permit at all is the evidence.
         if !self.lease.is_live() {
             return Err(AuthorityRefusal::PhysicalRootReplaced);
         }

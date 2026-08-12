@@ -195,8 +195,15 @@ fn granting_publishes_non_current_before_the_permit_exists() {
     assert_eq!(grant.published_non_current().epoch(), runtime.mutation_epoch());
 
     let drain = Arc::new(PermitDrainSignal::new());
+    let published = grant.published_non_current().publication();
     let mut permit = SourceMutationPermit::grant(grant, Arc::clone(&lease), Arc::clone(&drain))
         .expect("a grant matching its lease must produce a permit");
+
+    // The permit carries the exact publication that made the source
+    // non-queryable, rather than merely asserting that one happened.
+    assert_eq!(permit.published_non_current().publication(), published);
+    assert_eq!(runtime.published_identity(), Some(published));
+
     permit
         .start_side_effect()
         .expect("a permit whose source published non-Current may act");
@@ -326,6 +333,69 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
     assert_eq!(stale, AuthorityRefusal::WholeAuthorityMismatch);
     assert!(!lease_a.is_live(), "installing root B must revoke root A");
     assert!(lease_b.is_live(), "root B must be installed");
+}
+
+#[test]
+fn the_non_current_proof_names_the_publication_the_source_actually_stored() {
+    let (mut runtime, _lease, live) = current_source();
+    let grant = runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+
+    // The proof must not name a publication identity that nothing published.
+    assert_eq!(
+        runtime.published_identity(),
+        Some(grant.published_non_current().publication()),
+        "the proof named a publication the source never stored"
+    );
+    assert_ne!(
+        grant.published_non_current().publication(),
+        live,
+        "freezing must publish a new identity, not reuse the Current one"
+    );
+}
+
+#[test]
+fn the_mutation_epoch_never_rewinds_across_a_transition() {
+    let (mut runtime, lease_a, live) = current_source();
+
+    // Burn an epoch by granting and draining a permit.
+    let grant = runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    let drain = Arc::new(PermitDrainSignal::new());
+    drop(
+        SourceMutationPermit::grant(grant, Arc::clone(&lease_a), Arc::clone(&drain))
+            .expect("grant must produce a permit"),
+    );
+    let before = runtime.mutation_epoch();
+    let permits_before = runtime.permits_issued();
+    assert!(before.get() >= 1);
+
+    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    transition::apply(
+        &mut runtime,
+        TransitionKind::Rebind,
+        &lease_a,
+        BindingAuthority::bind(lease_b.identity()),
+        ObserverToken::fresh(),
+        Some(&drain),
+    )
+    .expect("a drained source may transition");
+
+    // A transition that reset the epoch would let a stale authority compare
+    // equal to a later one.
+    assert!(
+        runtime.mutation_epoch() > before,
+        "epoch rewound across a transition: {:?} -> {:?}",
+        before,
+        runtime.mutation_epoch()
+    );
+    assert_eq!(
+        runtime.permits_issued(),
+        permits_before,
+        "a transition must not discard the permit record"
+    );
 }
 
 #[test]

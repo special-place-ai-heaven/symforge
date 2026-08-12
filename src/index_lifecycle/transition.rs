@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use super::authority::{
-    AuthorityRefusal, BindingAuthority, CurrentPublication, ObserverToken, PhaseName, SourceRuntime,
+    AuthorityRefusal, BindingAuthority, CurrentPublication, ObserverToken, SourceRuntime,
 };
 use super::mutation::PermitDrainSignal;
 use super::physical_root::PhysicalRootLease;
@@ -69,19 +69,12 @@ pub fn apply(
 ) -> Result<TransitionReceipt, AuthorityRefusal> {
     let mut steps = Vec::new();
 
-    // Freeze: stop granting before anything else moves.
-    if runtime.phase() == PhaseName::Current {
-        let retained = runtime
-            .live_publication()
-            .expect("phase reported Current")
-            .generation();
-        let binding = runtime
-            .live_publication()
-            .expect("phase reported Current")
-            .binding()
-            .clone();
-        *runtime = SourceRuntime::refreshing(binding, retained);
-    }
+    // Freeze: stop granting before anything else moves. This mutates the source
+    // in place rather than replacing it, so the monotonic mutation epoch and the
+    // permit record survive the transition. Constructing a fresh `SourceRuntime`
+    // here would rewind the epoch to its initial value on every reload and
+    // rebind, which would let a stale authority compare equal to a later one.
+    runtime.freeze();
     steps.push(TransitionStep::Freeze);
 
     // Drain: an outstanding permit must have ended by some terminal path.
@@ -95,7 +88,7 @@ pub fn apply(
     // Install: revoke the outgoing root before the incoming binding is live, so
     // no surviving permit can resolve a path under the replaced root.
     outgoing.revoke();
-    *runtime = SourceRuntime::current(CurrentPublication::promote(incoming, observer_cut));
+    runtime.install(CurrentPublication::promote(incoming, observer_cut));
     steps.push(TransitionStep::Install);
 
     Ok(TransitionReceipt { kind, steps })
