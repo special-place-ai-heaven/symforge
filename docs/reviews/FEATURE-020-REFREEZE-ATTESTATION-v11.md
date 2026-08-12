@@ -5,7 +5,7 @@ This detached attestation binds the refreeze manifest to the exact baseline, des
 <!-- SYMFORGE FEATURE020 ATTESTATION V11 JSON START -->
 ```json
 {
-  "amendment_set_id": "3447921dca81bba970ad1de46cac994f7e9483aa98f6635cc9aedad48eb87acc",
+  "amendment_set_id": "dadc713ed3910f894f6e5fdd81e3570e2b4ea6816e48226754f2c8fec099eb71",
   "baseline": {
     "commit": "1521abb0197dac16e046a2b0b20a66a70c3a909b",
     "tree": "c26043df97571dd079681291d2621a4e06438d8d"
@@ -26,7 +26,7 @@ This detached attestation binds the refreeze manifest to the exact baseline, des
   "kind": "symforge-feature-020-refreeze-attestation",
   "manifest": {
     "path": "specs/020-repository-knowledge-index/REFREEZE-MANIFEST-v11.md",
-    "sha256": "81e760fecebda770acc3e474939cef0eec1ddafd79c842a33212abe64d9c9232"
+    "sha256": "1f08169ffd784142c59a6bde4e81b9ed3e5aa0ee4e07e07cab3715e00a622d8b"
   },
   "public_api": {
     "canonical_sha256": "c45f3cd3f77e5690ad1dcd2e5fc7e39e30d52df38fa564d7b663e1c95823a7da",

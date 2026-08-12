@@ -256,6 +256,8 @@ jobs:
         run: python execution/conventional_commits.py check-range "HEAD^!"
 
       - name: Run version sync tests
+        env:
+          SYMFORGE_REQUIRE_SSHSIG: '1'
         run: python -m unittest discover -s execution -p 'test_*.py'
 
       - name: Verify Feature 020 V11 refreeze integrity
@@ -852,6 +854,8 @@ jobs:
           fi
 
           FROZEN_PATHS=(
+            .gitattributes
+            .github/CODEOWNERS
             .github/release-evidence-requirements-v11.json
             .github/workflows/ci.yml
             .github/workflows/release.yml
@@ -1968,6 +1972,8 @@ jobs:
           python-version: '3.12'
 
       - name: Run version sync tests
+        env:
+          SYMFORGE_REQUIRE_SSHSIG: '1'
         run: python -m unittest discover -s execution -p 'test_*.py'
 
       - name: Verify release metadata stays aligned

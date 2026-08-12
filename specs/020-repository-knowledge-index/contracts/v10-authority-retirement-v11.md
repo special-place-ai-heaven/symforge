@@ -3,10 +3,13 @@
 This is the closed V10 authority and ingress retirement inventory. Slice 4 owns
 the final cut: every member below must either route through the V11 runtime or
 be unreachable before Preventive V1 is exposed. Absence from this inventory is
-not permission to survive. Before activation, the byte census below closes the four
-authority-bearing source categories against unlisted additions; after activation,
-their executed Slice 4 reachability cases replace the preactivation census. All
-retirement evidence is planned and unexecuted.
+not permission to survive. Before activation, the byte census below closes the five
+authority-bearing source categories against unlisted additions. Each source blob is
+decoded as UTF-8 and only CRLF pairs are normalized to LF before hashing, so an
+otherwise byte-identical LF or CRLF checkout has the same census; no other byte or
+Unicode normalization is permitted. After activation, the executed Slice 4
+reachability cases replace the preactivation census. All retirement evidence is
+planned and unexecuted.
 
 <!-- SYMFORGE V10 AUTHORITY RETIREMENT V11 JSON START -->
 ```json
@@ -21,19 +24,23 @@ retirement evidence is planned and unexecuted.
   "preactivation_closure": {
     "writers": {
       "paths": ["src/cli/init.rs", "src/gitignore_hygiene.rs", "src/live_index/persist.rs", "src/live_index/single_file.rs", "src/protocol/edit.rs", "src/protocol/edit_tools.rs", "src/protocol/knowledge_curation.rs", "src/protocol/tools.rs"],
-      "digest": "9117d0f66dd138b33c84c008ce4ab43f8f6dc1724d5192105d68fd8fa7347ebb"
+      "digest": "e2e4120433514d9c0ea3ad366c26ef14a50bac5950ec7fe4f361c8e3a5ac00ae"
     },
     "callbacks": {
       "paths": ["src/daemon.rs", "src/live_index/git_temporal.rs", "src/live_index/persist.rs", "src/main.rs", "src/protocol/edit_hooks.rs", "src/protocol/knowledge_curation.rs", "src/server/serve.rs", "src/watcher/mod.rs"],
-      "digest": "d90ed99bbff93ad10945276e1fd12c07f18e6eae29795c11ea2aebb8c9987024"
+      "digest": "0338146c8ee23d07abc28a2bae09aee740d854ec1a24370e22b77bc83bb80216"
     },
     "publication_roots": {
       "paths": ["src/daemon.rs", "src/live_index/store.rs", "src/protocol/mod.rs", "src/server/mod.rs", "src/sidecar/mod.rs"],
-      "digest": "27ba02d4ac620eea372f3fb0854a0f6de75c688d469804fcc5dd33b1dddd3a12"
+      "digest": "6f2e24f4c15e6fd58d97b5ebaefff228700e7ca7d52bfa87451e71acbd47cf1d"
     },
     "cache": {
       "paths": ["src/daemon.rs", "src/protocol/knowledge_curation.rs", "src/protocol/session.rs", "src/sidecar/mod.rs", "src/worktree.rs"],
-      "digest": "c43a5e9ee857686d44b88481e21e19357be53655e418794bb1326ed61d2a9850"
+      "digest": "554deb77a982c03738e20f22a3d43424a05500367226b9de28bf75fc084cdd99"
+    },
+    "ccr": {
+      "paths": ["src/protocol/ccr.rs"],
+      "digest": "d6bb6ecb8e64f955f796d0851901f21cfe8b96b99f83b1d7c7f392f08afff9e8"
     }
   },
   "entries": [

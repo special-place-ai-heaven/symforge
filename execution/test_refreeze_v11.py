@@ -29,6 +29,9 @@ API_PATH = f"{FEATURE_ROOT}/contracts/public-api-v11.json"
 FIXTURE_MANIFEST_PATH = (
     "tests/fixtures/public-api-v11-consumer/fixture-manifest.json"
 )
+RELEASE_EVIDENCE_REQUIREMENTS_PATH = (
+    ".github/release-evidence-requirements-v11.json"
+)
 CONTEXT_PATH = "CONTEXT.md"
 MANIFEST_START = "<!-- SYMFORGE FEATURE020 REFREEZE V11 JSON START -->"
 MANIFEST_END = "<!-- SYMFORGE FEATURE020 REFREEZE V11 JSON END -->"
@@ -54,6 +57,14 @@ REAL_SSH_KEYGEN_EXECUTABLE = (
 SYSTEM_SSH_KEYGEN_EXECUTABLE = (
     REAL_SSH_KEYGEN_EXECUTABLE or SYSTEM_GIT_EXECUTABLE
 )
+
+
+def required_sshsig_executable() -> Path | None:
+    if REAL_SSH_KEYGEN_EXECUTABLE is not None:
+        return REAL_SSH_KEYGEN_EXECUTABLE
+    if os.environ.get("SYMFORGE_REQUIRE_SSHSIG") == "1":
+        raise RuntimeError("required ssh-keygen executable unavailable")
+    return None
 
 REQUIRED_NORMATIVE_PATHS = [
     CONTEXT_PATH,
@@ -125,6 +136,11 @@ class RefreezeFixture:
         self.git("config", "user.name", "Refreeze Test")
         self.git("config", "core.autocrlf", "false")
 
+        repository_root = Path(__file__).resolve().parent.parent
+        self.write(
+            RELEASE_EVIDENCE_REQUIREMENTS_PATH,
+            (repository_root / RELEASE_EVIDENCE_REQUIREMENTS_PATH).read_bytes(),
+        )
         baseline_lines = [f"baseline clause {index}\n" for index in range(1, 20)]
         self.write(f"{FEATURE_ROOT}/spec.md", "".join(baseline_lines).encode())
         self.write(DESIGN_PATH, b"cleared lifecycle design\n")
@@ -208,7 +224,6 @@ class RefreezeFixture:
             ).encode(),
         )
 
-        repository_root = Path(__file__).resolve().parent.parent
         api_bytes = (repository_root / API_PATH).read_bytes()
         self.api = json.loads(api_bytes)
         for corpus_entry in self.api["configuration_domain"]["cover"][
@@ -384,6 +399,15 @@ class RefreezeFixture:
         api_entry["sha256"] = sha256(api_bytes)
         return self.reseal_manifest(manifest)
 
+    def replace_release_evidence_phase(self, phase: str) -> str:
+        requirements = json.loads(self.read(RELEASE_EVIDENCE_REQUIREMENTS_PATH))
+        requirements["phase"] = phase
+        self.write(
+            RELEASE_EVIDENCE_REQUIREMENTS_PATH,
+            json.dumps(requirements, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        return self.commit_all(f"set release evidence phase to {phase}")
+
     def make_external_approval(
         self,
     ) -> tuple[dict[str, object], Path, Path, Path, str]:
@@ -471,7 +495,7 @@ class RefreezeV11Tests(unittest.TestCase):
 
         for path in reversed(created):
             if path.exists():
-                shutil.rmtree(path, onerror=remove_readonly)
+                shutil.rmtree(path, onexc=remove_readonly)
 
     def assert_internal_error(
         self,
@@ -501,6 +525,29 @@ class RefreezeV11Tests(unittest.TestCase):
         )
 
         self.assertEqual(status, 0)
+
+    def test_verify_internal_accepts_release_evidence_activation(self) -> None:
+        fixture = RefreezeFixture()
+        target = fixture.replace_release_evidence_phase("active")
+
+        result = refreeze_v11.verify_internal(
+            fixture.root,
+            target,
+            git_executable=SYSTEM_GIT_EXECUTABLE,
+        )
+
+        self.assertEqual(result.target_commit, target)
+
+    def test_verify_internal_rejects_release_evidence_phase_regression(self) -> None:
+        fixture = RefreezeFixture()
+        fixture.replace_release_evidence_phase("active")
+        target = fixture.replace_release_evidence_phase("pre_activation")
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "RELEASE_EVIDENCE_PHASE_REGRESSION",
+        )
 
     def test_fixture_directories_are_removed_by_test_cleanup(self) -> None:
         fixture = RefreezeFixture()
@@ -1157,6 +1204,72 @@ class RefreezeV11Tests(unittest.TestCase):
             "FIXTURE_MANIFEST_COVERAGE_INVALID",
         )
 
+    def test_verify_internal_rejects_fabricated_pre_activation_fact(self) -> None:
+        fixture = RefreezeFixture()
+        fixture_manifest = json.loads(fixture.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["pre_activation_facts"]["assignment_proof_sha256"] = (
+            "0" * 64
+        )
+        fixture.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        target = fixture.commit_all("fabricate pre-activation fixture evidence")
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "FIXTURE_MANIFEST_PREACTIVATION_FACTS_INVALID",
+        )
+
+    def test_verify_internal_rejects_fixture_evidence_mapping_drift(self) -> None:
+        fixture = RefreezeFixture()
+        fixture_manifest = json.loads(fixture.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["closed_evidence_mapping"]["closed"] = False
+        fixture.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        target = fixture.commit_all("drift fixture evidence mapping")
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "FIXTURE_MANIFEST_CLOSED_EVIDENCE_MAPPING_INVALID",
+        )
+
+    def test_verify_internal_rejects_fixture_input_inventory_drift(self) -> None:
+        fixture = RefreezeFixture()
+        fixture_manifest = json.loads(fixture.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["inputs"].append("fabricated-input.rs")
+        fixture.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        target = fixture.commit_all("drift fixture input inventory")
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "FIXTURE_MANIFEST_INPUTS_INVALID",
+        )
+
+    def test_verify_internal_rejects_fixture_limitations_drift(self) -> None:
+        fixture = RefreezeFixture()
+        fixture_manifest = json.loads(fixture.read(FIXTURE_MANIFEST_PATH))
+        fixture_manifest["limitations"].append("fabricated limitation")
+        fixture.write(
+            FIXTURE_MANIFEST_PATH,
+            json.dumps(fixture_manifest, indent=2, sort_keys=True).encode() + b"\n",
+        )
+        target = fixture.commit_all("drift fixture limitations")
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "FIXTURE_MANIFEST_LIMITATIONS_INVALID",
+        )
+
     def test_verify_internal_requires_compile_fail_expected_error_codes(self) -> None:
         fixture = RefreezeFixture()
         cases_path = (
@@ -1187,6 +1300,31 @@ class RefreezeV11Tests(unittest.TestCase):
             fixture,
             target,
             "API_COMPILE_FAIL_EXPECTED_ERROR_CODES_INVALID",
+        )
+
+    def test_verify_internal_rejects_fabricated_compile_fail_results(self) -> None:
+        fixture = RefreezeFixture()
+        cases_path = (
+            "tests/fixtures/public-api-v11-consumer/compile-fail/cases.json"
+        )
+        case_catalog = json.loads(fixture.read(cases_path))
+        case_catalog["expected_results_sha256"] = "0" * 64
+        case_bytes = json.dumps(case_catalog, indent=2, sort_keys=True).encode() + b"\n"
+        fixture.write(cases_path, case_bytes)
+
+        api = deepcopy(fixture.api)
+        corpus_entry = next(
+            item
+            for item in api["configuration_domain"]["cover"]["input_corpus"]
+            if item["path"] == cases_path
+        )
+        corpus_entry["sha256"] = sha256(case_bytes)
+        target = fixture.replace_public_api(api)
+
+        self.assert_internal_error(
+            fixture,
+            target,
+            "API_COMPILE_FAIL_EXPECTED_RESULTS_INVALID",
         )
 
     def test_verify_internal_rejects_minimal_vacuous_public_api(self) -> None:
@@ -3698,13 +3836,12 @@ class RefreezeV11Tests(unittest.TestCase):
             )
 
     def test_sshsig_invocation_uses_argv_stdin_and_no_shell(self) -> None:
-        completed = subprocess.CompletedProcess(
-            [str(SYSTEM_SSH_KEYGEN_EXECUTABLE)], 0
-        )
+        ssh_keygen = Path("external.ssh-keygen")
+        completed = subprocess.CompletedProcess([str(ssh_keygen)], 0)
         with patch.object(refreeze_v11.subprocess, "run", return_value=completed) as run:
             accepted = refreeze_v11.verify_sshsig(
                 b"canonical approval bytes",
-                ssh_keygen_executable=SYSTEM_SSH_KEYGEN_EXECUTABLE,
+                ssh_keygen_executable=ssh_keygen,
                 signature=Path("external.sshsig"),
                 allowed_signers=Path("external.allowed_signers"),
                 release_identity="release-ci@example.invalid",
@@ -3716,7 +3853,7 @@ class RefreezeV11Tests(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                str(SYSTEM_SSH_KEYGEN_EXECUTABLE),
+                str(ssh_keygen),
                 "-Y",
                 "verify",
                 "-f",
@@ -3734,14 +3871,27 @@ class RefreezeV11Tests(unittest.TestCase):
         self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
 
-    @unittest.skipIf(
-        REAL_SSH_KEYGEN_EXECUTABLE is None,
-        "trusted ssh-keygen executable unavailable",
-    )
+    def test_sshsig_required_mode_rejects_an_unavailable_executable(self) -> None:
+        with (
+            patch.dict(os.environ, {"SYMFORGE_REQUIRE_SSHSIG": "1"}),
+            patch(
+                f"{__name__}.REAL_SSH_KEYGEN_EXECUTABLE",
+                None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "required ssh-keygen executable unavailable",
+            ),
+        ):
+            required_sshsig_executable()
+
     def test_sshsig_real_ed25519_round_trip_fails_closed(self) -> None:
-        ssh_keygen = REAL_SSH_KEYGEN_EXECUTABLE
-        self.assertIsNotNone(ssh_keygen)
-        assert ssh_keygen is not None
+        try:
+            ssh_keygen = required_sshsig_executable()
+        except RuntimeError as error:
+            self.fail(str(error))
+        if ssh_keygen is None:
+            self.skipTest("trusted ssh-keygen executable unavailable")
         approval_bytes = b"canonical approval bytes for a real SSHSIG round trip"
         release_identity = "release-ci@example.invalid"
 

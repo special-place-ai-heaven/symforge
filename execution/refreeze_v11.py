@@ -31,6 +31,9 @@ FIXTURE_MANIFEST_PATH = (
 COMPILE_FAIL_CASES_PATH = (
     "tests/fixtures/public-api-v11-consumer/compile-fail/cases.json"
 )
+RELEASE_EVIDENCE_REQUIREMENTS_PATH = (
+    ".github/release-evidence-requirements-v11.json"
+)
 CONTEXT_PATH = "CONTEXT.md"
 
 MANIFEST_START = "<!-- SYMFORGE FEATURE020 REFREEZE V11 JSON START -->"
@@ -651,6 +654,40 @@ class GitObjects:
         )
         return result.returncode == 0
 
+    def path_history(self, commit: str, path: str) -> list[str]:
+        _validate_repo_path(path)
+        output = self._run(
+            ["rev-list", "--full-history", commit, "--", path]
+        ).stdout
+        commits: list[str] = []
+        for raw_line in output.splitlines():
+            value = _decode_ascii_line(raw_line, "GIT_HISTORY_INVALID")
+            if GIT_OID_RE.fullmatch(value) is None:
+                raise RefreezeError("GIT_HISTORY_INVALID")
+            commits.append(value)
+        return commits
+
+    def blob_exists(self, commit: str, path: str) -> bool:
+        _validate_repo_path(path)
+        tree_output = self._run(
+            ["ls-tree", "-z", "--full-tree", commit, "--", path]
+        ).stdout
+        raw_entries = [entry for entry in tree_output.split(b"\0") if entry]
+        if not raw_entries:
+            return False
+        if len(raw_entries) != 1:
+            raise RefreezeError("GIT_TREE_ENTRY_INVALID")
+        mode, object_type, _oid, discovered_path = self._parse_tree_entry(
+            raw_entries[0]
+        )
+        if (
+            discovered_path != path
+            or object_type != b"blob"
+            or mode not in {b"100644", b"100755"}
+        ):
+            raise RefreezeError("GIT_TREE_ENTRY_UNSUPPORTED")
+        return True
+
     @staticmethod
     def _parse_tree_entry(raw_entry: bytes) -> tuple[bytes, bytes, str, str]:
         metadata, separator, raw_path = raw_entry.partition(b"\t")
@@ -986,6 +1023,11 @@ def _validate_compile_fail_cases(
         "API_COMPILE_FAIL_CASE_CATALOG_INVALID",
     )
     _exact(
+        case_catalog["expected_results_sha256"],
+        None,
+        "API_COMPILE_FAIL_EXPECTED_RESULTS_INVALID",
+    )
+    _exact(
         case_catalog["materialization_rule"],
         "Expand every subject/path in every group to an independent temporary "
         "dependent crate; one compiler invocation per atomic case; accept a "
@@ -1117,6 +1159,72 @@ def _validate_fixture_manifest(
     )
     if coverage != expected_coverage:
         raise RefreezeError("FIXTURE_MANIFEST_COVERAGE_INVALID")
+    pre_activation_facts = _closed_object(
+        fixture_manifest["pre_activation_facts"],
+        frozenset(
+            {
+                "all_cfg_inventory_sha256",
+                "assignment_proof_sha256",
+                "dependent_positive_compile_result",
+                "generated_rustdoc_graph_set_sha256",
+                "negative_case_results_sha256",
+                "observed_v10_atom_set_sha256",
+                "predicate_inventory_sha256",
+                "rustc_cfg_sha256_by_target",
+            }
+        ),
+        "FIXTURE_MANIFEST_PREACTIVATION_FACTS_INVALID",
+    )
+    if any(value is not None for value in pre_activation_facts.values()):
+        raise RefreezeError("FIXTURE_MANIFEST_PREACTIVATION_FACTS_INVALID")
+    _exact(
+        fixture_manifest["closed_evidence_mapping"],
+        {
+            "case_catalog": "compile-fail/cases.json",
+            "closed": True,
+            "non_exhaustive_assertions": [
+                {
+                    "assertion_id": "authority-types-01-not-deserialize",
+                    "required_exhaustive_evidence": "public_item_graph",
+                    "required_probe_completeness": "non_exhaustive",
+                }
+            ],
+            "unlisted_non_exhaustive_assertion": "reject",
+            "unsupported_exhaustive_evidence": "reject",
+        },
+        "FIXTURE_MANIFEST_CLOSED_EVIDENCE_MAPPING_INVALID",
+    )
+    _exact(
+        fixture_manifest["inputs"],
+        [
+            "README.md",
+            "all-cfg/Cargo.toml",
+            "all-cfg/src/lib.rs",
+            "compile-fail/Cargo.toml",
+            "compile-fail/cases.json",
+            "compile-fail/src/lib.rs",
+            "compile-fail/templates/impl_family_absent.rs.in",
+            "compile-fail/templates/path_absent.rs.in",
+            "compile-fail/templates/trait_absent.rs.in",
+            "dependent-positive/Cargo.toml",
+            "dependent-positive/src/lib.rs",
+            "graph-cover.json",
+        ],
+        "FIXTURE_MANIFEST_INPUTS_INVALID",
+    )
+    _exact(
+        fixture_manifest["limitations"],
+        [
+            "The current product crate does not expose the V11 API; these are "
+            "inputs, not passing compiler evidence.",
+            "Impl-family rules are exhaustive only in the future public-item "
+            "graph comparison; compile-fail templates use a distinct local Probe "
+            "type as a non-reflexive external-consumer witness.",
+            "The checked-in corpus has no self-authorizing generator or verifier; "
+            "the frozen contract and externally approved target remain authoritative.",
+        ],
+        "FIXTURE_MANIFEST_LIMITATIONS_INVALID",
+    )
 
 
 def _validate_api(
@@ -2450,7 +2558,6 @@ def _validate_api_contract(api: dict[str, object]) -> None:
         raise RefreezeError("API_PREACTIVATION_INVALID")
     category_ids: list[str] = []
     old_atoms: list[str] = []
-    mapped_v11_atoms: list[str] = []
     kept_v11_atoms: list[str] = []
     v11_atom_universe = module_paths | export_paths | associated_atom_paths
     for category in categories:
@@ -2471,7 +2578,6 @@ def _validate_api_contract(api: dict[str, object]) -> None:
             )
             if any(atom not in v11_atom_universe for atom in category_v11_atoms):
                 raise RefreezeError("API_MIGRATION_V11_ATOM_INVALID")
-            mapped_v11_atoms.extend(category_v11_atoms)
             if decision == "keep":
                 if category_v11_atoms != category_atoms:
                     raise RefreezeError("API_MIGRATION_KEEP_IDENTITY_INVALID")
@@ -2482,17 +2588,12 @@ def _validate_api_contract(api: dict[str, object]) -> None:
         or len(set(old_atoms)) != len(old_atoms)
     ):
         raise RefreezeError("API_MIGRATION_ATOM_PARTITION_INVALID")
-    mapped_v11_atom_set = set(mapped_v11_atoms)
     expected_introduced_v11_atoms = (
         v11_atom_universe
         - set(kept_v11_atoms)
     )
     if set(introduced_v11_atoms) != expected_introduced_v11_atoms:
         raise RefreezeError("API_MIGRATION_INTRODUCED_ATOMS_INVALID")
-    if not (v11_atom_universe - set(introduced_v11_atoms)).issubset(
-        mapped_v11_atom_set
-    ):
-        raise RefreezeError("API_MIGRATION_V11_COVERAGE_INVALID")
     root_categories = [item for item in categories if item["id"] == "v10-00-crate-root"]
     if len(root_categories) != 1:
         raise RefreezeError("API_V10_ROOT_MAPPING_INVALID")
@@ -2925,6 +3026,73 @@ def _validate_attestation(
     return attestation_path, _sha256(raw)
 
 
+def _release_evidence_phase(git: GitObjects, commit: str) -> str:
+    requirements = _closed_object(
+        _parse_json_bytes(
+            git.read_blob(commit, RELEASE_EVIDENCE_REQUIREMENTS_PATH)
+        ),
+        frozenset(
+            {
+                "kind",
+                "phase",
+                "required_oracle_receipts",
+                "required_review_documents",
+                "required_task_receipts",
+                "schema_version",
+            }
+        ),
+        "RELEASE_EVIDENCE_REQUIREMENTS_INVALID",
+    )
+    _exact(
+        requirements["kind"],
+        "symforge.lifecycle_release_evidence_requirements.v11",
+        "RELEASE_EVIDENCE_REQUIREMENTS_INVALID",
+    )
+    _exact(
+        requirements["schema_version"],
+        1,
+        "RELEASE_EVIDENCE_REQUIREMENTS_INVALID",
+    )
+    phase = requirements["phase"]
+    if phase not in {"active", "pre_activation"}:
+        raise RefreezeError("RELEASE_EVIDENCE_REQUIREMENTS_INVALID")
+    requirement_fields = (
+        "required_oracle_receipts",
+        "required_review_documents",
+        "required_task_receipts",
+    )
+    for field in requirement_fields:
+        _sorted_unique_strings(
+            requirements[field],
+            "RELEASE_EVIDENCE_REQUIREMENTS_INVALID",
+            nonempty=False,
+        )
+    if phase == "pre_activation" and any(
+        requirements[field] for field in requirement_fields
+    ):
+        raise RefreezeError("RELEASE_EVIDENCE_REQUIREMENTS_INVALID")
+    return phase
+
+
+def _validate_release_evidence_phase_history(
+    git: GitObjects,
+    target_commit: str,
+) -> None:
+    if _release_evidence_phase(git, target_commit) != "pre_activation":
+        return
+    for ancestor in git.path_history(
+        target_commit,
+        RELEASE_EVIDENCE_REQUIREMENTS_PATH,
+    ):
+        if ancestor == target_commit or not git.blob_exists(
+            ancestor,
+            RELEASE_EVIDENCE_REQUIREMENTS_PATH,
+        ):
+            continue
+        if _release_evidence_phase(git, ancestor) == "active":
+            raise RefreezeError("RELEASE_EVIDENCE_PHASE_REGRESSION")
+
+
 def verify_internal(
     root: Path,
     target_ref: str,
@@ -2934,6 +3102,7 @@ def verify_internal(
     git = GitObjects(root, git_executable=git_executable)
     target_commit = git.resolve_commit(target_ref)
     target_tree = git.resolve_tree(target_commit)
+    _validate_release_evidence_phase_history(git, target_commit)
     manifest_bytes = git.read_blob(target_commit, MANIFEST_PATH)
     manifest = _closed_object(
         _parse_sentinel_json(manifest_bytes, MANIFEST_START, MANIFEST_END),

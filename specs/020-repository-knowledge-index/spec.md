@@ -922,19 +922,44 @@ historical scope can still retrieve them.
   quarantine, checkpoint, or state-write failure MUST degrade persistence health
   without changing source identity or, by itself, revoking a valid Current
   generation. Query readiness remains independent from durability but depends on
-  complete live observation. Promotion and each later complete whole-declared-scope
-  verification pass set `verification_deadline = completion_monotonic + 15 minutes`
-  for the exact project-slot instance, source-slot instance, generation digest,
-  observer cut, policy version, and declared scope. A partial slice, cancellation,
-  retry, cursor resume, persistence failure, or process restart MUST NOT advance or
-  reconstruct that deadline; restart begins non-current until a fresh complete proof.
+  complete live observation. A whole-declared-scope verification pass begins from a
+  sealed `VerificationScopeReceipt` bound to the exact project-slot instance,
+  source-slot instance, generation digest, stable observer cut, policy version, and
+  declared scope. That receipt enumerates every canonical catalog entry and terminal
+  disposition, admitted source-byte range, scope-discovery obligation, required
+  derived artifact, and required certificate. Completion requires authoritative
+  stable-cut rescans at both boundaries, an exact path/disposition bijection, every
+  catalog obligation checked, every admitted byte range rehashed, every required
+  derived artifact and certificate recomputed, and zero missing, extra, skipped, or
+  unresolved obligations; any identity, cut, path, policy, or content drift aborts
+  the pass and cannot emit a complete `VerificationRecord`.
+
+  Under the default finite profile, `verification_bytes` is admitted-source plus
+  required-artifact bytes and is at most 17,179,869,184; `verification_entries` is
+  catalog, disposition, discovery, and artifact obligations and is at most 200,000.
+  Current promotion requires a `VerificationFeasibilityReceipt` reserving at least
+  33,554,432 verification bytes/second and 1,000 verification entries/second, with
+  `ceil(verification_bytes / 33554432) + ceil(verification_entries / 1000) <= 720`
+  seconds. The successor pass MUST start within 180 seconds of the prior completion,
+  so even the default maximum (512 + 200 = 712 seconds) completes before the fixed
+  900-second deadline. A source outside either bound, without both reservations, or
+  with a computed pass bound above 720 seconds remains non-current with
+  `SourceRefusal`; runtime configuration cannot extend these default ceilings or the
+  deadline.
+
+  Promotion and each later complete whole-declared-scope verification pass set
+  `verification_deadline = completion_monotonic + 15 minutes` for that exact sealed
+  identity. A partial slice, cancellation, retry, cursor resume, persistence failure,
+  or process restart MUST NOT advance or reconstruct that deadline; restart begins
+  non-current until a fresh complete proof.
   At or after the monotonic deadline, if no newer complete `VerificationRecord` is
   bound to that exact identity tuple, the source supervisor MUST atomically latch
   `VerificationOverdueLatched` before any strict lease can linearize. An
   absent/gapped observer, incomplete baseline, unknown ordering, scope-dirty marker,
   or that overdue latch MUST synchronously make strict acquisition non-current and
   return `SourceRefusal`. Only a fresh complete exact-bound verification and
-  publication may clear the latch. Durable
+  publication may clear the latch. Loss of the reserved service floor makes the
+  source non-current rather than extending the deadline. Durable
   cross-restart `index_folder` idempotency uses global control state; when unavailable
   replay remains process-local and is labeled non-durable. A stored completion
   receipt is historical evidence, not a live postcondition: same-key/same-hash replay

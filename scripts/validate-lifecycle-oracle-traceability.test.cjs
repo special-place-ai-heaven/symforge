@@ -452,7 +452,7 @@ function buildPositiveMaterializedFixture(root) {
     workflow_commit: releaseCommit,
     workflow_run_id: "1",
     workflow_run_attempt: 1,
-    workflow_job: "gate-release-ref",
+    workflow_job: "display-name-is-not-a-trust-property",
     workflow_event: "workflow_dispatch",
     status: "passed",
   };
@@ -620,12 +620,33 @@ const cases = [
     },
   },
   {
+    name: "whole-scope verification omits its exact completion and feasibility proof",
+    expected: "ERROR VERIFICATION_PASS_ORACLE_INVALID:",
+    mutate(root) {
+      mutateSentinel(root, acceptancePath, acceptanceStart, acceptanceEnd, (acceptance) => {
+        const oracle = acceptance.oracles.find((item) => item.oracle_id === "ORACLE-ROLLING-VERIFICATION-COVERAGE");
+        oracle.assertions = oracle.assertions.filter((assertion) => !assertion.startsWith("A complete whole-declared-scope pass"));
+      });
+    },
+  },
+  {
     name: "new writer in a retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
     mutate(root) {
       fs.appendFileSync(
         path.join(root, "src/protocol/edit.rs"),
         "\npub fn unretired_writer(path: &std::path::Path) { std::fs::write(path, b\"unretired\").unwrap(); }\n",
+        "utf8",
+      );
+    },
+  },
+  {
+    name: "new CCR path in its retirement-owned source file",
+    expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    mutate(root) {
+      fs.appendFileSync(
+        path.join(root, "src/protocol/ccr.rs"),
+        "\npub fn unretired_ccr_path(result: String) -> String { rewrite_footer_for_symforge_facade(result) }\n",
         "utf8",
       );
     },
@@ -1650,6 +1671,18 @@ try {
   else if (fixtureBaseline.status !== 0) failures.push(`fixture baseline: checker failed (${`${fixtureBaseline.stdout || ""}${fixtureBaseline.stderr || ""}`.trim()})`);
 } finally {
   safeRemoveFixture(fixtureBaselineRoot);
+}
+const closureLineEndingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
+try {
+  copyFixture(closureLineEndingRoot);
+  const writerPath = path.join(closureLineEndingRoot, "src/protocol/edit.rs");
+  const writerText = fs.readFileSync(writerPath, "utf8").replace(/\r\n/gu, "\n");
+  fs.writeFileSync(writerPath, writerText, "utf8");
+  const closureLineEnding = runChecker(closureLineEndingRoot);
+  if (closureLineEnding.error) failures.push(`closure line-ending equivalence: spawn failed (${closureLineEnding.error.code || closureLineEnding.error.message})`);
+  else if (closureLineEnding.status !== 0) failures.push(`closure line-ending equivalence: checker failed (${`${closureLineEnding.stdout || ""}${closureLineEnding.stderr || ""}`.trim()})`);
+} finally {
+  safeRemoveFixture(closureLineEndingRoot);
 }
 const postactivationOrdinaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
 try {

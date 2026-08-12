@@ -96,7 +96,7 @@ const RETIREMENT_CATEGORIES = [
   "compatibility_aliases",
   "raw_embed",
 ];
-const RETIREMENT_CLOSURE_CATEGORIES = ["writers", "callbacks", "publication_roots", "cache"];
+const RETIREMENT_CLOSURE_CATEGORIES = ["writers", "callbacks", "publication_roots", "cache", "ccr"];
 
 const EXPECTED_COMPATIBILITY_ALIASES = ["detect_changes", "trace_symbol"];
 
@@ -186,7 +186,7 @@ const REQUIRED_SLICE4 = new Set(["FR-025", "FR-041", "FR-042", "SC-017", "SC-024
 const EXPECTED_TRACE_TEST_IDS = [
   ...new Set([...EXPECTED_ACCEPTANCE_ORACLES.values()].map((value) => value[2]).concat("TEST-OPAQUE-PATH-INHERITED")),
 ].sort();
-const EXPECTED_BOUND_IDS = ["BOUND-ARTIFACT", "BOUND-CAPACITY", "BOUND-QUERY", "BOUND-REPLAY", "BOUND-SOURCE"];
+const EXPECTED_BOUND_IDS = ["BOUND-ARTIFACT", "BOUND-CAPACITY", "BOUND-QUERY", "BOUND-REPLAY", "BOUND-SOURCE", "BOUND-VERIFICATION"];
 const EXPECTED_FAIRNESS_IDS = ["FAIR-CANCEL", "FAIR-OBSERVER", "FAIR-PROJECT", "FAIR-RETRY"];
 const EXPECTED_CI_ARTIFACT_IDS = ["CI-RELEASE", "CI-SLICE0", "CI-SLICE1", "CI-SLICE2", "CI-SLICE3", "CI-SLICE4"];
 const EXPECTED_RELEASE_VALIDATION = {
@@ -277,15 +277,15 @@ const EXPECTED_PROMPTS = [
 const FROZEN_DIGESTS = {
   catalogs: {
     domain: "symforge.lifecycle.v11.trace.catalogs",
-    hash: "bb7c1c6dc1c31f33db50b179d42c7e248c44d97d7da954a52a29e6063266eb32",
+    hash: "e5b5080ede1761ec9f2d4d265dc352b6e41192780e7b00d9246393cca8bdc5b4",
   },
   requirement_rows: {
     domain: "symforge.lifecycle.v11.trace.requirement_rows",
-    hash: "2bae235c749d0f83394f5dff9d4485c0e8985a9b1d0ccfaed6936998c43107e0",
+    hash: "a76397f3d24e6e7d7524347853fe35562c635585e40df2b26248ecd3a6a11f4d",
   },
   invariants: {
     domain: "symforge.lifecycle.v11.trace.invariants",
-    hash: "d15af22fa059f120f3c0216db9868717bc8bd9b3119cb24de836a3c8876a398e",
+    hash: "10108e816eb880c2752f473ff8c1ba12fb4bf8d981bc6babd1d8a733daf5cff0",
   },
   state_models: {
     domain: "symforge.lifecycle.v11.trace.state_models",
@@ -297,11 +297,11 @@ const FROZEN_DIGESTS = {
   },
   acceptance_oracles: {
     domain: "symforge.lifecycle.v11.acceptance.oracles",
-    hash: "a6895de307fd2f24a82abf40cc2bc79113d2a0c4fe56168423eac4adc63cd1fb",
+    hash: "de5d45f8d7f8a43863bffa50eec102ffcc9f8a9fc713b8e524fe917e613d045b",
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "6eb8113adf2ce0f23af460982dde5eef44d0e92bb3dfa6610692ccd4f619cee4",
+    hash: "3310ec039003c6ac3c441dc73ac59f5f77d2137ce532eca06d3766abd9b931fe",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -1565,45 +1565,53 @@ function validateAcceptance(acceptance, trace, taskCatalog) {
   const expectedObserverModel = ["Unregistered", "Registering", "Replaying", "Live", "GapLatched", "OverflowLatched", "VerificationOverdueLatched", "Stopped"];
   const observerModel = trace && trace.catalogs && trace.catalogs.state_models && trace.catalogs.state_models["MODEL-OBSERVER"];
   const rollingVerification = oracles.find((oracle) => isObject(oracle) && oracle.oracle_id === "ORACLE-ROLLING-VERIFICATION-COVERAGE");
-  const expectedOverdueSemantics = {
-    requirement_ids: ["FR-011", "FR-031", "FR-039", "FR-049", "FR-052", "SC-003", "SC-004", "SC-009"],
-    implementation_tasks: ["T055", "T062", "T063", "T065"],
+  const expectedRequirementIds = ["FR-011", "FR-031", "FR-039", "FR-049", "FR-052", "SC-003", "SC-004", "SC-009"];
+  const expectedImplementationTasks = ["T055", "T062", "T063", "T065"];
+  const requiredOverdueAssertions = [
+    "Partial progress, cancellation, retry, cursor resume, persistence, and restart never extend or reconstruct verification_deadline",
+    "At or after verification_deadline without a newer exact-bound complete record, VerificationOverdueLatched becomes non-Current before any strict lease linearizes and returns SourceRefusal",
+  ];
+  const requiredOverdueBounds = [
+    "MAX_CURRENT_UNVERIFIED_AGE is exactly 15 minutes and cannot be infinite, disabled, or configured upward",
+  ];
+  if (JSON.stringify(observerModel) !== JSON.stringify(expectedObserverModel) || !isObject(rollingVerification) ||
+      JSON.stringify(rollingVerification.requirement_ids) !== JSON.stringify(expectedRequirementIds) ||
+      JSON.stringify(rollingVerification.implementation_tasks) !== JSON.stringify(expectedImplementationTasks) ||
+      requiredOverdueAssertions.some((value) => !Array.isArray(rollingVerification.assertions) || !rollingVerification.assertions.includes(value)) ||
+      requiredOverdueBounds.some((value) => !Array.isArray(rollingVerification.bounds) || !rollingVerification.bounds.includes(value))) {
+    fail("OVERDUE_VERIFICATION_ORACLE_INVALID", "the finite deadline, overdue latch, exact-bound refresh, and strict-refusal oracle must remain closed");
+  }
+  const expectedVerificationPassSemantics = {
     preconditions: [
-      "A Current root carries a complete VerificationRecord and a monotonic verification_deadline exactly 15 minutes after that record completed",
-      "The monotonic clock, rolling cursor, observer health, strict-lease linearization, and independently corruptible scopes are controllable",
+      "A Current root carries a sealed VerificationScopeReceipt, a complete VerificationRecord, a feasible VerificationWorkBound, and a monotonic verification_deadline exactly 15 minutes after that record completed",
+      "The monotonic clock, rolling cursor, observer health, strict-lease linearization, capacity reservation, and independently corruptible scopes are controllable",
     ],
     actions: [
-      "Advance rolling verification through partial, cancelled, resumed, restarted, and complete whole-declared-scope passes",
-      "Pause strict acquisition immediately before, exactly at, and after verification_deadline",
-      "Inject source drift, corruption, observer gaps, publication replacement, and snapshot quarantine at each cursor boundary",
+      "Build the sealed scope from every canonical catalog entry, admitted byte range, required derived artifact and certificate, policy version, and stable observer cut",
+      "Advance rolling verification through partial, cancelled, resumed, restarted, and complete whole-declared-scope passes at the maximum default work bound",
     ],
     assertions: [
-      "Coverage records exactly the scopes and generation actually checked",
-      "Only a complete whole-declared-scope VerificationRecord bound to the exact project slot, source slot, generation digest, observer cut, policy version, and declared scope advances verification_deadline",
-      "Partial progress, cancellation, retry, cursor resume, persistence, and restart never extend or reconstruct verification_deadline",
-      "At or after verification_deadline without a newer exact-bound complete record, VerificationOverdueLatched becomes non-Current before any strict lease linearizes and returns SourceRefusal",
-      "Any mismatch or observer uncertainty revokes Current before further strict answers",
-      "Resume never skips unverified work or attaches an old cursor to a new incarnation",
+      "A complete whole-declared-scope pass performs authoritative stable-cut rescans at both boundaries, proves an exact path/disposition bijection to the sealed scope, verifies every catalog entry, rehashes every admitted byte range, recomputes every required derived artifact and certificate, and finishes with zero missing, extra, skipped, or unresolved obligations",
+      "Only a complete whole-declared-scope VerificationRecord bound to the exact project slot, source slot, generation digest, observer cut, policy version, and sealed VerificationScopeReceipt advances verification_deadline",
+      "VerificationWorkBound records verification_bytes as admitted-source plus required-artifact bytes and verification_entries as catalog, disposition, discovery, and artifact obligations; ceil(verification_bytes / 33554432) plus ceil(verification_entries / 1000) seconds is at most 720",
+      "Current promotion requires a VerificationFeasibilityReceipt reserving at least 33554432 verification bytes per second and 1000 verification entries per second, and the successor pass starts no later than 180 seconds after the prior completion",
     ],
-    positive_control: "A complete exact-bound pass before the deadline publishes its VerificationRecord and advances the next deadline by exactly 15 minutes.",
     negative_controls: [
-      "An infinite, disabled, reconstructed, or partial-progress-extended deadline is rejected",
-      "A strict lease at or after an unmet deadline is refused even when retained bytes remain readable",
-      "A corrupted or changed scope prevents a complete verification record",
-      "A cursor from a prior root, project, or source incarnation is rejected",
+      "A scope with any omitted catalog entry, disposition, admitted byte range, discovery obligation, derived artifact, or certificate cannot emit a complete VerificationRecord",
+      "A default scope above 17179869184 bytes, above 200000 entries, without both reserved service floors, or whose computed bound exceeds 720 seconds remains non-Current with SourceRefusal",
     ],
     bounds: [
-      "MAX_CURRENT_UNVERIFIED_AGE is exactly 15 minutes and cannot be infinite, disabled, or configured upward",
-      "The fixture scopes, cursor states, clock cuts, and injected failures are finite",
+      "DEFAULT_MAX_VERIFICATION_BYTES is 17179869184, DEFAULT_MAX_VERIFICATION_ENTRIES is 200000, reserved floors are 33554432 bytes per second and 1000 entries per second, and DEFAULT_MAX_COMPLETE_VERIFICATION_PASS is 720 seconds",
+      "The successor pass starts within 180 seconds, so the maximum 720-second pass completes within the fixed 900-second overdue interval",
     ],
     fairness: [
-      "A continuously Current root receives every bounded verification slice before its fixed deadline or becomes synchronously non-Current",
-      "An overdue source cannot starve its fresh complete re-verification behind new strict leases",
+      "A feasible successor pass starts no later than 180 seconds after the prior complete record and retains its reserved service floors until completion or typed refusal",
+      "A source that cannot obtain or retain that reservation becomes non-Current rather than extending the deadline",
     ],
   };
-  if (JSON.stringify(observerModel) !== JSON.stringify(expectedObserverModel) || !isObject(rollingVerification) ||
-      Object.entries(expectedOverdueSemantics).some(([key, expected]) => JSON.stringify(rollingVerification[key]) !== JSON.stringify(expected))) {
-    fail("OVERDUE_VERIFICATION_ORACLE_INVALID", "the finite deadline, overdue latch, exact-bound refresh, and strict-refusal oracle must remain closed");
+  if (!isObject(rollingVerification) || Object.entries(expectedVerificationPassSemantics).some(([key, expected]) =>
+    expected.some((value) => !Array.isArray(rollingVerification[key]) || !rollingVerification[key].includes(value)))) {
+    fail("VERIFICATION_PASS_ORACLE_INVALID", "whole-scope completion and its finite default feasibility bound must remain closed");
   }
   const capacity = oracles.find((oracle) => isObject(oracle) && oracle.oracle_id === "ORACLE-CAPACITY-PHYSICAL-OWNERSHIP");
   const expectedCapacitySemantics = {
@@ -2159,6 +2167,10 @@ function validateRetirementSourceInventory(retirement, sourceMap) {
   }
 }
 
+function normalizeRetirementClosureSource(source) {
+  return source.replace(/\r\n/gu, "\n");
+}
+
 function validateRetirementClosure(retirement, sourceMap) {
   const closure = retirement && retirement.preactivation_closure;
   if (!exactKeys(closure, RETIREMENT_CLOSURE_CATEGORIES, "retirement.preactivation_closure")) return;
@@ -2183,7 +2195,7 @@ function validateRetirementClosure(retirement, sourceMap) {
         fail("RETIREMENT_CLOSURE_MISMATCH", `${category}: missing ${relativePath}`);
         continue;
       }
-      blobHashes[relativePath] = sha256Bytes(Buffer.from(source, "utf8"));
+      blobHashes[relativePath] = sha256Bytes(Buffer.from(normalizeRetirementClosureSource(source), "utf8"));
     }
     const actualDigest = canonicalDigest(`symforge.lifecycle.v11.retirement.closure.${category}`, blobHashes);
     if (!validSha256(record.digest) || record.digest !== actualDigest) {
@@ -2550,7 +2562,6 @@ function validateApprovedRefreeze(evidence, retirement, releaseCommit) {
       typeof result.workflow_commit !== "string" || !/^[0-9a-f]{40,64}$/u.test(result.workflow_commit) ||
       typeof result.workflow_run_id !== "string" || !/^[1-9][0-9]{0,19}$/u.test(result.workflow_run_id) ||
       !Number.isInteger(result.workflow_run_attempt) || result.workflow_run_attempt < 1 || result.workflow_run_attempt > 1000 ||
-      result.workflow_job !== "gate-release-ref" ||
       !["push", "workflow_dispatch"].includes(result.workflow_event) ||
       result.status !== "passed") {
     fail("APPROVED_REFREEZE_INVALID", "closed external-verification result mismatch");
