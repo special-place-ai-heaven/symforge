@@ -648,25 +648,24 @@ pub struct VerificationScopeReceipt {
     pub observer_cut: ObservationCut,
     pub policy_version: PolicyVersion,
     pub strict_scope_contract: StrictScopeContractV1,
-    pub catalog_entries: BTreeSet<CatalogPath>,
     pub terminal_dispositions: BTreeMap<CatalogPath, FileDisposition>,
     pub admitted_byte_ranges: BTreeMap<CatalogPath, AdmittedByteRange>,
     pub discovery_obligations: BTreeSet<ScopeDiscoveryObligationId>,
-    pub required_artifact_set: RequiredArtifactSetId,
-    pub required_artifacts: BTreeSet<ArtifactKind>,
+    pub required_artifact_set_id: RequiredArtifactSetId,
     pub required_certificates: BTreeSet<CompletenessCertificateId>,
 }
 
-/// Cost of the pass the receipt above describes. `bound_seconds` is
+/// Cost of the pass the receipt above describes. `bound` is
 /// `ceil(verification_bytes / RESERVED_VERIFICATION_BYTES_PER_SECOND)
-///  + ceil(verification_entries / RESERVED_VERIFICATION_ENTRIES_PER_SECOND)`.
-/// The default ceilings cap it at 512 + 200 = 712 seconds, so
-/// `DEFAULT_MAX_COMPLETE_VERIFICATION_PASS` is a ceiling the defaults never reach.
+///  + ceil(verification_entries / RESERVED_VERIFICATION_ENTRIES_PER_SECOND)`
+/// seconds, compared directly against `DEFAULT_MAX_COMPLETE_VERIFICATION_PASS`.
+/// The default ceilings cap it at 512 + 200 = 712 seconds, so that constant is a
+/// ceiling the defaults never reach.
 pub struct VerificationWorkBound {
     pub scope_receipt: VerificationScopeReceiptId,
     pub verification_bytes: u64,
     pub verification_entries: u64,
-    pub bound_seconds: u32,
+    pub bound: Duration,
 }
 
 /// Capacity actually reserved for the pass. Promotion to `Current` requires one;
