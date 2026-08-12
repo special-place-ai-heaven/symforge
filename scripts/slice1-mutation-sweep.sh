@@ -46,8 +46,8 @@ MUTATIONS=(
   "proof-names-stored|$AUTHORITY|.expect(\"a Current source always has a publication to freeze\")|.and(Some(PublicationIdentity::fresh())).expect(\"mutated\")|the non-Current proof names the stored publication"
   # The two defects three independent reviews found. Both were live while every
   # gate this slice had was green, so both earn a permanent guard.
-  "commit-receipt-lease|$MUTATION|if receipt.lease() != self.lease.identity() {|if false {|commit refuses a receipt from another lease"
-  "drain-arms-on-grant|$MUTATION|drain.arm();|let _ = \&drain;|a signal reports outstanding once a permit is attached"
+  "commit-receipt-lease|$MUTATION|if receipt.lease() != self.lease.identity() {|if receipt.lease() != receipt.lease() {|commit refuses a receipt from another lease"
+  "drain-arms-on-grant|$MUTATION|drain.arm();|let _ = &drain;|a signal reports outstanding once a permit is attached"
 )
 
 # Batches of four keep each run inside the tool's wall-clock ceiling.
