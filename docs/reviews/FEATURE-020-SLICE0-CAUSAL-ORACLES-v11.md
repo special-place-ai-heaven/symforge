@@ -116,13 +116,15 @@ slice silently skipped its artifact, the requirement table alone would not detec
 Slices 0–3 must therefore be checked against their task receipts, not against this
 table. The contract is frozen; this is noted for the reviewers of T020 and T090.
 
-## T014 — defect 2.8 reproduced; the oracle itself is blocked until Slice 4
+## T014 — observed RED oracle for design defect 2.8
 
-**Status: the defect is confirmed and reproduced. The oracle does not land.**
-`src/watcher/mod.rs` is byte-censused by the retirement contract for the whole
-pre-activation period, so the oracle T014 describes cannot be committed until Slice 4
-— see "Two contradictions inside the frozen corpus" below. What follows is the
-reproduction, performed locally and then reverted.
+**Status: landed.** This section first recorded the oracle as blocked, because the
+retirement census digested whole source bytes and so forbade the very edit T014
+requires. That contradiction was resolved by amending the refreeze (see "Two
+contradictions inside the frozen corpus" below): the census now digests a canonical
+release form, in which `#[cfg(test)]` items are invisible and production bytes are
+not. The oracle and its `cfg(test)` seam therefore land as T014 specifies, with the
+census reporting `OK` and still failing on any production edit to the same files.
 
 The design document's §2.8 says `effective_fence_generation`
 (`src/watcher/mod.rs:255`) assumes reload publishes the new root before advancing
@@ -159,12 +161,12 @@ The oracle asserts the consequence, not the intermediate fence value, so it stay
 valid under either fix — reordering the commit, or binding root and generation into
 one authority.
 
-**Why it cannot land now.** Both the oracle and its seam are edits to censused files
-(`src/watcher/mod.rs` in `callbacks`, `src/live_index/store.rs` in
-`publication_roots`). The reproduction above is preserved here as the evidence T014
-asks for; the executable oracle belongs to the slice that may legally edit those
-files. The exact code is recoverable from this document plus the two line references,
-and the reproduction takes minutes to repeat.
+**Gating.** The oracle carries `#[ignore]` naming Slice 1 (T022–T029) as the owner
+that must remove it, so a deliberately RED control does not turn `main` red. Append
+`--ignored` to the frozen command to reproduce the failure. Both the oracle and its
+seam live in `#[cfg(test)]` scope, which the amended census does not digest; adding
+any production byte to `src/watcher/mod.rs` or `src/live_index/store.rs` still fails
+`RETIREMENT_CLOSURE_MISMATCH`, and that was verified directly rather than assumed.
 
 ## T015–T017 — observed RED positive controls
 
@@ -186,8 +188,30 @@ Each carries `#[ignore]` naming the slice that must remove it, so a deliberately
 RED control does not turn `main` red and the fix's acceptance is the control
 passing without the attribute.
 
-The T015 single-flight control and the T014 oracle are **not** in this set; both need
-edits to censused sources. See the contradictions section below.
+The T015 single-flight control is not in this set because it needs crate-internal
+access; it lands as a unit test in `src/daemon.rs::tests` — see below.
+
+### The single-flight control counts production's own loader
+
+`ensure_project_slot_for_session_with` takes the loader as a closure parameter, so a
+unit test can pass `ProjectInstance::load` — exactly what
+`ensure_project_slot_for_session` supplies in production — wrapped in a counter. Four
+threads entering a shared barrier and racing one first open produce:
+
+```
+cargo test --lib daemon::tests::concurrent_first_open_performs_exactly_one_cold_load -- --exact --nocapture --ignored
+
+4 concurrent first opens of one root must perform exactly one cold load; every
+extra load is a complete project index built, paid for, and discarded by `or_insert`
+  left: 4
+ right: 1
+```
+
+An earlier attempt added a `cold_project_loads` counter to `DaemonState` to make the
+waste observable from an integration test. That was abandoned: it changed production
+code to observe a defect, and the injected loader counts the same real loads at the
+seam that owns them with no production change at all. Slice 2 (T030–T040) inherits an
+assertion that needs no instrument to keep working.
 
 ### The gap control had to be reframed before it meant anything
 
@@ -301,33 +325,55 @@ frozen.
 The check only fires when the target file exists (`isRegularFile(file)`), which is the
 only reason Slice 0 can land at all.
 
-## Deviations taken, and why
+## How each contradiction was resolved
 
-Both are deliberate and reversible, and both preserve every bit of engineering value
-that is reachable without breaking a frozen gate.
+**Contradiction 1 was fixed at the source.** The refreeze was amended so the census
+digests a canonical release form — `#[cfg(test)]` items removed, comments dropped,
+code whitespace collapsed, string and character literals verbatim — instead of raw
+source bytes. The census still freezes V10 authority, because any production byte
+moves the digest; test-only code, which the release build never compiles, no longer
+does. T014's oracle and its `cfg(test)` seam therefore land exactly as `tasks.md`
+specifies, and the 2.4 single-flight control lands as a unit test in
+`src/daemon.rs::tests`. Both were verified against the amended census, and adding a
+production line to the same files was verified to still fail.
 
-1. **Slice 0's controls live in `tests/project_index_lifecycle_slice0_controls.rs`,
-   not `tests/project_index_lifecycle_slice0.rs`.** The reserved filename stays
-   unwritten so `TEST-PUBLICATION` stays dormant until the slice that can make it pass.
-   The control that would have carried that name is
-   `publication_of_one_source_preserves_sibling_latest`, deliberately renamed so no
-   reader mistakes it for the catalog case being satisfied.
-2. **No censused V10 source is touched.** Two items are therefore blocked rather than
-   landed:
-   - **T014's oracle.** The deterministic pause needs a seam between the generation
-     advance and the root publication, both inside `store.rs`. No public or
-     crate-visible operation advances the generation without also publishing, so the
-     only alternative is a two-thread race — and a flaky oracle is worse than none.
-     The defect itself is confirmed and reproduced; see the T014 section above for the
-     exact interleaving and observed corruption.
-   - **The 2.4 single-flight control.** Its instrument (`cold_project_loads`, one
-     `AtomicU64` at the loader call site in `daemon.rs`) is a censused-file edit. With
-     the instrument applied locally, four concurrent first opens measured **four** cold
-     loads against an expected one. Nothing in the public surface counts index builds,
-     so the control cannot be written without it.
+**Contradiction 2 is worked around, deliberately.** Slice 0's integration controls
+live in `tests/project_index_lifecycle_slice0_controls.rs`, leaving the catalog's
+reserved `tests/project_index_lifecycle_slice0.rs` unwritten so `TEST-PUBLICATION`
+stays dormant until the slice that can make it pass. The control that would have
+carried that name is `publication_of_one_source_preserves_sibling_latest`, renamed so
+no reader mistakes it for the catalog case being satisfied.
 
-Both blocked items become legal in Slice 4. Neither was faked, weakened into a
-vacuous pass, or silently dropped.
+That second one is a real remaining inconsistency in the frozen corpus, not a solved
+problem: a `planned_exact` case cannot simultaneously be present, RED, and green in
+CI. It is left for the T021 adversarial review to rule on, since unlike the first it
+does not block any Slice 0 work.
+
+### Known gap in the amended stripper
+
+`normalizeRetirementClosureSource` recognises a literal `#[cfg(test)]` attribute. It
+does **not** recognise `#[cfg(all(test, feature = "…"))]`, which is equivalent to
+rustc and is the natural spelling when a test-only helper's consumer sits behind a
+feature gate — so the census reads such an item as production code and fails.
+
+Found immediately: the T014 hook's re-export has to be server-gated (its consumer is
+`src/watcher/mod.rs::tests`, and `watcher` is `#[cfg(feature = "server")]`, so under
+`--no-default-features --features embed` the bare `#[cfg(test)]` form is an unused
+import that `-D warnings` rejects). Writing that as `cfg(all(test, feature =
+"server"))` moved the `publication_roots` digest.
+
+The workaround is exact and costs nothing: two stacked attributes, `#[cfg(test)]`
+first, then `#[cfg(feature = "…")]`. The cut runs from the first attribute to the
+item's terminator, so the second is absorbed with it. `CLAUDE.md` records this as the
+supported spelling.
+
+The proper fix is for the stripper to evaluate test-only cfg predicates — `test`, and
+`all(...)` with `test` as a conjunct, while correctly *rejecting* `any(test, …)` and
+`not(test)`, which are not test-only. That needs another refreeze amendment and
+signature, so it is deferred rather than done here; it blocks nothing while the
+stacked spelling is used.
+
+Nothing was faked, weakened into a vacuous pass, or silently dropped.
 
 ## Scope note
 

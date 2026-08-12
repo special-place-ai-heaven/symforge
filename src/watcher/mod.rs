@@ -3327,6 +3327,104 @@ mod tests {
         );
     }
 
+    /// Feature 020 Slice 0 causal oracle (T014) for design defect 2.8, "root
+    /// and generation authority can split".
+    ///
+    /// [`effective_fence_generation`]'s contract comment asserts that reload
+    /// "publishes the new live index (with its new `indexed_root`) BEFORE
+    /// bumping the generation", which is what makes adopting an advanced
+    /// generation safe: a retarget would show a different `indexed_root` and be
+    /// kept stale. `reload_for_binding_with_exclusions` does the opposite —
+    /// `project_generation.fetch_add` runs first and `swap_and_publish` runs
+    /// after — so there is a window under the write lock where the generation
+    /// is already the new one and the published root is still A.
+    ///
+    /// A root-A watcher that samples the fence inside that window sees
+    /// `indexed_root == A`, concludes "same-project reload", and adopts the
+    /// advanced generation. Once root B is published that adopted value equals
+    /// the current generation, so the store's under-lock fence accepts the
+    /// mutation and the root-A reconcile removes root B's files.
+    ///
+    /// The oracle asserts the consequence rather than the intermediate value,
+    /// so it stays valid under either fix (reordering the commit, or binding
+    /// root and generation into one authority): whatever a mid-commit observer
+    /// walks away with must not authorize a root-A reindex against root B.
+    ///
+    /// RED by design and therefore ignored, like the other out-of-gate suites
+    /// in this repo: the defect it names is fixed in Slice 1, and the fix's
+    /// acceptance is this test passing without the attribute. Run it with
+    /// `cargo test --lib watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture --ignored`.
+    #[test]
+    #[ignore = "Feature 020 Slice 0 RED oracle for design defect 2.8; remove this attribute in Slice 1 (T022-T029) when one authority binds root and generation"]
+    fn generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b() {
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        let a_src = project_a.path().join("src");
+        let b_src = project_b.path().join("src");
+        std::fs::create_dir_all(&a_src).unwrap();
+        std::fs::create_dir_all(&b_src).unwrap();
+        std::fs::write(a_src.join("a.rs"), b"fn a() {}").unwrap();
+        std::fs::write(b_src.join("b.rs"), b"fn b() {}").unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(project_a.path()).unwrap();
+        let spawn_gen = shared.current_project_generation();
+
+        // What a stale root-A watcher takes away from the mid-commit window.
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let sink = std::sync::Arc::clone(&observed);
+            let hook_shared = std::sync::Arc::clone(&shared);
+            let root_a = project_a.path().to_path_buf();
+            let _guard = crate::live_index::store::install_reload_mid_commit_hook(move || {
+                let fence = effective_fence_generation(&hook_shared, &root_a, spawn_gen);
+                let live_root = hook_shared.read().indexed_root.clone();
+                *sink.lock().unwrap() = Some((fence, live_root));
+            });
+            shared.reload(project_b.path()).unwrap();
+        }
+        let (fence_gen, mid_commit_root) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("reload must fire the mid-commit hook exactly once");
+
+        assert_ne!(
+            shared.current_project_generation(),
+            spawn_gen,
+            "precondition: the retarget must advance the project generation"
+        );
+
+        // Replay the watcher's own reconcile with the generation it captured.
+        let rejected_before = shared.current_rejected_stale_mutations();
+        let repairs =
+            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, fence_gen);
+
+        let context = format!(
+            "observed fence {fence_gen}, spawn generation {spawn_gen}, root \
+             published at observation time {mid_commit_root:?}"
+        );
+        assert!(
+            shared.read().get_file("src/a.rs").is_none(),
+            "root A's file must not be written into root B's publication \
+             ({context}); a mid-commit observer must not be able to authorize a \
+             root-A reindex against root B"
+        );
+        assert!(
+            shared.read().get_file("src/b.rs").is_some(),
+            "root B's file must survive a root-A reconcile carrying the \
+             generation observed mid-commit ({context})"
+        );
+        assert_eq!(
+            repairs, 0,
+            "a foreign-root reconcile repairs zero bytes; it is a rejected \
+             mutation, not a repair ({context})"
+        );
+        assert!(
+            shared.current_rejected_stale_mutations() > rejected_before,
+            "the foreign-root mutation must be rejected by the store fence"
+        );
+    }
+
     /// Cold-start regression: a SAME-ROOT reload (the fire-and-forget
     /// `bg_index.reload(&bg_root)` main.rs runs when no snapshot exists) bumps
     /// the project generation AFTER the watcher captured `expected_gen` at spawn.
