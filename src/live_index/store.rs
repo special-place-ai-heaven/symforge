@@ -3570,7 +3570,12 @@ mod reload_mid_commit {
     }
 }
 
-#[cfg(test)]
+// Gated on `server` as well as `test`: the only consumer is the watcher oracle
+// in `src/watcher/mod.rs::tests`, and `watcher` is itself `#[cfg(feature =
+// "server")]`. Under `--no-default-features --features embed` the lib tests
+// still compile, so a bare `#[cfg(test)]` here is an unused import and the
+// embed build denies warnings.
+#[cfg(all(test, feature = "server"))]
 pub(crate) use reload_mid_commit::install as install_reload_mid_commit_hook;
 
 /// Thread-safe shared handle to the index.

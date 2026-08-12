@@ -5,6 +5,17 @@
 - `npm/` only: `cd npm && npm test`
 - Mixed: run both before reporting success
 
+**The default-feature gates cannot catch a feature-gated `cfg` mistake.** CI's
+`embed-build` job runs `cargo test --no-default-features --features embed --lib --
+--test-threads=1`, where the lib tests still compile but every
+`#[cfg(feature = "server")]` module (`watcher`, `daemon`, `protocol`, `sidecar`,
+`server`, `cli`, …) is absent. A `#[cfg(test)]` item whose only consumer lives behind
+`server` is therefore an unused import there, and `-D warnings` fails the build — while
+every default-feature gate above passes. Run that exact command before pushing
+anything that adds a `#[cfg(test)]` helper, and gate such helpers on
+`#[cfg(all(test, feature = "server"))]` when their consumer is server-only. Found the
+slow way on 2026-08-12: green locally and on the `rust` job, red on `embed-build`.
+
 ### Windows build cache (disk)
 
 - Artifacts: repo `.cargo/config.toml` sets `target-dir = "target"`, i.e. artifacts land **beside the checkout, on whatever drive the repo is on** (gitignored). The comment in that file and this line both used to say "on **E:**", which was only ever true while the checkout lived there; as_of 2026-08-12 the repo is on **C:** with no E: drive present, and `target/` had reached **180 GB** on C:. Do **not** pass `CARGO_TARGET_DIR=...` on the command line (older handoffs suggested `C:/symforge-target` — that filled **C:**).
