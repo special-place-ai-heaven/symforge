@@ -641,6 +641,28 @@ const cases = [
     },
   },
   {
+    name: "ignored case is still rejected where the catalog requires it to have run",
+    expected: "ERROR INHERITED_TEST_CASE_MISSING:",
+    mutate(root) {
+      const file = path.join(root, "src/discovery/mod.rs");
+      const text = fs.readFileSync(file, "utf8");
+      const marker = "        fn non_utf8_path_is_opaque_catalog_only_without_lossy_collision() {";
+      if (!text.includes(marker)) throw new Error("inherited opaque-path case not found in fixture");
+      fs.writeFileSync(file, text.replace(marker, `        #[ignore = "self-test"]\n${marker}`), "utf8");
+    },
+  },
+  {
+    name: "string literal content changed in a retirement-owned source file",
+    expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    mutate(root) {
+      const file = path.join(root, "src/protocol/edit.rs");
+      const text = fs.readFileSync(file, "utf8");
+      const match = /"[A-Za-z0-9 _.:-]{6,}"/u.exec(text);
+      if (!match) throw new Error("no string literal available in the censused writer source");
+      fs.writeFileSync(file, text.replace(match[0], match[0].slice(0, -1) + 'X"'), "utf8");
+    },
+  },
+  {
     name: "new CCR path in its retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
     mutate(root) {
@@ -1683,6 +1705,47 @@ try {
   else if (closureLineEnding.status !== 0) failures.push(`closure line-ending equivalence: checker failed (${`${closureLineEnding.stdout || ""}${closureLineEnding.stderr || ""}`.trim()})`);
 } finally {
   safeRemoveFixture(closureLineEndingRoot);
+}
+const closureCfgTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
+try {
+  copyFixture(closureCfgTestRoot);
+  // The census freezes V10 authority, which is what the release build contains.
+  // Test-only code is compiled out, so adding it must NOT move the digest --
+  // otherwise the retirement contract forbids the very edits tasks.md requires.
+  // The two RETIREMENT_CLOSURE_MISMATCH cases above still cover the converse:
+  // production code added to the same file does move it.
+  fs.appendFileSync(
+    path.join(closureCfgTestRoot, "src/protocol/edit.rs"),
+    [
+      "",
+      "/// Test-only helper documented above its attribute, which is the",
+      "/// idiomatic placement and must not move the census either.",
+      "#[cfg(test)]",
+      "mod census_equivalence_probe {",
+      "    #[test]",
+      "    fn probe() { assert!(true); }",
+      "}",
+      "",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  // Prose and layout are not authority either: rewording a comment and
+  // re-indenting must be invisible to the census for the same reason.
+  const censusProse = path.join(closureCfgTestRoot, "src/protocol/ccr.rs");
+  const proseText = fs.readFileSync(censusProse, "utf8");
+  const proseLine = /^([ \t]*)\/\/[^\n]*$/mu.exec(proseText);
+  if (!proseLine) throw new Error("no line comment available in the censused CCR source");
+  fs.writeFileSync(
+    censusProse,
+    proseText.replace(proseLine[0], `${proseLine[1]}//   reworded for the census equivalence probe`),
+    "utf8",
+  );
+  const closureCfgTest = runChecker(closureCfgTestRoot);
+  if (closureCfgTest.error) failures.push(`closure cfg(test) equivalence: spawn failed (${closureCfgTest.error.code || closureCfgTest.error.message})`);
+  else if (closureCfgTest.status !== 0) failures.push(`closure cfg(test) equivalence: checker failed (${`${closureCfgTest.stdout || ""}${closureCfgTest.stderr || ""}`.trim()})`);
+} finally {
+  safeRemoveFixture(closureCfgTestRoot);
 }
 const postactivationOrdinaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
 try {
