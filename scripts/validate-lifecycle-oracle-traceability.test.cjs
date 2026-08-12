@@ -663,6 +663,30 @@ const cases = [
     },
   },
   {
+    name: "cfg(not(test)) item added to a retirement-owned source file",
+    expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    mutate(root) {
+      // not(test) is the opposite of test-only: it ships. The census must see it.
+      fs.appendFileSync(
+        path.join(root, "src/protocol/edit.rs"),
+        ["", "#[cfg(not(test))]", "pub fn ships_in_release() {}", ""].join("\n"),
+        "utf8",
+      );
+    },
+  },
+  {
+    name: "cfg(any(test, feature)) item added to a retirement-owned source file",
+    expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    mutate(root) {
+      // any() needs only one disjunct, so a feature build compiles this.
+      fs.appendFileSync(
+        path.join(root, "src/protocol/ccr.rs"),
+        ["", '#[cfg(any(test, feature = "server"))]', "pub fn maybe_ships() {}", ""].join("\n"),
+        "utf8",
+      );
+    },
+  },
+  {
     name: "new CCR path in its retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
     mutate(root) {
@@ -1720,7 +1744,7 @@ try {
       "",
       "/// Test-only helper documented above its attribute, which is the",
       "/// idiomatic placement and must not move the census either.",
-      "#[cfg(test)]",
+      '#[cfg(all(test, feature = "server"))]',
       "mod census_equivalence_probe {",
       "    #[test]",
       "    fn probe() { assert!(true); }",

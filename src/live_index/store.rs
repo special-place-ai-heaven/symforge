@@ -3581,8 +3581,7 @@ mod reload_mid_commit {
 // its stripper recognises a literal `#[cfg(test)]` and would treat the `all`
 // form as production code. Leading with `#[cfg(test)]` keeps the whole item
 // test-only in the census's eyes as well as the compiler's.
-#[cfg(test)]
-#[cfg(feature = "server")]
+#[cfg(all(test, feature = "server"))]
 pub(crate) use reload_mid_commit::install as install_reload_mid_commit_hook;
 
 /// Thread-safe shared handle to the index.

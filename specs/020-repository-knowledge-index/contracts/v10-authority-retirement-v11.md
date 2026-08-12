@@ -605,7 +605,7 @@ planned and unexecuted.
       ]
     },
     "publication_roots": {
-      "digest": "f09e746dd8b3a5354284d5fd1c403b1ee962005d96bb9c749d58fbce0fb7ce90",
+      "digest": "3f81dbb8cb3a7a1a625e41660e520f4af455b11424e50a4f6aead8e81fa3e152",
       "paths": [
         "src/daemon.rs",
         "src/live_index/store.rs",

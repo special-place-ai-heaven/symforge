@@ -308,7 +308,7 @@ const FROZEN_DIGESTS = {
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "35d27c8785291b156de2967100417115c09862e073e1404a72f00cf96269f1cb",
+    hash: "6e1d1ead522ec11170d55f600888da43d3187497343fc69ad58dbfea48a82bea",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -2192,70 +2192,152 @@ function validateRetirementSourceInventory(retirement, sourceMap) {
   }
 }
 
-/// Remove every `#[cfg(test)]`-attributed item or statement.
+/// Does this `cfg` predicate compile ONLY under `cfg(test)`?
+///
+/// `test` is test-only. `all(..)` is test-only when any conjunct is, because
+/// every conjunct must hold. `any(..)` is test-only only when every disjunct is,
+/// because any one suffices. `not(..)` is never treated as test-only: `not(test)`
+/// is the exact opposite, and anything subtler is not worth guessing about a
+/// digest that gates a release.
+///
+/// Unknown shapes answer false, so an unrecognised predicate keeps its item in
+/// the census rather than silently removing production code from it.
+function cfgPredicateIsTestOnly(predicate) {
+  const text = predicate.trim();
+  if (text === "test") return true;
+  const call = /^(all|any|not)\s*\(([\s\S]*)\)$/u.exec(text);
+  if (!call) return false;
+  const [, name, inner] = call;
+  if (name === "not") return false;
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const character of inner) {
+    if (character === "(") depth += 1;
+    else if (character === ")") depth -= 1;
+    if (character === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  if (current.trim() !== "") parts.push(current);
+  const resolved = parts.map((part) => cfgPredicateIsTestOnly(part));
+  if (resolved.length === 0) return false;
+  return name === "all" ? resolved.some(Boolean) : resolved.every(Boolean);
+}
+
+/// Every `#[...]` attribute starting at `index`, as `{start, end, predicate}`.
+/// `predicate` is the text inside `cfg(...)`, or null for any other attribute.
+function rustAttributeAt(masked, index) {
+  if (!masked.startsWith("#", index)) return null;
+  let scan = index + 1;
+  while (scan < masked.length && /\s/u.test(masked[scan])) scan += 1;
+  if (masked[scan] !== "[") return null;
+  let depth = 0;
+  for (; scan < masked.length; scan += 1) {
+    if (masked[scan] === "[") depth += 1;
+    else if (masked[scan] === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        scan += 1;
+        break;
+      }
+    }
+  }
+  const body = masked.slice(index, scan);
+  const cfg = /^#\s*\[\s*cfg\s*\(([\s\S]*)\)\s*\]$/u.exec(body);
+  return { start: index, end: scan, predicate: cfg ? cfg[1] : null };
+}
+
+/// Remove every item or statement that compiles only under `cfg(test)`.
 ///
 /// The census exists to freeze V10 *authority* while V11 is built beside it, so
-/// what it must pin is the source as the release build sees it. Test-only code
-/// is compiled out and changes no shipped behaviour, and freezing it as well
-/// made the retirement contract forbid the very edits `tasks.md` T014 requires.
-/// Production additions to a censused file still move the digest, which is the
-/// property the two closure self-tests assert.
+/// what it must pin is the source the release build compiles. Test-only code is
+/// compiled out and changes no shipped behaviour; freezing it too made the
+/// retirement contract forbid the very edits `tasks.md` T014 requires.
+/// Production additions still move the digest, which is the property the closure
+/// self-tests assert.
+///
+/// A run of consecutive attributes is taken as a unit: if any of them is a
+/// test-only `cfg`, the whole run and its item go, so `#[derive(Debug)]
+/// #[cfg(test)] struct X;` does not leave a stray attribute behind.
 ///
 /// Offsets come from the masked source so a `;` or brace inside a comment or
-/// string literal cannot terminate an item early; the cut is applied to the
-/// original bytes at those same offsets.
+/// string literal cannot terminate an item early.
 function stripCfgTestItems(source) {
   const masked = maskRustCommentsAndLiterals(source);
   const cuts = [];
-  for (const match of masked.matchAll(/#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]/gu)) {
-    const start = match.index;
-    let index = start + match[0].length;
+  let index = 0;
+  while (index < masked.length) {
+    const first = rustAttributeAt(masked, index);
+    if (!first) {
+      index += 1;
+      continue;
+    }
+    // Collect the whole run of attributes that share this item.
+    const run = [first];
+    let cursor = first.end;
+    for (;;) {
+      while (cursor < masked.length && /\s/u.test(masked[cursor])) cursor += 1;
+      const next = rustAttributeAt(masked, cursor);
+      if (!next) break;
+      run.push(next);
+      cursor = next.end;
+    }
+    const testOnly = run.some(
+      (attribute) => attribute.predicate !== null && cfgPredicateIsTestOnly(attribute.predicate),
+    );
+    if (!testOnly) {
+      index = first.end;
+      continue;
+    }
+    // Consume the attributed item: a balanced brace block, or through `;`.
+    let scan = cursor;
     let nesting = 0;
     let end = -1;
-    while (index < masked.length) {
-      const character = masked[index];
+    while (scan < masked.length) {
+      const character = masked[scan];
       if (character === "(" || character === "[") nesting += 1;
       else if (character === ")" || character === "]") nesting -= 1;
       else if (nesting === 0 && character === ";") {
-        end = index + 1;
+        end = scan + 1;
         break;
       } else if (nesting === 0 && character === "{") {
         let depth = 0;
-        let scan = index;
-        for (; scan < masked.length; scan += 1) {
-          if (masked[scan] === "{") depth += 1;
-          else if (masked[scan] === "}") {
+        let block = scan;
+        for (; block < masked.length; block += 1) {
+          if (masked[block] === "{") depth += 1;
+          else if (masked[block] === "}") {
             depth -= 1;
             if (depth === 0) {
-              scan += 1;
+              block += 1;
               break;
             }
           }
         }
-        end = scan;
+        end = block;
         break;
       }
-      index += 1;
+      scan += 1;
     }
     // No line-framing heuristics: whatever whitespace the cut leaves behind is
     // erased by `canonicalReleaseSource`, so where a removed item's blank lines
     // went is not observable in the digest.
-    cuts.push([start, end === -1 ? masked.length : end]);
+    const cutEnd = end === -1 ? masked.length : end;
+    cuts.push([first.start, cutEnd]);
+    index = cutEnd;
   }
   if (cuts.length === 0) return source;
-  cuts.sort((left, right) => left[0] - right[0]);
   let result = "";
-  let cursor = 0;
+  let position = 0;
   for (const [start, end] of cuts) {
-    // A nested attribute inside an already-cut item is already removed.
-    if (start < cursor) {
-      cursor = Math.max(cursor, end);
-      continue;
-    }
-    result += source.slice(cursor, start);
-    cursor = end;
+    if (start < position) continue;
+    result += source.slice(position, start);
+    position = end;
   }
-  return result + source.slice(cursor);
+  return result + source.slice(position);
 }
 
 /// Reduce source to the code a release build compiles, in a canonical form.
