@@ -278,6 +278,57 @@ entry is renamed `temp-first-label` and describes what it actually proves rather
 than implying I/O-order coverage. The write/rename order is currently held by
 code review alone.
 
+## Two open discrepancies for the next slice to decide
+
+Both were found by an independent audit of this branch, not by the author, and
+both are recorded rather than resolved here because in each case the author is
+the interested party.
+
+### 1. The module lives at a path the task roster does not name
+
+`tasks.md` names **`src/index_lifecycle/`** at top level — twelve files across
+Slices 1 to 4, including Slice 2's `registry.rs`, `capacity.rs`,
+`process_runtime.rs` and `embedded.rs`. This slice put the module at
+**`src/live_index/index_lifecycle/`** instead, because a new top-level `pub mod`
+moves the frozen public-API census from 83 atoms to 84 and
+`symforge::index_lifecycle` appears nowhere in the frozen contract.
+
+The placement satisfies the gate and three independent reviewers judged it
+defensible. It is still a divergence from the spec's named paths, and Slice 2
+would otherwise inherit it by accident. The choice is one of:
+
+- keep `live_index/` and treat every `src/index_lifecycle/...` path in the task
+  roster as meaning `src/live_index/index_lifecycle/...`;
+- amend the public-API contract to introduce `symforge::index_lifecycle`, which
+  needs a refreeze and re-approval;
+- make the top-level module private, which the contract-mandated integration
+  oracles in `tests/` cannot reach.
+
+Decide before Slice 2 adds four more files under whichever root wins.
+
+### 2. A Slice 0 control still points at a slice that has finished
+
+`tests/project_index_lifecycle_slice0.rs::same_path_root_replacement_is_not_silently_adopted`
+carries `#[ignore = "... remove this attribute in Slice 1 (T022-T029) when
+physical root identity is canonical and fenced"]`. It is still RED after Slice 1,
+and CI is green either way because the producer observes it as `failed` exactly
+as its roster entry expects.
+
+On the evidence, Slice 1 is not incomplete: the control was **added** by T018
+(Slice 0), no Phase 3 task assigns fixing it, T027 implements physical-root
+replacement inside the new module only, and T023 states plainly that production
+writer integration is Slice 4. The control drives the production `LiveIndex`
+(`load`/`reload`/`freshness_status`), which this slice never touches. Slice 1
+made root identity canonical — `canonical_physical_root_identity_is_stable`
+proves two leases on one directory are different roots — but nothing wired that
+into the production path.
+
+So the annotation was written optimistically in Slice 0 and should almost
+certainly say Slice 4. It is **not** re-annotated here, because the author of
+Slice 1 rewriting a control's target slice to make Slice 1 look complete is
+precisely the move a reviewer should distrust. Someone other than this slice
+should confirm and change it.
+
 ## Known limits carried forward
 
 - **The authority oracles lease the bare shared temp directory.**
