@@ -65,16 +65,29 @@ that what changes is behaviour and only behaviour.
 
 ### Guard mutation results
 
-| Guard | Reverted to | Caught by |
-|---|---|---|
-| grant validates the exact live publication identity | `if false` | _pending_ |
-| permit pairs a grant only with its own root lease | `if false` | _pending_ |
-| transition refuses to install over a live permit | `if false` | _pending_ |
-| install revokes the outgoing root lease | statement deleted | _pending_ |
-| a terminal permit refuses a second termination | `if false` | _pending_ |
-| a dropped permit reports `Drained` | statement deleted | _pending_ |
-| a revoked lease resolves nothing | `if false` | _pending_ |
-| replacement creates its temporary before replacing | step reordered | _pending_ |
+All ten guards are load-bearing; every one of them is caught.
+
+| Guard | Caught by |
+|---|---|
+| the exact live publication identity | `grant_requires_the_exact_live_current_publication` |
+| a grant pairs only with its own root lease | `a_grant_cannot_be_paired_with_a_lease_on_another_root`, `a_root_a_permit_cannot_write_after_root_b_is_installed` |
+| a transition refuses to install over a live permit | `a_transition_refuses_to_install_over_a_live_permit` |
+| install revokes the outgoing root lease | `a_root_a_permit_cannot_write_after_root_b_is_installed`, `a_transition_refuses_to_install_over_a_live_permit` |
+| a terminal permit refuses a second termination | `a_permit_is_terminal_once_it_ends` |
+| a dropped permit reports `Drained` | `dropping_a_permit_reports_drained_rather_than_stranding_the_source`, `a_transition_refuses_to_install_over_a_live_permit` |
+| a revoked lease resolves nothing | `a_revoked_lease_resolves_nothing`, `replacement_through_a_revoked_lease_touches_nothing` |
+| replacement creates its temporary before replacing | `replacement_creates_its_temporary_before_replacing` |
+| the mutation epoch is monotonic across freeze | `the_mutation_epoch_never_rewinds_across_a_transition`, `granting_publishes_non_current_before_the_permit_exists` |
+| the non-`Current` proof names the stored publication | `the_non_current_proof_names_the_publication_the_source_actually_stored`, `granting_publishes_non_current_before_the_permit_exists` |
+
+A mutation must change behaviour and only behaviour. Three of these initially
+failed to build instead: two left a parameter unused and one left a method
+unused, and this crate denies warnings, so the build failed for a reason
+unrelated to the guard. They now preserve the binding (`if cond && false`,
+`let _ = &x`, `let _ = x.advanced()`), because "did not compile" is
+unfalsifiable evidence — it reads as a statement about the guard when it is
+usually a statement about the mutation. The sweep prints the compiler's actual
+reason for that case now.
 
 ### Guards not covered by the sweep
 
@@ -115,6 +128,41 @@ inference; it does **not** yet route the live watcher through
 Slice 4 activation, and T023 already records that production writer integration
 is Slice 4 work. Binding the watcher to a permit type whose runtime does not
 exist would be scaffolding, not prevention.
+
+## Defects found by self-review, after the oracles were green
+
+The oracles were green and the sweep had confirmed eight guards when a read-back
+of the slice's own code turned up three defects that no test caught. All three
+are the house failure mode — a component reporting something it did not observe
+— which is precisely why passing tests were not sufficient evidence.
+
+1. **A guard that could not fail.** `start_side_effect` compared the proof's
+   epoch against the authority's. Both are assigned from the same value in
+   `request_mutation_grant`, so the comparison was structurally always true. It
+   read as ordering verification while verifying nothing. Deleted, with the
+   reason recorded at the site; the ordering is enforced by construction, and
+   the proof is now exposed so a caller can name the publication instead.
+2. **A proof naming a publication nobody stored.** `NonCurrentPublicationProof`
+   carried a freshly minted identity while the `Refreshing` phase recorded none,
+   so it attested to a publication that did not exist. `freeze` now performs the
+   publication, stores its identity in the phase, and returns it.
+3. **A transition that rewound the mutation epoch.** Freeze and install replaced
+   the whole `SourceRuntime`, resetting the epoch to `initial()` and discarding
+   the permit record on every reload and rebind — which would let a stale
+   authority compare equal to a later one. Both now mutate in place.
+
+Each fix carries a test, and both new guards are in the sweep above.
+
+## Recovery note: a corrupted build directory, not a code defect
+
+The first full-suite run after these fixes failed every target in 23 seconds
+with `E0463: can't find crate for symforge` and "required to be available in
+rlib format". That is the corrupted-`target/` signature already recorded in
+`CLAUDE.md`, not a regression: `cargo clippy --all-targets` had passed on the
+same tree minutes earlier. Recovery was the documented cheapest-first path —
+delete `target/debug/incremental`, then `cargo clean -p symforge` — which
+removed 39.1 GB and returned the directory to 1.9 GB. Do not diagnose these
+errors as code failures.
 
 ## Known limits carried forward
 
