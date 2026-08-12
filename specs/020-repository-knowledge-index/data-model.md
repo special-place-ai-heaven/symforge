@@ -647,11 +647,13 @@ pub struct VerificationScopeReceipt {
     pub generation_digest: GenerationDigest,
     pub observer_cut: ObservationCut,
     pub policy_version: PolicyVersion,
-    pub catalog_entries: BTreeSet<CatalogEntryId>,
-    pub terminal_dispositions: BTreeMap<CatalogEntryId, FileDisposition>,
-    pub admitted_byte_ranges: BTreeMap<CatalogEntryId, AdmittedByteRange>,
+    pub strict_scope_contract: StrictScopeContractV1,
+    pub catalog_entries: BTreeSet<CatalogPath>,
+    pub terminal_dispositions: BTreeMap<CatalogPath, FileDisposition>,
+    pub admitted_byte_ranges: BTreeMap<CatalogPath, AdmittedByteRange>,
     pub discovery_obligations: BTreeSet<ScopeDiscoveryObligationId>,
-    pub required_artifacts: BTreeSet<RequiredArtifactId>,
+    pub required_artifact_set: RequiredArtifactSetId,
+    pub required_artifacts: BTreeSet<ArtifactKind>,
     pub required_certificates: BTreeSet<CompletenessCertificateId>,
 }
 
@@ -671,7 +673,6 @@ pub struct VerificationWorkBound {
 /// losing the reservation makes the source non-current rather than extending the
 /// deadline, so an unaffordable pass can never masquerade as a completed one.
 pub struct VerificationFeasibilityReceipt {
-    pub scope_receipt: VerificationScopeReceiptId,
     pub work_bound: VerificationWorkBound,
     pub reserved_bytes_per_second: u64,
     pub reserved_entries_per_second: u64,
@@ -680,10 +681,11 @@ pub struct VerificationFeasibilityReceipt {
 
 pub const DEFAULT_MAX_VERIFICATION_BYTES: u64 = 17_179_869_184;
 pub const DEFAULT_MAX_VERIFICATION_ENTRIES: u64 = 200_000;
-pub const DEFAULT_MAX_COMPLETE_VERIFICATION_PASS_SECONDS: u32 = 720;
+pub const DEFAULT_MAX_COMPLETE_VERIFICATION_PASS: Duration = Duration::from_secs(720);
 pub const RESERVED_VERIFICATION_BYTES_PER_SECOND: u64 = 33_554_432;
 pub const RESERVED_VERIFICATION_ENTRIES_PER_SECOND: u64 = 1_000;
-pub const MAX_SUCCESSOR_VERIFICATION_START_SECONDS: u32 = 180;
+pub const MAX_SUCCESSOR_VERIFICATION_START: Duration = Duration::from_secs(180);
+pub const MAX_CURRENT_UNVERIFIED_AGE: Duration = Duration::from_secs(900);
 
 pub enum DeltaCause {
     Added,
