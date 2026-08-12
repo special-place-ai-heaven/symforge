@@ -15,6 +15,14 @@
 // owning slice removing the `#[ignore]`, or the control has gone vacuous. Both
 // need a human to look, so the exit code is non-zero and the artifact says which
 // case changed.
+//
+// The slice that DOES fix a control's defect reclassifies it here as RESOLVED
+// rather than deleting it. A resolved control keeps running — in the default
+// suite, without `#[ignore]` — and this producer then asserts it PASSES. So the
+// artifact records the RED->GREEN transition, which is the fixing slice's actual
+// product, instead of going quiet about a case that used to be evidence; and a
+// resolved control that regresses (fails again, or is re-`#[ignore]`d back into
+// silence) is caught by the same roster check that catches a lost RED one.
 
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -25,26 +33,31 @@ const ARTIFACT = path.join("target", "ci", "lifecycle-v11", "slice-0-oracle-cont
 const CARGO = process.env.SYMFORGE_LIFECYCLE_CARGO_EXECUTABLE || "cargo";
 const GIT = process.env.SYMFORGE_LIFECYCLE_GIT_EXECUTABLE || "git";
 
-// Every Slice 0 control, with the exact command that runs it. Expected outcome
-// is RED for all of them until the named slice removes the attribute.
+// Every Slice 0 control, with the exact command that runs it. `expected` is the
+// outcome of the SUITE: "red" while its controls still carry `#[ignore]` and must
+// fail, "green" once the owning slice fixed the defect and the control moved into
+// the default suite (which is why a resolved suite must NOT pass `--ignored` —
+// with the attribute gone it would select nothing and exit 0 having run nothing).
 const SUITES = [
   {
     target: "tests/project_index_lifecycle_slice0.rs",
+    expected: "red",
     args: ["test", "--test", "project_index_lifecycle_slice0", "--", "--ignored", "--test-threads=1"],
   },
   {
     target: "src/watcher/mod.rs::tests",
+    expected: "green",
     args: [
       "test",
       "--lib",
       "watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
       "--",
       "--exact",
-      "--ignored",
     ],
   },
   {
     target: "src/daemon.rs::tests",
+    expected: "red",
     args: [
       "test",
       "--lib",
@@ -61,10 +74,13 @@ const MAX_REASON_BYTES = 512;
 
 // The exact Slice 0 roster. Without it the producer only checks that the cases it
 // HAPPENS to parse are still failing, so deleting or renaming a control leaves the
-// rest red and the artifact still reports "expected_failures_preserved" -- success
-// claimed for a roster it never measured. Removing a control is a deliberate act
-// belonging to the slice that fixes its defect, so that slice must edit this list too.
-const EXPECTED_CASES = [
+// rest red and the artifact still reports success -- claimed for a roster it never
+// measured. Reclassifying a control is a deliberate act belonging to the slice that
+// fixes its defect, so that slice must edit these lists too.
+//
+// Still RED: the defect each names is unfixed, the test carries `#[ignore]`, and it
+// MUST fail.
+const RED_CASES = [
   "capacity_refused_open_creates_no_slot_and_no_watcher",
   "configured_capacity_bounds_the_process_not_each_load",
   "daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
@@ -74,10 +90,38 @@ const EXPECTED_CASES = [
   "old_observer_delivery_after_promotion_is_not_current",
   "same_path_root_replacement_is_not_silently_adopted",
   "snapshot_seed_is_not_queryable_before_verification",
-  "watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
   "watcher_mutation_during_candidate_build_is_not_discarded",
   "whole_project_publication_preserves_latest_siblings",
 ];
+
+// RESOLVED: the named slice fixed the defect, the `#[ignore]` is gone, and the
+// control MUST now pass. It stays on the roster and stays run — dropping it would
+// delete the regression guard and leave this artifact silent about the transition
+// it exists to evidence.
+const RESOLVED_CASES = new Map([
+  [
+    "watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
+    {
+      slice: 1,
+      tasks: ["T028"],
+      defect: "2.8 root and generation authority can split",
+      // Not the commit reordering the oracle's prose predicted: the fence takes
+      // both values from one `Arc<PublishedGeneration>`, so the generation and
+      // the root that publication served cannot disagree.
+      fix: "src/watcher/mod.rs::effective_fence_generation reads one published generation",
+    },
+  ],
+]);
+
+const EXPECTED_CASES = [...RED_CASES, ...RESOLVED_CASES.keys()];
+
+/// The outcome this producer asserts for a case: "green" once its owning slice
+/// resolved it, "red" while it is still a positive control.
+function expectationFor(caseName) {
+  return RESOLVED_CASES.has(caseName) ? "green" : "red";
+}
+
+const OBSERVED_FOR_EXPECTED = { red: "failed", green: "passed" };
 
 function git(...args) {
   const result = spawnSync(GIT, args, { cwd: repositoryRoot, encoding: "utf8", shell: false });
@@ -125,24 +169,37 @@ function runSuite(suite) {
   if (result.signal) {
     throw new Error(`killed by ${result.signal}: ${suite.args.join(" ")}`);
   }
-  // Every control is RED, so a suite of them must exit non-zero. Exit 0 means
-  // either nothing ran or they stopped failing; the roster check below names
-  // which, but the run itself is already not what this artifact assumes.
-  if (result.status === 0) {
+  // A RED suite must exit non-zero. Exit 0 means either nothing ran or its
+  // controls stopped failing; the roster check below names which, but the run
+  // itself is already not what this artifact assumes.
+  if (suite.expected === "red" && result.status === 0) {
     throw new Error(
       `exited 0 with no failing case, so nothing was preserved: ${suite.args.join(" ")}`,
     );
   }
+  // A resolved suite exiting non-zero is NOT thrown on: that is a regression in a
+  // control this producer is here to report, so it is parsed, recorded with its
+  // bounded reason line, and failed by the per-case check. A non-zero exit that
+  // parsed no case at all -- a build failure -- still throws below.
+
+  // libtest prints `ignored, {reason}` for `#[ignore = "..."]`, which every Slice 0
+  // control uses, so the outcome is NOT always the end of the line. Anchoring there
+  // made a silenced control parse as no case at all: re-`#[ignore]`ing a resolved
+  // control failed closed (good) with "no cases parsed" (wrong cause — that error
+  // means a build failure). The optional suffix keeps the observation honest.
   const cases = [];
-  for (const match of output.matchAll(/^test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)$/gmu)) {
+  for (const match of output.matchAll(
+    /^test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)(?:, [^\n]*)?$/gmu,
+  )) {
     const [, caseName, outcome] = match;
     cases.push({
       case: caseName,
       target: suite.target,
       command: `${CARGO} ${suite.args.join(" ")}`,
-      expected: "red",
+      expected: expectationFor(caseName),
       observed: outcome === "FAILED" ? "failed" : outcome === "ok" ? "passed" : "ignored",
       reason: outcome === "FAILED" ? reasonFor(output, caseName) : null,
+      resolved_by: RESOLVED_CASES.get(caseName) ?? null,
     });
   }
   if (cases.length === 0) {
@@ -152,7 +209,9 @@ function runSuite(suite) {
 }
 
 const cases = SUITES.flatMap(runSuite).sort((left, right) => left.case.localeCompare(right.case));
-const unexpected = cases.filter((entry) => entry.observed !== "failed");
+const unexpected = cases.filter(
+  (entry) => entry.observed !== OBSERVED_FOR_EXPECTED[entry.expected],
+);
 const observedNames = cases.map((entry) => entry.case).sort();
 const expectedNames = [...EXPECTED_CASES].sort();
 const missing = expectedNames.filter((name) => !observedNames.includes(name));
@@ -160,18 +219,22 @@ const extra = observedNames.filter((name) => !expectedNames.includes(name));
 
 const artifact = {
   kind: "symforge.lifecycle.v11.slice0_oracle_contract",
-  schema_version: 1,
+  // 2: `expected` is per case and may be "green" for a control its owning slice
+  // resolved, which every v1 reader assumed impossible; cases carry `resolved_by`.
+  schema_version: 2,
   slice: 0,
   release_commit: git("rev-parse", "--verify", "HEAD"),
   release_tree: git("rev-parse", "--verify", "HEAD^{tree}"),
   case_count: cases.length,
   expected_case_count: EXPECTED_CASES.length,
+  red_case_count: RED_CASES.length,
+  resolved_case_count: RESOLVED_CASES.size,
   missing_cases: missing,
   unexpected_cases: extra,
   cases,
   status:
     unexpected.length === 0 && missing.length === 0 && extra.length === 0
-      ? "expected_failures_preserved"
+      ? "expected_outcomes_preserved"
       : "unexpected_outcome",
 };
 
@@ -191,17 +254,20 @@ for (const name of extra) {
 if (unexpected.length > 0 || missing.length > 0 || extra.length > 0) {
   for (const entry of unexpected) {
     process.stderr.write(
-      `ERROR SLICE0_ORACLE_UNEXPECTED: ${entry.case} observed ${entry.observed}, expected red\n`,
+      `ERROR SLICE0_ORACLE_UNEXPECTED: ${entry.case} observed ${entry.observed}, expected ${entry.expected}\n`,
     );
   }
   process.stderr.write(
     "A Slice 0 positive control that stops failing is either a fix landed without its " +
-      "owning slice removing #[ignore], or a control gone vacuous. A control that "
-      + "disappears from the roster is a lost positive control. All need review.\n",
+      "owning slice reclassifying it here, or a control gone vacuous. A resolved control "
+      + "that stops passing is a regression of the fix that resolved it, and one observed "
+      + "`ignored` has been silenced by a re-added attribute. A control that disappears "
+      + "from the roster is a lost positive control. All need review.\n",
   );
   process.exitCode = 1;
 } else {
   process.stdout.write(
-    `slice 0 oracle contract: ${cases.length} expected failures preserved -> ${ARTIFACT}\n`,
+    `slice 0 oracle contract: ${cases.length} controls preserved `
+      + `(${RED_CASES.length} red, ${RESOLVED_CASES.size} resolved-green) -> ${ARTIFACT}\n`,
   );
 }

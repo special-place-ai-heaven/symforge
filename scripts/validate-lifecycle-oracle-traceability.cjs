@@ -308,7 +308,7 @@ const FROZEN_DIGESTS = {
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "e2f2c262fa640f1ba4e50da9b1bf9280aeaba5639e29a8b3e8f6495d0018cbe8",
+    hash: "4c118fabce2e7317934229f63c9f1e3871907a677550ae1294fcddcb1976a6fb",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",
@@ -2488,6 +2488,16 @@ function validateRetirementClosure(retirement, sourceMap) {
       blobHashes[relativePath] = sha256Bytes(Buffer.from(normalized, "utf8"));
     }
     const actualDigest = canonicalDigest(`symforge.lifecycle.v11.retirement.closure.${category}`, blobHashes);
+    // A frozen digest that nobody can recompute is unmaintainable: every slice
+    // that legitimately edits a censused file has to regenerate it, and the
+    // gate deliberately refuses to print it so a mismatch cannot be papered
+    // over by copying the number out of the failure. This opt-in emits the
+    // computed value WITHOUT relaxing anything -- the comparison below still
+    // runs and still fails -- so regeneration is a deliberate act that leaves
+    // the reviewer the same evidence it always did.
+    if (process.env.SYMFORGE_LIFECYCLE_EMIT_CLOSURE === "1") {
+      process.stdout.write(`CLOSURE ${category} ${actualDigest}\n`);
+    }
     if (!validSha256(record.digest) || record.digest !== actualDigest) {
       fail("RETIREMENT_CLOSURE_MISMATCH", `${category}: preactivation source census changed`);
     }
@@ -2554,7 +2564,13 @@ function validateFrozenDigest(key, value, code) {
     fail("CANONICAL_DIGEST_SPEC_INVALID", key);
     return;
   }
-  if (canonicalDigest(spec.domain, value) !== spec.hash) fail(code, key);
+  const actual = canonicalDigest(spec.domain, value);
+  // Same opt-in as the closure census: emit what was computed so a legitimate
+  // regeneration is possible, without relaxing the comparison that follows.
+  if (process.env.SYMFORGE_LIFECYCLE_EMIT_CLOSURE === "1") {
+    process.stdout.write(`FROZEN ${key} ${actual}\n`);
+  }
+  if (actual !== spec.hash) fail(code, key);
 }
 
 function validateFrozenContracts(trace, acceptance, retirement) {

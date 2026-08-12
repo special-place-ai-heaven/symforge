@@ -8,6 +8,7 @@ pub mod git_temporal;
 // now a real `detect_impact` production dependency (no longer cbm-spike-gated).
 pub mod graph;
 mod health_view;
+pub mod index_lifecycle;
 pub mod knowledge_authority;
 pub mod knowledge_bridge;
 pub mod local_ref_scout;
