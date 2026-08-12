@@ -1,0 +1,18 @@
+# Feature 020 V11 activation, refreeze, and release controls.
+# GitHub branch protection or rulesets must require code-owner review;
+# CODEOWNERS does not enforce merge policy by itself.
+/.github/CODEOWNERS @special-place-administrator
+/.github/release-evidence-requirements-v11.json @special-place-administrator
+/.github/workflows/ci.yml @special-place-administrator
+/.github/workflows/release.yml @special-place-administrator
+/.gitattributes @special-place-administrator
+/CONTEXT.md @special-place-administrator
+/docs/reviews/FEATURE-020-REFREEZE-ATTESTATION-v11.md @special-place-administrator
+/docs/reviews/FEATURE-020-V11-RELEASE-GATE.md @special-place-administrator
+/docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md @special-place-administrator
+/execution/refreeze_v11.py @special-place-administrator
+/execution/test_refreeze_v11.py @special-place-administrator
+/scripts/validate-lifecycle-oracle-traceability.cjs @special-place-administrator
+/scripts/validate-lifecycle-oracle-traceability.test.cjs @special-place-administrator
+/specs/020-repository-knowledge-index/ @special-place-administrator
+/tests/fixtures/public-api-v11-consumer/ @special-place-administrator

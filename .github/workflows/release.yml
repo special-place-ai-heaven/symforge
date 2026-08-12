@@ -14,23 +14,235 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 permissions:
-  actions: write
-  contents: write
-  issues: write
-  pull-requests: write
+  actions: read
+  contents: read
 
 jobs:
-  verify-main-push:
+  resolve-release-ref:
     runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.resolve.outputs.release_ref }}
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+      lifecycle_gate_active: ${{ steps.lifecycle-requirements.outputs.active }}
+      lifecycle_requirements_sha256: ${{ steps.lifecycle-requirements.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - id: lifecycle-requirements
+        name: Validate committed Feature 020 lifecycle release requirements
+        shell: bash
+        env:
+          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          python -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          REQUIREMENTS_PATH = ".github/release-evidence-requirements-v11.json"
+          EXPECTED_FIELDS = {
+              "kind",
+              "phase",
+              "required_oracle_receipts",
+              "required_review_documents",
+              "required_task_receipts",
+              "schema_version",
+          }
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+          def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("lifecycle release requirements contain a duplicate key")
+                  result[key] = value
+              return result
+
+          def reject_json_constant(_: str) -> object:
+              fail("lifecycle release requirements contain a non-finite number")
+
+          workflow_commit = os.environ["WORKFLOW_COMMIT"]
+          if not re.fullmatch(r"[0-9a-f]{40}", workflow_commit):
+              fail("the executing workflow commit is unavailable or malformed")
+          environment = {
+              key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+          }
+          environment.update(
+              {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+          )
+
+          def git(*arguments: str) -> bytes:
+              completed = subprocess.run(
+                  ["git", *arguments],
+                  env=environment,
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  shell=False,
+                  check=False,
+              )
+              if completed.returncode != 0:
+                  fail("cannot read the committed lifecycle release requirements")
+              return completed.stdout
+
+          if git("rev-parse", "--verify", f"{workflow_commit}^{{commit}}") != (
+              workflow_commit + "\n"
+          ).encode("ascii"):
+              fail("the executing workflow commit is not canonical")
+          tree_entry = git("ls-tree", "-z", workflow_commit, "--", REQUIREMENTS_PATH)
+          expected_entry = re.compile(
+              rb"100644 blob [0-9a-f]{40}\t"
+              + re.escape(REQUIREMENTS_PATH.encode("ascii"))
+              + rb"\x00"
+          )
+          if expected_entry.fullmatch(tree_entry) is None:
+              fail("the lifecycle release requirements are absent or not a regular file")
+          blob = git("cat-file", "blob", f"{workflow_commit}:{REQUIREMENTS_PATH}")
+          try:
+              requirements = json.loads(
+                  blob.decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_pairs,
+                  parse_constant=reject_json_constant,
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+              raise SystemExit("lifecycle release requirements are not strict UTF-8 JSON") from error
+          if (
+              not isinstance(requirements, dict)
+              or set(requirements) != EXPECTED_FIELDS
+              or requirements.get("kind")
+              != "symforge.lifecycle_release_evidence_requirements.v11"
+              or not isinstance(requirements.get("schema_version"), int)
+              or isinstance(requirements.get("schema_version"), bool)
+              or requirements.get("schema_version") != 1
+              or requirements.get("phase") not in ("pre_activation", "active")
+          ):
+              fail("lifecycle release requirements have an invalid closed schema")
+
+          def validate_paths(name: str, pattern: str) -> list[str]:
+              values = requirements.get(name)
+              if (
+                  not isinstance(values, list)
+                  or any(not isinstance(value, str) for value in values)
+                  or values != sorted(values)
+                  or len(values) != len(set(values))
+                  or any(re.fullmatch(pattern, value) is None for value in values)
+              ):
+                  fail(f"{name} is not a sorted, unique, closed path set")
+              return values
+
+          oracle_receipts = validate_paths(
+              "required_oracle_receipts",
+              r"target/ci/lifecycle-v11/[a-z0-9][a-z0-9._-]*\.json",
+          )
+          review_documents = validate_paths(
+              "required_review_documents",
+              r"docs/reviews/[A-Za-z0-9][A-Za-z0-9._-]*\.md",
+          )
+          task_receipts = validate_paths(
+              "required_task_receipts",
+              r"target/ci/lifecycle-v11/task-T[0-9]{3}\.json",
+          )
+          if set(oracle_receipts) & set(task_receipts):
+              fail("lifecycle receipt categories overlap")
+          reserved_receipts = {
+              "target/ci/lifecycle-v11/refreeze-approval-result.json",
+              "target/ci/lifecycle-v11/release-evidence.json",
+              "target/ci/lifecycle-v11/task-T089.json",
+          }
+          if reserved_receipts & (set(oracle_receipts) | set(task_receipts)):
+              fail("pre-approval requirements contain causally premature evidence")
+          phase = requirements["phase"]
+          declared_sets = (oracle_receipts, review_documents, task_receipts)
+          if phase == "pre_activation" and any(declared_sets):
+              fail("pre-activation lifecycle requirements must declare zero evidence")
+          if phase == "active" and not all(declared_sets):
+              fail("active lifecycle requirements must declare every closed evidence set")
+          if phase == "active" and review_documents != [
+              "docs/reviews/FEATURE-020-V11-RELEASE-GATE.md"
+          ]:
+              fail("active lifecycle requirements do not close the release-gate review")
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8", newline="\n") as handle:
+              handle.write(f"active={'true' if phase == 'active' else 'false'}\n")
+              handle.write(f"sha256={hashlib.sha256(blob).hexdigest()}\n")
+          PY
+
+      - id: resolve
+        name: Resolve immutable release candidate
+        shell: bash
+        env:
+          MANUAL_TAG: ${{ inputs.tag }}
+          WORKFLOW_EVENT: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          git fetch --no-tags --force origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+
+          if [[ "$WORKFLOW_EVENT" == "workflow_dispatch" \
+              && "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            echo "::error::Manual release dispatch must run from refs/heads/main."
+            exit 1
+          fi
+
+          CANONICAL_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if [[ -n "$MANUAL_TAG" ]]; then
+            if [[ ! "$MANUAL_TAG" =~ $CANONICAL_TAG_RE ]]; then
+              echo "::error::Manual rebuild tag is not canonical."
+              exit 1
+            fi
+            RELEASE_REF="$(git rev-parse --verify --end-of-options "refs/tags/${MANUAL_TAG}^{commit}" 2>/dev/null)" || {
+              echo "::error::Manual rebuild tag does not resolve to a commit."
+              exit 1
+            }
+            if ! git merge-base --is-ancestor "$RELEASE_REF" "refs/remotes/origin/main"; then
+              echo "::error::Manual rebuild tag is not reachable from origin/main."
+              exit 1
+            fi
+            echo "tag_name=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
+          else
+            RELEASE_REF="$(git rev-parse --verify --end-of-options "${GITHUB_SHA}^{commit}" 2>/dev/null)" || {
+              echo "::error::Workflow commit does not resolve."
+              exit 1
+            }
+            echo "tag_name=" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "release_ref=$RELEASE_REF" >> "$GITHUB_OUTPUT"
+
+  verify-release-ref:
+    needs: resolve-release-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve-release-ref.outputs.release_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
 
       - name: Free disk space for Rust builds
         run: bash execution/free_runner_disk.sh
@@ -39,12 +251,24 @@ jobs:
         if: github.event_name == 'push'
         run: python execution/conventional_commits.py check-push-range "${{ github.event.before }}" "$GITHUB_SHA"
 
-      - name: Validate manual run HEAD commit subject
+      - name: Validate manual run resolved tag commit subject
         if: github.event_name == 'workflow_dispatch'
         run: python execution/conventional_commits.py check-range "HEAD^!"
 
       - name: Run version sync tests
+        env:
+          SYMFORGE_REQUIRE_SSHSIG: '1'
         run: python -m unittest discover -s execution -p 'test_*.py'
+
+      - name: Verify Feature 020 V11 refreeze integrity
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
+        run: python execution/refreeze_v11.py verify-internal --target-ref HEAD
+
+      - name: Test and verify Feature 020 V11 lifecycle traceability
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
+        run: |
+          node scripts/validate-lifecycle-oracle-traceability.test.cjs
+          node scripts/validate-lifecycle-oracle-traceability.cjs
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
@@ -73,7 +297,7 @@ jobs:
       - name: Run embed-feature lib tests
         run: cargo test --no-default-features --features embed --lib -- --test-threads=1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
 
@@ -94,31 +318,1673 @@ jobs:
           node scripts/verify-tools.cjs --bin target/release/symforge
           node scripts/verify-tools.cjs --fixture verify-tools-real --bin target/release/symforge
 
-  prepare-release:
-    needs: verify-main-push
+      # T078-T088 produce the code-owned execution bundle. T089 is deliberately
+      # absent here: it can only be assembled after the external approval below
+      # has actually been verified against the approved ancestor.
+      - name: Require code-owned Feature 020 V11 pre-approval evidence
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
+        shell: bash
+        env:
+          EXPECTED_REQUIREMENTS_SHA256: ${{ needs.resolve-release-ref.outputs.lifecycle_requirements_sha256 }}
+        run: |
+          set -euo pipefail
+          python -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
+          bundle = workspace / "target/ci/lifecycle-v11"
+          requirements_path = workspace / ".github/release-evidence-requirements-v11.json"
+
+          def fail(message: str) -> None:
+              print(f"::error::{message}", file=sys.stderr)
+              raise SystemExit(1)
+
+          def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("The lifecycle release requirements contain a duplicate key.")
+                  result[key] = value
+              return result
+
+          if not requirements_path.is_file() or requirements_path.is_symlink():
+              fail("The lifecycle release requirements are unavailable or unsafe.")
+          requirements_bytes = requirements_path.read_bytes()
+          if (
+              hashlib.sha256(requirements_bytes).hexdigest()
+              != os.environ["EXPECTED_REQUIREMENTS_SHA256"]
+          ):
+              fail("The lifecycle release requirements differ from the executing workflow.")
+          try:
+              requirements = json.loads(
+                  requirements_bytes.decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_pairs,
+                  parse_constant=lambda _: fail(
+                      "The lifecycle release requirements contain a non-finite number."
+                  ),
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+              raise SystemExit(
+                  "The lifecycle release requirements are not strict UTF-8 JSON."
+              ) from error
+          if not isinstance(requirements, dict) or requirements.get("phase") != "active":
+              fail("The lifecycle release requirements are not active.")
+          task_receipts = requirements.get("required_task_receipts")
+          oracle_receipts = requirements.get("required_oracle_receipts")
+          if not isinstance(task_receipts, list) or not isinstance(oracle_receipts, list):
+              fail("The lifecycle release receipt sets are malformed.")
+          expected_files = set(task_receipts) | set(oracle_receipts)
+
+          if not bundle.is_dir() or bundle.is_symlink() or bundle.resolve() != bundle:
+              fail("The code-owned pre-approval evidence directory is unavailable or unsafe.")
+          for parent in (workspace / "target", workspace / "target/ci", bundle):
+              if parent.is_symlink():
+                  fail("The code-owned pre-approval evidence path contains a symbolic link.")
+          for path in bundle.rglob("*"):
+              if path.is_symlink():
+                  fail("The code-owned pre-approval evidence bundle contains a symbolic link.")
+
+          actual_files = {
+              path.relative_to(workspace).as_posix()
+              for path in bundle.rglob("*")
+              if path.is_file()
+          }
+          if actual_files != expected_files:
+              fail("The code-owned pre-approval evidence does not match the closed requirements.")
+
+          for name in (
+              "refreeze-approval-result.json",
+              "task-T089.json",
+              "release-evidence.json",
+          ):
+              path = bundle / name
+              if path.exists() or path.is_symlink():
+                  fail("Pre-approval evidence contains causally premature T089 material.")
+          PY
+
+      - name: Upload code-owned Feature 020 V11 pre-approval evidence
+        if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feature-020-v11-preapproval-evidence
+          path: target/ci/lifecycle-v11/
+          if-no-files-found: error
+          retention-days: 1
+
+  feature-020-v11-gate:
+    needs:
+      - resolve-release-ref
+      - verify-release-ref
+    if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
     runs-on: ubuntu-latest
+    environment: feature-020-v11-release-approval
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      release_ref: ${{ steps.gate.outputs.release_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve-release-ref.outputs.release_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - id: trusted-tools
+        name: Resolve trusted gate executables outside the repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          resolve_tool() {
+            local name="$1"
+            local candidate
+            local canonical
+            candidate="$(command -v -- "$name")" || {
+              echo "::error::A required gate executable is unavailable."
+              exit 1
+            }
+            if [[ "$candidate" != /* ]]; then
+              echo "::error::A required gate executable did not resolve to an absolute path."
+              exit 1
+            fi
+            canonical="$(/usr/bin/readlink -f -- "$candidate")" || {
+              echo "::error::A required gate executable could not be canonicalized."
+              exit 1
+            }
+            if [[ ! -f "$canonical" || ! -x "$canonical" \
+                || "$canonical" == "$GITHUB_WORKSPACE" \
+                || "$canonical" == "$GITHUB_WORKSPACE"/* \
+                || "$canonical" == "$RUNNER_TEMP" \
+                || "$canonical" == "$RUNNER_TEMP"/* ]]; then
+              echo "::error::A required gate executable is not a trusted external file."
+              exit 1
+            fi
+            printf '%s' "$canonical"
+          }
+
+          echo "git=$(resolve_tool git)" >> "$GITHUB_OUTPUT"
+          echo "ssh_keygen=$(resolve_tool ssh-keygen)" >> "$GITHUB_OUTPUT"
+          echo "python=$(resolve_tool python)" >> "$GITHUB_OUTPUT"
+          echo "node=$(resolve_tool node)" >> "$GITHUB_OUTPUT"
+          echo "cargo=$(resolve_tool cargo)" >> "$GITHUB_OUTPUT"
+
+          IFS=':' read -r -a path_entries <<< "$PATH"
+          safe_path=""
+          for entry in "${path_entries[@]}"; do
+            if [[ "$entry" != /* ]]; then
+              echo "::error::The gate PATH contains a non-absolute entry."
+              exit 1
+            fi
+            canonical="$(/usr/bin/readlink -f -- "$entry")" || {
+              echo "::error::A gate PATH entry could not be canonicalized."
+              exit 1
+            }
+            if [[ ! -d "$canonical" \
+                || "$canonical" == "$GITHUB_WORKSPACE" \
+                || "$canonical" == "$GITHUB_WORKSPACE"/* \
+                || "$canonical" == "$RUNNER_TEMP" \
+                || "$canonical" == "$RUNNER_TEMP"/* ]]; then
+              echo "::error::The gate PATH contains an unsafe entry."
+              exit 1
+            fi
+            safe_path="${safe_path:+$safe_path:}$canonical"
+          done
+          echo "safe_path=$safe_path" >> "$GITHUB_OUTPUT"
+
+      - name: Download code-owned Feature 020 V11 pre-approval evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: feature-020-v11-preapproval-evidence
+          path: target/ci/lifecycle-v11
+
+      - name: Revalidate the downloaded pre-approval evidence boundary
+        shell: bash
+        env:
+          EXPECTED_REQUIREMENTS_SHA256: ${{ needs.resolve-release-ref.outputs.lifecycle_requirements_sha256 }}
+          TRUSTED_PYTHON: ${{ steps.trusted-tools.outputs.python }}
+        run: |
+          set -euo pipefail
+          "$TRUSTED_PYTHON" -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
+          bundle = workspace / "target/ci/lifecycle-v11"
+          requirements_path = workspace / ".github/release-evidence-requirements-v11.json"
+
+          def fail(message: str) -> None:
+              print(f"::error::{message}", file=sys.stderr)
+              raise SystemExit(1)
+
+          def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("Downloaded requirements contain a duplicate key.")
+                  result[key] = value
+              return result
+
+          if not requirements_path.is_file() or requirements_path.is_symlink():
+              fail("The lifecycle release requirements are unavailable or unsafe.")
+          requirements_bytes = requirements_path.read_bytes()
+          if (
+              hashlib.sha256(requirements_bytes).hexdigest()
+              != os.environ["EXPECTED_REQUIREMENTS_SHA256"]
+          ):
+              fail("The lifecycle release requirements differ from the executing workflow.")
+          try:
+              requirements = json.loads(
+                  requirements_bytes.decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_pairs,
+                  parse_constant=lambda _: fail(
+                      "Downloaded requirements contain a non-finite number."
+                  ),
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+              raise SystemExit("Downloaded requirements are not strict UTF-8 JSON.") from error
+          if not isinstance(requirements, dict) or requirements.get("phase") != "active":
+              fail("The lifecycle release requirements are not active.")
+          task_receipts = requirements.get("required_task_receipts")
+          oracle_receipts = requirements.get("required_oracle_receipts")
+          if not isinstance(task_receipts, list) or not isinstance(oracle_receipts, list):
+              fail("The lifecycle release receipt sets are malformed.")
+          expected_files = set(task_receipts) | set(oracle_receipts)
+
+          if not bundle.is_dir() or bundle.is_symlink() or bundle.resolve() != bundle:
+              fail("The downloaded pre-approval evidence directory is unavailable or unsafe.")
+          for parent in (workspace / "target", workspace / "target/ci", bundle):
+              if parent.is_symlink():
+                  fail("The downloaded pre-approval evidence path contains a symbolic link.")
+          for path in bundle.rglob("*"):
+              if path.is_symlink():
+                  fail("The downloaded pre-approval evidence contains a symbolic link.")
+          actual_files = {
+              path.relative_to(workspace).as_posix()
+              for path in bundle.rglob("*")
+              if path.is_file()
+          }
+          if actual_files != expected_files:
+              fail("Downloaded evidence does not match the closed requirements.")
+          for name in (
+              "refreeze-approval-result.json",
+              "task-T089.json",
+              "release-evidence.json",
+          ):
+              path = bundle / name
+              if path.exists() or path.is_symlink():
+                  fail("Downloaded evidence contains causally premature T089 material.")
+          PY
+
+      - name: Bind the executing workflow to the gated release tree
+        shell: bash
+        env:
+          EXECUTING_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GATED_RELEASE_REF: ${{ needs.resolve-release-ref.outputs.release_ref }}
+          TRUSTED_GIT: ${{ steps.trusted-tools.outputs.git }}
+          TRUSTED_PYTHON: ${{ steps.trusted-tools.outputs.python }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$EXECUTING_WORKFLOW_SHA" ]]; then
+            echo "::error::The executing workflow commit is unavailable."
+            exit 1
+          fi
+          if [[ "$("$TRUSTED_GIT" rev-parse --verify --end-of-options "${EXECUTING_WORKFLOW_SHA}^{commit}" 2>/dev/null)" != "$EXECUTING_WORKFLOW_SHA" ]]; then
+            echo "::error::The executing workflow commit is not canonical."
+            exit 1
+          fi
+
+          EXECUTING_WORKFLOW="$RUNNER_TEMP/executing-release-workflow.yml"
+          if [[ -e "$EXECUTING_WORKFLOW" || -L "$EXECUTING_WORKFLOW" ]]; then
+            echo "::error::The executing-workflow comparison path already exists."
+            exit 1
+          fi
+          "$TRUSTED_GIT" show "${EXECUTING_WORKFLOW_SHA}:.github/workflows/release.yml" > "$EXECUTING_WORKFLOW"
+          if ! "$TRUSTED_PYTHON" -I - "$EXECUTING_WORKFLOW" <<'PY'
+          import sys
+          from pathlib import Path
+
+          raise SystemExit(Path(sys.argv[1]).read_bytes() != Path(".github/workflows/release.yml").read_bytes())
+          PY
+          then
+            echo "::error::The executing workflow is not byte-identical to the gated release workflow."
+            exit 1
+          fi
+          "$TRUSTED_PYTHON" -I - "$EXECUTING_WORKFLOW" <<'PY'
+          import sys
+          from pathlib import Path
+
+          Path(sys.argv[1]).unlink()
+          PY
+
+      - id: gate
+        name: Verify signed refreeze ancestor and emit the closed approval result
+        shell: bash
+        env:
+          APPROVAL_RECORD_B64: ${{ secrets.FEATURE_020_V11_APPROVAL_RECORD_B64 }}
+          APPROVAL_SIGNATURE_B64: ${{ secrets.FEATURE_020_V11_APPROVAL_SIGNATURE_B64 }}
+          ALLOWED_SIGNERS_B64: ${{ secrets.FEATURE_020_V11_ALLOWED_SIGNERS_B64 }}
+          APPROVAL_HISTORY_ZIP_B64: ${{ secrets.FEATURE_020_V11_APPROVAL_HISTORY_ZIP_B64 }}
+          BASH_ENV: ''
+          ENV: ''
+          EXPECTED_RELEASE_IDENTITY: ${{ vars.FEATURE_020_V11_RELEASE_IDENTITY }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          GATED_RELEASE_REF: ${{ needs.resolve-release-ref.outputs.release_ref }}
+          PATH: ${{ steps.trusted-tools.outputs.safe_path }}
+          PYTHONHOME: ''
+          PYTHONPATH: ''
+          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+          WORKFLOW_EVENT: ${{ github.event_name }}
+          WORKFLOW_JOB: ${{ github.job }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          TRUSTED_GIT: ${{ steps.trusted-tools.outputs.git }}
+          TRUSTED_PYTHON: ${{ steps.trusted-tools.outputs.python }}
+          TRUSTED_SSH_KEYGEN: ${{ steps.trusted-tools.outputs.ssh_keygen }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          if [[ -z "$EXPECTED_RELEASE_IDENTITY" ]]; then
+            echo "::error::Required GitHub Environment release identity is unavailable."
+            exit 1
+          fi
+          if [[ "$EXPECTED_REPOSITORY" != "special-place-ai-heaven/symforge" ]]; then
+            echo "::error::The release approval gate is running for an unexpected repository."
+            exit 1
+          fi
+          if [[ "$("$TRUSTED_GIT" rev-parse --verify HEAD)" != "$GATED_RELEASE_REF" ]]; then
+            echo "::error::Checked-out tree does not match the resolved release commit."
+            exit 1
+          fi
+
+          MATERIAL_DIR="$RUNNER_TEMP/feature-020-v11-release-approval"
+          if [[ -e "$MATERIAL_DIR" || -L "$MATERIAL_DIR" ]]; then
+            echo "::error::External approval material directory already exists."
+            exit 1
+          fi
+          mkdir -p "$MATERIAL_DIR/history"
+          export MATERIAL_DIR
+
+          cleanup_material() {
+            "$TRUSTED_PYTHON" -I - "$MATERIAL_DIR" <<'PY'
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          material = Path(sys.argv[1]).resolve()
+          runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          if material.parent != runner_temp or material.name != "feature-020-v11-release-approval":
+              raise SystemExit("refusing to remove an unexpected approval material path")
+          if material.exists():
+              shutil.rmtree(material)
+          PY
+          }
+          trap cleanup_material EXIT
+
+          "$TRUSTED_PYTHON" -I - <<'PY'
+          import base64
+          import binascii
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          root = Path(os.environ["MATERIAL_DIR"])
+          max_file_bytes = 1_048_576
+          max_history_bytes = 8_388_608
+
+          def fail(message: str) -> None:
+              print(f"::error::{message}", file=sys.stderr)
+              raise SystemExit(1)
+
+          def decode(name: str, destination: Path, *, required: bool = True) -> bytes:
+              encoded = os.environ.get(name, "")
+              if not encoded:
+                  if required:
+                      fail(f"Required GitHub Environment input {name} is unavailable.")
+                  return b""
+              try:
+                  value = base64.b64decode(encoded, validate=True)
+              except (binascii.Error, ValueError):
+                  fail(f"GitHub Environment input {name} is not valid base64.")
+              if not value:
+                  fail(f"GitHub Environment input {name} decoded to an empty file.")
+              if len(value) > max_history_bytes:
+                  fail(f"GitHub Environment input {name} exceeds the size limit.")
+              destination.write_bytes(value)
+              return value
+
+          record_bytes = decode("APPROVAL_RECORD_B64", root / "approval.json")
+          decode("APPROVAL_SIGNATURE_B64", root / "approval.json.sig")
+          decode("ALLOWED_SIGNERS_B64", root / "allowed_signers")
+
+          def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("External approval record contains a duplicate JSON key.")
+                  result[key] = value
+              return result
+
+          def reject_json_constant(_: str) -> object:
+              fail("External approval record contains a non-finite JSON number.")
+
+          try:
+              record = json.loads(
+                  record_bytes.decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_pairs,
+                  parse_constant=reject_json_constant,
+              )
+              approved_target = record["target_commit"]
+          except (KeyError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+              fail("External approval record cannot identify its target commit.")
+          if not isinstance(approved_target, str) or not re.fullmatch(
+              r"[0-9a-f]{40}", approved_target
+          ):
+              fail("External approval target commit is malformed.")
+          (root / "approved-target").write_text(approved_target + "\n", encoding="ascii")
+
+          history_bytes = decode(
+              "APPROVAL_HISTORY_ZIP_B64",
+              root / "approval-history.zip",
+              required=False,
+          )
+          if history_bytes:
+              try:
+                  archive = zipfile.ZipFile(io.BytesIO(history_bytes))
+              except zipfile.BadZipFile:
+                  fail("External approval history is not a valid ZIP archive.")
+              with archive:
+                  infos = archive.infolist()
+                  if len(infos) > 256:
+                      fail("External approval history contains too many files.")
+                  names: set[str] = set()
+                  total = 0
+                  for info in infos:
+                      name = info.filename
+                      if (
+                          info.is_dir()
+                          or name in names
+                          or not re.fullmatch(r"[0-9a-f]{64}\.json(?:\.sig)?", name)
+                      ):
+                          fail("External approval history contains an invalid entry.")
+                      names.add(name)
+                      try:
+                          with archive.open(info) as source:
+                              value = source.read(max_file_bytes + 1)
+                              trailing = source.read(1)
+                      except (RuntimeError, zipfile.BadZipFile):
+                          fail("External approval history contains an unreadable entry.")
+                      if len(value) > max_file_bytes or trailing:
+                          fail("External approval history entry exceeds the size limit.")
+                      total += len(value)
+                      if total > max_history_bytes:
+                          fail("External approval history exceeds the size limit.")
+                      (root / "history" / name).write_bytes(value)
+          PY
+
+          unset APPROVAL_RECORD_B64 APPROVAL_SIGNATURE_B64 ALLOWED_SIGNERS_B64
+          unset APPROVAL_HISTORY_ZIP_B64
+          APPROVED_TARGET="$(<"$MATERIAL_DIR/approved-target")"
+
+          if ! "$TRUSTED_SSH_KEYGEN" -Y verify \
+            -f "$MATERIAL_DIR/allowed_signers" \
+            -I "$EXPECTED_RELEASE_IDENTITY" \
+            -n symforge-feature-020-refreeze-v11 \
+            -s "$MATERIAL_DIR/approval.json.sig" \
+            < "$MATERIAL_DIR/approval.json" >/dev/null 2>&1; then
+            echo "::error::External approval signature is invalid."
+            exit 1
+          fi
+
+          "$TRUSTED_GIT" show "${APPROVED_TARGET}:execution/refreeze_v11.py" \
+            > "$MATERIAL_DIR/refreeze_v11.py"
+          if ! "$TRUSTED_PYTHON" -I "$MATERIAL_DIR/refreeze_v11.py" \
+              --git-executable "$TRUSTED_GIT" \
+              --root "$GITHUB_WORKSPACE" \
+              verify-approval \
+              --target-ref "$APPROVED_TARGET" \
+              --approval-record "$MATERIAL_DIR/approval.json" \
+              --approval-signature "$MATERIAL_DIR/approval.json.sig" \
+              --approval-history-dir "$MATERIAL_DIR/history" \
+              --allowed-signers "$MATERIAL_DIR/allowed_signers" \
+              --ssh-keygen-executable "$TRUSTED_SSH_KEYGEN" \
+              --expected-release-identity "$EXPECTED_RELEASE_IDENTITY" \
+              --expected-repository "$EXPECTED_REPOSITORY" \
+              > "$MATERIAL_DIR/verify-approval.stdout" \
+              2> "$MATERIAL_DIR/verify-approval.stderr"; then
+            echo "::error::External refreeze approval verification failed."
+            exit 1
+          fi
+          "$TRUSTED_PYTHON" -I - \
+            "$MATERIAL_DIR/verify-approval.stdout" \
+            "$MATERIAL_DIR/verify-approval.stderr" <<'PY'
+          import sys
+          from pathlib import Path
+
+          expected = b"Feature 020 V11 external approval verification passed.\n"
+          if Path(sys.argv[1]).read_bytes() != expected or Path(sys.argv[2]).read_bytes():
+              raise SystemExit("external approval verifier returned unexpected output")
+          PY
+
+          if [[ "$APPROVED_TARGET" == "$GATED_RELEASE_REF" ]] \
+            || ! "$TRUSTED_GIT" merge-base --is-ancestor "$APPROVED_TARGET" "$GATED_RELEASE_REF"; then
+            echo "::error::The signed refreeze target is not a strict ancestor of the release candidate."
+            exit 1
+          fi
+
+          FROZEN_PATHS=(
+            .gitattributes
+            .github/CODEOWNERS
+            .github/release-evidence-requirements-v11.json
+            .github/workflows/ci.yml
+            .github/workflows/release.yml
+            CONTEXT.md
+            docs/reviews/FEATURE-020-REFREEZE-ATTESTATION-v11.md
+            docs/reviews/FEATURE-020-V11-RELEASE-GATE.md
+            docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md
+            execution/refreeze_v11.py
+            execution/test_refreeze_v11.py
+            scripts/validate-lifecycle-oracle-traceability.cjs
+            scripts/validate-lifecycle-oracle-traceability.test.cjs
+            specs/020-repository-knowledge-index
+          )
+          if ! "$TRUSTED_GIT" diff --quiet --no-ext-diff --no-textconv \
+            "$APPROVED_TARGET^{tree}" \
+            "$GATED_RELEASE_REF^{tree}" \
+            -- "${FROZEN_PATHS[@]}"; then
+            echo "::error::The release candidate rewrites the approved frozen corpus or gate executables."
+            exit 1
+          fi
+
+          "$TRUSTED_PYTHON" -I "$MATERIAL_DIR/refreeze_v11.py" \
+            --git-executable "$TRUSTED_GIT" \
+            --root "$GITHUB_WORKSPACE" \
+            verify-internal \
+            --target-ref "$GATED_RELEASE_REF"
+
+          APPROVED_TREE="$("$TRUSTED_GIT" rev-parse --verify "${APPROVED_TARGET}^{tree}")"
+          RELEASE_TREE="$("$TRUSTED_GIT" rev-parse --verify "${GATED_RELEASE_REF}^{tree}")"
+          APPROVAL_RESULT="target/ci/lifecycle-v11/refreeze-approval-result.json"
+          "$TRUSTED_PYTHON" -I - \
+            "$APPROVED_TARGET" \
+            "$APPROVED_TREE" \
+            "$GATED_RELEASE_REF" \
+            "$RELEASE_TREE" \
+            "$MATERIAL_DIR" \
+            "$APPROVAL_RESULT" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          approved_commit, approved_tree, release_commit, release_tree = sys.argv[1:5]
+          material_argument = sys.argv[5]
+          material = Path(material_argument).resolve(strict=True)
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
+          bundle = workspace / "target/ci/lifecycle-v11"
+          result_path = (workspace / sys.argv[6]).resolve(strict=False)
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+          if (
+              not bundle.is_dir()
+              or bundle.is_symlink()
+              or bundle.resolve(strict=True) != bundle
+              or result_path.parent != bundle
+              or result_path.exists()
+              or result_path.is_symlink()
+          ):
+              fail("refusing to write the approval result to an unsafe path")
+
+          def sha256_bytes(value: bytes) -> str:
+              return hashlib.sha256(value).hexdigest()
+
+          def canonical_json(value: object) -> bytes:
+              return json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  allow_nan=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ).encode("utf-8")
+
+          def canonical_digest(domain: str, value: object) -> str:
+              return sha256_bytes(domain.encode("utf-8") + b"\0" + canonical_json(value))
+
+          def reject_duplicate_pairs(
+              pairs: list[tuple[str, object]],
+          ) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("an approval record contains a duplicate JSON key")
+                  result[key] = value
+              return result
+
+          def reject_json_constant(_: str) -> object:
+              fail("an approval record contains a non-finite JSON number")
+
+          def parse_record(value: bytes) -> dict[str, object]:
+              try:
+                  record = json.loads(
+                      value.decode("utf-8"),
+                      object_pairs_hook=reject_duplicate_pairs,
+                      parse_constant=reject_json_constant,
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+                  raise SystemExit("an approval record is not valid JSON") from error
+              if not isinstance(record, dict):
+                  fail("an approval record is not a JSON object")
+              return record
+
+          def read(name: str) -> bytes:
+              path = material / name
+              if not path.is_file() or path.is_symlink():
+                  fail("a required approval-verification input is unavailable")
+              return path.read_bytes()
+
+          approved_verifier = read("refreeze_v11.py")
+          release_verifier = (workspace / "execution/refreeze_v11.py").read_bytes()
+          if approved_verifier != release_verifier:
+              fail("the approved and release verifier bytes differ")
+          release_workflow = (workspace / ".github/workflows/release.yml").read_bytes()
+
+          current_record_bytes = read("approval.json")
+          current_signature_bytes = read("approval.json.sig")
+          current_record = parse_record(current_record_bytes)
+          approval_sequence = current_record.get("sequence")
+          approval_predecessor = current_record.get("predecessor_digest")
+          if (
+              not isinstance(approval_sequence, int)
+              or isinstance(approval_sequence, bool)
+              or not 1 <= approval_sequence <= 256
+          ):
+              fail("the verified approval sequence is invalid")
+
+          history_directory = material / "history"
+          history_inventory_descending: list[dict[str, object]] = []
+          expected_history_files: set[str] = set()
+          predecessor = approval_predecessor
+          for sequence in range(approval_sequence - 1, 0, -1):
+              if not isinstance(predecessor, str) or len(predecessor) != 64:
+                  fail("the verified approval predecessor chain is invalid")
+              record_name = f"{predecessor}.json"
+              signature_name = f"{predecessor}.json.sig"
+              expected_history_files.update((record_name, signature_name))
+              record_path = history_directory / record_name
+              signature_path = history_directory / signature_name
+              if (
+                  not record_path.is_file()
+                  or record_path.is_symlink()
+                  or not signature_path.is_file()
+                  or signature_path.is_symlink()
+              ):
+                  fail("a verified approval-history entry is unavailable")
+              predecessor_bytes = record_path.read_bytes()
+              signature_bytes = signature_path.read_bytes()
+              if sha256_bytes(predecessor_bytes) != predecessor:
+                  fail("a verified approval-history digest changed")
+              predecessor_record = parse_record(predecessor_bytes)
+              if predecessor_record.get("sequence") != sequence:
+                  fail("the verified approval-history sequence changed")
+              history_inventory_descending.append(
+                  {
+                      "record_sha256": predecessor,
+                      "sequence": sequence,
+                      "signature_sha256": sha256_bytes(signature_bytes),
+                  }
+              )
+              predecessor = predecessor_record.get("predecessor_digest")
+          if predecessor is not None:
+              fail("the verified approval-history root is invalid")
+          actual_history_files = {
+              path.name for path in history_directory.iterdir() if path.is_file()
+          }
+          if actual_history_files != expected_history_files:
+              fail("the external approval history contains unbound files")
+          approval_history = sorted(
+              history_inventory_descending, key=lambda entry: entry["sequence"]
+          )
+          history_inventory_sha256 = canonical_digest(
+              "symforge.refreeze.v11.approval-history-inventory",
+              approval_history,
+          )
+          current_record_sha256 = sha256_bytes(current_record_bytes)
+          current_signature_sha256 = sha256_bytes(current_signature_bytes)
+          history_root_sha256 = canonical_digest(
+              "symforge.refreeze.v11.approval-history-root",
+              {
+                  "approval_history_count": len(approval_history),
+                  "approval_history_inventory_sha256": history_inventory_sha256,
+                  "approval_predecessor_digest": approval_predecessor,
+                  "approval_sequence": approval_sequence,
+                  "current_record_sha256": current_record_sha256,
+                  "current_signature_sha256": current_signature_sha256,
+              },
+          )
+          verifier_argv = [
+              os.environ["TRUSTED_PYTHON"],
+              "-I",
+              f"{material_argument}/refreeze_v11.py",
+              "--git-executable",
+              os.environ["TRUSTED_GIT"],
+              "--root",
+              os.environ["GITHUB_WORKSPACE"],
+              "verify-approval",
+              "--target-ref",
+              approved_commit,
+              "--approval-record",
+              f"{material_argument}/approval.json",
+              "--approval-signature",
+              f"{material_argument}/approval.json.sig",
+              "--approval-history-dir",
+              f"{material_argument}/history",
+              "--allowed-signers",
+              f"{material_argument}/allowed_signers",
+              "--ssh-keygen-executable",
+              os.environ["TRUSTED_SSH_KEYGEN"],
+              "--expected-release-identity",
+              os.environ["EXPECTED_RELEASE_IDENTITY"],
+              "--expected-repository",
+              os.environ["EXPECTED_REPOSITORY"],
+          ]
+
+          result = {
+              "allowed_signers_sha256": sha256_bytes(read("allowed_signers")),
+              "approved_commit": approved_commit,
+              "approved_tree": approved_tree,
+              "approval_history_count": len(approval_history),
+              "approval_history_inventory": approval_history,
+              "approval_history_inventory_sha256": history_inventory_sha256,
+              "approval_history_root_sha256": history_root_sha256,
+              "approval_predecessor_digest": approval_predecessor,
+              "approval_sequence": approval_sequence,
+              "command_id": "refreeze-v11-verify-approval",
+              "command_argv_sha256": sha256_bytes(canonical_json(verifier_argv)),
+              "exit_code": 0,
+              "expected_repository": os.environ["EXPECTED_REPOSITORY"],
+              "external_inputs": "outside_repository",
+              "kind": "symforge.refreeze_approval_verification_result.v11",
+              "record_sha256": current_record_sha256,
+              "release_commit": release_commit,
+              "release_identity_sha256": sha256_bytes(
+                  os.environ["EXPECTED_RELEASE_IDENTITY"].encode("utf-8")
+              ),
+              "release_tree": release_tree,
+              "runner_kind": "github_actions_protected_environment",
+              "runner_repository": os.environ["EXPECTED_REPOSITORY"],
+              "schema_version": 1,
+              "signature_sha256": current_signature_sha256,
+              "status": "passed",
+              "stderr_sha256": sha256_bytes(read("verify-approval.stderr")),
+              "stdout_sha256": sha256_bytes(read("verify-approval.stdout")),
+              "verifier_sha256": sha256_bytes(approved_verifier),
+              "workflow_commit": os.environ["WORKFLOW_COMMIT"],
+              "workflow_event": os.environ["WORKFLOW_EVENT"],
+              "workflow_job": os.environ["WORKFLOW_JOB"],
+              "workflow_path": ".github/workflows/release.yml",
+              "workflow_run_attempt": int(os.environ["WORKFLOW_RUN_ATTEMPT"]),
+              "workflow_run_id": os.environ["WORKFLOW_RUN_ID"],
+              "workflow_sha256": sha256_bytes(release_workflow),
+          }
+          payload = canonical_json(result) + b"\n"
+          temporary = result_path.with_name(result_path.name + ".tmp")
+          if temporary.exists() or temporary.is_symlink():
+              fail("the approval-result temporary path already exists")
+          with temporary.open("xb") as handle:
+              handle.write(payload)
+              handle.flush()
+              os.fsync(handle.fileno())
+          os.replace(temporary, result_path)
+          result_hash_path = material / "approval-result-sha256"
+          if result_hash_path.exists() or result_hash_path.is_symlink():
+              fail("the approval-result hash path already exists")
+          result_hash_path.write_text(sha256_bytes(payload) + "\n", encoding="ascii")
+          PY
+
+          APPROVAL_RESULT_SHA256="$(<"$MATERIAL_DIR/approval-result-sha256")"
+          cleanup_material
+          trap - EXIT
+
+          echo "release_ref=$GATED_RELEASE_REF" >> "$GITHUB_OUTPUT"
+          echo "approved_refreeze_commit=$APPROVED_TARGET" >> "$GITHUB_OUTPUT"
+          echo "approved_refreeze_tree=$APPROVED_TREE" >> "$GITHUB_OUTPUT"
+          echo "approval_result_sha256=$APPROVAL_RESULT_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize closed T089 evidence inside the frozen workflow
+        shell: bash
+        env:
+          APPROVAL_RESULT_SHA256: ${{ steps.gate.outputs.approval_result_sha256 }}
+          APPROVED_TARGET: ${{ steps.gate.outputs.approved_refreeze_commit }}
+          APPROVED_TREE: ${{ steps.gate.outputs.approved_refreeze_tree }}
+          BASH_ENV: ''
+          ENV: ''
+          GATED_RELEASE_REF: ${{ steps.gate.outputs.release_ref }}
+          PATH: ${{ steps.trusted-tools.outputs.safe_path }}
+          PYTHONHOME: ''
+          PYTHONPATH: ''
+          TRUSTED_GIT: ${{ steps.trusted-tools.outputs.git }}
+          TRUSTED_PYTHON: ${{ steps.trusted-tools.outputs.python }}
+        run: |
+          set -euo pipefail
+          umask 077
+          "$TRUSTED_PYTHON" -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path, PurePosixPath
+
+          TRACE_PATH = "specs/020-repository-knowledge-index/contracts/lifecycle-oracle-traceability-v11.md"
+          ACCEPTANCE_PATH = "specs/020-repository-knowledge-index/contracts/lifecycle-acceptance-oracles-v11.md"
+          RETIREMENT_PATH = "specs/020-repository-knowledge-index/contracts/v10-authority-retirement-v11.md"
+          TASKS_PATH = "specs/020-repository-knowledge-index/tasks.md"
+          CHECKER_PATH = "scripts/validate-lifecycle-oracle-traceability.cjs"
+          WORKFLOW_PATH = ".github/workflows/release.yml"
+          VERIFIER_PATH = "execution/refreeze_v11.py"
+          REQUIREMENTS_PATH = ".github/release-evidence-requirements-v11.json"
+          RELEASE_GATE_REVIEW_PATH = "docs/reviews/FEATURE-020-V11-RELEASE-GATE.md"
+          APPROVAL_PATH = "target/ci/lifecycle-v11/refreeze-approval-result.json"
+          TASK_PATH = "target/ci/lifecycle-v11/task-T089.json"
+          EVIDENCE_PATH = "target/ci/lifecycle-v11/release-evidence.json"
+          EXPECTED_STDOUT_SHA256 = "0265822a4b6823d04526ef56f82e47f1a0c592c15e234fb0ad3bd812ef377ed5"
+          EXPECTED_STDERR_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
+          bundle = workspace / "target/ci/lifecycle-v11"
+          trusted_git = os.environ["TRUSTED_GIT"]
+          expected_approval_sha256 = os.environ["APPROVAL_RESULT_SHA256"]
+          expected_release = os.environ["GATED_RELEASE_REF"]
+          expected_approved = os.environ["APPROVED_TARGET"]
+          expected_approved_tree = os.environ["APPROVED_TREE"]
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
+          def sha256_bytes(value: bytes) -> str:
+              return hashlib.sha256(value).hexdigest()
+
+          def canonical_bytes(value: object) -> bytes:
+              return json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  allow_nan=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ).encode("utf-8")
+
+          def reject_duplicate_pairs(
+              pairs: list[tuple[str, object]],
+          ) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("JSON input contains a duplicate key")
+                  result[key] = value
+              return result
+
+          def reject_json_constant(_: str) -> object:
+              fail("JSON input contains a non-finite number")
+
+          def parse_json_bytes(value: bytes, context: str) -> object:
+              try:
+                  return json.loads(
+                      value.decode("utf-8"),
+                      object_pairs_hook=reject_duplicate_pairs,
+                      parse_constant=reject_json_constant,
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+                  raise SystemExit(f"{context} is not strict UTF-8 JSON") from error
+
+          def relative_path(value: str) -> PurePosixPath:
+              if not isinstance(value, str) or not value or "\\" in value:
+                  fail("an evidence path is malformed")
+              relative = PurePosixPath(value)
+              if relative.is_absolute() or relative.as_posix() != value or any(
+                  part in ("", ".", "..") for part in relative.parts
+              ):
+                  fail("an evidence path is unsafe")
+              return relative
+
+          def workspace_file(value: str, *, artifact: bool = False) -> Path:
+              relative = relative_path(value)
+              if artifact and not value.startswith("target/ci/lifecycle-v11/"):
+                  fail("an artifact path is outside the lifecycle evidence directory")
+              current = workspace
+              for part in relative.parts:
+                  current = current / part
+                  if current.is_symlink():
+                      fail("an evidence path contains a symbolic link")
+              if not current.is_file():
+                  fail("a required evidence file is unavailable")
+              resolved = current.resolve(strict=True)
+              if not resolved.is_relative_to(workspace):
+                  fail("an evidence path escapes the repository")
+              return current
+
+          def read_artifact(value: str) -> bytes:
+              return workspace_file(value, artifact=True).read_bytes()
+
+          git_environment = {
+              key: value
+              for key, value in os.environ.items()
+              if not key.startswith("GIT_")
+          }
+          git_environment.update(
+              {
+                  "GIT_NO_REPLACE_OBJECTS": "1",
+                  "GIT_OPTIONAL_LOCKS": "0",
+                  "LC_ALL": "C",
+              }
+          )
+
+          def run_git(
+              arguments: list[str],
+              *,
+              allowed_codes: tuple[int, ...] = (0,),
+          ) -> subprocess.CompletedProcess[bytes]:
+              completed = subprocess.run(
+                  [trusted_git, *arguments],
+                  cwd=workspace,
+                  env=git_environment,
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  shell=False,
+                  check=False,
+              )
+              if completed.returncode not in allowed_codes:
+                  fail("a trusted Git identity check failed")
+              return completed
+
+          def git_text(arguments: list[str]) -> str:
+              value = run_git(arguments).stdout
+              try:
+                  text = value.decode("ascii")
+              except UnicodeDecodeError as error:
+                  raise SystemExit("trusted Git returned a non-ASCII identity") from error
+              if not text.endswith("\n"):
+                  fail("trusted Git returned a malformed identity")
+              text = text.rstrip("\r\n")
+              if "\n" in text or "\r" in text:
+                  fail("trusted Git returned multiple identities")
+              return text
+
+          def git_blob(commit: str, value: str) -> bytes:
+              relative_path(value)
+              return run_git(["cat-file", "blob", f"{commit}:{value}"]).stdout
+
+          def pinned_blob(commit: str, value: str) -> bytes:
+              blob = git_blob(commit, value)
+              if workspace_file(value).read_bytes() != blob:
+                  fail("a pinned release-tree file differs from the worktree")
+              return blob
+
+          def extract_sentinel(
+              blob: bytes,
+              start: str,
+              end: str,
+              context: str,
+          ) -> dict[str, object]:
+              try:
+                  text = blob.decode("utf-8")
+              except UnicodeDecodeError as error:
+                  raise SystemExit(f"{context} is not UTF-8") from error
+              if text.count(start) != 1 or text.count(end) != 1:
+                  fail(f"{context} sentinel markers are not exact")
+              inner = text.split(start, 1)[1].split(end, 1)[0]
+              match = re.fullmatch(
+                  r"\s*\x60{3}json\r?\n(.*?)\r?\n\x60{3}\s*",
+                  inner,
+                  re.DOTALL,
+              )
+              if match is None:
+                  fail(f"{context} sentinel payload is malformed")
+              parsed = parse_json_bytes(match.group(1).encode("utf-8"), context)
+              if not isinstance(parsed, dict):
+                  fail(f"{context} sentinel payload is not an object")
+              return parsed
+
+          def source_file(target: object) -> str:
+              if not isinstance(target, str) or "::" not in target:
+                  fail("a frozen source target is malformed")
+              value = target.split("::", 1)[0]
+              relative_path(value)
+              if not value.endswith(".rs"):
+                  fail("a frozen source target is not Rust source")
+              return value
+
+          def atomic_create(value: str, payload: bytes) -> None:
+              path = workspace / relative_path(value)
+              temporary = path.with_name(path.name + ".tmp")
+              if path.exists() or path.is_symlink() or temporary.exists() or temporary.is_symlink():
+                  fail("a closed T089 output already exists")
+              with temporary.open("xb") as handle:
+                  handle.write(payload)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+              os.replace(temporary, path)
+              directory = os.open(path.parent, os.O_RDONLY)
+              try:
+                  os.fsync(directory)
+              finally:
+                  os.close(directory)
+
+          if (
+              not bundle.is_dir()
+              or bundle.is_symlink()
+              or bundle.resolve(strict=True) != bundle
+              or any(path.is_symlink() for path in bundle.rglob("*"))
+              or not re.fullmatch(r"[0-9a-f]{64}", expected_approval_sha256)
+          ):
+              fail("the lifecycle evidence boundary is unsafe")
+          for output in (TASK_PATH, EVIDENCE_PATH):
+              path = workspace / output
+              if path.exists() or path.is_symlink():
+                  fail("causally premature closed T089 evidence exists")
+          initial_files = {
+              path.relative_to(bundle).as_posix()
+              for path in bundle.rglob("*")
+              if path.is_file()
+          }
+
+          release_commit = git_text(["rev-parse", "--verify", "HEAD^{commit}"])
+          release_tree = git_text(["rev-parse", "--verify", "HEAD^{tree}"])
+          if release_commit != expected_release:
+              fail("the finalizer is not running at the gated release commit")
+          requirements = parse_json_bytes(
+              pinned_blob(release_commit, REQUIREMENTS_PATH),
+              "lifecycle release requirements",
+          )
+          requirements_fields = {
+              "kind",
+              "phase",
+              "required_oracle_receipts",
+              "required_review_documents",
+              "required_task_receipts",
+              "schema_version",
+          }
+          if (
+              not isinstance(requirements, dict)
+              or set(requirements) != requirements_fields
+              or requirements.get("kind")
+              != "symforge.lifecycle_release_evidence_requirements.v11"
+              or not isinstance(requirements.get("schema_version"), int)
+              or isinstance(requirements.get("schema_version"), bool)
+              or requirements.get("schema_version") != 1
+              or requirements.get("phase") != "active"
+          ):
+              fail("the lifecycle release requirements are not an active closed schema")
+
+          def closed_paths(name: str, pattern: str) -> list[str]:
+              values = requirements.get(name)
+              if (
+                  not isinstance(values, list)
+                  or not values
+                  or any(not isinstance(value, str) for value in values)
+                  or values != sorted(values)
+                  or len(values) != len(set(values))
+                  or any(re.fullmatch(pattern, value) is None for value in values)
+              ):
+                  fail(f"the active {name} set is not closed")
+              return values
+
+          required_oracle_receipts = closed_paths(
+              "required_oracle_receipts",
+              r"target/ci/lifecycle-v11/[a-z0-9][a-z0-9._-]*\.json",
+          )
+          required_review_documents = closed_paths(
+              "required_review_documents",
+              r"docs/reviews/[A-Za-z0-9][A-Za-z0-9._-]*\.md",
+          )
+          if required_review_documents != [RELEASE_GATE_REVIEW_PATH]:
+              fail("the active review set does not close the release-gate review")
+          required_task_receipts = closed_paths(
+              "required_task_receipts",
+              r"target/ci/lifecycle-v11/task-T[0-9]{3}\.json",
+          )
+          expected_task_receipts = [
+              f"target/ci/lifecycle-v11/task-T{task_number:03d}.json"
+              for task_number in range(78, 89)
+          ]
+          if required_task_receipts != expected_task_receipts:
+              fail("the active task receipt set does not close T078 through T088")
+          expected_initial_files = {
+              value.removeprefix("target/ci/lifecycle-v11/")
+              for value in (*required_task_receipts, *required_oracle_receipts)
+          }
+          expected_initial_files.add(
+              APPROVAL_PATH.removeprefix("target/ci/lifecycle-v11/")
+          )
+          if initial_files != expected_initial_files:
+              fail("the T089 input bundle differs from the active closed requirements")
+          approved_commit = git_text(["rev-parse", "--verify", f"{expected_approved}^{{commit}}"])
+          approved_tree = git_text(["rev-parse", "--verify", f"{expected_approved}^{{tree}}"])
+          if approved_commit != expected_approved or approved_tree != expected_approved_tree:
+              fail("the approved refreeze identity changed")
+          ancestry = run_git(
+              ["merge-base", "--is-ancestor", approved_commit, release_commit],
+              allowed_codes=(0, 1),
+          )
+          if ancestry.returncode != 0 or approved_commit == release_commit:
+              fail("the approved refreeze is not a strict ancestor")
+
+          checker_blob = pinned_blob(release_commit, CHECKER_PATH)
+          workflow_blob = pinned_blob(release_commit, WORKFLOW_PATH)
+          verifier_blob = pinned_blob(release_commit, VERIFIER_PATH)
+          if (
+              git_blob(approved_commit, CHECKER_PATH) != checker_blob
+              or git_blob(approved_commit, WORKFLOW_PATH) != workflow_blob
+              or git_blob(approved_commit, VERIFIER_PATH) != verifier_blob
+          ):
+              fail("a frozen gate executable changed after approval")
+
+          approval_bytes = read_artifact(APPROVAL_PATH)
+          if sha256_bytes(approval_bytes) != expected_approval_sha256:
+              fail("the closed approval result changed")
+          approval = parse_json_bytes(approval_bytes, "approval result")
+          approval_fields = {
+              "allowed_signers_sha256",
+              "approved_commit",
+              "approved_tree",
+              "approval_history_count",
+              "approval_history_inventory",
+              "approval_history_inventory_sha256",
+              "approval_history_root_sha256",
+              "approval_predecessor_digest",
+              "approval_sequence",
+              "command_argv_sha256",
+              "command_id",
+              "exit_code",
+              "expected_repository",
+              "external_inputs",
+              "kind",
+              "record_sha256",
+              "release_commit",
+              "release_identity_sha256",
+              "release_tree",
+              "runner_kind",
+              "runner_repository",
+              "schema_version",
+              "signature_sha256",
+              "status",
+              "stderr_sha256",
+              "stdout_sha256",
+              "verifier_sha256",
+              "workflow_commit",
+              "workflow_event",
+              "workflow_job",
+              "workflow_path",
+              "workflow_run_attempt",
+              "workflow_run_id",
+              "workflow_sha256",
+          }
+          if (
+              not isinstance(approval, dict)
+              or set(approval) != approval_fields
+              or approval.get("kind") != "symforge.refreeze_approval_verification_result.v11"
+              or approval.get("schema_version") != 1
+              or approval.get("status") != "passed"
+              or approval.get("approved_commit") != approved_commit
+              or approval.get("approved_tree") != approved_tree
+              or approval.get("release_commit") != release_commit
+              or approval.get("release_tree") != release_tree
+              or approval.get("verifier_sha256") != sha256_bytes(verifier_blob)
+              or approval.get("workflow_sha256") != sha256_bytes(workflow_blob)
+              or approval.get("stdout_sha256") != EXPECTED_STDOUT_SHA256
+              or approval.get("stderr_sha256") != EXPECTED_STDERR_SHA256
+          ):
+              fail("the closed approval result does not match the frozen gate")
+
+          trace_blob = pinned_blob(release_commit, TRACE_PATH)
+          acceptance_blob = pinned_blob(release_commit, ACCEPTANCE_PATH)
+          retirement_blob = pinned_blob(release_commit, RETIREMENT_PATH)
+          trace = extract_sentinel(
+              trace_blob,
+              "<!-- SYMFORGE LIFECYCLE ORACLE TRACEABILITY V11 JSON START -->",
+              "<!-- SYMFORGE LIFECYCLE ORACLE TRACEABILITY V11 JSON END -->",
+              "traceability contract",
+          )
+          acceptance = extract_sentinel(
+              acceptance_blob,
+              "<!-- SYMFORGE LIFECYCLE ACCEPTANCE ORACLES V11 JSON START -->",
+              "<!-- SYMFORGE LIFECYCLE ACCEPTANCE ORACLES V11 JSON END -->",
+              "acceptance contract",
+          )
+          extract_sentinel(
+              retirement_blob,
+              "<!-- SYMFORGE V10 AUTHORITY RETIREMENT V11 JSON START -->",
+              "<!-- SYMFORGE V10 AUTHORITY RETIREMENT V11 JSON END -->",
+              "retirement contract",
+          )
+          catalogs = trace.get("catalogs")
+          commands = catalogs.get("commands") if isinstance(catalogs, dict) else None
+          tests = catalogs.get("tests") if isinstance(catalogs, dict) else None
+          seams = catalogs.get("seams") if isinstance(catalogs, dict) else None
+          oracles_value = acceptance.get("oracles")
+          if (
+              not all(isinstance(value, dict) for value in (commands, tests, seams))
+              or not isinstance(oracles_value, list)
+          ):
+              fail("the frozen lifecycle catalogs are malformed")
+
+          oracles: list[dict[str, object]] = []
+          oracle_ids: set[str] = set()
+          artifact_paths: set[str] = set()
+          requirement_map = {
+              **{f"FR-{number:03d}": [] for number in range(1, 53)},
+              **{f"SC-{number:03d}": [] for number in range(1, 27)},
+          }
+          for oracle in oracles_value:
+              if not isinstance(oracle, dict):
+                  fail("a frozen acceptance oracle is malformed")
+              oracle_id = oracle.get("oracle_id")
+              artifact = oracle.get("ci_artifact")
+              requirement_ids = oracle.get("requirement_ids")
+              if (
+                  not isinstance(oracle_id, str)
+                  or oracle_id in oracle_ids
+                  or not isinstance(artifact, str)
+                  or artifact in artifact_paths
+                  or not isinstance(requirement_ids, list)
+                  or any(requirement not in requirement_map for requirement in requirement_ids)
+              ):
+                  fail("a frozen acceptance oracle identity is malformed")
+              relative_path(artifact)
+              oracle_ids.add(oracle_id)
+              artifact_paths.add(artifact)
+              oracles.append(oracle)
+              for requirement in requirement_ids:
+                  requirement_map[requirement].append(oracle_id)
+          oracles.sort(key=lambda oracle: str(oracle["oracle_id"]))
+          for mapped in requirement_map.values():
+              mapped.sort()
+              if not mapped:
+                  fail("a frozen requirement has no acceptance oracle")
+          if sorted(artifact_paths) != required_oracle_receipts:
+              fail("the active oracle receipt set differs from the frozen acceptance contract")
+
+          requirement_receipts = [
+              {
+                  "oracle_ids": requirement_map[requirement],
+                  "release_tree": release_tree,
+                  "requirement_id": requirement,
+                  "status": "passed",
+              }
+              for requirement in requirement_map
+          ]
+          oracle_receipts = [
+              {
+                  "artifact": str(oracle["ci_artifact"]),
+                  "artifact_sha256": sha256_bytes(
+                      read_artifact(str(oracle["ci_artifact"]))
+                  ),
+                  "oracle_id": str(oracle["oracle_id"]),
+                  "release_tree": release_tree,
+                  "status": "passed",
+              }
+              for oracle in oracles
+          ]
+
+          exact_cases: list[dict[str, object]] = []
+          benchmarks: list[dict[str, object]] = []
+          for test_id, test in tests.items():
+              if not isinstance(test_id, str) or not isinstance(test, dict):
+                  fail("a frozen lifecycle test is malformed")
+              kind = test.get("kind")
+              if kind not in ("planned_exact", "inherited_exact", "planned_benchmark"):
+                  continue
+              target = test.get("target")
+              command_id = test.get("command_id")
+              command = commands.get(command_id) if isinstance(command_id, str) else None
+              if not isinstance(target, str) or not isinstance(command, str):
+                  fail("a frozen lifecycle test command is malformed")
+              source = source_file(target)
+              source_hash = sha256_bytes(pinned_blob(release_commit, source))
+              base = {
+                  "command": command,
+                  "release_tree": release_tree,
+                  "source_sha256": source_hash,
+                  "status": "passed",
+                  "target": target,
+                  "test_id": test_id,
+              }
+              if kind == "planned_benchmark":
+                  registration = test.get("registration")
+                  matches = [
+                      oracle
+                      for oracle in oracles
+                      if oracle.get("trace_test_id") == test_id
+                  ]
+                  if not isinstance(registration, str) or len(matches) != 1:
+                      fail("a frozen benchmark mapping is malformed")
+                  artifact = str(matches[0]["ci_artifact"])
+                  benchmarks.append(
+                      {
+                          **base,
+                          "receipt": artifact,
+                          "receipt_sha256": sha256_bytes(read_artifact(artifact)),
+                          "registration": registration,
+                      }
+                  )
+              else:
+                  exact_cases.append(base)
+          exact_cases.sort(key=lambda receipt: str(receipt["test_id"]))
+          benchmarks.sort(key=lambda receipt: str(receipt["test_id"]))
+
+          reverse_seams: dict[str, list[str]] = {}
+          for seam_id, anchors in seams.items():
+              if not isinstance(seam_id, str) or not isinstance(anchors, list):
+                  fail("a frozen production seam is malformed")
+              for anchor in anchors:
+                  if not isinstance(anchor, str):
+                      fail("a frozen production anchor is malformed")
+                  reverse_seams.setdefault(anchor, []).append(seam_id)
+          source_receipts = []
+          for anchor in sorted(reverse_seams):
+              source_receipts.append(
+                  {
+                      "anchor": anchor,
+                      "release_tree": release_tree,
+                      "seam_ids": sorted(reverse_seams[anchor]),
+                      "source_sha256": sha256_bytes(
+                          pinned_blob(release_commit, source_file(anchor))
+                      ),
+                      "status": "passed",
+                  }
+              )
+
+          tasks_blob = pinned_blob(release_commit, TASKS_PATH)
+          try:
+              task_text = tasks_blob.decode("utf-8")
+          except UnicodeDecodeError as error:
+              raise SystemExit("the frozen task catalog is not UTF-8") from error
+          declarations = re.findall(
+              r"^- \[[ xX]\] T089\b[^\r\n]*$",
+              task_text,
+              re.MULTILINE,
+          )
+          if len(declarations) != 1:
+              fail("the frozen T089 task declaration is not exact")
+          review_results = [
+              {
+                  "path": review_path,
+                  "sha256": sha256_bytes(pinned_blob(release_commit, review_path)),
+                  "status": "passed",
+              }
+              for review_path in required_review_documents
+          ]
+          task_result = {
+              "artifact_results": [
+                  *review_results,
+                  {
+                      "path": APPROVAL_PATH,
+                      "sha256": expected_approval_sha256,
+                      "status": "passed",
+                  },
+              ],
+              "command_results": [
+                  {
+                      "command_id": "refreeze-approval-and-evidence",
+                      "exit_code": 0,
+                      "stderr_sha256": str(approval["stderr_sha256"]),
+                      "stdout_sha256": str(approval["stdout_sha256"]),
+                  }
+              ],
+              "kind": "symforge.lifecycle_release_task_result.v11",
+              "release_commit": release_commit,
+              "release_tree": release_tree,
+              "schema_version": 1,
+              "status": "passed",
+              "task_declaration_sha256": sha256_bytes(
+                  declarations[0].encode("utf-8")
+              ),
+              "task_id": "T089",
+          }
+          task_payload = canonical_bytes(task_result) + b"\n"
+          atomic_create(TASK_PATH, task_payload)
+
+          task_receipts = []
+          for artifact in (*required_task_receipts, TASK_PATH):
+              match = re.fullmatch(
+                  r"target/ci/lifecycle-v11/task-(T[0-9]{3})\.json",
+                  artifact,
+              )
+              if match is None:
+                  fail("a task receipt path is malformed")
+              task_id = match.group(1)
+              task_receipts.append(
+                  {
+                      "artifact": artifact,
+                      "artifact_sha256": sha256_bytes(read_artifact(artifact)),
+                      "release_tree": release_tree,
+                      "status": "passed",
+                      "task_id": task_id,
+                  }
+              )
+
+          evidence = {
+              "acceptance_contract_sha256": sha256_bytes(acceptance_blob),
+              "approval_verification": {
+                  "result_artifact": APPROVAL_PATH,
+                  "result_sha256": expected_approval_sha256,
+                  "status": "passed",
+              },
+              "approved_refreeze_commit": approved_commit,
+              "approved_refreeze_tree": approved_tree,
+              "benchmark_receipts": benchmarks,
+              "checker_sha256": sha256_bytes(checker_blob),
+              "kind": "symforge.lifecycle_release_evidence.v11",
+              "oracle_receipts": oracle_receipts,
+              "release_commit": release_commit,
+              "release_tree": release_tree,
+              "requirement_receipts": requirement_receipts,
+              "retirement_contract_sha256": sha256_bytes(retirement_blob),
+              "rust_case_receipts": exact_cases,
+              "schema_version": 1,
+              "source_receipts": source_receipts,
+              "status": "passed",
+              "task_receipts": task_receipts,
+              "trace_contract_sha256": sha256_bytes(trace_blob),
+          }
+          evidence_payload = canonical_bytes(evidence) + b"\n"
+          atomic_create(EVIDENCE_PATH, evidence_payload)
+
+          if sha256_bytes(read_artifact(APPROVAL_PATH)) != expected_approval_sha256:
+              fail("the closed approval result changed during T089")
+          final_files = {
+              path.relative_to(bundle).as_posix()
+              for path in bundle.rglob("*")
+              if path.is_file()
+          }
+          if final_files != initial_files | {"task-T089.json", "release-evidence.json"}:
+              fail("the inline T089 finalizer wrote outside its exact allowlist")
+          for arguments in (
+              ["diff", "--quiet", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
+              [
+                  "diff",
+                  "--cached",
+                  "--quiet",
+                  "--no-ext-diff",
+                  "--no-textconv",
+                  "HEAD",
+                  "--",
+              ],
+          ):
+              if run_git(arguments, allowed_codes=(0, 1)).returncode != 0:
+                  fail("the release worktree changed during T089")
+          untracked = run_git(["ls-files", "--others", "-z"]).stdout
+          for entry in untracked.split(b"\0"):
+              if not entry:
+                  continue
+              try:
+                  value = entry.decode("utf-8")
+              except UnicodeDecodeError as error:
+                  raise SystemExit("an untracked release path is not UTF-8") from error
+              if not value.startswith("target/"):
+                  fail("the release worktree has an unexpected untracked path")
+          if (
+              pinned_blob(release_commit, CHECKER_PATH) != checker_blob
+              or pinned_blob(release_commit, WORKFLOW_PATH) != workflow_blob
+              or git_blob(approved_commit, CHECKER_PATH) != checker_blob
+              or git_blob(approved_commit, WORKFLOW_PATH) != workflow_blob
+          ):
+              fail("a frozen checker or workflow changed during T089")
+          PY
+
+      - name: Verify materialized Feature 020 V11 lifecycle evidence
+        shell: bash
+        env:
+          APPROVAL_RESULT_SHA256: ${{ steps.gate.outputs.approval_result_sha256 }}
+          BASH_ENV: ''
+          ENV: ''
+          GATED_RELEASE_REF: ${{ steps.gate.outputs.release_ref }}
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          PATH: ${{ steps.trusted-tools.outputs.safe_path }}
+          SYMFORGE_LIFECYCLE_CARGO_EXECUTABLE: ${{ steps.trusted-tools.outputs.cargo }}
+          SYMFORGE_LIFECYCLE_GIT_EXECUTABLE: ${{ steps.trusted-tools.outputs.git }}
+          TRUSTED_GIT: ${{ steps.trusted-tools.outputs.git }}
+          TRUSTED_NODE: ${{ steps.trusted-tools.outputs.node }}
+          TRUSTED_PYTHON: ${{ steps.trusted-tools.outputs.python }}
+        run: |
+          set -euo pipefail
+          "$TRUSTED_PYTHON" -I - <<'PY'
+          import hashlib
+          import os
+          import subprocess
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
+          trusted_git = os.environ["TRUSTED_GIT"]
+          release_commit = os.environ["GATED_RELEASE_REF"]
+          environment = {
+              key: value
+              for key, value in os.environ.items()
+              if not key.startswith("GIT_")
+          }
+          environment.update(
+              {
+                  "GIT_NO_REPLACE_OBJECTS": "1",
+                  "GIT_OPTIONAL_LOCKS": "0",
+                  "LC_ALL": "C",
+              }
+          )
+
+          def git_blob(path: str) -> bytes:
+              result = subprocess.run(
+                  [trusted_git, "cat-file", "blob", f"{release_commit}:{path}"],
+                  cwd=workspace,
+                  env=environment,
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  shell=False,
+                  check=False,
+              )
+              if result.returncode != 0:
+                  raise SystemExit("cannot re-read a frozen release-tree file")
+              return result.stdout
+
+          for relative in (
+              ".github/workflows/release.yml",
+              "scripts/validate-lifecycle-oracle-traceability.cjs",
+          ):
+              path = workspace / relative
+              if not path.is_file() or path.is_symlink() or path.read_bytes() != git_blob(relative):
+                  raise SystemExit("a frozen workflow or checker changed before T090")
+          approval = workspace / "target/ci/lifecycle-v11/refreeze-approval-result.json"
+          if (
+              not approval.is_file()
+              or approval.is_symlink()
+              or hashlib.sha256(approval.read_bytes()).hexdigest()
+              != os.environ["APPROVAL_RESULT_SHA256"]
+          ):
+              raise SystemExit("the closed approval result changed before T090")
+          PY
+          node() { "$TRUSTED_NODE" "$@"; }
+          node scripts/validate-lifecycle-oracle-traceability.cjs --require-materialized --evidence target/ci/lifecycle-v11/release-evidence.json
+
+      - name: Upload closed Feature 020 V11 lifecycle evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feature-020-v11-closed-release-evidence-${{ steps.gate.outputs.release_ref }}
+          path: target/ci/lifecycle-v11/
+          if-no-files-found: error
+          retention-days: 90
+
+  gate-release-ref:
+    needs:
+      - resolve-release-ref
+      - verify-release-ref
+      - feature-020-v11-gate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.gate.outputs.release_ref }}
+    steps:
+      - id: gate
+        name: Select the phase-appropriate release gate result
+        shell: bash
+        env:
+          FEATURE_GATE_RESULT: ${{ needs.feature-020-v11-gate.result }}
+          LIFECYCLE_GATE_ACTIVE: ${{ needs.resolve-release-ref.outputs.lifecycle_gate_active }}
+          RELEASE_REF: ${{ needs.resolve-release-ref.outputs.release_ref }}
+          VERIFY_RESULT: ${{ needs.verify-release-ref.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$VERIFY_RESULT" != "success" ]]; then
+            echo "::error::Release verification did not succeed."
+            exit 1
+          fi
+          case "$LIFECYCLE_GATE_ACTIVE" in
+            true)
+              if [[ "$FEATURE_GATE_RESULT" != "success" ]]; then
+                echo "::error::The active Feature 020 lifecycle release gate did not succeed."
+                exit 1
+              fi
+              ;;
+            false)
+              if [[ "$FEATURE_GATE_RESULT" != "skipped" ]]; then
+                echo "::error::The pre-activation Feature 020 lifecycle gate unexpectedly ran."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::The Feature 020 lifecycle gate phase is unavailable."
+              exit 1
+              ;;
+          esac
+          if [[ ! "$RELEASE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The phase-selected release commit is malformed."
+            exit 1
+          fi
+          echo "release_ref=$RELEASE_REF" >> "$GITHUB_OUTPUT"
+
+  prepare-release:
+    needs:
+      - resolve-release-ref
+      - gate-release-ref
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
     outputs:
       release_created: ${{ steps.context.outputs.release_created }}
       tag_name: ${{ steps.context.outputs.tag_name }}
       version: ${{ steps.context.outputs.version }}
       release_ref: ${{ steps.context.outputs.release_ref }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.gate-release-ref.outputs.release_ref }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
       - name: Run version sync tests
+        env:
+          SYMFORGE_REQUIRE_SSHSIG: '1'
         run: python -m unittest discover -s execution -p 'test_*.py'
+
+      - name: Verify release metadata stays aligned
+        run: python execution/version_sync.py check
 
       - id: release
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
-        uses: googleapis/release-please-action@v5
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          skip-github-release: true
           include-component-in-tag: false
           config-file: .github/release-please-config.json
           manifest-file: .github/.release-please-manifest.json
@@ -128,87 +1994,228 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_PRS_JSON: ${{ steps.release.outputs.prs }}
         run: |
-          # Wait for PR label to propagate, then find the release PR
+          set -euo pipefail
+          PR="$(python -I - <<'PY'
+          import json
+          import os
+
+          try:
+              pull_requests = json.loads(os.environ["RELEASE_PRS_JSON"])
+          except (KeyError, json.JSONDecodeError, TypeError) as error:
+              raise SystemExit("release-please did not return valid PR identity JSON") from error
+          if not isinstance(pull_requests, list) or len(pull_requests) != 1:
+              raise SystemExit("release-please did not return exactly one release PR")
+          number = pull_requests[0].get("number") if isinstance(pull_requests[0], dict) else None
+          if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+              raise SystemExit("release-please returned an invalid release PR number")
+          print(number)
+          PY
+          )"
+          if [[ ! "$PR" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::The release-please PR identity is malformed."
+            exit 1
+          fi
+
+          # Wait only for the exact action-returned PR's pending label.
+          status=1
           for attempt in 1 2 3 4 5 6; do
             sleep 10
-            PR=$(gh pr list --label "autorelease: pending" --json number --jq '.[0].number // empty')
-            if [[ -n "$PR" ]]; then
+            PR_CONTEXT="$(gh pr view "$PR" --json number,state,baseRefName,headRefName,labels)"
+            if python -I - "$PR" "$PR_CONTEXT" <<'PY'
+          import json
+          import sys
+
+          number = int(sys.argv[1])
+          try:
+              pull_request = json.loads(sys.argv[2])
+          except (json.JSONDecodeError, TypeError) as error:
+              raise SystemExit(2) from error
+          if (
+              not isinstance(pull_request, dict)
+              or pull_request.get("number") != number
+              or pull_request.get("state") != "OPEN"
+              or pull_request.get("baseRefName") != "main"
+              or not isinstance(pull_request.get("headRefName"), str)
+              or not pull_request["headRefName"].startswith("release-please--branches--main")
+          ):
+              raise SystemExit(2)
+          labels = pull_request.get("labels")
+          if not isinstance(labels, list) or not all(isinstance(label, dict) for label in labels):
+              raise SystemExit(2)
+          raise SystemExit(
+              0
+              if sum(label.get("name") == "autorelease: pending" for label in labels) == 1
+              else 1
+          )
+          PY
+            then
+              status=0
               break
+            else
+              status=$?
             fi
-            echo "Attempt $attempt: no pending release PR found yet, retrying..."
+            if [[ "$status" -eq 2 ]]; then
+              echo "::error::The action-returned release PR has an unexpected identity or state."
+              exit 1
+            fi
+            echo "Attempt $attempt: exact release PR is not pending yet, retrying..."
           done
-          if [[ -z "$PR" ]]; then
-            echo "::warning::No pending release PR found after 60s — skipping auto-merge"
-            exit 0
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::The exact release PR never acquired its pending label."
+            exit 1
           fi
           echo "Auto-merging release PR #$PR"
           gh pr merge "$PR" --merge --delete-branch
           # The PAT-powered merge triggers a new workflow run where
-          # release-please creates the release + tag, then build proceeds.
+          # the merged commit is independently gated before release creation.
 
       - id: context
         shell: bash
         env:
-          MANUAL_TAG: ${{ inputs.tag }}
-          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          MANUAL_TAG: ${{ needs.resolve-release-ref.outputs.tag_name }}
+          GATED_RELEASE_REF: ${{ needs.gate-release-ref.outputs.release_ref }}
         run: |
+          set -euo pipefail
           git fetch --tags --force
 
           CANONICAL_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-          TAG_NAME=""
-          VERSION=""
+          RELEASE_READY=false
+
+          if [[ "$(git rev-parse --verify HEAD)" != "$GATED_RELEASE_REF" ]]; then
+            echo "::error::Release preparation is not on the gated commit."
+            exit 1
+          fi
 
           if [[ -n "$MANUAL_TAG" ]]; then
             if [[ ! "$MANUAL_TAG" =~ $CANONICAL_TAG_RE ]]; then
-              echo "::error::Manual rebuild tags must use canonical vX.Y.Z format. Received '$MANUAL_TAG'."
+              echo "::error::Manual rebuild tag is not canonical."
               exit 1
             fi
             TAG_NAME="$MANUAL_TAG"
-          elif [[ "$RELEASE_CREATED" == "true" ]]; then
-            if [[ -z "$RELEASE_VERSION" ]]; then
-              echo "::error::release-please did not return a version for the created release."
-              exit 1
-            fi
-            TAG_NAME="$RELEASE_TAG"
-            VERSION="$RELEASE_VERSION"
-            EXPECTED_TAG="v$RELEASE_VERSION"
-            if [[ "$TAG_NAME" != "$EXPECTED_TAG" ]]; then
-              echo "::error::release-please returned tag '$TAG_NAME' but the canonical tag for this repository is '$EXPECTED_TAG'."
-              exit 1
-            fi
+            VERSION="${TAG_NAME#v}"
           else
-            TAG_NAME="$(git tag --points-at "$GITHUB_SHA" 'v*' | sort -V | tail -n1)"
+            VERSION="$(python -I - <<'PY'
+          import json
+          from pathlib import Path
+
+          value = json.loads(
+              Path(".github/.release-please-manifest.json").read_text(encoding="utf-8")
+          ).get(".")
+          if not isinstance(value, str) or not value:
+              raise SystemExit("release manifest version is unavailable")
+          print(value)
+          PY
+            )"
+            TAG_NAME="v$VERSION"
           fi
 
-          if [[ -n "$TAG_NAME" ]]; then
-            if [[ ! "$TAG_NAME" =~ $CANONICAL_TAG_RE ]]; then
-              echo "::error::Resolved release tag '$TAG_NAME' does not match canonical vX.Y.Z format."
+          if [[ ! "$TAG_NAME" =~ $CANONICAL_TAG_RE ]]; then
+            echo "::error::Resolved release tag is not canonical."
+            exit 1
+          fi
+          python execution/version_sync.py check --tag "$TAG_NAME"
+
+          if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
+            TAG_COMMIT="$(git rev-parse --verify --end-of-options "refs/tags/${TAG_NAME}^{commit}")"
+            if [[ "$TAG_COMMIT" == "$GATED_RELEASE_REF" ]]; then
+              RELEASE_READY=true
+            elif [[ -n "$MANUAL_TAG" ]]; then
+              echo "::error::Manual rebuild tag does not point at the gated commit."
+              exit 1
+            elif git merge-base --is-ancestor "$TAG_COMMIT" "$GATED_RELEASE_REF"; then
+              RELEASE_READY=false
+            else
+              echo "::error::Version tag is not on the gated commit's history."
               exit 1
             fi
+          elif [[ -n "$MANUAL_TAG" ]]; then
+            echo "::error::Manual rebuild tag does not exist."
+            exit 1
+          else
+            RELEASE_READY=true
+          fi
 
-            if ! git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
-              echo "::error::Tag '$TAG_NAME' does not exist in this repository."
-              exit 1
-            fi
-
-            if [[ -z "$VERSION" ]]; then
-              VERSION="${TAG_NAME#v}"
-            fi
-
-            echo "release_created=true" >> "$GITHUB_OUTPUT"
+          echo "release_created=$RELEASE_READY" >> "$GITHUB_OUTPUT"
+          echo "release_ref=$GATED_RELEASE_REF" >> "$GITHUB_OUTPUT"
+          if [[ "$RELEASE_READY" == "true" ]]; then
             echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "release_ref=$TAG_NAME" >> "$GITHUB_OUTPUT"
-          else
-            echo "release_created=false" >> "$GITHUB_OUTPUT"
-            echo "release_ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release at the gated commit
+        if: steps.context.outputs.release_created == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GATED_RELEASE_REF: ${{ needs.gate-release-ref.outputs.release_ref }}
+          TAG_NAME: ${{ steps.context.outputs.tag_name }}
+          MANUAL_TAG: ${{ needs.resolve-release-ref.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
+            TAG_COMMIT="$(git rev-parse --verify --end-of-options "refs/tags/${TAG_NAME}^{commit}")"
+            if [[ "$TAG_COMMIT" != "$GATED_RELEASE_REF" ]]; then
+              echo "::error::Release tag moved away from the gated commit."
+              exit 1
+            fi
+          fi
+
+          RELEASE_PR=""
+          if [[ -z "$MANUAL_TAG" ]]; then
+            mapfile -t RELEASE_PRS < <(
+              gh api "repos/$GH_REPO/commits/$GATED_RELEASE_REF/pulls" \
+                --jq ".[] | select(.merge_commit_sha == \"$GATED_RELEASE_REF\") | select(any(.labels[]?; (.name == \"autorelease: pending\") or (.name == \"autorelease: tagged\"))) | .number" \
+                | sort -u
+            )
+            if [[ "${#RELEASE_PRS[@]}" -ne 1 || ! "${RELEASE_PRS[0]}" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not resolve exactly one release PR for the gated commit."
+              exit 1
+            fi
+            RELEASE_PR="${RELEASE_PRS[0]}"
+          fi
+
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh api --method POST "repos/$GH_REPO/releases" \
+              --raw-field tag_name="$TAG_NAME" \
+              --raw-field target_commitish="$GATED_RELEASE_REF" \
+              --raw-field name="$TAG_NAME" \
+              --field generate_release_notes=true >/dev/null
+          fi
+
+          git fetch --tags --force
+          TAG_COMMIT="$(git rev-parse --verify --end-of-options "refs/tags/${TAG_NAME}^{commit}")"
+          if [[ "$TAG_COMMIT" != "$GATED_RELEASE_REF" ]]; then
+            echo "::error::Created release tag does not point at the gated commit."
+            exit 1
+          fi
+
+          # release-please's PR-only mode cannot perform its normal
+          # pending-to-tagged transition. Bind that transition to the exact
+          # gated merge commit, after its tag and GitHub release exist.
+          if [[ -z "$MANUAL_TAG" ]]; then
+            PR_LABELS="$(gh pr view "$RELEASE_PR" --json labels --jq '.labels[].name')"
+            if grep -Fqx 'autorelease: pending' <<< "$PR_LABELS"; then
+              gh pr edit "$RELEASE_PR" \
+                --remove-label 'autorelease: pending' \
+                --add-label 'autorelease: tagged' >/dev/null
+            fi
+
+            PR_LABELS="$(gh pr view "$RELEASE_PR" --json labels --jq '.labels[].name')"
+            if grep -Fqx 'autorelease: pending' <<< "$PR_LABELS" \
+              || ! grep -Fqx 'autorelease: tagged' <<< "$PR_LABELS"; then
+              echo "::error::Release PR label transition did not complete."
+              exit 1
+            fi
           fi
 
   build:
-    needs: prepare-release
+    needs:
+      - prepare-release
+      - gate-release-ref
     if: needs.prepare-release.outputs.release_created == 'true'
     strategy:
       matrix:
@@ -232,11 +2239,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
+          ref: ${{ needs.gate-release-ref.outputs.release_ref }}
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
@@ -257,7 +2265,7 @@ jobs:
         run: cp "${{ matrix.binary }}" "${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -266,22 +2274,24 @@ jobs:
   build-npm-package:
     needs:
       - prepare-release
+      - gate-release-ref
       - build
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
+          ref: ${{ needs.gate-release-ref.outputs.release_ref }}
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
       - name: Verify release versions
         run: python execution/version_sync.py check --tag "${{ needs.prepare-release.outputs.tag_name }}"
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
 
@@ -321,7 +2331,7 @@ jobs:
         run: npm test
 
       - name: Download built binary artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: symforge-*
           path: dist-binaries
@@ -363,7 +2373,7 @@ jobs:
           ls -l dist-npm
 
       - name: Upload npm package artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package
           path: dist-npm/*.tgz
@@ -372,16 +2382,27 @@ jobs:
   upload-release-assets:
     needs:
       - prepare-release
+      - gate-release-ref
       - build
       - build-npm-package
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
+      - name: Download release binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: symforge-*
           path: artifacts
           merge-multiple: true
+
+      - name: Download npm package artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+          path: artifacts
 
       - name: Upload assets to GitHub release
         env:
@@ -392,17 +2413,20 @@ jobs:
   cargo-publish:
     needs:
       - prepare-release
+      - gate-release-ref
       - build
       - build-npm-package
       - upload-release-assets
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
+    environment: cargo-publish
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
+          ref: ${{ needs.gate-release-ref.outputs.release_ref }}
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
@@ -422,27 +2446,29 @@ jobs:
   npm-publish:
     needs:
       - prepare-release
+      - gate-release-ref
       - build-npm-package
       - upload-release-assets
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     environment: npm-publish
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
+          ref: ${{ needs.gate-release-ref.outputs.release_ref }}
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
       - name: Download npm package artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: npm-package
           path: dist

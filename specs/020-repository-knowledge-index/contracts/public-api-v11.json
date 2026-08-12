@@ -1,0 +1,3600 @@
+{
+  "canonicalization": "jcs+symforge-api-v1",
+  "configuration_domain": {
+    "cells": [
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed",
+        "id": "aarch64-apple-darwin__embed",
+        "target": "aarch64-apple-darwin"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed-cbm-spike",
+        "id": "aarch64-apple-darwin__embed-cbm-spike",
+        "target": "aarch64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server",
+        "id": "aarch64-apple-darwin__server",
+        "target": "aarch64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server-cbm-spike",
+        "id": "aarch64-apple-darwin__server-cbm-spike",
+        "target": "aarch64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed",
+        "id": "aarch64-apple-darwin__server-embed",
+        "target": "aarch64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed-cbm-spike",
+        "id": "aarch64-apple-darwin__server-embed-cbm-spike",
+        "target": "aarch64-apple-darwin"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed",
+        "id": "x86_64-apple-darwin__embed",
+        "target": "x86_64-apple-darwin"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed-cbm-spike",
+        "id": "x86_64-apple-darwin__embed-cbm-spike",
+        "target": "x86_64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server",
+        "id": "x86_64-apple-darwin__server",
+        "target": "x86_64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server-cbm-spike",
+        "id": "x86_64-apple-darwin__server-cbm-spike",
+        "target": "x86_64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed",
+        "id": "x86_64-apple-darwin__server-embed",
+        "target": "x86_64-apple-darwin"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed-cbm-spike",
+        "id": "x86_64-apple-darwin__server-embed-cbm-spike",
+        "target": "x86_64-apple-darwin"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed",
+        "id": "x86_64-pc-windows-msvc__embed",
+        "target": "x86_64-pc-windows-msvc"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed-cbm-spike",
+        "id": "x86_64-pc-windows-msvc__embed-cbm-spike",
+        "target": "x86_64-pc-windows-msvc"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server",
+        "id": "x86_64-pc-windows-msvc__server",
+        "target": "x86_64-pc-windows-msvc"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server-cbm-spike",
+        "id": "x86_64-pc-windows-msvc__server-cbm-spike",
+        "target": "x86_64-pc-windows-msvc"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed",
+        "id": "x86_64-pc-windows-msvc__server-embed",
+        "target": "x86_64-pc-windows-msvc"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed-cbm-spike",
+        "id": "x86_64-pc-windows-msvc__server-embed-cbm-spike",
+        "target": "x86_64-pc-windows-msvc"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed",
+        "id": "x86_64-unknown-linux-gnu__embed",
+        "target": "x86_64-unknown-linux-gnu"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed-cbm-spike",
+        "id": "x86_64-unknown-linux-gnu__embed-cbm-spike",
+        "target": "x86_64-unknown-linux-gnu"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server",
+        "id": "x86_64-unknown-linux-gnu__server",
+        "target": "x86_64-unknown-linux-gnu"
+      },
+      {
+        "expected_graph": "server-v11",
+        "feature_vector": "server-cbm-spike",
+        "id": "x86_64-unknown-linux-gnu__server-cbm-spike",
+        "target": "x86_64-unknown-linux-gnu"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed",
+        "id": "x86_64-unknown-linux-gnu__server-embed",
+        "target": "x86_64-unknown-linux-gnu"
+      },
+      {
+        "expected_graph": "server-embed-v11",
+        "feature_vector": "server-embed-cbm-spike",
+        "id": "x86_64-unknown-linux-gnu__server-embed-cbm-spike",
+        "target": "x86_64-unknown-linux-gnu"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed",
+        "id": "x86_64-unknown-linux-musl__embed",
+        "target": "x86_64-unknown-linux-musl"
+      },
+      {
+        "expected_graph": "embed-v11",
+        "feature_vector": "embed-cbm-spike",
+        "id": "x86_64-unknown-linux-musl__embed-cbm-spike",
+        "target": "x86_64-unknown-linux-musl"
+      }
+    ],
+    "cfg_keys": [
+      {
+        "allowed_values": [
+          "cbm-spike",
+          "embed",
+          "server"
+        ],
+        "name": "feature",
+        "shape": "multi-value",
+        "source": "cargo"
+      },
+      {
+        "allowed_values": [
+          "aarch64",
+          "x86_64"
+        ],
+        "name": "target_arch",
+        "shape": "single-value",
+        "source": "rustc"
+      },
+      {
+        "allowed_values": [
+          "little"
+        ],
+        "name": "target_endian",
+        "shape": "single-value",
+        "source": "rustc"
+      },
+      {
+        "allowed_values": [
+          "",
+          "gnu",
+          "msvc",
+          "musl"
+        ],
+        "name": "target_env",
+        "shape": "single-value",
+        "source": "rustc"
+      },
+      {
+        "allowed_values": [
+          "unix",
+          "windows"
+        ],
+        "name": "target_family",
+        "shape": "multi-value",
+        "source": "rustc"
+      },
+      {
+        "allowed_values": [
+          "128",
+          "16",
+          "32",
+          "64",
+          "8",
+          "ptr"
+        ],
+        "name": "target_has_atomic",
+        "shape": "multi-value",
+        "source": "rustc"
+      },
+      {
+        "allowed_values": [
+          "linux",
+          "macos",
+          "windows"
+        ],
+        "name": "target_os",
+        "shape": "single-value",
+        "source": "rustc"
+      },
+      {
+        "allowed_values": [
+          "64"
+        ],
+        "name": "target_pointer_width",
+        "shape": "single-value",
+        "source": "rustc"
+      },
+      {
+        "allowed_values": [
+          "apple",
+          "pc",
+          "unknown"
+        ],
+        "name": "target_vendor",
+        "shape": "single-value",
+        "source": "rustc"
+      }
+    ],
+    "cover": {
+      "assignment_proof_sha256": null,
+      "input_corpus": [
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/all-cfg/Cargo.toml",
+          "role": "all-cfg-manifest",
+          "sha256": "3ad576bbd969cede7a56e796565f19fe0d7d846ce06d081f32b8c1b086126d89"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/all-cfg/src/lib.rs",
+          "role": "all-cfg-source",
+          "sha256": "e094843a977f9756a55dbd36e6934b5cd960a241e49ddcdaf9745c6b118c2630"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/compile-fail/Cargo.toml",
+          "role": "compile-fail-manifest",
+          "sha256": "ea60159ff8d3796b6468b832d7e08d3491eff8b6c18ceb58a895137674d3c9fa"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/compile-fail/cases.json",
+          "role": "compile-fail-case-catalog",
+          "sha256": "befd16c4f9f34d141aa0d7881ae092383be501c935bdc86a82fb185324cc081c"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/compile-fail/src/lib.rs",
+          "role": "compile-fail-placeholder",
+          "sha256": "b70020312eba5b15f882bcb0ccf4f94d44c3e9a4ec4d76405375e05b1475880b"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/compile-fail/templates/impl_family_absent.rs.in",
+          "role": "compile-fail-template",
+          "sha256": "40d05b59f8243d2a355df24ca8aaf8a1e6281050c6f9b0ea10b40f369fd630ad"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/compile-fail/templates/path_absent.rs.in",
+          "role": "compile-fail-template",
+          "sha256": "9072fe605fd7434c2ad4c9845f6dd4dc93b4102c3949cf2c6efd84bfaace03a3"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/compile-fail/templates/trait_absent.rs.in",
+          "role": "compile-fail-template",
+          "sha256": "a06013b594835543b0e832ddede05cf0175b50c65d628622d34de68eec524416"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/dependent-positive/Cargo.toml",
+          "role": "dependent-positive-manifest",
+          "sha256": "5f1fd6831a0ab75984148a84914856184506c31d59b11e143c8d31569a72d570"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/dependent-positive/src/lib.rs",
+          "role": "dependent-positive-source",
+          "sha256": "c0ca3d48968a797994e83795a6c141f3ee879aa83f8b7c3b80e1ea4f5cd7e4b2"
+        },
+        {
+          "path": "tests/fixtures/public-api-v11-consumer/graph-cover.json",
+          "role": "graph-cover",
+          "sha256": "107bd7c359999b8c3a20865a1cb5e6c1aadd42c188eb27323b84e57045b7219a"
+        }
+      ],
+      "mode": "explicit-cells-or-bdd-equivalence",
+      "predicate_inventory_sha256": null,
+      "status": "pre_activation_required"
+    },
+    "feature_vectors": [
+      {
+        "default_features": false,
+        "disabled": [
+          "cbm-spike",
+          "server"
+        ],
+        "id": "embed",
+        "requested": [
+          "embed"
+        ],
+        "resolved": [
+          "embed"
+        ]
+      },
+      {
+        "default_features": false,
+        "disabled": [
+          "server"
+        ],
+        "id": "embed-cbm-spike",
+        "requested": [
+          "cbm-spike",
+          "embed"
+        ],
+        "resolved": [
+          "cbm-spike",
+          "embed"
+        ]
+      },
+      {
+        "default_features": true,
+        "disabled": [
+          "cbm-spike",
+          "embed"
+        ],
+        "id": "server",
+        "requested": [
+          "server"
+        ],
+        "resolved": [
+          "server"
+        ]
+      },
+      {
+        "default_features": true,
+        "disabled": [
+          "embed"
+        ],
+        "id": "server-cbm-spike",
+        "requested": [
+          "cbm-spike",
+          "server"
+        ],
+        "resolved": [
+          "cbm-spike",
+          "server"
+        ]
+      },
+      {
+        "default_features": true,
+        "disabled": [
+          "cbm-spike"
+        ],
+        "id": "server-embed",
+        "requested": [
+          "embed",
+          "server"
+        ],
+        "resolved": [
+          "embed",
+          "server"
+        ]
+      },
+      {
+        "default_features": true,
+        "disabled": [],
+        "id": "server-embed-cbm-spike",
+        "requested": [
+          "cbm-spike",
+          "embed",
+          "server"
+        ],
+        "resolved": [
+          "cbm-spike",
+          "embed",
+          "server"
+        ]
+      }
+    ],
+    "features": {
+      "cbm_spike_public_graph_effect": "forbidden",
+      "declared": [
+        "cbm-spike",
+        "embed",
+        "server"
+      ],
+      "default": [
+        "server"
+      ],
+      "rejected_vectors": [
+        [],
+        [
+          "cbm-spike"
+        ]
+      ]
+    },
+    "profiles": {
+      "all-features": "server-embed-cbm-spike",
+      "default": "server",
+      "embed-only": "embed"
+    },
+    "targets": [
+      {
+        "atomic_widths": [
+          "128",
+          "16",
+          "32",
+          "64",
+          "8",
+          "ptr"
+        ],
+        "endian": "little",
+        "id": "aarch64-apple-darwin",
+        "pointer_width": 64,
+        "rustc_cfg_sha256": null,
+        "rustc_cfg_status": "pre_activation_required",
+        "supported_feature_vectors": [
+          "embed",
+          "embed-cbm-spike",
+          "server",
+          "server-cbm-spike",
+          "server-embed",
+          "server-embed-cbm-spike"
+        ],
+        "triple": "aarch64-apple-darwin"
+      },
+      {
+        "atomic_widths": [
+          "128",
+          "16",
+          "32",
+          "64",
+          "8",
+          "ptr"
+        ],
+        "endian": "little",
+        "id": "x86_64-apple-darwin",
+        "pointer_width": 64,
+        "rustc_cfg_sha256": null,
+        "rustc_cfg_status": "pre_activation_required",
+        "supported_feature_vectors": [
+          "embed",
+          "embed-cbm-spike",
+          "server",
+          "server-cbm-spike",
+          "server-embed",
+          "server-embed-cbm-spike"
+        ],
+        "triple": "x86_64-apple-darwin"
+      },
+      {
+        "atomic_widths": [
+          "128",
+          "16",
+          "32",
+          "64",
+          "8",
+          "ptr"
+        ],
+        "endian": "little",
+        "id": "x86_64-pc-windows-msvc",
+        "pointer_width": 64,
+        "rustc_cfg_sha256": null,
+        "rustc_cfg_status": "pre_activation_required",
+        "supported_feature_vectors": [
+          "embed",
+          "embed-cbm-spike",
+          "server",
+          "server-cbm-spike",
+          "server-embed",
+          "server-embed-cbm-spike"
+        ],
+        "triple": "x86_64-pc-windows-msvc"
+      },
+      {
+        "atomic_widths": [
+          "16",
+          "32",
+          "64",
+          "8",
+          "ptr"
+        ],
+        "endian": "little",
+        "id": "x86_64-unknown-linux-gnu",
+        "pointer_width": 64,
+        "rustc_cfg_sha256": null,
+        "rustc_cfg_status": "pre_activation_required",
+        "supported_feature_vectors": [
+          "embed",
+          "embed-cbm-spike",
+          "server",
+          "server-cbm-spike",
+          "server-embed",
+          "server-embed-cbm-spike"
+        ],
+        "triple": "x86_64-unknown-linux-gnu"
+      },
+      {
+        "atomic_widths": [
+          "16",
+          "32",
+          "64",
+          "8",
+          "ptr"
+        ],
+        "endian": "little",
+        "id": "x86_64-unknown-linux-musl",
+        "pointer_width": 64,
+        "rustc_cfg_sha256": null,
+        "rustc_cfg_status": "pre_activation_required",
+        "supported_feature_vectors": [
+          "embed",
+          "embed-cbm-spike"
+        ],
+        "triple": "x86_64-unknown-linux-musl"
+      }
+    ]
+  },
+  "crate": {
+    "api_major": 11,
+    "cargo_lock_sha256": null,
+    "edition": "2024",
+    "identity_status": "pre_activation_required",
+    "lib_crate": "symforge",
+    "package": "symforge",
+    "source_commit": null,
+    "toolchain": {
+      "extractor_version": null,
+      "normalizer_version": 1,
+      "rustc_commit": null,
+      "rustdoc_format_version": null,
+      "status": "pre_activation_required"
+    }
+  },
+  "expected_graph": {
+    "activation_rule": "For every supported cell, the normalized observed public graph MUST equal the corresponding expected projection exactly. Missing and extra atoms both refuse activation.",
+    "auto_traits": {
+      "expansion": "Every subject is checked against every trait in universe; groups are an exact cartesian compression, not a wildcard.",
+      "expectation_groups": [
+        {
+          "states": {
+            "core::marker::Send": "positive",
+            "core::marker::Sync": "positive",
+            "core::marker::Unpin": "positive",
+            "std::panic::RefUnwindSafe": "positive",
+            "std::panic::UnwindSafe": "positive"
+          },
+          "subjects": [
+            "symforge::embed::EngineInfo",
+            "symforge::embed::ReceiptWaitError",
+            "symforge::embed::RetryAdvice",
+            "symforge::embed::ShutdownReport",
+            "symforge::embed::SourceCloseReport",
+            "symforge::embed::SourceRefusalKind",
+            "symforge::embed::SourceRuntimePhase",
+            "symforge::embed::SourceRuntimeView",
+            "symforge::embed::SymbolMatch",
+            "symforge::embed::SymbolSearchRequest",
+            "symforge::embed::SymbolSearchResult",
+            "symforge::embed::TextMatch",
+            "symforge::embed::TextSearchRequest",
+            "symforge::embed::TextSearchResult",
+            "symforge::server_api::ServerExit"
+          ]
+        },
+        {
+          "states": {
+            "core::marker::Send": "positive",
+            "core::marker::Sync": "positive",
+            "core::marker::Unpin": "positive",
+            "std::panic::RefUnwindSafe": "negative",
+            "std::panic::UnwindSafe": "negative"
+          },
+          "subjects": [
+            "symforge::embed::EmbeddedSourceHandle",
+            "symforge::embed::ProcessIndexRuntime",
+            "symforge::embed::RefreshTicket",
+            "symforge::embed::ShutdownReceipt",
+            "symforge::embed::SourceCloseReceipt"
+          ]
+        },
+        {
+          "states": {
+            "core::marker::Send": "conditional:T",
+            "core::marker::Sync": "conditional:T",
+            "core::marker::Unpin": "conditional:T",
+            "std::panic::RefUnwindSafe": "conditional:T",
+            "std::panic::UnwindSafe": "conditional:T"
+          },
+          "subjects": [
+            "symforge::embed::Claim"
+          ]
+        },
+        {
+          "states": {
+            "core::marker::Send": "positive",
+            "core::marker::Sync": "positive",
+            "core::marker::Unpin": "positive",
+            "std::panic::RefUnwindSafe": "positive",
+            "std::panic::UnwindSafe": "positive"
+          },
+          "subjects": [
+            "symforge::embed::AtomicAuthority",
+            "symforge::embed::ClaimProvenance",
+            "symforge::embed::EmbeddedSourceSpec",
+            "symforge::embed::EvaluationProvenance",
+            "symforge::embed::OperationKind",
+            "symforge::embed::OperationReceipt",
+            "symforge::embed::SourceRefusal",
+            "symforge::server_api::ServerBootstrapError"
+          ]
+        }
+      ],
+      "universe": [
+        "core::marker::Send",
+        "core::marker::Sync",
+        "core::marker::Unpin",
+        "std::panic::RefUnwindSafe",
+        "std::panic::UnwindSafe"
+      ]
+    },
+    "exports": [
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:AtomicAuthority",
+        "namespace": "type",
+        "path": "symforge::embed::AtomicAuthority"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:Claim",
+        "namespace": "type",
+        "path": "symforge::embed::Claim"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:ClaimProvenance",
+        "namespace": "type",
+        "path": "symforge::embed::ClaimProvenance"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:EmbeddedSourceHandle",
+        "namespace": "type",
+        "path": "symforge::embed::EmbeddedSourceHandle"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:EmbeddedSourceSpec",
+        "namespace": "type",
+        "path": "symforge::embed::EmbeddedSourceSpec"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:EngineInfo",
+        "namespace": "type",
+        "path": "symforge::embed::EngineInfo"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:EvaluationProvenance",
+        "namespace": "type",
+        "path": "symforge::embed::EvaluationProvenance"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:OperationKind",
+        "namespace": "type",
+        "path": "symforge::embed::OperationKind"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:OperationReceipt",
+        "namespace": "type",
+        "path": "symforge::embed::OperationReceipt"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:ProcessIndexRuntime",
+        "namespace": "type",
+        "path": "symforge::embed::ProcessIndexRuntime"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:ReceiptWaitError",
+        "namespace": "type",
+        "path": "symforge::embed::ReceiptWaitError"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:RefreshTicket",
+        "namespace": "type",
+        "path": "symforge::embed::RefreshTicket"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:RetryAdvice",
+        "namespace": "type",
+        "path": "symforge::embed::RetryAdvice"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:ShutdownReceipt",
+        "namespace": "type",
+        "path": "symforge::embed::ShutdownReceipt"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:ShutdownReport",
+        "namespace": "type",
+        "path": "symforge::embed::ShutdownReport"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SourceCloseReceipt",
+        "namespace": "type",
+        "path": "symforge::embed::SourceCloseReceipt"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SourceCloseReport",
+        "namespace": "type",
+        "path": "symforge::embed::SourceCloseReport"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SourceRefusal",
+        "namespace": "type",
+        "path": "symforge::embed::SourceRefusal"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SourceRefusalKind",
+        "namespace": "type",
+        "path": "symforge::embed::SourceRefusalKind"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SourceRuntimePhase",
+        "namespace": "type",
+        "path": "symforge::embed::SourceRuntimePhase"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SourceRuntimeView",
+        "namespace": "type",
+        "path": "symforge::embed::SourceRuntimeView"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SymbolMatch",
+        "namespace": "type",
+        "path": "symforge::embed::SymbolMatch"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SymbolSearchRequest",
+        "namespace": "type",
+        "path": "symforge::embed::SymbolSearchRequest"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:SymbolSearchResult",
+        "namespace": "type",
+        "path": "symforge::embed::SymbolSearchResult"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:TextMatch",
+        "namespace": "type",
+        "path": "symforge::embed::TextMatch"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:TextSearchRequest",
+        "namespace": "type",
+        "path": "symforge::embed::TextSearchRequest"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:TextSearchResult",
+        "namespace": "type",
+        "path": "symforge::embed::TextSearchResult"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "function:embed:engine_info",
+        "namespace": "value",
+        "path": "symforge::embed::engine_info"
+      },
+      {
+        "availability": "feature=server",
+        "item": "type:server_api:ServerBootstrapError",
+        "namespace": "type",
+        "path": "symforge::server_api::ServerBootstrapError"
+      },
+      {
+        "availability": "feature=server",
+        "item": "type:server_api:ServerExit",
+        "namespace": "type",
+        "path": "symforge::server_api::ServerExit"
+      },
+      {
+        "availability": "feature=server",
+        "item": "function:server_api:run",
+        "namespace": "value",
+        "path": "symforge::server_api::run"
+      }
+    ],
+    "functions": [
+      {
+        "abi": "Rust",
+        "async": false,
+        "availability": "feature=embed",
+        "const": false,
+        "id": "function:embed:engine_info",
+        "inputs": [],
+        "output": {
+          "id": "type:embed:EngineInfo",
+          "kind": "api"
+        },
+        "unsafe": false
+      },
+      {
+        "abi": "Rust",
+        "async": false,
+        "availability": "feature=server",
+        "const": false,
+        "id": "function:server_api:run",
+        "inputs": [
+          {
+            "name": "args",
+            "type": {
+              "arguments": [
+                {
+                  "kind": "path",
+                  "path": "std::ffi::OsString"
+                }
+              ],
+              "kind": "generic",
+              "path": "std::vec::Vec"
+            }
+          }
+        ],
+        "output": {
+          "arguments": [
+            {
+              "id": "type:server_api:ServerExit",
+              "kind": "api"
+            },
+            {
+              "id": "type:server_api:ServerBootstrapError",
+              "kind": "api"
+            }
+          ],
+          "kind": "generic",
+          "path": "core::result::Result"
+        },
+        "unsafe": false
+      }
+    ],
+    "graph_projections": [
+      {
+        "excluded_modules": [
+          "symforge::server_api"
+        ],
+        "id": "embed-v11",
+        "included_modules": [
+          "symforge",
+          "symforge::embed"
+        ]
+      },
+      {
+        "excluded_modules": [],
+        "id": "server-embed-v11",
+        "included_modules": [
+          "symforge",
+          "symforge::embed",
+          "symforge::server_api"
+        ]
+      },
+      {
+        "excluded_modules": [
+          "symforge::embed"
+        ],
+        "id": "server-v11",
+        "included_modules": [
+          "symforge",
+          "symforge::server_api"
+        ]
+      }
+    ],
+    "impls": [
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:AtomicAuthority:identity",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "identity",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:AtomicAuthority:kind_name",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "kind_name",
+            "output": {
+              "kind": "reference",
+              "lifetime": "static",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          }
+        ],
+        "for": "type:embed:AtomicAuthority",
+        "generics": [],
+        "id": "impl:AtomicAuthority",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:Claim:evaluation",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "evaluation",
+            "output": {
+              "arguments": [
+                {
+                  "kind": "reference",
+                  "lifetime": "elided",
+                  "mutable": false,
+                  "target": {
+                    "id": "type:embed:EvaluationProvenance",
+                    "kind": "api"
+                  }
+                }
+              ],
+              "kind": "generic",
+              "path": "core::option::Option"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:Claim:operation",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "operation",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "id": "type:embed:OperationReceipt",
+                "kind": "api"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:Claim:producing_runtime_identity",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "producing_runtime_identity",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:Claim:provenance",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "provenance",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "id": "type:embed:ClaimProvenance",
+                "kind": "api"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:Claim:value",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "value",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "binder": "T0",
+                "kind": "generic-parameter"
+              }
+            }
+          }
+        ],
+        "for": "type:embed:Claim",
+        "generics": [
+          {
+            "binder": "T0",
+            "kind": "type"
+          }
+        ],
+        "id": "impl:Claim<T>",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ClaimProvenance:authorities",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "authorities",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "element": {
+                  "id": "type:embed:AtomicAuthority",
+                  "kind": "api"
+                },
+                "kind": "slice"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ClaimProvenance:authority_count",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "authority_count",
+            "output": {
+              "kind": "primitive",
+              "name": "usize"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ClaimProvenance:identity",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "identity",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ClaimProvenance:kind_name",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "kind_name",
+            "output": {
+              "kind": "reference",
+              "lifetime": "static",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          }
+        ],
+        "for": "type:embed:ClaimProvenance",
+        "generics": [],
+        "id": "impl:ClaimProvenance",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceHandle:begin_close",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "begin_close",
+            "output": {
+              "id": "type:embed:SourceCloseReceipt",
+              "kind": "api"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceHandle:request_refresh",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "request_refresh",
+            "output": {
+              "arguments": [
+                {
+                  "id": "type:embed:RefreshTicket",
+                  "kind": "api"
+                },
+                {
+                  "id": "type:embed:SourceRefusal",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceHandle:runtime_view",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "runtime_view",
+            "output": {
+              "id": "type:embed:SourceRuntimeView",
+              "kind": "api"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceHandle:search_symbols",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              },
+              {
+                "name": "request",
+                "type": {
+                  "kind": "reference",
+                  "lifetime": "elided",
+                  "mutable": false,
+                  "target": {
+                    "id": "type:embed:SymbolSearchRequest",
+                    "kind": "api"
+                  }
+                }
+              }
+            ],
+            "name": "search_symbols",
+            "output": {
+              "arguments": [
+                {
+                  "arguments": [
+                    {
+                      "id": "type:embed:SymbolSearchResult",
+                      "kind": "api"
+                    }
+                  ],
+                  "kind": "generic",
+                  "path": "symforge::embed::Claim"
+                },
+                {
+                  "id": "type:embed:SourceRefusal",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceHandle:search_text",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              },
+              {
+                "name": "request",
+                "type": {
+                  "kind": "reference",
+                  "lifetime": "elided",
+                  "mutable": false,
+                  "target": {
+                    "id": "type:embed:TextSearchRequest",
+                    "kind": "api"
+                  }
+                }
+              }
+            ],
+            "name": "search_text",
+            "output": {
+              "arguments": [
+                {
+                  "arguments": [
+                    {
+                      "id": "type:embed:TextSearchResult",
+                      "kind": "api"
+                    }
+                  ],
+                  "kind": "generic",
+                  "path": "symforge::embed::Claim"
+                },
+                {
+                  "id": "type:embed:SourceRefusal",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          }
+        ],
+        "for": "type:embed:EmbeddedSourceHandle",
+        "generics": [],
+        "id": "impl:EmbeddedSourceHandle",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceSpec:current_worktree",
+            "inputs": [
+              {
+                "name": "root",
+                "type": {
+                  "kind": "path",
+                  "path": "std::path::PathBuf"
+                }
+              }
+            ],
+            "name": "current_worktree",
+            "output": {
+              "id": "type:embed:EmbeddedSourceSpec",
+              "kind": "api"
+            }
+          }
+        ],
+        "for": "type:embed:EmbeddedSourceSpec",
+        "generics": [],
+        "id": "impl:EmbeddedSourceSpec",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EvaluationProvenance:identity",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "identity",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          }
+        ],
+        "for": "type:embed:EvaluationProvenance",
+        "generics": [],
+        "id": "impl:EvaluationProvenance",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:OperationReceipt:canonical_argument_hash",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "canonical_argument_hash",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:OperationReceipt:identity",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "identity",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:OperationReceipt:operation_kind",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "operation_kind",
+            "output": {
+              "id": "type:embed:OperationKind",
+              "kind": "api"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:OperationReceipt:schema_version",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "schema_version",
+            "output": {
+              "kind": "primitive",
+              "name": "u32"
+            }
+          }
+        ],
+        "for": "type:embed:OperationReceipt",
+        "generics": [],
+        "id": "impl:OperationReceipt",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ProcessIndexRuntime:acquire",
+            "inputs": [],
+            "name": "acquire",
+            "output": {
+              "arguments": [
+                {
+                  "id": "type:embed:ProcessIndexRuntime",
+                  "kind": "api"
+                },
+                {
+                  "id": "type:embed:SourceRefusal",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ProcessIndexRuntime:begin_shutdown",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "begin_shutdown",
+            "output": {
+              "id": "type:embed:ShutdownReceipt",
+              "kind": "api"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ProcessIndexRuntime:open_embedded_source",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              },
+              {
+                "name": "spec",
+                "type": {
+                  "id": "type:embed:EmbeddedSourceSpec",
+                  "kind": "api"
+                }
+              }
+            ],
+            "name": "open_embedded_source",
+            "output": {
+              "arguments": [
+                {
+                  "id": "type:embed:EmbeddedSourceHandle",
+                  "kind": "api"
+                },
+                {
+                  "id": "type:embed:SourceRefusal",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          }
+        ],
+        "for": "type:embed:ProcessIndexRuntime",
+        "generics": [],
+        "id": "impl:ProcessIndexRuntime",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:RefreshTicket:operation",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "operation",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "id": "type:embed:OperationReceipt",
+                "kind": "api"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:RefreshTicket:requested_source_version",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "requested_source_version",
+            "output": {
+              "kind": "primitive",
+              "name": "u64"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:RefreshTicket:ticket_identity",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "ticket_identity",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          }
+        ],
+        "for": "type:embed:RefreshTicket",
+        "generics": [],
+        "id": "impl:RefreshTicket",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:ShutdownReceipt:wait",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              },
+              {
+                "name": "deadline",
+                "type": {
+                  "kind": "path",
+                  "path": "std::time::Instant"
+                }
+              }
+            ],
+            "name": "wait",
+            "output": {
+              "arguments": [
+                {
+                  "id": "type:embed:ShutdownReport",
+                  "kind": "api"
+                },
+                {
+                  "id": "type:embed:ReceiptWaitError",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          }
+        ],
+        "for": "type:embed:ShutdownReceipt",
+        "generics": [],
+        "id": "impl:ShutdownReceipt",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:SourceCloseReceipt:wait",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              },
+              {
+                "name": "deadline",
+                "type": {
+                  "kind": "path",
+                  "path": "std::time::Instant"
+                }
+              }
+            ],
+            "name": "wait",
+            "output": {
+              "arguments": [
+                {
+                  "id": "type:embed:SourceCloseReport",
+                  "kind": "api"
+                },
+                {
+                  "id": "type:embed:ReceiptWaitError",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          }
+        ],
+        "for": "type:embed:SourceCloseReceipt",
+        "generics": [],
+        "id": "impl:SourceCloseReceipt",
+        "trait": null
+      },
+      {
+        "associated_items": [
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:SourceRefusal:evidence_identity",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "evidence_identity",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "kind": "primitive",
+                "name": "str"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:SourceRefusal:kind",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "kind",
+            "output": {
+              "id": "type:embed:SourceRefusalKind",
+              "kind": "api"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:SourceRefusal:operation",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "operation",
+            "output": {
+              "kind": "reference",
+              "lifetime": "elided",
+              "mutable": false,
+              "target": {
+                "id": "type:embed:OperationReceipt",
+                "kind": "api"
+              }
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:SourceRefusal:retry",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "retry",
+            "output": {
+              "id": "type:embed:RetryAdvice",
+              "kind": "api"
+            }
+          }
+        ],
+        "for": "type:embed:SourceRefusal",
+        "generics": [],
+        "id": "impl:SourceRefusal",
+        "trait": null
+      }
+    ],
+    "items": [
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:AtomicAuthority",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [
+          {
+            "binder": "T0",
+            "kind": "type"
+          }
+        ],
+        "id": "type:embed:Claim",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:ClaimProvenance",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:EmbeddedSourceHandle",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:EmbeddedSourceSpec",
+        "kind": "struct"
+      },
+      {
+        "attrs": {
+          "non_exhaustive": true
+        },
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "grammars",
+              "type": {
+                "kind": "reference",
+                "lifetime": "static",
+                "mutable": false,
+                "target": {
+                  "element": {
+                    "kind": "reference",
+                    "lifetime": "static",
+                    "mutable": false,
+                    "target": {
+                      "kind": "primitive",
+                      "name": "str"
+                    }
+                  },
+                  "kind": "slice"
+                }
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "secret_policy_version",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "snapshot_format_version",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "version",
+              "type": {
+                "kind": "reference",
+                "lifetime": "static",
+                "mutable": false,
+                "target": {
+                  "kind": "primitive",
+                  "name": "str"
+                }
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:EngineInfo",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:EvaluationProvenance",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "variants": [
+            "AcquireRuntime",
+            "CloseSource",
+            "OpenEmbeddedSource",
+            "RefreshSource",
+            "SearchSymbols",
+            "SearchText",
+            "ShutdownRuntime"
+          ]
+        },
+        "generics": [],
+        "id": "type:embed:OperationKind",
+        "kind": "enum"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:OperationReceipt",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:ProcessIndexRuntime",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "variants": [
+            "DeadlineElapsed",
+            "WouldSelfWait"
+          ]
+        },
+        "generics": [],
+        "id": "type:embed:ReceiptWaitError",
+        "kind": "enum"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:RefreshTicket",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "variants": [
+            "Automatic",
+            "Never",
+            "OnEvent",
+            "Operator"
+          ]
+        },
+        "generics": [],
+        "id": "type:embed:RetryAdvice",
+        "kind": "enum"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:ShutdownReceipt",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "closed_sources",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "joined_workers",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:ShutdownReport",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:SourceCloseReceipt",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "already_terminal",
+              "type": {
+                "kind": "primitive",
+                "name": "bool"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "terminal_source_version",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:SourceCloseReport",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:SourceRefusal",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "variants": [
+            "AdmissionUnavailable",
+            "InvalidSelection",
+            "SelectionUnavailable",
+            "SourceUnavailable"
+          ]
+        },
+        "generics": [],
+        "id": "type:embed:SourceRefusalKind",
+        "kind": "enum"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "variants": [
+            "Blocked",
+            "Current",
+            "Loading",
+            "Refreshing",
+            "Stopped",
+            "Stopping"
+          ]
+        },
+        "generics": [],
+        "id": "type:embed:SourceRuntimePhase",
+        "kind": "enum"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "binding_identity",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "current_publication_identity",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "core::option::Option"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "observer_epoch",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "phase",
+              "type": {
+                "id": "type:embed:SourceRuntimePhase",
+                "kind": "api"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "source_version",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:SourceRuntimeView",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "end_line",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "kind",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "name",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "path",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "start_line",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:SymbolMatch",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "limit",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "path_prefix",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "core::option::Option"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "query",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "core::option::Option"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:SymbolSearchRequest",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "matches",
+              "type": {
+                "arguments": [
+                  {
+                    "id": "type:embed:SymbolMatch",
+                    "kind": "api"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "truncated",
+              "type": {
+                "kind": "primitive",
+                "name": "bool"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:SymbolSearchResult",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "byte_end",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "byte_start",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "line",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "path",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "preview",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:TextMatch",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "case_sensitive",
+              "type": {
+                "kind": "primitive",
+                "name": "bool"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "limit",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "path_prefix",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "core::option::Option"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "query",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:TextSearchRequest",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "matches",
+              "type": {
+                "arguments": [
+                  {
+                    "id": "type:embed:TextMatch",
+                    "kind": "api"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "truncated",
+              "type": {
+                "kind": "primitive",
+                "name": "bool"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:TextSearchResult",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=server",
+        "definition": {
+          "fields": [],
+          "has_nonpublic_fields": true,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:server_api:ServerBootstrapError",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=server",
+        "definition": {
+          "variants": [
+            "RefusedToStart",
+            "Success"
+          ]
+        },
+        "generics": [],
+        "id": "type:server_api:ServerExit",
+        "kind": "enum"
+      }
+    ],
+    "macros": [],
+    "modules": [
+      {
+        "availability": "always",
+        "doc_hidden": false,
+        "path": "symforge"
+      },
+      {
+        "availability": "feature=embed",
+        "doc_hidden": false,
+        "path": "symforge::embed"
+      },
+      {
+        "availability": "feature=server",
+        "doc_hidden": false,
+        "path": "symforge::server_api"
+      }
+    ],
+    "semantic_algebras": {
+      "AtomicAuthority": {
+        "construction": "crate_private",
+        "variants": [
+          {
+            "fields": [
+              "binding_authority_id",
+              "content_identity",
+              "manifest_digest",
+              "never_reused_publication_id",
+              "observer_epoch",
+              "optional_path_and_byte_digest",
+              "source_version",
+              "strict_scope_certificate_id"
+            ],
+            "name": "Generation"
+          },
+          {
+            "fields": [
+              "binding_authority_id",
+              "evidence",
+              "observed_at",
+              "path",
+              "physical_root_identity"
+            ],
+            "name": "DiskObservation"
+          },
+          {
+            "fields": [
+              "binding_authority_id",
+              "coverage",
+              "finished_at",
+              "observation_cut",
+              "physical_root_identity",
+              "policy_versions",
+              "scan_id",
+              "scope",
+              "started_at"
+            ],
+            "name": "WorktreeScopeObservation"
+          },
+          {
+            "fields": [
+              "membership",
+              "object",
+              "path",
+              "repository_id",
+              "resolved_from"
+            ],
+            "name": "GitObservation"
+          }
+        ]
+      },
+      "Claim": {
+        "construction": "crate_private_operation_envelope_builder",
+        "fields": [
+          "evaluation",
+          "operation",
+          "producing_runtime_identity",
+          "provenance",
+          "value"
+        ]
+      },
+      "ClaimProvenance": {
+        "construction": "crate_private_operation_envelope_builder",
+        "variants": [
+          {
+            "fields": [
+              "authority"
+            ],
+            "name": "Single"
+          },
+          {
+            "fields": [
+              "left",
+              "operation",
+              "relation",
+              "right"
+            ],
+            "name": "Comparison"
+          },
+          {
+            "fields": [
+              "nonempty_inputs",
+              "operation"
+            ],
+            "name": "Derivation"
+          },
+          {
+            "fields": [
+              "additional_authorities",
+              "generations",
+              "operation",
+              "selections"
+            ],
+            "invariant": "Selections and generations form an exact nonempty ProjectSourceKey bijection.",
+            "name": "SelectedAggregate"
+          }
+        ]
+      },
+      "EvaluationProvenance": {
+        "construction": "crate_private_ranking_snapshot",
+        "fields": [
+          "evaluation_time",
+          "persistent_store_instance_id",
+          "persistent_store_version",
+          "ranking_policy_id",
+          "session_incarnation",
+          "session_version"
+        ]
+      },
+      "OperationReceipt": {
+        "construction": "crate_private_operation_contract_v1",
+        "fields": [
+          "canonical_argument_hash",
+          "operation_kind",
+          "operation_schema_version",
+          "selector_filter_consistency_ids",
+          "value_affecting_algorithm_and_policy_versions"
+        ]
+      },
+      "SourceRefusal": {
+        "construction": "crate_private_operation_envelope_builder",
+        "variants": [
+          {
+            "fields": [
+              "canonical_selector_hash",
+              "operation"
+            ],
+            "name": "InvalidSelection"
+          },
+          {
+            "fields": [
+              "cause",
+              "operation",
+              "subject"
+            ],
+            "name": "AdmissionUnavailable"
+          },
+          {
+            "fields": [
+              "cause",
+              "operation",
+              "source"
+            ],
+            "name": "SourceUnavailable"
+          },
+          {
+            "fields": [
+              "operation",
+              "resolved_selection_set"
+            ],
+            "invariant": "Selection receipts and evidence are an exact nonempty bijection and at least one source is unavailable.",
+            "name": "SelectionUnavailable"
+          }
+        ]
+      },
+      "UnavailableCause": {
+        "legal_variants": [
+          {
+            "basis": "RuntimePublication",
+            "name": "NotCurrent",
+            "retry": [
+              "Automatic"
+            ]
+          },
+          {
+            "basis": "OptionalRuntimePublication",
+            "name": "AuthorityRevoked",
+            "retry": [
+              "Never",
+              "OnEvent"
+            ]
+          },
+          {
+            "basis": "CapacityEvidence",
+            "name": "CapacityUnavailable",
+            "retry": [
+              "Automatic",
+              "Operator"
+            ]
+          },
+          {
+            "basis": "RuntimePublication",
+            "name": "VerificationOverdue",
+            "retry": [
+              "Automatic"
+            ]
+          },
+          {
+            "basis": "RootAttemptBasis",
+            "name": "ObservationIncomplete",
+            "retry": [
+              "Automatic",
+              "OnEvent",
+              "Operator"
+            ]
+          },
+          {
+            "basis": "RootAttemptBasis",
+            "name": "RootIdentityChanged",
+            "retry": [
+              "OnEvent",
+              "Operator"
+            ]
+          },
+          {
+            "basis": "RootAttemptBasis",
+            "name": "UnsafePathTraversal",
+            "retry": [
+              "Never",
+              "Operator"
+            ]
+          },
+          {
+            "basis": "RootAttemptBasis",
+            "name": "RootedIoUnsupported",
+            "retry": [
+              "Never",
+              "Operator"
+            ]
+          },
+          {
+            "basis": "None",
+            "name": "SourceAlreadyOpen",
+            "retry": [
+              "Never",
+              "OnEvent"
+            ]
+          },
+          {
+            "basis": "RefusalBasis",
+            "name": "SourceFault",
+            "retry": [
+              "Automatic",
+              "Never",
+              "OnEvent",
+              "Operator"
+            ]
+          }
+        ]
+      }
+    },
+    "status": "normative_expected_graph",
+    "trait_impls": [
+      {
+        "for": "symforge::embed::EmbeddedSourceHandle",
+        "polarity": "positive",
+        "trait": "core::ops::Drop"
+      },
+      {
+        "for": "symforge::embed::EngineInfo",
+        "polarity": "positive",
+        "trait": "core::clone::Clone"
+      },
+      {
+        "for": "symforge::embed::EngineInfo",
+        "polarity": "positive",
+        "trait": "core::cmp::Eq"
+      },
+      {
+        "for": "symforge::embed::EngineInfo",
+        "polarity": "positive",
+        "trait": "core::cmp::PartialEq"
+      },
+      {
+        "for": "symforge::embed::EngineInfo",
+        "polarity": "positive",
+        "trait": "core::fmt::Debug"
+      },
+      {
+        "for": "symforge::embed::EngineInfo",
+        "polarity": "positive",
+        "trait": "core::marker::Copy"
+      },
+      {
+        "for": "symforge::embed::ProcessIndexRuntime",
+        "polarity": "positive",
+        "trait": "core::clone::Clone"
+      },
+      {
+        "for": "symforge::embed::ProcessIndexRuntime",
+        "polarity": "positive",
+        "trait": "core::ops::Drop"
+      },
+      {
+        "for": "symforge::embed::ReceiptWaitError",
+        "polarity": "positive",
+        "trait": "core::fmt::Debug"
+      },
+      {
+        "for": "symforge::embed::ReceiptWaitError",
+        "polarity": "positive",
+        "trait": "core::fmt::Display"
+      },
+      {
+        "for": "symforge::embed::ReceiptWaitError",
+        "polarity": "positive",
+        "trait": "std::error::Error"
+      },
+      {
+        "for": "symforge::embed::SourceRefusal",
+        "polarity": "positive",
+        "trait": "core::fmt::Debug"
+      },
+      {
+        "for": "symforge::embed::SourceRefusal",
+        "polarity": "positive",
+        "trait": "core::fmt::Display"
+      },
+      {
+        "for": "symforge::embed::SourceRefusal",
+        "polarity": "positive",
+        "trait": "std::error::Error"
+      },
+      {
+        "for": "symforge::server_api::ServerBootstrapError",
+        "polarity": "positive",
+        "trait": "core::fmt::Debug"
+      },
+      {
+        "for": "symforge::server_api::ServerBootstrapError",
+        "polarity": "positive",
+        "trait": "core::fmt::Display"
+      },
+      {
+        "for": "symforge::server_api::ServerBootstrapError",
+        "polarity": "positive",
+        "trait": "std::error::Error"
+      }
+    ],
+    "type_ast": {
+      "closed_kinds": [
+        "api",
+        "generic",
+        "generic-parameter",
+        "path",
+        "primitive",
+        "receiver",
+        "reference",
+        "slice"
+      ],
+      "rendered_rust_strings_are_normative": false,
+      "version": 1
+    }
+  },
+  "health_topology": {
+    "public_rust_health_types": [],
+    "rule": "Health remains an MCP/HTTP wire contract backed by crate-private DTOs. The separate binary crate reaches it only through server_api::run; no health type, raw runtime, or server module is public Rust API.",
+    "server_bootstrap": "symforge::server_api::run(args: Vec<std::ffi::OsString>) -> Result<ServerExit, ServerBootstrapError>"
+  },
+  "kind": "symforge-rust-public-api",
+  "migration_v10": {
+    "atomization": {
+      "activation_requirement": "The pinned v10 rustdoc/HIR extractor MUST expand every category below into exact atoms and prove each old atom maps exactly once. Any unmapped old atom refuses activation.",
+      "observed_atom_set_sha256": null,
+      "status": "pre_activation_required"
+    },
+    "baseline": {
+      "commit": null,
+      "configuration_domain_sha256": null,
+      "graph_set_sha256": null,
+      "status": "pre_activation_required",
+      "version": "10.0.4"
+    },
+    "categories": [
+      {
+        "atoms": [
+          "symforge"
+        ],
+        "covers_descendants": false,
+        "decision": "keep",
+        "id": "v10-00-crate-root",
+        "rationale": "The public crate root remains the single namespace anchor; this row keeps only the root module itself, while every descendant is independently kept, replaced, removed, or introduced by another exact row.",
+        "v11_atoms": [
+          "symforge"
+        ]
+      },
+      {
+        "atoms": [
+          "symforge::analytics",
+          "symforge::capability",
+          "symforge::cli",
+          "symforge::daemon",
+          "symforge::discovery",
+          "symforge::domain",
+          "symforge::edit_safety",
+          "symforge::git",
+          "symforge::gitignore_hygiene",
+          "symforge::hash",
+          "symforge::idempotency",
+          "symforge::knowledge",
+          "symforge::live_index",
+          "symforge::observability",
+          "symforge::parsing",
+          "symforge::path_shadow",
+          "symforge::paths",
+          "symforge::process_util",
+          "symforge::protocol",
+          "symforge::server",
+          "symforge::sidecar",
+          "symforge::stel",
+          "symforge::stel_core",
+          "symforge::version_registry",
+          "symforge::watcher",
+          "symforge::watcher_state",
+          "symforge::worktree"
+        ],
+        "covers_descendants": true,
+        "decision": "remove",
+        "id": "v10-01-raw-crate-root-modules",
+        "rationale": "All engine, protocol, CLI, watcher, Git, parser, persistence, STEL, and raw state modules become crate-private. Server entry is replaced by server_api and health remains wire-only."
+      },
+      {
+        "atoms": [
+          "symforge::embed"
+        ],
+        "covers_descendants": false,
+        "decision": "keep",
+        "id": "v10-02-embed-module",
+        "v11_atoms": [
+          "symforge::embed"
+        ]
+      },
+      {
+        "atoms": [
+          "symforge::embed::EngineInfo",
+          "symforge::embed::engine_info"
+        ],
+        "covers_descendants": true,
+        "decision": "keep",
+        "id": "v10-03-engine-info",
+        "v11_atoms": [
+          "symforge::embed::EngineInfo",
+          "symforge::embed::engine_info"
+        ]
+      },
+      {
+        "atoms": [
+          "symforge::embed::IndexLoadSource",
+          "symforge::embed::LiveIndex",
+          "symforge::embed::PublishedIndexState",
+          "symforge::embed::PublishedIndexStatus",
+          "symforge::embed::SharedIndex",
+          "symforge::embed::SnapshotVerifyState"
+        ],
+        "covers_descendants": true,
+        "decision": "replace",
+        "id": "v10-04-raw-runtime-state",
+        "rationale": "Replace raw and degraded-capable state with lifecycle-owned runtime, source handle, strict runtime view, refusals, and receipts.",
+        "v11_atoms": [
+          "symforge::embed::EmbeddedSourceHandle",
+          "symforge::embed::ProcessIndexRuntime",
+          "symforge::embed::SourceRefusal",
+          "symforge::embed::SourceRuntimeView"
+        ]
+      },
+      {
+        "atoms": [
+          "symforge::embed::SearchFilesTier",
+          "symforge::embed::SearchFilesView",
+          "symforge::embed::SymbolSearchResult",
+          "symforge::embed::TextSearchError",
+          "symforge::embed::TextSearchResult",
+          "symforge::embed::search_symbols",
+          "symforge::embed::search_text"
+        ],
+        "covers_descendants": true,
+        "decision": "replace",
+        "id": "v10-05-authorityless-search",
+        "rationale": "Replace free functions and authority-less results with handle methods returning typed Claim envelopes or the closed SourceRefusal algebra.",
+        "v11_atoms": [
+          "symforge::embed::Claim",
+          "symforge::embed::SymbolSearchRequest",
+          "symforge::embed::SymbolSearchResult",
+          "symforge::embed::TextSearchRequest",
+          "symforge::embed::TextSearchResult"
+        ]
+      },
+      {
+        "atoms": [
+          "symforge::embed::ReindexResult",
+          "symforge::embed::remove_file",
+          "symforge::embed::update_file_from_disk"
+        ],
+        "covers_descendants": true,
+        "decision": "replace",
+        "id": "v10-06-raw-mutation",
+        "rationale": "Replace direct mutation with managed observation and one lifecycle-owned refresh request.",
+        "v11_atoms": [
+          "symforge::embed::EmbeddedSourceHandle::request_refresh",
+          "symforge::embed::RefreshTicket"
+        ]
+      },
+      {
+        "atoms": [
+          "symforge::embed::IndexSnapshot",
+          "symforge::embed::PortableSnapshotProvenance",
+          "symforge::embed::StatePlacement",
+          "symforge::embed::import_portable_snapshot",
+          "symforge::embed::load_snapshot",
+          "symforge::embed::load_snapshot_for_root",
+          "symforge::embed::project_local_state_placement",
+          "symforge::embed::snapshot_compatible",
+          "symforge::embed::snapshot_to_live_index"
+        ],
+        "covers_descendants": true,
+        "decision": "remove",
+        "id": "v10-07-snapshot-surface",
+        "rationale": "Snapshot restore and persistence become private candidate-seed lifecycle work, never external publication authority."
+      },
+      {
+        "atoms": [
+          "symforge::embed::FileClassification",
+          "symforge::embed::FileProcessingResult",
+          "symforge::embed::IndexedFile",
+          "symforge::embed::LanguageId",
+          "symforge::embed::ParseStatus",
+          "symforge::embed::ReferenceKind",
+          "symforge::embed::SymbolKind",
+          "symforge::embed::SymbolRecord",
+          "symforge::embed::process_file"
+        ],
+        "covers_descendants": true,
+        "decision": "remove",
+        "id": "v10-08-parser-domain-surface",
+        "rationale": "Raw parsing and index-record constructors could bypass complete-candidate and authority publication rules."
+      },
+      {
+        "atoms": [
+          "symforge::embed::GitRepo"
+        ],
+        "covers_descendants": true,
+        "decision": "remove",
+        "id": "v10-09-git-surface",
+        "rationale": "No raw Git handle is exposed until a separately frozen authority-bearing operation exists."
+      },
+      {
+        "atoms": [
+          "symforge::embed::AdmissionDecision",
+          "symforge::embed::CalibrationVerdict",
+          "symforge::embed::IntentBucket",
+          "symforge::embed::LedgerStoreStatus",
+          "symforge::embed::LedgerSubsystemState",
+          "symforge::embed::LedgerSummary",
+          "symforge::embed::RouteConfidence",
+          "symforge::embed::StelCalibrationSummary",
+          "symforge::embed::StelLedgerEvent",
+          "symforge::embed::StelLedgerStore",
+          "symforge::embed::StoredLedgerRecord",
+          "symforge::embed::format_calibration_section",
+          "symforge::embed::summarize_calibration"
+        ],
+        "covers_descendants": true,
+        "decision": "remove",
+        "id": "v10-10-stel-surface",
+        "rationale": "STEL remains server-owned implementation detail. A future external telemetry API requires its own attested manifest amendment."
+      },
+      {
+        "atoms": [
+          "symforge::embed::domain",
+          "symforge::embed::git",
+          "symforge::embed::live_index",
+          "symforge::embed::parsing"
+        ],
+        "covers_descendants": true,
+        "decision": "remove",
+        "id": "v10-11-deep-embed-reexports",
+        "rationale": "Deep reexports are raw bypasses and are not part of the managed V11 facade."
+      }
+    ],
+    "introduced_v11_atoms": [
+      "symforge::embed::AtomicAuthority",
+      "symforge::embed::AtomicAuthority::identity",
+      "symforge::embed::AtomicAuthority::kind_name",
+      "symforge::embed::Claim",
+      "symforge::embed::Claim::evaluation",
+      "symforge::embed::Claim::operation",
+      "symforge::embed::Claim::producing_runtime_identity",
+      "symforge::embed::Claim::provenance",
+      "symforge::embed::Claim::value",
+      "symforge::embed::ClaimProvenance",
+      "symforge::embed::ClaimProvenance::authorities",
+      "symforge::embed::ClaimProvenance::authority_count",
+      "symforge::embed::ClaimProvenance::identity",
+      "symforge::embed::ClaimProvenance::kind_name",
+      "symforge::embed::EmbeddedSourceHandle",
+      "symforge::embed::EmbeddedSourceHandle::begin_close",
+      "symforge::embed::EmbeddedSourceHandle::request_refresh",
+      "symforge::embed::EmbeddedSourceHandle::runtime_view",
+      "symforge::embed::EmbeddedSourceHandle::search_symbols",
+      "symforge::embed::EmbeddedSourceHandle::search_text",
+      "symforge::embed::EmbeddedSourceSpec",
+      "symforge::embed::EmbeddedSourceSpec::current_worktree",
+      "symforge::embed::EvaluationProvenance",
+      "symforge::embed::EvaluationProvenance::identity",
+      "symforge::embed::OperationKind",
+      "symforge::embed::OperationReceipt",
+      "symforge::embed::OperationReceipt::canonical_argument_hash",
+      "symforge::embed::OperationReceipt::identity",
+      "symforge::embed::OperationReceipt::operation_kind",
+      "symforge::embed::OperationReceipt::schema_version",
+      "symforge::embed::ProcessIndexRuntime",
+      "symforge::embed::ProcessIndexRuntime::acquire",
+      "symforge::embed::ProcessIndexRuntime::begin_shutdown",
+      "symforge::embed::ProcessIndexRuntime::open_embedded_source",
+      "symforge::embed::ReceiptWaitError",
+      "symforge::embed::RefreshTicket",
+      "symforge::embed::RefreshTicket::operation",
+      "symforge::embed::RefreshTicket::requested_source_version",
+      "symforge::embed::RefreshTicket::ticket_identity",
+      "symforge::embed::RetryAdvice",
+      "symforge::embed::ShutdownReceipt",
+      "symforge::embed::ShutdownReceipt::wait",
+      "symforge::embed::ShutdownReport",
+      "symforge::embed::SourceCloseReceipt",
+      "symforge::embed::SourceCloseReceipt::wait",
+      "symforge::embed::SourceCloseReport",
+      "symforge::embed::SourceRefusal",
+      "symforge::embed::SourceRefusal::evidence_identity",
+      "symforge::embed::SourceRefusal::kind",
+      "symforge::embed::SourceRefusal::operation",
+      "symforge::embed::SourceRefusal::retry",
+      "symforge::embed::SourceRefusalKind",
+      "symforge::embed::SourceRuntimePhase",
+      "symforge::embed::SourceRuntimeView",
+      "symforge::embed::SymbolMatch",
+      "symforge::embed::SymbolSearchRequest",
+      "symforge::embed::SymbolSearchResult",
+      "symforge::embed::TextMatch",
+      "symforge::embed::TextSearchRequest",
+      "symforge::embed::TextSearchResult",
+      "symforge::server_api",
+      "symforge::server_api::ServerBootstrapError",
+      "symforge::server_api::ServerExit",
+      "symforge::server_api::run"
+    ]
+  },
+  "negative_assertions": [
+    {
+      "id": "authority-types-01-not-deserialize",
+      "kind": "impl-absent",
+      "subjects": [
+        "symforge::embed::AtomicAuthority",
+        "symforge::embed::Claim<T>",
+        "symforge::embed::ClaimProvenance",
+        "symforge::embed::EvaluationProvenance",
+        "symforge::embed::OperationReceipt",
+        "symforge::embed::SourceRefusal"
+      ],
+      "trait": "serde::Deserialize"
+    },
+    {
+      "id": "authority-types-02-not-default",
+      "kind": "impl-absent",
+      "subjects": [
+        "symforge::embed::AtomicAuthority",
+        "symforge::embed::Claim<T>",
+        "symforge::embed::ClaimProvenance",
+        "symforge::embed::EvaluationProvenance",
+        "symforge::embed::OperationReceipt",
+        "symforge::embed::SourceRefusal"
+      ],
+      "trait": "core::default::Default"
+    },
+    {
+      "id": "authority-types-03-not-from",
+      "kind": "impl-family-absent-except-reflexive",
+      "permitted_source": "Self",
+      "subjects": [
+        "symforge::embed::AtomicAuthority",
+        "symforge::embed::Claim<T>",
+        "symforge::embed::ClaimProvenance",
+        "symforge::embed::EvaluationProvenance",
+        "symforge::embed::OperationReceipt",
+        "symforge::embed::SourceRefusal"
+      ],
+      "trait_family": "core::convert::From<_>"
+    },
+    {
+      "id": "cbm-spike-no-public-graph-delta",
+      "kind": "graph-equivalence",
+      "pairs": [
+        [
+          "embed",
+          "embed-cbm-spike"
+        ],
+        [
+          "server",
+          "server-cbm-spike"
+        ],
+        [
+          "server-embed",
+          "server-embed-cbm-spike"
+        ]
+      ]
+    },
+    {
+      "id": "embedded-source-handle-not-clone",
+      "kind": "impl-absent",
+      "subjects": [
+        "symforge::embed::EmbeddedSourceHandle"
+      ],
+      "trait": "core::clone::Clone"
+    },
+    {
+      "forbidden_prefixes": [
+        "symforge::analytics",
+        "symforge::capability",
+        "symforge::cli",
+        "symforge::daemon",
+        "symforge::discovery",
+        "symforge::domain",
+        "symforge::edit_safety",
+        "symforge::git",
+        "symforge::gitignore_hygiene",
+        "symforge::hash",
+        "symforge::idempotency",
+        "symforge::knowledge",
+        "symforge::live_index",
+        "symforge::observability",
+        "symforge::parsing",
+        "symforge::path_shadow",
+        "symforge::paths",
+        "symforge::process_util",
+        "symforge::protocol",
+        "symforge::server",
+        "symforge::sidecar",
+        "symforge::stel",
+        "symforge::stel_core",
+        "symforge::version_registry",
+        "symforge::watcher",
+        "symforge::watcher_state",
+        "symforge::worktree"
+      ],
+      "id": "no-raw-crate-root-modules",
+      "kind": "export-prefix-absent"
+    },
+    {
+      "forbidden_prefixes": [
+        "symforge::embed::domain",
+        "symforge::embed::git",
+        "symforge::embed::live_index",
+        "symforge::embed::parsing"
+      ],
+      "id": "no-raw-deep-embed-reexports",
+      "kind": "export-prefix-absent"
+    },
+    {
+      "forbidden_prefixes": [
+        "symforge::health",
+        "symforge::server_api::health"
+      ],
+      "id": "no-rust-health-api",
+      "kind": "export-prefix-absent"
+    },
+    {
+      "forbidden_prefixes": [
+        "symforge::embed::stel",
+        "symforge::stel",
+        "symforge::stel_core"
+      ],
+      "id": "no-stel-public-api",
+      "kind": "export-prefix-absent"
+    },
+    {
+      "id": "runtime-handle-no-as-ref",
+      "kind": "impl-family-absent",
+      "subjects": [
+        "symforge::embed::EmbeddedSourceHandle",
+        "symforge::embed::ProcessIndexRuntime"
+      ],
+      "trait_family": "core::convert::AsRef<_>"
+    },
+    {
+      "id": "runtime-handle-no-borrow",
+      "kind": "impl-family-absent-except-reflexive",
+      "permitted_source": "Self",
+      "subjects": [
+        "symforge::embed::EmbeddedSourceHandle",
+        "symforge::embed::ProcessIndexRuntime"
+      ],
+      "trait_family": "core::borrow::Borrow<_>"
+    },
+    {
+      "id": "runtime-handle-no-deref",
+      "kind": "impl-absent",
+      "subjects": [
+        "symforge::embed::EmbeddedSourceHandle",
+        "symforge::embed::ProcessIndexRuntime"
+      ],
+      "trait": "core::ops::Deref"
+    }
+  ],
+  "observed_graph": {
+    "cell_graphs": null,
+    "graph_set_sha256": null,
+    "required_equality": "exact",
+    "status": "pre_activation_required"
+  },
+  "policy": {
+    "array_ordering": {
+      "algebra_variant_arrays": "declared_semantic_order",
+      "generic_argument_arrays": "positional",
+      "named_set_arrays": "lexicographic_by_id_name_or_path",
+      "struct_field_arrays": "lexicographic_by_name",
+      "trait_impl_arrays": "canonical_tuple_by_subject_trait_polarity"
+    },
+    "associated_item_signatures": {
+      "inheritance_literal": "inherited_from_owning_export",
+      "required_fields": [
+        "abi",
+        "async",
+        "availability",
+        "cfg",
+        "const",
+        "generics",
+        "unsafe",
+        "where_predicates"
+      ],
+      "schema_version": 1,
+      "unknown_fields": "reject"
+    },
+    "closed_world": true,
+    "doc_hidden_counts_as_public": true,
+    "pin_upstream_blanket_impls": true,
+    "unknown_cfg_name": "reject",
+    "unknown_cfg_value": "reject",
+    "unknown_feature_vector": "reject",
+    "unknown_target": "reject",
+    "unlisted_export": "reject",
+    "unlisted_impl": "reject",
+    "unlisted_item": "reject",
+    "unlisted_macro": "reject",
+    "unlisted_module": "reject"
+  },
+  "schema_version": 1,
+  "stel": {
+    "decision": "remove_from_public_rust_api",
+    "future_rule": "A public telemetry API requires a separately reviewed and attested manifest amendment.",
+    "runtime_placement": "crate_private_server_owned"
+  }
+}

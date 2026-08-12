@@ -16,17 +16,19 @@ jobs:
   conventional-commits:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
       - name: Validate pull request title
         if: github.event_name == 'pull_request'
-        run: python execution/conventional_commits.py check-subject "${{ github.event.pull_request.title }}"
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python execution/conventional_commits.py check-subject -- "$PR_TITLE"
 
       - name: Validate pushed commit subjects
         if: github.event_name == 'push'
@@ -40,14 +42,30 @@ jobs:
     needs: conventional-commits
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
       - name: Run version sync tests
+        env:
+          SYMFORGE_REQUIRE_SSHSIG: '1'
         run: python -m unittest discover -s execution -p 'test_*.py'
+
+      - name: Verify Feature 020 V11 refreeze integrity
+        run: python execution/refreeze_v11.py verify-internal --target-ref HEAD
+
+      - name: Test and verify Feature 020 V11 lifecycle traceability
+        run: |
+          node scripts/validate-lifecycle-oracle-traceability.test.cjs
+          node scripts/validate-lifecycle-oracle-traceability.cjs
 
       - name: Verify release metadata stays aligned
         run: python execution/version_sync.py check
@@ -56,7 +74,7 @@ jobs:
     needs: release-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free disk space for Rust builds
         run: bash execution/free_runner_disk.sh
@@ -111,7 +129,7 @@ jobs:
         run: cargo build --release
 
       - name: Set up Node for tool-correctness harness
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
 
@@ -131,7 +149,7 @@ jobs:
     needs: release-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
@@ -156,7 +174,7 @@ jobs:
     needs: release-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively. A hardcoded `toolchain:` input
@@ -199,7 +217,7 @@ jobs:
     needs: release-version
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
@@ -228,7 +246,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
@@ -245,9 +263,9 @@ jobs:
     needs: release-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
 

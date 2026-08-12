@@ -1,6 +1,6 @@
 # Contract: Source Binding and Runtime State
 
-**Status**: Frozen (2026-07-17)<br>
+**Status**: V11 refreeze candidate (2026-08-11; non-conflicting V10 evidence retained)<br>
 **Surface**: startup/session binding, `index_folder`, `health`, `status`, init,
 checkpoint/snapshot/idempotency consumers<br>
 **Core invariant**: permission to index a source is not permission to write state
@@ -14,6 +14,73 @@ same live process can then index a normal accessible project. A caller may also
 explicitly request bounded indexing of an exact protected root; that mode never
 touches `<source>/.symforge` and remains queryable with user-local or memory-only
 derived state.
+
+## V11 lifecycle amendment
+
+The V10 placement, authorization, identity, and recovery evidence in this contract
+remains applicable. The following V11 rules supersede every older clause that permits
+a public degraded, last-valid, or last-verified generation read:
+
+- Only lifecycle `Current` is queryable. Every generation-backed tool, resource,
+  prompt, hook, sidecar route, CCR operation, checkpoint, and embedded consumer
+  acquires its generation through the strict lifecycle Interface.
+- `Loading`, `Refreshing`, `Blocked`, and `Stopping` return the one exact
+  `SourceRefusal` algebra. A retained verified generation is byte-identical internal
+  recovery material, remains non-current, and is never exposed through a fallback.
+- Single-source refusal uses `SourceUnavailable` after authorization; a selected
+  multi-source request uses `SelectionUnavailable` with an exact bijection over the
+  sealed selection receipt. Pre-binding selection and admission failures retain their
+  indistinguishable `InvalidSelection`/`AdmissionUnavailable` forms.
+- Persistence health is orthogonal to source truth. A durability failure alone does
+  not revoke a valid `Current` generation. `Gapped` observer coverage, an incomplete
+  baseline, unknown ordering, or an overdue verification obligation synchronously
+  publishes non-current state and revokes strict acquisition until a complete
+  successor promotes.
+- Promotion requires one sealed `RequiredArtifactSet` and complete evidence for every
+  advertised strict artifact, including temporal, bridge, authority, and suppression
+  state. Missing, capacity-exhausted, or truncated required work exists only in
+  bounded attempt accounting: the candidate is discarded and strict acquisition
+  refuses. Public truncation is legal only after a strict lease has been acquired for
+  response rendering. A feature omitted from protocol advertisement before lifecycle
+  startup is absent from `RequiredArtifactSet`; any bounded/truncated optional work for
+  it remains non-authoritative outside the candidate and produces no capability,
+  generation artifact, or public claim. Neither case weakens generation completeness.
+
+Thus `Ready` means lifecycle `Current` under complete, non-overdue observation proof;
+it does not mean that persistence is durable. Historical V10 tests below remain useful
+for placement and recovery, but any expectation of a labeled stale success is replaced
+by typed refusal.
+
+## V11 public evidence envelope
+
+Every public source-truth success is constructed as one `Claim<T>`. It carries the
+operation-specific opaque `OperationReceipt`, the full `ClaimProvenance`, the
+producing runtime/publication identity, and `EvaluationProvenance` whenever ranking,
+ordering, or scores are observable. Every `SourceRefusal` carries the same operation
+receipt. The receipt binds normalized arguments, selectors/filters, and all
+value-affecting algorithm and policy versions; a formatter or Adapter cannot assemble
+these fields independently.
+
+`Generation` provenance is legal only for facts derived wholly from generation-owned
+bytes and structures pinned by a strict `Current` lease. A pure path read, complete
+worktree scan, or immutable Git-object read instead carries `DiskObservation`,
+`WorktreeScopeObservation`, or `GitObservation`. A disk receipt may establish
+path-local bytes/metadata/missing at its observation time; a worktree-scope receipt may
+establish completeness only for its sealed declared scope and interval; a Git receipt
+may establish membership/non-membership only in its exact object/tree. Those
+operations may remain responsive while a source is non-current, but none claims
+lifecycle `Current`, generation membership, or generation/repository-wide
+completeness or absence. A mixed result is a typed `Comparison`/`Derivation`, while a
+selected-source total or no-match uses the private `SelectedAggregate` constructor and
+the lease's exact source bijection.
+
+Human-readable text, structured content, cache keys/values, durable persistence, CCR
+handles, and retrieval round trips preserve the identical operation, claim, and
+evaluation envelope. Response budgeting may reduce a successfully leased response to
+provenance/counts plus a retrieval handle, but it cannot drop or synthesize authority.
+Health/status is separately captured immutable runtime-publication evidence: it may
+report `Current` or non-current work while generation reads refuse, but it exposes no
+generation root and cannot attest source bytes, repository absence, or disk/Git truth.
 
 ## `index_folder` input
 
@@ -114,8 +181,8 @@ placement resolver. Ownership is closed and explicit:
 
 | Owner | Consumers |
 |---|---|
-| canonical source root | source/Git reads, relative paths, watcher, repo-owned inputs (including the policy ledger and retained `.symforge/` configuration), and narrowly guarded policy/ignore/team-artifact writes |
-| `ProjectStateDir` | snapshot/temp/quarantine/reset/checkpoint, per-project replay/curation intent, coupling/frecency/STEL, analytics, API-key store, edit-safety TEE snapshots, and derived cleanup |
+| canonical source root | source/Git reads, relative paths, watcher, and repo-owned inputs (including the policy ledger and retained `.symforge/` configuration). Every SymForge-owned in-scope repository-content mutation—including structural edit, curation, init, ignore/attributes/hygiene, a team-export companion `.gitattributes` or other repository-content write, and any write-producing probe, retry, replay, recovery, or cleanup—requires a fresh non-cloneable `SourceMutationPermit` and beneath-confined handle-relative I/O. Excluded team-artifact state bytes and metadata are not repository-content mutation. |
+| `ProjectStateDir` | snapshot/temp/quarantine/reset/checkpoint, excluded legacy team-artifact state bytes and metadata, per-project replay/curation intent, coupling/frecency/STEL, analytics, API-key store, edit-safety TEE snapshots, and derived cleanup |
 | `ControlStateDir` | edit-safety trust store, sidecar port/PID/session descriptors and status readers, daemon discovery/control, hook adoption/hint state, operator profile, onboarding state, runtime-startup coordination, cross-project `index_folder` replay/locks, and process-global version-registry/update state |
 | process memory | live index/watcher/session memberships and labeled non-durable fallbacks |
 
@@ -173,8 +240,10 @@ identical; only restart durability is unavailable and reported.
 - Source reads, Git, relative paths, and watcher roots use the canonical source.
 - Derived persistence uses only `ProjectStateDir`.
 - Global or memory-only placement does not by itself disable watching.
-- Watcher failure retains last-valid content behind explicit degraded freshness and
-  bounded reconciliation; it is not reported as a persistence failure.
+- Watcher failure leaves any retained verified generation unchanged and internal,
+  publishes non-current observer/work state, and returns `SourceRefusal` to strict
+  consumers while bounded reconciliation runs. It is not reported as a persistence
+  failure.
 - Snapshot headers bind schema/policy, placement `ProjectId`, stable repository/source
   identity, captured source version, canonical manifest digest, resident-content
   digest, and a repository fingerprint. Working-tree state is the closed
@@ -195,18 +264,38 @@ identical; only restart durability is unavailable and reported.
 ## Init and Git hygiene
 
 Automatic startup/scout/watcher/reconciliation/ref ingestion only observe
-`.gitignore` hygiene. The shared mutation runs after successful explicit normal
-`index_folder` binding and during project-aware init, only for a normal current
-repository/worktree with mutation capability:
+`.gitignore` hygiene. Every repository-content write performed by init, structural
+editing, knowledge curation, `.gitignore`, `.gitattributes`, a team-export companion
+repository-content change, or another hygiene path—including a write-producing probe, retry, replay,
+recovery, or cleanup—uses a fresh tracked, non-cloneable `SourceMutationPermit`. A
+persisted intent, receipt, or prior permit cannot substitute for fresh live authority.
+The excluded team-artifact state bytes and metadata are `ProjectStateDir` persistence,
+not an in-scope repository-content write, and are expressly outside this
+permit/republication rule.
+The permit owns the live `PhysicalRootLease` and one mutation epoch. Granting it
+invalidates old-epoch candidates and atomically publishes non-current `Refreshing`
+before the first repository disk side effect; no caller can retain or clone write
+authority around that transition.
+
+The shared `.gitignore` mutation runs after successful explicit normal
+`index_folder` binding and during project-aware init, only for a normal lifecycle-
+`Current` repository/worktree with mutation capability:
 
 1. resolve the repository root;
 2. if root `.gitignore` is absent, do nothing and do not create it;
-3. refuse a symlink/reparse-point file or concurrent hash change;
-4. if the repository-root `.gitignore` itself already has an effective ordered rule
+3. if the repository-root `.gitignore` itself already has an effective ordered rule
    that ignores root `.symforge/`, do nothing; global excludes and
    `.git/info/exclude` do not satisfy repository hygiene;
-5. otherwise append canonical `/.symforge/` atomically/idempotently while preserving
-   BOM, bytes, line-ending style, and final-newline behavior.
+4. otherwise request a permit for the exact binding/root/path and call
+   `start_side_effect`; preparation and every path component use beneath-root,
+   handle-relative, no-follow/reparse-safe traversal to a validated final-parent
+   handle, and a platform without equivalent containment refuses destructive I/O;
+5. through that handle, re-read and revalidate the file identity/hash and ordered
+   ignore semantics, refusing a symlink/reparse point or concurrent change; if the
+   rule became effective, resolve the permit with `NoSideEffectProof`;
+6. otherwise append canonical `/.symforge/` atomically/idempotently while preserving
+   BOM, bytes, line-ending style, and final-newline behavior, using a same-directory
+   temp and replacement through the validated parent handle.
 
 The append never rewrites existing bytes. It uses the first existing newline
 sequence (`CRLF` or `LF`), falling back to `LF` when none exists. Empty and BOM-only
@@ -217,9 +306,14 @@ the result remains without a final newline. Ordered negation semantics are honor
 an effective equivalent rooted rule in that root file is a no-op.
 
 Protected-root authority never enables init. Scouting always excludes `.symforge/`
-regardless of ignore state. A permission or hash-race failure is returned in the
-`index_folder`/init receipt and health, but does not roll back the valid source bind
-or make live queries unavailable.
+regardless of ignore state. A rejection before permit grant leaves the existing
+runtime publication untouched. Once granted, `commit`, drop, panic, refusal, or
+rollback after any repository side effect leaves the source non-current until a
+complete successor promotes. Even a proven no-side-effect terminal path returns
+through a fenced verification/no-op candidate at the latest observer cut and mutation
+epoch and installs fresh safety authority; it never restores `Current` directly. The
+operation receipt and health expose the typed failure/work state without rolling back
+the valid source binding.
 
 The legacy opt-in team artifact remains at project-local
 `.symforge/index.bin.zst`. Its export receipt reports one honest Git visibility:
@@ -227,7 +321,13 @@ The legacy opt-in team artifact remains at project-local
 `ignored_force_add_required`, or `git_visibility_unavailable`. Export is refused
 unless authorization is normal, source mutation is allowed, and placement is
 project-local. It is never redirected to user-local state, and a refusal writes
-neither artifact nor `.gitattributes`.
+neither artifact nor `.gitattributes`. The artifact bytes themselves are excluded
+derived state written through the resolved project-local `ProjectStateDir` owner; that
+state-only write acquires no `SourceMutationPermit`, does not publish `Refreshing`, and
+does not schedule generation republication. If export also writes `.gitattributes` or
+any other in-scope repository content, that separate write uses a fresh permit, the
+pre-write non-current transition, and handle-relative confined I/O; success or any
+terminal path converges only through a fenced complete successor candidate.
 
 ## Health contract
 
@@ -240,15 +340,23 @@ Full and compact health expose these independently:
 - durable replay availability;
 - current-session membership authority and live replay postcondition;
 - query readiness;
-- watcher/freshness state;
+- observer coverage, verification deadline, and non-current work state;
 - snapshot load/identity state;
 - reason-bearing init, curation, edit, checkpoint, and team-artifact capability
   statuses;
 - `.gitignore` hygiene when applicable.
 
-`Ready` means the live query generation is usable. It never implies that persistence
-is durable or watcher freshness is complete. Unsafe path strings need not be echoed;
-health may use the safe project ID and typed reason.
+`Ready` means the selected live generation is lifecycle `Current`, observer coverage
+is complete, and no verification obligation is overdue. It never implies that
+persistence is durable. `Gapped`, incomplete, unknown-order, or overdue proof state is
+non-Ready even when an older verified generation is retained. Unsafe path strings need
+not be echoed; health may use the safe project ID and typed reason.
+Health is a runtime-state surface, not a generation-read bypass: it may remain
+available in `Loading`, `Refreshing`, `Blocked`, or `Stopping`, labels any generation
+retained by `Refreshing`, `Blocked`, or `Stopping` as internal/non-current, and never turns runtime telemetry, persistence
+status, or an observation attempt into `Generation` provenance. If a separate pure
+disk, complete worktree-scan, or Git operation is reported, it retains its own typed
+observation authority and makes no generation-currentness claim.
 
 ## Contract tests
 
@@ -278,14 +386,18 @@ health may use the safe project ID and typed reason.
 12. Global control failure never creates CWD-relative `.symforge`; replay is labeled
     process-local/non-durable.
 13. Memory-only watcher remains live; checkpoint reports unavailable; restart cold
-    rebuilds.
+    rebuilds. Memory-only placement may still reach `Current`, but a watcher gap or
+    overdue proof revokes strict acquisition exactly as in durable placement.
 14. Explicit normal `index_folder` and project-aware init share a byte-for-byte
     empty/BOM-only/CRLF/LF/final-newline/equivalent/negated/raced/symlinked root
     `.gitignore` matrix; global/info excludes do not satisfy it and automatic paths
     never mutate.
 15. Protected/read-only/user-local/memory-only bindings cannot export the team
     artifact or mutate `.gitattributes`; normal export distinguishes tracked,
-    untracked-visible, ignored-force-add, and unavailable Git visibility.
+    untracked-visible, ignored-force-add, and unavailable Git visibility. An artifact-
+    bytes-only export remains excluded `ProjectStateDir` state and leaves lifecycle
+    `Current`/publication unchanged; a companion `.gitattributes` write requires the
+    normal permit and successor protocol.
 16. A second session, reconnect, alias selector, and daemon restart cannot inherit
     protected membership; a fresh exact explicit request joins one existing slot.
 17. Override/non-override reuse of one key conflicts, protected `add=true` failure
@@ -295,7 +407,28 @@ health may use the safe project ID and typed reason.
 18. Post-bind state-write failure degrades only durability; normal memory-only mode
     exposes reason-bearing mutation capabilities instead of illegal boolean mixes.
 19. Health reports binding, membership, placement, durability, readiness, and
-    watcher freshness independently.
+    observer proof independently. Durability alone cannot change `Current`; a gap or
+    overdue observer proof must make readiness non-current synchronously.
 20. Runtime-data-base, analytics, and TEE discovery have no CWD-relative
     `.symforge` fallback, and a source-owned `.symforge` config path cannot become a
     state-placement or repository-root oracle.
+21. A required temporal/bridge/authority/suppression artifact that exceeds capacity or
+    truncates discards the candidate, records bounded attempt diagnostics, and makes
+    strict generation acquisition refuse. Only post-lease output budgeting may
+    truncate a public value; bounded optional work for an explicitly unadvertised
+    feature remains outside `RequiredArtifactSet` and produces no candidate artifact,
+    capability, authority, or public claim.
+22. Init, curation, `.gitignore`, `.gitattributes` or other team-export companion
+    repository content, and every other SymForge-owned in-scope repository-content write require a fresh
+    non-cloneable `SourceMutationPermit`, including write-producing probe/retry/replay/
+    recovery/cleanup paths; persisted records never substitute for it. They publish
+    non-current before the first side effect and use beneath-confined handle-relative
+    I/O. Success, failure after a side effect, and a proven no-side-effect terminal
+    path can regain `Current` only through a fenced complete successor candidate.
+    Excluded team-artifact state bytes and metadata use `ProjectStateDir` without a
+    permit or republication.
+23. Generation, disk, complete-worktree-scan, and Git facts retain their distinct
+    `ClaimProvenance`; every text/structured/cache/persistence/CCR/retrieval form
+    preserves its `OperationReceipt` and full provenance, plus
+    `EvaluationProvenance` whenever observable ranking/order/scores exist. Health
+    remains runtime evidence and cannot mint source truth.

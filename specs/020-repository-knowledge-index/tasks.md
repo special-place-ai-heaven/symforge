@@ -1,3 +1,11 @@
+> [!CAUTION]
+> **Execution authority changed for V11.** The checked V10 gates below are immutable
+> historical receipts only. They do not authorize V11 implementation, do not satisfy
+> any V11 task, and must not be edited or reinterpreted. The only executable work in
+> this file is the unchecked `Txxx` graph after `END V10 HISTORICAL RECEIPTS`.
+
+<!-- BEGIN V10 HISTORICAL RECEIPTS — PRESERVE EVERY LINE VERBATIM -->
+
 # Tasks: Repository Knowledge Index
 
 **Branch**: `feat/repository-knowledge-index`
@@ -817,3 +825,197 @@ filter/search that authority without a forward dependency; Gate J consumes both 
 orientation and read-only review, and Gate K alone owns mutation. Safe parallel work
 is limited to independent red fixtures/review after shared contracts freeze. Shared
 domain/store/watcher/persist edits remain serialized.
+
+<!-- END V10 HISTORICAL RECEIPTS -->
+
+---
+
+# Executable V11 tasks: Preventive project-index lifecycle
+
+**Authority**: The V11 lifecycle-prevention design and the hash-pinned Feature 020
+refreeze manifest govern this graph. Work follows RED -> observed failure -> minimal
+GREEN -> focused verification. A versioned acceptance specification is not reported
+as an executed test until the slice that introduces its production seam.
+
+## Phase 1 — Refreeze prerequisite (implementation-blocking)
+
+**Goal**: Freeze one internally consistent Feature 020 authority set before any V11
+product code or Slice 0 oracle is added.
+
+- [ ] T001 Inventory every file in `specs/020-repository-knowledge-index/` plus the bound `CONTEXT.md`, record its exact SHA-256 and authority classification, and create `specs/020-repository-knowledge-index/REFREEZE-MANIFEST-v11.md` with only the declared non-recursive self-hash exclusion
+- [ ] T002 Map amendment IDs A01-A19 to every replaced clause hash and successor requirement, contract, task, and test ID, then compute the amendment-set ID as the domain-separated SHA-256 of canonical sorted records rather than an operator label in `specs/020-repository-knowledge-index/REFREEZE-MANIFEST-v11.md`
+- [ ] T003 Apply A01-A19 consistently, create and complete the normative `contracts/lifecycle-oracle-traceability-v11.md`, `contracts/lifecycle-acceptance-oracles-v11.md`, and `contracts/v10-authority-retirement-v11.md` before inventory freeze, and record V11 as the breaking embed/lifecycle release boundary before Slice 0 across `specs/020-repository-knowledge-index/GOAL.md`, `specs/020-repository-knowledge-index/spec.md`, `specs/020-repository-knowledge-index/plan.md`, `specs/020-repository-knowledge-index/data-model.md`, `specs/020-repository-knowledge-index/tasks.md`, `specs/020-repository-knowledge-index/quickstart.md`, `specs/020-repository-knowledge-index/contracts/`, `specs/020-repository-knowledge-index/checklists/requirements.md`, and bound `CONTEXT.md` wherever its mapped authority lives
+- [ ] T004 Mark all completed degraded-publication material as superseded historical evidence without changing its receipt bytes in `specs/020-repository-knowledge-index/REFREEZE-MANIFEST-v11.md`
+- [ ] T005 [P] Define the canonical V11 public Interface, supported target/cfg/feature domain, and V10 keep/replace/remove matrix in `specs/020-repository-knowledge-index/contracts/public-api-v11.json`
+- [ ] T006 Add generated all-cfg inventory, graph-cover, dependent-crate positive, and compile-fail fixtures for the allowlist in `tests/fixtures/public-api-v11-consumer/`
+- [ ] T007 Write RED tests for unclassified files, unmapped clauses/requirements, hash drift, noncanonical amendment ordering, operator-label substitution, contradictory degraded language, unsupported cfgs, API expansion, coordinated in-tree digest rewrites, and missing FR/SC implementation-or-test traceability in `execution/test_refreeze_v11.py` and `scripts/validate-lifecycle-oracle-traceability.test.cjs`
+- [ ] T008 Implement canonical sorted-record/domain-separated amendment-set recomputation plus manifest-aware replacement, API-allowlist, exact-hash, external-anchor validation, and the exhaustive frozen traceability checker until T007 is GREEN in `execution/refreeze_v11.py` and `scripts/validate-lifecycle-oracle-traceability.cjs`, with exact internal gates `python execution/refreeze_v11.py verify-internal --target-ref HEAD` and `node scripts/validate-lifecycle-oracle-traceability.cjs`
+- [ ] T009 After every T003-T006 corpus/API edit is complete, regenerate all final file hashes, classifications, A01-A19 replacement mappings, and the amendment-set ID in `specs/020-repository-knowledge-index/REFREEZE-MANIFEST-v11.md`, then require a clean no-drift rerun before attestation
+- [ ] T010 Pin the final T009 manifest, lifecycle-design, bound-context, amendment-set, and public-API digests in `docs/reviews/FEATURE-020-REFREEZE-ATTESTATION-v11.md`; run the manifest validator, exhaustive lifecycle traceability checker, and cross-artifact analysis against those final bytes, record the exact bounded results, and rerun after the final attestation write without treating the mutable file as its own trust anchor
+- [ ] T011 Freeze one candidate target commit/tree and obtain independent review; if any finding changes the corpus, preserve the review evidence, regenerate T001-T010, and repeat until the exact target is clear in `docs/reviews/FEATURE-020-REFREEZE-ATTESTATION-v11.md`
+- [ ] T012 Obtain a trusted signed append-only `RefreezeApprovalRecordV11` outside the repository that binds the exact T011 commit/tree, final detached-attestation digest, and trusted release identity; rerun `python execution/refreeze_v11.py verify-internal --target-ref HEAD`, then use `execution/refreeze_v11.py` to prove the external record accepts only that target and rejects any coordinated in-tree rewrite retaining it
+
+> [!IMPORTANT]
+> **HARD STOP — NO SLICE 0 OR PRODUCT CODE MAY BEGIN UNTIL T001-T012 ARE COMPLETE.**
+> The external approval record is immutable input held outside the repository. It must
+> never be fabricated, inferred from an in-tree file, or copied into this tree.
+> After T012, every file under the Feature 020 root—including these checkbox bytes—is
+> immutable. Record execution status and evidence under `docs/reviews/`; do not check
+> boxes or edit a frozen contract. Any normative Feature 020 change requires a new
+> manifest, attestation, exact-target review, and trusted external approval.
+
+## Phase 2 — Slice 0: causal RED oracles and acceptance specifications
+
+**Goal**: Preserve working positive controls for every known V10 defect and freeze
+future-seam acceptance contracts without pretending that unimplemented tests ran.
+
+- [ ] T013 Validate the frozen `contracts/lifecycle-oracle-traceability-v11.md` table against every `FR-001` through `FR-052` and `SC-001` through `SC-026`, then record the immutable table digest, bounds, fairness assumptions, inherited-test resolution, and intended Slice 0 CI artifacts in `docs/reviews/FEATURE-020-SLICE0-CAUSAL-ORACLES-v11.md` without modifying the frozen contract
+- [ ] T014 Add and observe the smallest real-seam RED oracle `generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b` in `src/watcher/mod.rs::tests`, pausing after generation advance and before root publication; run exactly `cargo test --lib watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture`
+- [ ] T015 Add and observe RED positive controls for simultaneous first open, refusal without slot/watcher mutation, mutable-empty placeholder publication, and failed/panicked load retention in `tests/project_index_lifecycle_slice0.rs`
+- [ ] T016 Add and observe RED positive controls for old-observer delivery after promotion, watcher mutation of a candidate, and observer replacement gaps in `tests/project_index_lifecycle_slice0.rs`
+- [ ] T017 Add and observe RED positive controls for hybrid ArcSwap reads, generation-labeled live-disk bytes, same-stamp rewrites, and incomplete worktree derivations; pause a prepared source-A delta, publish source B, resume A, and prove latest B survives, same-source drift retries or aborts, equal numeric epochs cannot replace the opaque source-publication token, and exactly one whole-project root store occurs in `tests/project_index_lifecycle_slice0.rs`
+- [ ] T018 Add and observe RED positive controls for same-path physical-root replacement, multi-loader close/rebind ordering, query/capacity starvation, charge conservation, raw embed bypass, and live V10 snapshot writers in `tests/project_index_lifecycle_slice0.rs`
+- [ ] T019 Materialize RED test stubs from the frozen `contracts/lifecycle-acceptance-oracles-v11.md` mutation, ingress, observer, capacity, registry, query, provenance, verification, activation, embed, and migration specifications at their declared target slices without editing the frozen contract
+- [ ] T020 Extend and run the pre-refreeze `scripts/validate-lifecycle-oracle-traceability.cjs` checker against Slice 0 execution evidence so it rejects a missing requirement row, implementation owner, executable-or-inherited test, positive-control result, a not-yet-runnable oracle mislabeled as executed, or an unmapped invariant; add a fail-closed `--require-materialized --evidence <release-evidence.json>` mode whose code-owned resolvers require every planned Rust case and benchmark registration to exist and every T078-T089 receipt to bind the same release tree
+- [ ] T021 Run the exhaustive traceability checker and V10 positive-control commands, preserve expected failures as bounded CI artifacts, and obtain the required adversarial architecture review before Slice 1 in `docs/reviews/FEATURE-020-SLICE0-CAUSAL-ORACLES-v11.md`
+
+## Phase 3 — Slice 1: atomic mutation authority
+
+**Goal**: Make cross-root mutation and publication impossible before introducing the
+larger lifecycle runtime.
+
+- [ ] T022 Write and observe RED authority tests for exact whole-authority validation, mutation-permit terminality, epoch mismatch, and root-A writes after root-B install; add the grant-provenance matrix that accepts only a consumed exact live-`Current` authority and rejects `Loading`, `Refreshing`, `Blocked`, `Stopping`, candidate, snapshot, retained-generation, and stale-publication inputs without advancing the mutation epoch or creating a permit record in `tests/project_index_authority_v11.rs`
+- [ ] T023 Write and observe RED primitive tests for no-follow handle-relative I/O, symlink/reparse escapes, replacement before temp creation, and a mutation permit refusing `start_side_effect` unless its exact grant has already published non-Current in `tests/physical_root_lease_v11.rs` and `tests/project_index_authority_v11.rs`; production writer integration remains a Slice 4 activation test
+- [ ] T024 Define `BindingAuthority`, `ObserverToken`, `CandidateAuthority`, generation-bound `MutationAuthority`, and sealed `CurrentMutationGrantAuthority` consumable only from an exact live-`Current` publication, with never-reused identity and checked exhaustion in `src/index_lifecycle/authority.rs`
+- [ ] T025 Implement owning `PhysicalRootLease` plus beneath-confined, handle-relative destructive I/O until T023 is GREEN in `src/index_lifecycle/physical_root.rs`
+- [ ] T026 Implement non-cloneable mutation permits whose grant consumes `CurrentMutationGrantAuthority`, with grant/start/commit/no-side-effect/drop terminal paths until T022 is GREEN in `src/index_lifecycle/mutation.rs`
+- [ ] T027 Implement writer-validated Freeze -> Drain -> Install for reload, rebind, and physical-root replacement in `src/index_lifecycle/transition.rs`
+- [ ] T028 Replace separate-field fence inference at the watcher/store mutation seam with the whole mutation authority in `src/watcher/mod.rs` and `src/live_index/store.rs`
+- [ ] T029 Run the Slice 1 focused tests, record RED-to-GREEN evidence and impact analysis, and complete the post-slice adversarial code review in `docs/reviews/FEATURE-020-SLICE1-EVIDENCE-v11.md`
+
+## Phase 4 — Slice 2: registry tombstones and process-wide capacity
+
+**Goal**: Establish single-flight admission, non-revivable close/reopen, and exact
+process memory ownership before retained-plus-candidate overlap exists.
+
+- [ ] T030 Write and observe RED registry tests for pending admission, concurrent join, protected-membership refusal, late-grant refund, close/reopen coalescing, process shutdown races, and SC-019 authorized protected roots selecting user-local/memory-only placement and reaching `PendingProjectAdmission` with zero state or durability-probe I/O below the source root; Slice 2 does not construct or claim lifecycle `Current` in `tests/project_registry_lifecycle_v11.rs`
+- [ ] T031 Write and observe RED embedded-source tests for one handle/close authority, `SourceAlreadyOpen`, close/Drop coalescing, final-owner shutdown, and `WouldSelfWait` in `tests/embed_lifecycle_v11.rs`
+- [ ] T032 Write and observe RED capacity tests for fixed safety precharge, oldest-satisfiable scheduling, drain barriers, resize cleanup-before-requeue, detached owners, and exact conservation in `tests/process_capacity_pool_v11.rs`
+- [ ] T033 Implement `PendingProjectAdmission`, `LiveProjectSlot`, stopping tombstones, never-reused slot identity, and atomic install/cancel transfer in `src/index_lifecycle/registry.rs`
+- [ ] T034 Implement the shared process runtime, persistent factory-incarnation registry, and stable capacity domain for daemon, stdio, serve, and embed in `src/index_lifecycle/process_runtime.rs`
+- [ ] T035 Implement hierarchical capacity owners, immutable grants, allocation construction guards, charged residency groups, and query-response reservation in `src/index_lifecycle/capacity.rs`
+- [ ] T036 Implement out-of-lock dispatch, revocation/refund, oldest-satisfiable drain barriers, pin-aware parking, replacement headroom, and cleanup-before-requeue resize until T032 is GREEN in `src/index_lifecycle/capacity.rs`
+- [ ] T037 Implement the internal embedded registration, sole-handle ownership, close receipt, and independent finalizer foundation behind production-unreachable constructors until T031 is GREEN in `src/index_lifecycle/embedded.rs`, leaving the V10 public embed lane unchanged
+- [ ] T038 Wire pending admission, fixed revocation-package charging, and SC-019 protected-root state placement with no source-local state/durability probe into dark daemon/stdio/serve adapters in `src/index_lifecycle/adapters.rs` without replacing any V10 production admission path before Slice 4
+- [ ] T039 Prove refusal or cancellation cannot construct `Current`, leak a slot, double-refund, or release live blocking memory in `tests/project_registry_lifecycle_v11.rs` and `tests/process_capacity_pool_v11.rs`
+- [ ] T040 Run the Slice 2 focused and model tests, record accounting/identity evidence, and complete the post-slice adversarial code review in `docs/reviews/FEATURE-020-SLICE2-EVIDENCE-v11.md`
+
+## Phase 5 — Slice 3: behavior-neutral seams, provenance, and dark runtime
+
+**Goal**: Type every response authority and build the preventive runtime behind
+production-unreachable constructors without changing V10 behavior.
+
+- [ ] T041 Write and observe RED claim-attribution and `OperationContractV1` Cartesian-negative tests for `Generation`, `DiskObservation`, `WorktreeScopeObservation`, `GitObservation`, `Comparison`, n-ary `Derivation`, `SelectedAggregate`, `EvaluationProvenance`, every typed refusal basis/retry/status combination, and `KnowledgeVoiceFilter` never selecting consistency; add compile-fail/private-constructor cases proving `OutputCoverage::Truncated` cannot exist before a completed strict lease and cannot enter candidate, attempt, cache, CCR, or persistence identity in `tests/claim_provenance_v11.rs`
+- [ ] T042 Write and observe RED cross-authority tests proving generation mode never reads unmatched disk bytes; `DiskObservation::PathMissing` proves only path-local absence at its observation time, complete `WorktreeScopeObservation` only its sealed scope/interval, and `GitObservation::NotInTree` only the exact object tree; none proves generation/repository-wide absence, rebinds refuse mixed-root derivations, and a failed pure observation returns typed refusal while preserving `Current` unless it independently proves lifecycle invalidation through the observer seam in `tests/read_gate_authority_v11.rs`
+- [ ] T043 Define sealed `OperationReceipt`, `ClaimContext`, provenance, scope-certificate, selection-receipt, typed `SourceRefusal`, and post-lease-only `OutputCoverage` constructors; require a sealed completed-lease render authority to construct `OutputCoverage::Truncated` in `src/protocol/claim_provenance.rs`
+- [ ] T044 Split generation-byte resolution from beneath-confined disk observation and make authority choice explicit in `src/protocol/read_gate.rs`
+- [ ] T045 Migrate raw fallback, untracked search, validation, each diff mode, worktree impact, text/structured formatting, cache, CCR, persistence, and retrieval through typed provenance in `src/protocol/`
+- [ ] T046 Consolidate legacy production reads on one captured published source set without naming any V10 fact product `Current` in `src/live_index/view.rs`
+- [ ] T047 Implement the closed `SourceRuntimeState`, immutable project runtime root, lifecycle supervisor, strict lease constructors, and V11 `EmbeddedSourceHandle` behind a dark-only factory in `src/index_lifecycle/runtime.rs`
+- [ ] T048 Implement the attested V11 replacement items behind production-unreachable seams and generate the exact future export delta in `src/index_lifecycle/public_api.rs`; do not remove, replace, expose, or widen any live V10 `src/lib.rs` export in Slice 3
+- [ ] T049 Run the generated all-cfg inventory plus dependent-crate positive/compile-fail fixtures against the dark API adapter and record the future activation consumer result in `docs/reviews/AAP-MIGRATION-RECEIPT-v11.md` without claiming the V11 exports are live
+- [ ] T050 Generate the failing `tests/activation_cut_v11.rs::all_ingress_uses_exact_typed_authority_branch` reachability test from the frozen `contracts/v10-authority-retirement-v11.md` inventory and prove every V10 writer, callback, publication root, cache/CCR lane, snapshot path, tool, resource, prompt, sidecar/hook query/freshening/finalization lane, and raw embed bypass has an exact Slice 4 owner; the matrix must distinguish `GenerationLeased`, `DiskObserved`, `WorktreeScopeObserved`, `GitObserved`, `RuntimeHealthObserved`, `MutationPermitted`, `StateWriteAuthorized`, and `Refused` without modifying the frozen inventory
+- [ ] T051 Prove all Slice 3 preventive constructors remain unreachable from daemon, stdio, serve, embed, snapshot, observer, and mutation entry points in `tests/preventive_runtime_dark_v11.rs`
+- [ ] T052 Run the Slice 3 provenance round trips, cfg matrix, public-API harness, and unchanged-V10 behavior gates, then complete the post-slice adversarial code review in `docs/reviews/FEATURE-020-SLICE3-EVIDENCE-v11.md`
+
+## Phase 6 — Slice 4: candidate, invalidation, delta, and activation (indivisible)
+
+**Goal**: Enable preventive lifecycle everywhere in one cut. No merge or release may
+ship a refusal-per-edit full-rebuild phase, a legacy fallback, or mixed authority.
+
+- [ ] T053 [P] Write and observe RED candidate tests for isolated build, publish-before-prune, retry supersession, and the closed promotion matrix: `Unreadable`, `UnstableDuringRead`, `AbortedCircuitBreaker`, `ParseStatus::Failed`, unknown ordering, truncated required derivations, and `PartialParse` block promotion; add exact `tests/index_candidate_lifecycle_v11.rs::opaque_non_utf8_path_identity_is_lossless`, proving lossy-display collisions retain distinct stable native identities, remain catalog-only with zero content probes, and never persist a lossy spelling; metadata-terminal exclusions remain complete; capability certificates cannot authorize partial promotion; failed/panicked candidates are discarded
+- [ ] T054 [P] Write and observe RED observer tests for stable-token cuts, gap latching, predecessor drain, post-barrier baseline, ingress unwind retention, and exhausted-capacity safety transitions in `tests/observer_handoff_v11.rs`
+- [ ] T055 [P] Write and observe RED verification tests for scope discovery, entry obligations, same-stamp rewrites, the exact 15-minute monotonic deadline boundary (just-before remains eligible; at/after latches `VerificationOverdueLatched` before strict acquisition), partial/cancelled/resumed work never extending the deadline, overdue acquisition refusal, fair resumable rolling passes, fenced proof refresh, a sealed `VerificationScopeReceipt` that no pass may silently narrow, a `VerificationWorkBound` whose computed seconds never exceed the reachable 712-second default, a `VerificationFeasibilityReceipt` whose lost reservation forces non-Current rather than extending the deadline, and every policy-version mismatch forcing non-Current authoritative re-scout before any new `Current` promotion in `tests/rolling_verification_v11.rs`
+- [ ] T056 [P] Write and observe RED strict-query tests for atomic multi-source capture, empty/missing/extra/mismatched `SelectedAggregate` rejection, exact selected-source bijection, no-match only when every selected source is `Current`, stale finalization, retarget races, post-lease rendering that may add `OutputCoverage::Truncated` only after a complete strict lease without changing source-truth/candidate/cache/CCR identity, SC-019 authorized protected roots reaching `Current` only after full candidate promotion with zero state/durability-probe I/O below the source root, and committed-generation versus bounded-attempt accounting across health, health_compact, status, and health resources in `tests/project_query_lease_v11.rs`
+- [ ] T057 [P] Write and observe RED snapshot tests for untrusted V10 seeds, pre-decode capacity, root/digest mismatch, quarantine, rollback, concurrent V10 writers, `.symforge/v11/` namespace isolation, and runtime secret-canary bytes never entering snapshots, quarantine metadata, receipts, or diagnostics in `tests/snapshot_v11_migration.rs`
+- [ ] T058 [P] Write and observe RED activation tests for one process mode, legacy-gate drain, cache/CCR invalidation, response finalization, raw-embed retirement, and never-simultaneous publication roots; prove cold/restart curation recovery cannot mint a permit and stays read-only until `Current`, exact post-image receipt finalization and excluded team-artifact state writes remain `ProjectStateDir`-only without a permit, the FR-051 `already_tracked`/`untracked_visible`/`ignored_force_add_required`/`git_visibility_unavailable` receipt-and-refusal matrix is exact, and every pre-image retry/probe/cleanup and init/root-ignore/`.gitattributes`/hygiene/curation source write refuses unless a fresh `SourceMutationPermit` already published non-Current in `tests/activation_cut_v11.rs` plus focused `src/cli/init.rs` and persistence tests
+- [ ] T059 Move loader ownership, cancellation, attempt accounting, classified failure, and retry triggers into the per-source supervisor in `src/index_lifecycle/supervisor.rs`
+- [ ] T060 Implement capacity-reserved isolated full and delta candidates with complete artifact certificates and one runtime-store commit point; preserve `CatalogPath` native/opaque identity through scout, candidate, manifest, and promotion without lossy reconstruction; every prepared source delta exact-validates only its changed source token and no-allocation patches the latest whole project root so unrelated newer membership/source siblings survive, while same-source drift retries or aborts and numeric epochs never authorize publication, in `src/index_lifecycle/candidate.rs`
+- [ ] T061 Implement the bounded coalescing accumulator, monotonic invalidation cuts, scope-dirty/gap latches, stable observer handoff, and full successor baseline in `src/index_lifecycle/observer.rs`
+- [ ] T062 Implement racy-clean entry obligations, scope-discovery deadlines, resumable rolling verification, immutable proof refresh, and the exact FR-049 monotonic overdue predicate: only a complete exact-identity whole-scope `VerificationRecord` bound to its sealed `VerificationScopeReceipt` advances the fixed 15-minute deadline, promotion requires a `VerificationFeasibilityReceipt` whose `VerificationWorkBound` is affordable at the reserved service floors, and deadline expiry atomically latches non-Current before any strict lease in `src/index_lifecycle/verification.rs`
+- [ ] T063 Implement project/single-source strict leases, exact multi-project selections, separate ranking snapshots, sealed completed-lease render authority and post-lease `OutputCoverage`, `SourceRefusal` transport mapping, and committed-generation-versus-attempt health projections in `src/index_lifecycle/query.rs`, `src/live_index/health_view.rs`, and `src/protocol/`
+- [ ] T064 Route external watcher observations, targeted and sidecar/hook freshening, temporal, bridge, authority, local-ref, and derived observations directly through the isolated candidate pipeline without a mutation permit; route only SymForge-owned structural edit/curation, init/root-ignore/`.gitattributes`/hygiene source-byte writes through a fresh `SourceMutationPermit` that first publishes non-Current and then returns through the isolated candidate pipeline; keep non-Current recovery read-only until `Current` and keep exact post-image receipt finalization state-only in `src/watcher/mod.rs`, `src/sidecar/`, `src/cli/init.rs`, `src/cli/hook.rs`, `src/protocol/edit.rs`, `src/protocol/edit_hooks.rs`, and `src/live_index/`
+- [ ] T065 Bump the snapshot format and implement bounded untrusted-seed restore, complete re-observation, quarantine, atomic V11 replacement, preserved rollback, rebuild fallback, and excluded team-artifact bytes/metadata as `ProjectStateDir` persistence-only without source mutation authority; implement the exact FR-051 `already_tracked`/`untracked_visible`/`ignored_force_add_required`/`git_visibility_unavailable` receipt-and-refusal matrix, and route only a companion in-scope `.gitattributes` change through T064's permit path in `src/live_index/persist.rs`
+- [ ] T066 Implement `LegacyOpen -> LegacyClosing -> PreventiveV1Open`, register every tool/resource/prompt query, cache/CCR/retrieval, sidecar/hook, and finalization lane, and make mode selection process-wide and non-configurable in `src/index_lifecycle/activation.rs`
+- [ ] T067 In the same activation change, expose only the attested V11 replacement API and `EmbeddedSourceHandle`, then retire every inventoried V10 constructor, writer, callback, secondary publication root, legacy fallback, tool/resource/prompt handler bypass, sidecar/hook bypass, and raw embed update/remove export in `src/daemon.rs`, `src/main.rs`, `src/sidecar/`, `src/cli/hook.rs`, `src/embed.rs`, and `src/lib.rs`
+- [ ] T068 Make `ObservedRefreshGateV1` executable as the registered `benches/observed_refresh_gate_v1.rs::observed_refresh_gate_v1` benchmark with fixed add/modify/delete/rename/terminal-classification and burst workloads; daemon/stdio/serve managed-observer-plus-authoritative-poll and embed-contract trigger matrices; delivered-event, gap/need-rescan, and suppressed-notification campaigns; exact completed-write-burst or SymForge-mutation-commit to the first strict lease carrying that byte identity; corpora digests, host/cache/quiescence controls, completion receipts, pre-granted capacity vector plus scratch/headroom, and clean-rebuild equivalence in `tests/fixtures/observed-refresh-v1/`; emit the code-owned benchmark receipt consumed by release materialization validation
+- [ ] T069 Add retained-plus-candidate peak accounting, burst convergence, capacity fairness, and no-unaccounted-residency measurements in `tests/process_capacity_pool_v11.rs` and `benches/observed_refresh_gate_v1.rs`
+- [ ] T070 Run `ObservedRefreshGateV1` against baseline `1521abb0` and the candidate with p95 <=2 seconds, maximum <=5 seconds, p95 <=1.25x baseline, no single-path full rebuild outside Gap/ScopeDirty, and record exact results in `docs/reviews/OBSERVED-REFRESH-GATE-v1.md`
+- [ ] T071 Prove every advertised edit class has the same canonical manifest, required artifact digests, and representative query results as a clean full rebuild in `tests/delta_full_rebuild_equivalence_v11.rs`
+- [ ] T072 Run the indivisible activation campaign across daemon, stdio, serve, embed, every tool/resource/prompt handler, sidecar/hook query/freshening/finalization, snapshot, observer, mutation, local-ref, derived, cache, CCR, and retrieval through `all_ingress_uses_exact_typed_authority_branch`; include the exact four-state FR-051 team-artifact receipt/refusal matrix, then complete the post-slice adversarial code review in `docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md`
+- [ ] T073 Update the breaking lifecycle/embed migration boundary, removed exports, replacement APIs, and rollback constraints in `docs/migrations/v11-index-lifecycle.md`
+
+## Phase 7 — Slice 5: mechanical removal
+
+**Goal**: Delete only code already proven unreachable in Slice 4; do not change runtime
+authority, public behavior, writer reachability, or activation mode.
+
+- [ ] T074 Capture a pre-cleanup public API, authority-reachability, behavior, and activation baseline in `docs/reviews/FEATURE-020-SLICE5-BASELINE-v11.md`
+- [ ] T075 Remove unreachable placeholder storage, bootstrap/circuit-breaker lifecycle fields, legacy mode branches, secondary publication roots, obsolete tests, and compatibility comments in `src/`
+- [ ] T076 Remove dead V10 embed implementation only after the allowlist negative suite proves it unnameable in `src/embed.rs`
+- [ ] T077 Re-run the T074 baseline, prove Slice 5 changed no runtime authority, public behavior, writer reachability, or activation result, and complete the post-slice adversarial code review in `docs/reviews/FEATURE-020-SLICE5-EVIDENCE-v11.md`
+
+## Phase 8 — Release and adversarial closure
+
+**Goal**: Land only after causal, model, performance, memory, provenance, migration,
+surface, and operational gates all pass on one frozen tree.
+
+- [ ] T078 Run formatting and Clippy with warnings denied and record exact commands/results in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T079 Run focused lifecycle, capacity, watcher, snapshot, provenance, embed, migration, and activation suites in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T080 Add and run four separate pure proptest command models in `tests/model/`, four separate TLA+ specifications for process ownership, registry identity, source promotion/invalidation, and capacity admission in `formal/v11/`, and the shared production transition kernel through its `cfg(loom)` adapter in `src/index_lifecycle/loom_tests.rs`, with adjacent-interface assumptions, bounds, fairness, and traceability recorded
+- [ ] T081 Run the serial all-target suite, release build, canonical full/compact tool, resource, and prompt fixtures, and the SC-006 representative-workflow token comparator with at least 50% median reduction as a hard gate in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T082 Run cold-start race, same-stamp/suppressed-notification, rolling-deadline, observer-handoff, and root-replacement campaigns with working positive controls in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T083 Run measured concurrent-project memory coverage for retired query-pinned generations, retained-plus-candidate overlap, snapshot scratch, and accumulators in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T084 Run the complete provenance/refusal matrix through text, structured, HTTP, cache, CCR, persistence, and retrieval, including `OperationContractV1` Cartesian negatives, exact-bijection `SelectedAggregate` cases, cross-query/filter/consistency cache-confusion negatives, equal-shape nonexistent-versus-unauthorized `InvalidSelection`, `KnowledgeVoiceFilter`-not-consistency proofs, separate `RankingSnapshot` identity/order algebra, post-lease-only `OutputCoverage::Truncated` round trips that cannot alter candidate/cache/CCR identity, and runtime secret-canary plus policy-mismatch campaigns across output, logs, analytics, diagnostics, cache/CCR, snapshots, persistence, retrieval, review, and curation that report only rule IDs and file:line locations in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T085 Run same-process activation and restart campaigns seeded with apparently valid V10 cache records, CCR handles, snapshots, and live legacy writers in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T086 Run the generated V11 public-API allowlist, all-cfg graph cover, dependent-crate fixtures, and unknown-configuration rejection in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T087 Run the secret-safety scan reporting only rule IDs and file:line locations, never values, in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T088 Freeze the exact release commit/tree and all gate digests, obtain an independent adversarial review, and resolve every accepted P0/P1/P2 in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T089 Re-run `execution/refreeze_v11.py` with the trusted external approval record, prove the approved refreeze remains the immutable ancestor of the release tree, and assemble the canonical same-tree T078-T089 execution receipt at `target/ci/lifecycle-v11/release-evidence.json` for `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+- [ ] T090 Run exactly `node scripts/validate-lifecycle-oracle-traceability.cjs --require-materialized --evidence target/ci/lifecycle-v11/release-evidence.json` on the final frozen release tree and record the clear-to-land decision only when every planned Rust case and benchmark is materialized, every requirement row plus T078-T089 is green, and every receipt binds that same tree in `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md`
+
+## V11 dependencies
+
+```text
+T001 -> T002 -> T003/T004
+T005 -> T006
+T003/T004/T006 -> T007 -> T008 -> final manifest regeneration T009 -> T010 -> T011 -> T012
+HARD STOP: T012 -> Slice 0
+Slice 0 (T013-T021) -> Slice 1 (T022-T029) -> Slice 2 (T030-T040)
+Slice 2 -> Slice 3 (T041-T052) -> indivisible Slice 4 (T053-T073)
+Slice 4 -> mechanical Slice 5 (T074-T077) -> release closure (T078-T090)
+```
+
+Parallel work is restricted to tasks marked `[P]`. Shared registry, lifecycle,
+capacity, watcher, persistence, activation, and public-export edits remain serialized.
+Slice 4 is one enablement unit: no subset is independently shippable.
+
+## Independent acceptance by feature story
+
+- **US1 / safety**: one pathological observation blocks only candidate promotion; it never publishes partial, stale, mixed, or false-current state.
+- **US2 / trust**: promoted manifests are total and attempt diagnostics cannot masquerade as committed dispositions.
+- **US3 / bounded retrieval**: success and no-match require an exact all-`Current` selection; otherwise the response is typed refusal.
+- **US4 / convergence**: every edit class converges through bounded deltas under `ObservedRefreshGateV1` without a refusal-per-edit availability cliff.
+- **US5 / recovery**: restart treats legacy/snapshot bytes as untrusted seeds and promotes only after complete current-process proof.
+- **US6 / temporal scope**: Git, generation, disk, and worktree authorities remain explicit and root-compatible across comparisons.
+- **US7 / security**: protected/sensitive selectors and disk observations cannot leak bytes, identities, or generation endorsement.
+- **US8 / first contact**: orientation is available only from complete `Current` sources; a mixed selection refuses with exact evidence.
+- **US9 / authority hygiene**: retrieval voice never selects consistency, and stale documents cannot acquire generation authority.
+
+## V11 implementation strategy
+
+The safety MVP is the refreeze plus Slices 0-2: it closes the proven cross-root and
+single-flight/capacity foundations while leaving production on V10 authority. Slice 3
+adds behavior-neutral typed seams and a dark runtime. Slice 4 is the only activation
+point and must include deltas, verification, capacity, provenance, embed migration,
+public API retirement, and `ObservedRefreshGateV1` together. Slice 5 is deletion only.

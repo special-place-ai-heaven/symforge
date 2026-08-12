@@ -1,0 +1,8 @@
+{
+  "kind": "symforge.lifecycle_release_evidence_requirements.v11",
+  "phase": "pre_activation",
+  "required_oracle_receipts": [],
+  "required_review_documents": [],
+  "required_task_receipts": [],
+  "schema_version": 1
+}

@@ -6,3 +6,4 @@
 tests/fixtures/verify-tools/** text eol=lf
 tests/fixtures/verify-tools-real/** text eol=lf
 execution/*.sh text eol=lf
+src/**/*.rs text eol=lf

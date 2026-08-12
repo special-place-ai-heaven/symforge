@@ -1,12 +1,14 @@
 # Implementation Plan: Repository Knowledge Index
 
-**Branch**: `feat/repository-knowledge-index`
+**Branch**: `design/project-activation-prevention`
 **Spec**: [spec.md](./spec.md)
-**Status**: Frozen — implementation authorized by scoped adversarial verification
+**Status**: V11 refreeze in progress — implementation is not authorized until the
+manifest, attestation, external approval, and public-API contract gates pass
 
 ## Summary
 
-Build the feature in four ordered layers:
+Refreeze the Feature 020 knowledge work onto the cleared V11 source-lifecycle
+architecture, then build it in four product layers:
 
 1. Make repository discovery and publication total, bounded, deterministic, live,
    and recovery-safe through one metadata-first manifest.
@@ -18,9 +20,11 @@ Build the feature in four ordered layers:
    bounded remediation review, and persist approved lifecycle voice in one
    hash-bound repo policy ledger.
 
-Do not start knowledge-tool/bridge/authority implementation while bulk, watcher,
-reconciliation, snapshot verification, and publication disagree on file scope or
-generation. Physical file movement/deletion is not part of this feature.
+Do not start production lifecycle or knowledge implementation until every Feature
+020 artifact is classified and the externally anchored refreeze approval binds the
+exact commit/tree. Bulk, watcher, reconciliation, snapshot verification, embed, and
+publication must share one lifecycle authority before knowledge-tool/bridge/authority
+activation. Physical file movement/deletion is not part of this feature.
 
 ## Technical context
 
@@ -29,12 +33,25 @@ generation. Physical file movement/deletion is not part of this feature.
 user-local `StatePlacement` when writable and are optional in memory-only mode
 **Search**: existing trigram candidate index, Aho-Corasick/regex line matching,
 exact line renderer, Markdown section spans
-**Concurrency**: Rayon for off-lock build, bounded in-flight bytes, `ArcSwap` for
-published immutable generation
+**Concurrency**: Rayon for off-lock build, bounded in-flight bytes, and one
+`ArcSwap<ProjectRuntimePublication>` as the sole immutable publication root; numeric
+epochs are diagnostic and never authorize a read, mutation, or commit
 **Git**: existing `git2`, bounded temporal evidence, worktree/project routing
-**Tests**: colocated Rust unit tests plus focused integration fixtures
+**V11 lifecycle topology**: `src/index_lifecycle/` owns whole-authority tokens,
+physical-root leases, mutation permits, registry/process ownership, capacity,
+embedded handles, closed runtime state, candidate/supervisor/observer/verification,
+query acquisition, activation, and the planned public API adapter
+**Tests and proof**: colocated Rust unit tests plus focused integration fixtures,
+production-kernel Loom interleavings, four pure proptest command models, four TLA+
+models under `formal/v11/`, and `ObservedRefreshGateV1` correctness/performance
+fixtures under `benches/` and `tests/fixtures/`
 
-## Constitution check
+## Project-principles check
+
+`.specify/memory/constitution.md` is still an unratified template and therefore
+supplies no project-specific normative clauses. This table checks the repository
+principles in `AGENTS.md`; no template placeholder is treated as constitutional
+authority. Ratifying a Spec Kit constitution is separate governance work.
 
 | Principle | Plan response |
 |---|---|
@@ -44,8 +61,8 @@ published immutable generation
 | Local-first | No remote service, DB, new knowledge-specific sidecar, or fetch; source roots need not be writable. |
 | Byte exactness | Stable reads preserve raw bytes/hash/line endings. |
 | Recovery | Versioned manifest snapshot, quarantine, source rebuild. |
-| Idempotency | Equal Complete manifests produce no mutation; Degraded retries. |
-| Failure isolation | Terminal per-file states; previous generation retained. |
+| Idempotency | Equal complete, exactly fenced candidates produce no mutation; failed attempts never mint a manifest. |
+| Failure isolation | Failed candidates are discarded; any retained generation is immutable, internal, and non-current. |
 | Bounded work | Independent entry/catalog-metadata/read/probe/in-flight/derived/source/output limits. |
 | Simplicity | Reuse current index/search; no embeddings/FTS/vector store. |
 
@@ -110,12 +127,15 @@ scout_repository (metadata only first)
                     +-- temporal/authority evidence     |
                     +-- repo policy voice               |
                                                         v
-                              staged LiveIndex + manifest + derived views
+                              isolated candidate + manifest + strict certificates
                                                         |
                               validate accounting/generation/coverage
                                                         |
                                                         v
-                                   ArcSwap<PublishedSourceSet> (one store)
+                    registry-owned ArcSwap<ProjectRuntimePublication> (one root store)
+                                  ProjectRuntimeState::Live
+                                  SourceRuntimeState::Current
+                                  -> Arc<VerifiedGeneration>
 ```
 
 Process-global `ControlStateDir` selection is a separate private user-local lane;
@@ -123,41 +143,45 @@ it is neither source binding nor `ProjectStateDir`, and it has no launch-CWD/sou
 derived fallback. A protected membership exists only for the session whose direct
 override request succeeded and is dormant across other sessions and restarts.
 
-### Publication rule
+### V11 publication rule
 
-All I/O, hashing, parsing, reconciliation diffing, outline/health/search-index
-construction, bridge resolution, and authority derivation happen before
-publication. One immutable source-set bundle is swapped once. Incremental file
-events batch all lane changes for a path into one clone/update/swap. Short updates
-serialize under one publication writer lock per `ProjectInstance`; that lock and the
-`ArcSwap<PublishedSourceSet>` swap are the single commit boundary for every P0/P1
-lane. A commit copies the current bounded source map while holding that lock, replaces
-only its own source entry, and swaps once—never committing a map copied off-lock.
-Long scout/reconciliation builds may prepare off-lock, but their rebase/retry/abort
-fence is scoped to the source bundle they replace. A concurrent swap for another
-source does not invalidate the prepared commit. A P1 add/update/remove advances
-`registry_generation` and its own source bundle only; it never advances or blocks the
-current worktree's publication/content/project generations. Check-then-swap without
-serialization is forbidden.
+All I/O contributing to `Generation` authority or candidate artifacts, including
+authoritative source observation, hashing, parsing, discovery, proof refresh,
+reconciliation, outline/search, bridge, temporal, and authority derivation, happens
+in a capacity-reserved isolated candidate. Typed pure `DiskObservation`,
+`WorktreeScopeObservation`, and `GitObservation` adapters run under their own
+observation leases/`ClaimContext` outside candidates and cannot mint generation
+authority. Excluded `ProjectStateDir` persistence, exact post-image receipt
+finalization, control-plane health capture, and post-lease response rendering are
+not candidate artifacts and cannot mint source authority. The candidate is unreachable from queries, caches,
+checkpoints, and legacy embed paths. Promotion requires one sealed completeness
+certificate covering the manifest and every advertised strict artifact.
 
-Every consumer captures one `PublishedSourceSet` per selected `ProjectInstance` and
-then each selected immutable source generation at call start. `get_repo_map`, context
-tools, review, and formatters may not independently reload outline/live/authority
-state. Derived role/bridge/authority budgets have their own
-coverage status and cannot turn a complete manifest into false complete insight.
-Existing asynchronously swapped Git temporal/hotspot state moves into the bundle.
-Each job marker captures the live content generation and exact source-version tip;
-completion publishes a derived-only generation only when its analyzed target matches
-both that marker and the current live target. The new bundle carries that accepted tip
-consistently while content generation and manifest/content digests remain unchanged.
+The registry alone owns the immutable `Arc<ProjectRuntimePublication>` root; its
+closed payload is `ProjectRuntimeState`. Source lifecycle code supplies a sealed
+source transition intent; the registry patches that source into the latest whole
+project root under the publication writer and performs one non-fallible store.
+Untouched membership and source siblings are preserved. Binding,
+physical-root, observer, mutation, candidate, and exact source-publication identities
+are validated as one authority; check-then-swap or separately sampled generations
+are forbidden.
 
-A failed observation never leaves the old bundle falsely Current. Publish one new
-degraded wrapper atomically: reuse the last-valid immutable content/manifest,
-advance publication generation only, preserve content generation, and attach safe
-freshness reasons. Snapshot candidates remain Verifying and unqueryable until
-validated. Freshness is never read from a side channel outside the captured bundle.
+Every generation-backed public consumer obtains a strict
+`ProjectQueryLease`/`QueryLease` from that single runtime root. A successful lease
+exists only for `Current(VerifiedGeneration)` and pins one immutable generation plus
+its exact scope/provenance evidence. Health instead uses the lifecycle-owned composite
+`capture_source_view` seam and remains available while a source is non-Current. Pure
+`DiskObservation`, complete `WorktreeScopeObservation`, and immutable
+`GitObservation` operations use their own authority leases; a mixed derivation uses
+one identity-compatible `ClaimContext` and requires a Current generation lease only
+when generation structure is an input. A failed generation- or candidate-critical
+observation publishes `Loading`, `Refreshing`, or `Blocked`; a failed pure
+observation returns typed `SourceRefusal` and preserves lifecycle state unless it
+independently proves lifecycle invalidation through the observer seam. Any retained
+generation remains byte-identical and internal. Snapshot seeds remain untrusted
+candidates. There is no public degraded wrapper or derived-only mutation of Current.
 
-### Read rule
+### V11 read and capacity rule
 
 Metadata may terminate admission. Only undecided, under-ceiling candidates receive
 a bounded probe. Only admitted candidates receive a full read. Full-read bytes
@@ -166,13 +190,66 @@ when ownership transfers into the staged `LiveIndex`; the independent admitted-
 content ceiling then governs staged/resident bytes. This release point permits an
 in-flight budget smaller than the admitted ceiling without deadlock.
 
+All allocation-producing interfaces reserve from one process capacity domain before
+allocation and retain exact charges through final physical drop. Active, candidate,
+retired/query-pinned generations, observer/journal state, snapshot stages, parser and
+blocking work, runtime publication nodes, output materialization, and child partitions
+are all included. Capacity refusal leaves the runtime non-current and cannot construct
+a placeholder project/source.
+
 Catalog entry and canonical descriptor bytes are budgeted before a complete
 manifest can exist. Entry/metadata exhaustion aborts the candidate observation; it
 does not publish a truncated `RepositoryManifest`. Oversized path spellings fall
 back to an opaque catalog ID and metadata-only disposition where one entry still
 fits; issue strings/counts are independently bounded.
 
-## Phase 0 — Freeze regression oracles
+## V11 prerequisite and implementation sequence
+
+The checked-in `REFREEZE-MANIFEST-v11.md` classifies every Feature 020 artifact plus
+bound `CONTEXT.md`, maps `F020-V11-A01` through `A19` to exact replaced/replacement
+clauses and regressions, and excludes only its own recursive digest. The detached
+attestation pins the manifest, cleared lifecycle design, context, canonical public
+API, and amendment-set digest. A signed append-only `RefreezeApprovalRecordV11`
+stored outside this repository must bind the exact target commit/tree and trusted
+release identity. Internal validation cannot substitute for that trust anchor.
+
+The canonical `contracts/public-api-v11.json` is a closed allowlist over every
+supported target/cfg/feature cell and the complete externally reachable Rust public
+item/impl graph. It also defines the v10 keep/replace/remove mapping. No slice may
+invent or widen an external Interface after approval.
+
+1. **Slice 0 — causal RED oracles.** Check in current positive controls for the
+   generation-before-root race, duplicate first load, placeholder/capacity admission,
+   same-stamp staleness, raw-disk generation attribution, and raw embed bypass. Map
+   every later acceptance oracle to its production seam, slice, exact command,
+   fairness bound, and CI artifact; do not claim unimplementable future oracles ran.
+2. **Slice 1 — atomic mutation authority.** Add whole binding/root/observer/candidate/
+   mutation authority, pinned beneath-confined root I/O, non-cloneable permits, and
+   Freeze -> Drain -> Install. Remove `effective_fence_generation` inference.
+3. **Slice 2 — registry tombstone and capacity foundation.** Add pending singleflight
+   admission, project/source revocation packages, stable process runtime/capacity
+   domain, exact grant-to-charge ownership, blocking/query/snapshot envelopes,
+   hierarchical tombstones, fair admission, and cleanup-before-resize.
+4. **Slice 3 — behavior-neutral seams, provenance, and dark runtime.** Consolidate
+   current reads without relabeling them Current; type generation, disk,
+   worktree-scope, and Git evidence; preserve operation/selection/evaluation receipts;
+   build closed runtime/query/embed Interfaces behind unreachable constructors; and
+   generate the attested external API harness. Production authority remains V10.
+5. **Slice 4 — indivisible candidate/delta activation.** Install lifecycle-owned
+   loading, isolated full/delta candidates, observer accumulator/handoff, pre-write
+   invalidation, proof obligations/deadlines, snapshot-as-seed, strict leases, claim
+   composition, and one process-wide `PreventiveV1` cut across every entry path. The
+   same cut retires all legacy writers/exports and must pass `ObservedRefreshGateV1`,
+   capacity, equivalence, activation, and external approval gates. No full-rebuild-
+   per-edit refusal intermediate ships.
+6. **Slice 5 — mechanical cleanup only.** Delete already-unreachable placeholder,
+   circuit-breaker lifecycle, legacy mode, secondary publication, and raw embed code.
+   This slice cannot retire authority or change behavior.
+
+## Historical V10 Phase 0 — superseded execution record
+
+The V10 phases below remain implementation evidence. Where they conflict with the
+V11 publication/readiness rules or sequence above, they are non-authoritative.
 
 Write and run the red tests before production edits:
 
@@ -212,7 +289,7 @@ Write and run the red tests before production edits:
 - read mutation refusal;
 - in-flight hand-off cannot deadlock a corpus larger than the in-flight budget;
 - catalog-only delete/missed create reconciliation;
-- degraded coverage retries to convergence;
+- incomplete observation remains non-current and retries to convergence;
 - reconciliation racing a watcher event cannot lose either update;
 - snapshot manifest parity;
 - stale verifier retarget fence;
@@ -228,7 +305,7 @@ Write and run the red tests before production edits:
 Stop if any proposed “red” test already passes for the intended reason; revise the
 oracle rather than adding redundant code.
 
-## Phase 1 — Metadata-first manifest
+## Historical V10 Phase 1 — Metadata-first manifest
 
 ### Changes
 
@@ -296,9 +373,9 @@ oracle rather than adding redundant code.
 - Keep catalog entry count and canonical catalog-metadata bytes independent from
   admitted, in-flight, and derived-state bytes. Refuse an incomplete candidate
   observation before a `RepositoryManifest` exists when either catalog bound is
-  exhausted. Publish no partial manifest: retain an existing last-valid generation
-  only behind degraded freshness, or remain cold/non-Ready with a typed capacity
-  reason and zero queryable partial generation.
+  exhausted. Publish no partial manifest: discard the candidate, keep any retained
+  verified generation internal/non-current, and return a typed capacity refusal with
+  zero queryable partial generation.
 - Sort safe paths by normalized case-insensitive key plus exact UTF-8 bytes and
   opaque paths by public ID; retain case-fold collisions as distinct entries and
   isolate only platform-unsafe paths.
@@ -306,7 +383,7 @@ oracle rather than adding redundant code.
   opaque ID without lossy conversion and keep it outside content targets.
 - Bound every persisted path/issue descriptor; use an opaque ID plus typed
   `PathMetadataTooLarge` disposition rather than retaining an oversized spelling.
-- Convert walker errors into bounded issues and degraded coverage.
+- Convert walker errors into bounded attempt issues that prevent promotion.
 - Include repository-owned hidden instruction/documentation trees while hard-
   excluding `.git/` and `.symforge/`; expose ignore-pruned coverage as policy.
 - Return an immutable manifest plan; do not store content in it.
@@ -318,7 +395,7 @@ idempotent live-postcondition replay, ignore/artifact hygiene, capability receip
 and scout/admission focused tests pass; the existing normal over-byte-cap test still
 refuses admitted content.
 
-## Phase 2 — Stable bounded content execution
+## Historical V10 Phase 2 — Stable bounded content execution
 
 ### Changes
 
@@ -333,7 +410,8 @@ refuses admitted content.
 - Hold in-flight permits through read/verify/parse/hand-off, then release after
   bytes transfer into staged-index accounting.
 - Replace outcome `filter_map` loss with terminal dispositions.
-- Mark all post-break paths `AbortedCircuitBreaker`.
+- Mark all post-break paths `AbortedCircuitBreaker` in attempt accounting, cancel the
+  remaining work, and discard the candidate without minting a manifest.
 - Map an individual read request larger than the global in-flight budget to terminal
   `HardSkip(PerFileCeiling)` before allocation.
 
@@ -342,7 +420,7 @@ refuses admitted content.
 Stable-read and terminal-accounting tests pass under normal, read-error,
 mutation, and circuit-breaker fixtures.
 
-## Phase 3 — Watcher and reconciliation convergence
+## Historical V10 Phase 3 — Watcher and reconciliation convergence
 
 ### Changes
 
@@ -356,21 +434,21 @@ mutation, and circuit-breaker fixtures.
 - Make removal clear every state for a path.
 - Replace Tier-1-only reconciliation with fresh manifest diff.
 - Treat rename as delete+add unless identity evidence is conclusive.
-- Trigger full reconciliation on overflow/`need_rescan`, watcher fresh instance,
-  generation/policy/topology changes, and any Degraded coverage result.
-- Retry degraded reconciliation with bounded backoff; equal entry digest is a
-  no-op only when both observations are Complete.
-- Treat every `Unreadable`/`UnstableDuringRead` entry as Degraded and keep a bounded
-  re-observation trigger; persistent failure stays explicit instead of becoming an
-  equal-digest no-op.
+- Trigger authoritative reconciliation on overflow/`need_rescan`, watcher fresh
+  instance, generation/policy/topology changes, and any incomplete observation.
+- Publish non-current work state and retry with lifecycle-owned bounded backoff;
+  equal entry digest is a no-op only for a complete, exactly fenced proof.
+- Treat every `Unreadable`/`UnstableDuringRead` observation as promotion-blocking
+  attempt evidence and keep an independent re-observation trigger; persistent failure
+  remains an explicit refusal rather than becoming an equal-digest no-op.
 
 ### Exit gate
 
 Missed create/delete/rename, catalog-only shrink/delete, event storm, overflow,
-transient degraded recovery, and stale-generation tests pass; equal complete
+transient non-current recovery, and stale-generation tests pass; equal complete
 manifest reconciliation is a no-op.
 
-## Phase 4 — Snapshot and atomic generation
+## Historical V10 Phase 4 — Snapshot and atomic generation
 
 ### Changes
 
@@ -408,9 +486,11 @@ manifest reconciliation is a no-op.
   and envelope while content generation and manifest/content digests stay unchanged.
   Gates G/H attach their derived rebuilds to the same publication path later. Rejected
   stale work re-captures one bounded pending-latest recomputation target.
-- Represent observation freshness inside each source bundle with separate
-  publication/content generations; failed observations atomically publish degraded
-  last-valid wrappers rather than leaving stale content marked Current.
+- Represent source truth and work in one closed runtime state. Failed generation- or
+  candidate-critical source observations atomically publish non-current work/refusal
+  state while any retained verified generation remains immutable and unreachable
+  through strict acquisition. A failed pure observation returns typed refusal without
+  changing lifecycle state unless it independently proves observer-seam invalidation.
 - Compute the canonical manifest digest once per debounced published batch and
   cache it; never recompute it per query or per raw watcher event.
 - Construct reload replacement directly from `ReloadData`; avoid cloning the old
@@ -421,7 +501,7 @@ manifest reconciliation is a no-op.
 Snapshot/source logical parity, corrupt quarantine, crash-before-publish, stale
 verifier, and concurrent mixed-generation tests pass.
 
-## Phase 5 — Activate knowledge targeting
+## Historical V10 Phase 5 — Activate knowledge targeting
 
 ### Changes
 
@@ -451,7 +531,7 @@ verifier, and concurrent mixed-generation tests pass.
 README/unknown prose/config/Rust fixtures show exact target partitioning; prose
 never leaks into code symbol/text results.
 
-## Phase 6 — Evidence bridge core
+## Historical V10 Phase 6 — Evidence bridge core
 
 ### Changes
 
@@ -477,7 +557,7 @@ missing, cross-source, secret-positive, removal, rename, derived-budget, and
 concurrent-publication tests report exact uncertainty with no code-scope/frecency
 contamination.
 
-## Phase 7 — Authority and policy foundations
+## Historical V10 Phase 7 — Authority and policy foundations
 
 ### Changes
 
@@ -509,7 +589,7 @@ Axis/type, mixed-unit, declared-intent, exact divergence, temporal provenance,
 policy hash/version/conflict, budget, and default-voice tests pass before the search
 schema is advertised.
 
-## Phase 8 — `search_knowledge` and routing
+## Historical V10 Phase 8 — `search_knowledge` and routing
 
 ### Changes
 
@@ -540,7 +620,7 @@ Tool schema (including existing `project`/`projects` selectors), formatter,
 routing, no-match, security, output budget, cross-project, and deterministic
 ranking tests pass.
 
-## Phase 9 — Repository mental model and read-only review
+## Historical V10 Phase 9 — Repository mental model and read-only review
 
 ### Changes
 
@@ -565,7 +645,7 @@ future-intent, ADR divergence, explicit supersession, exact duplicate, stale pol
 metadata conflict, age-only, shallow-history, review-hash, and no-mutation fixtures
 pass with deterministic voice and exact evidence.
 
-## Phase 10 — Guarded logical curation
+## Historical V10 Phase 10 — Guarded logical curation
 
 ### Changes
 
@@ -596,7 +676,7 @@ Preview/no-write, stale-guard, concurrent-curator, idempotent replay, crash-afte
 intent/temp-sync/file-sync/replace/completion, unsupported-durability, wrong-source,
 and no-file-delete fixtures pass with exact pre/post recovery and zero partial policy.
 
-## Phase 11 — Worktrees and local refs
+## Historical V10 Phase 11 — Worktrees and local refs
 
 ### Changes
 
@@ -611,21 +691,21 @@ and no-file-delete fixtures pass with exact pre/post recovery and zero partial p
 - Resolve bridge/authority evidence only within each source. A ref's policy ledger
   comes from that ref tree; current-worktree curation never writes another source.
 - Reconcile ref/worktree topology and movement.
-- Publish one bounded immutable `PublishedSourceSet` per `ProjectInstance` for its
-  current worktree plus local refs. The existing cross-project dispatcher snapshots
-  linked-worktree handles and captures each selected set once; responses return
-  per-source generation/digest/coverage plus worst overall coverage.
+- Publish each source through the registry-owned closed runtime root. A multi-source
+  read acquires a sealed selection receipt and exact Current generation for every
+  selected source; any unavailable member returns the per-source refusal set rather
+  than a mixed-freshness success envelope.
 - Keep local refs as an independently bounded P1 lane. Its failure or memory cap
   cannot block current-worktree readiness, and advertised `source_scope` values
   expand only with the gate that implements them.
 
 ### Exit gate
 
-Current-worktree precedence, divergent variants, identical-blob dedupe, mixed-
-freshness per-source envelopes, ref movement, giant blob, bounded mapping memory,
+Current-worktree precedence, divergent variants, identical-blob dedupe, strict
+multi-source refusal evidence, ref movement, giant blob, bounded mapping memory,
 and no-network/LFS tests pass.
 
-## Phase 12 — Health, corpus, and release gates
+## Historical V10 Phase 12 — Health, corpus, and release gates
 
 - Add manifest/resource/derived-coverage/disposition/retry/reconciliation/authority-
   hygiene fields to health.
@@ -653,10 +733,12 @@ and no-network/LFS tests pass.
 | Knowledge extraction | `src/parsing/mod.rs`, `src/parsing/config_extractors/markdown.rs` |
 | Mental model/bridge/authority | `src/live_index/query.rs`, `src/live_index/graph.rs`, `src/live_index/git_temporal.rs`, one narrow knowledge-derived module |
 | Lifecycle policy | one versioned `.symforge-knowledge.toml` parser/writer plus existing idempotency/edit-safety seams |
+| Preventive lifecycle | `src/index_lifecycle/{authority,physical_root,mutation,registry,process_runtime,capacity,embedded,runtime,supervisor,candidate,observer,verification,query,activation,public_api}.rs` |
 | Watch/reconcile | `src/watcher/mod.rs` |
 | Snapshot/verification | `src/live_index/persist.rs` |
 | Worktree/ref sources | `src/worktree/`, `src/git.rs`, daemon project ownership |
 | MCP/tool UX | `src/protocol/search_tools.rs`, `src/protocol/tools.rs`, `src/protocol/mod.rs`, `src/protocol/smart_query.rs`, `src/daemon.rs` |
+| Proof/performance | `src/index_lifecycle/loom_tests.rs`, `tests/model/`, `formal/v11/`, `benches/observed_refresh_gate_v1.rs`, `tests/fixtures/observed-refresh-v1/` |
 | Surface/catalog docs | `src/cli/init.rs`, README/AGENTS/tool catalog |
 
 ## Complexity budget
@@ -667,11 +749,15 @@ Allowed new concepts:
 2. metadata-only repository manifest;
 3. overlapping index targets;
 4. terminal file disposition;
-5. one atomic published source set with immutable per-source generations;
-6. one knowledge-search tool;
-7. one compact derived bridge/authority view;
-8. one repo-owned lifecycle policy ledger;
-9. one read-only review tool and one ledger-only curation tool so MCP mutation
+5. one registry-owned immutable project-runtime root with closed per-source states;
+6. one source-lifecycle module owning whole-authority tokens, isolated candidates,
+   observer/verification state, physical-root leases, and mutation permits;
+7. one process runtime and process-wide capacity domain;
+8. one sealed claim/provenance/refusal algebra at every public read seam;
+9. one knowledge-search tool;
+10. one compact derived bridge/authority view;
+11. one repo-owned lifecycle policy ledger;
+12. one read-only review tool and one ledger-only curation tool so MCP mutation
    annotations and user approval remain unambiguous.
 
 Anything else requires a demonstrated missing behavior. In particular, no new
