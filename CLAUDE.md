@@ -12,9 +12,18 @@
 `server`, `cli`, …) is absent. A `#[cfg(test)]` item whose only consumer lives behind
 `server` is therefore an unused import there, and `-D warnings` fails the build — while
 every default-feature gate above passes. Run that exact command before pushing
-anything that adds a `#[cfg(test)]` helper, and gate such helpers on
-`#[cfg(all(test, feature = "server"))]` when their consumer is server-only. Found the
-slow way on 2026-08-12: green locally and on the `rust` job, red on `embed-build`.
+anything that adds a `#[cfg(test)]` helper. Found the slow way on 2026-08-12: green
+locally and on the `rust` job, red on `embed-build`.
+
+When such a helper's consumer is server-only, gate it as two stacked attributes —
+`#[cfg(test)]` then `#[cfg(feature = "server")]` — **not** as
+`#[cfg(all(test, feature = "server"))]`. The two are identical to rustc but not to the
+Feature 020 retirement census: its stripper (`normalizeRetirementClosureSource` in
+`scripts/validate-lifecycle-oracle-traceability.cjs`) recognises a literal
+`#[cfg(test)]` and would read the `all` form as production code, failing
+`RETIREMENT_CLOSURE_MISMATCH`. Leading with `#[cfg(test)]` keeps the item test-only for
+both. That stripper limitation is a known gap, recorded for the next refreeze
+amendment; until then the stacked form is the supported spelling.
 
 ### Windows build cache (disk)
 

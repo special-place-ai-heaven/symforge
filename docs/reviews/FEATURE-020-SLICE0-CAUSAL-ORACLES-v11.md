@@ -349,6 +349,30 @@ problem: a `planned_exact` case cannot simultaneously be present, RED, and green
 CI. It is left for the T021 adversarial review to rule on, since unlike the first it
 does not block any Slice 0 work.
 
+### Known gap in the amended stripper
+
+`normalizeRetirementClosureSource` recognises a literal `#[cfg(test)]` attribute. It
+does **not** recognise `#[cfg(all(test, feature = "…"))]`, which is equivalent to
+rustc and is the natural spelling when a test-only helper's consumer sits behind a
+feature gate — so the census reads such an item as production code and fails.
+
+Found immediately: the T014 hook's re-export has to be server-gated (its consumer is
+`src/watcher/mod.rs::tests`, and `watcher` is `#[cfg(feature = "server")]`, so under
+`--no-default-features --features embed` the bare `#[cfg(test)]` form is an unused
+import that `-D warnings` rejects). Writing that as `cfg(all(test, feature =
+"server"))` moved the `publication_roots` digest.
+
+The workaround is exact and costs nothing: two stacked attributes, `#[cfg(test)]`
+first, then `#[cfg(feature = "…")]`. The cut runs from the first attribute to the
+item's terminator, so the second is absorbed with it. `CLAUDE.md` records this as the
+supported spelling.
+
+The proper fix is for the stripper to evaluate test-only cfg predicates — `test`, and
+`all(...)` with `test` as a conjunct, while correctly *rejecting* `any(test, …)` and
+`not(test)`, which are not test-only. That needs another refreeze amendment and
+signature, so it is deferred rather than done here; it blocks nothing while the
+stacked spelling is used.
+
 Nothing was faked, weakened into a vacuous pass, or silently dropped.
 
 ## Scope note
