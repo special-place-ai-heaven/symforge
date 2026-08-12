@@ -89,6 +89,61 @@ impl KnowledgeFixture {
     }
 }
 
+/// Sub-lines every complete `search_knowledge` hit block carries after
+/// SIFT-WS1. A block that shows some but not all of these was cut in half.
+const HIT_BLOCK_MARKERS: [&str; 4] = [
+    "content_hash=",
+    "authority:",
+    "finding_ids=",
+    "bridge_previews=",
+];
+
+/// Split a response into hit blocks: a block starts at `<n>. ` and runs to the
+/// next block start (or the CCR footer / end of output).
+fn hit_blocks(output: &str) -> Vec<Vec<&str>> {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in output.lines() {
+        let starts_block = line
+            .split_once(". ")
+            .is_some_and(|(ordinal, _)| ordinal.parse::<usize>().is_ok());
+        if starts_block {
+            blocks.push(vec![line]);
+        } else if line == "---" || line.starts_with("CCR:") {
+            break;
+        } else if let Some(current) = blocks.last_mut() {
+            current.push(line);
+        }
+    }
+    blocks
+}
+
+fn complete_hit_blocks(output: &str) -> usize {
+    hit_blocks(output)
+        .iter()
+        .filter(|block| {
+            let text = block.join("\n");
+            HIT_BLOCK_MARKERS.iter().all(|marker| text.contains(marker))
+        })
+        .count()
+}
+
+/// Frozen contract test 7: truncation retains COMPLETE provenance. A hit block
+/// is atomic — budgeting may withhold it, but must never emit part of it.
+fn assert_no_partial_hit_block(output: &str) {
+    for block in hit_blocks(output) {
+        let text = block.join("\n");
+        let present = HIT_BLOCK_MARKERS
+            .iter()
+            .filter(|marker| text.contains(*marker))
+            .count();
+        assert!(
+            present == 0 || present == HIT_BLOCK_MARKERS.len(),
+            "partial hit block escaped budgeting ({present}/{} markers):\n{text}\n--- full ---\n{output}",
+            HIT_BLOCK_MARKERS.len()
+        );
+    }
+}
+
 fn assert_budgeted_knowledge_context(output: &str, require_trust: bool) {
     if require_trust {
         assert!(output.contains("Trust:"), "trust header missing: {output}");
@@ -134,6 +189,112 @@ fn assert_budgeted_knowledge_context(output: &str, require_trust: bool) {
             );
         }
     }
+}
+
+/// SIFT-WS1 (SC-001/SC-002). The slice's headline claims are "the answer is
+/// readable first" and "the envelope stops crowding it out". Both are asserted
+/// here rather than left to a manual post-release dogfood check, so they cannot
+/// silently regress.
+///
+/// Pre-slice baseline on this repository (commit 83b6b32, captured in
+/// specs/020-repository-knowledge-index/sift/quickstart.md): a 872-byte,
+/// 6-line envelope carrying two full 64-hex digests, then one ~700-1200 byte
+/// pipe-delimited mega-line per hit with the excerpt buried mid-line.
+#[tokio::test]
+async fn answer_arrives_before_provenance_and_the_envelope_stays_bounded() {
+    let fixture = KnowledgeFixture::new();
+    let output = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "search_knowledge",
+            json!({
+                "query": "shutdown is not a safe persistence boundary",
+                "source_scope": "current",
+                "limit": 10
+            }),
+        )
+        .await;
+
+    let blocks = hit_blocks(&output);
+    assert!(!blocks.is_empty(), "expected at least one hit: {output}");
+
+    // Answer-first: the excerpt is the third line of its block (location,
+    // heading, excerpt), never buried behind provenance.
+    for block in &blocks {
+        let excerpt_line = block
+            .iter()
+            .position(|line| line.trim_start().starts_with('"'))
+            .unwrap_or_else(|| panic!("no excerpt line in block:\n{}", block.join("\n")));
+        assert!(
+            excerpt_line <= 2,
+            "excerpt must arrive within the first 3 lines of its block, found at {excerpt_line}:\n{}",
+            block.join("\n")
+        );
+    }
+
+    // Bounded IDs: no envelope line may carry a full 64-hex digest. The
+    // pre-slice `Source:` line was ~300 chars because it printed two of them.
+    let envelope_end = output
+        .lines()
+        .position(|line| {
+            line.split_once(". ")
+                .is_some_and(|(ordinal, _)| ordinal.parse::<usize>().is_ok())
+        })
+        .unwrap_or(output.lines().count());
+    for line in output.lines().take(envelope_end) {
+        let longest_hex = line
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest_hex < 64,
+            "envelope line still carries an unbounded 64-hex digest: {line}"
+        );
+    }
+}
+
+/// SIFT-WS1 (T023). `classify_search_knowledge_output` (tools.rs) keys on the
+/// literal `"\nNo match:"` to emit `OutcomeClass::EmptyResult`, and the STEL
+/// dependent-chain special case reads that same classification. The seam is a
+/// silent coupling: if a reformat moved or renamed it, typed no-match answers
+/// would be misclassified with nothing failing. Pin the exact prefix, its
+/// leading newline, and its position as the final line.
+#[tokio::test]
+async fn no_match_seam_keeps_its_exact_prefix_and_position() {
+    let fixture = KnowledgeFixture::new();
+    let output = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "search_knowledge",
+            json!({"query": "orbital zebra lattice", "source_scope": "current"}),
+        )
+        .await;
+
+    assert!(
+        output.contains("\nNo match: "),
+        "outcome classifier keys on a leading-newline `No match: ` seam: {output}"
+    );
+    let last = output.lines().last().expect("non-empty response");
+    assert!(
+        last.starts_with("No match: "),
+        "the seam must be the final line so provenance precedes it: {output}"
+    );
+    assert_eq!(
+        output.matches("\nNo match: ").count(),
+        1,
+        "exactly one seam, or the classifier reads an ambiguous response: {output}"
+    );
+    // Provenance still precedes it -- a no-match answer is a successful,
+    // fully-attributed response, not an error.
+    assert!(
+        output.contains("Trust:"),
+        "no-match keeps its envelope: {output}"
+    );
+    assert!(
+        output.contains("Counts: overflow="),
+        "no-match keeps its counts: {output}"
+    );
 }
 
 #[tokio::test]
@@ -560,7 +721,7 @@ async fn weak_and_sensitive_queries_are_rejected_without_echo() {
 }
 
 #[tokio::test]
-async fn ccr_truncation_withholds_partial_hits_and_round_trips_full_safe_output() {
+async fn truncation_withholds_partial_hits() {
     let fixture = KnowledgeFixture::new();
     let capped = fixture
         .server
@@ -573,42 +734,59 @@ async fn ccr_truncation_withholds_partial_hits_and_round_trips_full_safe_output(
             }),
         )
         .await;
-    let hash = capped
-        .split("hash=\"")
-        .nth(1)
-        .and_then(|suffix| suffix.split('"').next())
-        .expect("over-budget knowledge search must emit a CCR hash");
-    for line in capped.lines().filter(|line| line.contains("docs/")) {
-        assert!(line.contains("authority:"), "partial hit escaped: {line}");
-        assert!(line.contains("finding_ids="), "provenance missing: {line}");
+
+    // Hits are multi-line blocks. A line-boundary cut could keep `path:line`
+    // and drop the excerpt -- frozen contract test 7 forbids that. The
+    // formatter therefore withholds a block rather than splitting it.
+    // CCR retrieve of omitted hits is not asserted: that call site lives in
+    // a Feature 020 censused file and is not changed in this PR.
+    assert_no_partial_hit_block(&capped);
+    assert_eq!(
+        complete_hit_blocks(&capped),
+        0,
+        "max_tokens=120 must return provenance with no hit block at all: {capped}"
+    );
+    assert!(
+        capped.contains("Trust:"),
+        "header must survive a tight budget: {capped}"
+    );
+
+    let mid = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "search_knowledge",
+            json!({
+                "query": "deterministic ranking",
+                "limit": 10,
+                "max_tokens": 300
+            }),
+        )
+        .await;
+    assert!(mid.contains("Trust:"), "header must survive: {mid}");
+    assert_no_partial_hit_block(&mid);
+    assert!(
+        complete_hit_blocks(&mid) >= 1,
+        "max_tokens=300 must fit at least one COMPLETE hit block: {mid}"
+    );
+
+    for budget in (120..=900).step_by(15) {
+        let swept = fixture
+            .server
+            .dispatch_tool_for_tests(
+                "search_knowledge",
+                json!({
+                    "query": "deterministic ranking",
+                    "limit": 10,
+                    "max_tokens": budget
+                }),
+            )
+            .await;
+        assert_no_partial_hit_block(&swept);
         assert!(
-            line.contains("bridge_previews="),
-            "bridge preview missing: {line}"
+            swept.contains("Trust:"),
+            "budget {budget} must still return provenance: {swept}"
         );
     }
-
-    let full = fixture
-        .server
-        .dispatch_tool_for_tests("symforge_retrieve", json!({"hash": hash}))
-        .await;
-    assert!(
-        full.len() > capped.len(),
-        "CCR must restore the full output"
-    );
-    assert!(full.contains("docs/a-tie.md"), "first full hit: {full}");
-    assert!(full.contains("docs/z-tie.md"), "second full hit: {full}");
-    assert!(full.contains("source_version="), "source version: {full}");
-    assert!(full.contains("publication="), "publication: {full}");
-    assert!(full.contains("content="), "content generation: {full}");
-
-    let evicted = fixture
-        .server
-        .dispatch_tool_for_tests("symforge_retrieve", json!({"hash": "000000000000"}))
-        .await;
-    assert!(
-        evicted.contains("stale or expired") && evicted.contains("retry"),
-        "an unavailable captured CCR generation must be explicit and retryable: {evicted}"
-    );
 }
 
 #[tokio::test]

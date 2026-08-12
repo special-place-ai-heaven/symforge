@@ -84,6 +84,22 @@ pub enum CodeAnchorId {
     Symbol { symbol: SymbolId, start_line: u32 },
 }
 
+impl CodeAnchorId {
+    /// Single agent-facing rendering of a resolved code anchor.
+    ///
+    /// Lives next to the type so a new variant cannot be added without
+    /// deciding how it displays. `#` separates path from symbol name;
+    /// `:` prefixes the line.
+    pub fn label(&self) -> String {
+        match self {
+            Self::File { path } => format!("file:{path}"),
+            Self::Symbol { symbol, start_line } => {
+                format!("symbol:{}#{}:{start_line}", symbol.path, symbol.name)
+            }
+        }
+    }
+}
+
 impl Ord for CodeAnchorId {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
