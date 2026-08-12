@@ -452,7 +452,7 @@ function buildPositiveMaterializedFixture(root) {
     workflow_commit: releaseCommit,
     workflow_run_id: "1",
     workflow_run_attempt: 1,
-    workflow_job: "display-name-is-not-a-trust-property",
+    workflow_job: "feature-020-v11-gate",
     workflow_event: "workflow_dispatch",
     status: "passed",
   };
@@ -1778,6 +1778,9 @@ try {
     });
     runMaterializedTamper("approval runner workflow blob is not the release workflow", "ERROR APPROVED_REFREEZE_INVALID:", () => {
       rewriteApprovalClosure((approval) => { approval.workflow_sha256 = "d".repeat(64); });
+    });
+    runMaterializedTamper("approval result did not come from the environment-protected gate job", "ERROR APPROVED_REFREEZE_INVALID:", () => {
+      rewriteApprovalClosure((approval) => { approval.workflow_job = "gate-release-ref"; });
     });
     runMaterializedTamper("T089 output hashes diverge from protected approval execution", "ERROR RELEASE_TASK_RECEIPT_INVALID:", () => {
       const task = JSON.parse(fs.readFileSync(path.join(positiveMaterializedRoot, taskPath), "utf8"));

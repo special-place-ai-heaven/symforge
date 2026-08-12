@@ -14,6 +14,10 @@ const PUBLIC_API_PATH = "specs/020-repository-knowledge-index/contracts/public-a
 const CHECKER_PATH = "scripts/validate-lifecycle-oracle-traceability.cjs";
 const RELEASE_GATE_REVIEW_PATH = "docs/reviews/FEATURE-020-V11-RELEASE-GATE.md";
 const RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml";
+// `github.job` is the job_id, not the display name, and release.yml is byte-pinned by
+// workflow_sha256 above. Pinning it proves the approval result came from the one job
+// that declares `environment: feature-020-v11-release-approval`.
+const APPROVAL_GATE_JOB_ID = "feature-020-v11-gate";
 const PLANNED = "planned_not_executed";
 const CAPACITY_DIMENSIONS = [
   "process_slots",
@@ -297,7 +301,7 @@ const FROZEN_DIGESTS = {
   },
   acceptance_oracles: {
     domain: "symforge.lifecycle.v11.acceptance.oracles",
-    hash: "de5d45f8d7f8a43863bffa50eec102ffcc9f8a9fc713b8e524fe917e613d045b",
+    hash: "b429c0132a348feba633cff21313ad15a739cdbe3f913cb8d31d21a010d0c16a",
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
@@ -1602,7 +1606,7 @@ function validateAcceptance(acceptance, trace, taskCatalog) {
     ],
     bounds: [
       "DEFAULT_MAX_VERIFICATION_BYTES is 17179869184, DEFAULT_MAX_VERIFICATION_ENTRIES is 200000, reserved floors are 33554432 bytes per second and 1000 entries per second, and DEFAULT_MAX_COMPLETE_VERIFICATION_PASS is 720 seconds",
-      "The successor pass starts within 180 seconds, so the maximum 720-second pass completes within the fixed 900-second overdue interval",
+      "The successor pass starts within 180 seconds, so the maximum reachable 712-second pass completes before the fixed 900-second overdue deadline",
     ],
     fairness: [
       "A feasible successor pass starts no later than 180 seconds after the prior complete record and retains its reserved service floors until completion or typed refusal",
@@ -2559,6 +2563,7 @@ function validateApprovedRefreeze(evidence, retirement, releaseCommit) {
       result.runner_repository !== "special-place-ai-heaven/symforge" ||
       result.workflow_path !== RELEASE_WORKFLOW_PATH ||
       result.workflow_sha256 !== sha256Bytes(workflowBlob) ||
+      result.workflow_job !== APPROVAL_GATE_JOB_ID ||
       typeof result.workflow_commit !== "string" || !/^[0-9a-f]{40,64}$/u.test(result.workflow_commit) ||
       typeof result.workflow_run_id !== "string" || !/^[1-9][0-9]{0,19}$/u.test(result.workflow_run_id) ||
       !Number.isInteger(result.workflow_run_attempt) || result.workflow_run_attempt < 1 || result.workflow_run_attempt > 1000 ||

@@ -1049,7 +1049,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/lifecycle-acceptance-oracles-v11.md",
       "scope": "feature",
-      "sha256": "1024f84f6d50136f9bdf371fc70a91dd87bf63fd604e8fd8c439d457aa2bc849",
+      "sha256": "809bd50ee378b67392442169257c0ba48f832b987e630c9c333ef9a71b830f34",
       "superseded_by": []
     },
     {

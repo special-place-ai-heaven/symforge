@@ -656,6 +656,16 @@ class GitObjects:
 
     def path_history(self, commit: str, path: str) -> list[str]:
         _validate_repo_path(path)
+        # A truncated clone hides ancestors, so an absence answer derived from this
+        # walk would assert history the walk never saw.
+        if (
+            _decode_ascii_line(
+                self._run(["rev-parse", "--is-shallow-repository"]).stdout.strip(),
+                "GIT_HISTORY_SHALLOW",
+            )
+            != "false"
+        ):
+            raise RefreezeError("GIT_HISTORY_SHALLOW")
         output = self._run(
             ["rev-list", "--full-history", commit, "--", path]
         ).stdout
