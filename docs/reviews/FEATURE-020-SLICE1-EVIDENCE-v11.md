@@ -164,6 +164,43 @@ delete `target/debug/incremental`, then `cargo clean -p symforge` — which
 removed 39.1 GB and returned the directory to 1.9 GB. Do not diagnose these
 errors as code failures.
 
+## The frozen public surface, and where this module lives
+
+CI rejected the first push because the top-level public API moved from the
+frozen 83 atoms to 84. `symforge::index_lifecycle` appears nowhere in the frozen
+contract — not in the preactivation set, and not in `introduced_v11_atoms`,
+which introduces only the `embed` surface and `server_api`. A top-level public
+module was therefore never permissible for this slice. That is consistent with
+the data model, which states that these closed publication names are not public
+constructors.
+
+The module now lives under `live_index`, where it belongs architecturally: it
+governs live-index publication. The top-level surface is back to exactly 83.
+
+**Stated openly for a reviewer to judge**: `derivePublicApiAtoms` counts only
+top-level `pub mod` declarations in `lib.rs` (plus the `embed` surface), so
+nested items such as
+`symforge::live_index::index_lifecycle::authority::BindingAuthority` are
+reachable by a consumer but are not counted by the census. That is the
+contract's own granularity rather than a loophole invented here, but it does
+mean the census measures the top-level surface, not total reachability. If the
+intent is to freeze reachability, the census — not this slice — is what needs
+amending.
+
+## Regenerating a frozen digest
+
+T028 legitimately edited a censused file, so the `callbacks` closure digest
+moved. Exactly one category moved, which is itself evidence the change was
+surgical.
+
+Regenerating it exposed a maintainability gap: both digest gates deliberately
+refuse to print the value they computed, so a slice that legitimately edits a
+censused file had no way to produce the new number. They now emit it under
+`SYMFORGE_LIFECYCLE_EMIT_CLOSURE=1`, **without relaxing either comparison** —
+the gate still fails on a mismatch, and the self-test still rejects all 103
+fail-closed cases. Regeneration stays a deliberate act that leaves a reviewer
+the same evidence it always did.
+
 ## Known limits carried forward
 
 - **TOCTOU in root confinement.** Components are checked with
