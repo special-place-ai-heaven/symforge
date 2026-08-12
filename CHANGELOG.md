@@ -26,6 +26,18 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.1.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.4...v10.1.0) (2026-08-12)
+
+
+### Features
+
+* **index:** freeze v11 lifecycle prevention contract and release gates ([#549](https://github.com/special-place-ai-heaven/symforge/issues/549)) ([7753996](https://github.com/special-place-ai-heaven/symforge/commit/7753996053bc9f59dbb10e59bcbc8b0394e417a3))
+
+
+### Bug Fixes
+
+* **release:** restore releases after the pre-activation gate skip ([#550](https://github.com/special-place-ai-heaven/symforge/issues/550)) ([bbbe2a9](https://github.com/special-place-ai-heaven/symforge/commit/bbbe2a94d27ce884c942bfcc0e6248dc1b849d54))
+
 ## [10.0.4](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.3...v10.0.4) (2026-08-10)
 
 
