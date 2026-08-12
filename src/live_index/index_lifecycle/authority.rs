@@ -394,8 +394,8 @@ pub enum AuthorityRefusal {
     PhysicalRootReplaced,
     /// The permit has already reached a terminal state.
     PermitAlreadyTerminal,
-    /// A side effect was attempted before the source published non-`Current`.
-    SideEffectBeforeNonCurrentPublication,
+    /// A side effect was attempted on a permit that is already in flight.
+    SideEffectAlreadyInFlight,
     /// The authority presented does not match the live source as a whole.
     WholeAuthorityMismatch,
     /// A transition was attempted while a permit was still outstanding.
@@ -408,7 +408,7 @@ pub enum AuthorityRefusal {
 pub struct SourceRuntime {
     phase: SourcePhase,
     mutation_epoch: MutationEpoch,
-    permits_issued: u64,
+    grants_issued: u64,
 }
 
 impl SourceRuntime {
@@ -417,7 +417,7 @@ impl SourceRuntime {
         Self {
             phase: SourcePhase::Loading,
             mutation_epoch: MutationEpoch::initial(),
-            permits_issued: 0,
+            grants_issued: 0,
         }
     }
 
@@ -426,7 +426,7 @@ impl SourceRuntime {
         Self {
             phase: SourcePhase::Current(publication),
             mutation_epoch: MutationEpoch::initial(),
-            permits_issued: 0,
+            grants_issued: 0,
         }
     }
 
@@ -439,7 +439,7 @@ impl SourceRuntime {
                 publication: PublicationIdentity::fresh(),
             },
             mutation_epoch: MutationEpoch::initial(),
-            permits_issued: 0,
+            grants_issued: 0,
         }
     }
 
@@ -448,7 +448,7 @@ impl SourceRuntime {
         Self {
             phase: SourcePhase::Blocked { retained },
             mutation_epoch: MutationEpoch::initial(),
-            permits_issued: 0,
+            grants_issued: 0,
         }
     }
 
@@ -457,7 +457,7 @@ impl SourceRuntime {
         Self {
             phase: SourcePhase::Stopping { retained },
             mutation_epoch: MutationEpoch::initial(),
-            permits_issued: 0,
+            grants_issued: 0,
         }
     }
 
@@ -473,8 +473,8 @@ impl SourceRuntime {
 
     /// How many permits this source has ever issued. A refused request must not
     /// change this.
-    pub fn permits_issued(&self) -> u64 {
-        self.permits_issued
+    pub fn grants_issued(&self) -> u64 {
+        self.grants_issued
     }
 
     /// The generation this phase retains, if any.
@@ -532,30 +532,42 @@ impl SourceRuntime {
     /// Epoch and permit record are carried across, never reset: the epoch is
     /// monotonic for the life of the source, so a reload or rebind cannot rewind
     /// it and let a stale authority compare equal to a later one.
-    pub fn freeze(&mut self) -> PublicationIdentity {
-        let publication = PublicationIdentity::fresh();
-        self.mutation_epoch = self.mutation_epoch.advanced();
+    /// Returns `None` when the phase had nothing to publish.
+    ///
+    /// `Loading`, `Blocked` and `Stopping` store no publication, so an earlier
+    /// version returning a freshly minted identity for them was attesting to a
+    /// publication nothing had stored — the same defect this slice already fixed
+    /// once. It also advanced the epoch for a freeze that did not happen; it now
+    /// leaves the epoch alone on that path too.
+    pub fn freeze(&mut self) -> Option<PublicationIdentity> {
         let (retained, binding) = match &self.phase {
             SourcePhase::Current(current) => (current.generation(), current.binding().clone()),
             SourcePhase::Refreshing {
                 retained, binding, ..
             } => (*retained, binding.clone()),
             SourcePhase::Loading | SourcePhase::Blocked { .. } | SourcePhase::Stopping { .. } => {
-                // Nothing queryable to retain; the phase is already non-Current.
-                return self.published_identity().unwrap_or(publication);
+                return None;
             }
         };
+        let publication = PublicationIdentity::fresh();
+        self.mutation_epoch = self.mutation_epoch.advanced();
         self.phase = SourcePhase::Refreshing {
             retained,
             binding,
             publication,
         };
-        publication
+        Some(publication)
     }
 
     /// Install a new `Current` publication, preserving the monotonic epoch and
-    /// the permit record.
-    pub fn install(&mut self, publication: CurrentPublication) {
+    /// the grant record.
+    ///
+    /// Deliberately `pub(crate)`: republishing `Current` makes the source
+    /// queryable again, and a permit outstanding from the previous freeze would
+    /// then be able to act against a queryable source. `transition::apply` is
+    /// the only caller, and it reaches this line only after Drain has confirmed
+    /// nothing is outstanding.
+    pub(crate) fn install(&mut self, publication: CurrentPublication) {
         self.phase = SourcePhase::Current(publication);
     }
 
@@ -602,9 +614,13 @@ impl SourceRuntime {
         // `freeze` performs and records that publication, and the proof below
         // names the identity it actually stored -- not a freshly minted one that
         // nothing published.
-        let publication = self.freeze();
+        // The phase was matched as `Current` above and nothing between here and
+        // there can change it, so `freeze` has something to publish.
+        let publication = self
+            .freeze()
+            .expect("a Current source always has a publication to freeze");
         let epoch = self.mutation_epoch;
-        self.permits_issued += 1;
+        self.grants_issued += 1;
 
         Ok(CurrentMutationGrantAuthority {
             authority: MutationAuthority {

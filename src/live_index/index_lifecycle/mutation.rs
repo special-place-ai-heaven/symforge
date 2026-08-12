@@ -38,6 +38,7 @@ enum PermitState {
 /// drop path reports here rather than relying on the holder to be well behaved.
 #[derive(Debug, Default)]
 pub struct PermitDrainSignal {
+    armed: AtomicBool,
     ended: AtomicBool,
     termination: std::sync::Mutex<Option<Termination>>,
 }
@@ -48,9 +49,21 @@ impl PermitDrainSignal {
         Self::default()
     }
 
-    /// Whether the permit has ended by any path.
+    /// Whether nothing is outstanding: either no permit was ever attached to
+    /// this signal, or the permit that was has ended by some terminal path.
+    ///
+    /// A signal that no permit ever used reports ended, which is what lets
+    /// `transition::apply` take this by value rather than as an `Option`. An
+    /// optional drain is not a drain: passing `None` skipped the check entirely
+    /// and installed over a live permit, making ordering 3 a calling convention
+    /// instead of a property of the API.
     pub fn has_ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
+        !self.armed.load(Ordering::Acquire) || self.ended.load(Ordering::Acquire)
+    }
+
+    /// Attach a permit to this signal. Called only when a permit is created.
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
     }
 
     /// How the permit ended, once it has.
@@ -73,15 +86,28 @@ impl PermitDrainSignal {
     }
 }
 
-/// Proof that a permit performed no source-disk side effect.
+/// The holder's declaration that its permit performed no source-disk side
+/// effect.
+///
+/// **This is a declaration, not a proof.** An earlier doc comment here claimed
+/// it was "constructible only by the lane that actually observed the absence",
+/// which was false: the constructor is public and any caller can produce one. It
+/// therefore cannot distinguish an observed absence from an asserted one, and
+/// naming it a proof made it read like the sibling
+/// [`NonCurrentPublicationProof`], which really does derive its force from
+/// private fields and a single construction site.
+///
+/// It is kept as a distinct type so the declaration is explicit at the call
+/// site rather than implied by calling a bare method. When Slice 4 introduces
+/// the write lane that can actually observe the absence, construction should
+/// move behind it and this type can become a real proof.
 #[derive(Debug)]
 pub struct NoSideEffectProof {
     _seal: (),
 }
 
 impl NoSideEffectProof {
-    /// Attest that nothing was written. Constructible only by the lane that
-    /// actually observed the absence.
+    /// Declare that nothing was written.
     pub fn observed() -> Self {
         Self { _seal: () }
     }
@@ -139,6 +165,7 @@ impl SourceMutationPermit {
             return Err(AuthorityRefusal::PhysicalRootReplaced);
         }
 
+        drain.arm();
         Ok(Self {
             authority,
             published_non_current,
@@ -146,6 +173,23 @@ impl SourceMutationPermit {
             state: PermitState::Granted,
             drain,
         })
+    }
+
+    /// Replace a path beneath this permit's own pinned lease.
+    ///
+    /// Prefer this over calling `replace_beneath` with a lease of your own: here
+    /// the lease that writes is the pinned one by construction, so there is no
+    /// opportunity to write under a root the authority never named.
+    pub fn replace_beneath(
+        &mut self,
+        relative: &std::path::Path,
+        contents: &[u8],
+    ) -> Result<WriteReceipt, AuthorityRefusal> {
+        if self.state != PermitState::InFlight {
+            return Err(AuthorityRefusal::PermitAlreadyTerminal);
+        }
+        super::physical_root::replace_beneath(&self.lease, relative, contents)
+            .map_err(AuthorityRefusal::from)
     }
 
     /// The whole authority this permit carries.
@@ -180,7 +224,10 @@ impl SourceMutationPermit {
     pub fn start_side_effect(&mut self) -> Result<(), AuthorityRefusal> {
         match self.state {
             PermitState::Terminal(_) => return Err(AuthorityRefusal::PermitAlreadyTerminal),
-            PermitState::InFlight => return Err(AuthorityRefusal::PermitAlreadyTerminal),
+            // Naming the state the permit is actually in. Reporting
+            // `PermitAlreadyTerminal` for an in-flight permit was correct in
+            // outcome and wrong in what it claimed to have observed.
+            PermitState::InFlight => return Err(AuthorityRefusal::SideEffectAlreadyInFlight),
             PermitState::Granted => {}
         }
 
@@ -202,11 +249,19 @@ impl SourceMutationPermit {
     }
 
     /// Commit an observed write.
+    ///
+    /// The receipt must name this permit's own lease. Discarding it and
+    /// reporting `Committed` regardless was the defect three independent
+    /// reviewers found: a permit pinned to root A could be handed a receipt for
+    /// a write that landed under root B and would report success for it. A
+    /// permit may only attest to a side effect its own authority produced.
     pub fn commit(&mut self, receipt: WriteReceipt) -> Result<RefreshTicket, AuthorityRefusal> {
         if self.state != PermitState::InFlight {
             return Err(AuthorityRefusal::PermitAlreadyTerminal);
         }
-        let _ = receipt;
+        if receipt.lease() != self.lease.identity() {
+            return Err(AuthorityRefusal::WholeAuthorityMismatch);
+        }
         self.finish(Termination::Committed)
     }
 

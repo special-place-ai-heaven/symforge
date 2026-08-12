@@ -60,11 +60,7 @@ fn mutation_authority_is_exact_and_terminal() {
             phase: PhaseName::Refreshing
         }
     );
-    assert_eq!(
-        runtime.permits_issued(),
-        1,
-        "a refused grant issued a permit"
-    );
+    assert_eq!(runtime.grants_issued(), 1, "a refused grant was counted");
 
     // Terminal: the permit drives once and then refuses every path.
     let drain = Arc::new(PermitDrainSignal::new());
@@ -91,6 +87,106 @@ fn mutation_authority_is_exact_and_terminal() {
     ] {
         assert_eq!(refusal, AuthorityRefusal::PermitAlreadyTerminal);
     }
+}
+
+/// Found by three independent reviews: `commit` discarded the receipt, so a
+/// permit pinned to root A could report `Committed` for a write that landed
+/// under root B.
+#[test]
+fn a_permit_cannot_commit_a_write_that_landed_under_another_root() {
+    let (mut runtime, lease_a, live) = current_source();
+    let elsewhere = tempfile::tempdir().expect("other root");
+    let lease_b = PhysicalRootLease::take(elsewhere.path());
+
+    let grant = runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    let drain = Arc::new(PermitDrainSignal::new());
+    let mut permit = SourceMutationPermit::grant(grant, Arc::clone(&lease_a), Arc::clone(&drain))
+        .expect("grant must produce a permit");
+    permit.start_side_effect().expect("permit may act");
+
+    // Negative: a receipt from another lease is refused, and the permit does not
+    // become terminal on the strength of a write it never authorized.
+    let foreign = symforge::live_index::index_lifecycle::physical_root::replace_beneath(
+        &lease_b,
+        std::path::Path::new("elsewhere.txt"),
+        b"not ours",
+    )
+    .expect("the other lease writes beneath its own root");
+    assert_eq!(
+        permit
+            .commit(foreign)
+            .expect_err("a permit must not commit another root's write"),
+        AuthorityRefusal::WholeAuthorityMismatch
+    );
+    assert!(
+        !permit.is_terminal(),
+        "a refused commit terminated the permit"
+    );
+    assert!(!drain.has_ended());
+
+    // Positive: its own lease's receipt commits, so the refusal is about the
+    // root rather than about receipts in general.
+    let own = permit
+        .replace_beneath(std::path::Path::new("slice1-own-write.txt"), b"ours")
+        .expect("a permit writes beneath its own lease");
+    assert_eq!(own.lease(), lease_a.identity());
+    assert_eq!(
+        permit
+            .commit(own)
+            .expect("its own receipt commits")
+            .termination(),
+        Termination::Committed
+    );
+}
+
+/// Found by two independent reviews: an optional drain signal let a caller skip
+/// the check entirely and install over a live permit.
+#[test]
+fn a_transition_cannot_skip_drain() {
+    let (mut runtime, lease_a, live) = current_source();
+    let grant = runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    let drain = Arc::new(PermitDrainSignal::new());
+    let permit = SourceMutationPermit::grant(grant, Arc::clone(&lease_a), Arc::clone(&drain))
+        .expect("grant must produce a permit");
+
+    // A signal with a live permit attached reports outstanding, and there is no
+    // longer any way to pass "no signal" instead.
+    assert!(!drain.has_ended());
+    let phase_before = runtime.phase();
+    let epoch_before = runtime.mutation_epoch();
+    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    assert_eq!(
+        transition::apply(
+            &mut runtime,
+            TransitionKind::Rebind,
+            &lease_a,
+            BindingAuthority::bind(lease_b.identity()),
+            ObserverToken::fresh(),
+            &drain,
+        )
+        .expect_err("a live permit must block the transition"),
+        AuthorityRefusal::OutstandingPermit
+    );
+
+    // A refused transition leaves no trace: it must not have frozen first.
+    assert_eq!(runtime.phase(), phase_before, "a refused transition froze");
+    assert_eq!(
+        runtime.mutation_epoch(),
+        epoch_before,
+        "a refused transition advanced the epoch"
+    );
+    assert!(lease_a.is_live(), "a refused transition revoked");
+
+    // A signal that never had a permit reports nothing outstanding, which is
+    // what makes the non-optional parameter usable for a first install.
+    let fresh = PermitDrainSignal::new();
+    assert!(fresh.has_ended());
+
+    drop(permit);
 }
 
 /// The epoch the source is standing on, for comparison against a ticket.
@@ -133,7 +229,7 @@ fn grant_requires_the_exact_live_current_publication() {
         0,
         "refusal advanced the epoch"
     );
-    assert_eq!(runtime.permits_issued(), 0, "refusal recorded a permit");
+    assert_eq!(runtime.grants_issued(), 0, "refusal recorded a grant");
     assert_eq!(
         runtime.phase(),
         PhaseName::Current,
@@ -146,7 +242,7 @@ fn grant_requires_the_exact_live_current_publication() {
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("the exact live Current publication must grant");
     assert_eq!(grant.authority().publication(), live);
-    assert_eq!(runtime.permits_issued(), 1);
+    assert_eq!(runtime.grants_issued(), 1);
 }
 
 #[test]
@@ -183,7 +279,7 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
             }
         );
         assert_eq!(runtime.mutation_epoch().get(), 0);
-        assert_eq!(runtime.permits_issued(), 0);
+        assert_eq!(runtime.grants_issued(), 0);
         assert_eq!(runtime.phase(), expected_phase);
     }
 
@@ -227,7 +323,7 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
             }
         );
         assert_eq!(runtime.mutation_epoch().get(), 0);
-        assert_eq!(runtime.permits_issued(), 0);
+        assert_eq!(runtime.grants_issued(), 0);
         assert_eq!(runtime.phase(), PhaseName::Current);
 
         // Same source, same instant: the live publication does grant.
@@ -415,7 +511,7 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
         &lease_a,
         BindingAuthority::bind(lease_b.identity()),
         ObserverToken::fresh(),
-        Some(&drain),
+        &drain,
     )
     .expect("a drained source may install a new root");
     assert_eq!(
@@ -481,7 +577,7 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
             .expect("grant must produce a permit"),
     );
     let before = runtime.mutation_epoch();
-    let permits_before = runtime.permits_issued();
+    let permits_before = runtime.grants_issued();
     assert!(before.get() >= 1);
 
     let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
@@ -491,7 +587,7 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
         &lease_a,
         BindingAuthority::bind(lease_b.identity()),
         ObserverToken::fresh(),
-        Some(&drain),
+        &drain,
     )
     .expect("a drained source may transition");
 
@@ -504,9 +600,9 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
         runtime.mutation_epoch()
     );
     assert_eq!(
-        runtime.permits_issued(),
+        runtime.grants_issued(),
         permits_before,
-        "a transition must not discard the permit record"
+        "a transition must not discard the grant record"
     );
 }
 
@@ -528,7 +624,7 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
         &lease_a,
         BindingAuthority::bind(lease_b.identity()),
         ObserverToken::fresh(),
-        Some(&drain),
+        &drain,
     )
     .expect_err("a transition must not install over a live permit");
     assert_eq!(refusal, AuthorityRefusal::OutstandingPermit);
@@ -542,7 +638,7 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
         &lease_a,
         BindingAuthority::bind(lease_b.identity()),
         ObserverToken::fresh(),
-        Some(&drain),
+        &drain,
     )
     .expect("a drained source may transition");
     assert!(!lease_a.is_live());

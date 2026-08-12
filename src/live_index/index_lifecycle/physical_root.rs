@@ -2,16 +2,28 @@
 //!
 //! A lease owns one physical root. Every path a permit touches is resolved
 //! component-by-component beneath that root, refusing any symlink or reparse
-//! point rather than following it, so a mutation authorized for root A can never
-//! reach root B through a link planted inside A.
+//! point rather than following it.
 //!
-//! ponytail: confinement is checked per component with `symlink_metadata` before
-//! the open, which leaves a TOCTOU window between check and open. Closing it
-//! needs handle-relative I/O (`openat`/`NtCreateFile` with
-//! `FILE_FLAG_OPEN_REPARSE_POINT`), i.e. a `cap-std`-style `Dir` handle. That is
-//! a dependency decision, deliberately not taken inside this slice; the seam
-//! below (`resolve_beneath` returning a final-parent handle plus leaf name) is
-//! the shape that upgrade would slot into.
+//! **What this module does NOT claim.** Confinement is *not* closed. Each
+//! component is checked with `symlink_metadata` and then opened separately, so a
+//! component swapped to a link between the check and the open is followed. An
+//! earlier version of this comment said a mutation authorized for root A "can
+//! never reach root B through a link planted inside A"; that asserted more than
+//! the code observes, and the honest statement is narrower: **link metadata is
+//! refused at check time, and the check-then-open window is open.**
+//!
+//! The one escape that needed no race at all is closed. The replacement
+//! temporary used to carry a predictable name and be written with `fs::write`,
+//! which follows links, so a link planted at that path any time beforehand
+//! redirected the write outside the root deterministically. The temporary is now
+//! created with `create_new`, which refuses to open anything that already
+//! exists — link included — under an unpredictable name.
+//!
+//! Closing the remaining window needs handle-relative I/O (`openat`, or
+//! `NtCreateFile` with `FILE_FLAG_OPEN_REPARSE_POINT`), i.e. a `cap-std`-style
+//! `Dir` handle. That is a dependency decision deliberately not taken inside this
+//! slice; `resolve_beneath` returns a final parent plus leaf name, which is the
+//! shape that upgrade slots into.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +31,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::authority::AuthorityRefusal;
 
 static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Distinguishes concurrent replacements of the same target within one process.
+static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How many temporary names to try before refusing.
+const MAX_TEMP_ATTEMPTS: u32 = 16;
 
 /// Identity of one installed physical root. Never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -204,10 +222,15 @@ pub enum ReplacementStep {
 
 /// What a replacement actually did, recorded as it happened rather than asserted
 /// afterwards.
+///
+/// The receipt names the lease that produced it. Without that, a receipt is just
+/// a value a caller can hand to any permit, and a permit pinned to root A can
+/// report success for a write that landed under root B.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteReceipt {
     steps: Vec<ReplacementStep>,
     target: PathBuf,
+    lease: PhysicalRootIdentity,
 }
 
 impl WriteReceipt {
@@ -219,6 +242,11 @@ impl WriteReceipt {
     /// The path that was replaced.
     pub fn target(&self) -> &Path {
         &self.target
+    }
+
+    /// The lease that actually performed this write.
+    pub fn lease(&self) -> PhysicalRootIdentity {
+        self.lease
     }
 }
 
@@ -237,30 +265,79 @@ pub fn replace_beneath(
 
     let mut steps = Vec::new();
 
-    let mut temp_name = target.leaf().to_os_string();
-    temp_name.push(format!(".symforge-tmp-{}", std::process::id()));
-    let temp_path = target.parent().join(&temp_name);
-
-    if let Some(parent) = temp_path.parent() {
+    if let Some(parent) = target.path().parent() {
         std::fs::create_dir_all(parent).map_err(|error| RootRefusal::Unreadable {
             path: parent.to_path_buf(),
             message: error.to_string(),
         })?;
     }
-    std::fs::write(&temp_path, contents).map_err(|error| RootRefusal::Unreadable {
-        path: temp_path.clone(),
-        message: error.to_string(),
-    })?;
+
+    // The temporary is created with `create_new`, which fails if ANYTHING
+    // already occupies the name -- including a symlink or reparse point. This is
+    // not a refinement of the link check: a predictable temp name written with
+    // `fs::write` follows a link that was planted long before the mutation, so
+    // the escape needs no race to win and no TOCTOU window to exploit. Refusing
+    // to create over an existing name closes it outright, and the unpredictable
+    // suffix removes the plant target in the first place.
+    let mut temp_path = PathBuf::new();
+    let mut file = None;
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let mut name = target.leaf().to_os_string();
+        name.push(format!(
+            ".symforge-tmp-{}-{}-{attempt}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let candidate = target.parent().join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(handle) => {
+                temp_path = candidate;
+                file = Some(handle);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(RootRefusal::Unreadable {
+                    path: candidate,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    let Some(mut handle) = file else {
+        return Err(RootRefusal::Unreadable {
+            path: target.parent().to_path_buf(),
+            message: "no unused temporary name was available beneath the leased root".to_owned(),
+        });
+    };
+
+    let written = std::io::Write::write_all(&mut handle, contents).and_then(|()| handle.sync_all());
+    drop(handle);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(RootRefusal::Unreadable {
+            path: temp_path,
+            message: error.to_string(),
+        });
+    }
     steps.push(ReplacementStep::TempCreated);
 
-    std::fs::rename(&temp_path, target.path()).map_err(|error| RootRefusal::Unreadable {
-        path: target.path(),
-        message: error.to_string(),
-    })?;
+    if let Err(error) = std::fs::rename(&temp_path, target.path()) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(RootRefusal::Unreadable {
+            path: target.path(),
+            message: error.to_string(),
+        });
+    }
     steps.push(ReplacementStep::Replaced);
 
     Ok(WriteReceipt {
         steps,
         target: target.path(),
+        lease: lease.identity(),
     })
 }

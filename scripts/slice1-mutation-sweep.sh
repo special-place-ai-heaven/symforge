@@ -29,7 +29,15 @@ MUTATIONS=(
   "permit-terminality|$MUTATION|if matches!(self.state, PermitState::Terminal(_)) {|if false {|a terminal permit refuses a second termination"
   "drop-drains|$MUTATION|self.drain.record(Termination::Drained);||a dropped permit reports Drained"
   "lease-revoked|$PHYSICAL|if !self.is_live() {|if false {|a revoked lease resolves nothing"
-  "temp-first|$PHYSICAL|steps.push(ReplacementStep::TempCreated);|steps.push(ReplacementStep::Replaced);|replacement creates its temporary before replacing"
+  # Reviewer grok-4-5 is right that this proves less than the others: it reverts
+  # the RECEIPT LABEL, so what it demonstrates is that the receipt's recorded
+  # order is load-bearing -- not that the underlying write/rename order is. A
+  # build that renamed first while pushing the labels in order would stay green
+  # here. Closing that needs an oracle able to observe the target mid-flight,
+  # which needs a seam this slice does not have; it is recorded as an open limit
+  # in the evidence document rather than papered over with a mutation whose
+  # effect no test can see. The label is described as what it is.
+  "temp-first-label|$PHYSICAL|steps.push(ReplacementStep::TempCreated);|steps.push(ReplacementStep::Replaced);|the receipt's recorded temp-before-replace order is load-bearing"
   "epoch-monotonic|$AUTHORITY|self.mutation_epoch = self.mutation_epoch.advanced();|let _ = self.mutation_epoch.advanced();|the mutation epoch is monotonic across freeze"
   "proof-names-stored|$AUTHORITY|let publication = self.freeze();|let publication = { self.freeze(); PublicationIdentity::fresh() };|the non-Current proof names the stored publication"
 )

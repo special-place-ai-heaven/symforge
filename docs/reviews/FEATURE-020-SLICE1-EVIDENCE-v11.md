@@ -201,6 +201,45 @@ the gate still fails on a mismatch, and the self-test still rejects all 103
 fail-closed cases. Regeneration stays a deliberate act that leaves a reviewer
 the same evidence it always did.
 
+## Adversarial review round 1 (three independent models)
+
+`docs/reviews/REVIEW-REQUEST-feature-020-slice-1-2026-08-12.md` was reviewed by
+kimi-k3, cursor-grok-4-5, and composer, whose findings are recorded verbatim
+beside it. Every gate this slice had was green while the first finding below was
+live.
+
+Fixed in response:
+
+| Finding | Found by | Fix |
+|---|---|---|
+| `commit` discarded the receipt, so a permit on root A could report `Committed` for a write under root B | composer (BLOCKER), kimi (MAJOR) | `WriteReceipt` carries the lease that produced it; `commit` refuses a mismatch; `SourceMutationPermit::replace_beneath` writes through the pinned lease by construction |
+| `outstanding: Option` let a caller skip Drain and install over a live permit | grok, composer | The signal is non-optional. It reports "nothing outstanding" until a permit arms it, so a first install still works without an escape hatch |
+| Predictable temp name + `fs::write` following a pre-planted link — a deterministic escape needing no race | kimi | `create_new` refuses to open anything that already exists, link included, under an unpredictable name |
+| `freeze` returned an identity nothing stored, for three phases | all three | Returns `Option`, and no longer advances the epoch for a freeze that did not happen |
+| A refused transition had already frozen, so `Err` concealed a state change | kimi, grok | Drain is checked before Freeze; the recorded Drain step re-observes after it |
+| `install` was `pub`, so a caller could republish `Current` and let an outstanding permit act against a queryable source | kimi | `pub(crate)`; `transition::apply` is the only caller and reaches it only after Drain |
+| `SideEffectBeforeNonCurrentPublication` was dead code implying a check that did not run | composer | Replaced by `SideEffectAlreadyInFlight`, which names the state actually observed |
+| `permits_issued` counted grants | kimi | Renamed `grants_issued` |
+| `NoSideEffectProof` claimed to be constructible only by an observing lane, but its constructor is public | kimi | Documented as a declaration, not a proof, with the Slice 4 path to making it real |
+
+All three independently cleared the two judgements the request flagged as least
+confident: the census granularity argument and the digest-emit affordance.
+
+### Accepted and NOT closed
+
+grok-4-5: the `temp-first` sweep entry reverts the **receipt label**, not the
+write/rename order, so it demonstrates that the receipt's recorded order is
+load-bearing — not that the underlying I/O order is. A build that renamed first
+while pushing the labels in order would stay green.
+
+This is correct and is not fixed. Closing it needs an oracle that can observe the
+target mid-flight, which needs a seam this slice does not have: the natural
+observation points are inside `replace_beneath`, and the oracles are integration
+tests in an external crate that cannot reach a `#[cfg(test)]` hook. The sweep
+entry is renamed `temp-first-label` and describes what it actually proves rather
+than implying I/O-order coverage. The write/rename order is currently held by
+code review alone.
+
 ## Known limits carried forward
 
 - **TOCTOU in root confinement.** Components are checked with
