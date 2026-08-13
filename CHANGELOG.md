@@ -26,6 +26,18 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.4.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.3.0...v10.4.0) (2026-08-13)
+
+
+### Features
+
+* **feature-020:** Slice 2 — registry tombstones and process-wide capacity ([#565](https://github.com/special-place-ai-heaven/symforge/issues/565)) ([6c3794f](https://github.com/special-place-ai-heaven/symforge/commit/6c3794f308aae143f63f6eb689fcf6ef2eaad84b))
+
+
+### Bug Fixes
+
+* **sidecar:** treat Windows verbatim roots as the same project ([#569](https://github.com/special-place-ai-heaven/symforge/issues/569)) ([39d2366](https://github.com/special-place-ai-heaven/symforge/commit/39d2366943e79aa29ed8338e0d6609b0d5b024b2))
+
 ## [10.3.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.2.0...v10.3.0) (2026-08-13)
 
 
