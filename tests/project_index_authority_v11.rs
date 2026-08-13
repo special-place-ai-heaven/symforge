@@ -9,9 +9,10 @@
 use std::sync::Arc;
 
 use symforge::live_index::index_lifecycle::authority::{
-    AuthorityRefusal, BindingAuthority, CandidateAuthority, CurrentPublication, GenerationIdentity,
-    MutationGrantInput, ObserverToken, PhaseName, Provenance, PublicationIdentity,
-    SnapshotIdentity, SourceRuntime,
+    AuthorityRefusal, BindingAuthority, BlockedCause, CandidateAuthority, CurrentPublication,
+    GenerationIdentity, MutationGrantInput, NonCurrentWork, ObserverPhase, ObserverToken,
+    PhaseName, Provenance, PublicationIdentity, RevocationResidency, SnapshotIdentity,
+    SourceRuntime,
 };
 use symforge::live_index::index_lifecycle::mutation::{
     NoSideEffectProof, PermitDrainSignal, SourceMutationPermit, Termination,
@@ -189,6 +190,140 @@ fn a_transition_cannot_skip_drain() {
     drop(permit);
 }
 
+/// Slice 2 widening: a source can hold MORE THAN ONE outstanding permit.
+///
+/// Slice 1 tracked a single `PermitDrainSignal` and refused a transition on one
+/// outstanding permit, which cannot express a source draining several at once —
+/// the frozen model's `active_permits` is plural. A count alone would not do
+/// either: a permit retired twice would drive it below the truth and make a
+/// still-busy source look drained.
+#[test]
+fn a_source_tracks_every_outstanding_permit_and_retires_each_once() {
+    let (mut runtime, _lease, live) = current_source();
+    runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+
+    let first = PublicationIdentity::fresh();
+    let second = PublicationIdentity::fresh();
+    assert!(
+        runtime.record_permit(first),
+        "a Refreshing source records permits"
+    );
+    assert!(runtime.record_permit(second));
+    assert_eq!(runtime.active_permits().len(), 2);
+    assert!(!runtime.active_permits().is_drained());
+
+    // Retiring one leaves the other outstanding: the source is NOT drained.
+    assert!(runtime.retire_permit(first));
+    assert!(
+        !runtime.active_permits().is_drained(),
+        "one retired permit drained a source that still holds another"
+    );
+
+    // Retiring the same permit twice must not drain the source.
+    assert!(
+        !runtime.retire_permit(first),
+        "a permit retired twice reported as retired again"
+    );
+    assert_eq!(runtime.active_permits().len(), 1);
+
+    // Positive: retiring the genuinely outstanding one drains it.
+    assert!(runtime.retire_permit(second));
+    assert!(runtime.active_permits().is_drained());
+}
+
+/// A re-freeze must carry outstanding permits across.
+///
+/// Freezing a source that is already `Refreshing` with a live permit must not
+/// publish an empty permit set: the next transition would see a drained source
+/// and install over a permit that is still acting.
+#[test]
+fn re_freezing_does_not_forget_an_outstanding_permit() {
+    let (mut runtime, _lease, live) = current_source();
+    runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+
+    let outstanding = PublicationIdentity::fresh();
+    runtime.record_permit(outstanding);
+    assert_eq!(runtime.active_permits().len(), 1);
+
+    let epoch_before = runtime.mutation_epoch();
+    runtime.freeze().expect("a Refreshing source re-freezes");
+
+    assert_eq!(
+        runtime.active_permits().len(),
+        1,
+        "a re-freeze dropped an outstanding permit"
+    );
+    assert!(runtime.mutation_epoch() > epoch_before);
+}
+
+/// Every phase except `Stopping` reports the binding it is actually on.
+#[test]
+fn only_a_stopping_source_has_surrendered_its_binding() {
+    let lease = PhysicalRootLease::take(std::env::temp_dir());
+    let binding = BindingAuthority::bind(lease.identity());
+
+    let loading = SourceRuntime::loading(binding.clone());
+    assert_eq!(loading.retained_binding(), Some(&binding));
+    assert_eq!(loading.work(), Some(NonCurrentWork::Dirty));
+    assert_eq!(loading.observer_phase(), ObserverPhase::Absent);
+
+    let blocked = SourceRuntime::blocked(binding.clone(), None);
+    assert_eq!(blocked.retained_binding(), Some(&binding));
+    assert_eq!(
+        blocked.blocked_cause(),
+        Some(BlockedCause::VerificationFailed)
+    );
+
+    // Only Stopping has genuinely surrendered it.
+    let stopping = SourceRuntime::stopping(None, None);
+    assert_eq!(stopping.retained_binding(), None);
+    assert_eq!(stopping.blocked_cause(), None);
+}
+
+/// A `Stopping` source carries the teardown capacity it committed.
+///
+/// Omitting the field would imply no charge was made, and the refund path would
+/// have nothing to reconcile against.
+#[test]
+fn a_stopping_source_carries_its_committed_revocation_residency() {
+    let residency = RevocationResidency::committed();
+    let stopping = SourceRuntime::stopping(None, Some(residency));
+    assert_eq!(stopping.committed_revocation_residency(), Some(residency));
+
+    // Paired: a source that committed nothing reports nothing rather than a
+    // zero charge that looks like a real one.
+    assert_eq!(
+        SourceRuntime::stopping(None, None).committed_revocation_residency(),
+        None
+    );
+
+    // Two committed charges are distinct, so refunds cannot be conflated.
+    assert_ne!(
+        RevocationResidency::committed().charge(),
+        RevocationResidency::committed().charge()
+    );
+}
+
+/// An observer phase with no live token must not present one.
+#[test]
+fn a_source_without_a_live_observer_cannot_present_a_token() {
+    let token = ObserverToken::fresh();
+    assert_eq!(ObserverPhase::Active { token }.token(), Some(token));
+    assert_eq!(ObserverPhase::Draining { token }.token(), Some(token));
+
+    // Negative: absent and observer-free hold no token to present.
+    assert_eq!(ObserverPhase::Absent.token(), None);
+    assert_eq!(
+        ObserverPhase::ObserverFree { handoff: token }.token(),
+        None,
+        "an observer-free source presented a token it does not hold"
+    );
+}
+
 /// The epoch the source is standing on, for comparison against a ticket.
 fn authority_epoch(
     runtime: &SourceRuntime,
@@ -250,7 +385,12 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
     // Non-Current phases refuse regardless of what is presented, and leave no
     // epoch or permit trace behind.
     let non_current: Vec<(PhaseName, SourceRuntime)> = vec![
-        (PhaseName::Loading, SourceRuntime::loading()),
+        (
+            PhaseName::Loading,
+            SourceRuntime::loading(BindingAuthority::bind(
+                PhysicalRootLease::take(std::env::temp_dir()).identity(),
+            )),
+        ),
         (
             PhaseName::Refreshing,
             SourceRuntime::refreshing(
@@ -260,11 +400,14 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
         ),
         (
             PhaseName::Blocked,
-            SourceRuntime::blocked(Some(GenerationIdentity::fresh())),
+            SourceRuntime::blocked(
+                BindingAuthority::bind(PhysicalRootLease::take(std::env::temp_dir()).identity()),
+                Some(GenerationIdentity::fresh()),
+            ),
         ),
         (
             PhaseName::Stopping,
-            SourceRuntime::stopping(Some(GenerationIdentity::fresh())),
+            SourceRuntime::stopping(Some(GenerationIdentity::fresh()), None),
         ),
     ];
 
@@ -336,7 +479,9 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
 #[test]
 fn strict_queryability_is_closed_over_retained_generations() {
     // Loading retains nothing; only Current is queryable.
-    let loading = SourceRuntime::loading();
+    let loading = SourceRuntime::loading(BindingAuthority::bind(
+        PhysicalRootLease::take(std::env::temp_dir()).identity(),
+    ));
     assert_eq!(loading.retained_generation(), None);
     assert_eq!(loading.live_publication(), None);
 
@@ -354,14 +499,21 @@ fn strict_queryability_is_closed_over_retained_generations() {
     );
 
     // Blocked and Stopping may retain zero or one.
-    assert_eq!(SourceRuntime::blocked(None).retained_generation(), None);
+    assert_eq!(
+        SourceRuntime::blocked(
+            BindingAuthority::bind(PhysicalRootLease::take(std::env::temp_dir()).identity()),
+            None
+        )
+        .retained_generation(),
+        None
+    );
     let accounted = GenerationIdentity::fresh();
     assert_eq!(
-        SourceRuntime::stopping(Some(accounted)).retained_generation(),
+        SourceRuntime::stopping(Some(accounted), None).retained_generation(),
         Some(accounted)
     );
     assert_eq!(
-        SourceRuntime::stopping(Some(accounted)).live_publication(),
+        SourceRuntime::stopping(Some(accounted), None).live_publication(),
         None
     );
 }

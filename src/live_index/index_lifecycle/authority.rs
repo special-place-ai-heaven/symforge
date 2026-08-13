@@ -343,25 +343,194 @@ pub enum PhaseName {
 /// The live runtime phase of one source.
 #[derive(Debug)]
 enum SourcePhase {
-    Loading,
+    Loading {
+        binding: BindingAuthority,
+        observer_phase: ObserverPhase,
+        work: NonCurrentWork,
+    },
     Current(CurrentPublication),
     Refreshing {
         retained: GenerationIdentity,
         binding: BindingAuthority,
         publication: PublicationIdentity,
+        observer_phase: ObserverPhase,
+        /// Permits outstanding against this source.
+        ///
+        /// Plural, per the frozen model. Slice 1 tracked a single
+        /// `PermitDrainSignal` and refused a transition on one outstanding
+        /// permit, which cannot express a source draining several at once.
+        active_permits: ActivePermits,
+        work: NonCurrentWork,
     },
     Blocked {
+        binding: BindingAuthority,
+        observer_phase: ObserverPhase,
         retained: Option<GenerationIdentity>,
+        cause: BlockedCause,
     },
     Stopping {
         retained: Option<GenerationIdentity>,
+        /// Teardown capacity already charged for this source's revocation.
+        ///
+        /// The frozen model requires a `Stopping` source to carry the residency
+        /// it has committed, so a revocation cannot be started that the process
+        /// cannot afford to finish. Slice 2's capacity work refunds against this;
+        /// until `capacity.rs` lands it records the charge as an opaque receipt
+        /// rather than pretending no charge exists.
+        committed_source_revocation_residency: Option<RevocationResidency>,
     },
+}
+
+/// Where a source's filesystem observer stands.
+///
+/// A source may hold no observer at all, hold one, be handing one over, or have
+/// lost one and be waiting to retry. Slice 1 carried only a bare `ObserverToken`
+/// where a token existed and had no way to say "absent" or "mid-handoff".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObserverPhase {
+    /// No observer has been registered yet.
+    Absent,
+    /// An observer is registered and delivering.
+    Active {
+        /// The stable token identifying this registration.
+        token: ObserverToken,
+    },
+    /// An observer is being handed over and is no longer authoritative.
+    Draining {
+        /// The token being drained.
+        token: ObserverToken,
+    },
+    /// The observer was lost; a replacement has not yet been registered.
+    ObserverFree {
+        /// Identifies the handoff attempt, so a retry is not mistaken for a new one.
+        handoff: ObserverToken,
+    },
+}
+
+impl ObserverPhase {
+    /// The token this phase stands on, when one exists.
+    ///
+    /// `Absent` and `ObserverFree` deliberately return `None` rather than
+    /// inventing a token: a source with no live observer must not be able to
+    /// present one.
+    pub fn token(&self) -> Option<ObserverToken> {
+        match self {
+            Self::Active { token } | Self::Draining { token } => Some(*token),
+            Self::Absent | Self::ObserverFree { .. } => None,
+        }
+    }
+}
+
+/// What a non-`Current` source is doing about becoming `Current` again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NonCurrentWork {
+    /// Known stale, nothing started yet.
+    Dirty,
+    /// Cannot start until capacity is granted.
+    WaitingForCapacity,
+    /// A candidate is being built under this authority.
+    Building {
+        /// The candidate doing the work.
+        candidate: CandidateIdentity,
+    },
+    /// A built candidate is being verified.
+    Verifying {
+        /// The candidate under verification.
+        candidate: CandidateIdentity,
+    },
+    /// A previous attempt failed and a retry is pending.
+    RetryWait {
+        /// How many attempts have been made.
+        attempt: u32,
+    },
+}
+
+/// The permits outstanding against one source.
+///
+/// A newtype rather than a bare count: the frozen model requires a transition to
+/// refuse while ANY permit is outstanding, and a count that could be decremented
+/// twice would silently authorize an install over a live permit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivePermits {
+    outstanding: Vec<PublicationIdentity>,
+}
+
+impl ActivePermits {
+    /// No permits outstanding.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Record a permit issued under `grant`.
+    pub fn record(&mut self, grant: PublicationIdentity) {
+        if !self.outstanding.contains(&grant) {
+            self.outstanding.push(grant);
+        }
+    }
+
+    /// Retire a permit. Returns whether it was outstanding, so a caller cannot
+    /// retire a permit twice and drive the count below the truth.
+    pub fn retire(&mut self, grant: PublicationIdentity) -> bool {
+        let before = self.outstanding.len();
+        self.outstanding.retain(|entry| *entry != grant);
+        self.outstanding.len() != before
+    }
+
+    /// Whether anything is still outstanding.
+    pub fn is_drained(&self) -> bool {
+        self.outstanding.is_empty()
+    }
+
+    /// How many permits are outstanding.
+    pub fn len(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    /// Whether no permit has ever been recorded, or all have retired.
+    pub fn is_empty(&self) -> bool {
+        self.outstanding.is_empty()
+    }
+}
+
+/// Why a source is `Blocked`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedCause {
+    /// A candidate failed verification and no retry can help without operator action.
+    VerificationFailed,
+    /// The observer could not be re-registered.
+    ObserverUnavailable,
+    /// Capacity was refused and the request cannot be satisfied.
+    CapacityRefused,
+}
+
+/// Teardown capacity committed to a revocation.
+///
+/// Opaque until `capacity.rs` lands. It exists now so `Stopping` can carry the
+/// charge the frozen model requires rather than omitting the field and implying
+/// no charge was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevocationResidency {
+    charge: PublicationIdentity,
+}
+
+impl RevocationResidency {
+    /// Record a committed teardown charge under a never-reused identity.
+    pub fn committed() -> Self {
+        Self {
+            charge: PublicationIdentity::fresh(),
+        }
+    }
+
+    /// The identity of the charge, for refund reconciliation.
+    pub fn charge(self) -> PublicationIdentity {
+        self.charge
+    }
 }
 
 impl SourcePhase {
     fn name(&self) -> PhaseName {
         match self {
-            Self::Loading => PhaseName::Loading,
+            Self::Loading { .. } => PhaseName::Loading,
             Self::Current(_) => PhaseName::Current,
             Self::Refreshing { .. } => PhaseName::Refreshing,
             Self::Blocked { .. } => PhaseName::Blocked,
@@ -413,9 +582,13 @@ pub struct SourceRuntime {
 
 impl SourceRuntime {
     /// Start a source in `Loading` with no queryable generation.
-    pub fn loading() -> Self {
+    pub fn loading(binding: BindingAuthority) -> Self {
         Self {
-            phase: SourcePhase::Loading,
+            phase: SourcePhase::Loading {
+                binding,
+                observer_phase: ObserverPhase::Absent,
+                work: NonCurrentWork::Dirty,
+            },
             mutation_epoch: MutationEpoch::initial(),
             grants_issued: 0,
         }
@@ -437,6 +610,9 @@ impl SourceRuntime {
                 retained,
                 binding,
                 publication: PublicationIdentity::fresh(),
+                observer_phase: ObserverPhase::Absent,
+                active_permits: ActivePermits::none(),
+                work: NonCurrentWork::Dirty,
             },
             mutation_epoch: MutationEpoch::initial(),
             grants_issued: 0,
@@ -444,20 +620,82 @@ impl SourceRuntime {
     }
 
     /// Start a source in `Blocked`.
-    pub fn blocked(retained: Option<GenerationIdentity>) -> Self {
+    pub fn blocked(binding: BindingAuthority, retained: Option<GenerationIdentity>) -> Self {
         Self {
-            phase: SourcePhase::Blocked { retained },
+            phase: SourcePhase::Blocked {
+                binding,
+                observer_phase: ObserverPhase::Absent,
+                retained,
+                cause: BlockedCause::VerificationFailed,
+            },
             mutation_epoch: MutationEpoch::initial(),
             grants_issued: 0,
         }
     }
 
-    /// Start a source in `Stopping`.
-    pub fn stopping(retained: Option<GenerationIdentity>) -> Self {
+    /// Start a source in `Stopping`, carrying the teardown capacity it committed.
+    pub fn stopping(
+        retained: Option<GenerationIdentity>,
+        committed_source_revocation_residency: Option<RevocationResidency>,
+    ) -> Self {
         Self {
-            phase: SourcePhase::Stopping { retained },
+            phase: SourcePhase::Stopping {
+                retained,
+                committed_source_revocation_residency,
+            },
             mutation_epoch: MutationEpoch::initial(),
             grants_issued: 0,
+        }
+    }
+
+    /// The observer phase this source stands on.
+    ///
+    /// `Current` sources carry their observer cut inside the publication, so this
+    /// reports `Active` on the publication's cut rather than inventing a
+    /// separate one.
+    pub fn observer_phase(&self) -> ObserverPhase {
+        match &self.phase {
+            SourcePhase::Current(publication) => ObserverPhase::Active {
+                token: publication.observer_cut(),
+            },
+            SourcePhase::Loading { observer_phase, .. }
+            | SourcePhase::Refreshing { observer_phase, .. }
+            | SourcePhase::Blocked { observer_phase, .. } => observer_phase.clone(),
+            SourcePhase::Stopping { .. } => ObserverPhase::Absent,
+        }
+    }
+
+    /// What a non-`Current` source is doing about becoming `Current` again.
+    pub fn work(&self) -> Option<NonCurrentWork> {
+        match &self.phase {
+            SourcePhase::Loading { work, .. } | SourcePhase::Refreshing { work, .. } => {
+                Some(work.clone())
+            }
+            SourcePhase::Current(_)
+            | SourcePhase::Blocked { .. }
+            | SourcePhase::Stopping { .. } => None,
+        }
+    }
+
+    /// The permits outstanding against this source.
+    ///
+    /// Only a `Refreshing` source can hold permits: a grant moves the source off
+    /// `Current`, and no other phase issues one.
+    pub fn active_permits(&self) -> ActivePermits {
+        match &self.phase {
+            SourcePhase::Refreshing { active_permits, .. } => active_permits.clone(),
+            _ => ActivePermits::none(),
+        }
+    }
+
+    /// The teardown capacity a `Stopping` source has committed, if any.
+    pub fn committed_revocation_residency(&self) -> Option<RevocationResidency> {
+        match &self.phase {
+            SourcePhase::Stopping {
+                committed_source_revocation_residency,
+                ..
+            } => *committed_source_revocation_residency,
+            _ => None,
         }
     }
 
@@ -485,21 +723,41 @@ impl SourceRuntime {
     /// generation is never queryable — it is reported here for accounting only.
     pub fn retained_generation(&self) -> Option<GenerationIdentity> {
         match &self.phase {
-            SourcePhase::Loading => None,
+            SourcePhase::Loading { .. } => None,
             SourcePhase::Current(publication) => Some(publication.generation()),
             SourcePhase::Refreshing { retained, .. } => Some(*retained),
-            SourcePhase::Blocked { retained } | SourcePhase::Stopping { retained } => *retained,
+            SourcePhase::Blocked { retained, .. } | SourcePhase::Stopping { retained, .. } => {
+                *retained
+            }
         }
     }
 
     /// The binding a non-`Current` phase is still bound to, if any.
+    /// Every phase except `Stopping` is bound to a physical root.
+    ///
+    /// `Loading` and `Blocked` previously reported `None` here, which read as
+    /// "this source has no binding" when in fact both carry one — a `Loading`
+    /// source is bound before it has a generation, and a `Blocked` source stays
+    /// bound so an operator can act on the right root. Only `Stopping` has
+    /// genuinely surrendered its binding.
     pub fn retained_binding(&self) -> Option<&BindingAuthority> {
         match &self.phase {
             SourcePhase::Current(publication) => Some(publication.binding()),
-            SourcePhase::Refreshing { binding, .. } => Some(binding),
-            SourcePhase::Loading | SourcePhase::Blocked { .. } | SourcePhase::Stopping { .. } => {
-                None
-            }
+            SourcePhase::Refreshing { binding, .. }
+            | SourcePhase::Loading { binding, .. }
+            | SourcePhase::Blocked { binding, .. } => Some(binding),
+            SourcePhase::Stopping { .. } => None,
+        }
+    }
+
+    /// Why a `Blocked` source is blocked.
+    ///
+    /// `None` for every other phase rather than a default cause: a source that
+    /// is not blocked has no reason to report.
+    pub fn blocked_cause(&self) -> Option<BlockedCause> {
+        match &self.phase {
+            SourcePhase::Blocked { cause, .. } => Some(cause.clone()),
+            _ => None,
         }
     }
 
@@ -520,9 +778,9 @@ impl SourceRuntime {
         match &self.phase {
             SourcePhase::Current(publication) => Some(publication.publication()),
             SourcePhase::Refreshing { publication, .. } => Some(*publication),
-            SourcePhase::Loading | SourcePhase::Blocked { .. } | SourcePhase::Stopping { .. } => {
-                None
-            }
+            SourcePhase::Loading { .. }
+            | SourcePhase::Blocked { .. }
+            | SourcePhase::Stopping { .. } => None,
         }
     }
 
@@ -540,12 +798,39 @@ impl SourceRuntime {
     /// once. It also advanced the epoch for a freeze that did not happen; it now
     /// leaves the epoch alone on that path too.
     pub fn freeze(&mut self) -> Option<PublicationIdentity> {
-        let (retained, binding) = match &self.phase {
-            SourcePhase::Current(current) => (current.generation(), current.binding().clone()),
+        // Observer phase, outstanding permits and in-flight work are CARRIED
+        // ACROSS a re-freeze, not reset. A source already `Refreshing` with a
+        // live permit that froze again would otherwise publish an empty
+        // `active_permits`, and the very next transition would see a drained
+        // source and install over that permit -- the defect this slice widened
+        // the model to make expressible.
+        let (retained, binding, observer_phase, active_permits, work) = match &self.phase {
+            SourcePhase::Current(current) => (
+                current.generation(),
+                current.binding().clone(),
+                ObserverPhase::Active {
+                    token: current.observer_cut(),
+                },
+                ActivePermits::none(),
+                NonCurrentWork::Dirty,
+            ),
             SourcePhase::Refreshing {
-                retained, binding, ..
-            } => (*retained, binding.clone()),
-            SourcePhase::Loading | SourcePhase::Blocked { .. } | SourcePhase::Stopping { .. } => {
+                retained,
+                binding,
+                observer_phase,
+                active_permits,
+                work,
+                ..
+            } => (
+                *retained,
+                binding.clone(),
+                observer_phase.clone(),
+                active_permits.clone(),
+                work.clone(),
+            ),
+            SourcePhase::Loading { .. }
+            | SourcePhase::Blocked { .. }
+            | SourcePhase::Stopping { .. } => {
                 return None;
             }
         };
@@ -555,8 +840,61 @@ impl SourceRuntime {
             retained,
             binding,
             publication,
+            observer_phase,
+            active_permits,
+            work,
         };
         Some(publication)
+    }
+
+    /// Record that a permit was issued against this source's current freeze.
+    ///
+    /// Returns whether it was recorded: only a `Refreshing` source can hold
+    /// permits, because a grant is what moved it off `Current`.
+    pub fn record_permit(&mut self, grant: PublicationIdentity) -> bool {
+        match &mut self.phase {
+            SourcePhase::Refreshing { active_permits, .. } => {
+                active_permits.record(grant);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Retire a permit that has reached a terminal path.
+    ///
+    /// Returns whether this call retired it. A second retire of the same permit
+    /// returns `false` rather than draining the source twice, so a
+    /// double-terminated permit cannot make a still-busy source look drained.
+    pub fn retire_permit(&mut self, grant: PublicationIdentity) -> bool {
+        match &mut self.phase {
+            SourcePhase::Refreshing { active_permits, .. } => active_permits.retire(grant),
+            _ => false,
+        }
+    }
+
+    /// Record what a non-`Current` source is now doing.
+    pub fn set_work(&mut self, next: NonCurrentWork) -> bool {
+        match &mut self.phase {
+            SourcePhase::Loading { work, .. } | SourcePhase::Refreshing { work, .. } => {
+                *work = next;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record an observer phase change for a non-`Current` source.
+    pub fn set_observer_phase(&mut self, next: ObserverPhase) -> bool {
+        match &mut self.phase {
+            SourcePhase::Loading { observer_phase, .. }
+            | SourcePhase::Refreshing { observer_phase, .. }
+            | SourcePhase::Blocked { observer_phase, .. } => {
+                *observer_phase = next;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Install a new `Current` publication, preserving the monotonic epoch and
