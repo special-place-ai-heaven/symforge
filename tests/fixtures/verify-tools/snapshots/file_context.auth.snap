@@ -16,8 +16,8 @@ Knowledge evidence:
   source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab publication=<gen> content=<gen> target=file:src/auth.rs
   counts total=6 shown=5 overflow=1 ambiguous=0 missing=0
   coverage bridge=complete authority=complete
-  1. cases.jsonl:5 bytes=1302..1313 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=1 resolution=resolved_exact lifecycle=active voice=unknown
-  2. cases.jsonl:6 bytes=1540..1551 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=2 resolution=resolved_exact lifecycle=active voice=unknown
-  3. snapshots/file_context.auth.snap:2 bytes=58..69 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=11 resolution=resolved_exact lifecycle=active voice=unknown
-  4. snapshots/file_context.auth.snap:3 bytes=112..123 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=12 resolution=resolved_exact lifecycle=active voice=unknown
-  5. snapshots/file_context.auth.snap:5 bytes=133..144 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=13 resolution=resolved_exact lifecycle=active voice=unknown
+  1. cases.jsonl:5 bytes=1302..1313 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=1 resolution=resolved_exact lifecycle=unknown voice=unknown
+  2. cases.jsonl:6 bytes=1540..1551 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=2 resolution=resolved_exact lifecycle=unknown voice=unknown
+  3. snapshots/file_context.auth.snap:2 bytes=58..69 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=11 resolution=resolved_exact lifecycle=unknown voice=unknown
+  4. snapshots/file_context.auth.snap:3 bytes=112..123 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=12 resolution=resolved_exact lifecycle=unknown voice=unknown
+  5. snapshots/file_context.auth.snap:5 bytes=133..144 content_hash=<hash> source=23f0b55b77424cf55382590696f62d9e08008c99c4080cc8653ecab3af52ebab generation=<gen> link_id=<id> bridge_index=13 resolution=resolved_exact lifecycle=unknown voice=unknown
