@@ -239,6 +239,48 @@ overlap across amendments. A20 therefore declares those contracts in its
 `contract_clause_ids` rather than claiming replacement ranges inside A19's — the
 attribution the manifest can actually express, stated rather than fudged.
 
+A third review, by Grok 4.6 and aimed only at what the first two had not
+examined, then found that **both of the above were still wrong**, and it was
+right twice.
+
+8. **A20 restored the prior publication, which is the V10 last-valid lane under
+   a new name.** Closing "serve while the permit writes" left "serve once the
+   permit retires", and my R20A oracle asserted the survivor as its *positive*
+   case. After `replace_beneath` the retained generation may no longer describe
+   disk, and FR-043 — a requirement A20 itself lists — says in as many words that
+   no terminal path directly restores the prior publication. Queryability now
+   turns on whether the refresh ever *issued* a permit, not on whether one is
+   outstanding: `ActivePermits::ever_recorded` latches, `retire` does not clear
+   it, `freeze` carries it, and only installing a successor `Current` clears it.
+   Mutation-verified: restoring the `is_drained` condition fails R20A alone.
+9. **The corpus fix was a veneer.** Eight *openings* said the new rule while
+   FR-017 — "A non-current source MUST return the closed `SourceRefusal`
+   envelope" — sat untouched inside A19's `spec.md:130-1179` range, along with
+   NFR-003, SC-011, the GOAL bullets and `plan.md`'s failure-isolation row. And
+   `ORACLE-QUERY-ATOMIC-LEASE` carried my new assertion NEXT TO "refuses anything
+   not proved Current and complete": one oracle, two contradictory assertions,
+   added by me without reconciling the first. All are amended together now, and
+   A20's `requirement_ids` gain FR-017 and SC-011 — it had listed FR-037/043/051,
+   requirements it did not edit, while omitting the ones it did. (NFR-003 cannot
+   be listed: `REQUIREMENT_ID_RE` admits only `FR-`/`SC-` forms.)
+
+It also closed two gaps neither earlier review saw. **Not one oracle in this
+slice spawned a thread**, so the 33 "carry-forward" oracles would all have passed
+a build with the `Mutex` deleted; there are now two genuinely racing oracles,
+eight threads on one key through a barrier and sixteen reservations against a
+four-block limit. And the Windows link claim rested on a comment naming the wrong
+predicate — the policy is this crate's `symlink_metadata().is_symlink()` walk,
+not `cap-std`, which follows in-sandbox links and refuses only escapes. There is
+now a `#[cfg(windows)]` oracle that creates an unprivileged `mklink /J` junction
+and proves the refusal.
+
+Its unrefuted criticism, recorded rather than answered: this change is above the
+reviewable ceiling, and the A20 miss is the measurement. Two adversarial reviews
+returned green on a corpus half that was self-contradictory. It also judged that
+re-slicing the runtime now would be theater, since the blockers were closed as
+one unit — but that any further A20 text-and-digest correction should be its own
+stacked change, and T060/T063 should not start before it exists.
+
 Two oracles were themselves wrong and were fixed rather than bent.
 `concurrent_opens_join_one_admission` handed its two opens two different
 tempdirs — two different projects under one key — and passed. And the join check

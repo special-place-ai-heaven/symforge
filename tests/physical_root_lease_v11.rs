@@ -238,12 +238,13 @@ fn replacement_through_a_revoked_lease_touches_nothing() {
 
 /// Symlink creation is unprivileged on Unix; CI runs there.
 ///
-/// Windows reparse points take the SAME branch — `Metadata::is_symlink` on the
-/// `cap-std` handle, which reports a reparse point as a symlink — and no test
-/// creates one, so that half is unverified. An earlier version of this comment
-/// credited `metadata_is_reparse_point`, which lives in `src/paths.rs`, is
-/// called only from `src/gitignore_hygiene.rs`, and has nothing to do with this
-/// path: a claim about code that does not run here.
+/// The never-follow policy is this userspace `symlink_metadata().is_symlink()`
+/// walk, NOT `cap-std` — cap-std follows links that stay inside the capability
+/// and refuses only those that escape it. On Windows `is_symlink` is true for
+/// name-surrogate reparse tags, which covers symlinks and `mklink /J`
+/// junctions, but not cloud-placeholder or WOF tags. So the claim this pins is
+/// narrower than "reparse points are refused", and the Windows half now has its
+/// own test below rather than a comment asserting equivalence.
 #[cfg(unix)]
 #[test]
 fn a_link_component_is_refused_rather_than_followed() {
@@ -327,5 +328,59 @@ fn a_staged_replacement_refuses_to_commit_under_a_revoked_lease() {
     assert_eq!(
         std::fs::read(root.path().join("target.txt")).expect("target replaced"),
         b"replacement"
+    );
+}
+
+/// The Windows half of the same refusal, on a directory junction.
+///
+/// `mklink /J` is unprivileged, unlike `mklink /D`, so this runs without
+/// Developer Mode or elevation. It is the one Windows reparse kind the policy
+/// claims to catch: a name-surrogate tag that `symlink_metadata().is_symlink()`
+/// reports true for. Until this existed, the Windows claim rested on a comment.
+#[cfg(windows)]
+#[test]
+fn a_junction_component_is_refused_rather_than_followed() {
+    let root = tempfile::tempdir().expect("temp root");
+    let outside = tempfile::tempdir().expect("outside root");
+    std::fs::write(outside.path().join("escaped.txt"), b"outside").expect("outside file");
+    std::fs::create_dir(root.path().join("real")).expect("real dir");
+
+    let junction = root.path().join("link");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(outside.path())
+        .output()
+        .expect("mklink runs");
+    assert!(
+        status.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let lease = PhysicalRootLease::take(root.path());
+
+    // Negative: a write through the junction is refused before any I/O, and the
+    // file outside the root is untouched.
+    let refusal = replace_beneath(&lease, Path::new("link/escaped.txt"), b"written")
+        .expect_err("a junction component must be refused");
+    assert!(
+        matches!(refusal, RootRefusal::LinkComponent { .. }),
+        "expected a link-component refusal, got {refusal:?}"
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("escaped.txt")).expect("outside file survives"),
+        b"outside",
+        "a refused write reached through the junction"
+    );
+
+    // Positive: an ordinary directory beneath the same root still writes, so the
+    // refusal is about the junction rather than about subdirectories.
+    let receipt = replace_beneath(&lease, Path::new("real/ok.txt"), b"written")
+        .expect("a real subdirectory writes");
+    assert_eq!(receipt.lease(), lease.identity());
+    assert_eq!(
+        std::fs::read(root.path().join("real/ok.txt")).expect("written"),
+        b"written"
     );
 }

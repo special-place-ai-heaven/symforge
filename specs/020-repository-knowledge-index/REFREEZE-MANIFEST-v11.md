@@ -873,9 +873,11 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       ],
       "requirement_ids": [
         "F020-V11-A20",
+        "FR-017",
         "FR-037",
         "FR-043",
-        "FR-051"
+        "FR-051",
+        "SC-011"
       ]
     }
   ],

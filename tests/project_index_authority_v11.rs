@@ -929,17 +929,50 @@ fn a_refreshing_source_still_serves_its_complete_retained_generation() {
         "a source served readers while its own permit rewrote its disk"
     );
 
-    // And when that permit retires, the source serves its retention again: the
-    // refusal is about the outstanding permit, not a blanket refusal to serve a
-    // refreshing source.
+    // Retiring that permit does NOT restore reads. An earlier version asserted
+    // the opposite as its positive case, which is the V10 last-valid answer
+    // under a new name: `replace_beneath` has run, so the retained generation
+    // may no longer describe the bytes on disk, and FR-043 says no terminal path
+    // directly restores the prior publication. Draining says the write finished,
+    // not that it never happened.
     let outstanding = mutating.active_permits();
     assert_eq!(outstanding.len(), 1);
     for grant in outstanding.outstanding() {
         assert!(mutating.retire_permit(grant));
     }
+    assert!(mutating.active_permits().is_drained());
     assert!(
-        mutating.is_queryable(),
-        "retiring the last permit did not restore reads"
+        !mutating.is_queryable(),
+        "a source restored the prior publication by retiring a permit"
+    );
+
+    // Only a successor Current restores reads, which is the sole path FR-043
+    // leaves open. Driven through `transition::apply` rather than a direct
+    // install, because that IS the path: a transition is what promotes.
+    let successor_root = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
+    transition::apply(
+        &mut mutating,
+        TransitionKind::Rebind,
+        &_lease,
+        BindingAuthority::bind(successor_root.identity()),
+        ObserverToken::fresh(),
+        &PermitDrainSignal::new(),
+    )
+    .expect("a drained source installs its successor");
+    let restored = mutating
+        .queryable_generation()
+        .expect("a successor Current is queryable");
+
+    // And installing clears the latch, so the next reload-entered refresh serves
+    // its retention: the refusal above was about that mutation, not a source
+    // that has been permanently poisoned by ever having been written to.
+    assert!(mutating.freeze().is_some());
+    assert_eq!(
+        mutating.queryable_generation(),
+        Some(restored),
+        "a reload-entered refresh after a completed mutation stopped serving"
     );
 }
 

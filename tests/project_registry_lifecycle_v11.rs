@@ -7,7 +7,7 @@
 use symforge::live_index::index_lifecycle::authority::BindingAuthority;
 use symforge::live_index::index_lifecycle::physical_root::PhysicalRootLease;
 use symforge::live_index::index_lifecycle::registry::{
-    ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection, StatePlacement,
+    ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection, SlotIdentity, StatePlacement,
 };
 
 fn binding() -> BindingAuthority {
@@ -710,4 +710,60 @@ fn an_executed_plan_uses_the_decision_the_plan_recorded() {
     assert_eq!(live.slot(), slot);
     assert_eq!(live.placement(), StatePlacement::UserLocal);
     assert_eq!(live.capacity_owner().expect("live slot"), Some(owner));
+}
+
+/// Two real threads racing one key must reach one admission.
+///
+/// Found by adversarial review: not one oracle in this slice spawned a thread,
+/// so `concurrent_opens_join_one_admission` proved a sequential property under a
+/// concurrent name, and a build that deleted the `Mutex` and used a bare
+/// `HashMap` would have passed every one of them. The lock is the mechanism; a
+/// test that never overlaps two calls does not pin that it stays.
+#[test]
+fn overlapping_admits_of_one_key_mint_one_identity() {
+    use std::sync::Barrier;
+
+    let registry = ProjectRegistry::new();
+    let key = ProjectKey::new("raced");
+    let root = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity();
+
+    // A barrier so both threads are inside `admit` at the same time rather than
+    // merely dispatched at the same time.
+    let gate = std::sync::Arc::new(Barrier::new(8));
+    let slots: Vec<SlotIdentity> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let registry = std::sync::Arc::clone(&registry);
+                let key = key.clone();
+                let gate = std::sync::Arc::clone(&gate);
+                scope.spawn(move || {
+                    gate.wait();
+                    registry
+                        .admit(
+                            key,
+                            BindingAuthority::bind(root),
+                            RootProtection::Normal,
+                            false,
+                            StatePlacement::ProjectLocal,
+                        )
+                        .expect("every racing open joins")
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect()
+    });
+
+    // One identity for all eight, and the registry counted all eight joiners.
+    assert!(
+        slots.windows(2).all(|pair| pair[0] == pair[1]),
+        "racing opens of one key minted more than one identity: {slots:?}"
+    );
+    assert_eq!(registry.pending_joiners(&key), Some(8));
+
+    // And it installs once, under that identity.
+    let live = registry.install(&key, None).expect("install");
+    assert_eq!(live.slot(), slots[0]);
 }

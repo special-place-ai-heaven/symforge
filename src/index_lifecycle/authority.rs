@@ -477,14 +477,22 @@ pub enum NonCurrentWork {
     },
 }
 
-/// The permits outstanding against one source.
+/// The permits outstanding against one source, and whether any ever was.
 ///
 /// A newtype rather than a bare count: the frozen model requires a transition to
 /// refuse while ANY permit is outstanding, and a count that could be decremented
 /// twice would silently authorize an install over a live permit.
+///
+/// `ever_recorded` is the second question, and it is not the same one.
+/// "Outstanding" answers whether a write is in flight. "Ever recorded" answers
+/// whether a write HAPPENED against this freeze — and once it has, the retained
+/// generation no longer describes the bytes on disk, so retiring the permit must
+/// not restore it. FR-043 says exactly that: no terminal path directly restores
+/// the prior publication. Draining is not a time machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivePermits {
     outstanding: Vec<PublicationIdentity>,
+    ever_recorded: bool,
 }
 
 impl ActivePermits {
@@ -495,9 +503,18 @@ impl ActivePermits {
 
     /// Record a permit issued under `grant`.
     pub fn record(&mut self, grant: PublicationIdentity) {
+        self.ever_recorded = true;
         if !self.outstanding.contains(&grant) {
             self.outstanding.push(grant);
         }
+    }
+
+    /// Whether any permit was ever recorded against this freeze.
+    ///
+    /// Latched: `retire` never clears it, and `freeze` carries it across, so it
+    /// is cleared only by installing a successor `Current`.
+    pub fn ever_recorded(&self) -> bool {
+        self.ever_recorded
     }
 
     /// Retire a permit. Returns whether it was outstanding, so a caller cannot
@@ -800,6 +817,15 @@ impl SourceRuntime {
     /// mutation case silently, and reopened the exact window the freeze ordering
     /// exists to close.
     ///
+    /// The condition is `ever_recorded`, not `is_drained`, and the difference is
+    /// the whole rule. Draining says the write finished; it says nothing about
+    /// whether it happened. Once a permit has existed against this freeze the
+    /// retained generation may no longer describe the bytes on disk, so serving
+    /// it after the permit retires is the V10 last-valid answer wearing a new
+    /// name — and FR-043 forbids it in as many words: no terminal path directly
+    /// restores the prior publication. Only a successor `Current` does, which is
+    /// what clears the latch.
+    ///
     /// `Blocked` and `Stopping` return `None` even when they retain something.
     /// Neither has a successor in flight, so its retention is a remnant rather
     /// than a refresh, and serving it would be serving the last thing that
@@ -812,7 +838,7 @@ impl SourceRuntime {
                 retained,
                 active_permits,
                 ..
-            } => active_permits.is_drained().then_some(*retained),
+            } => (!active_permits.ever_recorded()).then_some(*retained),
             SourcePhase::Loading { .. }
             | SourcePhase::Blocked { .. }
             | SourcePhase::Stopping { .. } => None,

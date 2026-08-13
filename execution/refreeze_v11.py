@@ -220,7 +220,18 @@ EXPECTED_AMENDMENT_MAPPINGS = {
     # to take a project offline for the duration of any reindex, contradicting a
     # green production test.
     "F020-V11-A20": {
-        "requirement_ids": ("F020-V11-A20", "FR-037", "FR-043", "FR-051"),
+        # FR-017 and SC-011 are what A20 actually changes: both stated that a
+        # non-current source must refuse, which is the rule the amendment
+        # narrows. Listing only FR-037/043/051 let the amendment declare
+        # requirements it did not edit and omit the ones it did.
+        "requirement_ids": (
+            "F020-V11-A20",
+            "FR-017",
+            "FR-037",
+            "FR-043",
+            "FR-051",
+            "SC-011",
+        ),
         # A20 first declared only these two, while the pre-amendment rule was
         # still asserted in four more contracts and the quickstart -- a live
         # contradiction inside a corpus where every document claims supremacy.

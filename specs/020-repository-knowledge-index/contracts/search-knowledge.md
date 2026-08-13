@@ -64,8 +64,8 @@ implementation voice, not lifecycle `Current`.
 
 Before searching, the project registry freezes the authorized selected-source set in
 a sealed selection receipt and acquires one strict complete-generation lease for every
-selected source, per F020-V11-A20. `Loading`, `Blocked`, `Stopping`, `Gapped`,
-permit-holding `Refreshing`, or verification-overdue returns one exact refusal:
+selected source, per F020-V11-A20. `Loading`, `Blocked`, `Stopping`, `Gapped`, any
+`Refreshing` that issued a permit, or verification-overdue returns one exact refusal:
 resolved source or `SelectionUnavailable` with bijective per-source evidence for a
 selected set. Invalid or unauthorized selection retains its indistinguishable
 `InvalidSelection` shape. A retained verified generation remains internal recovery

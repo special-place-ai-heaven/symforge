@@ -20,8 +20,8 @@ index. If any required selected source is non-current, the call returns exact
 The V10 role, bridge, ranking, security, and formatting evidence remains applicable
 after strict acquisition. Every map, `ask`, file/symbol context, and knowledge-search
 generation read acquires lifecycle `Current` for every required selected source through
-the project registry, or, per F020-V11-A20, what `Refreshing` retains while no mutation
-permit is outstanding. A `Blocked` or `Stopping` retention is internal, non-current
+the project registry, or, per F020-V11-A20, what a `Refreshing` RELOAD retains. A
+permit-issuing refresh, a `Blocked` or a `Stopping` retention is internal, non-current
 material; it cannot supply a map, backlink, absence, or last-verified response.
 
 Single-source failure returns `SourceUnavailable`; multi-source failure returns
@@ -269,8 +269,8 @@ same `SafeHit` output guard before formatting, budgeting, analytics, or CCR.
 17. A repeated `get_file_content` during watcher-triggered non-current work refuses;
     after successor promotion it serves the new generation, never a prior-generation
     cache receipt or content.
-18. Loading, Blocked, Stopping, `Gapped`, verification-overdue, and permit-holding
-    Refreshing sources return exact `SourceRefusal` before map/card/backlink/absence
+18. Loading, Blocked, Stopping, `Gapped`, verification-overdue, and any Refreshing
+    that issued a permit return exact `SourceRefusal` before map/card/backlink/absence
     formatting; only a complete generation is ever exposed, per F020-V11-A20.
 19. Current/intent/history authority choices filter voice within one captured
     lifecycle-`Current` generation and cannot select generation consistency.

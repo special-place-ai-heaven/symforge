@@ -306,7 +306,7 @@ const FROZEN_DIGESTS = {
   },
   acceptance_oracles: {
     domain: "symforge.lifecycle.v11.acceptance.oracles",
-    hash: "c1587a3b95bdc7cace7e27b250a86a882a6b37be03f1c0677bc807395686ddd9",
+    hash: "ea83e1c29100c68bdd667747a25ef83be01e6a0c40181ddea914294ca1350008",
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",

@@ -431,3 +431,54 @@ fn whole_runtime_capacity_is_conserved_under_activation() {
          measure, so nothing here has observed whole-runtime conservation. T069 owns the body."
     );
 }
+
+/// Reservations racing a tight limit must never over-promise.
+///
+/// The companion to the registry race, and for the same reason: every capacity
+/// oracle here is single-threaded, so none of them observes the `Mutex` doing
+/// its job. If `reserve` read `charged` and wrote it without holding the lock
+/// across both, two threads could each see room for the last block.
+#[test]
+fn racing_reservations_never_exceed_the_limit() {
+    use std::sync::Barrier;
+
+    let pool = ProcessCapacityPool::new();
+    // Exactly four blocks of 250 fit; sixteen threads ask for one each.
+    let root = pool.root(1_000);
+    let gate = std::sync::Arc::new(Barrier::new(16));
+
+    let granted: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let pool = std::sync::Arc::clone(&pool);
+                let gate = std::sync::Arc::clone(&gate);
+                scope.spawn(move || {
+                    gate.wait();
+                    // Held to the end of the scope, so nothing is refunded while
+                    // the others are still asking.
+                    pool.reserve(root, 250).ok()
+                })
+            })
+            .collect();
+        let held: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+        let count = held.iter().filter(|grant| grant.is_some()).count();
+        assert_eq!(
+            pool.charged(root),
+            250 * count as u64,
+            "charged does not match the grants actually issued"
+        );
+        count
+    });
+
+    assert_eq!(
+        granted, 4,
+        "the pool issued {granted} grants for four blocks"
+    );
+    // Every grant dropped at scope exit, so the whole limit came back.
+    assert_eq!(pool.charged(root), 0);
+    assert_eq!(pool.available(root), 1_000);
+    assert_eq!(pool.unknown_refunds(), 0);
+}
