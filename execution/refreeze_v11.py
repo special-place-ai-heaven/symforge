@@ -2850,7 +2850,11 @@ def _validate_amendments(
 ) -> tuple[set[str], str]:
     if not isinstance(value, list):
         raise RefreezeError("AMENDMENTS_INVALID")
-    expected_ids = [f"F020-V11-A{index:02}" for index in range(1, 20)]
+    # A01-A20. The set is EXACT, not a lower bound: a missing amendment must
+    # still fail, so widening this for A20 raises the ceiling rather than
+    # relaxing the check. A20 (queryability closes on completeness, not recency)
+    # was decided by the operator and is signed for; see the manifest record.
+    expected_ids = [f"F020-V11-A{index:02}" for index in range(1, 21)]
     if len(value) != len(expected_ids):
         raise RefreezeError("AMENDMENT_COUNT_INVALID")
     records: list[dict[str, object]] = []
