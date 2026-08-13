@@ -11,10 +11,10 @@ This refreeze supersedes the V10 publication/readiness semantics wherever they
 conflict with the rules below. Historical review receipts remain evidence of the
 work performed, but they do not authorize a V11 implementation.
 
-1. `Current` is the only generation-queryable source state. `Loading` retains no
-   generation; `Refreshing` retains exactly one verified generation, while `Blocked`
-   and `Stopping` may retain zero or one. Any retained `VerifiedGeneration` is
-   immutable recovery evidence and never a public degraded or last-valid query lane.
+1. Only a COMPLETE verified generation is queryable (F020-V11-A20). `Current` is,
+   and so is what a `Refreshing` RELOAD retains; a refresh that issued a mutation
+   permit stays unqueryable until a successor `Current` installs. `Loading` holds
+   none. `Blocked` and `Stopping` retentions are recovery evidence, never a lane.
 2. Cold placeholders, snapshot seeds, candidates, capacity-refused attempts, and
    failed observations cannot mint query authority. They expose a closed
    `SourceRefusal` with safe diagnostics until one complete generation promotes.
@@ -690,10 +690,10 @@ historical scope can still retrieve them.
 - **FR-017**: Every successful result carrying `GenerationAuthority`, or deriving any
   fact from generation structure, MUST be built from a sealed Current lease and carry
   its complete generation, binding, source, scope, operation, and provenance
-  identities. A non-current source MUST return the closed `SourceRefusal` envelope
-  for that generation-backed operation instead of a stale/degraded success. Retained
-  generations and attempt diagnostics remain visible only through bounded health and
-  recovery evidence that cannot be mistaken for query authority. Pure root-bound
+  identities. A source with no COMPLETE generation MUST return the closed
+  `SourceRefusal` envelope instead of a stale/degraded success; per F020-V11-A20 a
+  `Refreshing` RELOAD still holds one and leases it, while a refresh that issued a
+  mutation permit does not until a successor installs. Pure root-bound
   `DiskObservation`, complete `WorktreeScopeObservation`, `GitObservation`, and
   runtime health do not require Current and remain independently authoritative within
   their closed authority: disk may prove path-local `PathMissing` from its retained
@@ -1014,8 +1014,8 @@ historical scope can still retrieve them.
   an in-flight budget smaller than that ceiling is legal and MUST NOT deadlock.
 - **NFR-003 Availability and trust**: One bad file cannot publish partial, stale, or
   mixed state. An observation-critical failure blocks candidate promotion and
-  strict-current acquisition; any retained verified generation remains immutable
-  and internal while the lifecycle exposes explicit recovery work/refusal evidence.
+  strict-current acquisition; a retained verified generation remains immutable, and
+  internal except where F020-V11-A20 leases a reload's, with refusal evidence.
 - **NFR-004 Recovery**: Crash/corruption leaves either the previous valid generation
   or an explicit source rebuild path.
 - **NFR-005 Latency**: V11 defines no independent cold-start SLO: a cold source stays
@@ -1069,8 +1069,8 @@ historical scope can still retrieve them.
   exact CI embed gate pass before completion.
 - **SC-011**: From an all-Current sealed selection, one bounded first-contact call
   returns source-cited entry points for every declared knowledge role plus explicit
-  unknown roles. If any selected source is non-current, the call returns a typed
-  per-source refusal and no partial orientation or absence claim.
+  unknown roles. If any selected source has no complete leasable generation per
+  F020-V11-A20, the call returns a typed per-source refusal and no absence claim.
 - **SC-012**: Bridge fixtures resolve exact path/unique-symbol links in both
   directions, expose ambiguous/missing links without guessing, and remove/repair
   backlinks atomically after source changes.

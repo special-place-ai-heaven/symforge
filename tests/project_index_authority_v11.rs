@@ -9,9 +9,10 @@
 use std::sync::Arc;
 
 use symforge::live_index::index_lifecycle::authority::{
-    AuthorityRefusal, BindingAuthority, CandidateAuthority, CurrentPublication, GenerationIdentity,
-    MutationGrantInput, ObserverToken, PhaseName, Provenance, PublicationIdentity,
-    SnapshotIdentity, SourceRuntime,
+    AuthorityRefusal, BindingAuthority, BlockedCause, CandidateAuthority, CurrentPublication,
+    GenerationIdentity, MutationGrantInput, NonCurrentWork, ObserverPhase, ObserverToken,
+    PhaseName, Provenance, PublicationIdentity, RevocationResidency, SnapshotIdentity,
+    SourceRuntime,
 };
 use symforge::live_index::index_lifecycle::mutation::{
     NoSideEffectProof, PermitDrainSignal, SourceMutationPermit, Termination,
@@ -20,12 +21,42 @@ use symforge::live_index::index_lifecycle::physical_root::PhysicalRootLease;
 use symforge::live_index::index_lifecycle::transition::{self, TransitionKind, TransitionStep};
 
 /// A source that is `Current` on a fresh root, plus the lease that root is on.
-fn current_source() -> (SourceRuntime, Arc<PhysicalRootLease>, PublicationIdentity) {
-    let lease = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+///
+/// The root is a per-test `TempDir`, not the machine's shared temp directory.
+/// Two of these tests write real files through a permit, and leasing the shared
+/// root meant those files were never cleaned up and, on a multi-user machine, a
+/// probe owned by someone else would make the rename fail — turning a property
+/// failure into an environment failure and telling us nothing about the code.
+/// The `TempDir` is returned so the caller keeps it alive; dropping it early
+/// would delete the root out from under the lease.
+fn current_source() -> (
+    SourceRuntime,
+    Arc<PhysicalRootLease>,
+    PublicationIdentity,
+    tempfile::TempDir,
+) {
+    let root = tempfile::tempdir().expect("per-test root");
+    let lease = Arc::new(PhysicalRootLease::take(root.path()));
     let binding = BindingAuthority::bind(lease.identity());
     let publication = CurrentPublication::promote(binding, ObserverToken::fresh());
     let identity = publication.publication();
-    (SourceRuntime::current(publication), lease, identity)
+    (SourceRuntime::current(publication), lease, identity, root)
+}
+
+/// Retire every permit the source still records.
+///
+/// `request_mutation_grant` now records the permit its grant will become, so a
+/// mutation-entered `Refreshing` source is not queryable and cannot be
+/// transitioned over. A terminated `SourceMutationPermit` ends its own drain
+/// signal, but nothing yet tells the `SourceRuntime` it is over — the permit
+/// does not hold the runtime and cannot. Slice 4's writer lane owns that call;
+/// until then a caller that ends a permit must also retire it, and these
+/// oracles do it explicitly rather than pretending the source noticed by
+/// itself.
+fn retire_all_permits(runtime: &mut SourceRuntime) {
+    for grant in runtime.active_permits().outstanding().collect::<Vec<_>>() {
+        assert!(runtime.retire_permit(grant), "permit was outstanding");
+    }
 }
 
 /// TEST-MUTATION-AUTHORITY (T022). The name is pinned by
@@ -37,7 +68,7 @@ fn current_source() -> (SourceRuntime, Arc<PhysicalRootLease>, PublicationIdenti
 /// mutation the source never authorized.
 #[test]
 fn mutation_authority_is_exact_and_terminal() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
 
     // Exact: the authority names this publication, generation, binding and
     // epoch as one whole.
@@ -94,7 +125,7 @@ fn mutation_authority_is_exact_and_terminal() {
 /// under root B.
 #[test]
 fn a_permit_cannot_commit_a_write_that_landed_under_another_root() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let elsewhere = tempfile::tempdir().expect("other root");
     let lease_b = PhysicalRootLease::take(elsewhere.path());
 
@@ -145,7 +176,7 @@ fn a_permit_cannot_commit_a_write_that_landed_under_another_root() {
 /// the check entirely and install over a live permit.
 #[test]
 fn a_transition_cannot_skip_drain() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -158,7 +189,9 @@ fn a_transition_cannot_skip_drain() {
     assert!(!drain.has_ended());
     let phase_before = runtime.phase();
     let epoch_before = runtime.mutation_epoch();
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     assert_eq!(
         transition::apply(
             &mut runtime,
@@ -189,6 +222,144 @@ fn a_transition_cannot_skip_drain() {
     drop(permit);
 }
 
+/// Slice 2 widening: a source can hold MORE THAN ONE outstanding permit.
+///
+/// Slice 1 tracked a single `PermitDrainSignal` and refused a transition on one
+/// outstanding permit, which cannot express a source draining several at once —
+/// the frozen model's `active_permits` is plural. A count alone would not do
+/// either: a permit retired twice would drive it below the truth and make a
+/// still-busy source look drained.
+#[test]
+fn a_source_tracks_every_outstanding_permit_and_retires_each_once() {
+    let (mut runtime, _lease, live, _root) = current_source();
+    runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    // The grant records a permit of its own; this oracle counts the two it
+    // records below, so start from a drained source.
+    retire_all_permits(&mut runtime);
+
+    let first = PublicationIdentity::fresh();
+    let second = PublicationIdentity::fresh();
+    assert!(
+        runtime.record_permit(first),
+        "a Refreshing source records permits"
+    );
+    assert!(runtime.record_permit(second));
+    assert_eq!(runtime.active_permits().len(), 2);
+    assert!(!runtime.active_permits().is_drained());
+
+    // Retiring one leaves the other outstanding: the source is NOT drained.
+    assert!(runtime.retire_permit(first));
+    assert!(
+        !runtime.active_permits().is_drained(),
+        "one retired permit drained a source that still holds another"
+    );
+
+    // Retiring the same permit twice must not drain the source.
+    assert!(
+        !runtime.retire_permit(first),
+        "a permit retired twice reported as retired again"
+    );
+    assert_eq!(runtime.active_permits().len(), 1);
+
+    // Positive: retiring the genuinely outstanding one drains it.
+    assert!(runtime.retire_permit(second));
+    assert!(runtime.active_permits().is_drained());
+}
+
+/// A re-freeze must carry outstanding permits across.
+///
+/// Freezing a source that is already `Refreshing` with a live permit must not
+/// publish an empty permit set: the next transition would see a drained source
+/// and install over a permit that is still acting.
+#[test]
+fn re_freezing_does_not_forget_an_outstanding_permit() {
+    let (mut runtime, _lease, live, _root) = current_source();
+    runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    retire_all_permits(&mut runtime);
+
+    let outstanding = PublicationIdentity::fresh();
+    runtime.record_permit(outstanding);
+    assert_eq!(runtime.active_permits().len(), 1);
+
+    let epoch_before = runtime.mutation_epoch();
+    runtime.freeze().expect("a Refreshing source re-freezes");
+
+    assert_eq!(
+        runtime.active_permits().len(),
+        1,
+        "a re-freeze dropped an outstanding permit"
+    );
+    assert!(runtime.mutation_epoch() > epoch_before);
+}
+
+/// Every phase except `Stopping` reports the binding it is actually on.
+#[test]
+fn only_a_stopping_source_has_surrendered_its_binding() {
+    let lease = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep());
+    let binding = BindingAuthority::bind(lease.identity());
+
+    let loading = SourceRuntime::loading(binding.clone());
+    assert_eq!(loading.retained_binding(), Some(&binding));
+    assert_eq!(loading.work(), Some(NonCurrentWork::Dirty));
+    assert_eq!(loading.observer_phase(), ObserverPhase::Absent);
+
+    let blocked = SourceRuntime::blocked(binding.clone(), None);
+    assert_eq!(blocked.retained_binding(), Some(&binding));
+    assert_eq!(
+        blocked.blocked_cause(),
+        Some(BlockedCause::VerificationFailed)
+    );
+
+    // Only Stopping has genuinely surrendered it.
+    let stopping = SourceRuntime::stopping(None, None);
+    assert_eq!(stopping.retained_binding(), None);
+    assert_eq!(stopping.blocked_cause(), None);
+}
+
+/// A `Stopping` source carries the teardown capacity it committed.
+///
+/// Omitting the field would imply no charge was made, and the refund path would
+/// have nothing to reconcile against.
+#[test]
+fn a_stopping_source_carries_its_committed_revocation_residency() {
+    let residency = RevocationResidency::committed();
+    let stopping = SourceRuntime::stopping(None, Some(residency));
+    assert_eq!(stopping.committed_revocation_residency(), Some(residency));
+
+    // Paired: a source that committed nothing reports nothing rather than a
+    // zero charge that looks like a real one.
+    assert_eq!(
+        SourceRuntime::stopping(None, None).committed_revocation_residency(),
+        None
+    );
+
+    // Two committed charges are distinct, so refunds cannot be conflated.
+    assert_ne!(
+        RevocationResidency::committed().charge(),
+        RevocationResidency::committed().charge()
+    );
+}
+
+/// An observer phase with no live token must not present one.
+#[test]
+fn a_source_without_a_live_observer_cannot_present_a_token() {
+    let token = ObserverToken::fresh();
+    assert_eq!(ObserverPhase::Active { token }.token(), Some(token));
+    assert_eq!(ObserverPhase::Draining { token }.token(), Some(token));
+
+    // Negative: absent and observer-free hold no token to present.
+    assert_eq!(ObserverPhase::Absent.token(), None);
+    assert_eq!(
+        ObserverPhase::ObserverFree { handoff: token }.token(),
+        None,
+        "an observer-free source presented a token it does not hold"
+    );
+}
+
 /// The epoch the source is standing on, for comparison against a ticket.
 fn authority_epoch(
     runtime: &SourceRuntime,
@@ -210,7 +381,7 @@ fn replace_beneath_temp(
 
 #[test]
 fn grant_requires_the_exact_live_current_publication() {
-    let (mut runtime, _lease, live) = current_source();
+    let (mut runtime, _lease, live, _root) = current_source();
 
     // Negative: a publication identity that was never live is refused.
     let stranger = PublicationIdentity::fresh();
@@ -250,21 +421,33 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
     // Non-Current phases refuse regardless of what is presented, and leave no
     // epoch or permit trace behind.
     let non_current: Vec<(PhaseName, SourceRuntime)> = vec![
-        (PhaseName::Loading, SourceRuntime::loading()),
+        (
+            PhaseName::Loading,
+            SourceRuntime::loading(BindingAuthority::bind(
+                PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
+            )),
+        ),
         (
             PhaseName::Refreshing,
             SourceRuntime::refreshing(
-                BindingAuthority::bind(PhysicalRootLease::take(std::env::temp_dir()).identity()),
+                BindingAuthority::bind(
+                    PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
+                ),
                 GenerationIdentity::fresh(),
             ),
         ),
         (
             PhaseName::Blocked,
-            SourceRuntime::blocked(Some(GenerationIdentity::fresh())),
+            SourceRuntime::blocked(
+                BindingAuthority::bind(
+                    PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
+                ),
+                Some(GenerationIdentity::fresh()),
+            ),
         ),
         (
             PhaseName::Stopping,
-            SourceRuntime::stopping(Some(GenerationIdentity::fresh())),
+            SourceRuntime::stopping(Some(GenerationIdentity::fresh()), None),
         ),
     ];
 
@@ -285,7 +468,9 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
 
     // Non-Current *provenances* refuse even while the source is genuinely
     // Current, so the refusal is about what was presented, not about the phase.
-    let lease = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     let binding = BindingAuthority::bind(lease.identity());
     let candidate = CandidateAuthority::open(binding.clone(), ObserverToken::fresh());
 
@@ -333,15 +518,24 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
     }
 }
 
+/// Superseded by F020-V11-A20 and rewritten rather than deleted.
+///
+/// The pre-amendment rule was that only `Current` is queryable. A20 narrowed the
+/// invariant to COMPLETENESS: a `Refreshing` source keeps serving the complete
+/// generation it retained, because refusing bought no safety and took the source
+/// offline for the whole of a rebuild. What stays closed is that no partial,
+/// candidate, or remnant state is ever served.
 #[test]
 fn strict_queryability_is_closed_over_retained_generations() {
     // Loading retains nothing; only Current is queryable.
-    let loading = SourceRuntime::loading();
+    let loading = SourceRuntime::loading(BindingAuthority::bind(
+        PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
+    ));
     assert_eq!(loading.retained_generation(), None);
     assert_eq!(loading.live_publication(), None);
 
     // Refreshing retains exactly one, and it is not queryable.
-    let lease = PhysicalRootLease::take(std::env::temp_dir());
+    let lease = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep());
     let binding = BindingAuthority::bind(lease.identity());
     let retained = GenerationIdentity::fresh();
     let refreshing = SourceRuntime::refreshing(binding.clone(), retained);
@@ -350,25 +544,46 @@ fn strict_queryability_is_closed_over_retained_generations() {
     assert_eq!(
         refreshing.live_publication(),
         None,
-        "a retained generation must not be queryable"
+        "a Refreshing source has no live Current publication"
+    );
+    // A20: but it IS queryable, from the complete generation it retained.
+    assert_eq!(
+        refreshing.queryable_generation(),
+        Some(retained),
+        "a refreshing source stopped serving its complete retained generation"
     );
 
     // Blocked and Stopping may retain zero or one.
-    assert_eq!(SourceRuntime::blocked(None).retained_generation(), None);
+    assert_eq!(
+        SourceRuntime::blocked(
+            BindingAuthority::bind(
+                PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()
+            ),
+            None
+        )
+        .retained_generation(),
+        None
+    );
     let accounted = GenerationIdentity::fresh();
     assert_eq!(
-        SourceRuntime::stopping(Some(accounted)).retained_generation(),
+        SourceRuntime::stopping(Some(accounted), None).retained_generation(),
         Some(accounted)
     );
     assert_eq!(
-        SourceRuntime::stopping(Some(accounted)).live_publication(),
+        SourceRuntime::stopping(Some(accounted), None).live_publication(),
         None
+    );
+    // A20: a remnant is not a refresh, so it is not queryable.
+    assert_eq!(
+        SourceRuntime::stopping(Some(accounted), None).queryable_generation(),
+        None,
+        "a stopping source served a remnant"
     );
 }
 
 #[test]
 fn granting_publishes_non_current_before_the_permit_exists() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
 
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
@@ -405,8 +620,10 @@ fn granting_publishes_non_current_before_the_permit_exists() {
 
 #[test]
 fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
-    let (mut runtime, lease_a, live) = current_source();
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let (mut runtime, lease_a, live, _root) = current_source();
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
 
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
@@ -423,7 +640,7 @@ fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
 
     // Positive: the same shape with the matching lease succeeds, so the refusal
     // above is validating the pairing rather than refusing all pairings.
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -438,7 +655,7 @@ fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
 
 #[test]
 fn a_permit_is_terminal_once_it_ends() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -471,7 +688,7 @@ fn a_permit_is_terminal_once_it_ends() {
 
 #[test]
 fn dropping_a_permit_reports_drained_rather_than_stranding_the_source() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -487,7 +704,7 @@ fn dropping_a_permit_reports_drained_rather_than_stranding_the_source() {
 
 #[test]
 fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -503,8 +720,12 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
         .no_side_effect(NoSideEffectProof::observed())
         .expect("permit terminates");
 
-    // Install root B through the writer-validated transition.
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    // Install root B through the writer-validated transition. The permit ended
+    // above; retiring it is the caller obligation Slice 4's writer lane takes on.
+    retire_all_permits(&mut runtime);
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     let receipt = transition::apply(
         &mut runtime,
         TransitionKind::PhysicalRootReplacement,
@@ -545,7 +766,7 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
 
 #[test]
 fn the_non_current_proof_names_the_publication_the_source_actually_stored() {
-    let (mut runtime, _lease, live) = current_source();
+    let (mut runtime, _lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -565,7 +786,7 @@ fn the_non_current_proof_names_the_publication_the_source_actually_stored() {
 
 #[test]
 fn the_mutation_epoch_never_rewinds_across_a_transition() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
 
     // Burn an epoch by granting and draining a permit.
     let grant = runtime
@@ -580,7 +801,10 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
     let permits_before = runtime.grants_issued();
     assert!(before.get() >= 1);
 
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    retire_all_permits(&mut runtime);
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     transition::apply(
         &mut runtime,
         TransitionKind::Rebind,
@@ -608,7 +832,7 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
 
 #[test]
 fn a_transition_refuses_to_install_over_a_live_permit() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -617,7 +841,9 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
         .expect("grant must produce a permit");
 
     // Negative: the permit is outstanding, so Install must not happen.
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     let refusal = transition::apply(
         &mut runtime,
         TransitionKind::Rebind,
@@ -630,8 +856,11 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
     assert_eq!(refusal, AuthorityRefusal::OutstandingPermit);
     assert!(lease_a.is_live(), "a refused transition must not revoke");
 
-    // Positive: once the permit ends, the same transition proceeds.
+    // Positive: once the permit ends AND is retired, the same transition
+    // proceeds. Both are required now: the drain signal is one permit's, while
+    // `active_permits` is what the source itself still holds.
     drop(permit);
+    retire_all_permits(&mut runtime);
     transition::apply(
         &mut runtime,
         TransitionKind::Rebind,
@@ -642,4 +871,305 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
     )
     .expect("a drained source may transition");
     assert!(!lease_a.is_live());
+}
+
+/// F020-V11-R20A. Named by `contracts/lifecycle-acceptance-oracles-v11.md`; do not
+/// rename without amending that contract.
+///
+/// A refreshing source keeps serving the complete generation it retained. This is
+/// the availability half of A20: without it, every reindex takes the project
+/// offline for the duration of the rebuild.
+#[test]
+fn a_refreshing_source_still_serves_its_complete_retained_generation() {
+    // A RELOAD-entered refresh: a candidate is building elsewhere and the
+    // retained generation's bytes are untouched. This is the case A20 exists
+    // for, and the one this oracle must pin.
+    //
+    // It deliberately does NOT enter `Refreshing` through
+    // `request_mutation_grant`. An earlier version did, and so asserted that a
+    // source stays queryable while a permit is rewriting the very files the
+    // retained generation describes — found by adversarial review. The mutation
+    // case is the paired negative below.
+    let root = tempfile::tempdir().expect("per-test root");
+    let lease = Arc::new(PhysicalRootLease::take(root.path()));
+    let binding = BindingAuthority::bind(lease.identity());
+    let publication = CurrentPublication::promote(binding.clone(), ObserverToken::fresh());
+    let served_before = publication.generation();
+
+    let runtime = SourceRuntime::refreshing(binding, served_before);
+    assert_eq!(runtime.phase(), PhaseName::Refreshing);
+    assert_eq!(runtime.live_publication(), None);
+
+    // Still queryable, and from the SAME generation it served before: the reader
+    // sees no interruption and no different answer.
+    assert!(
+        runtime.is_queryable(),
+        "a reloading source stopped serving, which takes the project offline"
+    );
+    assert_eq!(
+        runtime.queryable_generation(),
+        Some(served_before),
+        "a refreshing source served a different generation than the one it retained"
+    );
+
+    // Paired negative: a MUTATION-entered refresh retains the same complete
+    // generation and must not serve it, because a permit is replacing the files
+    // it describes. `request_mutation_grant` freezes for exactly this reason.
+    let (mut mutating, _lease, live, _root) = current_source();
+    mutating
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    assert_eq!(mutating.phase(), PhaseName::Refreshing);
+    assert!(
+        mutating.retained_generation().is_some(),
+        "the mutation case must retain something, or the refusal below is vacuous"
+    );
+    assert!(
+        !mutating.is_queryable(),
+        "a source served readers while its own permit rewrote its disk"
+    );
+
+    // Retiring that permit does NOT restore reads. An earlier version asserted
+    // the opposite as its positive case, which is the V10 last-valid answer
+    // under a new name: `replace_beneath` has run, so the retained generation
+    // may no longer describe the bytes on disk, and FR-043 says no terminal path
+    // directly restores the prior publication. Draining says the write finished,
+    // not that it never happened.
+    let outstanding = mutating.active_permits();
+    assert_eq!(outstanding.len(), 1);
+    for grant in outstanding.outstanding() {
+        assert!(mutating.retire_permit(grant));
+    }
+    assert!(mutating.active_permits().is_drained());
+    assert!(
+        !mutating.is_queryable(),
+        "a source restored the prior publication by retiring a permit"
+    );
+
+    // Only a successor Current restores reads, which is the sole path FR-043
+    // leaves open. Driven through `transition::apply` rather than a direct
+    // install, because that IS the path: a transition is what promotes.
+    let successor_root = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
+    transition::apply(
+        &mut mutating,
+        TransitionKind::Rebind,
+        &_lease,
+        BindingAuthority::bind(successor_root.identity()),
+        ObserverToken::fresh(),
+        &PermitDrainSignal::new(),
+    )
+    .expect("a drained source installs its successor");
+    let restored = mutating
+        .queryable_generation()
+        .expect("a successor Current is queryable");
+
+    // And installing clears the latch, so the next reload-entered refresh serves
+    // its retention: the refusal above was about that mutation, not a source
+    // that has been permanently poisoned by ever having been written to.
+    assert!(mutating.freeze().is_some());
+    assert_eq!(
+        mutating.queryable_generation(),
+        Some(restored),
+        "a reload-entered refresh after a completed mutation stopped serving"
+    );
+}
+
+/// F020-V11-R20B. Named by `contracts/lifecycle-acceptance-oracles-v11.md`; do not
+/// rename without amending that contract.
+///
+/// The safety half of A20. A retention held by a source with no successor in
+/// flight is a remnant, not a refresh, and must never be served.
+#[test]
+fn blocked_and_stopping_retentions_are_never_queryable() {
+    let lease = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep());
+    let binding = BindingAuthority::bind(lease.identity());
+    let retained = GenerationIdentity::fresh();
+
+    for runtime in [
+        SourceRuntime::blocked(binding.clone(), Some(retained)),
+        SourceRuntime::stopping(Some(retained), None),
+    ] {
+        // It retains something, for recovery and accounting...
+        assert_eq!(runtime.retained_generation(), Some(retained));
+        // ...and none of it is servable.
+        assert!(
+            !runtime.is_queryable(),
+            "{:?} served a remnant retention",
+            runtime.phase()
+        );
+        assert_eq!(runtime.queryable_generation(), None);
+    }
+
+    // Loading holds nothing at all.
+    let loading = SourceRuntime::loading(binding.clone());
+    assert_eq!(loading.retained_generation(), None);
+    assert!(!loading.is_queryable());
+
+    // Paired positive: a Refreshing source with the same retention IS queryable,
+    // so the refusals above are about having no successor in flight rather than
+    // a blanket refusal to ever serve a retention.
+    let refreshing = SourceRuntime::refreshing(binding, retained);
+    assert_eq!(refreshing.queryable_generation(), Some(retained));
+}
+
+/// Revocation must reach authority that already left the slot that issued it.
+///
+/// Found by adversarial review. `LiveProjectSlot::binding()` refuses once the
+/// slot is stopped, which stops a holder that asks AGAIN — but `BindingAuthority`
+/// is `Clone`, and a holder that cloned it before the stop still named the right
+/// root and still held a live lease, so `SourceMutationPermit::grant` accepted
+/// it and wrote to disk under a slot the registry had already retired. "It
+/// refuses reads through the slot" is not the same claim as "it retracts
+/// authority", and only the second one is worth making.
+///
+/// A binding's liveness is now shared across its clones, so stopping the slot
+/// retires every copy at once.
+#[test]
+fn a_binding_cloned_before_the_stop_stops_authorizing_with_it() {
+    use symforge::live_index::index_lifecycle::registry::{
+        ProjectKey, ProjectRegistry, RootProtection, StatePlacement,
+    };
+
+    let root = tempfile::tempdir().expect("per-test root");
+    let lease = Arc::new(PhysicalRootLease::take(root.path()));
+    let binding = BindingAuthority::bind(lease.identity());
+
+    let registry = ProjectRegistry::new();
+    let key = ProjectKey::new("cloned-binding");
+    registry
+        .admit(
+            key.clone(),
+            binding.clone(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::ProjectLocal,
+        )
+        .expect("ordinary admission");
+    let slot = registry.install(&key, None).expect("install pending");
+
+    // The escape: take a clone while the slot is live, the way any holder can.
+    let escaped = slot
+        .binding()
+        .expect("a live slot hands out its binding")
+        .clone();
+    assert!(escaped.is_live());
+
+    // Paired positive, taken BEFORE the stop so the refusal below cannot be
+    // mistaken for the grant path being broken in general.
+    let publication = CurrentPublication::promote(escaped.clone(), ObserverToken::fresh());
+    let live_publication = publication.publication();
+    let mut runtime = SourceRuntime::current(publication);
+    let grant = runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live_publication))
+        .expect("live Current must grant");
+    let permit = SourceMutationPermit::grant(
+        grant,
+        Arc::clone(&lease),
+        Arc::new(PermitDrainSignal::default()),
+    );
+    assert!(
+        permit.is_ok(),
+        "a live binding must still authorize, or the refusal below proves nothing"
+    );
+    drop(permit);
+
+    registry.stop(&key).expect("stop the live slot");
+
+    // The clone is retired with the slot, and so is the whole chain built on it.
+    assert!(
+        !escaped.is_live(),
+        "a stop left an escaped binding authorizing"
+    );
+    assert!(slot.binding().is_err());
+
+    let publication = CurrentPublication::promote(escaped.clone(), ObserverToken::fresh());
+    let live_publication = publication.publication();
+    let mut runtime = SourceRuntime::current(publication);
+    let grant = runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live_publication))
+        .expect("the runtime itself is unaware of the registry stop");
+    assert_eq!(
+        SourceMutationPermit::grant(
+            grant,
+            Arc::clone(&lease),
+            Arc::new(PermitDrainSignal::default()),
+        )
+        .expect_err("a revoked binding must not authorize a disk write"),
+        AuthorityRefusal::BindingRevoked {
+            binding: escaped.identity()
+        }
+    );
+}
+
+/// A transition must not attest a freeze it did not perform, or resurrect a
+/// source that is stopping.
+///
+/// Found by adversarial review. `freeze()` returns `None` for a phase with no
+/// publication to freeze, and `transition::apply` was its only caller and
+/// discarded the result — so on a `Stopping` source it pushed
+/// `TransitionStep::Freeze` and then installed `Current`, producing a receipt
+/// attesting a publication that never happened and making a revoked source
+/// queryable again. `Option` is not `#[must_use]`, so nothing warned.
+#[test]
+fn a_transition_refuses_a_phase_that_has_nothing_to_freeze() {
+    let lease_a = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
+    // Never attached to a permit, so it reports drained: the refusals below are
+    // about the freeze having nothing to publish, not about an outstanding
+    // permit.
+    let drain = PermitDrainSignal::new();
+    assert!(drain.has_ended());
+
+    for mut runtime in [
+        SourceRuntime::stopping(Some(GenerationIdentity::fresh()), None),
+        SourceRuntime::blocked(
+            BindingAuthority::bind(lease_a.identity()),
+            Some(GenerationIdentity::fresh()),
+        ),
+        SourceRuntime::loading(BindingAuthority::bind(lease_a.identity())),
+    ] {
+        let phase = runtime.phase();
+        assert_eq!(
+            transition::apply(
+                &mut runtime,
+                TransitionKind::Rebind,
+                &lease_a,
+                BindingAuthority::bind(lease_b.identity()),
+                ObserverToken::fresh(),
+                &drain,
+            )
+            .expect_err("a phase with nothing to freeze must not transition"),
+            AuthorityRefusal::PhaseNotCurrent { phase }
+        );
+        // Not promoted, not queryable, and the outgoing lease not revoked.
+        assert_eq!(runtime.phase(), phase);
+        assert!(!runtime.is_queryable());
+        assert!(lease_a.is_live(), "a refused transition revoked the root");
+    }
+
+    // Paired positive: a Current source, whose freeze does publish, transitions.
+    let (mut current, lease, _live, _root) = current_source();
+    let receipt = transition::apply(
+        &mut current,
+        TransitionKind::Rebind,
+        &lease,
+        BindingAuthority::bind(lease_b.identity()),
+        ObserverToken::fresh(),
+        &drain,
+    )
+    .expect("a Current source transitions");
+    assert_eq!(
+        receipt.steps(),
+        &[
+            TransitionStep::Freeze,
+            TransitionStep::Drain,
+            TransitionStep::Install,
+        ]
+    );
 }

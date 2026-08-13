@@ -62,7 +62,7 @@ authority. Ratifying a Spec Kit constitution is separate governance work.
 | Byte exactness | Stable reads preserve raw bytes/hash/line endings. |
 | Recovery | Versioned manifest snapshot, quarantine, source rebuild. |
 | Idempotency | Equal complete, exactly fenced candidates produce no mutation; failed attempts never mint a manifest. |
-| Failure isolation | Failed candidates are discarded; any retained generation is immutable, internal, and non-current. |
+| Failure isolation | Failed candidates are discarded; a retained generation is immutable and internal, and non-current unless its refresh issued no mutation permit, per F020-V11-A20. |
 | Bounded work | Independent entry/catalog-metadata/read/probe/in-flight/derived/source/output limits. |
 | Simplicity | Reuse current index/search; no embeddings/FTS/vector store. |
 

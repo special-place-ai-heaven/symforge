@@ -21,12 +21,12 @@ The V10 placement, authorization, identity, and recovery evidence in this contra
 remains applicable. The following V11 rules supersede every older clause that permits
 a public degraded, last-valid, or last-verified generation read:
 
-- Only lifecycle `Current` is queryable. Every generation-backed tool, resource,
-  prompt, hook, sidecar route, CCR operation, checkpoint, and embedded consumer
-  acquires its generation through the strict lifecycle Interface.
-- `Loading`, `Refreshing`, `Blocked`, and `Stopping` return the one exact
-  `SourceRefusal` algebra. A retained verified generation is byte-identical internal
-  recovery material, remains non-current, and is never exposed through a fallback.
+- Only a COMPLETE verified generation is queryable, per F020-V11-A20. Every
+  generation-backed tool, resource, prompt, hook, sidecar route, CCR operation,
+  checkpoint, and embedded consumer acquires it through the strict Interface.
+- `Loading`, `Blocked`, and `Stopping` return the one exact `SourceRefusal`
+  algebra, and so does any `Refreshing` that has issued a mutation permit, until a
+  successor installs. A reload-entered refresh serves what it retains.
 - Single-source refusal uses `SourceUnavailable` after authorization; a selected
   multi-source request uses `SelectionUnavailable` with an exact bijection over the
   sealed selection receipt. Pre-binding selection and admission failures retain their
@@ -353,7 +353,7 @@ non-Ready even when an older verified generation is retained. Unsafe path string
 not be echoed; health may use the safe project ID and typed reason.
 Health is a runtime-state surface, not a generation-read bypass: it may remain
 available in `Loading`, `Refreshing`, `Blocked`, or `Stopping`, labels any generation
-retained by `Refreshing`, `Blocked`, or `Stopping` as internal/non-current, and never turns runtime telemetry, persistence
+retained by `Blocked` or `Stopping` as internal/non-current, and never turns runtime telemetry, persistence
 status, or an observation attempt into `Generation` provenance. If a separate pure
 disk, complete worktree-scan, or Git operation is reported, it retains its own typed
 observation authority and makes no generation-currentness claim.

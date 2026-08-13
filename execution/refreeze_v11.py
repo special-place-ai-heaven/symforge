@@ -51,9 +51,11 @@ MAX_APPROVAL_CHAIN_LENGTH = 128
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-AMENDMENT_ID_RE = re.compile(r"^F020-V11-A(?:0[1-9]|1[0-9])$")
+# A01-A20. Stays an exact enumeration rather than \d{2}: a typo'd id must still
+# be rejected, so the ceiling moves deliberately when an amendment is added.
+AMENDMENT_ID_RE = re.compile(r"^F020-V11-A(?:0[1-9]|1[0-9]|20)$")
 REQUIREMENT_ID_RE = re.compile(
-    r"^(?:(?:FR|SC)-[0-9]{3}|F020-V11-A(?:0[1-9]|1[0-9]))$"
+    r"^(?:(?:FR|SC)-[0-9]{3}|F020-V11-A(?:0[1-9]|1[0-9]|20))$"
 )
 PLAN_TASK_ID_RE = re.compile(r"^T[0-9]{3}$")
 REGRESSION_ID_RE = re.compile(r"^F020-V11-R[0-9]{2}[A-Z]?$")
@@ -209,6 +211,37 @@ EXPECTED_AMENDMENT_MAPPINGS = {
         ),
         "plan_task_ids": ("T003", "T041", "T063", "T084"),
         "regression_ids": ("F020-V11-R19A", "F020-V11-R19B"),
+    },
+    # A20: strict queryability closes on COMPLETENESS, not recency. The one
+    # generation a Refreshing source retains stays queryable because it was
+    # Current immediately before the refresh and is complete; Blocked and
+    # Stopping retentions stay non-queryable because neither has a successor in
+    # flight. Decided by the operator after the pre-amendment reading was found
+    # to take a project offline for the duration of any reindex, contradicting a
+    # green production test.
+    "F020-V11-A20": {
+        # Exactly what A20 edits, and nothing else. It first declared FR-037,
+        # FR-043 and FR-051 - curation, permit terminal paths, team artifact -
+        # none of which it changes a word of, while omitting FR-017 and SC-011,
+        # which both said a non-current source must refuse and are the rule the
+        # amendment narrows. A20 COMPLIES with FR-043; it does not amend it, and
+        # an amendment that lists requirements it never touched is how a reader
+        # loses the ability to ask what a given amendment actually did.
+        "requirement_ids": ("F020-V11-A20", "FR-017", "SC-011"),
+        # A20 first declared only these two, while the pre-amendment rule was
+        # still asserted in four more contracts and the quickstart -- a live
+        # contradiction inside a corpus where every document claims supremacy.
+        # It now declares every contract it corrects.
+        "contract_clause_ids": (
+            "contracts/knowledge-authority-hygiene.md"
+            "#v11-lifecycle-acquisition-and-voice-filtering",
+            _ACCEPTANCE_CONTRACT,
+            "contracts/repository-mental-model.md#v11-lifecycle-amendment",
+            "contracts/search-knowledge.md#v11-lifecycle-acquisition",
+            _SOURCE_BINDING_CONTRACT,
+        ),
+        "plan_task_ids": ("T003", "T024", "T027", "T060"),
+        "regression_ids": ("F020-V11-R20A", "F020-V11-R20B"),
     },
 }
 
@@ -2850,7 +2883,11 @@ def _validate_amendments(
 ) -> tuple[set[str], str]:
     if not isinstance(value, list):
         raise RefreezeError("AMENDMENTS_INVALID")
-    expected_ids = [f"F020-V11-A{index:02}" for index in range(1, 20)]
+    # A01-A20. The set is EXACT, not a lower bound: a missing amendment must
+    # still fail, so widening this for A20 raises the ceiling rather than
+    # relaxing the check. A20 (queryability closes on completeness, not recency)
+    # was decided by the operator and is signed for; see the manifest record.
+    expected_ids = [f"F020-V11-A{index:02}" for index in range(1, 21)]
     if len(value) != len(expected_ids):
         raise RefreezeError("AMENDMENT_COUNT_INVALID")
     records: list[dict[str, object]] = []

@@ -29,9 +29,12 @@ before any production-reachable PreventiveV1 implementation:
 4. Prove a coordinated in-tree manifest/design/context/API/attestation rewrite is
    rejected while the prior external approval record remains unchanged.
 
-All v11 generation-query acceptance uses one rule: only lifecycle `Current` may
-grant a strict query lease. A retained verified generation in `Refreshing`,
-`Blocked`, or `Stopping` is internal recovery material and explicitly non-current.
+All v11 generation-query acceptance uses one rule, F020-V11-A20: only a COMPLETE
+verified generation may grant a strict query lease — `Current`, and what a
+`Refreshing` RELOAD retains. A refresh that issued a mutation permit is unqueryable
+until a successor `Current` installs, retired or not, because FR-043 forbids any
+terminal path from restoring the prior publication. `Blocked` and `Stopping`
+retentions are internal recovery material and explicitly non-current.
 There is no public degraded wrapper or automatic last-known-good answer. A cold
 placeholder and every candidate remain nonqueryable; an incomplete selected source
 returns the closed `SourceRefusal` algebra. Promotion requires one complete,
@@ -350,10 +353,12 @@ placement ID is insufficient: no prior manifest/content/temporal state may becom
 
 ## Claim-authority acceptance
 
-1. Put the source in `Refreshing` and prove a generation-backed search/read refuses,
-   while health returns its immutable runtime snapshot and a pure root-bound syntax/
-   untracked read can return `DiskObservation` from the actually opened object,
-   including path-local `PathMissing` from a retained final-parent handle.
+1. Put the source in `Refreshing` **by granting a mutation permit** and prove a
+   generation-backed search/read refuses, per F020-V11-A20 — and still refuses after
+   that permit retires, until a successor `Current` installs. Health returns
+   its immutable runtime snapshot throughout, and a pure root-bound syntax/untracked
+   read can return `DiskObservation` from the actually opened object, including
+   path-local `PathMissing` from a retained final-parent handle.
 2. Under the same non-Current state, prove a complete root-bound scan may return
    `WorktreeScopeObservation` and an immutable Git-object/ref read may return
    `GitObservation`. The former may attest completeness only for its sealed declared

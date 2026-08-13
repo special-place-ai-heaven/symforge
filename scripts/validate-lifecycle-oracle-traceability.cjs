@@ -83,6 +83,8 @@ const EXPECTED_AMENDMENT_REGRESSION_BINDINGS = new Map([
   ["F020-V11-R18C", "ORACLE-CAPACITY-RUNTIME-INTEGRATION"],
   ["F020-V11-R19A", "ORACLE-QUERY-ATOMIC-LEASE"],
   ["F020-V11-R19B", "ORACLE-KNOWLEDGE-CURRENT-PROJECTION"],
+  ["F020-V11-R20A", "ORACLE-QUERY-ATOMIC-LEASE"],
+  ["F020-V11-R20B", "ORACLE-QUERY-ATOMIC-LEASE"],
 ]);
 
 const RETIREMENT_CATEGORIES = [
@@ -304,7 +306,7 @@ const FROZEN_DIGESTS = {
   },
   acceptance_oracles: {
     domain: "symforge.lifecycle.v11.acceptance.oracles",
-    hash: "d1d47c59a3a23952e4e598e8c44b5f33778915a744c51d4c3b2ec58e07b84fec",
+    hash: "ea83e1c29100c68bdd667747a25ef83be01e6a0c40181ddea914294ca1350008",
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
@@ -3382,7 +3384,12 @@ function runVerifiedCommand(spec, runtime = {}) {
   // already fixes, and those two rules drift.
   if (spec.expect_execution) {
     const combined = `${stdout.toString("utf8")}${stderr.toString("utf8")}`;
-    if (/^test .* \.\.\. ignored$/mu.test(combined)) return { ok: false, reason: "case_ignored" };
+    // `ignored\b`, not `ignored$`: `#[ignore = "reason"]` prints
+    // `... ignored, <reason>`, so anchoring at the end never matched the very
+    // shape this guard exists for. The refusal still happened, through the
+    // not-reported branch below, which is how a dead guard survives - it is
+    // named for a case another rule was quietly catching.
+    if (/^test .* \.\.\. ignored\b/mu.test(combined)) return { ok: false, reason: "case_ignored" };
     if (!/^test .* \.\.\. (?:ok|FAILED)$/mu.test(combined)) {
       return { ok: false, reason: "case_not_reported" };
     }
