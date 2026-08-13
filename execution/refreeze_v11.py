@@ -221,8 +221,16 @@ EXPECTED_AMENDMENT_MAPPINGS = {
     # green production test.
     "F020-V11-A20": {
         "requirement_ids": ("F020-V11-A20", "FR-037", "FR-043", "FR-051"),
+        # A20 first declared only these two, while the pre-amendment rule was
+        # still asserted in four more contracts and the quickstart -- a live
+        # contradiction inside a corpus where every document claims supremacy.
+        # It now declares every contract it corrects.
         "contract_clause_ids": (
+            "contracts/knowledge-authority-hygiene.md"
+            "#v11-lifecycle-acquisition-and-voice-filtering",
             _ACCEPTANCE_CONTRACT,
+            "contracts/repository-mental-model.md#v11-lifecycle-amendment",
+            "contracts/search-knowledge.md#v11-lifecycle-acquisition",
             _SOURCE_BINDING_CONTRACT,
         ),
         "plan_task_ids": ("T003", "T024", "T027", "T060"),
