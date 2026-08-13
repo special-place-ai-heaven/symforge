@@ -861,7 +861,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
         },
         {
           "clause_id": "F020-V11-A20-TARGET-02",
-          "end_line": 1548,
+          "end_line": 1549,
           "path": "specs/020-repository-knowledge-index/data-model.md",
           "sha256": "46819009ad71c748ae0d106992aaf8ecdd92df6fd8386d2de7e38a1e9bb055db",
           "source": "target",
