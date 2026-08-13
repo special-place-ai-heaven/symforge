@@ -530,17 +530,38 @@ fn process_may_be_alive(_pid: u32) -> bool {
 }
 
 /// Case-tolerant, separator-tolerant root comparison (Windows paths).
+///
+/// `cfg!(windows)` already folds case. That is not enough: Windows
+/// `canonicalize` / `current_dir` often yield the extended-length verbatim
+/// form (`\\?\C:\...`), and `Path::display` slash-unifies that to `//?/C:/...`
+/// (what `health` prints as `project_root`). Sidecar descriptors typically
+/// store the plain `C:\...` form. Slash+case folding still leaves
+/// `//?/c:/proj` != `c:/proj`, so every descriptor is identity-rejected.
 fn same_root_identity(a: &str, b: &str) -> bool {
-    let canon = |raw: &str| {
-        let normalized = raw.replace('\\', "/");
-        let trimmed = normalized.trim_end_matches('/').to_string();
-        if cfg!(windows) {
-            trimmed.to_lowercase()
-        } else {
-            trimmed
-        }
+    canon_root_identity(a) == canon_root_identity(b)
+}
+
+fn canon_root_identity(raw: &str) -> String {
+    let normalized = raw.replace('\\', "/");
+    let stripped = if let Some(rest) = strip_ascii_prefix_ci(&normalized, "//?/unc/") {
+        format!("//{rest}")
+    } else if let Some(rest) = strip_ascii_prefix_ci(&normalized, "//?/") {
+        rest.to_string()
+    } else {
+        normalized
     };
-    canon(a) == canon(b)
+    let trimmed = stripped.trim_end_matches('/');
+    if cfg!(windows) {
+        trimmed.to_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then_some(&s[prefix.len()..])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,6 +796,33 @@ mod tests {
         let control = ControlStateDir::new(tmp.path().join("control"));
         let sidecar_dir = resolve_symforge_dir(&control);
         f(&control, &sidecar_dir);
+    }
+
+    #[test]
+    fn same_root_identity_strips_windows_verbatim_prefix() {
+        let plain = r"C:\AI_STUFF\PROGRAMMING\symforge";
+        assert!(
+            same_root_identity(r"\\?\C:\AI_STUFF\PROGRAMMING\symforge", plain),
+            "backslash verbatim prefix must match the plain root"
+        );
+        assert!(
+            same_root_identity(
+                "//?/C:/AI_STUFF/PROGRAMMING/symforge",
+                "C:/AI_STUFF/PROGRAMMING/symforge",
+            ),
+            "slash-unified verbatim prefix (health project_root form) must match"
+        );
+        assert!(
+            same_root_identity(
+                r"\\?\C:\AI_STUFF\PROGRAMMING\symforge",
+                "C:/AI_STUFF/PROGRAMMING/symforge"
+            ),
+            "mixed separators after stripping the prefix must match"
+        );
+        assert!(
+            !same_root_identity(r"\\?\C:\other", plain),
+            "verbatim prefix must not collapse distinct roots"
+        );
     }
 
     /// Task 8 (recovered finding): closing one adapter must not delete or
