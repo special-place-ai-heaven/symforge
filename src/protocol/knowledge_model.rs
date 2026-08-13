@@ -659,9 +659,13 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(root.path().join("docs/design")).unwrap();
+        // The operations ROLE comes from the "runbook" path token and the intent
+        // DOMAIN from the "design" path token. An Operations heading here would
+        // now assign the operations domain instead: heading evidence outranks
+        // path conventions, which would move this card into the current lane.
         fs::write(
-            root.path().join("docs/design/intent.md"),
-            "# Operations\nProposed operating model.\n",
+            root.path().join("docs/design/runbook.md"),
+            "# Proposed operating model\nProposed operating model.\n",
         )
         .unwrap();
         fs::write(
@@ -687,7 +691,7 @@ mod tests {
         assert!(rendered.contains("content_hash="));
         assert!(rendered.contains("evidence_anchor=README.md#"));
         assert!(rendered.contains("Intent roles:"));
-        assert!(rendered.contains("operations docs/design/intent.md:1"));
+        assert!(rendered.contains("operations docs/design/runbook.md:1"));
         assert!(rendered.contains("Missing roles:"));
         assert!(rendered.contains("ownership_governance"));
         assert!(rendered.contains("Hygiene:"));
