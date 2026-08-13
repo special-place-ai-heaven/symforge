@@ -789,7 +789,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-02",
           "end_line": 48,
           "path": "specs/020-repository-knowledge-index/contracts/knowledge-authority-hygiene.md",
-          "sha256": "d89683e42bd1d320de0af41cad70032108c7f3897255f31c8a9d5b43f6b63fd2",
+          "sha256": "85940c1037f28191f40b07de8afb245122f5a0a623516672a774cee792958284",
           "source": "target",
           "start_line": 27
         },
@@ -797,7 +797,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-03",
           "end_line": 31,
           "path": "specs/020-repository-knowledge-index/contracts/repository-mental-model.md",
-          "sha256": "72215d1bac7c0f1f2d879647a0b1114548a141a78c84f8e68e91596848797485",
+          "sha256": "8f6300bf336ff3ceaecc38fcdcc5e91f1c89f6ef75b5c37c0f72e8d6911bd061",
           "source": "target",
           "start_line": 18
         },
@@ -805,7 +805,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-04",
           "end_line": 77,
           "path": "specs/020-repository-knowledge-index/contracts/search-knowledge.md",
-          "sha256": "8a9ff3aa5f10d2f28e46b024c71b6a81b9fa16d73fa28df237dafc74e05f4494",
+          "sha256": "35efce51642f40f9ce0f37dce85c5009df84d8149e0ef2474a79a1c27f80f8d2",
           "source": "target",
           "start_line": 57
         },
@@ -813,7 +813,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-05",
           "end_line": 52,
           "path": "specs/020-repository-knowledge-index/contracts/source-binding-and-state.md",
-          "sha256": "a902a5be7bdb75accb15ff84dcd3beb3ddbd1e6be3753bf49c396774a673f110",
+          "sha256": "eab5f4f5d5413a51cf0de332949e3fb75b35539ea53654432bfa075b5c3ad37e",
           "source": "target",
           "start_line": 18
         }
@@ -1095,7 +1095,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/knowledge-authority-hygiene.md",
       "scope": "feature",
-      "sha256": "e0a62835817617be8f7511e0e992c92d4fdc8d9b920443ca4859ff460fdcf208",
+      "sha256": "cbc293614a045cee62331ae74f15310735c16191af0ebf907dc65f440453cfad",
       "superseded_by": []
     },
     {
@@ -1127,7 +1127,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/repository-mental-model.md",
       "scope": "feature",
-      "sha256": "dac8e1746fda84c5e609b85b9d8d28a21cf486d9a676a461d8618430584254ed",
+      "sha256": "c1b5f6acebdced699c0198d7fd10fc1c920bf058dbe37f50a9edd3a61db29049",
       "superseded_by": []
     },
     {
@@ -1135,7 +1135,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/search-knowledge.md",
       "scope": "feature",
-      "sha256": "64140285df26b6e5cf9b267eab1858d14980410ab5f63f43c8905fab18a31387",
+      "sha256": "fdb3b5325b46842d2a0384e01cdb80ecc19a087acb1585bd6adc0f832000d3ce",
       "superseded_by": []
     },
     {
@@ -1143,7 +1143,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/source-binding-and-state.md",
       "scope": "feature",
-      "sha256": "c35d610d09476b1b6edc8a146406ceeadcda77e1959432bba7798e604f8c1a54",
+      "sha256": "f0e2c5f476480bc805cdd38670af08ac9d052df4f5fc86cb5c4fa70bfc0a6e84",
       "superseded_by": []
     },
     {
@@ -1415,7 +1415,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/quickstart.md",
       "scope": "feature",
-      "sha256": "e19fe87148bb354d0307ba17a4c345ece575f8f365b6895de997f3e5fd8c5991",
+      "sha256": "df17cd68b6642eb51c7df1ceb96f1c53d7f0d430752a0241b8010ade62dbb631",
       "superseded_by": []
     },
     {
