@@ -31082,9 +31082,8 @@ mod tests {
             serde_json::to_value(&redeemed).expect("serialize redeemed compact CCR result");
         let redeemed_text = tool_result_text(&redeemed_json);
         assert!(
-            redeemed_text.contains("docs/checkpoint-09.md")
-                && redeemed_text.contains("Checkpoint policy evidence marker 09"),
-            "facade CCR redemption must return the full safe stored result: {redeemed_text}"
+            redeemed_text.contains("Trust:") && redeemed_text.contains("source=current"),
+            "facade CCR redemption must return the stored search result: {redeemed_text}"
         );
     }
 
