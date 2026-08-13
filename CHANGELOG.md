@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.4.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.4.0...v10.4.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* **read-gate:** admit git-object reads in the symbol diff lane ([#571](https://github.com/special-place-ai-heaven/symforge/issues/571)) ([7492917](https://github.com/special-place-ai-heaven/symforge/commit/7492917c2631d2cb703194b4c4d959d81914e584))
+
 ## [10.4.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.3.0...v10.4.0) (2026-08-13)
 
 
