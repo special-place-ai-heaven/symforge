@@ -106,6 +106,146 @@ fn protected_membership_and_state_placement() {
     assert_eq!(live.placement(), StatePlacement::ProjectLocal);
 }
 
+/// T039: refusal and cancellation cannot construct `Current`, leak a slot,
+/// double-refund, or release memory something still holds.
+///
+/// These are one test because they are one property — that a path which did not
+/// complete leaves the process exactly as it found it. Splitting them would let
+/// each pass while the combination still drifted.
+#[test]
+fn a_refused_or_cancelled_admission_leaves_nothing_behind() {
+    use symforge::live_index::index_lifecycle::adapters::{self, AdapterRefusal};
+    use symforge::live_index::index_lifecycle::process_runtime::{ProcessRuntime, SurfaceKind};
+
+    let runtime = ProcessRuntime::incarnate(10_000);
+    let registry = ProjectRegistry::new();
+    let owner = runtime
+        .attach(SurfaceKind::Daemon, 4_000)
+        .expect("the daemon surface attaches");
+    let charged_before = runtime.ledger().charged(owner);
+    let available_before = runtime.available();
+
+    // A refused plan charges nothing and admits nothing.
+    let refused = adapters::plan_admission(
+        &runtime,
+        SurfaceKind::Daemon,
+        ProjectKey::new("protected"),
+        RootProtection::Protected,
+        false,
+        StatePlacement::MemoryOnly,
+    )
+    .expect_err("an unauthorized protected root must be refused");
+    assert_eq!(
+        refused,
+        AdapterRefusal::Registry(RegistryRefusal::ProtectedWithoutAuthorization)
+    );
+    assert_eq!(runtime.ledger().charged(owner), charged_before);
+    assert_eq!(runtime.available(), available_before);
+    assert_eq!(registry.tombstone_count(), 0);
+
+    // A cancelled admission retires its identity, installs nothing, and never
+    // becomes queryable.
+    let key = ProjectKey::new("cancelled-clean");
+    registry
+        .admit(
+            key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::ProjectLocal,
+        )
+        .expect("admits");
+    let slot = registry.cancel(&key).expect("cancels");
+    assert!(registry.is_tombstoned(slot));
+    assert!(
+        !registry.is_current(&key, slot),
+        "a cancelled admission reported as current"
+    );
+    assert_eq!(
+        registry.live(&key).expect_err("nothing is live"),
+        RegistryRefusal::NotAdmitted
+    );
+    assert_eq!(runtime.ledger().charged(owner), charged_before);
+
+    // A surface holding a live allocation cannot be detached: detaching would
+    // return capacity to the process that the surface is still using.
+    let held = runtime
+        .ledger()
+        .redeem(runtime.ledger().reserve(owner, 1_000).expect("headroom"));
+    assert!(
+        runtime.detach(SurfaceKind::Daemon).is_err(),
+        "a surface with live allocations was detached"
+    );
+    assert_eq!(
+        runtime.available(),
+        available_before,
+        "a refused detach returned capacity anyway"
+    );
+
+    // Positive: once drained, the detach returns exactly the promise, once.
+    drop(held);
+    let returned = runtime
+        .detach(SurfaceKind::Daemon)
+        .expect("a drained surface detaches");
+    assert_eq!(returned, 4_000);
+    assert_eq!(runtime.available(), 10_000);
+
+    // And detaching twice does not return it a second time.
+    assert!(
+        runtime.detach(SurfaceKind::Daemon).is_err(),
+        "a surface was detached twice"
+    );
+    assert_eq!(
+        runtime.available(),
+        10_000,
+        "a second detach invented capacity"
+    );
+    assert_eq!(runtime.ledger().unknown_refunds(), 0);
+}
+
+/// Slice 2 must never construct or claim lifecycle `Current`.
+///
+/// The spec states this as a constraint on the slice, so it is asserted rather
+/// than assumed: every path that could plausibly yield a queryable generation is
+/// exercised and none does.
+#[test]
+fn slice_two_never_constructs_a_queryable_generation() {
+    let registry = ProjectRegistry::new();
+    let key = ProjectKey::new("never-current");
+
+    registry
+        .admit(
+            key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::ProjectLocal,
+        )
+        .expect("admits");
+
+    // Pending is not live.
+    assert_eq!(
+        registry.live(&key).expect_err("pending is not queryable"),
+        RegistryRefusal::StillPending
+    );
+
+    // Installed yields a slot, and a slot is not a generation: it carries a
+    // binding and a capacity owner, and there is no way to ask it for anything
+    // queryable.
+    let live = registry.install(&key, None).expect("installs");
+    live.binding().expect("a live slot has a binding");
+    assert_eq!(
+        live.capacity_owner()
+            .expect("a live slot reports its owner"),
+        None,
+        "no capacity owner was attached, so none should be reported"
+    );
+
+    // Stopping revokes it; nothing anywhere became queryable.
+    registry.stop(&key).expect("stops");
+    assert!(!live.is_live());
+}
+
 /// Concurrent opens of one key join a single admission.
 #[test]
 fn concurrent_opens_join_one_admission() {

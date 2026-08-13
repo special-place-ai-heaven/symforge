@@ -109,10 +109,7 @@ impl EmbeddedRegistration {
     /// Refuses if a handle is already live for this key. Handing out a second
     /// handle would let one close while the other still believes it holds an
     /// open source.
-    pub fn open(
-        self: &Arc<Self>,
-        key: ProjectKey,
-    ) -> Result<EmbeddedSourceHandle, EmbedRefusal> {
+    pub fn open(self: &Arc<Self>, key: ProjectKey) -> Result<EmbeddedSourceHandle, EmbedRefusal> {
         let mut open = self.open.lock().expect("embedded registration mutex");
         if let Some(held_by) = open.get(&key) {
             return Err(EmbedRefusal::SourceAlreadyOpen { held_by: *held_by });
