@@ -236,8 +236,14 @@ fn replacement_through_a_revoked_lease_touches_nothing() {
     );
 }
 
-/// Symlink creation is unprivileged on Unix; CI runs there. The same refusal
-/// path serves reparse points on Windows through `metadata_is_reparse_point`.
+/// Symlink creation is unprivileged on Unix; CI runs there.
+///
+/// Windows reparse points take the SAME branch — `Metadata::is_symlink` on the
+/// `cap-std` handle, which reports a reparse point as a symlink — and no test
+/// creates one, so that half is unverified. An earlier version of this comment
+/// credited `metadata_is_reparse_point`, which lives in `src/paths.rs`, is
+/// called only from `src/gitignore_hygiene.rs`, and has nothing to do with this
+/// path: a claim about code that does not run here.
 #[cfg(unix)]
 #[test]
 fn a_link_component_is_refused_rather_than_followed() {

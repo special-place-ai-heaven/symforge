@@ -8,8 +8,19 @@ documentation-hygiene rule; regenerate with `pwsh scripts/campaign-state.ps1`.
 
 ## What shipped
 
-Six modules under `src/index_lifecycle/`, 53 oracles across five test files,
-every gate green including the embed configuration.
+Six modules under `src/index_lifecycle/`, 56 executing oracles across five test
+files plus one planned Slice-4 stub, every gate green including the embed
+configuration.
+
+Those 56 are not one population and should not be quoted as one number. **23 of
+them, all in `project_index_authority_v11.rs`, pin `SourceRuntime` — a
+`&mut self` state model with a single owner.** Slice 4 replaces it with an
+`ArcSwap` publication root read concurrently, and the failures that matter there
+are interleavings `&mut self` makes unrepresentable, so those 23 do not survive
+T060 as evidence of the shipping thing. **The other 33 pin `Arc` + `Mutex` +
+atomic primitives — registry, capacity, embedded, physical root — which carry
+forward intact.** That split was drawn by the contract review and is recorded
+here rather than averaged away.
 
 | Module | Task | What it establishes |
 |---|---|---|
@@ -198,6 +209,35 @@ closed. The four that mattered most:
 
 Both registry blockers were mutation-verified: reverting each fix turns its own
 oracle red and leaves every other oracle green.
+
+A second review, on a contract-and-claims lens, found three more — all real,
+all reproduced by execution rather than reading:
+
+5. **A grant leaked its charge.** `reserve` charges immediately and only the
+   *permit* had a `Drop`, so a grant abandoned between reserve and redeem lost
+   those bytes permanently, with no refund and no counter, and wedged
+   `release_owner` for that owner forever. The module's stated invariant is that
+   every charged byte is held or refunded exactly once; a grant was neither.
+6. **A transition attested a freeze it never performed.** `freeze` returns `None`
+   for a phase with no publication to freeze, `transition::apply` was its only
+   caller and discarded the result, and `Option` is not `#[must_use]`. On a
+   `Stopping` source it recorded a Freeze step and installed `Current` —
+   resurrecting a revoked source with a receipt for a publication that never
+   happened.
+7. **A20 was amended in two documents out of eight.** Six further sites across
+   four contracts and the quickstart still asserted the pre-amendment rule,
+   including "Only lifecycle `Current` is queryable" in the very contract Slice 4
+   implements its query lease against, and an acceptance step instructing a
+   reader to prove that a `Refreshing` source refuses. Both documents are V11 and
+   both claim supremacy, so this was a contradiction inside the frozen corpus,
+   not V11 superseding V10. All eight now state one rule; every edit inside an
+   existing clause range is line-count-neutral, checked range by range.
+
+Amending those four contracts moved A19's clause hashes, because A20's
+corrections land inside ranges A19 already owns and clause ranges may not
+overlap across amendments. A20 therefore declares those contracts in its
+`contract_clause_ids` rather than claiming replacement ranges inside A19's — the
+attribution the manifest can actually express, stated rather than fudged.
 
 Two oracles were themselves wrong and were fixed rather than bent.
 `concurrent_opens_join_one_admission` handed its two opens two different
