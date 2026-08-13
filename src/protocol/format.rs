@@ -3,6 +3,30 @@
 //! All functions take `&LiveIndex` (or data derived from it) and return `String`.
 //! No I/O, no async. Output matches the locked formats defined in CONTEXT.md.
 
+// Feature 020 V11 claim attribution (T043). The frozen contract places the file
+// at `src/protocol/claim_provenance.rs`, and that is where it lives. The
+// DECLARATION is here, in `format.rs`, and deliberately NOT in
+// `src/protocol/mod.rs`:
+//
+//   * `protocol/mod.rs` is inside the `publication_roots` set of the frozen
+//     retirement census, so adding a `mod` line there is a release-compiled edit
+//     of a hashed file and would move that digest. `format.rs` is in none of the
+//     five closure path lists.
+//   * `protocol/mod.rs` declares `read_gate` as `pub(crate) mod`, so anchoring
+//     there would make the whole provenance module crate-private — and
+//     `tests/claim_provenance_v11.rs` is a SEPARATE CRATE that could never see
+//     it. `format.rs` is `pub mod`, so the types are reachable from the oracles.
+//
+// `#[path]` resolves relative to the directory CONTAINING this file, so the bare
+// name lands on `src/protocol/claim_provenance.rs`. Verified against rustc
+// rather than recalled: `#[path = "../claim_provenance.rs"]` makes it look for
+// `src/claim_provenance.rs` and fail.
+//
+// Do NOT "tidy" this into `protocol/mod.rs`. It silently moves a frozen digest
+// and breaks the oracles' visibility in one edit.
+#[path = "claim_provenance.rs"]
+pub mod claim_provenance;
+
 /// Budget limits for reference/dependent output to prevent unbounded token usage.
 pub struct OutputLimits {
     /// Maximum number of files to include in the output.

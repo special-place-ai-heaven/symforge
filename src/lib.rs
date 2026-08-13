@@ -8,6 +8,14 @@ pub mod domain;
 pub mod git;
 pub mod hash;
 pub mod knowledge;
+// Feature 020 V11 identity minting, shared by the dark lifecycle runtime and the
+// protocol provenance types so both draw from ONE process-wide counter.
+//
+// `pub(crate)` is load-bearing, not a style choice: the frozen public-API census
+// adds one atom per `pub mod NAME;` line in THIS file, so a plain `pub mod` here
+// would widen a surface Slice 3 must leave frozen. Modules that expose one of
+// these types publicly re-export it instead.
+pub(crate) mod lifecycle_identity;
 pub mod live_index;
 pub mod parsing;
 pub mod paths;

@@ -17,12 +17,12 @@
 //! The four refusal KIND NAMES are identical across both documents, so these
 //! tests match on `kind()` and never destructure fields.
 
+use symforge::live_index::knowledge_bridge::DerivedLimitKind;
 use symforge::protocol::format::claim_provenance::{
     AtomicAuthority, Claim, ClaimInput, ClaimProvenance, ComparisonRelation, EvaluationProvenance,
     ObservationLease, OperationKind, OperationReceipt, OutputCoverage, PhysicalRootLease,
     RetryAdvice, SourceRefusalKind,
 };
-use symforge::live_index::knowledge_bridge::DerivedLimitKind;
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -45,7 +45,10 @@ fn every_authority_kind(lease: &ObservationLease) -> Vec<AtomicAuthority> {
         a_generation(lease),
         AtomicAuthority::DiskObservation(
             lease
-                .observe_missing_path("src/gone.rs", symforge::protocol::format::claim_provenance::ObservationTime::fresh())
+                .observe_missing_path(
+                    "src/gone.rs",
+                    symforge::protocol::format::claim_provenance::ObservationTime::fresh(),
+                )
                 .expect("missing path"),
         ),
         AtomicAuthority::WorktreeScopeObservation(
@@ -154,6 +157,33 @@ fn a_selected_aggregate_refuses_a_selection_without_its_generation() {
 }
 
 #[test]
+fn a_selected_aggregate_refuses_an_extra_unselected_generation() {
+    // The OTHER arm of the bijection. "Missing, extra, forged, or uncaptured
+    // inputs refuse" — data-model.md:1893. The missing-generation test above
+    // exercises containment; this one exercises the length guard, which is the
+    // only thing that catches a captured generation nobody selected. Found by
+    // mutation: disabling the length check alone survived the original suite.
+    let lease = a_lease("root-a");
+    let refusal = ClaimProvenance::selected_aggregate(
+        an_operation(OperationKind::SelectedAggregate),
+        vec![lease.selection_receipt("project-a")],
+        vec![
+            (
+                "project-a".to_string(),
+                lease.admit_generation().expect("gen"),
+            ),
+            (
+                "project-b".to_string(),
+                lease.admit_generation().expect("gen"),
+            ),
+        ],
+    )
+    .expect_err("an extra captured generation breaks the exact bijection");
+
+    assert_eq!(refusal.kind(), SourceRefusalKind::SelectionUnavailable);
+}
+
+#[test]
 fn a_selected_aggregate_admits_an_exact_bijection() {
     // GREEN-CONTROL: the refusal above is about the MISSING generation, not
     // about SelectedAggregate being unconstructible.
@@ -161,7 +191,10 @@ fn a_selected_aggregate_admits_an_exact_bijection() {
     let provenance = ClaimProvenance::selected_aggregate(
         an_operation(OperationKind::SelectedAggregate),
         vec![lease.selection_receipt("project-a")],
-        vec![("project-a".to_string(), lease.admit_generation().expect("gen"))],
+        vec![(
+            "project-a".to_string(),
+            lease.admit_generation().expect("gen"),
+        )],
     )
     .expect("an exact selection-to-generation bijection is admitted");
 
@@ -169,11 +202,24 @@ fn a_selected_aggregate_admits_an_exact_bijection() {
     assert_eq!(provenance.authority_count(), 1);
 }
 
-// ── The refusal Cartesian: every kind against every retry advice ───────────
+// ── The OperationContractV1 Cartesian ──────────────────────────────────────
 
+/// The name is pinned by the frozen traceability catalog:
+/// `contracts/lifecycle-oracle-traceability-v11.md` binds `TEST-PROVENANCE` to
+/// `tests/claim_provenance_v11.rs::operation_contract_cartesian_matrix`
+/// (CMD-PROVENANCE, owner T041, introduced_slice 3). The checker activates the
+/// pin the moment this FILE exists, so the test carries the contract-pinned
+/// name, not an invented one — and since the pinned name says OPERATION
+/// contract, the operation kind is an axis of the matrix, not a constant.
 #[test]
-fn every_refusal_kind_round_trips_with_every_retry_advice() {
+fn operation_contract_cartesian_matrix() {
     let lease = a_lease("root-a");
+    let operations = [
+        OperationKind::Retrieval,
+        OperationKind::Comparison,
+        OperationKind::Derivation,
+        OperationKind::SelectedAggregate,
+    ];
     let kinds = [
         SourceRefusalKind::AdmissionUnavailable,
         SourceRefusalKind::InvalidSelection,
@@ -187,27 +233,45 @@ fn every_refusal_kind_round_trips_with_every_retry_advice() {
     ];
 
     let mut seen = 0usize;
-    for kind in kinds {
-        for advice in advices {
-            let operation = an_operation(OperationKind::Retrieval);
-            let refusal = lease.refuse(operation, kind, advice);
+    for operation_kind in operations {
+        for kind in kinds {
+            for advice in advices {
+                let operation = an_operation(operation_kind);
+                let refusal = lease.refuse(operation, kind, advice);
 
-            assert_eq!(refusal.kind(), kind, "the refusal reports the kind it was built with");
-            assert_eq!(refusal.retry(), advice, "retry advice survives the round trip");
-            assert_eq!(
-                refusal.operation().operation_kind(),
-                OperationKind::Retrieval,
-                "every refusal names the operation that produced it"
-            );
-            assert!(
-                refusal.evidence_identity().is_some(),
-                "a refusal carries the identity of the evidence it refused on"
-            );
-            seen += 1;
+                assert_eq!(
+                    refusal.kind(),
+                    kind,
+                    "the refusal reports the kind it was built with"
+                );
+                assert_eq!(
+                    refusal.retry(),
+                    advice,
+                    "retry advice survives the round trip"
+                );
+                assert_eq!(
+                    refusal.operation().operation_kind(),
+                    operation_kind,
+                    "every refusal names the operation that produced it"
+                );
+                assert_eq!(
+                    refusal.operation().schema_version(),
+                    OperationReceipt::SCHEMA_VERSION,
+                    "the receipt rides the one V11 schema"
+                );
+                assert!(
+                    refusal.evidence_identity().is_some(),
+                    "a refusal carries the identity of the evidence it refused on"
+                );
+                seen += 1;
+            }
         }
     }
 
-    assert_eq!(seen, 12, "control: the full 4x3 Cartesian was exercised");
+    assert_eq!(
+        seen, 48,
+        "control: the full 4x4x3 operation-contract Cartesian was exercised"
+    );
 }
 
 // ── Evaluation provenance accompanies observable ordering ─────────────────
@@ -227,7 +291,11 @@ fn an_ordered_result_carries_evaluation_provenance_and_an_unordered_one_does_not
         "order is observable, so the ranking that produced it must be attributable"
     );
 
-    let unordered = Claim::single(an_operation(OperationKind::Retrieval), a_generation(&lease), ());
+    let unordered = Claim::single(
+        an_operation(OperationKind::Retrieval),
+        a_generation(&lease),
+        (),
+    );
     assert!(
         unordered.evaluation().is_none(),
         "no observable order means no ranking to attribute"
@@ -279,7 +347,11 @@ fn truncated_coverage_never_enters_a_claim_identity() {
     let render = lease.completed_render_authority().expect("completed lease");
     let truncated = render.truncate(vec![(DerivedLimitKind::Output, 1)]);
 
-    let claim = Claim::single(an_operation(OperationKind::Retrieval), a_generation(&lease), ());
+    let claim = Claim::single(
+        an_operation(OperationKind::Retrieval),
+        a_generation(&lease),
+        (),
+    );
     let before = claim.provenance().identity();
     let rendered = claim.render_bounded(truncated);
 
@@ -295,7 +367,8 @@ fn truncated_coverage_never_enters_a_claim_identity() {
 
 #[test]
 fn the_knowledge_voice_filter_never_selects_consistency() {
-    let selectable = symforge::protocol::format::claim_provenance::KnowledgeVoiceFilter::selectable_voices();
+    let selectable =
+        symforge::protocol::format::claim_provenance::KnowledgeVoiceFilter::selectable_voices();
 
     assert!(
         !selectable.iter().any(|voice| voice.is_consistency()),

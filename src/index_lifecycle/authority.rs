@@ -7,56 +7,18 @@
 //! sealed [`CurrentMutationGrantAuthority`] that was consumed from an exact live
 //! `Current` publication, or it is refused.
 
-use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Process-global monotonic identity source. Never restarts, never reuses.
-static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
-
-fn next_identity() -> NonZeroU64 {
-    let raw = NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed);
-    NonZeroU64::new(raw).expect("identity counter starts at 1 and only increases")
-}
-
-macro_rules! identity_newtype {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub struct $name(NonZeroU64);
-
-        impl $name {
-            /// Mint a fresh never-reused identity.
-            pub fn fresh() -> Self {
-                Self(next_identity())
-            }
-        }
-    };
-}
-
-identity_newtype!(
-    /// Identity of a source binding to one physical root.
-    BindingIdentity
-);
-identity_newtype!(
-    /// Stable identity of a filesystem observer registration.
-    ObserverToken
-);
-identity_newtype!(
-    /// Identity of an in-progress candidate build.
-    CandidateIdentity
-);
-identity_newtype!(
-    /// Identity of a promoted generation's authority.
-    GenerationIdentity
-);
-identity_newtype!(
-    /// Identity of one publication of source runtime state.
-    PublicationIdentity
-);
-identity_newtype!(
-    /// Identity of an untrusted on-disk snapshot seed.
-    SnapshotIdentity
-);
+// The identity newtypes and their counter moved to `crate::lifecycle_identity`
+// so the V11 provenance types under `protocol` can mint from the SAME counter
+// without importing this dark module. Re-exported here so every existing path
+// through `authority::` keeps resolving.
+//
+// Do not reintroduce a local counter: two counters means two identity spaces,
+// and two identities minted "fresh" could then compare unequal while both
+// claiming uniqueness.
+pub use crate::lifecycle_identity::{
+    BindingIdentity, CandidateIdentity, GenerationIdentity, ObserverToken, PublicationIdentity,
+    SnapshotIdentity,
+};
 
 /// Monotonic per-source mutation epoch. An ordering aid, never an authorization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

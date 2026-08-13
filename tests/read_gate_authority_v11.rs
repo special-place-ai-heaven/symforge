@@ -81,7 +81,10 @@ fn an_operation() -> OperationReceipt {
 
 /// Derive one claim from two leases, which is the seam where root
 /// compatibility is decided.
-fn derive_across(left: &ObservationLease, right: &ObservationLease) -> Result<Claim<()>, SourceRefusal> {
+fn derive_across(
+    left: &ObservationLease,
+    right: &ObservationLease,
+) -> Result<Claim<()>, SourceRefusal> {
     Claim::derive(
         an_operation(),
         [
