@@ -30,7 +30,7 @@ fn capacity_is_conserved_until_physical_drop() {
     assert_eq!(ledger.outstanding_charges(root), 1);
 
     // Redeeming does not change the charge: the bytes were already committed.
-    let allocation = ledger.redeem(grant);
+    let allocation = ledger.redeem(grant).expect("own grant");
     assert_eq!(ledger.charged(root), 400);
     assert_eq!(allocation.bytes(), 400);
 
@@ -46,7 +46,9 @@ fn capacity_is_conserved_until_physical_drop() {
     assert_eq!(ledger.outstanding_charges(root), 0);
 
     // Explicit release refunds exactly the same way, and reports what it freed.
-    let second = ledger.redeem(ledger.reserve(root, 250).expect("headroom exists"));
+    let second = ledger
+        .redeem(ledger.reserve(root, 250).expect("headroom exists"))
+        .expect("own grant");
     assert_eq!(ledger.charged(root), 250);
     assert_eq!(second.release(), 250);
     assert_eq!(ledger.charged(root), 0);
@@ -71,8 +73,12 @@ fn one_grant_backs_exactly_one_allocation() {
     let ledger = ProcessCapacityPool::new();
     let root = ledger.root(1_000);
 
-    let first = ledger.redeem(ledger.reserve(root, 100).expect("headroom"));
-    let second = ledger.redeem(ledger.reserve(root, 100).expect("headroom"));
+    let first = ledger
+        .redeem(ledger.reserve(root, 100).expect("headroom"))
+        .expect("own grant");
+    let second = ledger
+        .redeem(ledger.reserve(root, 100).expect("headroom"))
+        .expect("own grant");
     assert_eq!(
         ledger.charged(root),
         200,
@@ -100,7 +106,9 @@ fn one_grant_backs_exactly_one_allocation() {
 fn an_exhausted_owner_refuses_without_charging() {
     let ledger = ProcessCapacityPool::new();
     let root = ledger.root(500);
-    let held = ledger.redeem(ledger.reserve(root, 400).expect("headroom"));
+    let held = ledger
+        .redeem(ledger.reserve(root, 400).expect("headroom"))
+        .expect("own grant");
 
     // Negative: over-large request is refused with what was actually available.
     assert_eq!(
@@ -123,7 +131,7 @@ fn an_exhausted_owner_refuses_without_charging() {
     // size rather than about the owner being closed.
     let fits = ledger.reserve(root, 100).expect("100 fits exactly");
     assert_eq!(ledger.charged(root), 500);
-    drop(ledger.redeem(fits));
+    drop(ledger.redeem(fits).expect("own grant"));
     drop(held);
     assert_eq!(ledger.charged(root), 0);
 }
@@ -168,7 +176,9 @@ fn a_child_owner_is_backed_by_its_parent() {
     assert_eq!(ledger.available(sibling), 400);
 
     // Spending inside the child does not double-charge the parent.
-    let inside = ledger.redeem(ledger.reserve(child, 500).expect("fits in the child"));
+    let inside = ledger
+        .redeem(ledger.reserve(child, 500).expect("fits in the child"))
+        .expect("own grant");
     assert_eq!(ledger.charged(child), 500);
     assert_eq!(
         ledger.charged(root),
@@ -188,7 +198,9 @@ fn a_child_cannot_be_released_while_it_is_still_spending() {
     let child = ledger.child(root, 600).expect("600 fits");
     assert_eq!(ledger.available(root), 400);
 
-    let inside = ledger.redeem(ledger.reserve(child, 200).expect("fits in the child"));
+    let inside = ledger
+        .redeem(ledger.reserve(child, 200).expect("fits in the child"))
+        .expect("own grant");
 
     // Negative: releasing now would refund the parent for capacity the child is
     // still spending, letting the process promise the same bytes twice.
@@ -226,7 +238,9 @@ fn a_child_cannot_be_released_while_it_is_still_spending() {
 fn a_refund_for_an_unknown_charge_invents_nothing() {
     let ledger = ProcessCapacityPool::new();
     let root = ledger.root(1_000);
-    let allocation = ledger.redeem(ledger.reserve(root, 300).expect("headroom"));
+    let allocation = ledger
+        .redeem(ledger.reserve(root, 300).expect("headroom"))
+        .expect("own grant");
 
     // Release once: legitimate, refunds the real amount.
     assert_eq!(allocation.release(), 300);
@@ -237,7 +251,9 @@ fn a_refund_for_an_unknown_charge_invents_nothing() {
     // its charge is unknown here, so it must refund zero and be counted.
     let other = ProcessCapacityPool::new();
     let other_root = other.root(1_000);
-    let foreign = other.redeem(other.reserve(other_root, 100).expect("headroom"));
+    let foreign = other
+        .redeem(other.reserve(other_root, 100).expect("headroom"))
+        .expect("own grant");
     drop(foreign);
     assert_eq!(
         ledger.unknown_refunds(),
@@ -245,6 +261,86 @@ fn a_refund_for_an_unknown_charge_invents_nothing() {
         "another ledger's refund reached this one"
     );
     assert_eq!(other.charged(other_root), 0);
+}
+
+/// Releasing an owner that still backs children would promise the same bytes
+/// twice.
+///
+/// Found by adversarial review. A child's limit is charged to its parent at
+/// `child()` time and recorded in `charged`, never in `outstanding`, so the
+/// outstanding-only guard saw an owner with live children as perfectly drained:
+/// `release_owner` returned its whole limit to the grandparent while its own
+/// children kept spending against a limit nothing backed. The reviewer's
+/// sequence promised 1500 bytes beneath a 1000-byte root.
+#[test]
+fn an_owner_that_still_backs_children_cannot_return_its_promise() {
+    let ledger = ProcessCapacityPool::new();
+    let root = ledger.root(1_000);
+    let a = ledger.child(root, 600).expect("fits under the root");
+    let b = ledger.child(a, 500).expect("fits under a");
+
+    // The whole 600 is charged to the root the moment `a` exists.
+    assert_eq!(ledger.charged(root), 600);
+    assert_eq!(
+        ledger.release_owner(a).expect_err("a still backs b"),
+        CapacityRefusal::HasChildren { children: 1 }
+    );
+    // Nothing moved: the root is still backing the promise it made.
+    assert_eq!(ledger.charged(root), 600);
+    assert_eq!(ledger.available(root), 400);
+    // And the over-promise the refusal prevents is still refused.
+    assert!(ledger.child(root, 1_000).is_err());
+
+    // Paired positive: release the leaf first, then the parent, and every byte
+    // comes back exactly once.
+    assert_eq!(ledger.release_owner(b).expect("b backs nothing"), 500);
+    assert_eq!(ledger.release_owner(a).expect("a now backs nothing"), 600);
+    assert_eq!(ledger.charged(root), 0);
+    assert_eq!(ledger.available(root), 1_000);
+
+    // Releasing an owner this pool does not have refunded nothing, and says so
+    // rather than reporting a success it never performed.
+    assert_eq!(
+        ledger.release_owner(a).expect_err("already gone"),
+        CapacityRefusal::UnknownOwner
+    );
+}
+
+/// A pool must not honour another pool's grant.
+///
+/// Found by adversarial review. `redeem` copied the grant's fields and stamped
+/// the redeeming pool onto the permit, so the refund landed here while the
+/// issuer kept the charge outstanding forever. `unknown_refunds` did fire — on
+/// the pool that had lost nothing, leaving the pool that actually leaked
+/// capacity reporting a clean account. That is worse than no detector.
+#[test]
+fn a_grant_from_another_pool_is_refused_rather_than_honoured() {
+    let issuer = ProcessCapacityPool::new();
+    let issuer_root = issuer.root(1_000);
+    let other = ProcessCapacityPool::new();
+
+    let grant = issuer.reserve(issuer_root, 300).expect("headroom");
+    assert_eq!(issuer.charged(issuer_root), 300);
+
+    assert_eq!(
+        other.redeem(grant).expect_err("not this pool's grant"),
+        CapacityRefusal::ForeignGrant
+    );
+
+    // The issuer still holds the charge, and nobody counted a phantom refund.
+    assert_eq!(issuer.charged(issuer_root), 300);
+    assert_eq!(issuer.outstanding_charges(issuer_root), 1);
+    assert_eq!(issuer.unknown_refunds(), 0);
+    assert_eq!(other.unknown_refunds(), 0);
+
+    // Paired positive: the issuing pool still honours its own grant, and the
+    // refund lands where the charge was made.
+    let permit = issuer
+        .redeem(issuer.reserve(issuer_root, 100).expect("headroom"))
+        .expect("own grant");
+    assert_eq!(permit.release(), 100);
+    assert_eq!(issuer.charged(issuer_root), 300);
+    assert_eq!(issuer.unknown_refunds(), 0);
 }
 
 /// TEST-CAPACITY-INTEGRATION (T069, Slice 4). Reserved name, empty of proof.

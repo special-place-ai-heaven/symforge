@@ -68,6 +68,28 @@ pub enum RegistryRefusal {
     ProtectedWithoutAuthorization,
     /// The slot is still admitting; it has not published anything yet.
     StillPending,
+    /// The occupancy being joined is on a different physical root, so the caller
+    /// and the occupancy disagree about what this key even is.
+    ///
+    /// Compared on the ROOT, not the binding identity. `BindingAuthority::bind`
+    /// mints a fresh identity per call, so two legitimate concurrent opens of
+    /// one path hold different binding identities for the same root — comparing
+    /// identities would refuse exactly the single-flight join this registry
+    /// exists to provide.
+    RootMismatch {
+        /// The root the existing occupancy is bound to.
+        joined: super::physical_root::PhysicalRootIdentity,
+        /// The root the caller presented.
+        presented: super::physical_root::PhysicalRootIdentity,
+    },
+    /// The occupancy being joined places its state somewhere else, so honouring
+    /// the join would write state where the caller said it must not go.
+    PlacementMismatch {
+        /// Where the existing occupancy places state.
+        joined: StatePlacement,
+        /// Where the caller asked for it.
+        presented: StatePlacement,
+    },
 }
 
 /// How a project's derived state may be placed on disk.
@@ -140,6 +162,11 @@ impl PendingProjectAdmission {
 /// holder to voluntarily check `is_current` first would be documenting the
 /// hazard rather than closing it.
 ///
+/// Refusing the accessor is necessary but not sufficient: it reaches only the
+/// holder that asks again. `revoke` therefore retires the binding itself, whose
+/// liveness every clone shares, so a binding extracted before the stop stops
+/// authorizing at the same instant.
+///
 /// Identity, key and placement stay readable after revocation on purpose: they
 /// are diagnostics, and an operator investigating a stale holder needs to see
 /// WHICH slot it was.
@@ -200,7 +227,14 @@ impl LiveProjectSlot {
     }
 
     /// Revoke this occupancy. Idempotent, and never undone.
+    ///
+    /// Revokes the BINDING as well as the handle. Refusing `binding()` only
+    /// stops a holder that asks again; a holder that cloned the binding earlier
+    /// would still hold everything `SourceMutationPermit::grant` inspects. The
+    /// binding's liveness is shared across its clones, so retiring it here
+    /// reaches authority that has already left this slot.
     fn revoke(&self) {
+        self.binding.revoke();
         self.revoked.store(true, Ordering::Release);
     }
 }
@@ -264,12 +298,47 @@ impl ProjectRegistry {
         }
 
         let mut state = self.occupancy.lock().expect("registry mutex");
+        // Joining is only single-flight if the request being joined is the
+        // request that was made. An earlier version dropped the caller's
+        // binding, protection and placement on both join branches and returned
+        // `Ok`, so a caller that admitted a key as protected with user-local
+        // state joined an occupancy admitted as ordinary with project-local
+        // state and was told its request succeeded — state written beneath a
+        // root the second caller had declared protected, reported as success.
+        // A different binding is a different physical root for one key, which is
+        // the disagreement binding identity exists to detect.
         match state.keys.get_mut(&key) {
             Some(Occupancy::Pending(pending)) => {
+                if pending.binding.physical_root() != binding.physical_root() {
+                    return Err(RegistryRefusal::RootMismatch {
+                        joined: pending.binding.physical_root(),
+                        presented: binding.physical_root(),
+                    });
+                }
+                if pending.placement != placement {
+                    return Err(RegistryRefusal::PlacementMismatch {
+                        joined: pending.placement,
+                        presented: placement,
+                    });
+                }
                 pending.joiners += 1;
                 Ok(pending.slot)
             }
-            Some(Occupancy::Live(live)) => Ok(live.slot()),
+            Some(Occupancy::Live(live)) => {
+                if live.binding.physical_root() != binding.physical_root() {
+                    return Err(RegistryRefusal::RootMismatch {
+                        joined: live.binding.physical_root(),
+                        presented: binding.physical_root(),
+                    });
+                }
+                if live.placement != placement {
+                    return Err(RegistryRefusal::PlacementMismatch {
+                        joined: live.placement,
+                        presented: placement,
+                    });
+                }
+                Ok(live.slot())
+            }
             None => {
                 let slot = SlotIdentity::fresh();
                 state.keys.insert(
@@ -297,22 +366,33 @@ impl ProjectRegistry {
 
     /// Install the pending admission for `key` as live.
     ///
-    /// Refuses a slot identity that has been tombstoned: a cancelled or stopped
-    /// admission can never be revived, only replaced by a new one.
+    /// A cancelled or stopped admission can never be revived, and what makes
+    /// that true is that `cancel` and `stop` REMOVE the entry as they tombstone
+    /// it, so there is no pending admission left to install. This used to carry
+    /// a tombstone check here as well; it could not fire, because a tombstoned
+    /// identity is never the identity of a pending entry, and a guard implying
+    /// an observation it never makes is the shape this repository's reporting
+    /// invariant names. The real mechanism is stated instead.
     pub fn install(
         self: &Arc<Self>,
         key: &ProjectKey,
         owner: Option<OwnerIdentity>,
     ) -> Result<Arc<LiveProjectSlot>, RegistryRefusal> {
         let mut state = self.occupancy.lock().expect("registry mutex");
-        let Some(Occupancy::Pending(pending)) = state.keys.remove(key) else {
-            // Put back whatever was there; a live slot is not an error to
-            // install over, but it is not a pending admission either.
-            return Err(RegistryRefusal::NotAdmitted);
+        let pending = match state.keys.remove(key) {
+            Some(Occupancy::Pending(pending)) => pending,
+            // `remove` already took it, so a refusal MUST put it back. An
+            // earlier version refused here without reinserting, which evicted a
+            // live slot from the map without revoking or tombstoning it and
+            // left its handle serving - the precise defect this module exists
+            // to prevent, reintroduced by a `let`-else whose comment claimed a
+            // restore that no line performed.
+            Some(other) => {
+                state.keys.insert(key.clone(), other);
+                return Err(RegistryRefusal::NotAdmitted);
+            }
+            None => return Err(RegistryRefusal::NotAdmitted),
         };
-        if state.tombstones.contains_key(&pending.slot) {
-            return Err(RegistryRefusal::Tombstoned { slot: pending.slot });
-        }
         let live = Arc::new(LiveProjectSlot {
             slot: pending.slot,
             key: pending.key.clone(),
@@ -330,8 +410,14 @@ impl ProjectRegistry {
     /// Cancel a pending admission, retiring its identity permanently.
     pub fn cancel(self: &Arc<Self>, key: &ProjectKey) -> Result<SlotIdentity, RegistryRefusal> {
         let mut state = self.occupancy.lock().expect("registry mutex");
-        let Some(Occupancy::Pending(pending)) = state.keys.remove(key) else {
-            return Err(RegistryRefusal::NotAdmitted);
+        let pending = match state.keys.remove(key) {
+            Some(Occupancy::Pending(pending)) => pending,
+            // Refusing must not evict the live slot it refused to cancel.
+            Some(other) => {
+                state.keys.insert(key.clone(), other);
+                return Err(RegistryRefusal::NotAdmitted);
+            }
+            None => return Err(RegistryRefusal::NotAdmitted),
         };
         state.tombstones.insert(pending.slot, pending.key);
         Ok(pending.slot)
@@ -345,8 +431,15 @@ impl ProjectRegistry {
     /// handle still hands out its binding.
     pub fn stop(self: &Arc<Self>, key: &ProjectKey) -> Result<SlotIdentity, RegistryRefusal> {
         let mut state = self.occupancy.lock().expect("registry mutex");
-        let Some(Occupancy::Live(live)) = state.keys.remove(key) else {
-            return Err(RegistryRefusal::NotAdmitted);
+        let live = match state.keys.remove(key) {
+            Some(Occupancy::Live(live)) => live,
+            // Refusing must not destroy the pending admission it refused to
+            // stop; every joiner already holds that admission's identity.
+            Some(other) => {
+                state.keys.insert(key.clone(), other);
+                return Err(RegistryRefusal::NotAdmitted);
+            }
+            None => return Err(RegistryRefusal::NotAdmitted),
         };
         // Revoke FIRST: every outstanding handle must start refusing before the
         // registry records the retirement, or a holder could still obtain the

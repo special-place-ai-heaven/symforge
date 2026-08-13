@@ -35,6 +35,19 @@ impl OwnerIdentity {
     }
 }
 
+/// Identity of one capacity pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolIdentity(std::num::NonZeroU64);
+
+static NEXT_POOL: AtomicU64 = AtomicU64::new(1);
+
+impl PoolIdentity {
+    fn fresh() -> Self {
+        let raw = NEXT_POOL.fetch_add(1, Ordering::Relaxed);
+        Self(std::num::NonZeroU64::new(raw).expect("pool counter starts at 1"))
+    }
+}
+
 /// Why a capacity request was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapacityRefusal {
@@ -57,6 +70,15 @@ pub enum CapacityRefusal {
         /// What the parent could back.
         available: u64,
     },
+    /// An owner still backs children, so its promise is not free to return.
+    HasChildren {
+        /// How many children still hold a limit backed by this owner.
+        children: usize,
+    },
+    /// The owner named is not in this pool.
+    UnknownOwner,
+    /// The grant was issued by a different pool, so this one cannot honour it.
+    ForeignGrant,
 }
 
 /// An immutable authorization to allocate a fixed number of bytes, exactly once.
@@ -69,6 +91,11 @@ pub struct CapacityGrant {
     owner: OwnerIdentity,
     bytes: u64,
     charge: PublicationIdentity,
+    /// Which pool issued it. A grant redeemed by a different pool would charge
+    /// one account and refund another, leaving the issuer's charge outstanding
+    /// forever while the redeemer counted an unknown refund — the loss recorded
+    /// against the one account that did not lose anything.
+    pool: PoolIdentity,
 }
 
 impl CapacityGrant {
@@ -155,18 +182,41 @@ struct OwnerRow {
 ///
 /// Hierarchical: a child owner's limit is backed by its parent's headroom, so
 /// the sum of everything charged beneath a root can never exceed that root.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProcessCapacityPool {
+    identity: PoolIdentity,
     rows: std::sync::Mutex<BTreeMap<OwnerIdentity, OwnerRow>>,
     /// Refunds that named a charge the ledger did not have. A non-zero value
     /// means somebody is refunding capacity that was never charged.
+    ///
+    /// No public sequence reaches it any more: `redeem` refuses a foreign grant,
+    /// `release_owner` refuses while charges or children are outstanding, and a
+    /// permit refunds exactly once by construction. It stays as a fail-closed
+    /// backstop for a future caller, and its unreachability is a property the
+    /// oracles pin by proving each of those refusals — not a claim that the
+    /// counter was exercised.
     unknown_refunds: AtomicU64,
+}
+
+impl Default for ProcessCapacityPool {
+    fn default() -> Self {
+        Self {
+            identity: PoolIdentity::fresh(),
+            rows: std::sync::Mutex::new(BTreeMap::new()),
+            unknown_refunds: AtomicU64::new(0),
+        }
+    }
 }
 
 impl ProcessCapacityPool {
     /// A ledger with no owners.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// This pool's identity.
+    pub fn identity(&self) -> PoolIdentity {
+        self.identity
     }
 
     /// Create a root owner with a fixed limit.
@@ -243,20 +293,30 @@ impl ProcessCapacityPool {
             owner,
             bytes,
             charge,
+            pool: self.identity,
         })
     }
 
-    /// Redeem a grant into a live allocation.
+    /// Redeem a grant into a live permit.
     ///
-    /// Consumes the grant by value, so one grant can never back two allocations.
-    pub fn redeem(self: &Arc<Self>, grant: CapacityGrant) -> CapacityPermit {
-        CapacityPermit {
+    /// Consumes the grant by value, so one grant can never back two permits, and
+    /// refuses a grant this pool did not issue. Honouring a foreign grant would
+    /// charge the issuing pool forever while the refund landed here, so the pool
+    /// that actually lost capacity would be the one reporting a clean account.
+    pub fn redeem(
+        self: &Arc<Self>,
+        grant: CapacityGrant,
+    ) -> Result<CapacityPermit, CapacityRefusal> {
+        if grant.pool != self.identity {
+            return Err(CapacityRefusal::ForeignGrant);
+        }
+        Ok(CapacityPermit {
             owner: grant.owner,
             bytes: grant.bytes,
             charge: grant.charge,
             ledger: Arc::clone(self),
             refunded: false,
-        }
+        })
     }
 
     /// How many bytes `owner` currently has charged.
@@ -299,13 +359,19 @@ impl ProcessCapacityPool {
 
     /// Release a child owner, refunding its whole promise to its parent.
     ///
-    /// Refuses while the child still holds outstanding charges: refunding the
-    /// parent for capacity a child is still spending would let the process
-    /// promise the same bytes twice.
+    /// Refuses while the child still holds outstanding charges OR still backs
+    /// children of its own. Both would let the process promise the same bytes
+    /// twice: a child's limit is charged to its parent at `child()` time and
+    /// recorded in `charged`, never in `outstanding`, so an owner with live
+    /// children looked perfectly drained to an outstanding-only check. Releasing
+    /// it returned its whole limit to the grandparent while its own children kept
+    /// spending against a limit nothing backed any more.
     pub fn release_owner(self: &Arc<Self>, owner: OwnerIdentity) -> Result<u64, CapacityRefusal> {
         let mut rows = self.rows.lock().expect("capacity ledger mutex");
         let Some(row) = rows.get(&owner) else {
-            return Ok(0);
+            // Releasing an owner this pool does not have refunded nothing, and
+            // reporting `Ok(0)` for it is a success this call never observed.
+            return Err(CapacityRefusal::UnknownOwner);
         };
         if !row.outstanding.is_empty() {
             return Err(CapacityRefusal::Exhausted {
@@ -313,8 +379,26 @@ impl ProcessCapacityPool {
                 available: row.limit.saturating_sub(row.charged),
             });
         }
+        // Scanning beats a maintained counter here: the rows are few, and a
+        // counter is a second representation of the same fact that can drift
+        // from it.
+        let children = rows
+            .values()
+            .filter(|candidate| candidate.parent == Some(owner))
+            .count();
+        if children > 0 {
+            return Err(CapacityRefusal::HasChildren { children });
+        }
         let limit = row.limit;
         let parent = row.parent;
+        // A recorded parent that is not in the pool means the refund has nowhere
+        // to land. Returning the limit anyway would report capacity restored to
+        // an account that does not exist.
+        if let Some(parent) = parent
+            && !rows.contains_key(&parent)
+        {
+            return Err(CapacityRefusal::UnknownOwner);
+        }
         rows.remove(&owner);
         if let Some(parent) = parent
             && let Some(parent_row) = rows.get_mut(&parent)

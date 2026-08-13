@@ -77,7 +77,14 @@ pub fn apply(
     // to transitions. Checking first costs nothing: an outstanding permit
     // implies its own grant already published non-`Current`, so freezing before
     // the check bought no additional safety.
-    if !outstanding.has_ended() {
+    // Two questions, not one. `outstanding` is the drain signal of ONE permit;
+    // `active_permits` is what the source itself still has outstanding. Slice 2
+    // widened the model to plural precisely because a source can be draining
+    // several at once, and for a while only the model was plural: a source with
+    // three live permits passed this gate whenever the single signal handed in
+    // had ended. Asking the source directly is what makes the `Drain` step below
+    // an observation about the source rather than about one caller's argument.
+    if !outstanding.has_ended() || !runtime.active_permits().is_drained() {
         return Err(AuthorityRefusal::OutstandingPermit);
     }
 
@@ -94,7 +101,7 @@ pub fn apply(
     // can acquire a permit in between -- the source is non-`Current` now, so
     // `request_mutation_grant` refuses -- but the step claims an observation, so
     // it makes one.
-    if !outstanding.has_ended() {
+    if !outstanding.has_ended() || !runtime.active_permits().is_drained() {
         return Err(AuthorityRefusal::OutstandingPermit);
     }
     steps.push(TransitionStep::Drain);

@@ -151,3 +151,51 @@ fn a_reopened_source_is_a_new_identity() {
         "a reopened source reused its predecessor's identity"
     );
 }
+
+/// A finalizer must refuse only its own source, and shutdown must not latch.
+///
+/// Found by adversarial review. `FINALIZING` was a bare `bool`, so
+/// `a.finalize(|| b.close())` reported that closing an unrelated source would
+/// wait on itself — a refusal naming something that did not happen, with `b`
+/// left open — while `a.finalize(|| drop(b))` was permitted, so the two paths
+/// disagreed about whether the hazard even existed. `has_shut_down` latched on
+/// the first shutdown and was never cleared, reporting a past moment as present
+/// state while a source was open.
+#[test]
+fn a_finalizer_refuses_only_its_own_source_and_shutdown_does_not_latch() {
+    let factory = EmbeddedSourceFactory::new();
+    let a = factory.open(ProjectKey::new("a")).expect("open a");
+    let b = factory.open(ProjectKey::new("b")).expect("open b");
+
+    // Negative: a's finalizer cannot close a.
+    let refusal = a.finalize(|| a.close().expect_err("closing self from its own finalizer"));
+    assert_eq!(refusal, EmbedRefusal::WouldSelfWait);
+    assert!(a.is_open(), "a refused close still closed the source");
+
+    // Positive, in the same finalizer: closing a DIFFERENT source is not a
+    // self-wait and proceeds.
+    let receipt = a.finalize(|| {
+        b.close()
+            .expect("closing another source is not a self-wait")
+    });
+    assert!(receipt.performed_shutdown());
+    assert!(!b.is_open());
+    assert_eq!(factory.open_count(), 1);
+
+    // Outside any finalizer, a closes normally: the refusal was about the
+    // finalizer, not about a.
+    let receipt = a.close().expect("a closes outside its finalizer");
+    assert!(receipt.was_final_owner());
+    assert_eq!(factory.open_count(), 0);
+    assert!(factory.has_shut_down());
+
+    // Opening again clears it: the factory is serving, so reporting it shut down
+    // would be a claim about a past moment presented as present state.
+    let c = factory
+        .open(ProjectKey::new("c"))
+        .expect("open after shutdown");
+    assert!(!factory.has_shut_down());
+    assert_eq!(factory.open_count(), 1);
+    drop(c);
+    assert!(factory.has_shut_down());
+}

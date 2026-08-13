@@ -83,11 +83,31 @@ impl MutationEpoch {
 /// Cloneable: a binding is a description of which root is authoritative, not a
 /// consumable permission. Equality is exact on both the binding identity and the
 /// root lease identity, so a rebind never compares equal to its predecessor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **A clone shares its liveness with the original**, because a clone IS this
+/// binding rather than a copy of it. Revocation therefore reaches authority that
+/// was already handed out — the registry can refuse to hand out a stopped slot's
+/// binding, but it cannot reach a clone a holder took before the stop, and a
+/// permit granted from such a clone would write to disk under a slot the
+/// registry had already retired.
+#[derive(Debug, Clone)]
 pub struct BindingAuthority {
     identity: BindingIdentity,
     physical_root: crate::live_index::index_lifecycle::physical_root::PhysicalRootIdentity,
+    /// Shared across clones on purpose; see the type comment.
+    revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Identity, not liveness. Two handles on one binding are the same binding
+/// whether or not it has since been revoked, and comparing the flag would make
+/// a revocation look like a rebind.
+impl PartialEq for BindingAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.physical_root == other.physical_root
+    }
+}
+
+impl Eq for BindingAuthority {}
 
 impl BindingAuthority {
     /// Bind a source to a physical root under a fresh never-reused identity.
@@ -97,7 +117,19 @@ impl BindingAuthority {
         Self {
             identity: BindingIdentity::fresh(),
             physical_root,
+            revoked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Retire this binding and every clone of it. Idempotent, never undone.
+    pub fn revoke(&self) {
+        self.revoked
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this binding still authorizes anything.
+    pub fn is_live(&self) -> bool {
+        !self.revoked.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The binding's identity.
@@ -481,6 +513,12 @@ impl ActivePermits {
         self.outstanding.is_empty()
     }
 
+    /// The permits still outstanding, so a caller can retire them by name
+    /// rather than having to have remembered each identity it was issued.
+    pub fn outstanding(&self) -> impl Iterator<Item = PublicationIdentity> + '_ {
+        self.outstanding.iter().copied()
+    }
+
     /// How many permits are outstanding.
     pub fn len(&self) -> usize {
         self.outstanding.len()
@@ -567,6 +605,12 @@ pub enum AuthorityRefusal {
     SideEffectAlreadyInFlight,
     /// The authority presented does not match the live source as a whole.
     WholeAuthorityMismatch,
+    /// The binding the authority names has been revoked, so it authorizes
+    /// nothing regardless of how the holder obtained it.
+    BindingRevoked {
+        /// The retired binding, for diagnosis.
+        binding: BindingIdentity,
+    },
     /// A transition was attempted while a permit was still outstanding.
     OutstandingPermit,
 }
@@ -715,12 +759,15 @@ impl SourceRuntime {
         self.grants_issued
     }
 
-    /// The generation this phase retains, if any.
+    /// The generation this phase retains, if any. Accounting, not permission.
     ///
-    /// Strict queryability is closed: only `Current` holds a query-granting
-    /// generation. `Loading` retains none, `Refreshing` exactly one, and
-    /// `Blocked`/`Stopping` zero or one for recovery and accounting. A retained
-    /// generation is never queryable — it is reported here for accounting only.
+    /// `Loading` retains none, `Refreshing` exactly one, and `Blocked`/`Stopping`
+    /// zero or one for recovery and accounting. Retention says nothing about
+    /// whether a reader may be served: ask [`Self::queryable_generation`], which
+    /// is where A20 lives. This doc previously stated the pre-A20 rule — that a
+    /// retained generation is never queryable — twelve lines above the code that
+    /// implements the amendment, which is precisely the claim Slice 4 would have
+    /// read when it wired reads.
     pub fn retained_generation(&self) -> Option<GenerationIdentity> {
         match &self.phase {
             SourcePhase::Loading { .. } => None,
@@ -735,11 +782,23 @@ impl SourceRuntime {
     /// The generation a reader may be served from, if any (F020-V11-A20).
     ///
     /// Queryability closes on COMPLETENESS, not recency. `Current` is queryable.
-    /// So is the single generation `Refreshing` retains: it is the complete
-    /// verified generation that was `Current` immediately before the refresh
-    /// began, so serving it exposes no partial state, and refusing to serve it
-    /// would take the source offline for the whole of a rebuild while buying no
-    /// safety at all.
+    /// So is the single generation `Refreshing` retains **while no mutation
+    /// permit is outstanding against the source**: it is the complete verified
+    /// generation that was `Current` immediately before the refresh began, so
+    /// serving it exposes no partial state, and refusing to serve it would take
+    /// the source offline for the whole of a rebuild while buying no safety at
+    /// all.
+    ///
+    /// The permit condition is not a detail. `Refreshing` is reached two ways.
+    /// A **reload** builds a candidate elsewhere and leaves the retained
+    /// generation's bytes untouched, which is the case A20 was written for. A
+    /// **mutation** reaches it through `request_mutation_grant`, which freezes
+    /// precisely so the source stops being queryable before a source-disk side
+    /// effect is authorized; there the retained generation describes files a
+    /// permit is in the middle of replacing, so it is complete and must still not
+    /// be served. A20 as first written extended the reload argument to the
+    /// mutation case silently, and reopened the exact window the freeze ordering
+    /// exists to close.
     ///
     /// `Blocked` and `Stopping` return `None` even when they retain something.
     /// Neither has a successor in flight, so its retention is a remnant rather
@@ -749,7 +808,11 @@ impl SourceRuntime {
     pub fn queryable_generation(&self) -> Option<GenerationIdentity> {
         match &self.phase {
             SourcePhase::Current(publication) => Some(publication.generation()),
-            SourcePhase::Refreshing { retained, .. } => Some(*retained),
+            SourcePhase::Refreshing {
+                retained,
+                active_permits,
+                ..
+            } => active_permits.is_drained().then_some(*retained),
             SourcePhase::Loading { .. }
             | SourcePhase::Blocked { .. }
             | SourcePhase::Stopping { .. } => None,
@@ -986,6 +1049,13 @@ impl SourceRuntime {
         let publication = self
             .freeze()
             .expect("a Current source always has a publication to freeze");
+        // Record the permit this grant will become, on the source itself. The
+        // freeze alone no longer makes the source unqueryable — A20 keeps a
+        // refreshing source serving its retained generation — so what closes
+        // reads for the duration of a mutation is this outstanding permit. A
+        // grant that did not record one would leave the source serving the very
+        // files its holder is about to replace.
+        self.record_permit(publication);
         let epoch = self.mutation_epoch;
         self.grants_issued += 1;
 

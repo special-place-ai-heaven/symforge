@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use symforge::live_index::index_lifecycle::physical_root::{
-    PhysicalRootLease, ReplacementStep, RootRefusal, replace_beneath,
+    PhysicalRootLease, ReplacementStep, RootRefusal, replace_beneath, stage_replacement,
 };
 
 /// TEST-PHYSICAL-ROOT (T023). The name is pinned by
@@ -271,5 +271,55 @@ fn a_link_component_is_refused_rather_than_followed() {
         std::fs::read(outside.path().join("secret.txt")).expect("read outside"),
         b"outside".to_vec(),
         "the refused replacement must not have escaped the root"
+    );
+}
+
+/// A stage taken before a revocation must not commit after it.
+///
+/// Found by adversarial review. `transition::apply` revokes the outgoing lease
+/// "so no surviving permit can resolve a path under the replaced root", and the
+/// two-step write introduced by this slice opened a window in the middle of that
+/// ordering: `commit` held its own directory handle and never asked whether the
+/// lease was still live, so it renamed happily after the revocation and returned
+/// a receipt naming the retired lease.
+#[test]
+fn a_staged_replacement_refuses_to_commit_under_a_revoked_lease() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("target.txt"), b"original").expect("preimage");
+    let lease = PhysicalRootLease::take(root.path());
+
+    let staged = stage_replacement(&lease, Path::new("target.txt"), b"replacement")
+        .expect("a live lease stages");
+    let temp = staged.temp_path().to_path_buf();
+    assert!(
+        temp.exists(),
+        "the stage must exist for the window to be real"
+    );
+
+    lease.revoke();
+
+    assert_eq!(
+        staged
+            .commit()
+            .expect_err("a revoked lease must not commit"),
+        RootRefusal::LeaseRevoked
+    );
+    // The target still holds its preimage, and the abandoned stage cleaned up.
+    assert_eq!(
+        std::fs::read(root.path().join("target.txt")).expect("target survives"),
+        b"original"
+    );
+    assert!(!temp.exists(), "a refused commit left its temporary behind");
+
+    // Paired positive: on a live lease the identical sequence commits, so the
+    // refusal is about revocation rather than about staging in general.
+    let live = PhysicalRootLease::take(root.path());
+    let staged = stage_replacement(&live, Path::new("target.txt"), b"replacement")
+        .expect("a live lease stages");
+    let receipt = staged.commit().expect("a live lease commits");
+    assert_eq!(receipt.lease(), live.identity());
+    assert_eq!(
+        std::fs::read(root.path().join("target.txt")).expect("target replaced"),
+        b"replacement"
     );
 }

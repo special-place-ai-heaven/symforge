@@ -25,6 +25,7 @@
 
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cap_std::ambient_authority;
@@ -97,7 +98,9 @@ pub struct PhysicalRootLease {
     /// refuses everything rather than silently falling back to path-based I/O,
     /// which is the fallback that would reintroduce the escape this closes.
     dir: Option<Dir>,
-    revoked: AtomicBool,
+    /// Shared with anything holding authority derived from this lease, so a
+    /// revocation reaches a staged replacement that is between its two steps.
+    revoked: Arc<AtomicBool>,
 }
 
 impl PhysicalRootLease {
@@ -113,7 +116,7 @@ impl PhysicalRootLease {
             identity: PhysicalRootIdentity::fresh(),
             root,
             dir,
-            revoked: AtomicBool::new(false),
+            revoked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -146,6 +149,11 @@ impl PhysicalRootLease {
     /// Revoke the lease. Idempotent.
     pub fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
+    }
+
+    /// The liveness this lease shares with authority derived from it.
+    fn revocation(&self) -> &Arc<AtomicBool> {
+        &self.revoked
     }
 
     /// Resolve `relative` beneath this lease's root without following links.
@@ -330,6 +338,14 @@ pub fn stage_replacement(
     let target = lease.resolve_beneath(relative)?;
     lease.refuse_link_relative(target.relative())?;
     let dir = lease.capability()?;
+    // Cloned BEFORE anything is created. Cloning after the temporary was written
+    // meant a failure here returned with the temporary already on disk and no
+    // `Drop` guard yet in existence to remove it, contradicting this module's own
+    // claim that an abandoned stage removes its own temporary.
+    let staged_dir = dir.try_clone().map_err(|error| RootRefusal::Unreadable {
+        path: lease.root().to_path_buf(),
+        message: error.to_string(),
+    })?;
 
     let mut steps = Vec::new();
 
@@ -403,10 +419,8 @@ pub fn stage_replacement(
         target_relative: target.relative().to_path_buf(),
         target: target.path(),
         lease: lease.identity(),
-        dir: dir.try_clone().map_err(|error| RootRefusal::Unreadable {
-            path: lease.root().to_path_buf(),
-            message: error.to_string(),
-        })?,
+        revoked: Arc::clone(lease.revocation()),
+        dir: staged_dir,
         steps,
     })
 }
@@ -422,6 +436,8 @@ pub struct StagedReplacement {
     target_relative: PathBuf,
     target: PathBuf,
     lease: PhysicalRootIdentity,
+    /// The originating lease's liveness, shared rather than copied.
+    revoked: Arc<AtomicBool>,
     dir: Dir,
     steps: Vec<ReplacementStep>,
 }
@@ -438,7 +454,18 @@ impl StagedReplacement {
     }
 
     /// Replace the target with the staged content.
+    ///
+    /// Re-checks the originating lease. `transition::apply` revokes the outgoing
+    /// lease "so no surviving permit can resolve a path under the replaced root",
+    /// and splitting the write into two steps opened a window that ordering was
+    /// written to close: a stage taken before the install committed happily after
+    /// it, and the resulting receipt named the revoked lease, so
+    /// `SourceMutationPermit::commit` attested a write performed under authority
+    /// that had been withdrawn. `Drop` removes the temporary on refusal.
     pub fn commit(mut self) -> Result<WriteReceipt, RootRefusal> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(RootRefusal::LeaseRevoked);
+        }
         if let Err(error) = self
             .dir
             .rename(&self.temp_relative, &self.dir, &self.target_relative)

@@ -173,7 +173,8 @@ fn a_refused_or_cancelled_admission_leaves_nothing_behind() {
     // return capacity to the process that the surface is still using.
     let held = runtime
         .ledger()
-        .redeem(runtime.ledger().reserve(owner, 1_000).expect("headroom"));
+        .redeem(runtime.ledger().reserve(owner, 1_000).expect("headroom"))
+        .expect("the runtime's own pool issued it");
     assert!(
         runtime.detach(SurfaceKind::Daemon).is_err(),
         "a surface with live allocations was detached"
@@ -249,15 +250,22 @@ fn slice_two_never_constructs_a_queryable_generation() {
 }
 
 /// Concurrent opens of one key join a single admission.
+///
+/// Both opens name the SAME physical root, because that is what two opens of one
+/// project are. Each mints its own `BindingAuthority` — `bind` gives a fresh
+/// identity per call — so this also pins that a join compares roots rather than
+/// binding identities. The earlier version handed the two opens two different
+/// tempdirs, i.e. two different projects under one key, and passed.
 #[test]
 fn concurrent_opens_join_one_admission() {
     let registry = ProjectRegistry::new();
     let key = ProjectKey::new("joined");
+    let root = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity();
 
     let first = registry
         .admit(
             key.clone(),
-            binding(),
+            BindingAuthority::bind(root),
             RootProtection::Normal,
             false,
             StatePlacement::ProjectLocal,
@@ -266,7 +274,7 @@ fn concurrent_opens_join_one_admission() {
     let second = registry
         .admit(
             key.clone(),
-            binding(),
+            BindingAuthority::bind(root),
             RootProtection::Normal,
             false,
             StatePlacement::ProjectLocal,
@@ -443,4 +451,263 @@ fn a_cancelled_admission_installs_nothing() {
     assert_ne!(reopened, slot);
     registry.install(&key, None).expect("installs");
     assert_eq!(registry.tombstone_count(), 1);
+}
+
+/// A refusal must not consume what it refused to act on.
+///
+/// Found by adversarial review: all three transitions matched their expected
+/// occupancy with `let Some(Occupancy::X(..)) = state.keys.remove(key) else`,
+/// and `remove` runs before the pattern is tested. Refusing therefore dropped
+/// the entry — a live slot evicted from the map with no revocation and no
+/// tombstone, its handle still serving, which is the exact defect this module
+/// exists to prevent. The comment above the first one even claimed a restore
+/// that no line performed.
+///
+/// Each refusal below is paired with the accepting call that proves the
+/// occupancy really did survive it.
+#[test]
+fn a_refused_transition_leaves_the_occupancy_it_refused_intact() {
+    let registry = ProjectRegistry::new();
+
+    // A live slot must survive install() and cancel(), which expect pending.
+    let live_key = ProjectKey::new("live");
+    registry
+        .admit(
+            live_key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::ProjectLocal,
+        )
+        .expect("ordinary admission");
+    let live = registry.install(&live_key, None).expect("install pending");
+
+    assert_eq!(
+        registry.install(&live_key, None).expect_err("not pending"),
+        RegistryRefusal::NotAdmitted
+    );
+    assert_eq!(
+        registry.cancel(&live_key).expect_err("not pending"),
+        RegistryRefusal::NotAdmitted
+    );
+
+    // Still live, still current, still handing out its binding, not tombstoned.
+    assert!(live.is_live(), "a refused install evicted the live slot");
+    assert!(registry.is_current(&live_key, live.slot()));
+    assert!(live.binding().is_ok());
+
+    // A pending admission must survive stop(), which expects live.
+    let pending_key = ProjectKey::new("pending");
+    let pending_slot = registry
+        .admit(
+            pending_key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::ProjectLocal,
+        )
+        .expect("ordinary admission");
+    assert_eq!(
+        registry.stop(&pending_key).expect_err("not live"),
+        RegistryRefusal::NotAdmitted
+    );
+
+    // The accepting case: the admission survived, so it still installs, and
+    // under the identity every joiner was already given.
+    let installed = registry
+        .install(&pending_key, None)
+        .expect("a refused stop destroyed the pending admission");
+    assert_eq!(installed.slot(), pending_slot);
+
+    // Paired positives: each transition still works on the occupancy it expects.
+    assert!(registry.stop(&live_key).is_ok());
+    let cancel_key = ProjectKey::new("cancel");
+    registry
+        .admit(
+            cancel_key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::ProjectLocal,
+        )
+        .expect("ordinary admission");
+    assert!(registry.cancel(&cancel_key).is_ok());
+}
+
+/// Joining an admission must be joining the admission you asked for.
+///
+/// Found by adversarial review. Both join branches dropped the caller's binding,
+/// protection and placement and returned `Ok`, so a caller that admitted a key
+/// as protected with user-local state joined an occupancy admitted as ordinary
+/// with project-local state and was told it succeeded — state written beneath a
+/// root the second caller had declared protected, reported as success. That is
+/// this repository's named recurring shape: reporting that a request was
+/// honoured without observing that it was.
+#[test]
+fn a_join_that_disagrees_with_the_occupancy_is_refused() {
+    let registry = ProjectRegistry::new();
+    let key = ProjectKey::new("joined");
+    let first = binding();
+
+    let slot = registry
+        .admit(
+            key.clone(),
+            first.clone(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::ProjectLocal,
+        )
+        .expect("ordinary admission");
+
+    // A different placement for the same key is refused, not silently joined.
+    assert_eq!(
+        registry
+            .admit(
+                key.clone(),
+                first.clone(),
+                RootProtection::Normal,
+                false,
+                StatePlacement::UserLocal,
+            )
+            .expect_err("placements disagree"),
+        RegistryRefusal::PlacementMismatch {
+            joined: StatePlacement::ProjectLocal,
+            presented: StatePlacement::UserLocal,
+        }
+    );
+
+    // So is a different physical root: one key cannot be two roots. Compared on
+    // the ROOT rather than the binding identity, because `bind` mints a fresh
+    // identity per call and two legitimate concurrent opens of one path hold
+    // different identities for the same root — comparing identities would refuse
+    // the single-flight join this registry exists to provide, which is exactly
+    // what `concurrent_opens_join_one_admission` caught.
+    let other = binding();
+    assert_eq!(
+        registry
+            .admit(
+                key.clone(),
+                other.clone(),
+                RootProtection::Normal,
+                false,
+                StatePlacement::ProjectLocal,
+            )
+            .expect_err("roots disagree"),
+        RegistryRefusal::RootMismatch {
+            joined: first.physical_root(),
+            presented: other.physical_root(),
+        }
+    );
+
+    // Paired positive for that distinction: a DIFFERENT binding on the SAME root
+    // joins, because it is the same project.
+    let same_root = BindingAuthority::bind(first.physical_root());
+    assert_ne!(same_root.identity(), first.identity());
+    assert_eq!(
+        registry
+            .admit(
+                key.clone(),
+                same_root,
+                RootProtection::Normal,
+                false,
+                StatePlacement::ProjectLocal,
+            )
+            .expect("a fresh binding on the same root joins"),
+        slot
+    );
+
+    // Paired positive: an identical request still joins, and joins the SAME
+    // admission — the refusals above are about disagreement, not about joining.
+    assert_eq!(
+        registry
+            .admit(
+                key.clone(),
+                first.clone(),
+                RootProtection::Normal,
+                false,
+                StatePlacement::ProjectLocal,
+            )
+            .expect("an identical request joins"),
+        slot
+    );
+    assert_eq!(registry.pending_joiners(&key), Some(3));
+
+    // And the same holds once installed, rather than only while pending.
+    let live = registry.install(&key, None).expect("install pending");
+    let other_root = other.physical_root();
+    assert_eq!(
+        registry
+            .admit(
+                key.clone(),
+                other,
+                RootProtection::Normal,
+                false,
+                StatePlacement::ProjectLocal,
+            )
+            .expect_err("roots disagree"),
+        RegistryRefusal::RootMismatch {
+            joined: first.physical_root(),
+            presented: other_root,
+        }
+    );
+    assert!(live.is_live());
+}
+
+/// An executed plan must execute the plan.
+///
+/// Found by adversarial review. `execute_plan` forwarded only the key and the
+/// placement; `protection` and `authorized` were supplied fresh by the caller
+/// and `plan.owner()` was never used at all — so the admission performed could
+/// differ from the admission planned, and the capacity owner the whole of T034
+/// exists to determine was computed and dropped. T038's value is that the
+/// decision made now is the decision Slice 4 must make under real traffic.
+#[test]
+fn an_executed_plan_uses_the_decision_the_plan_recorded() {
+    use symforge::live_index::index_lifecycle::adapters;
+    use symforge::live_index::index_lifecycle::process_runtime::{
+        ProcessIndexRuntime, SurfaceKind,
+    };
+
+    let runtime = ProcessIndexRuntime::incarnate(10_000);
+    let owner = runtime
+        .attach(SurfaceKind::Daemon, 4_000)
+        .expect("the daemon surface attaches");
+    let registry = ProjectRegistry::new();
+
+    // An authorized protected root may index but must not place state beneath
+    // itself, so the plan records UserLocal and touches nothing.
+    let plan = adapters::plan_admission(
+        &runtime,
+        SurfaceKind::Daemon,
+        ProjectKey::new("protected-planned"),
+        RootProtection::Protected,
+        true,
+        StatePlacement::UserLocal,
+    )
+    .expect("an authorized protected root with user-local state plans");
+    assert_eq!(plan.placement(), StatePlacement::UserLocal);
+    assert_eq!(plan.protection(), RootProtection::Protected);
+    assert!(plan.authorized());
+    assert!(!plan.touches_source_root());
+    assert_eq!(plan.owner(), owner);
+
+    // Executing it returns the owner the plan chose, and the registry sees the
+    // protection the plan recorded rather than whatever the caller says now.
+    let (slot, charged_to) =
+        adapters::execute_plan(&registry, &plan, binding()).expect("the plan executes");
+    assert_eq!(
+        charged_to, owner,
+        "the plan's owner did not survive execution"
+    );
+    assert_eq!(
+        registry.pending_joiners(plan.key()),
+        Some(1),
+        "the admission the plan named was not the admission performed"
+    );
+    let live = registry
+        .install(plan.key(), Some(charged_to))
+        .expect("install");
+    assert_eq!(live.slot(), slot);
+    assert_eq!(live.placement(), StatePlacement::UserLocal);
+    assert_eq!(live.capacity_owner().expect("live slot"), Some(owner));
 }

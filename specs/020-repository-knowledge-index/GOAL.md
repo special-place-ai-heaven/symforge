@@ -274,7 +274,10 @@ landing handoff is ready.
   always served the previous complete generation during a reload, and a green regression
   pins that behaviour. The invariant this feature exists to protect is that no partial,
   candidate, or snapshot state is ever served; recency was never the property under
-  protection. So the one generation a `Refreshing` source retains stays queryable, because
-  it was `Current` immediately before the refresh and is complete, while `Blocked` and
+  protection. So the one generation a `Refreshing` source retains stays queryable while no
+  mutation permit is outstanding against it, because it was `Current` immediately before
+  the refresh and is complete — but a permit is replacing the very files that generation
+  describes, so a mutation-entered refresh serves nothing and the freeze-before-grant
+  ordering keeps the meaning it was written for, while `Blocked` and
   `Stopping` retentions stay non-queryable since neither has a successor in flight to make
   the retention a refresh rather than a remnant.

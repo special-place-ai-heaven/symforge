@@ -161,6 +161,14 @@ impl SourceMutationPermit {
         if authority.binding().physical_root() != lease.identity() {
             return Err(AuthorityRefusal::WholeAuthorityMismatch);
         }
+        // A binding clone taken before its slot was stopped names the right root
+        // and holds a live lease, so neither check above sees anything wrong.
+        // This is the one that reaches it.
+        if !authority.binding().is_live() {
+            return Err(AuthorityRefusal::BindingRevoked {
+                binding: authority.binding().identity(),
+            });
+        }
         if !lease.is_live() {
             return Err(AuthorityRefusal::PhysicalRootReplaced);
         }

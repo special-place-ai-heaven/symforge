@@ -1539,14 +1539,14 @@ only and can never authorize a read, reuse, mutation, or publication.
 `SourceRuntimeState` makes strict queryability closed on COMPLETENESS, not on
 recency (F020-V11-A20). Only a COMPLETE verified generation may be queried.
 `Loading` retains none and is therefore not queryable. `Refreshing` retains exactly
-one, and that generation REMAINS QUERYABLE while a candidate builds: it is the
-complete verified generation that was `Current` immediately before the refresh, so
-serving it exposes no partial state (F020-V11-R20A). `Blocked` and `Stopping` may
-retain zero or one for recovery and accounting, and those are NOT queryable, because
-neither has a successor in flight to make the retention a refresh rather than a
-remnant (F020-V11-R20B). No public Interface can acquire a retained generation from
-`Blocked` or `Stopping`, and none can acquire a candidate, a snapshot seed, or any
-partially built artifact from any state.
+one, and that generation REMAINS QUERYABLE while a candidate builds AND no mutation
+permit is outstanding: it was `Current` immediately before the refresh, so serving
+it exposes no partial state, while an outstanding permit is replacing the very
+files it describes (F020-V11-R20A). `Blocked` and `Stopping` may retain zero or one
+for recovery and accounting, and those are NOT queryable, because neither has a
+successor in flight to make the retention a refresh rather than a remnant
+(F020-V11-R20B). No public Interface can acquire a retained generation from those,
+nor a candidate, a snapshot seed, or any partially built artifact from any state.
 `Current` has no separately published binding, mutation, coverage, sequence, or
 observer-evidence side field: its immutable generation owns accepted binding authority,
 observer token/cut, mutation epoch, and completeness. Its

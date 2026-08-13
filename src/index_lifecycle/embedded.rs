@@ -86,9 +86,16 @@ impl CloseReceipt {
 }
 
 thread_local! {
-    /// Set while this thread is inside a finalizer, so a close attempted from
-    /// within one can refuse rather than wait on itself.
-    static FINALIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Which source this thread is finalizing, if any, so a close attempted
+    /// from inside that source's own finalizer can refuse rather than wait on
+    /// itself.
+    ///
+    /// The identity is the whole point. A bare `bool` refused ANY close made
+    /// from inside ANY finalizer, so `a.finalize(|| b.close())` reported that
+    /// closing `b` would wait on itself — a diagnosis naming something that did
+    /// not happen, while `b` was left open.
+    static FINALIZING: std::cell::Cell<Option<EmbeddedIdentity>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Mints embedded source handles, and is the only thing that can.
@@ -120,6 +127,12 @@ impl EmbeddedSourceFactory {
         }
         let identity = EmbeddedIdentity::fresh();
         open.insert(key.clone(), identity);
+        // The factory is serving again, so it is no longer shut down. The flag
+        // latched before, which made `has_shut_down()` report `true` while
+        // `open_count()` was 1 — a claim about a past moment presented as
+        // present state. Cleared under the same lock that records the open, so
+        // the two can never disagree.
+        self.shutdown.store(false, Ordering::Release);
         Ok(EmbeddedSourceHandle {
             identity,
             key,
@@ -133,7 +146,8 @@ impl EmbeddedSourceFactory {
         self.open.lock().expect("embedded registration mutex").len()
     }
 
-    /// Whether the final owner has closed and the registration has shut down.
+    /// Whether the factory is currently shut down: the final owner closed and
+    /// nothing has been opened since.
     pub fn has_shut_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
@@ -185,7 +199,7 @@ impl EmbeddedSourceHandle {
     /// [`EmbedRefusal::WouldSelfWait`] when called from inside a finalizer,
     /// because waiting there is waiting on the calling thread itself.
     pub fn close(&self) -> Result<CloseReceipt, EmbedRefusal> {
-        if FINALIZING.with(std::cell::Cell::get) {
+        if FINALIZING.with(std::cell::Cell::get) == Some(self.identity) {
             return Err(EmbedRefusal::WouldSelfWait);
         }
         if self.closed.swap(true, Ordering::AcqRel) {
@@ -199,20 +213,22 @@ impl EmbeddedSourceHandle {
         })
     }
 
-    /// Run `finalizer` with self-wait detection armed.
+    /// Run `finalizer` with self-wait detection armed for THIS source.
     ///
     /// A finalizer that tries to close this source is refused rather than
-    /// deadlocked. The flag is cleared even if the finalizer panics, so one bad
-    /// finalizer cannot poison every later close on this thread.
+    /// deadlocked; a finalizer that closes some other source is none of this
+    /// source's business and proceeds. The previous value is restored even if
+    /// the finalizer panics, so one bad finalizer cannot poison every later
+    /// close on this thread, and nesting two finalizers cannot leave the outer
+    /// one disarmed.
     pub fn finalize<R>(&self, finalizer: impl FnOnce() -> R) -> R {
-        struct Guard;
+        struct Guard(Option<EmbeddedIdentity>);
         impl Drop for Guard {
             fn drop(&mut self) {
-                FINALIZING.with(|flag| flag.set(false));
+                FINALIZING.with(|flag| flag.set(self.0));
             }
         }
-        FINALIZING.with(|flag| flag.set(true));
-        let _guard = Guard;
+        let _guard = Guard(FINALIZING.with(|flag| flag.replace(Some(self.identity))));
         finalizer()
     }
 }
@@ -222,6 +238,15 @@ impl Drop for EmbeddedSourceHandle {
         // Coalesce with an explicit close. A handle dropped without closing must
         // still release the source, or the registration would believe a source
         // is open that nothing holds.
+        //
+        // `Drop` deliberately does NOT consult `FINALIZING`. The self-wait
+        // hazard `close` refuses is about WAITING, and `close_one` takes a
+        // mutex and returns — it never waits on the finalizer. Refusing here
+        // would be worse than the hazard: a `Drop` cannot report a refusal, so
+        // the source would simply stay open forever with nothing holding it.
+        // This is stated rather than left as an inconsistency between the two
+        // paths, which is how it read before: `a.finalize(|| drop(b))` was
+        // permitted while `a.finalize(|| b.close())` was refused.
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.registration.close_one(&self.key, self.identity);
         }

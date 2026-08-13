@@ -12,8 +12,8 @@ conflict with the rules below. Historical review receipts remain evidence of the
 work performed, but they do not authorize a V11 implementation.
 
 1. Only a COMPLETE verified generation is queryable (A20). `Current` is queryable,
-   and so is the one generation `Refreshing` retains, which was `Current` immediately
-   before the refresh. `Loading` retains none. `Blocked` and `Stopping` retentions are
+   and so is the one `Refreshing` retains while no mutation permit is outstanding
+   against it. `Loading` retains none. `Blocked` and `Stopping` retentions are
    immutable recovery evidence only, never a degraded or last-valid query lane.
 2. Cold placeholders, snapshot seeds, candidates, capacity-refused attempts, and
    failed observations cannot mint query authority. They expose a closed

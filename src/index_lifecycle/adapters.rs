@@ -34,6 +34,16 @@ pub struct AdmissionPlan {
     key: ProjectKey,
     placement: StatePlacement,
     owner: OwnerIdentity,
+    /// The protection the decision was taken under, and whether the caller was
+    /// authorized for it.
+    ///
+    /// Recorded because `execute_plan` used to take both again as its own
+    /// arguments, so the admission performed could differ from the admission
+    /// planned with nothing detecting it. A plan that does not carry the inputs
+    /// its decision depended on proves the decision is computable, not that it
+    /// is the decision applied.
+    protection: RootProtection,
+    authorized: bool,
     /// Whether this plan touches the source root at all.
     ///
     /// Recorded rather than asserted: SC-019 forbids state and durability probes
@@ -61,6 +71,16 @@ impl AdmissionPlan {
     /// The capacity owner that would be charged.
     pub fn owner(&self) -> OwnerIdentity {
         self.owner
+    }
+
+    /// The protection the decision was taken under.
+    pub fn protection(&self) -> RootProtection {
+        self.protection
+    }
+
+    /// Whether the caller was authorized for that protection.
+    pub fn authorized(&self) -> bool {
+        self.authorized
     }
 
     /// Whether executing this plan would write beneath the source root.
@@ -123,6 +143,8 @@ pub fn plan_admission(
         key,
         placement,
         owner,
+        protection,
+        authorized,
         touches_source_root: placement == StatePlacement::ProjectLocal,
     })
 }
@@ -132,20 +154,30 @@ pub fn plan_admission(
 /// Separated from planning so the decision can be inspected without acting on
 /// it, which is what lets a dark adapter be checked at all. Slice 4 calls this;
 /// nothing in production does today.
+///
+/// Every input comes from the plan. Taking `protection` and `authorized` as
+/// arguments here let the executed admission differ from the planned one with
+/// nothing to detect it, which turned the separation into a proof that the
+/// decision is computable rather than that it is applied.
+///
+/// The returned pair is the installed slot and the capacity owner the plan
+/// named. The owner is the output the whole of T034 exists to determine, and it
+/// was previously computed and then dropped on the floor; returning it is what
+/// lets a caller — and an oracle — charge the admission to the account the plan
+/// chose.
 pub fn execute_plan(
     registry: &Arc<ProjectRegistry>,
     plan: &AdmissionPlan,
     binding: BindingAuthority,
-    protection: RootProtection,
-    authorized: bool,
-) -> Result<SlotIdentity, AdapterRefusal> {
-    registry
+) -> Result<(SlotIdentity, OwnerIdentity), AdapterRefusal> {
+    let slot = registry
         .admit(
             plan.key().clone(),
             binding,
-            protection,
-            authorized,
+            plan.protection(),
+            plan.authorized(),
             plan.placement(),
         )
-        .map_err(AdapterRefusal::Registry)
+        .map_err(AdapterRefusal::Registry)?;
+    Ok((slot, plan.owner()))
 }
