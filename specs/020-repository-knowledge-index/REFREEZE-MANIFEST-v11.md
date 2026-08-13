@@ -853,7 +853,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "replacements": [
         {
           "clause_id": "F020-V11-A20-TARGET-01",
-          "end_line": 19,
+          "end_line": 17,
           "path": "specs/020-repository-knowledge-index/spec.md",
           "sha256": "59d421481281bbb2513ce6ebeec8253d08a91627d8040c848c69b54f62be0a49",
           "source": "target",
