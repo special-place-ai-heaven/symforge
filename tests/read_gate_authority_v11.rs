@@ -290,6 +290,115 @@ fn a_failed_observation_refuses_without_disturbing_the_current_generation() {
     );
 }
 
+// ── T044: the authority CHOICE is explicit, and generation never reads disk ─
+
+#[test]
+fn generation_resolution_never_reads_unmatched_disk_bytes() {
+    // T042's first clause, on T044's seam. A generation miss is a MISS — it
+    // surfaces to the caller, who must then CHOOSE disk observation by name.
+    // Before the split, the choice was implicit in which function a lane
+    // reached for, which is how a lane meaning to serve published bytes could
+    // silently backfill from disk.
+    use symforge::protocol::format::claim_provenance::{
+        GenerationResolution, observe_disk_beneath, resolve_generation_bytes,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("indexed.rs"),
+        "pub fn published_anchor() {}
+",
+    )
+    .expect("write indexed fixture");
+    let shared = symforge::live_index::LiveIndex::load(dir.path()).expect("load index");
+    let live = shared.read();
+
+    // AFTER the load: the indexed file changes on disk, and a new file appears
+    // that the generation never saw. Both are exactly what generation
+    // resolution must not observe.
+    std::fs::write(
+        dir.path().join("indexed.rs"),
+        "pub fn disk_only_anchor_a() {}
+",
+    )
+    .expect("rewrite on disk");
+    std::fs::write(
+        dir.path().join("diskonly.rs"),
+        "pub fn disk_only_anchor_b() {}
+",
+    )
+    .expect("write unindexed fixture");
+
+    // The generation serves the bytes it PUBLISHED, not the current disk.
+    let GenerationResolution::Published(bytes) = resolve_generation_bytes(&live, "indexed.rs")
+    else {
+        panic!("an indexed file resolves from the generation");
+    };
+    let text = std::str::from_utf8(bytes).expect("published bytes are utf8");
+    assert!(
+        text.contains("published_anchor"),
+        "generation resolution serves the published bytes"
+    );
+    assert!(
+        !text.contains("disk_only_anchor_a"),
+        "generation resolution must not observe the disk rewrite"
+    );
+
+    // The miss is a miss — never the disk bytes.
+    assert!(
+        matches!(
+            resolve_generation_bytes(&live, "diskonly.rs"),
+            GenerationResolution::NotInGeneration
+        ),
+        "a generation miss surfaces as a miss, not as disk content"
+    );
+
+    // GREEN-CONTROL: the disk-observation lane EXISTS and serves the current
+    // bytes when chosen by name — the split is a choice, not a wall.
+    let observed = observe_disk_beneath(&live, dir.path(), "diskonly.rs")
+        .expect("a deliberate confined observation is admitted");
+    assert!(
+        std::str::from_utf8(&observed)
+            .expect("observed bytes are utf8")
+            .contains("disk_only_anchor_b"),
+        "disk observation serves what is on disk right now"
+    );
+}
+
+#[test]
+fn a_disk_observation_is_confined_beneath_its_root() {
+    use symforge::protocol::format::claim_provenance::observe_disk_beneath;
+
+    let outside = tempfile::tempdir().expect("outside dir");
+    let canary = ["escape", "-", "canary", "-", "bytes"].concat();
+    std::fs::write(outside.path().join("secret.txt"), &canary).expect("write outside fixture");
+
+    let root = tempfile::TempDir::new_in(outside.path()).expect("nested root");
+    let shared = symforge::live_index::LiveIndex::load(root.path()).expect("load index");
+    let live = shared.read();
+
+    // A traversal component refuses BEFORE any read: the refusal must not
+    // echo the escaped content.
+    let refused = observe_disk_beneath(&live, root.path(), "../secret.txt")
+        .expect_err("a path that escapes the root must refuse");
+    assert!(
+        !refused.contains(canary.as_str()),
+        "the refusal must not carry the escaped bytes"
+    );
+
+    // An absolute path is an escape however it is spelled.
+    let absolute = outside.path().join("secret.txt");
+    let refused = observe_disk_beneath(&live, root.path(), absolute.to_str().expect("utf8 path"))
+        .expect_err("an absolute path must refuse");
+    assert!(!refused.contains(canary.as_str()));
+
+    // GREEN-CONTROL: a plain relative path beneath the root is admitted.
+    std::fs::write(root.path().join("inside.txt"), "inside-bytes").expect("write inside fixture");
+    let observed =
+        observe_disk_beneath(&live, root.path(), "inside.txt").expect("a beneath path is admitted");
+    assert_eq!(observed, b"inside-bytes");
+}
+
 // ── Context acquisition: rebinds refuse rather than composing roots ────────
 
 #[test]

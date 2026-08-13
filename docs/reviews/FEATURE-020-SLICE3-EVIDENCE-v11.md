@@ -1,5 +1,41 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## T044 — the authority choice is explicit (PR 2)
+
+Observed RED first: both oracles failed `E0432` naming exactly the three new
+seam items and nothing else. Then the seam, in `src/protocol/read_gate.rs`,
+on the policy/bytes/git/disk split #571 carved:
+
+- `resolve_generation_bytes` — serves `IndexedFile.content`, the bytes the
+  generation PUBLISHED. **The defect it exists to prevent is structurally
+  unrepresentable in it**: the function takes no workspace root, so an
+  in-function disk backfill cannot even locate a file, and its return borrows
+  from the index, so owned disk bytes cannot be returned without a deliberate
+  leak. This is recorded INSTEAD of a mutation for the never-reads-disk
+  guard, because the only writable mutant is one whose `fs::read` cannot find
+  the fixture and therefore survives for reasons unrelated to the property —
+  a theatrical mutant would be evidence-shaped noise. The oracle still pins
+  the behavior: published bytes survive a disk rewrite, and an unindexed
+  file resolves `NotInGeneration`, never disk content.
+- `observe_disk_beneath` — the deliberate lane, lexically confined beneath
+  the workspace root, refusing absolute paths, prefixes, and `..` components
+  BEFORE any read; the refusal never carries escaped content. Symlink policy
+  deliberately remains the crate's existing never-follow walk; the ceiling
+  and upgrade path are marked in the code.
+- Both re-exported through `claim_provenance` the same way as the identities,
+  because `read_gate` is crate-private and the oracles are a separate crate.
+  No `protocol/mod.rs` edit; no census atom.
+
+Mutation M12 — confinement disabled — caught by
+`a_disk_observation_is_confined_beneath_its_root` alone, restored. Eleven
+mutations across the slice so far: ten caught by name, one survivor that
+forced a new oracle, plus one guard proven structural rather than mutated.
+
+Gates on the T044 tree: oracle files 36 passed 0 failed; clippy all targets
+denied warnings clean; embed 1332 passed 0 failed; fmt clean; traceability
+OK; all five closure digests byte-identical — T044 touched only uncensused
+files, per the PR 2 first-commit decision.
+
 Living document for the slice; T052 completes it. Every claim here was observed,
 not inferred. Where a command is cited, it was run on the named tree.
 
