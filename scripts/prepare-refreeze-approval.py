@@ -66,6 +66,50 @@ def canonical(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def write_record(
+    record_path: Path,
+    signature_path: Path,
+    *,
+    commit: str,
+    tree: str,
+    attestation_digest: str,
+    sequence: int,
+    predecessor_digest: str | None,
+) -> int:
+    record = {
+        "kind": "symforge-feature-020-refreeze-approval",
+        "schema_version": 1,
+        "repository": REPOSITORY,
+        "purpose": PURPOSE,
+        "target_commit": commit,
+        "target_tree": tree,
+        "attestation": {"path": ATTESTATION_PATH, "sha256": attestation_digest},
+        "release_identity": RELEASE_IDENTITY,
+        "approved_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "sequence": sequence,
+        "store_locator": STORE_LOCATOR,
+        "store_version": STORE_VERSION,
+        "predecessor_digest": predecessor_digest,
+        "signature_namespace": NAMESPACE,
+    }
+    record_bytes = canonical(record)
+    record_path.write_bytes(record_bytes)
+    # A signature over the previous bytes must not sit beside the new ones.
+    signature_path.unlink(missing_ok=True)
+
+    print("APPROVAL RECORD WRITTEN")
+    print(f"  path               {record_path}")
+    print(f"  sequence           {sequence}", end="")
+    print(f"  (predecessor {predecessor_digest[:16]})" if predecessor_digest else "")
+    print(f"  target_commit      {commit}")
+    print(f"  target_tree        {tree}")
+    print(f"  attestation sha256 {attestation_digest}")
+    print(f"  record sha256      {hashlib.sha256(record_bytes).hexdigest()}")
+    print()
+    print("Not signed yet. Sign with: pwsh scripts/sign-refreeze-approval.ps1")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".", help="Repository worktree to bind.")
@@ -120,7 +164,25 @@ def main() -> int:
         if previous_bytes != canonical(previous):
             fail("the existing record is not canonical JSON; refusing to chain from it")
         if not signature_path.exists():
-            fail("the existing record has no signature; sign it before superseding it")
+            # An unsigned record is a DRAFT, not a predecessor: nobody approved
+            # it, and the commit it names has been superseded by whatever
+            # prompted this run. Replace it in place, keeping its position in the
+            # chain. Chaining from it would record an approval step that never
+            # happened; refusing outright would demand a signature for a tree
+            # that is already stale.
+            print(f"Replacing the unsigned draft at sequence {previous['sequence']}.")
+            predecessor_digest = previous["predecessor_digest"]
+            sequence = int(previous["sequence"])
+            record_path.unlink()
+            return write_record(
+                record_path,
+                signature_path,
+                commit=commit,
+                tree=tree,
+                attestation_digest=attestation_digest,
+                sequence=sequence,
+                predecessor_digest=predecessor_digest,
+            )
         allowed = store / "allowed_signers"
         if not allowed.exists():
             fail(f"no allowed_signers at {allowed}; cannot verify the predecessor")
@@ -154,38 +216,15 @@ def main() -> int:
         elif archived.read_bytes() != previous_bytes:
             fail(f"history entry {predecessor_digest[:12]} exists with different bytes")
 
-    record = {
-        "kind": "symforge-feature-020-refreeze-approval",
-        "schema_version": 1,
-        "repository": REPOSITORY,
-        "purpose": PURPOSE,
-        "target_commit": commit,
-        "target_tree": tree,
-        "attestation": {"path": ATTESTATION_PATH, "sha256": attestation_digest},
-        "release_identity": RELEASE_IDENTITY,
-        "approved_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        "sequence": sequence,
-        "store_locator": STORE_LOCATOR,
-        "store_version": STORE_VERSION,
-        "predecessor_digest": predecessor_digest,
-        "signature_namespace": NAMESPACE,
-    }
-    record_bytes = canonical(record)
-    record_path.write_bytes(record_bytes)
-    # A signature over the previous bytes must not sit beside the new ones.
-    signature_path.unlink(missing_ok=True)
-
-    print("APPROVAL RECORD WRITTEN")
-    print(f"  path               {record_path}")
-    print(f"  sequence           {sequence}", end="")
-    print(f"  (predecessor {predecessor_digest[:16]})" if predecessor_digest else "")
-    print(f"  target_commit      {commit}")
-    print(f"  target_tree        {tree}")
-    print(f"  attestation sha256 {attestation_digest}")
-    print(f"  record sha256      {hashlib.sha256(record_bytes).hexdigest()}")
-    print()
-    print("Not signed yet. Sign with: pwsh scripts/sign-refreeze-approval.ps1")
-    return 0
+    return write_record(
+        record_path,
+        signature_path,
+        commit=commit,
+        tree=tree,
+        attestation_digest=attestation_digest,
+        sequence=sequence,
+        predecessor_digest=predecessor_digest,
+    )
 
 
 if __name__ == "__main__":
