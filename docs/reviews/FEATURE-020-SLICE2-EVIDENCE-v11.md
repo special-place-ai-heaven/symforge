@@ -8,7 +8,7 @@ documentation-hygiene rule; regenerate with `pwsh scripts/campaign-state.ps1`.
 
 ## What shipped
 
-Six modules under `src/index_lifecycle/`, 45 oracles across five test files,
+Six modules under `src/index_lifecycle/`, 53 oracles across five test files,
 every gate green including the embed configuration.
 
 | Module | Task | What it establishes |
@@ -61,17 +61,30 @@ taken every project offline for the duration of every reindex.
 
 **F020-V11-A20** resolves it, operator-decided and signed: queryability closes on
 **completeness**, not recency. The single generation `Refreshing` retains stays
-queryable because it was `Current` immediately before the refresh and is
-complete. `Blocked` and `Stopping` retentions stay non-queryable — neither has a
-successor in flight, so a remnant is not a refresh. Candidates, snapshot seeds
-and partial artifacts remain unservable from every state.
+queryable — **while no mutation permit is outstanding against the source** —
+because it was `Current` immediately before the refresh and is complete.
+`Blocked` and `Stopping` retentions stay non-queryable — neither has a successor
+in flight, so a remnant is not a refresh. Candidates, snapshot seeds and partial
+artifacts remain unservable from every state.
 
-Two regressions encode it: `F020-V11-R20A`
-(`a_refreshing_source_still_serves_its_complete_retained_generation`) is the
-availability half; `F020-V11-R20B`
-(`blocked_and_stopping_retentions_are_never_queryable`) is the safety half, and
-pairs with a `Refreshing` source holding the identical retention so the refusal
-is demonstrably about having no successor rather than a blanket refusal.
+The permit condition is not decoration and was not in the first draft. Adversarial
+review pointed out that `Refreshing` is reached two ways: a reload builds a
+candidate elsewhere and leaves the retained generation's bytes alone, while a
+mutation reaches it through `request_mutation_grant`, whose entire purpose is to
+stop the source serving before a disk write is authorized. A20 extended the
+reload argument to the mutation case silently and reopened the window the freeze
+ordering exists to close.
+
+Two regressions encode it. `F020-V11-R20A` is the availability half, pinned by
+`a_refreshing_source_still_serves_its_complete_retained_generation` on a
+reload-entered refresh, with a mutation-entered refresh as its paired negative.
+`F020-V11-R20B` is the safety half, pinned by
+`blocked_and_stopping_retentions_are_never_queryable`, which pairs with a
+`Refreshing` source holding the identical retention so the refusal is
+demonstrably about having no successor rather than a blanket refusal. Both bind
+`ORACLE-QUERY-ATOMIC-LEASE`, the oracle that owns strict selection, which now
+carries an assertion for the availability half so it can fail when A20 is
+violated.
 
 ## Deferrals closed rather than carried
 
@@ -149,6 +162,59 @@ open; all three are closed.
   after a check cannot be followed, because the open is handle-relative too. The
   previous design documented this hazard honestly and did not fix it; documenting
   is not fixing.
+
+## What the adversarial review changed (T040)
+
+An independent review of the ordering and lifetime surface returned four
+blockers, seven majors and four minors; findings are in
+`REVIEW-FINDINGS-claude-orderings-feature-020-slice-2-2026-08-13.md`. All are
+closed. The four that mattered most:
+
+1. **A refusal consumed what it refused.** `install`, `cancel` and `stop` matched
+   their expected occupancy with a `let`-else over `remove`, and `remove` runs
+   before the pattern is tested. Refusing therefore evicted a live slot from the
+   map with no revocation and no tombstone — the exact defect this module was
+   written to prevent — under a comment claiming a restore that no line
+   performed.
+2. **Revocation did not reach authority already handed out.** `binding()`
+   refuses once the slot is stopped, which stops the holder that asks again;
+   `BindingAuthority` is `Clone`, so a clone taken before the stop still named
+   the right root and held a live lease, and `SourceMutationPermit::grant`
+   accepted it. "It refuses reads through the slot" is not the claim worth
+   making. A binding's liveness is now shared across its clones and `stop`
+   retires it.
+3. **A20 was wrong as first written.** `request_mutation_grant` freezes to
+   `Refreshing` precisely so the source stops serving before a source-disk write
+   is authorized. A20 made `Refreshing` queryable, so a reader was served the
+   very files a permit was replacing — and R20A, which reaches `Refreshing`
+   through `request_mutation_grant`, asserted it. Queryability now additionally
+   requires no outstanding permit; the grant records the permit it issues; R20A
+   is retargeted at a reload-entered refresh with the mutation case as its
+   paired negative.
+4. **Conservation broke on a three-level hierarchy.** A child's limit is charged
+   to its parent and never recorded as outstanding, so an owner with live
+   children looked drained; releasing it returned its whole limit while its
+   children kept spending against a limit nothing backed.
+
+Both registry blockers were mutation-verified: reverting each fix turns its own
+oracle red and leaves every other oracle green.
+
+Two oracles were themselves wrong and were fixed rather than bent.
+`concurrent_opens_join_one_admission` handed its two opens two different
+tempdirs — two different projects under one key — and passed. And the join check
+compares physical roots rather than binding identities, because
+`BindingAuthority::bind` mints a fresh identity per call, so comparing
+identities would have refused the single-flight join the registry exists to
+provide. The first version of that check did exactly that, and the old oracle
+caught it.
+
+`unknown_refunds` is now unreachable through the public API: `redeem` refuses a
+foreign grant, `release_owner` refuses while charges or children are
+outstanding, and a permit refunds exactly once by construction. It stays as a
+fail-closed backstop, and the evidence for it is those three refusals rather
+than a test that drives the counter — which is why the review's request to
+"drive it above zero" is answered by structure instead of by a test-only
+backdoor into production code.
 
 ## Design decisions worth challenging
 
