@@ -172,7 +172,10 @@ fn dropping_a_stage_without_committing_removes_its_temporary() {
 
     drop(staged);
 
-    assert!(!temp.exists(), "an abandoned stage left its temporary behind");
+    assert!(
+        !temp.exists(),
+        "an abandoned stage left its temporary behind"
+    );
     assert_eq!(
         std::fs::read(root.path().join(target)).expect("read back"),
         b"before".to_vec(),

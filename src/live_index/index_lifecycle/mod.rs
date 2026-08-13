@@ -21,8 +21,8 @@
 
 pub mod authority;
 pub mod capacity;
-pub mod process_runtime;
-pub mod registry;
 pub mod mutation;
 pub mod physical_root;
+pub mod process_runtime;
+pub mod registry;
 pub mod transition;

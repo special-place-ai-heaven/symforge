@@ -173,7 +173,9 @@ fn a_transition_cannot_skip_drain() {
     assert!(!drain.has_ended());
     let phase_before = runtime.phase();
     let epoch_before = runtime.mutation_epoch();
-    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     assert_eq!(
         transition::apply(
             &mut runtime,
@@ -408,14 +410,18 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
         (
             PhaseName::Refreshing,
             SourceRuntime::refreshing(
-                BindingAuthority::bind(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()),
+                BindingAuthority::bind(
+                    PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
+                ),
                 GenerationIdentity::fresh(),
             ),
         ),
         (
             PhaseName::Blocked,
             SourceRuntime::blocked(
-                BindingAuthority::bind(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()),
+                BindingAuthority::bind(
+                    PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
+                ),
                 Some(GenerationIdentity::fresh()),
             ),
         ),
@@ -442,7 +448,9 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
 
     // Non-Current *provenances* refuse even while the source is genuinely
     // Current, so the refusal is about what was presented, not about the phase.
-    let lease = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
+    let lease = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     let binding = BindingAuthority::bind(lease.identity());
     let candidate = CandidateAuthority::open(binding.clone(), ObserverToken::fresh());
 
@@ -515,7 +523,9 @@ fn strict_queryability_is_closed_over_retained_generations() {
     // Blocked and Stopping may retain zero or one.
     assert_eq!(
         SourceRuntime::blocked(
-            BindingAuthority::bind(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()),
+            BindingAuthority::bind(
+                PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()
+            ),
             None
         )
         .retained_generation(),
@@ -572,7 +582,9 @@ fn granting_publishes_non_current_before_the_permit_exists() {
 #[test]
 fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
     let (mut runtime, lease_a, live, _root) = current_source();
-    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
 
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
@@ -670,7 +682,9 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
         .expect("permit terminates");
 
     // Install root B through the writer-validated transition.
-    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     let receipt = transition::apply(
         &mut runtime,
         TransitionKind::PhysicalRootReplacement,
@@ -746,7 +760,9 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
     let permits_before = runtime.grants_issued();
     assert!(before.get() >= 1);
 
-    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     transition::apply(
         &mut runtime,
         TransitionKind::Rebind,
@@ -783,7 +799,9 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
         .expect("grant must produce a permit");
 
     // Negative: the permit is outstanding, so Install must not happen.
-    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
     let refusal = transition::apply(
         &mut runtime,
         TransitionKind::Rebind,

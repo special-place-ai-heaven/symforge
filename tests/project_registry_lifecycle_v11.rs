@@ -177,7 +177,8 @@ fn a_stopped_slot_refuses_to_serve_a_holder_that_never_asked() {
     // Positive: while live, the handle serves.
     assert!(held.is_live());
     held.binding().expect("a live slot hands out its binding");
-    held.capacity_owner().expect("a live slot reports its owner");
+    held.capacity_owner()
+        .expect("a live slot reports its owner");
     assert!(registry.is_current(&key, slot));
 
     let stopped = registry.stop(&key).expect("a live slot stops");
@@ -187,7 +188,8 @@ fn a_stopped_slot_refuses_to_serve_a_holder_that_never_asked() {
     // required from the holder.
     assert!(!held.is_live());
     assert_eq!(
-        held.binding().expect_err("a stopped slot must refuse its binding"),
+        held.binding()
+            .expect_err("a stopped slot must refuse its binding"),
         RegistryRefusal::Tombstoned { slot }
     );
     assert_eq!(
@@ -274,7 +276,9 @@ fn a_cancelled_admission_installs_nothing() {
     assert_eq!(registry.cancel(&key).expect("cancels"), slot);
     assert!(registry.is_tombstoned(slot));
     assert_eq!(
-        registry.install(&key, None).expect_err("nothing to install"),
+        registry
+            .install(&key, None)
+            .expect_err("nothing to install"),
         RegistryRefusal::NotAdmitted
     );
     assert_eq!(

@@ -1,32 +1,34 @@
 //! Owning physical-root lease and beneath-confined destructive I/O (T025).
 //!
-//! A lease owns one physical root. Every path a permit touches is resolved
-//! component-by-component beneath that root, refusing any symlink or reparse
-//! point rather than following it.
+//! A lease owns one physical root and holds a **directory capability** for it
+//! (`cap_std::fs::Dir`). Every path a permit touches is opened RELATIVE to that
+//! handle, so confinement is enforced by the operating system at open time
+//! rather than by a check that can go stale between looking and acting.
 //!
-//! **What this module does NOT claim.** Confinement is *not* closed. Each
-//! component is checked with `symlink_metadata` and then opened separately, so a
-//! component swapped to a link between the check and the open is followed. An
-//! earlier version of this comment said a mutation authorized for root A "can
-//! never reach root B through a link planted inside A"; that asserted more than
-//! the code observes, and the honest statement is narrower: **link metadata is
-//! refused at check time, and the check-then-open window is open.**
+//! This replaces an earlier design that resolved each component with
+//! `symlink_metadata` and then opened the path separately. That left a
+//! check-then-open window: a component swapped to a link after the check was
+//! followed. The window is now closed rather than documented — `cap-std` opens
+//! each component with no-follow semantics (`openat` with `O_NOFOLLOW` on Unix,
+//! reparse-point-aware `NtCreateFile` on Windows) and refuses to traverse out of
+//! the directory it was given, so a link planted inside root A cannot redirect a
+//! write to root B whether it was planted before, during, or after the call.
 //!
-//! The one escape that needed no race at all is closed. The replacement
-//! temporary used to carry a predictable name and be written with `fs::write`,
-//! which follows links, so a link planted at that path any time beforehand
-//! redirected the write outside the root deterministically. The temporary is now
-//! created with `create_new`, which refuses to open anything that already
-//! exists — link included — under an unpredictable name.
+//! Absolute paths and `..` are refused before they reach the handle, so the
+//! refusal names what was wrong instead of surfacing an opaque OS error.
 //!
-//! Closing the remaining window needs handle-relative I/O (`openat`, or
-//! `NtCreateFile` with `FILE_FLAG_OPEN_REPARSE_POINT`), i.e. a `cap-std`-style
-//! `Dir` handle. That is a dependency decision deliberately not taken inside this
-//! slice; `resolve_beneath` returns a final parent plus leaf name, which is the
-//! shape that upgrade slots into.
+//! Replacement is two-phase: stage the content under an unpredictable temporary
+//! name created with `create_new` (which refuses to open anything already
+//! occupying the name), then rename it over the target. The target therefore
+//! keeps its previous bytes until a complete replacement exists, and an
+//! abandoned stage removes its own temporary.
 
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 
 use super::authority::AuthorityRefusal;
 
@@ -89,17 +91,41 @@ impl From<RootRefusal> for AuthorityRefusal {
 pub struct PhysicalRootLease {
     identity: PhysicalRootIdentity,
     root: PathBuf,
+    /// The directory capability every operation goes through.
+    ///
+    /// `None` when the root could not be opened. A lease with no capability
+    /// refuses everything rather than silently falling back to path-based I/O,
+    /// which is the fallback that would reintroduce the escape this closes.
+    dir: Option<Dir>,
     revoked: AtomicBool,
 }
 
 impl PhysicalRootLease {
     /// Take a lease on `root` under a fresh identity.
+    ///
+    /// Opening the directory here is what makes the confinement real: from this
+    /// point every path is resolved relative to the handle, so the root cannot
+    /// be swapped underneath the lease.
     pub fn take(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).ok();
         Self {
             identity: PhysicalRootIdentity::fresh(),
-            root: root.into(),
+            root,
+            dir,
             revoked: AtomicBool::new(false),
         }
+    }
+
+    /// The directory capability, if the lease is live and the root opened.
+    fn capability(&self) -> Result<&Dir, RootRefusal> {
+        if !self.is_live() {
+            return Err(RootRefusal::LeaseRevoked);
+        }
+        self.dir.as_ref().ok_or_else(|| RootRefusal::Unreadable {
+            path: self.root.clone(),
+            message: "the leased root could not be opened as a directory capability".to_owned(),
+        })
     }
 
     /// This lease's root identity.
@@ -127,10 +153,12 @@ impl PhysicalRootLease {
     /// Returns the final parent directory and the leaf name, which is the pair a
     /// handle-relative implementation would return.
     pub fn resolve_beneath(&self, relative: &Path) -> Result<ResolvedTarget, RootRefusal> {
-        if !self.is_live() {
-            return Err(RootRefusal::LeaseRevoked);
-        }
+        let dir = self.capability()?;
 
+        // Reject absolute paths and parent traversal BEFORE the handle sees
+        // them, so the refusal names what was wrong instead of surfacing an
+        // opaque OS error. `cap-std` would refuse these too; this is about the
+        // quality of the diagnosis, not the strength of the guard.
         let mut components = Vec::new();
         for component in relative.components() {
             match component {
@@ -150,37 +178,51 @@ impl PhysicalRootLease {
             });
         };
 
+        // Walk the ancestors THROUGH THE CAPABILITY. Every lookup is relative to
+        // the leased directory, so a component that is a link cannot be followed
+        // out of the root even if it is swapped between this check and the open
+        // that follows: the open is handle-relative too.
+        let mut walked = PathBuf::new();
         let mut parent = self.root.clone();
         for part in parents {
+            walked.push(part);
             parent.push(part);
-            self.refuse_link(&parent)?;
+            match dir.symlink_metadata(&walked) {
+                Ok(metadata) if metadata.is_symlink() => {
+                    return Err(RootRefusal::LinkComponent { component: parent });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(RootRefusal::Unreadable {
+                        path: parent,
+                        message: error.to_string(),
+                    });
+                }
+            }
         }
+
+        let mut relative_path = walked.clone();
+        relative_path.push(leaf);
 
         Ok(ResolvedTarget {
             parent,
             leaf: leaf.clone(),
+            relative: relative_path,
         })
     }
 
-    /// Refuse a component that is a symlink or reparse point. A missing
-    /// component is not a link, so it is permitted: creation is the caller's
-    /// business, escape is not.
-    fn refuse_link(&self, path: &Path) -> Result<(), RootRefusal> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink()
-                    || crate::paths::metadata_is_reparse_point(&metadata)
-                {
-                    Err(RootRefusal::LinkComponent {
-                        component: path.to_path_buf(),
-                    })
-                } else {
-                    Ok(())
-                }
-            }
+    /// Refuse a leaf that is itself a link, through the capability.
+    fn refuse_link_relative(&self, relative: &Path) -> Result<(), RootRefusal> {
+        let dir = self.capability()?;
+        match dir.symlink_metadata(relative) {
+            Ok(metadata) if metadata.is_symlink() => Err(RootRefusal::LinkComponent {
+                component: self.root.join(relative),
+            }),
+            Ok(_) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(RootRefusal::Unreadable {
-                path: path.to_path_buf(),
+                path: self.root.join(relative),
                 message: error.to_string(),
             }),
         }
@@ -192,6 +234,9 @@ impl PhysicalRootLease {
 pub struct ResolvedTarget {
     parent: PathBuf,
     leaf: std::ffi::OsString,
+    /// The path as the directory capability sees it. Every operation uses this;
+    /// the absolute forms above are for diagnostics and receipts.
+    relative: PathBuf,
 }
 
 impl ResolvedTarget {
@@ -205,9 +250,14 @@ impl ResolvedTarget {
         &self.leaf
     }
 
-    /// The full resolved path.
+    /// The full resolved path, for diagnostics and receipts.
     pub fn path(&self) -> PathBuf {
         self.parent.join(&self.leaf)
+    }
+
+    /// The path relative to the leased directory capability.
+    pub fn relative(&self) -> &Path {
+        &self.relative
     }
 }
 
@@ -278,25 +328,27 @@ pub fn stage_replacement(
     contents: &[u8],
 ) -> Result<StagedReplacement, RootRefusal> {
     let target = lease.resolve_beneath(relative)?;
-    lease.refuse_link(&target.path())?;
+    lease.refuse_link_relative(target.relative())?;
+    let dir = lease.capability()?;
 
     let mut steps = Vec::new();
 
-    if let Some(parent) = target.path().parent() {
-        std::fs::create_dir_all(parent).map_err(|error| RootRefusal::Unreadable {
-            path: parent.to_path_buf(),
-            message: error.to_string(),
-        })?;
+    if let Some(parent) = target.relative().parent()
+        && !parent.as_os_str().is_empty()
+    {
+        dir.create_dir_all(parent)
+            .map_err(|error| RootRefusal::Unreadable {
+                path: target.parent().to_path_buf(),
+                message: error.to_string(),
+            })?;
     }
 
-    // The temporary is created with `create_new`, which fails if ANYTHING
-    // already occupies the name -- including a symlink or reparse point. This is
-    // not a refinement of the link check: a predictable temp name written with
-    // `fs::write` follows a link that was planted long before the mutation, so
-    // the escape needs no race to win and no TOCTOU window to exploit. Refusing
-    // to create over an existing name closes it outright, and the unpredictable
-    // suffix removes the plant target in the first place.
-    let mut temp_path = PathBuf::new();
+    // `create_new` refuses to open anything already occupying the name,
+    // including a symlink, and the open is handle-relative so it cannot escape
+    // the leased directory. The unpredictable suffix removes the plant target in
+    // the first place: a predictable temp name written through ambient `fs` was
+    // a deterministic escape that needed no race at all.
+    let mut temp_relative = PathBuf::new();
     let mut file = None;
     for attempt in 0..MAX_TEMP_ATTEMPTS {
         let mut name = target.leaf().to_os_string();
@@ -305,21 +357,22 @@ pub fn stage_replacement(
             std::process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
-        let candidate = target.parent().join(&name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let candidate = match target.relative().parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(&name),
+            _ => PathBuf::from(&name),
+        };
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match dir.open_with(&candidate, &options) {
             Ok(handle) => {
-                temp_path = candidate;
+                temp_relative = candidate;
                 file = Some(handle);
                 break;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(RootRefusal::Unreadable {
-                    path: candidate,
+                    path: lease.root().join(&candidate),
                     message: error.to_string(),
                 });
             }
@@ -332,21 +385,28 @@ pub fn stage_replacement(
         });
     };
 
-    let written = std::io::Write::write_all(&mut handle, contents).and_then(|()| handle.sync_all());
+    let written = handle.write_all(contents).and_then(|()| handle.sync_all());
     drop(handle);
     if let Err(error) = written {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = dir.remove_file(&temp_relative);
         return Err(RootRefusal::Unreadable {
-            path: temp_path,
+            path: lease.root().join(&temp_relative),
             message: error.to_string(),
         });
     }
     steps.push(ReplacementStep::TempCreated);
 
+    let temp_path = lease.root().join(&temp_relative);
     Ok(StagedReplacement {
+        temp_relative,
         temp_path,
+        target_relative: target.relative().to_path_buf(),
         target: target.path(),
         lease: lease.identity(),
+        dir: dir.try_clone().map_err(|error| RootRefusal::Unreadable {
+            path: lease.root().to_path_buf(),
+            message: error.to_string(),
+        })?,
         steps,
     })
 }
@@ -357,9 +417,12 @@ pub fn stage_replacement(
 /// must not leave litter beneath the leased root.
 #[derive(Debug)]
 pub struct StagedReplacement {
+    temp_relative: PathBuf,
     temp_path: PathBuf,
+    target_relative: PathBuf,
     target: PathBuf,
     lease: PhysicalRootIdentity,
+    dir: Dir,
     steps: Vec<ReplacementStep>,
 }
 
@@ -376,8 +439,11 @@ impl StagedReplacement {
 
     /// Replace the target with the staged content.
     pub fn commit(mut self) -> Result<WriteReceipt, RootRefusal> {
-        if let Err(error) = std::fs::rename(&self.temp_path, &self.target) {
-            let _ = std::fs::remove_file(&self.temp_path);
+        if let Err(error) = self
+            .dir
+            .rename(&self.temp_relative, &self.dir, &self.target_relative)
+        {
+            let _ = self.dir.remove_file(&self.temp_relative);
             self.steps.clear();
             return Err(RootRefusal::Unreadable {
                 path: self.target.clone(),
@@ -395,6 +461,7 @@ impl StagedReplacement {
         };
         // The temporary no longer exists under its old name; forget it so `Drop`
         // does not try to remove the file we just renamed into place.
+        self.temp_relative = PathBuf::new();
         self.temp_path = PathBuf::new();
         Ok(receipt)
     }
@@ -402,8 +469,8 @@ impl StagedReplacement {
 
 impl Drop for StagedReplacement {
     fn drop(&mut self) {
-        if !self.temp_path.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.temp_path);
+        if !self.temp_relative.as_os_str().is_empty() {
+            let _ = self.dir.remove_file(&self.temp_relative);
         }
     }
 }
