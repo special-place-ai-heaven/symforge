@@ -345,8 +345,12 @@ fn a_junction_component_is_refused_rather_than_followed() {
     std::fs::write(outside.path().join("escaped.txt"), b"outside").expect("outside file");
     std::fs::create_dir(root.path().join("real")).expect("real dir");
 
+    // Routed through `hidden_command` rather than built raw: a repo guard
+    // requires every spawn to carry CREATE_NO_WINDOW so no console flashes, and
+    // it is right to — a test that pops a window on every CI run is a test
+    // nobody keeps.
     let junction = root.path().join("link");
-    let status = std::process::Command::new("cmd")
+    let status = symforge::process_util::hidden_command("cmd")
         .args(["/C", "mklink", "/J"])
         .arg(&junction)
         .arg(outside.path())
