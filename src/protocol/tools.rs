@@ -2928,7 +2928,10 @@ fn tier2_reference_disclosure(
         // the manifest still records as merely oversized cannot have a textual
         // match disclosed once its bytes turn sensitive. The refusal itself is
         // discarded: only the path reaches the response, via `unswept`.
-        match read_gate::admit_disk_read(live, path, &root.join(path)) {
+        // T045: this is a DISK OBSERVATION by name — the sweep wants what is on
+        // disk right now, confined beneath the root. Manifest paths are
+        // relative and catalogued, so the confine never fires on them.
+        match read_gate::observe_disk_beneath(live, root, path) {
             Ok(bytes) => {
                 bytes_budget = bytes_budget.saturating_sub(bytes.len() as u64);
                 if String::from_utf8_lossy(&bytes).contains(name) {
@@ -8412,10 +8415,14 @@ impl SymForgeServer {
                     })
                     .unwrap_or_default();
 
-                let base_content = repo
-                    .file_at_ref(seed_base_ref, path) // D8/PR2-ungated-git-read
-                    .unwrap_or_default()
-                    .unwrap_or_default();
+                // Gated (D8 closed): the git-object store is a disclosure lane
+                // exactly like the working tree below. A refusal collapses to
+                // "no base content", the same conservative seed as the worktree
+                // arm — withheld beats disclosed for a demoted file's symbols.
+                let base_content =
+                    crate::protocol::read_gate::admit_git_text(&guard, &repo, seed_base_ref, path)
+                        .unwrap_or_default()
+                        .unwrap_or_default();
                 // Gated: a refusal collapses to "no current content", which
                 // seeds conservatively from the index rather than disclosing
                 // the demoted file's current symbol names or signatures.
@@ -8831,10 +8838,15 @@ impl SymForgeServer {
                         // `generation.live` is the same publication that produced
                         // the index miss above — a fresh `self.index.read()` would
                         // be a different snapshot.
-                        let content = match read_gate::admit_disk_read(
+                        // T045: the index MISS above was the generation's answer;
+                        // reading disk anyway is a DISK OBSERVATION, chosen by
+                        // name. `safe_repo_path` keeps the caller-facing message
+                        // split; the store's own lexical confine cannot fire
+                        // after it and is the store's invariant, not a check.
+                        let content = match read_gate::observe_disk_beneath(
                             generation.live.as_ref(),
+                            &root,
                             &input.path,
-                            &canon_path,
                         ) {
                             Ok(content) => content,
                             Err(refusal) => return refusal,
@@ -8966,8 +8978,10 @@ impl SymForgeServer {
         // for the fallback decision, so it gates the CURRENT bytes even when the
         // manifest says `Indexed` (D3: the exemption is about where bytes come
         // from). The gate owns the read; nothing below reopens the path.
+        // T045: a deliberate DISK OBSERVATION by name — validation is about the
+        // bytes on disk right now, never the generation's copy.
         let bytes =
-            match read_gate::admit_disk_read(published.live.as_ref(), &input.path, &canon_path) {
+            match read_gate::observe_disk_beneath(published.live.as_ref(), &root, &input.path) {
                 Ok(bytes) => bytes,
                 Err(refusal) => return refusal,
             };
@@ -31345,18 +31359,10 @@ mod tests {
         ];
         // read_gate owns both fetches; it is the gate, not a bypass of it.
         let gate_owner = ["read_", "gate.rs"].concat();
-        // D8/PR2: detect_impact still reaches git objects directly. It is
-        // production `tools.rs`, so fixing it regenerates the `writers`
-        // retirement-census digest and belongs with that batch. Allowlisted by
-        // an exact SENTINEL on the offending line — not by file and not by
-        // function, so a SECOND ungated read in the same function still fails.
-        // PR 2 deletes the sentinel and the call together.
-        let sentinel = ["D8", "/PR2-ungated-git-read"].concat();
         let protocol = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol");
 
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0usize;
-        let mut allowlisted = 0usize;
         let mut stack = vec![protocol];
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(&dir).expect("read protocol dir") {
@@ -31380,10 +31386,6 @@ mod tests {
                     if !needles.iter().any(|needle| line.contains(needle.as_str())) {
                         continue;
                     }
-                    if line.contains(sentinel.as_str()) {
-                        allowlisted += 1;
-                        continue;
-                    }
                     offenders.push(format!(
                         "{}:{}",
                         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -31398,11 +31400,10 @@ mod tests {
             scanned > 20,
             "control: the scan must recurse into protocol subdirectories, only saw {scanned} files"
         );
-        assert_eq!(
-            allowlisted, 1,
-            "exactly one ungated read is allowlisted (D8/PR2 detect_impact); \
-             a changed count means the sentinel was added or removed without updating this guard"
-        );
+        // D8 is closed: detect_impact's base seed now routes through
+        // admit_git_text, so the allowlist that carried it is DELETED rather
+        // than emptied — zero ungated reads and no exceptions machinery left
+        // to quietly grow.
         assert!(
             offenders.is_empty(),
             "these protocol lanes bypass the content gate: {offenders:?}"
