@@ -1,0 +1,337 @@
+# Slice 3 plan — behavior-neutral seams, provenance, and a dark runtime
+
+Slice 3 is T041–T052. Production stays on V10 authority for the whole slice. The
+deliverable is typed seams that Slice 4 can activate in one cut, plus a runtime that
+compiles, is tested, and is provably unreachable from every production entry point.
+
+## PROGRESS LEDGER — durable, does not depend on session state
+
+| Task | State |
+|---|---|
+| T041 RED provenance/contract negatives | not started |
+| T042 RED cross-authority | not started |
+| T043 sealed provenance types | not started |
+| T044 read_gate authority split | not started |
+| T045 protocol lane migration | not started |
+| T046 published-source-set consolidation | not started |
+| T047 dark runtime | not started |
+| T048 dark public API + export delta | not started |
+| T049 AAP migration receipt | not started |
+| T050 activation-cut matrix | not started |
+| T051 dark unreachability | not started |
+| T052 gates + adversarial review | not started |
+
+Entry state, verified at `10e036b5` (not inherited):
+
+- `python execution/refreeze_v11.py verify-internal --target-ref HEAD` — passed.
+- `node scripts/validate-lifecycle-oracle-traceability.cjs` — OK, 78 requirements,
+  24 acceptance oracles, 13 retirement categories.
+- Slices 0–2 are on `main`; Slice 2 landed as `6c3794f3` with all eight PR checks green.
+- External approval sequences 1–3 are signed and archived; sequence 4 is an UNSIGNED
+  DRAFT bound to `95f24cb1`, a commit the squash-merge replaced. `verify-approval` is
+  invoked only by `.github/workflows/release.yml` (T089), so this is a release-closure
+  item, not a Slice 2→3 gap. The draft gets re-targeted at the release commit;
+  `scripts/prepare-refreeze-approval.py` replaces an unsigned draft in place and keeps
+  its chain position, so no orphan signature exists.
+
+## Reality-fit findings from the investigation
+
+These change how the slice is built. Each is a measurement, not a reading of intent.
+
+**1. The 64 V11 atoms must NOT be exported in this slice, and the contract agrees.**
+`contracts/public-api-v11.json` lists 64 `introduced_v11_atoms`, every one under
+`symforge::embed::`. Its `observed_graph.status` is `pre_activation_required` and
+`crate.identity_status` is likewise `pre_activation_required`. The
+`activation_rule` ("missing and extra atoms both refuse activation") therefore binds
+at ACTIVATION, not now. T048's phrase "generate the exact future export delta" means
+compute and record the delta — not apply it. The live `src/lib.rs` census stays byte-
+frozen for the whole preactivation period. This is the same constraint Slice 2 hit,
+where a top-level `pub mod index_lifecycle;` would have widened the census and the
+`#[path]` re-anchor avoided it; the same discipline applies here.
+
+**2. The compile-fail harness already exists and is Python-driven, not `trybuild`.**
+`tests/fixtures/public-api-v11-consumer/` already has `all-cfg/`, `compile-fail/`
+(with `cases.json` and three `.rs.in` templates: `impl_family_absent`, `path_absent`,
+`trait_absent`), and `dependent-positive/`, all driven from `execution/refreeze_v11.py`.
+There is no `trybuild` dev-dependency and adding one would be redundant. T041's
+"compile-fail/private-constructor cases" extend `cases.json` and the templates; they do
+not introduce a second harness. `public-api-v11.json` carries 12 `negative_assertions`
+to satisfy.
+
+**3. T050 is a 244-member matrix, and the inventory is frozen.**
+`contracts/v10-authority-retirement-v11.md` closes 13 categories totalling 244 members
+— writers 25, callbacks 14, publication_roots 9, cache 9, ccr 4, snapshot 13, tools 40,
+resources 10, prompts 8, sidecar 24, hooks 7, compatibility_aliases 2, raw_embed 79 —
+all `executed: false`. Every member needs an exact Slice 4 owner across eight branches
+(`GenerationLeased`, `DiskObserved`, `WorktreeScopeObserved`, `GitObserved`,
+`RuntimeHealthObserved`, `MutationPermitted`, `StateWriteAuthorized`, `Refused`). The
+inventory itself must not be edited to make the matrix pass.
+
+**4. T044 is small, and T046 is much smaller than the task text implies.**
+`src/protocol/read_gate.rs` is 178 lines with three functions
+(`admit_worktree_text`, `disk_read_would_refuse`, `admit_disk_read`). Splitting
+generation-byte resolution from beneath-confined disk observation is a contained
+change.
+
+T046 reads as though the captured published source set must be built. It already
+exists: `src/live_index/store.rs:1309` holds `published_source_set:
+ArcSwap<PublishedSourceSet>`, and `store.rs:6668`
+(`published_source_set_is_the_single_atomic_root_for_current_source`) already pins it
+as the single atomic root for current source. So T046 is a MIGRATION of the remaining
+legacy readers onto an existing atomic root, not a new consolidation.
+
+Note the task names `src/live_index/view.rs`, but the ~10 independent `ArcSwap` fields
+that produce sequential reads live in `store.rs` (`live`, `published_source_set`,
+`project_state_dir`, `source_exclusions`, `scout_plan`, `freshness_status`,
+`published_state`, `published_repo_outline`, `git_temporal`). `view.rs` is a consumer.
+The work therefore spans both files; the task's named file is where the consumer-side
+change lands, and that is worth stating in the evidence rather than silently widening
+scope.
+
+**5. "Dark" has a precedent and a mechanical definition: no production call edge.**
+`src/index_lifecycle/mod.rs` states it as "`grep -rn index_lifecycle src/` returns no
+hit outside it other than its own declaration in `live_index/mod.rs` — a `#[path]`
+attribute and the `pub mod` line it decorates. Neither is a call edge." T051 formalizes
+exactly that into an executing test rather than inventing a second notion of darkness.
+That same doc comment also records a prior correction where an integration was claimed
+that did not exist — the reporting defect this feature exists to prevent. T047/T048
+must not repeat it: the module doc states what has no caller, and the test proves it.
+
+**6b. BINDING — one identity counter, shared through a new non-lifecycle module.**
+
+`GenerationIdentity` and its siblings are MACRO-GENERATED by `identity_newtype!`
+(`src/index_lifecycle/authority.rs:21-34`), which mints from a process-wide
+`NEXT_IDENTITY: AtomicU64`. A plain declaration search finds no `struct
+GenerationIdentity` at all, and an earlier census of mine reported it MISSING — which
+would have had T043 redeclare it.
+
+T043 must NOT redeclare it. A second `fresh()` on a second counter is TWO IDENTITY
+SPACES, which is strictly worse than the Slice 2 name mismatch: identities from the two
+spaces would compare unequal while both claiming to be fresh.
+
+It also must not import from `src/index_lifecycle/`. `claim_provenance` lives under
+`protocol`, and a `protocol -> index_lifecycle` reference is exactly the call edge
+T051's darkness proof forbids — `index_lifecycle/mod.rs` states its darkness as
+"`grep -rn index_lifecycle src/` returns no hit outside it".
+
+Resolution: move `identity_newtype!` and `NEXT_IDENTITY` into a small module that is
+under NEITHER tree — `src/lifecycle_identity.rs`. `authority.rs` and
+`claim_provenance.rs` both use it. One counter, no protocol-to-lifecycle edge.
+
+Three constraints hold at once, each verified rather than assumed:
+
+1. **Census (retirement closure).** `src/lib.rs`, `src/lifecycle_identity.rs`,
+   `src/index_lifecycle/authority.rs`, `src/protocol/format.rs` and
+   `src/protocol/claim_provenance.rs` are in NONE of the five closure path lists.
+2. **Public-API census.** `derivePublicApiAtoms`
+   (`validate-lifecycle-oracle-traceability.cjs:1998`) reads ONLY `src/lib.rs`
+   `^\s*pub\s+mod\s+NAME\s*;` lines plus `src/embed.rs` items and ITS `pub use crate::`
+   re-exports. So the declaration in `lib.rs` is `pub(crate) mod lifecycle_identity;` —
+   `pub(crate)` does not match `pub\s+mod`, so no atom is added. A plain `pub mod` WOULD
+   add `symforge::lifecycle_identity` and widen the frozen surface. Nothing under
+   `src/protocol/` is read by that function at all.
+3. **Visibility.** The crate runs `-D warnings`, so a `pub` field typed by a merely
+   crate-visible type trips `private_interfaces`. `claim_provenance` therefore
+   re-exports the identities it exposes with `pub use crate::lifecycle_identity::...`.
+   A `pub use` outside `embed.rs` is not counted by the census.
+
+**6a. BINDING — `DerivedLimitKind` and `LimitBreach` are the LIVE types, not the frozen ones.**
+
+The frozen `data-model.md:1007-1014` declares `DerivedLimitKind` with SIX variants.
+`src/live_index/knowledge_bridge.rs:179-189` ships EIGHT: the frozen six plus
+`OwnershipSelectors` and `AmbiguousSamples`, both of which production actively records
+and tests. `LimitBreach` at `:191-195` is already byte-identical to the frozen shape.
+
+T043 uses the LIVE eight. It does not transcribe the frozen six, because a six-variant
+second enum would silently drop two limit kinds that production reports — the exact
+reporting defect this feature exists to prevent, rebuilt on purpose.
+
+T043 also does NOT amend the corpus. An amendment to `data-model.md` is documentation
+catching up with shipping code; it is not required to write the types, and a drive-by
+frozen-corpus edit is the one path this campaign forbids. The staleness is recorded in
+the Slice 3 evidence document so a later amendment can add the two names deliberately,
+with its own manifest hash and approval chain.
+
+**6. The provenance model is fully frozen and is ~15 types.**
+`data-model.md:1683–1899` fixes `DiskObservationReceipt`, `WorktreeScopeObservationReceipt`,
+`GitObservationReceipt`, `AtomicAuthority`, `ClaimInput`, `ClaimProvenance`, `Claim<T>`,
+`SourceRefusal`, `ClaimContext`/`ClaimContextInput`, `OutputCoverage`, `LimitBreach`,
+`DerivedLimitKind`, `WorktreeObservationCut`, `WorktreeScopeCoverage`, `GitResolvedFrom`.
+T043 transcribes these names verbatim — Slice 2 lost time to four seam-name mismatches
+invented rather than copied, and that must not repeat.
+
+## T045 and T046 MUST regenerate the retirement census. This is designed, not a blocker.
+
+`contracts/v10-authority-retirement-v11.md` carries a `preactivation_closure` with five
+live SHA-256 digests over the NORMALIZED RELEASE FORM of named file sets. Slice 3's
+edit targets sit inside four of the five:
+
+| category | pinned digest covers | touched by |
+|---|---|---|
+| `ccr` | `src/protocol/ccr.rs` — that file alone | T045 |
+| `cache` | `session.rs`, `knowledge_curation.rs`, `daemon.rs`, `sidecar/mod.rs`, `worktree.rs` | T045 |
+| `writers` | `tools.rs`, `edit.rs`, `edit_tools.rs`, `knowledge_curation.rs`, … | T045 |
+| `publication_roots` | `store.rs`, `protocol/mod.rs`, `daemon.rs`, `server/mod.rs`, `sidecar/mod.rs` | T046 |
+| `callbacks` | `persist.rs`, `edit_hooks.rs`, `git_temporal.rs`, `watcher/mod.rs`, … | T045, if it reaches `knowledge_curation.rs` |
+
+**It is probably five, not four, and that is decided in PR 2's FIRST commit — not at
+gate time.** `src/protocol/knowledge_curation.rs` sits in THREE categories at once
+(`cache`, `callbacks`, `writers`). If T045's lane walk touches it, `callbacks` moves too
+and all five digests regenerate. The lane census answers whether it does; the answer is
+recorded before the first line of T045 is written, because discovering a fifth
+regeneration while trying to make a red gate green is precisely how a deliberate act
+turns into a silent fixup.
+
+The census rule is that ANY change to code a release build compiles moves the digest.
+So T045 and T046 necessarily break these. That is expected. The gate
+(`scripts/validate-lifecycle-oracle-traceability.cjs:2458` `validateRetirementClosure`)
+fails them as `RETIREMENT_CLOSURE_MISMATCH`, and its own comment at :2493 states the
+intent: "every slice that legitimately edits a censused file has to regenerate it, and
+the gate deliberately refuses to print it so a mismatch cannot be papered over by
+copying the number out of the failure."
+
+**The procedure, verified on this tree, not read off the comment:**
+
+```
+SYMFORGE_LIFECYCLE_EMIT_CLOSURE=1 node scripts/validate-lifecycle-oracle-traceability.cjs
+```
+
+emits `CLOSURE <category> <digest>` for all five WITHOUT relaxing the comparison. Run
+at `10e036b5` it emitted values identical to the five pinned digests and still reported
+OK, so both the emitter and the current tree are consistent.
+
+Consequences the plan binds:
+
+- Regenerating a closure digest is a DELIBERATE, reviewed act, recorded in the evidence
+  document with the before/after digest and the reason the censused file changed. It is
+  never a silent fixup to make a red gate green.
+- `record.paths` must equal every member-owned `src/` path derived from that category's
+  `entries[].members` (:2468). Adding or removing an inventory member changes `paths`
+  too, and the inventory itself stays frozen — so T045/T046 must not add members.
+- Normalization drops comments and test-only `cfg` items, so T041/T042/T051's test files
+  do NOT move any digest by themselves. But that alone does NOT make PR 1 census-clean:
+  PR 1 must also carry T043's production module, because the tests cannot compile
+  without it. PR 1 is census-clean only because that module is declared from an
+  UNCENSUSED parent — see the PR 1 section. Add the `mod` line to
+  `src/protocol/mod.rs` and PR 1 moves `publication_roots`.
+
+## Two risks, both now measured rather than assumed
+
+**RISK-A — cache identity under T045. SETTLED, and it is benign.**
+The concern was that a claim's `OperationReceipt` would leak into a cache key and move
+cache identity inside a slice that promises no behavior change. Measured: the CCR key
+is built at `src/protocol/ccr.rs:225–228` and hashes exactly two things — `tool_name`
+and `formatted`, the rendered output. Provenance is not an input. Therefore behavior-
+neutrality of the RENDERED OUTPUT is identical to cache-key neutrality: if T045 changes
+no byte of any lane's output, no CCR key moves, by construction rather than by hope.
+
+This converts RISK-A into one falsifiable assertion, which T045 must carry as a test:
+the CCR key input set remains `(tool_name, formatted)`. If a later task needs
+provenance in the key, that is a deliberate amendment with its own evidence, not a
+silent absorption.
+
+**RISK-B — T046 changes read tearing, which is an observable behavior change.**
+Migrating the remaining legacy readers onto the existing atomic `PublishedSourceSet`
+converts a torn multi-read into a consistent one. That is the task's purpose, but it is
+observable, and a test that pins today's torn interleaving would break. Breaking it
+would be correct — but only if it is FOUND first and named, not discovered at gate
+time and quietly adjusted. The affected tests are identified before `store.rs` or
+`view.rs` is touched, and each one that changes is listed in the evidence document with
+the reason it changed.
+
+## Order of work, and why
+
+The task order in `tasks.md` is already dependency-correct; the only addition is
+grouping into four reviewable landings, because Slice 2's unrefuted external criticism
+was change size, not correctness.
+
+**PR 1 — provenance core (T041, T042, T043), and it must not move a digest.**
+RED first: both test files written and OBSERVED failing before `claim_provenance.rs`
+exists. Then the sealed types, verbatim from the data model. Ends green with zero
+production call sites migrated.
+
+T041/T042 cannot ship WITHOUT T043. A Rust test that names a type which does not exist
+does not compile, so a "RED tests only" PR fails `cargo test --all-targets` and cannot
+merge. RED is a LOCAL observation recorded in the evidence document, not an
+independently mergeable commit. The three tasks therefore land together.
+
+That creates the trap this PR has to dodge. `src/protocol/claim_provenance.rs` is itself
+uncensused, but the obvious declaration — `mod claim_provenance;` in
+`src/protocol/mod.rs` — is a release-compiled edit to a file inside the
+`publication_roots` path set, so it WOULD move that digest and break this PR's whole
+claim to be census-clean.
+
+**Binding decision: the `mod` line does not go in `src/protocol/mod.rs`.** It is declared
+from a parent that is in NONE of the five path sets. Verified against the closure on this
+tree: `src/protocol/read_gate.rs` — NOT CENSUSED; `src/protocol/format.rs` — NOT
+CENSUSED; `src/live_index/mod.rs` — NOT CENSUSED (which is exactly why Slice 2's
+`#[path]` re-anchor was free). `read_gate.rs` is the right parent: T044 edits it anyway
+and it already owns the read-authority seam.
+
+The file stays at the contract-mandated path `src/protocol/claim_provenance.rs`; only
+the declaring parent moves. This is the Slice 2 `#[path]` move again — contract file
+location, uncensused parent — and it must be written down IN THE CODE, because the next
+agent's instinct will be to "tidy" that `mod` line back into `protocol/mod.rs` and
+silently move a frozen digest.
+
+**The exact spelling, resolved by compiling rather than asserted.** An earlier draft of
+this plan guessed that `#[path]` inside a non-`mod.rs` file resolves relative to that
+file's own module directory (`src/protocol/read_gate/`). That guess was WRONG, and a
+throwaway crate mirroring this layout proved it: `#[path = "../claim_provenance.rs"]`
+made rustc report
+
+```
+error: couldn't read `src\protocol\..\claim_provenance.rs`
+```
+
+naming its base directory as `src/protocol/` — the directory CONTAINING `read_gate.rs`,
+not `read_gate/`. The spelling that compiles and links is therefore the bare one:
+
+```rust
+// src/protocol/read_gate.rs
+#[path = "claim_provenance.rs"]
+pub(crate) mod claim_provenance;
+```
+
+which resolves to `src/protocol/claim_provenance.rs` and exposes the module as
+`crate::protocol::read_gate::claim_provenance`. Confirmed compiling and passing a
+linkage test in an isolated crate before any symforge file was touched.
+
+**PR 2 — authority split and lane migration (T044, T045, T046).** RISK-A settled
+before the first lane moves; RISK-B's affected tests identified before `view.rs` is
+touched. Every step keeps V10 output identical, proven by the existing suite, not by
+assertion.
+
+**PR 3 — dark runtime and dark API (T047, T048, T049, T051).** New modules
+`src/index_lifecycle/runtime.rs` and `src/index_lifecycle/public_api.rs`, reachable
+only from a dark factory; T051's unreachability proof lands in the SAME PR as the code
+it constrains, so the constraint can never be merged later than the thing it guards.
+
+**PR 4 — activation matrix and slice closure (T050, T052).** The 244-member matrix,
+then the full gate set and independent adversarial review.
+
+## Binding constraints for this slice
+
+- **Run the embed gate on the FIRST commit that adds a file.** `cargo test
+  --no-default-features --features embed --lib -- --test-threads=1`. Default-feature
+  gates cannot catch a feature-gated `cfg` mistake, and this campaign has already paid
+  for that lesson once.
+- **Long cargo runs go through Terminal Commander**, never the Bash tool — the 600 s
+  ceiling kills a cold `--all-targets` mid-write and corrupts `target/`.
+- **Do not edit the frozen corpus** to make a check pass. A frozen-clause change is an
+  amendment with a manifest hash, an `EXPECTED_AMENDMENT_MAPPINGS` entry, and a
+  regenerated digest chain.
+- **Every negative test pairs with its accepting case**, and each guard is
+  mutation-tested — remove the guard, prove the specific test fails, restore it.
+- **No known gap crosses the Slice 3 → Slice 4 boundary.** Documenting a hazard is not
+  fixing it.
+- **Do not start Slice 4 early.** Slice 4 is the single indivisible activation cut.
+- Keep nested parentheses out of commit bodies; release-please silently drops the commit.
+
+## Claims inherited, not verified
+
+- That Slice 4 can actually own all 244 inventory members. Slice 3 only proves each has
+  a named owner; whether the owner is correct is Slice 4's evidence.
+- Grok's five smoke findings against 10.3.0 (tools catalog, path-as-project correction,
+  `index_folder` parent refusal, `broken_anchor` vs `exact:symbol`, outline dropped
+  under budget) are a separate product pass, not observed by me, and not Slice 3 work.
