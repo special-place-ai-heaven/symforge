@@ -1,10 +1,22 @@
-//! The single admission/disclosure gate for raw-disk content reads.
+//! The single admission/disclosure gate for repository CONTENT reads.
 //!
-//! Every protocol lane that reopens a repository file from disk — rather than
-//! serving bytes already held in the in-memory index — routes its read through
-//! [`admit_disk_read`]. The gate owns the read: it classifies the exact buffer
-//! it just read and hands that buffer back only on a permit verdict, so no
-//! caller can classify one set of bytes and then render another.
+//! Every protocol lane that fetches repository bytes from outside the in-memory
+//! index routes through this module. There are two such object stores, not one:
+//!
+//!   * the working tree, via [`admit_worktree_text`] / [`admit_disk_read`];
+//!   * git objects, via [`admit_git_text`].
+//!
+//! The gate OWNS the fetch in both cases. It classifies the exact buffer it
+//! just obtained and hands that buffer back only on a permit verdict, so no
+//! caller can classify one set of bytes and then render another. A lane that
+//! fetched its own bytes and promised to classify them afterwards would be
+//! indistinguishable from an ungated read, which is why the fetch lives here.
+//!
+//! This doc previously described the gate as disk-only, and that omission was
+//! load-bearing: `diff_symbols` gated its working-tree read while the two
+//! `file_at_ref` reads beside it stayed ungated, disclosing a demoted file's
+//! symbol names and signatures out of git objects. Policy and classification
+//! are shared by both lanes precisely so the next store added cannot repeat it.
 
 use std::path::Path;
 
@@ -89,19 +101,20 @@ pub(crate) fn disk_read_would_refuse(
 ///
 /// Returns `Err` with the caller-ready refusal or IO message; the caller
 /// returns it verbatim.
-pub(crate) fn admit_disk_read(
-    live: &LiveIndex,
-    relative_path: &str,
-    canon_path: &Path,
-) -> Result<Vec<u8>, String> {
+/// Policy refusals that need NO bytes: the current path rule and the recorded
+/// disposition on the publication that produced the miss.
+///
+/// Split out so both the disk lane and the git-object lane consult exactly the
+/// same policy, and so the disk lane can still refuse WITHOUT reading the file.
+fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
     // Current path rule — no read needed.
     if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
-        return Err(format::content_withheld_by_admission(relative_path));
+        return Some(format::content_withheld_by_admission(relative_path));
     }
 
     // Recorded disposition on the publication that produced the miss — no read
     // needed. A missing entry is not authorization: it means the manifest has
-    // nothing to say, and the current-bytes classification below still applies.
+    // nothing to say, and the current-bytes classification still applies.
     if let Some(FileDisposition::MetadataOnly { reason }) =
         live.capture_file_disposition(relative_path)
     {
@@ -113,14 +126,77 @@ pub(crate) fn admit_disk_read(
                     .iter()
                     .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID) =>
             {
-                return Err(format::content_withheld_unscanned(relative_path));
+                return Some(format::content_withheld_unscanned(relative_path));
             }
             MetadataOnlyReason::SensitivePath { .. }
             | MetadataOnlyReason::SensitiveContent { .. } => {
-                return Err(format::content_withheld_by_admission(relative_path));
+                return Some(format::content_withheld_by_admission(relative_path));
             }
             _ => {}
         }
+    }
+    None
+}
+
+/// Admit bytes the caller ALREADY HOLDS — a git blob, not a disk read.
+///
+/// The disk lane and the git-object lane differ in exactly one step: where the
+/// bytes come from. Policy (path rule, recorded disposition) and content
+/// classification are identical, so they live here and both lanes share them.
+///
+/// This exists because `diff_symbols` gated its working-tree read and left the
+/// two `file_at_ref` reads beside it ungated, which disclosed a demoted file's
+/// symbol names and signatures out of git objects. A lane that holds repository
+/// bytes must admit them, whatever object store they came from.
+pub(crate) fn admit_bytes(
+    live: &LiveIndex,
+    relative_path: &str,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    if let Some(refusal) = refuse_by_policy(live, relative_path) {
+        return Err(refusal);
+    }
+    if let Some(refusal) = classify_admitted_bytes(relative_path, &bytes) {
+        return Err(refusal);
+    }
+    Ok(bytes)
+}
+
+/// Text for `relative_path` as of `git_ref`, admitted by [`admit_bytes`].
+///
+/// The gated replacement for a bare `GitRepo::file_at_ref` in a disclosure
+/// lane. Return shape MIRRORS `file_at_ref` so refusal stays distinguishable
+/// from absence at every call site:
+///   * `Ok(None)` — absent at that ref, binary, or not valid UTF-8;
+///   * `Ok(Some(text))` — admitted content, the only bytes a lane may use;
+///   * `Err(message)` — REFUSED, carrying the caller-ready refusal.
+pub(crate) fn admit_git_text(
+    live: &LiveIndex,
+    repo: &crate::git::GitRepo,
+    git_ref: &str,
+    relative_path: &str,
+) -> Result<Option<String>, String> {
+    // Policy first: a path-ruled file is refused without touching the object
+    // store at all.
+    if let Some(refusal) = refuse_by_policy(live, relative_path) {
+        return Err(refusal);
+    }
+    let Some(text) = repo.file_at_ref(git_ref, relative_path)? else {
+        return Ok(None);
+    };
+    let admitted = admit_bytes(live, relative_path, text.into_bytes())?;
+    Ok(String::from_utf8(admitted).ok())
+}
+
+pub(crate) fn admit_disk_read(
+    live: &LiveIndex,
+    relative_path: &str,
+    canon_path: &Path,
+) -> Result<Vec<u8>, String> {
+    // Policy refusals need no bytes, so they run BEFORE the read: a demoted
+    // file is never opened.
+    if let Some(refusal) = refuse_by_policy(live, relative_path) {
+        return Err(refusal);
     }
 
     // The one read, and the classification of exactly those bytes. Required
@@ -130,6 +206,14 @@ pub(crate) fn admit_disk_read(
         Ok(bytes) => bytes,
         Err(e) => return Err(format!("{relative_path} [error: could not read file: {e}]")),
     };
+    if let Some(refusal) = classify_admitted_bytes(relative_path, &bytes) {
+        return Err(refusal);
+    }
+    Ok(bytes)
+}
+
+/// Classify bytes the gate is holding. `None` admits them.
+fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> {
     // Fail closed on bytes the detector cannot have inspected, and do it HERE so
     // the refusal MESSAGE can be honest. `classify_stable_content` demotes both
     // populations correctly on its own — it collapses the scan-budget refusal
@@ -140,9 +224,9 @@ pub(crate) fn admit_disk_read(
     // `detect_lfs_pointer` requires valid UTF-8 under 1 KiB, so no pointer is
     // swallowed here.
     if crate::knowledge::exceeds_scan_limit(bytes.len())
-        || crate::knowledge::decode_searchable_text(&bytes).is_err()
+        || crate::knowledge::decode_searchable_text(bytes).is_err()
     {
-        return Err(format::content_withheld_unscanned(relative_path));
+        return Some(format::content_withheld_unscanned(relative_path));
     }
     let language = Path::new(relative_path)
         .extension()
@@ -159,9 +243,9 @@ pub(crate) fn admit_disk_read(
     // advising a reindex.
     if let crate::knowledge::StableContentAdmission::MetadataOnly(
         MetadataOnlyReason::SensitiveContent { rule_ids, .. },
-    ) = crate::knowledge::classify_stable_content(relative_path, targets, &bytes)
+    ) = crate::knowledge::classify_stable_content(relative_path, targets, bytes)
     {
-        return Err(
+        return Some(
             if rule_ids
                 .iter()
                 .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID)
@@ -174,5 +258,5 @@ pub(crate) fn admit_disk_read(
     }
 
     // Permit. These are the only bytes any gated lane may render or parse.
-    Ok(bytes)
+    None
 }
