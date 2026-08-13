@@ -212,6 +212,22 @@ EXPECTED_AMENDMENT_MAPPINGS = {
         "plan_task_ids": ("T003", "T041", "T063", "T084"),
         "regression_ids": ("F020-V11-R19A", "F020-V11-R19B"),
     },
+    # A20: strict queryability closes on COMPLETENESS, not recency. The one
+    # generation a Refreshing source retains stays queryable because it was
+    # Current immediately before the refresh and is complete; Blocked and
+    # Stopping retentions stay non-queryable because neither has a successor in
+    # flight. Decided by the operator after the pre-amendment reading was found
+    # to take a project offline for the duration of any reindex, contradicting a
+    # green production test.
+    "F020-V11-A20": {
+        "requirement_ids": ("F020-V11-A20", "FR-037", "FR-043", "FR-051"),
+        "contract_clause_ids": (
+            _ACCEPTANCE_CONTRACT,
+            _SOURCE_BINDING_CONTRACT,
+        ),
+        "plan_task_ids": ("T003", "T024", "T027", "T060"),
+        "regression_ids": ("F020-V11-R20A", "F020-V11-R20B"),
+    },
 }
 
 EXPECTED_DIRECT_TRAIT_IMPLS = (
