@@ -238,12 +238,13 @@ fn replacement_through_a_revoked_lease_touches_nothing() {
 
 /// Symlink creation is unprivileged on Unix; CI runs there.
 ///
-/// Windows reparse points take the SAME branch — `Metadata::is_symlink` on the
-/// `cap-std` handle, which reports a reparse point as a symlink — and no test
-/// creates one, so that half is unverified. An earlier version of this comment
-/// credited `metadata_is_reparse_point`, which lives in `src/paths.rs`, is
-/// called only from `src/gitignore_hygiene.rs`, and has nothing to do with this
-/// path: a claim about code that does not run here.
+/// Windows coverage is the junction test below. The userspace gate is
+/// `Metadata::is_symlink()`, which on Windows is the name-surrogate bit
+/// (`reparse_tag & 0x20000000`) — junctions included, not every reparse tag.
+/// An earlier version of this comment credited `metadata_is_reparse_point`,
+/// which lives in `src/paths.rs`, is called only from `src/gitignore_hygiene.rs`,
+/// and has nothing to do with this path: a claim about code that does not run
+/// here.
 #[cfg(unix)]
 #[test]
 fn a_link_component_is_refused_rather_than_followed() {
@@ -272,6 +273,54 @@ fn a_link_component_is_refused_rather_than_followed() {
     // And the destructive path refuses through the same gate.
     let refusal = replace_beneath(&lease, Path::new("escape/secret.txt"), b"overwritten")
         .expect_err("a replacement through a link must refuse");
+    assert!(matches!(refusal, RootRefusal::LinkComponent { .. }));
+    assert_eq!(
+        std::fs::read(outside.path().join("secret.txt")).expect("read outside"),
+        b"outside".to_vec(),
+        "the refused replacement must not have escaped the root"
+    );
+}
+
+/// Directory junctions are the Windows name-surrogate case CI cannot exercise
+/// on Unix. `mklink /J` creates `IO_REPARSE_TAG_MOUNT_POINT`, which Rust's
+/// `is_symlink` reports because of the name-surrogate bit.
+#[cfg(windows)]
+#[test]
+fn a_junction_component_is_refused_rather_than_followed() {
+    let root = tempfile::tempdir().expect("temp root");
+    let outside = tempfile::tempdir().expect("outside root");
+    std::fs::write(outside.path().join("secret.txt"), b"outside").expect("seed outside");
+
+    let lease = PhysicalRootLease::take(root.path());
+
+    std::fs::create_dir(root.path().join("real")).expect("create real dir");
+    lease
+        .resolve_beneath(Path::new("real/leaf.txt"))
+        .expect("a real directory component resolves");
+
+    let escape = root.path().join("escape");
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &escape.to_string_lossy(),
+            &outside.path().to_string_lossy(),
+        ])
+        .status()
+        .expect("spawn mklink /J");
+    assert!(status.success(), "mklink /J failed: {status}");
+
+    let refusal = lease
+        .resolve_beneath(Path::new("escape/secret.txt"))
+        .expect_err("a junction component must not be followed");
+    assert!(
+        matches!(refusal, RootRefusal::LinkComponent { .. }),
+        "unexpected refusal: {refusal:?}"
+    );
+
+    let refusal = replace_beneath(&lease, Path::new("escape/secret.txt"), b"overwritten")
+        .expect_err("a replacement through a junction must refuse");
     assert!(matches!(refusal, RootRefusal::LinkComponent { .. }));
     assert_eq!(
         std::fs::read(outside.path().join("secret.txt")).expect("read outside"),

@@ -4,6 +4,8 @@
 //! three controls that passed for reasons unrelated to the property under test,
 //! and a registry that refuses everything satisfies a lone negative perfectly.
 
+use std::thread;
+
 use symforge::live_index::index_lifecycle::authority::BindingAuthority;
 use symforge::live_index::index_lifecycle::physical_root::PhysicalRootLease;
 use symforge::live_index::index_lifecycle::registry::{
@@ -262,24 +264,39 @@ fn concurrent_opens_join_one_admission() {
     let key = ProjectKey::new("joined");
     let root = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity();
 
-    let first = registry
-        .admit(
-            key.clone(),
-            BindingAuthority::bind(root),
-            RootProtection::Normal,
-            false,
-            StatePlacement::ProjectLocal,
-        )
-        .expect("first open admits");
-    let second = registry
-        .admit(
-            key.clone(),
-            BindingAuthority::bind(root),
-            RootProtection::Normal,
-            false,
-            StatePlacement::ProjectLocal,
-        )
-        .expect("second open joins");
+    // Two threads, one key, one root: the mutex makes the join deterministic,
+    // but a sequential call never proved two callers actually raced. Each mints
+    // its own `BindingAuthority` — `bind` gives a fresh identity per call — so
+    // this also pins that a join compares roots rather than binding identities.
+    let first_registry = registry.clone();
+    let first_key = key.clone();
+    let first = thread::spawn(move || {
+        first_registry
+            .admit(
+                first_key,
+                BindingAuthority::bind(root),
+                RootProtection::Normal,
+                false,
+                StatePlacement::ProjectLocal,
+            )
+            .expect("first open admits")
+    });
+    let second_registry = registry.clone();
+    let second_key = key.clone();
+    let second = thread::spawn(move || {
+        second_registry
+            .admit(
+                second_key,
+                BindingAuthority::bind(root),
+                RootProtection::Normal,
+                false,
+                StatePlacement::ProjectLocal,
+            )
+            .expect("second open joins")
+    });
+
+    let first = first.join().expect("first admit thread");
+    let second = second.join().expect("second admit thread");
 
     assert_eq!(
         first, second,

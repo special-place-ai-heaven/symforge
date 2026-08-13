@@ -30,9 +30,9 @@ before any production-reachable PreventiveV1 implementation:
    rejected while the prior external approval record remains unchanged.
 
 All v11 generation-query acceptance uses one rule, F020-V11-A20: only a COMPLETE
-verified generation may grant a strict query lease — `Current`, and what
-`Refreshing` retains while no mutation permit is outstanding. `Blocked` and
-`Stopping` retentions are internal recovery material and explicitly non-current.
+verified generation may grant a strict query lease — `Current`, and what a
+reload-entered `Refreshing` retains. A mutation-entered refresh stays unqueryable
+until a successor `Current` installs; `Blocked`/`Stopping` retentions never serve.
 There is no public degraded wrapper or automatic last-known-good answer. A cold
 placeholder and every candidate remain nonqueryable; an incomplete selected source
 returns the closed `SourceRefusal` algebra. Promotion requires one complete,
@@ -351,9 +351,9 @@ placement ID is insufficient: no prior manifest/content/temporal state may becom
 
 ## Claim-authority acceptance
 
-1. Put the source in `Refreshing` **with a mutation permit outstanding** and prove a
-   generation-backed search/read refuses, per F020-V11-A20; prove the same source
-   serves its complete retained generation once that permit retires. Health returns
+1. Put the source in `Refreshing` **via a mutation grant** and prove a
+   generation-backed search/read refuses, per F020-V11-A20; prove it still refuses
+   after that permit retires, until a successor `Current` installs. Health returns
    its immutable runtime snapshot throughout, and a pure root-bound syntax/untracked
    read can return `DiskObservation` from the actually opened object, including
    path-local `PathMissing` from a retained final-parent handle.

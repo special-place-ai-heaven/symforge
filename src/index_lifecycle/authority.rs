@@ -482,19 +482,25 @@ pub enum NonCurrentWork {
 /// A newtype rather than a bare count: the frozen model requires a transition to
 /// refuse while ANY permit is outstanding, and a count that could be decremented
 /// twice would silently authorize an install over a live permit.
+///
+/// `issued` is sticky. A mutation-entered refresh records a permit and stays
+/// unqueryable even after every permit retires, until a successor `Current`
+/// installs. Drain still cares only about the outstanding set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivePermits {
     outstanding: Vec<PublicationIdentity>,
+    issued: bool,
 }
 
 impl ActivePermits {
-    /// No permits outstanding.
+    /// No permits outstanding, and none ever recorded.
     pub fn none() -> Self {
         Self::default()
     }
 
     /// Record a permit issued under `grant`.
     pub fn record(&mut self, grant: PublicationIdentity) {
+        self.issued = true;
         if !self.outstanding.contains(&grant) {
             self.outstanding.push(grant);
         }
@@ -502,6 +508,9 @@ impl ActivePermits {
 
     /// Retire a permit. Returns whether it was outstanding, so a caller cannot
     /// retire a permit twice and drive the count below the truth.
+    ///
+    /// Does not clear [`Self::ever_issued`]: queryability is about how the
+    /// refresh was entered, not about the outstanding set draining.
     pub fn retire(&mut self, grant: PublicationIdentity) -> bool {
         let before = self.outstanding.len();
         self.outstanding.retain(|entry| *entry != grant);
@@ -511,6 +520,11 @@ impl ActivePermits {
     /// Whether anything is still outstanding.
     pub fn is_drained(&self) -> bool {
         self.outstanding.is_empty()
+    }
+
+    /// Whether this source has ever recorded a mutation permit.
+    pub fn ever_issued(&self) -> bool {
+        self.issued
     }
 
     /// The permits still outstanding, so a caller can retire them by name
@@ -524,7 +538,7 @@ impl ActivePermits {
         self.outstanding.len()
     }
 
-    /// Whether no permit has ever been recorded, or all have retired.
+    /// Whether no permit is currently outstanding.
     pub fn is_empty(&self) -> bool {
         self.outstanding.is_empty()
     }
@@ -782,23 +796,20 @@ impl SourceRuntime {
     /// The generation a reader may be served from, if any (F020-V11-A20).
     ///
     /// Queryability closes on COMPLETENESS, not recency. `Current` is queryable.
-    /// So is the single generation `Refreshing` retains **while no mutation
-    /// permit is outstanding against the source**: it is the complete verified
-    /// generation that was `Current` immediately before the refresh began, so
-    /// serving it exposes no partial state, and refusing to serve it would take
-    /// the source offline for the whole of a rebuild while buying no safety at
-    /// all.
+    /// So is the single generation a **reload-entered** `Refreshing` retains: it
+    /// is the complete verified generation that was `Current` immediately before
+    /// the refresh began, so serving it exposes no partial state, and refusing
+    /// to serve it would take the source offline for the whole of a rebuild
+    /// while buying no safety at all.
     ///
-    /// The permit condition is not a detail. `Refreshing` is reached two ways.
-    /// A **reload** builds a candidate elsewhere and leaves the retained
-    /// generation's bytes untouched, which is the case A20 was written for. A
-    /// **mutation** reaches it through `request_mutation_grant`, which freezes
-    /// precisely so the source stops being queryable before a source-disk side
-    /// effect is authorized; there the retained generation describes files a
-    /// permit is in the middle of replacing, so it is complete and must still not
-    /// be served. A20 as first written extended the reload argument to the
-    /// mutation case silently, and reopened the exact window the freeze ordering
-    /// exists to close.
+    /// A **mutation-entered** `Refreshing` is the other door. It is reached
+    /// through `request_mutation_grant`, which freezes precisely so the source
+    /// stops being queryable before a source-disk side effect is authorized.
+    /// There the retained generation describes files a permit has replaced (or
+    /// is replacing), so it is complete and must still not be served — even
+    /// after every permit retires — until a successor `Current` installs.
+    /// FR-043 forbids any terminal path from restoring the prior publication;
+    /// draining the outstanding set is not an install.
     ///
     /// `Blocked` and `Stopping` return `None` even when they retain something.
     /// Neither has a successor in flight, so its retention is a remnant rather
@@ -812,7 +823,7 @@ impl SourceRuntime {
                 retained,
                 active_permits,
                 ..
-            } => active_permits.is_drained().then_some(*retained),
+            } => (!active_permits.ever_issued()).then_some(*retained),
             SourcePhase::Loading { .. }
             | SourcePhase::Blocked { .. }
             | SourcePhase::Stopping { .. } => None,
@@ -1050,11 +1061,12 @@ impl SourceRuntime {
             .freeze()
             .expect("a Current source always has a publication to freeze");
         // Record the permit this grant will become, on the source itself. The
-        // freeze alone no longer makes the source unqueryable — A20 keeps a
-        // refreshing source serving its retained generation — so what closes
-        // reads for the duration of a mutation is this outstanding permit. A
-        // grant that did not record one would leave the source serving the very
-        // files its holder is about to replace.
+        // freeze alone leaves `issued` false — that is the reload-entered
+        // refresh A20 keeps serving. Recording the permit is what marks the
+        // refresh mutation-entered, and that bit stays set after retire, so
+        // reads stay closed until a successor `Current` installs. A grant that
+        // did not record one would leave the source serving the very files its
+        // holder is about to replace.
         self.record_permit(publication);
         let epoch = self.mutation_epoch;
         self.grants_issued += 1;

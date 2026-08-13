@@ -58,23 +58,23 @@ authority.
 
 The V10 query, ranking, security, and evidence-shape rules remain applicable after one
 new mandatory gate. `authority_scope` is a `KnowledgeVoiceFilter` evaluated **inside**
-an already-acquired lifecycle `Current` generation; it is never a generation-
+an already-acquired queryable complete generation; it is never a generation-
 consistency selector. In particular, the wire value `current` means current-
 implementation voice, not lifecycle `Current`.
 
 Before searching, the project registry freezes the authorized selected-source set in
-a sealed selection receipt and acquires one strict complete-generation lease for every
-selected source, per F020-V11-A20. `Loading`, `Blocked`, `Stopping`, `Gapped`,
-permit-holding `Refreshing`, or verification-overdue returns one exact refusal:
+a sealed selection receipt and acquires one queryable complete-generation lease for
+every selected source, per F020-V11-A20. `Loading`, `Blocked`, `Stopping`, `Gapped`,
+mutation-entered `Refreshing`, or verification-overdue returns one exact refusal:
 resolved source or `SelectionUnavailable` with bijective per-source evidence for a
 selected set. Invalid or unauthorized selection retains its indistinguishable
-`InvalidSelection` shape. A retained verified generation remains internal recovery
-material and cannot supply hits, coverage, or a no-match result.
+`InvalidSelection` shape. A remnant or mutation-entered retention cannot supply hits,
+coverage, or a no-match result.
 
 A successful empty result is therefore an absence claim over the exact sealed
-selection and is legal only when every selected required source was acquired as
-`Current`. The V10 degraded/last-valid response rows below are retained only as
-historical evidence and are explicitly superseded by this gate.
+selection and is legal only when every selected required source was acquired as a
+queryable complete generation. The V10 degraded/last-valid rows below are retained
+as historical evidence and are explicitly superseded by this gate.
 
 ## V11 claim envelope and authority lane
 

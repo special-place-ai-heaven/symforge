@@ -28,24 +28,24 @@ advisory until an explicit policy action is approved.
 
 The V10 hygiene, proof, policy, security, and remediation evidence remains applicable
 after strict lifecycle acquisition. `search_knowledge`, `review_knowledge`, map/context
-views, and curation preview acquire lifecycle `Current` for every required selected
-source through one sealed project query lease, or what `Refreshing` retains while no
-mutation permit is outstanding, per F020-V11-A20. `Loading`, `Blocked`, `Stopping`,
-`Gapped`, and verification-overdue return the exact `SourceRefusal`, one source or
-`SelectionUnavailable` with bijective evidence for a selected set. Invalid or
-unauthorized selection retains its indistinguishable `InvalidSelection` form.
+views, and curation preview acquire a queryable complete generation for every required
+selected source through one sealed project query lease: `Current`, or what a
+reload-entered `Refreshing` retains, per F020-V11-A20. `Loading`, `Blocked`, `Stopping`,
+mutation-entered `Refreshing`, `Gapped`, and verification-overdue return the exact
+`SourceRefusal`, one source or `SelectionUnavailable` with bijective evidence. Invalid
+or unauthorized selection retains its indistinguishable `InvalidSelection` form.
 
-A retained verified generation remains byte-identical internal recovery material and
+A remnant or mutation-entered retention remains byte-identical recovery material and
 cannot supply findings, counts, remediation coverage, an empty result, or degraded/
 last-verified evidence. An empty review or search claim is legal only after every
-selected required source is acquired as `Current`.
+selected required source is acquired as a queryable complete generation.
 
 Every `authority_scope` wire value is parsed as a `KnowledgeVoiceFilter` **inside**
-that acquired `Current` generation. The wire value `current` means current-
+that acquired queryable generation. The wire value `current` means current-
 implementation voice, not lifecycle `Current`, and no voice value selects generation
 consistency. Persistence health remains orthogonal to read truth; curation apply may
-still require durable replay and atomic-write capability in addition to lifecycle
-`Current`.
+still require durable replay and atomic-write capability in addition to a queryable
+generation.
 
 ## V11 claim and observation envelope
 

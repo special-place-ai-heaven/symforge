@@ -25,8 +25,8 @@ a public degraded, last-valid, or last-verified generation read:
   generation-backed tool, resource, prompt, hook, sidecar route, CCR operation,
   checkpoint, and embedded consumer acquires it through the strict Interface.
 - `Loading`, `Blocked`, and `Stopping` return the one exact `SourceRefusal`
-  algebra, and so does `Refreshing` while a mutation permit is outstanding. What a
-  `Refreshing` source otherwise retains it serves; it is not a degraded fallback.
+  algebra, and so does a mutation-entered `Refreshing` until a successor `Current`
+  installs. A reload-entered `Refreshing` serves what it retains; not a fallback.
 - Single-source refusal uses `SourceUnavailable` after authorization; a selected
   multi-source request uses `SelectionUnavailable` with an exact bijection over the
   sealed selection receipt. Pre-binding selection and admission failures retain their

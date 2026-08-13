@@ -14,6 +14,11 @@
 //! the directory it was given, so a link planted inside root A cannot redirect a
 //! write to root B whether it was planted before, during, or after the call.
 //!
+//! The userspace gate in front of that open is `Metadata::is_symlink()`. On
+//! Windows that is the name-surrogate bit (`reparse_tag & 0x20000000`), so a
+//! directory junction is refused the same way as a symlink. It is not "every
+//! reparse point": a tag without that bit is not a `LinkComponent`.
+//!
 //! Absolute paths and `..` are refused before they reach the handle, so the
 //! refusal names what was wrong instead of surfacing an opaque OS error.
 //!
@@ -63,7 +68,10 @@ pub enum RootRefusal {
         /// The offending relative path.
         requested: PathBuf,
     },
-    /// A component is a symlink or reparse point, which is never followed.
+    /// A component is a symlink or a name-surrogate reparse point, which is
+    /// never followed. On Windows that is the name-surrogate bit
+    /// (`reparse_tag & 0x20000000`): junctions (`IO_REPARSE_TAG_MOUNT_POINT`)
+    /// count, while a reparse tag without that bit does not.
     LinkComponent {
         /// The component that is a link.
         component: PathBuf,

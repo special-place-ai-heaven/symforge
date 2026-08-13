@@ -12,23 +12,23 @@ After strict lifecycle acquisition succeeds, one bounded first-contact call give
 agent a truthful repository orientation: current code topology/hotspots, organized
 current/intent knowledge entry points, explicit code-to-knowledge evidence links, and
 uncertainty. It is a derived view, not a generated summary and not a third search
-index. If any required selected source is non-current, the call returns exact
+index. If any required selected source is unqueryable, the call returns exact
 `SourceRefusal` instead of a partial or last-verified orientation.
 
 ## V11 lifecycle amendment
 
 The V10 role, bridge, ranking, security, and formatting evidence remains applicable
 after strict acquisition. Every map, `ask`, file/symbol context, and knowledge-search
-generation read acquires lifecycle `Current` for every required selected source through
-the project registry, or, per F020-V11-A20, what `Refreshing` retains while no mutation
-permit is outstanding. A `Blocked` or `Stopping` retention is internal, non-current
-material; it cannot supply a map, backlink, absence, or last-verified response.
+generation read acquires a queryable complete generation for every required selected
+source through the project registry: `Current`, or, per F020-V11-A20, what a
+reload-entered `Refreshing` retains. A mutation-entered `Refreshing`, `Blocked`, or
+`Stopping` retention cannot supply a map, backlink, absence, or last-verified response.
 
 Single-source failure returns `SourceUnavailable`; multi-source failure returns
 `SelectionUnavailable` whose evidence is an exact bijection over the sealed selection
 receipt. Invalid or unauthorized selection retains its indistinguishable
 `InvalidSelection` form. Any authority-view choice is a `KnowledgeVoiceFilter` inside
-the captured `Current` generation, never a generation-consistency selector.
+the captured queryable generation, never a generation-consistency selector.
 
 ## V11 claim envelope and authority lanes
 
@@ -269,9 +269,9 @@ same `SafeHit` output guard before formatting, budgeting, analytics, or CCR.
 17. A repeated `get_file_content` during watcher-triggered non-current work refuses;
     after successor promotion it serves the new generation, never a prior-generation
     cache receipt or content.
-18. Loading, Blocked, Stopping, `Gapped`, verification-overdue, and permit-holding
+18. Loading, Blocked, Stopping, `Gapped`, verification-overdue, and mutation-entered
     Refreshing sources return exact `SourceRefusal` before map/card/backlink/absence
-    formatting; only a complete generation is ever exposed, per F020-V11-A20.
+    formatting; only a queryable complete generation is ever exposed, per F020-V11-A20.
 19. Current/intent/history authority choices filter voice within one captured
     lifecycle-`Current` generation and cannot select generation consistency.
 20. Every map/ask/context/search text and structured result, cache/persisted entry,

@@ -929,17 +929,28 @@ fn a_refreshing_source_still_serves_its_complete_retained_generation() {
         "a source served readers while its own permit rewrote its disk"
     );
 
-    // And when that permit retires, the source serves its retention again: the
-    // refusal is about the outstanding permit, not a blanket refusal to serve a
-    // refreshing source.
+    // And when that permit retires, reads stay closed: FR-043 forbids any
+    // terminal path from restoring the prior publication, and draining the
+    // outstanding set is not an install. Disk may already differ from the
+    // retained generation. The refusal is about how Refreshing was entered,
+    // not about a live permit count.
     let outstanding = mutating.active_permits();
     assert_eq!(outstanding.len(), 1);
     for grant in outstanding.outstanding() {
         assert!(mutating.retire_permit(grant));
     }
     assert!(
-        mutating.is_queryable(),
-        "retiring the last permit did not restore reads"
+        mutating.active_permits().is_drained(),
+        "retire must drain the outstanding set; Drain still keys off that"
+    );
+    assert!(
+        mutating.active_permits().ever_issued(),
+        "retire must not forget that a mutation permit was issued"
+    );
+    assert_eq!(mutating.phase(), PhaseName::Refreshing);
+    assert!(
+        !mutating.is_queryable(),
+        "retiring the last permit restored reads on a mutation-entered refresh"
     );
 }
 

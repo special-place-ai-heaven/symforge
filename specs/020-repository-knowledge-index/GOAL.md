@@ -60,20 +60,21 @@ preventive project/source lifecycle:
 - detect documentation divergence through typed, code-backed evidence without
   erasing intent, governance, north-star, security, or history material;
 - expose review/remediation and guarded cleanup without silent mutation or deletion.
-- make lifecycle `Current` the sole source of generation-backed query authority;
+- make a queryable complete generation (`Current`, or a reload-entered `Refreshing`
+  retention) the sole source of generation-backed query authority;
 - keep pure `DiskObservation`, `WorktreeScopeObservation`, and `GitObservation`
   independently authoritative without pretending they are generation evidence, and
   require identity-compatible `ClaimContext` for every mixed-authority derivation;
   allow only each observation authority's native negative/completeness claim—path-
   local `PathMissing`, completeness of one sealed worktree scope/interval, or
   `NotInTree` for one exact Git tree—never an unqualified generation/repository claim;
-- keep `Loading` generation-free, keep the one verified generation retained by
-  `Refreshing` internal, and keep the optional retained generation in `Blocked` or
-  `Stopping` explicitly non-current;
+- keep `Loading` generation-free, keep a reload-entered `Refreshing` serving the
+  one verified generation it retains, and keep a mutation-entered refresh plus the
+  optional retained generation in `Blocked` or `Stopping` explicitly unqueryable;
 - keep a cold placeholder nonqueryable and outside active publication authority;
 - promote only one complete, source-bound, root-bound, fully verified generation;
 - return the closed `SourceRefusal` algebra whenever a generation-backed selection is
-  not Current instead of wrapping or partially serving degraded evidence; health and
+  unqueryable instead of wrapping or partially serving degraded evidence; health and
   pure observation lanes retain their own typed, non-generation authority;
 - activate PreventiveV1 process-wide and indivisibly across daemon, stdio, serve,
   embed, snapshot, observer, mutation, local-ref, cache/CCR, and derived lanes.
@@ -92,8 +93,9 @@ preventive project/source lifecycle:
   degraded-publication oracle is reused as v11 proof.
 - [ ] A cold start exposes responsive protocol/health surfaces but no queryable
   placeholder, empty success, or generation claim before complete promotion.
-- [ ] Only `Current(VerifiedGeneration)` can grant a generation query lease; retained
-  state in Refreshing/Blocked remains internal and non-current. Pure disk, complete
+- [ ] Only a queryable complete generation can grant a generation query lease;
+  reload-entered Refreshing still serves its retention, while mutation-entered
+  Refreshing and Blocked/Stopping remnants remain unqueryable. Pure disk, complete
   worktree-scope, Git, and runtime-health evidence remains available through its own
   authority. It may express its native path/scope/tree negative proof, but cannot
   establish generation membership, generation completeness, or unqualified
@@ -157,13 +159,14 @@ preventive project/source lifecycle:
   Observation-native `PathMissing`, sealed-scope completeness, and exact-tree
   `NotInTree` remain legal without becoming generation/repository-wide claims.
 - `[freshness]` One captured immutable source set per generation-backed call; stale
-  off-lock work is rejected; lifecycle `Current` is the only generation-queryable
-  state. Pure observation and health lanes remain independently authoritative and
+  off-lock work is rejected; a queryable complete generation (`Current`, or a
+  reload-entered `Refreshing` retention) is the only generation-queryable state.
+  Pure observation and health lanes remain independently authoritative and
   never borrow generation semantics. There is no active degraded generation and no
-  public retained-generation fallback in v11.
-- `[lifecycle]` Cold placeholders and candidates are nonqueryable. Loading,
-  Refreshing, Blocked, and Stopping may retain recovery material internally but can
-  grant no generation-current claim.
+  public remnant or mutation-entered-refresh fallback in v11.
+- `[lifecycle]` Cold placeholders and candidates are nonqueryable. A reload-entered
+  Refreshing still serves its retained generation. Loading, mutation-entered
+  Refreshing, Blocked, and Stopping grant no generation-current claim.
 - `[promotion]` Promotion is one atomic publication of a complete verified generation
   with source/root/binding authority, complete manifest and observations, and every
   certificate required by the advertised strict scope. The sole public root is one
@@ -274,10 +277,8 @@ landing handoff is ready.
   always served the previous complete generation during a reload, and a green regression
   pins that behaviour. The invariant this feature exists to protect is that no partial,
   candidate, or snapshot state is ever served; recency was never the property under
-  protection. So the one generation a `Refreshing` source retains stays queryable while no
-  mutation permit is outstanding against it, because it was `Current` immediately before
-  the refresh and is complete — but a permit is replacing the very files that generation
-  describes, so a mutation-entered refresh serves nothing and the freeze-before-grant
-  ordering keeps the meaning it was written for, while `Blocked` and
-  `Stopping` retentions stay non-queryable since neither has a successor in flight to make
-  the retention a refresh rather than a remnant.
+  protection. So a reload-entered `Refreshing` still serves the complete generation it
+  retains (F020-V11-A20). A mutation-entered refresh stays unqueryable until a successor
+  `Current` installs — retiring the permit is not an install, and FR-043 forbids restoring
+  the prior publication. `Blocked` and `Stopping` retentions stay non-queryable since
+  neither has a successor in flight to make the retention a refresh rather than a remnant.

@@ -71,27 +71,29 @@ Wiring `index_folder` to the reload transition at Slice 4 would therefore have
 taken every project offline for the duration of every reindex.
 
 **F020-V11-A20** resolves it, operator-decided and signed: queryability closes on
-**completeness**, not recency. The single generation `Refreshing` retains stays
-queryable — **while no mutation permit is outstanding against the source** —
-because it was `Current` immediately before the refresh and is complete.
-`Blocked` and `Stopping` retentions stay non-queryable — neither has a successor
-in flight, so a remnant is not a refresh. Candidates, snapshot seeds and partial
-artifacts remain unservable from every state.
+**completeness**, not recency. A reload-entered `Refreshing` still serves the
+complete generation it retains, because it was `Current` immediately before the
+refresh and is complete. A mutation-entered refresh stays unqueryable until a
+successor `Current` installs — retiring the permit is not an install, and
+FR-043 forbids restoring the prior publication. `Blocked` and `Stopping`
+retentions stay non-queryable — neither has a successor in flight, so a remnant
+is not a refresh. Candidates, snapshot seeds and partial artifacts remain
+unservable from every state.
 
-The permit condition is not decoration and was not in the first draft. Adversarial
-review pointed out that `Refreshing` is reached two ways: a reload builds a
-candidate elsewhere and leaves the retained generation's bytes alone, while a
-mutation reaches it through `request_mutation_grant`, whose entire purpose is to
-stop the source serving before a disk write is authorized. A20 extended the
-reload argument to the mutation case silently and reopened the window the freeze
-ordering exists to close.
+The permit condition is not decoration. `Refreshing` is reached two ways: a
+reload builds a candidate elsewhere and leaves the retained generation's bytes
+alone, while a mutation reaches it through `request_mutation_grant`, whose
+entire purpose is to stop the source serving before a disk write is authorized.
+A20 as first written extended the reload argument to the mutation case silently
+and reopened the window the freeze ordering exists to close. The later reading
+that restored reads on permit retire was the same window wearing a drain.
 
 Two regressions encode it. `F020-V11-R20A` is the availability half, pinned by
 `a_refreshing_source_still_serves_its_complete_retained_generation` on a
-reload-entered refresh, with a mutation-entered refresh as its paired negative.
-`F020-V11-R20B` is the safety half, pinned by
-`blocked_and_stopping_retentions_are_never_queryable`, which pairs with a
-`Refreshing` source holding the identical retention so the refusal is
+reload-entered refresh, with a mutation-entered refresh as its paired negative
+— including after that permit retires. `F020-V11-R20B` is the safety half,
+pinned by `blocked_and_stopping_retentions_are_never_queryable`, which pairs
+with a `Refreshing` source holding the identical retention so the refusal is
 demonstrably about having no successor rather than a blanket refusal. Both bind
 `ORACLE-QUERY-ATOMIC-LEASE`, the oracle that owns strict selection, which now
 carries an assertion for the availability half so it can fail when A20 is

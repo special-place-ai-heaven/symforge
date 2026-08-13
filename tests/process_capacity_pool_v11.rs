@@ -5,6 +5,9 @@
 //! and Slice 0 already shipped three controls that passed for reasons unrelated
 //! to the property under test.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+
 use symforge::live_index::index_lifecycle::capacity::{CapacityRefusal, ProcessCapacityPool};
 
 /// TEST-CAPACITY (T032). The name is pinned by
@@ -99,6 +102,55 @@ fn one_grant_backs_exactly_one_allocation() {
     );
     drop(second);
     assert_eq!(ledger.charged(root), 0);
+}
+
+/// Concurrent reserve/redeem/drop against a tight limit still conserves.
+///
+/// The ledger mutex makes a data race unrepresentable; this still proves the
+/// accounting identity after real threads interleave grants, redemptions,
+/// exhaustion refusals, and drops — a sequential loop never did.
+#[test]
+fn concurrent_reserve_and_drop_conserves_a_tight_limit() {
+    let ledger = ProcessCapacityPool::new();
+    let limit = 3;
+    let root = ledger.root(limit);
+
+    let successes = std::sync::Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..12)
+        .map(|_| {
+            let ledger = ledger.clone();
+            let successes = successes.clone();
+            thread::spawn(move || match ledger.reserve(root, 1) {
+                Ok(grant) => {
+                    let permit = ledger.redeem(grant).expect("own grant");
+                    drop(permit);
+                    successes.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(CapacityRefusal::Exhausted { requested, available }) => {
+                    assert_eq!(requested, 1);
+                    assert!(available <= limit);
+                }
+                Err(other) => panic!("unexpected refusal: {other:?}"),
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("capacity thread");
+    }
+
+    assert_eq!(ledger.charged(root), 0, "a concurrent drop leaked a charge");
+    assert!(
+        successes.load(Ordering::Relaxed) > 0,
+        "every reserve failed; the positive control never ran"
+    );
+    assert_eq!(ledger.available(root), limit);
+    assert_eq!(ledger.outstanding_charges(root), 0);
+    assert_eq!(
+        ledger.unknown_refunds(),
+        0,
+        "a concurrent refund named a charge the ledger never issued"
+    );
 }
 
 /// Exhaustion refuses with the numbers, and does not charge on refusal.

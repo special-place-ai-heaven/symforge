@@ -11,10 +11,10 @@ This refreeze supersedes the V10 publication/readiness semantics wherever they
 conflict with the rules below. Historical review receipts remain evidence of the
 work performed, but they do not authorize a V11 implementation.
 
-1. Only a COMPLETE verified generation is queryable (A20). `Current` is queryable,
-   and so is the one `Refreshing` retains while no mutation permit is outstanding
-   against it. `Loading` retains none. `Blocked` and `Stopping` retentions are
-   immutable recovery evidence only, never a degraded or last-valid query lane.
+1. Only a COMPLETE verified generation is queryable (F020-V11-A20). `Current` is,
+   and so is the one a reload-entered `Refreshing` retains. A mutation-entered
+   `Refreshing` is unqueryable until a successor `Current` installs. `Loading`
+   retains none. `Blocked`/`Stopping` retentions are never a query lane.
 2. Cold placeholders, snapshot seeds, candidates, capacity-refused attempts, and
    failed observations cannot mint query authority. They expose a closed
    `SourceRefusal` with safe diagnostics until one complete generation promotes.
@@ -226,14 +226,14 @@ files must be queryable in their respective scopes.
    payload sizes consume no catalog-metadata or admitted-byte budget.
 3. **Given** a content-ingest candidate over the admitted-byte ceiling, **When**
    admission accounts the candidate, **Then** no canonical manifest is minted,
-   the candidate is discarded, strict acquisition is refused with a typed capacity
-   cause, and any retained verified generation remains byte-identical and non-current.
+   the candidate is discarded with a typed capacity cause, and any retained
+   verified generation remains byte-identical and still served on that refresh.
 4. **Given** unavailable metadata, **When** the scout evaluates a path, **Then**
    size never defaults to zero; the path receives an explicit unavailable issue.
 5. **Given** a repository over the catalog-entry ceiling, **When** scouting
    reaches the bound, **Then** attempt accounting records the refusal, no candidate
    generation or truncated manifest can promote, and any retained verified
-   generation remains internal and non-current.
+   generation remains byte-identical and still served on that refresh.
 6. **Given** paths or diagnostics whose bounded descriptors would exceed the
    catalog-metadata ceiling, **When** scouting reaches the bound, **Then** the
    observation is refused exactly like an entry-ceiling failure; it never publishes
@@ -324,9 +324,9 @@ must not return Markdown section symbols/content for that query.
 5. Results are bounded/diversified and retain provenance when output is truncated
    or moved behind CCR retrieval.
 6. A no-match result is `no_evidence_complete` only when a sealed selection receipt
-   has one `Current` lease for every selected source. Any non-current selected source
-   returns `SourceRefusal::SelectionUnavailable`; security withholding remains a
-   distinct, explicitly attributed outcome and cannot establish absence.
+   has one queryable complete generation for every selected source. Any unqueryable
+   selected source returns `SourceRefusal::SelectionUnavailable`; security withholding
+   remains a distinct, explicitly attributed outcome and cannot establish absence.
 
 ---
 
@@ -381,8 +381,8 @@ fixtures whose required reads all succeed; checkpoint, restart, and verify uncha
 disk. Before and after state must have the same canonical manifest and query results.
 Verification must not fully read metadata-terminal artifacts. Separately make one
 required path unreadable during source build or snapshot verification: the candidate
-must be discarded, any retained generation stays internal/non-current, and strict
-acquisition refuses. Restore access and prove bounded re-observation promotes a fresh
+must be discarded; a reload-entered refresh still serves its retained generation.
+A remnant stays unqueryable. Restore access and prove bounded re-observation promotes a fresh
 complete candidate with source-build/snapshot parity.
 
 **Acceptance Scenarios**:
@@ -478,8 +478,8 @@ plans, and handoffs. Every item is exact source evidence, not a generated summar
 orientation call returns the AGENTS architecture/mission, ownership/governance
 artifacts when present, current SpecKit/plan entry points, recovery invariants, and
 existing code hotspot signals with file/line/source/generation pointers. It refuses
-with per-source evidence when any selected source is non-current; from a complete
-Current selection it may state facets with no declared evidence but does not invent
+with per-source evidence when any selected source is unqueryable; from a complete
+queryable selection it may state facets with no declared evidence but does not invent
 owners, active status, or architecture conclusions.
 
 **Acceptance Scenarios**:
@@ -611,8 +611,8 @@ historical scope can still retrieve them.
   consume zero admitted bytes and only bounded path/descriptor metadata. Exhausting
   the catalog-entry or catalog-metadata budget MUST abort the candidate observation
   before a `RepositoryManifest` exists; no partial manifest may publish. A retained
-  verified generation remains byte-identical and non-current, while cold start stays
-  non-queryable. Strict acquisition returns a typed capacity refusal. The exact
+  verified generation remains byte-identical and still served on a reload-entered
+  refresh; cold start stays non-queryable. Capacity refusal is typed. The exact
   reasons are `CatalogEntryCapacityExceeded` and
   `CatalogMetadataCapacityExceeded`; budget-attempt issues remain bounded
   `AttemptAccounting` and never form a published manifest.
@@ -648,8 +648,8 @@ historical scope can still retrieve them.
   hybrid view, or check-then-swap stale map state.
 - **FR-009**: A failed next build MUST NOT modify the retained verified generation.
   The lifecycle owner MUST publish a closed non-current runtime state with bounded
-  attempt diagnostics and `SourceRefusal`; retained content remains internal and no
-  public consumer may acquire or label it as current.
+  attempt diagnostics and `SourceRefusal` for unqueryable phases; a reload-entered
+  refresh still serves the retained generation and MUST NOT label it as `Current`.
 - **FR-010**: Watcher single-path updates MUST use the shared scout/admission/read
   logic and MUST update/remove all lanes atomically.
 - **FR-011**: Reconciliation MUST diff complete manifests, not only Tier-1 paths,
@@ -688,14 +688,14 @@ historical scope can still retrieve them.
 - **FR-016**: Knowledge ranking MUST be deterministic, source-aware, diversified,
   and must not bump frecency.
 - **FR-017**: Every successful result carrying `GenerationAuthority`, or deriving any
-  fact from generation structure, MUST be built from a sealed Current lease and carry
-  its complete generation, binding, source, scope, operation, and provenance
-  identities. A non-current source MUST return the closed `SourceRefusal` envelope
-  for that generation-backed operation instead of a stale/degraded success. Retained
-  generations and attempt diagnostics remain visible only through bounded health and
-  recovery evidence that cannot be mistaken for query authority. Pure root-bound
+  fact from generation structure, MUST be built from a queryable complete generation
+  (`Current`, or a reload-entered `Refreshing` retention) and carry its complete
+  generation, binding, source, scope, operation, and provenance identities. A
+  mutation-entered `Refreshing`, `Loading`, `Blocked`, or `Stopping` source MUST return
+  the closed `SourceRefusal` envelope instead of a stale/degraded success. Remnant
+  recovery evidence cannot be mistaken for query authority. Pure root-bound
   `DiskObservation`, complete `WorktreeScopeObservation`, `GitObservation`, and
-  runtime health do not require Current and remain independently authoritative within
+  runtime health do not require a queryable generation and remain independently authoritative within
   their closed authority: disk may prove path-local `PathMissing` from its retained
   final-parent handle, a sealed worktree-scope receipt may prove completeness for its
   declared scope/interval, and Git may prove `NotInTree` for one exact tree. These
@@ -1013,9 +1013,9 @@ historical scope can still retrieve them.
   Staged/indexed residency is governed separately by the admitted-content ceiling;
   an in-flight budget smaller than that ceiling is legal and MUST NOT deadlock.
 - **NFR-003 Availability and trust**: One bad file cannot publish partial, stale, or
-  mixed state. An observation-critical failure blocks candidate promotion and
-  strict-current acquisition; any retained verified generation remains immutable
-  and internal while the lifecycle exposes explicit recovery work/refusal evidence.
+  mixed state. An observation-critical failure blocks candidate promotion; a
+  reload-entered Refreshing still serves its retained generation, while a
+  mutation-entered refresh and remnant retentions stay unqueryable recovery evidence.
 - **NFR-004 Recovery**: Crash/corruption leaves either the previous valid generation
   or an explicit source rebuild path.
 - **NFR-005 Latency**: V11 defines no independent cold-start SLO: a cold source stays
@@ -1067,9 +1067,9 @@ historical scope can still retrieve them.
   forces re-scout before lifecycle `Current`.
 - **SC-010**: Formatting, Clippy, focused suites, serial all-target tests, and the
   exact CI embed gate pass before completion.
-- **SC-011**: From an all-Current sealed selection, one bounded first-contact call
+- **SC-011**: From an all-queryable sealed selection, one bounded first-contact call
   returns source-cited entry points for every declared knowledge role plus explicit
-  unknown roles. If any selected source is non-current, the call returns a typed
+  unknown roles. If any selected source is unqueryable, the call returns a typed
   per-source refusal and no partial orientation or absence claim.
 - **SC-012**: Bridge fixtures resolve exact path/unique-symbol links in both
   directions, expose ambiguous/missing links without guessing, and remove/repair
