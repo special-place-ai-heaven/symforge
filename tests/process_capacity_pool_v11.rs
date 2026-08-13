@@ -246,3 +246,27 @@ fn a_refund_for_an_unknown_charge_invents_nothing() {
     );
     assert_eq!(other.charged(other_root), 0);
 }
+
+/// TEST-CAPACITY-INTEGRATION (T069, Slice 4). Reserved name, empty of proof.
+///
+/// The traceability checker requires every `planned_exact` case declared for a
+/// file to EXIST once that file exists, and Slice 2 created this file for
+/// TEST-CAPACITY. So the name is materialized here at its declared target,
+/// carrying nothing it has not observed: the activation cut whose conservation
+/// it measures does not exist before T060, so there is no runtime to hold to
+/// the identity `retained[d] + candidate[d] <= pregranted[d] + scratch[d] +
+/// headroom[d]` across all four surfaces.
+///
+/// It is RED by construction and kept out of the default suite by `#[ignore]`,
+/// the same shape Slice 0 used for its controls. Removing the attribute without
+/// writing the body fails loudly rather than reporting a pass; the release
+/// runner separately refuses an ignored-only run as execution evidence
+/// (`scripts/validate-lifecycle-oracle-traceability.cjs`, `expect_execution`).
+#[test]
+#[ignore = "Feature 020 planned_not_executed case for TEST-CAPACITY-INTEGRATION; remove this attribute in Slice 4 (T069) when the activation cut can be driven and conservation actually measured"]
+fn whole_runtime_capacity_is_conserved_under_activation() {
+    panic!(
+        "TEST-CAPACITY-INTEGRATION is planned_not_executed: no activation cut exists to \
+         measure, so nothing here has observed whole-runtime conservation. T069 owns the body."
+    );
+}
