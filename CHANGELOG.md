@@ -26,6 +26,19 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.3.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.2.0...v10.3.0) (2026-08-13)
+
+
+### Features
+
+* **knowledge:** answer-first search_knowledge hits and global limit ([#563](https://github.com/special-place-ai-heaven/symforge/issues/563)) ([8c297b1](https://github.com/special-place-ai-heaven/symforge/commit/8c297b1dadf2b324f3729ec5c4b395e1a6fadb4d))
+
+
+### Bug Fixes
+
+* **knowledge:** report Unknown lifecycle when no evidence exists ([#562](https://github.com/special-place-ai-heaven/symforge/issues/562)) ([b00a8a3](https://github.com/special-place-ai-heaven/symforge/commit/b00a8a3fafec7b25ce57e5fd87145b3fbf2659a2))
+* **release:** do not treat an untagged release merge as a silent skip ([#564](https://github.com/special-place-ai-heaven/symforge/issues/564)) ([4fc7a44](https://github.com/special-place-ai-heaven/symforge/commit/4fc7a44530e79dc6227ab3857460898855acb8df))
+
 ## [10.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.1.1...v10.2.0) (2026-08-12)
 
 
