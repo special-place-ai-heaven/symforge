@@ -265,3 +265,16 @@ green, `ObservedRefreshGateV1` passes, the indivisible PreventiveV1 activation p
 no simultaneous legacy authority or fallback, accepted reviews are resolved, no
 unsafe process remains, the exact staged scope is approved, and the authorized
 landing handoff is ready.
+
+## Amendments decided after the refreeze
+
+- **F020-V11-A20 — queryability closes on completeness, not recency**: The pre-amendment
+  reading made any reindex take the project offline, because `Refreshing` retained a
+  generation that nothing was allowed to query while a candidate built. Production has
+  always served the previous complete generation during a reload, and a green regression
+  pins that behaviour. The invariant this feature exists to protect is that no partial,
+  candidate, or snapshot state is ever served; recency was never the property under
+  protection. So the one generation a `Refreshing` source retains stays queryable, because
+  it was `Current` immediately before the refresh and is complete, while `Blocked` and
+  `Stopping` retentions stay non-queryable since neither has a successor in flight to make
+  the retention a refresh rather than a remnant.
