@@ -205,6 +205,46 @@ mutation loop held a live mutant and promoted the mutant to a blocker. Any
 audit fanned out into a mutation-owned worktree must read from a pinned
 `git show SHA:` baseline, not the working tree.
 
+## The ClaimContext chunk — the last piece of T043's named surface
+
+`ClaimContext`, `ClaimContextInput`, `CurrentQueryLease`,
+`OperationRelationshipContract`, and the free function `acquire_claim_context`
+now exist, on the frozen shape from `data-model.md:1844-1872` under the
+recorded Slice 3 adaptations: `String` keys per D10, the local lease per D11,
+and a `Vec` whose emptiness is refused in the constructor per D10's
+NonEmptyVec record.
+
+The closed relationship table is derived from `OperationKind` and nothing
+else: search operations permit the cross-source relation and require a
+`Current` lease per input; runtime lifecycle operations act on one source and
+require none. Both directions of every rule carry an accepting pair:
+
+- empty acquisition → `InvalidSelection`; one-input acquisition admitted
+- root drift between acquisitions under `CloseSource` → `SourceUnavailable`;
+  the SAME two roots under `SearchText` admitted, because that is the closed
+  contract's explicit cross-source relation, not a loophole
+- `SearchText` input without a `Current` lease → `AdmissionUnavailable`; with
+  the lease admitted; `RefreshSource` legitimately omits it
+- a returned context retains exactly the roots, sources, and repository ids
+  captured at acquisition — the falsifiable half of "a rebind after return
+  does not trigger a trailing live-state check"
+
+`current_query_lease` joins the fixture-evidence family: shape sealed, its
+`Ok` unconditional until Slice 4's strict-lease machinery provides the
+refusing evidence. Same rule as `completed_render_authority`: do not complete
+it with a fake check.
+
+**Mutation ledger, continued** — final suite 34 green:
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M8 | empty-acquisition guard disabled | `a_context_refuses_an_empty_acquisition`, alone |
+| M9 | root-drift guard disabled | `a_rebind_between_input_acquisitions_is_refused`, alone |
+| M10 | requires-current guard disabled | `a_generation_structured_operation_requires_a_current_lease_per_input`, alone |
+
+Ten mutations total across T043: nine caught by a named oracle alone, one
+survivor that forced a new oracle and was then caught by it.
+
 ## The traceability catalog caught an invented name (T041)
 
 First run of `node scripts/validate-lifecycle-oracle-traceability.cjs` on the

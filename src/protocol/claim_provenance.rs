@@ -353,6 +353,32 @@ impl ObservationLease {
         SourceRefusal::new(kind, operation, retry, evidence)
     }
 
+    /// A strict `Current` query lease for this source. Sealed constructor;
+    /// like the other lease constructors its EVIDENCE is a Slice 4 stand-in —
+    /// see the evidence document — while its shape is what Slice 4 keeps.
+    pub fn current_query_lease(&self) -> Result<CurrentQueryLease, SourceRefusal> {
+        Ok(CurrentQueryLease {
+            generation: GenerationIdentity::fresh(),
+        })
+    }
+
+    /// Capture one context input under this lease. The root is captured HERE,
+    /// at build time, which is what lets `acquire_claim_context` detect a
+    /// rebind between input acquisitions.
+    pub fn context_input(
+        &self,
+        project_source: &str,
+        repository_id: &str,
+        current: Option<CurrentQueryLease>,
+    ) -> ClaimContextInput {
+        ClaimContextInput {
+            project_source: project_source.to_string(),
+            repository_id: repository_id.to_string(),
+            root: self.root.root().to_string(),
+            current,
+        }
+    }
+
     /// Authority to bound the rendering of an ALREADY complete leased result.
     ///
     /// The SEAL is real and type-level: `OutputCoverage::Truncated` carries an
@@ -694,6 +720,164 @@ impl SourceSelectionReceipt {
     pub fn physical_root(&self) -> &str {
         &self.physical_root
     }
+}
+
+// ── Claim contexts: the one coherent acquisition ───────────────────────────
+
+/// A strict lease on one project's `Current` generation, minted through an
+/// [`ObservationLease`]. Sealed: holding one is the proof that a `Current`
+/// was captured for the query, and a generation-structured operation can
+/// never substitute a retained non-Current generation for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentQueryLease {
+    generation: GenerationIdentity,
+}
+
+impl CurrentQueryLease {
+    pub fn generation(&self) -> GenerationIdentity {
+        self.generation
+    }
+}
+
+/// One input to a claim context, captured THROUGH a lease at build time.
+/// Sealed: [`ObservationLease::context_input`] is the only constructor, so an
+/// input cannot claim a root nothing held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimContextInput {
+    project_source: String,
+    repository_id: String,
+    /// The root the constructing lease held at capture time. Revalidated by
+    /// [`acquire_claim_context`]; retained unchanged afterwards.
+    root: String,
+    current: Option<CurrentQueryLease>,
+}
+
+impl ClaimContextInput {
+    pub fn project_source(&self) -> &str {
+        &self.project_source
+    }
+
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn current(&self) -> Option<&CurrentQueryLease> {
+        self.current.as_ref()
+    }
+}
+
+/// The relationships one operation's context may contain, derived from the
+/// closed [`OperationKind`] table and from nothing else — a new operation
+/// cannot acquire a bespoke relationship vocabulary. Private fields: the table
+/// is closed, not configurable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationRelationshipContract {
+    cross_source_permitted: bool,
+    requires_current: bool,
+}
+
+impl OperationRelationshipContract {
+    /// The one table. Search operations query across project sources and
+    /// require a `Current` lease per input; runtime lifecycle operations act
+    /// on exactly one source and derive no generation-structured claims.
+    pub fn for_operation(kind: OperationKind) -> Self {
+        let search = matches!(
+            kind,
+            OperationKind::SearchSymbols | OperationKind::SearchText
+        );
+        Self {
+            cross_source_permitted: search,
+            requires_current: search,
+        }
+    }
+
+    pub fn cross_source_permitted(&self) -> bool {
+        self.cross_source_permitted
+    }
+
+    pub fn requires_current(&self) -> bool {
+        self.requires_current
+    }
+}
+
+/// One coherent acquisition: the operation, every input it captured, and the
+/// relationships the closed contract permits between them. Once returned, the
+/// context is RETAINED EVIDENCE — a later rebind does not trigger a trailing
+/// live-state check, and claims derived wholly from its inputs remain valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimContext {
+    operation: OperationReceipt,
+    inputs: Vec<ClaimContextInput>,
+    permitted_relationships: OperationRelationshipContract,
+}
+
+impl ClaimContext {
+    pub fn operation(&self) -> OperationReceipt {
+        self.operation
+    }
+
+    /// Never empty: [`acquire_claim_context`] refuses an empty acquisition, so
+    /// the guard is in the constructor rather than in a NonEmptyVec type
+    /// spelled by the data model — recorded in D10.
+    pub fn inputs(&self) -> &[ClaimContextInput] {
+        &self.inputs
+    }
+
+    pub fn permitted_relationships(&self) -> OperationRelationshipContract {
+        self.permitted_relationships
+    }
+}
+
+/// The one acquisition entry point, spelled as a free function by
+/// `data-model.md` line 1845.
+///
+/// Refusals, in order: an empty acquisition proves nothing; a root drift
+/// between input acquisitions is a REBIND, and rebinds refuse rather than
+/// composing roots — unless the closed contract explicitly permits a
+/// cross-source relation for this operation; and a generation-structured
+/// operation requires a `Current` lease on every input, never a retained
+/// substitute.
+pub fn acquire_claim_context(
+    operation: OperationReceipt,
+    inputs: Vec<ClaimContextInput>,
+) -> Result<ClaimContext, SourceRefusal> {
+    if inputs.is_empty() {
+        return Err(SourceRefusal::new(
+            SourceRefusalKind::InvalidSelection,
+            operation,
+            RetryAdvice::Never,
+            None,
+        ));
+    }
+    let contract = OperationRelationshipContract::for_operation(operation.operation_kind());
+    if !contract.cross_source_permitted() {
+        let first_root = inputs[0].root();
+        if inputs.iter().any(|input| input.root() != first_root) {
+            return Err(SourceRefusal::new(
+                SourceRefusalKind::SourceUnavailable,
+                operation,
+                RetryAdvice::Operator,
+                None,
+            ));
+        }
+    }
+    if contract.requires_current() && inputs.iter().any(|input| input.current().is_none()) {
+        return Err(SourceRefusal::new(
+            SourceRefusalKind::AdmissionUnavailable,
+            operation,
+            RetryAdvice::OnEvent,
+            None,
+        ));
+    }
+    Ok(ClaimContext {
+        operation,
+        inputs,
+        permitted_relationships: contract,
+    })
 }
 
 // ── Atomic authority ───────────────────────────────────────────────────────

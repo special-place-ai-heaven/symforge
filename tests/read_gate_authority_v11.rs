@@ -290,6 +290,80 @@ fn a_failed_observation_refuses_without_disturbing_the_current_generation() {
     );
 }
 
+// ── Context acquisition: rebinds refuse rather than composing roots ────────
+
+#[test]
+fn a_rebind_between_input_acquisitions_is_refused() {
+    use symforge::protocol::format::claim_provenance::acquire_claim_context;
+
+    // Two inputs captured under two different roots is what a rebind between
+    // acquisitions looks like from the context's side. CloseSource acts on
+    // exactly one source, so the closed contract permits no cross-source
+    // relation and the acquisition must refuse rather than compose.
+    let before = a_binding_on("root-a");
+    let after = a_binding_on("root-b");
+    let refusal = acquire_claim_context(
+        OperationReceipt::for_test(OperationKind::CloseSource),
+        vec![
+            before.context_input("project-a", "repo-1", None),
+            after.context_input("project-a", "repo-1", None),
+        ],
+    )
+    .expect_err("a root drift between acquisitions is a rebind and must refuse");
+
+    assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
+}
+
+#[test]
+fn a_cross_source_search_admits_two_roots_deliberately() {
+    use symforge::protocol::format::claim_provenance::acquire_claim_context;
+
+    // GREEN-CONTROL for the rebind refusal: search is the closed contract's
+    // explicit cross-source relation, so two roots compose HERE and only here.
+    let left = a_binding_on("root-a");
+    let right = a_binding_on("root-b");
+    let context = acquire_claim_context(
+        OperationReceipt::for_test(OperationKind::SearchText),
+        vec![
+            left.context_input(
+                "project-a",
+                "repo-1",
+                Some(left.current_query_lease().expect("lease")),
+            ),
+            right.context_input(
+                "project-b",
+                "repo-2",
+                Some(right.current_query_lease().expect("lease")),
+            ),
+        ],
+    )
+    .expect("the contract explicitly permits a cross-source search");
+
+    assert!(context.permitted_relationships().cross_source_permitted());
+    assert_eq!(context.inputs().len(), 2);
+}
+
+#[test]
+fn a_returned_context_retains_what_it_captured() {
+    use symforge::protocol::format::claim_provenance::acquire_claim_context;
+
+    // "A rebind after the complete context is returned does not trigger a
+    // trailing live-state check; claims derived wholly from its retained
+    // authorities remain valid." The retained half is falsifiable today: the
+    // context reports exactly the roots and sources captured at acquisition.
+    let lease = a_binding_on("root-a");
+    let context = acquire_claim_context(
+        OperationReceipt::for_test(OperationKind::CloseSource),
+        vec![lease.context_input("project-a", "repo-1", None)],
+    )
+    .expect("one source, one root");
+
+    let input = &context.inputs()[0];
+    assert_eq!(input.root(), "root-a");
+    assert_eq!(input.project_source(), "project-a");
+    assert_eq!(input.repository_id(), "repo-1");
+}
+
 // ── The one authority that MAY prove global absence ────────────────────────
 
 #[test]

@@ -337,6 +337,45 @@ fn a_selected_aggregate_refuses_a_foreign_root_authority() {
     assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
 }
 
+// ── Claim contexts: acquisition through the closed contract ────────────────
+
+#[test]
+fn a_context_refuses_an_empty_acquisition() {
+    use symforge::protocol::format::claim_provenance::acquire_claim_context;
+
+    let refusal = acquire_claim_context(an_operation(OperationKind::SearchText), Vec::new())
+        .expect_err("a context with no inputs proves nothing and must refuse");
+
+    assert_eq!(refusal.kind(), SourceRefusalKind::InvalidSelection);
+}
+
+#[test]
+fn a_generation_structured_operation_requires_a_current_lease_per_input() {
+    use symforge::protocol::format::claim_provenance::acquire_claim_context;
+
+    let lease = a_lease("root-a");
+
+    // Without the lease: refused, and the advice names the event that fixes it.
+    let bare = lease.context_input("project-a", "repo-1", None);
+    let refusal =
+        acquire_claim_context(an_operation(OperationKind::SearchText), vec![bare.clone()])
+            .expect_err("a search without a Current lease must refuse");
+    assert_eq!(refusal.kind(), SourceRefusalKind::AdmissionUnavailable);
+
+    // GREEN-CONTROL: with the lease, the same acquisition is admitted, so the
+    // refusal above is about the MISSING lease and not about search contexts.
+    let current = lease.current_query_lease().expect("current lease");
+    let held = lease.context_input("project-a", "repo-1", Some(current));
+    let context = acquire_claim_context(an_operation(OperationKind::SearchText), vec![held])
+        .expect("a search with a Current lease per input is admitted");
+    assert_eq!(context.inputs().len(), 1);
+
+    // A NON-generation-structured operation may omit the lease entirely.
+    let observation = acquire_claim_context(an_operation(OperationKind::RefreshSource), vec![bare])
+        .expect("a pure lifecycle operation omits Current");
+    assert!(!observation.permitted_relationships().requires_current());
+}
+
 // ── The OperationContractV1 Cartesian ──────────────────────────────────────
 
 /// The name is pinned by the frozen traceability catalog:
