@@ -150,7 +150,24 @@ def main() -> int:
     # The attestation pins the manifest, so it can only be repinned once the
     # manifest itself is committed. Reporting that rather than writing a hash
     # for a manifest state that is not in the tree yet.
+    # The attestation carries its own copy of the manifest's bindings and the
+    # verifier requires them to be equal, so a regenerated amendment set digest
+    # has to reach both documents.
     attestation_path = root / manifest["detached_attestation_path"]
+    attestation_raw = attestation_path.read_text(encoding="utf-8")
+    for field in ("amendment_set_id",):
+        expected = committed[field]
+        current = re.search(
+            rf'"{field}":\s*"([0-9a-f]{{64}})"', attestation_raw
+        )
+        if current is not None and current.group(1) != expected:
+            print(f"\n  attestation {field}\n    {current.group(1)}\n -> {expected}")
+            if arguments.write:
+                attestation_raw = attestation_raw.replace(current.group(1), expected, 1)
+                attestation_path.write_text(attestation_raw, encoding="utf-8", newline="")
+                print("Rewrote it. Commit, then run this again for the manifest pin.")
+                return 0
+
     committed_manifest = blob(root, "HEAD", str(MANIFEST).replace("\\", "/"))
     if committed_manifest is None:
         print("The manifest is not committed at HEAD.", file=sys.stderr)
