@@ -11,10 +11,12 @@ This refreeze supersedes the V10 publication/readiness semantics wherever they
 conflict with the rules below. Historical review receipts remain evidence of the
 work performed, but they do not authorize a V11 implementation.
 
-1. `Current` is the only generation-queryable source state. `Loading` retains no
-   generation; `Refreshing` retains exactly one verified generation, while `Blocked`
-   and `Stopping` may retain zero or one. Any retained `VerifiedGeneration` is
-   immutable recovery evidence and never a public degraded or last-valid query lane.
+1. Only a COMPLETE verified generation is queryable (A20). `Current` is queryable,
+   and so is the single generation `Refreshing` retains, because that generation was
+   `Current` immediately before the refresh began and is complete. `Loading` retains
+   no generation. `Blocked` and `Stopping` may retain zero or one, and those are
+   immutable recovery evidence only, never a query lane. No state exposes a partial,
+   degraded, or candidate artifact.
 2. Cold placeholders, snapshot seeds, candidates, capacity-refused attempts, and
    failed observations cannot mint query authority. They expose a closed
    `SourceRefusal` with safe diagnostics until one complete generation promotes.
