@@ -6911,6 +6911,11 @@ impl SymForgeServer {
     fn runtime_status_for(
         &self,
         published: &crate::live_index::PublishedIndexState,
+        // T046: the caller says which project-generation it is reporting —
+        // the health pair passes its captured bundle's value so the report
+        // cannot pair a newer counter with an older publication; callers
+        // without a capture pass the atomic EXPLICITLY, named at the site.
+        project_generation: u64,
         mode: format::RuntimeMode,
         project_id: Option<String>,
         session_id: Option<String>,
@@ -6932,7 +6937,7 @@ impl SymForgeServer {
             project_id,
             session_id,
             index_generation: published.generation,
-            project_generation: self.index.current_project_generation(),
+            project_generation,
             reset_project_generation: self.index.current_reset_project_generation(),
             load_source: published.load_source,
         }
@@ -7006,8 +7011,14 @@ impl SymForgeServer {
         // report is served through a daemon session (membership authority
         // applies); local in-process reports carry `None`.
         let session_is_daemon = session_id.is_some();
-        let runtime_status =
-            self.runtime_status_for(&published, mode, project_id, session_id, project_root);
+        let runtime_status = self.runtime_status_for(
+            &published,
+            generation.project_generation,
+            mode,
+            project_id,
+            session_id,
+            project_root,
+        );
         let watcher_guard = self.watcher_info.lock();
         let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
         let mut result = format::health_report_from_published_state_windowed(
@@ -7186,8 +7197,14 @@ impl SymForgeServer {
         let generation = source_set.current_generation();
         let published = Arc::clone(&generation.health);
         let session_is_daemon = session_id.is_some();
-        let runtime_status =
-            self.runtime_status_for(&published, mode, project_id, session_id, project_root);
+        let runtime_status = self.runtime_status_for(
+            &published,
+            generation.project_generation,
+            mode,
+            project_id,
+            session_id,
+            project_root,
+        );
         let watcher_guard = self.watcher_info.lock();
         let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
         let mut result = format::health_report_compact_from_published_state(
@@ -7938,6 +7955,7 @@ impl SymForgeServer {
                     ));
                     let runtime_status = self.runtime_status_for(
                         &published,
+                        self.index.current_project_generation(),
                         self.local_runtime_mode(),
                         None,
                         None,
@@ -11756,8 +11774,14 @@ impl SymForgeServer {
     /// stale or wrong binding is LOUD in every facade response, never silent.
     fn stel_bound_root_line(&self) -> String {
         let published = self.index.published_state();
-        let status =
-            self.runtime_status_for(&published, self.local_runtime_mode(), None, None, None);
+        let status = self.runtime_status_for(
+            &published,
+            self.index.current_project_generation(),
+            self.local_runtime_mode(),
+            None,
+            None,
+            None,
+        );
         format!(
             "project_root: {}",
             status.project_root.as_deref().unwrap_or("(unbound)")

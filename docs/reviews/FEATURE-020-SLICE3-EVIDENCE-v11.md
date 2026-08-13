@@ -43,8 +43,9 @@ activation surface, not to T045's task-text word "structured".
 
 Gates on the batch-two tree: lib suite 3166 passed 0 failed including the new
 envelope oracle; clippy all targets denied warnings clean; embed 1332 passed
-0 failed; fmt clean. The checker still reports the expected `writers`-only
-mismatch; the single regeneration waits for PR 2's end.
+0 failed; fmt clean. At the time batch two landed, the checker reported the
+expected `writers`-only mismatch; the regeneration has since HAPPENED — the
+T046 section's before/after table is the truth, and the pins are clean.
 
 ## T046 — per-caller single capture, and the one regeneration (PR 2)
 
@@ -58,7 +59,10 @@ each → one), daemon `project_health` (freshness now describes the same
 publication as the counts beside it), the daemon call-evidence block and
 `local_project_evidence` (generation number, load_source, counts, and state
 all off `current_generation()`; the atomic counter is no longer a side
-channel), `search_symbols`, `search_text` (handler + renderer share the
+channel — including `runtime_status_for`, whose reported project-generation
+is now a caller-supplied parameter: the health pair passes its captured
+bundle's value, and the two capture-less callers pass the atomic EXPLICITLY,
+named at the site), `search_symbols`, `search_text` (handler + renderer share the
 caller's capture through a new parameter), `search_files` (13 loads → 1),
 `find_references` (11 → 1), `append_impact_footer`, `edit_plan`, and
 `analyze_file_impact`, whose capture is taken BEFORE the sidecar await so the
@@ -97,7 +101,7 @@ The checker's own second-order pin (`FROZEN_DIGESTS.retirement_records`) was
 regenerated through its emit opt-in the same way: old `4c118fab…76a6fb`, new
 `313dceda…9c21bf`. Checker reports OK after both.
 
-## T044 — the authority choice is explicit (PR 2)## T044 — the authority choice is explicit (PR 2)
+## T044 — the authority choice is explicit (PR 2)
 
 Observed RED first: both oracles failed `E0432` naming exactly the three new
 seam items and nothing else. Then the seam, in `src/protocol/read_gate.rs`,
