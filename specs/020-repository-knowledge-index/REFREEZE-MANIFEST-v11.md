@@ -836,7 +836,6 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
         "T027",
         "T060"
       ],
-      "rationale": "The pre-amendment reading made a reindex take the project offline. Production has always served the previous complete generation while a reload builds, and test_same_project_reads_prior_generation_during_reload (daemon.rs) pins it green. Wiring index_folder to the reload transition under the pre-amendment reading would have regressed that at Slice 4 activation. The invariant V11 exists to protect is that no partial or candidate state is ever served; recency was never the property under protection, and conflating the two bought no safety while costing availability.",
       "regression_ids": [
         "F020-V11-R20A",
         "F020-V11-R20B"
@@ -844,31 +843,29 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "replaced": [
         {
           "clause_id": "F020-V11-A20-BASE-01",
-          "end_line": 1542,
-          "path": "specs/020-repository-knowledge-index/data-model.md",
-          "sha256": "acf421dfb6d6ca3354a25b097eecf82b4f275a9799f48bc3509dfb61b8e34371",
-          "source": "baseline",
-          "start_line": 1539
-        },
-        {
-          "clause_id": "F020-V11-A20-BASE-02",
-          "end_line": 17,
+          "end_line": 222,
           "path": "specs/020-repository-knowledge-index/spec.md",
-          "sha256": "f13a86c55a2414ba22b2897747df97e694e534ae7128fc6e3338b84636e9a48a",
+          "sha256": "9cd94ccd85bc2d911e27fb1374c69b21dc3256cbe3ae227b67a89d1e3b6cc90f",
           "source": "baseline",
-          "start_line": 14
+          "start_line": 221
         }
       ],
       "replacements": [
         {
-          "clause_id": "F020-V11-A20-NEW-01",
-          "path": "specs/020-repository-knowledge-index/data-model.md",
-          "summary": "Strict queryability is closed on COMPLETENESS, not recency. The single generation a Refreshing source retains remains queryable while a candidate builds, because it was Current immediately before the refresh and is complete. Blocked and Stopping retentions stay non-queryable: neither has a successor in flight, so the retention is a remnant rather than a refresh. Candidates, snapshot seeds and partially built artifacts remain non-queryable from every state."
+          "clause_id": "F020-V11-A20-TARGET-01",
+          "end_line": 19,
+          "path": "specs/020-repository-knowledge-index/spec.md",
+          "sha256": "8bf2b294c64e5602898a160fc5c1d23cded167bbd40629235d1ebe48fe0de966",
+          "source": "target",
+          "start_line": 14
         },
         {
-          "clause_id": "F020-V11-A20-NEW-02",
-          "path": "specs/020-repository-knowledge-index/spec.md",
-          "summary": "Only a complete verified generation is queryable. Current is queryable and so is the single generation Refreshing retains. Loading retains none. Blocked and Stopping retentions are immutable recovery evidence only."
+          "clause_id": "F020-V11-A20-TARGET-02",
+          "end_line": 1548,
+          "path": "specs/020-repository-knowledge-index/data-model.md",
+          "sha256": "080e162bdefae8b73326c84c6315a02b20e54e9ed301a8bb8088265ccd49b6f4",
+          "source": "target",
+          "start_line": 1539
         }
       ],
       "requirement_ids": [
