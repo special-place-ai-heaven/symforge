@@ -8413,7 +8413,7 @@ impl SymForgeServer {
                     .unwrap_or_default();
 
                 let base_content = repo
-                    .file_at_ref(seed_base_ref, path)
+                    .file_at_ref(seed_base_ref, path) // D8/PR2-ungated-git-read
                     .unwrap_or_default()
                     .unwrap_or_default();
                 // Gated: a refusal collapses to "no current content", which
@@ -31222,29 +31222,168 @@ mod tests {
         );
     }
 
-    /// GREEN-GUARD (FU-1). The structural half of the same property: no
-    /// protocol lane may reach the UNGATED working-tree read directly.
+    /// RED (D1). The working-tree read in `diff_symbols` is gated; the two
+    /// GIT-OBJECT reads beside it, in the same loop body, are not. In
+    /// committed-vs-committed mode BOTH sides come from `file_at_ref`, so the
+    /// admission gate is never consulted and a security-demoted file's symbol
+    /// names render straight into the diff.
     ///
-    /// Behavioural tests only cover the three lanes that exist today; this
-    /// fails the moment a FOURTH one is written, which is how the original
-    /// three came to share an ungated read in the first place.
+    /// `diff_symbols_result_view`'s own doc says `live` is needed "because
+    /// uncommitted mode reads the WORKING TREE, which is a disclosure lane".
+    /// That is true and incomplete: it scopes the hazard to one of three reads.
+    ///
+    /// The fixture demotes by PATH rule (`*.key` ->
+    /// `path.private-key-material`) because that is deterministic and needs no
+    /// content detector. The property under test is which AUTHORITY the lane
+    /// consults, not how likely a given filename is.
     #[test]
-    fn no_protocol_lane_reads_the_working_tree_ungated() {
+    fn committed_diff_does_not_disclose_symbols_of_a_demoted_file() {
+        let canary = runtime_canary();
+        let dir = init_git_repo();
+        let demoted = dir.path().join("deploy.key");
+        let admitted = dir.path().join("src.rs");
+
+        std::fs::write(
+            &demoted,
+            format!("function rotateMasterCredential() {{}}\n// {canary}\n"),
+        )
+        .expect("write demoted fixture");
+        std::fs::write(&admitted, "pub fn anchor() {}\n").expect("write admitted fixture");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "base"]);
+
+        // Both files gain a symbol, so both have something to disclose.
+        std::fs::write(
+            &demoted,
+            format!(
+                "function rotateMasterCredential() {{}}\nfunction issueDeployToken() {{}}\n// {canary}\n"
+            ),
+        )
+        .expect("rewrite demoted fixture");
+        std::fs::write(&admitted, "pub fn anchor() {}\npub fn added_anchor() {}\n")
+            .expect("rewrite admitted fixture");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "changes"]);
+
+        let shared = crate::live_index::LiveIndex::load(dir.path()).expect("load index");
+        let live = shared.read();
+        let repo = crate::git::GitRepo::open(dir.path()).expect("open git repo");
+
+        // Anti-vacuity: the gate really does refuse this path, so an absent
+        // symbol below is the gate acting rather than a fixture that never
+        // produced one.
+        assert!(
+            crate::protocol::read_gate::admit_disk_read(&live, "deploy.key", &demoted).is_err(),
+            "control: the admission gate must refuse deploy.key"
+        );
+
+        let result = super::format::diff_symbols_result_view(
+            "HEAD~1",
+            "HEAD",
+            &["deploy.key", "src.rs"],
+            &repo,
+            &live,
+            false,
+            false,
+        );
+
+        // GREEN-CONTROL: an admitted file is still diffed, so a passing test
+        // cannot be bought by refusing to render diffs at all.
+        assert!(
+            result.contains("added_anchor"),
+            "GREEN-CONTROL: an admitted file must still render its symbols, got {}",
+            refusal_shape(&result)
+        );
+
+        // The disclosure itself: symbol names read out of git objects.
+        assert!(
+            !result.contains("issueDeployToken"),
+            "a demoted file's symbol names must not be disclosed from git objects, got {}",
+            refusal_shape(&result)
+        );
+        assert!(
+            !result.contains("rotateMasterCredential"),
+            "a demoted file's existing symbols must not be disclosed either, got {}",
+            refusal_shape(&result)
+        );
+        assert!(
+            !result.contains(canary.as_str()),
+            "the diff must not echo withheld content"
+        );
+        assert!(
+            result.contains(WITHHELD_REFUSAL_PREFIX),
+            "the demoted file must be reported as withheld rather than silently skipped, got {}",
+            refusal_shape(&result)
+        );
+    }
+
+    /// GREEN-GUARD (FU-1, D2). The structural half of the same property: no
+    /// protocol lane may reach repository CONTENT through an ungated read.
+    ///
+    /// Behavioural tests only cover the lanes that exist today; this fails the
+    /// moment a new one is written, which is how the original three came to
+    /// share an ungated read in the first place.
+    ///
+    /// Two blind spots let D1 through and are closed here. The scan matched
+    /// only the working-tree read, so `file_at_ref` — a git-object read of the
+    /// same repository content — walked past it; and `read_dir` was not
+    /// recursive while its `.rs` check skipped directory entries, so
+    /// `src/protocol/format/` and `src/protocol/tools/` were never scanned at
+    /// all.
+    ///
+    /// The needle is the UNGATED call. A lane that wants repository bytes goes
+    /// through `read_gate`, which owns the fetch and classifies what it holds;
+    /// "call `file_at_ref` and classify afterwards" is indistinguishable from
+    /// the defect and is therefore not allowed.
+    #[test]
+    fn no_protocol_lane_reads_repository_content_ungated() {
         // Assembled at runtime so this scan does not match its OWN source, the
         // way the repository-wide detector tripwire avoids the same trap.
-        let needle = [".file_from_", "workdir("].concat();
+        let needles = [
+            [".file_from_", "workdir("].concat(),
+            [".file_at_", "ref("].concat(),
+        ];
+        // read_gate owns both fetches; it is the gate, not a bypass of it.
+        let gate_owner = ["read_", "gate.rs"].concat();
+        // D8/PR2: detect_impact still reaches git objects directly. It is
+        // production `tools.rs`, so fixing it regenerates the `writers`
+        // retirement-census digest and belongs with that batch. Allowlisted by
+        // an exact SENTINEL on the offending line — not by file and not by
+        // function, so a SECOND ungated read in the same function still fails.
+        // PR 2 deletes the sentinel and the call together.
+        let sentinel = ["D8", "/PR2-ungated-git-read"].concat();
         let protocol = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol");
+
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0usize;
-        for entry in fs::read_dir(&protocol).expect("read src/protocol") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = fs::read_to_string(&path).expect("read protocol source");
-            scanned += 1;
-            for (number, line) in text.lines().enumerate() {
-                if line.contains(needle.as_str()) {
+        let mut allowlisted = 0usize;
+        let mut stack = vec![protocol];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read protocol dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = fs::read_to_string(&path).expect("read protocol source");
+                scanned += 1;
+                let is_gate = path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy() == gate_owner);
+                if is_gate {
+                    continue;
+                }
+                for (number, line) in text.lines().enumerate() {
+                    if !needles.iter().any(|needle| line.contains(needle.as_str())) {
+                        continue;
+                    }
+                    if line.contains(sentinel.as_str()) {
+                        allowlisted += 1;
+                        continue;
+                    }
                     offenders.push(format!(
                         "{}:{}",
                         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -31253,10 +31392,20 @@ mod tests {
                 }
             }
         }
+
         assert!(scanned > 0, "control: the scan must actually read sources");
         assert!(
+            scanned > 20,
+            "control: the scan must recurse into protocol subdirectories, only saw {scanned} files"
+        );
+        assert_eq!(
+            allowlisted, 1,
+            "exactly one ungated read is allowlisted (D8/PR2 detect_impact); \
+             a changed count means the sentinel was added or removed without updating this guard"
+        );
+        assert!(
             offenders.is_empty(),
-            "these protocol lanes bypass the working-tree gate: {offenders:?}"
+            "these protocol lanes bypass the content gate: {offenders:?}"
         );
     }
 
