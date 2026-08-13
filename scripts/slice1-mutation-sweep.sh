@@ -33,15 +33,12 @@ MUTATIONS=(
   "permit-terminality|$MUTATION|if matches!(self.state, PermitState::Terminal(_)) {|if false {|a terminal permit refuses a second termination"
   "drop-drains|$MUTATION|self.drain.record(Termination::Drained);||a dropped permit reports Drained"
   "lease-revoked|$PHYSICAL|if !self.is_live() {|if false {|a revoked lease resolves nothing"
-  # Reviewer grok-4-5 is right that this proves less than the others: it reverts
-  # the RECEIPT LABEL, so what it demonstrates is that the receipt's recorded
-  # order is load-bearing -- not that the underlying write/rename order is. A
-  # build that renamed first while pushing the labels in order would stay green
-  # here. Closing that needs an oracle able to observe the target mid-flight,
-  # which needs a seam this slice does not have; it is recorded as an open limit
-  # in the evidence document rather than papered over with a mutation whose
-  # effect no test can see. The label is described as what it is.
-  "temp-first-label|$PHYSICAL|steps.push(ReplacementStep::TempCreated);|steps.push(ReplacementStep::Replaced);|the receipt's recorded temp-before-replace order is load-bearing"
+  # Now mutates the ACTUAL I/O, not the receipt label. grok-4-5 showed the label
+  # version proved only that the receipt records what the receipt records. The
+  # staged-replacement API made the ordering observable on disk, so this reverts
+  # it for real: truncate the target while staging, which is precisely the defect
+  # temp-before-replace prevents.
+  "temp-before-replace|$PHYSICAL|let mut temp_path = PathBuf::new();|let _ = std::fs::write(target.path(), b\"\"); let mut temp_path = PathBuf::new();|the target keeps its preimage until the replacement is committed"
   "epoch-monotonic|$AUTHORITY|self.mutation_epoch = self.mutation_epoch.advanced();|let _ = self.mutation_epoch.advanced();|the mutation epoch is monotonic across freeze"
   "proof-names-stored|$AUTHORITY|.expect(\"a Current source always has a publication to freeze\")|.and(Some(PublicationIdentity::fresh())).expect(\"mutated\")|the non-Current proof names the stored publication"
   # The two defects three independent reviews found. Both were live while every

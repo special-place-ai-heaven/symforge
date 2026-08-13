@@ -21,12 +21,26 @@ use symforge::live_index::index_lifecycle::physical_root::PhysicalRootLease;
 use symforge::live_index::index_lifecycle::transition::{self, TransitionKind, TransitionStep};
 
 /// A source that is `Current` on a fresh root, plus the lease that root is on.
-fn current_source() -> (SourceRuntime, Arc<PhysicalRootLease>, PublicationIdentity) {
-    let lease = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+///
+/// The root is a per-test `TempDir`, not the machine's shared temp directory.
+/// Two of these tests write real files through a permit, and leasing the shared
+/// root meant those files were never cleaned up and, on a multi-user machine, a
+/// probe owned by someone else would make the rename fail — turning a property
+/// failure into an environment failure and telling us nothing about the code.
+/// The `TempDir` is returned so the caller keeps it alive; dropping it early
+/// would delete the root out from under the lease.
+fn current_source() -> (
+    SourceRuntime,
+    Arc<PhysicalRootLease>,
+    PublicationIdentity,
+    tempfile::TempDir,
+) {
+    let root = tempfile::tempdir().expect("per-test root");
+    let lease = Arc::new(PhysicalRootLease::take(root.path()));
     let binding = BindingAuthority::bind(lease.identity());
     let publication = CurrentPublication::promote(binding, ObserverToken::fresh());
     let identity = publication.publication();
-    (SourceRuntime::current(publication), lease, identity)
+    (SourceRuntime::current(publication), lease, identity, root)
 }
 
 /// TEST-MUTATION-AUTHORITY (T022). The name is pinned by
@@ -38,7 +52,7 @@ fn current_source() -> (SourceRuntime, Arc<PhysicalRootLease>, PublicationIdenti
 /// mutation the source never authorized.
 #[test]
 fn mutation_authority_is_exact_and_terminal() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
 
     // Exact: the authority names this publication, generation, binding and
     // epoch as one whole.
@@ -95,7 +109,7 @@ fn mutation_authority_is_exact_and_terminal() {
 /// under root B.
 #[test]
 fn a_permit_cannot_commit_a_write_that_landed_under_another_root() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let elsewhere = tempfile::tempdir().expect("other root");
     let lease_b = PhysicalRootLease::take(elsewhere.path());
 
@@ -146,7 +160,7 @@ fn a_permit_cannot_commit_a_write_that_landed_under_another_root() {
 /// the check entirely and install over a live permit.
 #[test]
 fn a_transition_cannot_skip_drain() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -159,7 +173,7 @@ fn a_transition_cannot_skip_drain() {
     assert!(!drain.has_ended());
     let phase_before = runtime.phase();
     let epoch_before = runtime.mutation_epoch();
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
     assert_eq!(
         transition::apply(
             &mut runtime,
@@ -199,7 +213,7 @@ fn a_transition_cannot_skip_drain() {
 /// still-busy source look drained.
 #[test]
 fn a_source_tracks_every_outstanding_permit_and_retires_each_once() {
-    let (mut runtime, _lease, live) = current_source();
+    let (mut runtime, _lease, live, _root) = current_source();
     runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -240,7 +254,7 @@ fn a_source_tracks_every_outstanding_permit_and_retires_each_once() {
 /// and install over a permit that is still acting.
 #[test]
 fn re_freezing_does_not_forget_an_outstanding_permit() {
-    let (mut runtime, _lease, live) = current_source();
+    let (mut runtime, _lease, live, _root) = current_source();
     runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -263,7 +277,7 @@ fn re_freezing_does_not_forget_an_outstanding_permit() {
 /// Every phase except `Stopping` reports the binding it is actually on.
 #[test]
 fn only_a_stopping_source_has_surrendered_its_binding() {
-    let lease = PhysicalRootLease::take(std::env::temp_dir());
+    let lease = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep());
     let binding = BindingAuthority::bind(lease.identity());
 
     let loading = SourceRuntime::loading(binding.clone());
@@ -345,7 +359,7 @@ fn replace_beneath_temp(
 
 #[test]
 fn grant_requires_the_exact_live_current_publication() {
-    let (mut runtime, _lease, live) = current_source();
+    let (mut runtime, _lease, live, _root) = current_source();
 
     // Negative: a publication identity that was never live is refused.
     let stranger = PublicationIdentity::fresh();
@@ -388,20 +402,20 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
         (
             PhaseName::Loading,
             SourceRuntime::loading(BindingAuthority::bind(
-                PhysicalRootLease::take(std::env::temp_dir()).identity(),
+                PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
             )),
         ),
         (
             PhaseName::Refreshing,
             SourceRuntime::refreshing(
-                BindingAuthority::bind(PhysicalRootLease::take(std::env::temp_dir()).identity()),
+                BindingAuthority::bind(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()),
                 GenerationIdentity::fresh(),
             ),
         ),
         (
             PhaseName::Blocked,
             SourceRuntime::blocked(
-                BindingAuthority::bind(PhysicalRootLease::take(std::env::temp_dir()).identity()),
+                BindingAuthority::bind(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()),
                 Some(GenerationIdentity::fresh()),
             ),
         ),
@@ -428,7 +442,7 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
 
     // Non-Current *provenances* refuse even while the source is genuinely
     // Current, so the refusal is about what was presented, not about the phase.
-    let lease = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
     let binding = BindingAuthority::bind(lease.identity());
     let candidate = CandidateAuthority::open(binding.clone(), ObserverToken::fresh());
 
@@ -480,13 +494,13 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
 fn strict_queryability_is_closed_over_retained_generations() {
     // Loading retains nothing; only Current is queryable.
     let loading = SourceRuntime::loading(BindingAuthority::bind(
-        PhysicalRootLease::take(std::env::temp_dir()).identity(),
+        PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
     ));
     assert_eq!(loading.retained_generation(), None);
     assert_eq!(loading.live_publication(), None);
 
     // Refreshing retains exactly one, and it is not queryable.
-    let lease = PhysicalRootLease::take(std::env::temp_dir());
+    let lease = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep());
     let binding = BindingAuthority::bind(lease.identity());
     let retained = GenerationIdentity::fresh();
     let refreshing = SourceRuntime::refreshing(binding.clone(), retained);
@@ -501,7 +515,7 @@ fn strict_queryability_is_closed_over_retained_generations() {
     // Blocked and Stopping may retain zero or one.
     assert_eq!(
         SourceRuntime::blocked(
-            BindingAuthority::bind(PhysicalRootLease::take(std::env::temp_dir()).identity()),
+            BindingAuthority::bind(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity()),
             None
         )
         .retained_generation(),
@@ -520,7 +534,7 @@ fn strict_queryability_is_closed_over_retained_generations() {
 
 #[test]
 fn granting_publishes_non_current_before_the_permit_exists() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
 
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
@@ -557,8 +571,8 @@ fn granting_publishes_non_current_before_the_permit_exists() {
 
 #[test]
 fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
-    let (mut runtime, lease_a, live) = current_source();
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let (mut runtime, lease_a, live, _root) = current_source();
+    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
 
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
@@ -575,7 +589,7 @@ fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
 
     // Positive: the same shape with the matching lease succeeds, so the refusal
     // above is validating the pairing rather than refusing all pairings.
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -590,7 +604,7 @@ fn a_grant_cannot_be_paired_with_a_lease_on_another_root() {
 
 #[test]
 fn a_permit_is_terminal_once_it_ends() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -623,7 +637,7 @@ fn a_permit_is_terminal_once_it_ends() {
 
 #[test]
 fn dropping_a_permit_reports_drained_rather_than_stranding_the_source() {
-    let (mut runtime, lease, live) = current_source();
+    let (mut runtime, lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -639,7 +653,7 @@ fn dropping_a_permit_reports_drained_rather_than_stranding_the_source() {
 
 #[test]
 fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -656,7 +670,7 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
         .expect("permit terminates");
 
     // Install root B through the writer-validated transition.
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
     let receipt = transition::apply(
         &mut runtime,
         TransitionKind::PhysicalRootReplacement,
@@ -697,7 +711,7 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
 
 #[test]
 fn the_non_current_proof_names_the_publication_the_source_actually_stored() {
-    let (mut runtime, _lease, live) = current_source();
+    let (mut runtime, _lease, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -717,7 +731,7 @@ fn the_non_current_proof_names_the_publication_the_source_actually_stored() {
 
 #[test]
 fn the_mutation_epoch_never_rewinds_across_a_transition() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
 
     // Burn an epoch by granting and draining a permit.
     let grant = runtime
@@ -732,7 +746,7 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
     let permits_before = runtime.grants_issued();
     assert!(before.get() >= 1);
 
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
     transition::apply(
         &mut runtime,
         TransitionKind::Rebind,
@@ -760,7 +774,7 @@ fn the_mutation_epoch_never_rewinds_across_a_transition() {
 
 #[test]
 fn a_transition_refuses_to_install_over_a_live_permit() {
-    let (mut runtime, lease_a, live) = current_source();
+    let (mut runtime, lease_a, live, _root) = current_source();
     let grant = runtime
         .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
         .expect("live Current must grant");
@@ -769,7 +783,7 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
         .expect("grant must produce a permit");
 
     // Negative: the permit is outstanding, so Install must not happen.
-    let lease_b = Arc::new(PhysicalRootLease::take(std::env::temp_dir()));
+    let lease_b = Arc::new(PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()));
     let refusal = transition::apply(
         &mut runtime,
         TransitionKind::Rebind,

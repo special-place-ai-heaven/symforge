@@ -260,6 +260,23 @@ pub fn replace_beneath(
     relative: &Path,
     contents: &[u8],
 ) -> Result<WriteReceipt, RootRefusal> {
+    stage_replacement(lease, relative, contents)?.commit()
+}
+
+/// Stage a replacement without committing it.
+///
+/// Splitting the write in two is not a testing affordance bolted on: it makes
+/// the ordering OBSERVABLE. An oracle can stage, look at the filesystem, and see
+/// for itself that the temporary exists while the target still holds its
+/// original bytes -- which is the actual claim. Asserting on a receipt's own
+/// step list only ever proved that the receipt records what the receipt records;
+/// a build that renamed first while pushing the labels in order would have
+/// passed. Reviewer grok-4-5 found exactly that hole.
+pub fn stage_replacement(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    contents: &[u8],
+) -> Result<StagedReplacement, RootRefusal> {
     let target = lease.resolve_beneath(relative)?;
     lease.refuse_link(&target.path())?;
 
@@ -326,18 +343,67 @@ pub fn replace_beneath(
     }
     steps.push(ReplacementStep::TempCreated);
 
-    if let Err(error) = std::fs::rename(&temp_path, target.path()) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(RootRefusal::Unreadable {
-            path: target.path(),
-            message: error.to_string(),
-        });
-    }
-    steps.push(ReplacementStep::Replaced);
-
-    Ok(WriteReceipt {
-        steps,
+    Ok(StagedReplacement {
+        temp_path,
         target: target.path(),
         lease: lease.identity(),
+        steps,
     })
+}
+
+/// A replacement whose content is on disk but which has not replaced anything.
+///
+/// Dropping one without committing removes the temporary: an abandoned stage
+/// must not leave litter beneath the leased root.
+#[derive(Debug)]
+pub struct StagedReplacement {
+    temp_path: PathBuf,
+    target: PathBuf,
+    lease: PhysicalRootIdentity,
+    steps: Vec<ReplacementStep>,
+}
+
+impl StagedReplacement {
+    /// Where the staged content currently lives.
+    pub fn temp_path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    /// The path this will replace when committed.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Replace the target with the staged content.
+    pub fn commit(mut self) -> Result<WriteReceipt, RootRefusal> {
+        if let Err(error) = std::fs::rename(&self.temp_path, &self.target) {
+            let _ = std::fs::remove_file(&self.temp_path);
+            self.steps.clear();
+            return Err(RootRefusal::Unreadable {
+                path: self.target.clone(),
+                message: error.to_string(),
+            });
+        }
+        let receipt = WriteReceipt {
+            steps: {
+                let mut steps = std::mem::take(&mut self.steps);
+                steps.push(ReplacementStep::Replaced);
+                steps
+            },
+            target: self.target.clone(),
+            lease: self.lease,
+        };
+        // The temporary no longer exists under its old name; forget it so `Drop`
+        // does not try to remove the file we just renamed into place.
+        self.temp_path = PathBuf::new();
+        Ok(receipt)
+    }
+}
+
+impl Drop for StagedReplacement {
+    fn drop(&mut self) {
+        if !self.temp_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
 }

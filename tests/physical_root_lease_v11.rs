@@ -107,6 +107,79 @@ fn a_revoked_lease_resolves_nothing() {
     );
 }
 
+/// The ordering is observed ON DISK, not read off the receipt.
+///
+/// The previous oracle asserted that `WriteReceipt` listed `TempCreated` before
+/// `Replaced`, which only ever proved that the receipt records what the receipt
+/// records: a build that renamed first while pushing the labels in order would
+/// have passed it, and the mutation sweep would still have reported the guard
+/// caught. Reviewer grok-4-5 found that hole. Staging the write makes the claim
+/// checkable — with the stage held, the temporary must exist AND the target must
+/// still hold its original bytes.
+#[test]
+fn the_target_still_holds_its_preimage_while_the_replacement_is_staged() {
+    let root = tempfile::tempdir().expect("temp root");
+    let lease = PhysicalRootLease::take(root.path());
+    let target = Path::new("state.txt");
+    std::fs::write(root.path().join(target), b"before").expect("seed target");
+
+    let staged = symforge::live_index::index_lifecycle::physical_root::stage_replacement(
+        &lease, target, b"after",
+    )
+    .expect("staging succeeds");
+
+    // Observed on the filesystem, mid-flight: the replacement exists...
+    assert!(
+        staged.temp_path().exists(),
+        "the staged content is not on disk"
+    );
+    assert_eq!(
+        std::fs::read(staged.temp_path()).expect("read the staged content"),
+        b"after".to_vec()
+    );
+    // ...and the target is untouched.
+    assert_eq!(
+        std::fs::read(root.path().join(target)).expect("read the target"),
+        b"before".to_vec(),
+        "the target was modified before its replacement was committed"
+    );
+
+    // Committing swaps it, and the temporary is gone afterwards.
+    let temp = staged.temp_path().to_path_buf();
+    let receipt = staged.commit().expect("commit succeeds");
+    assert_eq!(
+        std::fs::read(root.path().join(target)).expect("read back"),
+        b"after".to_vec()
+    );
+    assert!(!temp.exists(), "the temporary survived the commit");
+    assert_eq!(receipt.target(), root.path().join(target));
+}
+
+/// An abandoned stage leaves nothing behind.
+#[test]
+fn dropping_a_stage_without_committing_removes_its_temporary() {
+    let root = tempfile::tempdir().expect("temp root");
+    let lease = PhysicalRootLease::take(root.path());
+    let target = Path::new("state.txt");
+    std::fs::write(root.path().join(target), b"before").expect("seed target");
+
+    let staged = symforge::live_index::index_lifecycle::physical_root::stage_replacement(
+        &lease, target, b"after",
+    )
+    .expect("staging succeeds");
+    let temp = staged.temp_path().to_path_buf();
+    assert!(temp.exists());
+
+    drop(staged);
+
+    assert!(!temp.exists(), "an abandoned stage left its temporary behind");
+    assert_eq!(
+        std::fs::read(root.path().join(target)).expect("read back"),
+        b"before".to_vec(),
+        "an abandoned stage modified the target"
+    );
+}
+
 #[test]
 fn replacement_creates_its_temporary_before_replacing() {
     let root = tempfile::tempdir().expect("temp root");
