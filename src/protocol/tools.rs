@@ -1237,39 +1237,6 @@ fn parse_state_for_file(file: &IndexedFile) -> &'static str {
     }
 }
 
-fn context_source_authority_label(refreshed: bool) -> &'static str {
-    if refreshed {
-        "disk-refreshed"
-    } else {
-        "current index"
-    }
-}
-
-/// The source-authority axis of a result envelope, MEASURED from the index's own
-/// freshness rather than asserted.
-///
-/// `format_search_envelope` collapses to the compact one-line `Trust:` banner
-/// exactly when authority is `"current index"`, and its own doc says any
-/// deviation must keep the loud six-line form so "degraded/stale/truncated
-/// results stay loud". That contract was unreachable on the code-navigation
-/// lane: every call site passed the literal `"current index"`, so a result could
-/// never be anything but confident — including one served from an index whose
-/// reconciliation against disk had failed or never run.
-///
-/// The rest of the envelope already works this way. The parse-state axis
-/// deliberately degrades (`"metadata-only (not parsed)"`, "instead of the
-/// misleading 'parsed'"), and the knowledge lane already gates its envelope on
-/// `FreshnessStatus`. This applies the same discipline to code navigation, which
-/// is the lane whose anchors an agent actually navigates by — a wrong line
-/// number in the right file is worse than a miss, because it is actionable.
-fn index_source_authority_label(freshness: &crate::domain::FreshnessStatus) -> &'static str {
-    match freshness {
-        crate::domain::FreshnessStatus::Current => "current index",
-        crate::domain::FreshnessStatus::Verifying => "index (verifying against disk)",
-        crate::domain::FreshnessStatus::Degraded { .. } => "index (UNVERIFIED against disk)",
-    }
-}
-
 fn context_bundle_completeness_label(
     view: &crate::live_index::ContextBundleFoundView,
     rendered: &str,
@@ -3313,11 +3280,21 @@ fn what_changed_scope_summary(input: &WhatChangedInput, mode: &WhatChangedMode) 
     parts.join("; ")
 }
 
-fn what_changed_source_authority_label(mode: &WhatChangedMode) -> &'static str {
+fn what_changed_source_authority(
+    mode: &WhatChangedMode,
+    freshness: &crate::domain::FreshnessStatus,
+) -> search_format::SourceAuthority {
     match mode {
-        WhatChangedMode::Timestamp(_) => "current index",
-        WhatChangedMode::Uncommitted => "git working tree",
-        WhatChangedMode::GitRef(_) => "git ref diff",
+        // T045: the Timestamp arm used to assert the literal "current index",
+        // collapsing the envelope regardless of measured freshness — the same
+        // forgeable-axis defect as the context lane, closed the same way.
+        WhatChangedMode::Timestamp(_) => search_format::SourceAuthority::from_freshness(freshness),
+        WhatChangedMode::Uncommitted => {
+            search_format::SourceAuthority::never_collapse("git working tree")
+        }
+        WhatChangedMode::GitRef(_) => {
+            search_format::SourceAuthority::never_collapse("git ref diff")
+        }
     }
 }
 
@@ -3378,7 +3355,7 @@ fn render_diff_symbols_output(
     };
     let envelope = search_format::format_search_envelope(
         "exact (git ref diff)",
-        "git ref diff",
+        search_format::SourceAuthority::never_collapse("git ref diff"),
         "high (tree-sitter AST extraction for supported languages, regex fallback for others)",
         &completeness,
         &scope_parts.join("; "),
@@ -3452,7 +3429,7 @@ fn render_search_text_output(
                     auto_corrected_regex,
                     options.ranked,
                 ),
-                index_source_authority_label(&server.index.freshness_status()),
+                search_format::SourceAuthority::from_freshness(&server.index.freshness_status()),
                 search_parse_state_for_paths(
                     &guard,
                     result.files.iter().map(|file| file.path.as_str()),
@@ -4975,7 +4952,17 @@ impl SymForgeServer {
                     } else {
                         "constrained"
                     },
-                    context_source_authority_label(refreshed),
+                    // T045: the non-refreshed arm used to ASSERT the literal
+                    // "current index", collapsing the envelope even while the
+                    // index was Degraded — the exact forgeable-axis defect the
+                    // measured type closes. Refreshed reads stay loud.
+                    if refreshed {
+                        search_format::SourceAuthority::never_collapse("disk-refreshed")
+                    } else {
+                        search_format::SourceAuthority::from_freshness(
+                            &self.index.freshness_status(),
+                        )
+                    },
                     parse_state,
                     &context_bundle_completeness_label(found.as_ref(), &result),
                     &scope,
@@ -5451,7 +5438,7 @@ impl SymForgeServer {
             let guard = self.index.read();
             Some(search_format::format_search_envelope(
                 search_symbols_match_type_label(&result, is_browse),
-                index_source_authority_label(&self.index.freshness_status()),
+                search_format::SourceAuthority::from_freshness(&self.index.freshness_status()),
                 search_parse_state_for_paths(
                     &guard,
                     result.hits.iter().map(|hit| hit.path.as_str()),
@@ -6137,7 +6124,9 @@ impl SymForgeServer {
                     let guard = self.index.read();
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        index_source_authority_label(&self.index.freshness_status()),
+                        search_format::SourceAuthority::from_freshness(
+                            &self.index.freshness_status(),
+                        ),
                         search_parse_state_for_paths(&guard, std::iter::once(path.as_str())),
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -6153,7 +6142,9 @@ impl SymForgeServer {
                     // parse state honestly instead of the misleading "parsed".
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        index_source_authority_label(&self.index.freshness_status()),
+                        search_format::SourceAuthority::from_freshness(
+                            &self.index.freshness_status(),
+                        ),
                         "metadata-only (not parsed)",
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -6172,7 +6163,9 @@ impl SymForgeServer {
                     let guard = self.index.read();
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        index_source_authority_label(&self.index.freshness_status()),
+                        search_format::SourceAuthority::from_freshness(
+                            &self.index.freshness_status(),
+                        ),
                         search_parse_state_for_paths(
                             &guard,
                             matches.iter().map(std::string::String::as_str),
@@ -6283,7 +6276,9 @@ impl SymForgeServer {
                             let guard = self.index.read();
                             search_format::format_search_envelope(
                                 "weak heuristic (git-temporal coupling)",
-                                "current index + git temporal",
+                                search_format::SourceAuthority::never_collapse(
+                                    "current index + git temporal",
+                                ),
                                 search_parse_state_for_paths(
                                     &guard,
                                     history
@@ -6336,7 +6331,9 @@ impl SymForgeServer {
                     let guard = self.index.read();
                     search_format::format_search_envelope(
                         "heuristic (git-temporal coupling)",
-                        "current index + git temporal",
+                        search_format::SourceAuthority::never_collapse(
+                            "current index + git temporal",
+                        ),
                         search_parse_state_for_paths(
                             &guard,
                             history.co_changes.iter().map(|entry| entry.path.as_str()),
@@ -6608,11 +6605,17 @@ impl SymForgeServer {
                     // still say "current" unconditionally — worth revisiting
                     // once every lane derives its own prefix.
                     if rank_by_path_cochange {
-                        "current index + optional coupling store"
+                        search_format::SourceAuthority::never_collapse(
+                            "current index + optional coupling store",
+                        )
                     } else if rank_by_frecency {
-                        "current index + optional frecency history"
+                        search_format::SourceAuthority::never_collapse(
+                            "current index + optional frecency history",
+                        )
                     } else {
-                        index_source_authority_label(&self.index.freshness_status())
+                        search_format::SourceAuthority::from_freshness(
+                            &self.index.freshness_status(),
+                        )
                     },
                     search_parse_state_for_paths(&guard, hits.iter().map(|hit| hit.path.as_str())),
                     &search_completeness_label(*overflow_count, hidden_noise_count),
@@ -8028,7 +8031,10 @@ impl SymForgeServer {
                                 let guard = self.index.read();
                                 search_format::format_search_envelope(
                                     "exact (timestamp compare)",
-                                    what_changed_source_authority_label(&mode),
+                                    what_changed_source_authority(
+                                        &mode,
+                                        &self.index.freshness_status(),
+                                    ),
                                     search_parse_state_for_paths(
                                         &guard,
                                         filtered.iter().map(|path| path.as_str()),
@@ -8122,7 +8128,10 @@ impl SymForgeServer {
                                     params.0.include_symbol_diff.unwrap_or(false);
                                 let envelope = search_format::format_search_envelope(
                                     "exact (uncommitted working tree)",
-                                    what_changed_source_authority_label(&mode),
+                                    what_changed_source_authority(
+                                        &mode,
+                                        &self.index.freshness_status(),
+                                    ),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, filtered.len()),
                                     &what_changed_scope_summary(&params.0, &mode),
@@ -8200,7 +8209,10 @@ impl SymForgeServer {
                                     params.0.include_symbol_diff.unwrap_or(false);
                                 let envelope = search_format::format_search_envelope(
                                     "exact (git ref diff)",
-                                    what_changed_source_authority_label(&mode),
+                                    what_changed_source_authority(
+                                        &mode,
+                                        &self.index.freshness_status(),
+                                    ),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, filtered.len()),
                                     &what_changed_scope_summary(&params.0, &mode),
@@ -9066,7 +9078,7 @@ impl SymForgeServer {
                 let guard = self.index.read();
                 Some(search_format::format_search_envelope(
                     find_references_match_type_label(input, mode),
-                    index_source_authority_label(&self.index.freshness_status()),
+                    search_format::SourceAuthority::from_freshness(&self.index.freshness_status()),
                     implementations_parse_state_for_paths(&guard, &view),
                     &implementations_completeness_label(&view, &limits),
                     &find_references_scope_summary(input, mode),
@@ -9196,7 +9208,9 @@ impl SymForgeServer {
                     }
                     Some(search_format::format_search_envelope(
                         find_references_match_type_label(input, mode),
-                        index_source_authority_label(&self.index.freshness_status()),
+                        search_format::SourceAuthority::from_freshness(
+                            &self.index.freshness_status(),
+                        ),
                         search_parse_state_for_paths(
                             &guard,
                             view.files.iter().map(|file| file.file_path.as_str()),

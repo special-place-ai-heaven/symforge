@@ -1,5 +1,51 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## T045 — the lanes and the measured envelope (PR 2)
+
+**Batch one** routed the three disk lanes through `observe_disk_beneath` and
+closed D8 by routing `detect_impact`'s base seed through `admit_git_text`,
+deleting the tripwire's sentinel allowlist outright. The `writers` drift was
+OBSERVED, not assumed: the checker was run after the first `tools.rs` edit and
+reported `RETIREMENT_CLOSURE_MISMATCH` for `writers` and for `writers` alone.
+
+**Batch two — the forgeable envelope axis.** `format_search_envelope` collapsed
+to the compact `Trust:` banner on `source_authority == "current index"` — a
+string equality any caller could satisfy by assertion. Two lanes did exactly
+that: the context bundle passed the literal whenever it had not disk-refreshed,
+and `what_changed`'s Timestamp arm passed it unconditionally — both collapsing
+the envelope while the index could be Verifying or Degraded. The second lane
+was found by the COMPILER during the migration, not by the census.
+
+The collapse now rides on `SourceAuthority`, a type honest by construction:
+`from_freshness` is the only constructor that can produce a collapsible value
+and it takes the index's measured `FreshnessStatus`; `never_collapse` covers
+disk-refreshed, composite, and git authorities whose labels are display only.
+A lying literal is UNREPRESENTABLE — no constructor accepts a caller-chosen
+string and marks it collapsible. Behavior is byte-identical for measured
+Current and for every already-loud lane; the sanctioned change is that the two
+asserting lanes now go loud with the honest label when freshness is not
+Current. Composite labels keep their existing text, including the recorded
+wart that they say "current" unconditionally — a text change was not in scope.
+
+Mutation M13 flipped the Degraded arm to collapsible and was caught by
+`a_measured_degraded_authority_never_collapses_however_clean_the_rest_is`
+alone, then restored. Twelve mutations across the slice: eleven caught by
+name, one survivor that forced its oracle, one guard proven structural.
+
+**D16 — `ProjectEvidence` and the structured `_meta` surface stay untyped in
+this PR, deliberately.** The MCP `_meta` object already carries an untyped
+provenance record with `generation` / `load_source` / `index_state`. Replacing
+it with `Claim`/`ClaimProvenance` is a client-visible schema change, not a
+read-gate migration, and no frozen atom requires it preactivation. Recorded
+here next to D12/D13 as T048/structured-activation work: the competitor is
+untyped strings versus the provenance types, and the swap belongs to the
+activation surface, not to T045's task-text word "structured".
+
+Gates on the batch-two tree: lib suite 3166 passed 0 failed including the new
+envelope oracle; clippy all targets denied warnings clean; embed 1332 passed
+0 failed; fmt clean. The checker still reports the expected `writers`-only
+mismatch; the single regeneration waits for PR 2's end.
+
 ## T044 — the authority choice is explicit (PR 2)
 
 Observed RED first: both oracles failed `E0432` naming exactly the three new
