@@ -8,6 +8,17 @@ pub mod git_temporal;
 // now a real `detect_impact` production dependency (no longer cbm-spike-gated).
 pub mod graph;
 mod health_view;
+// Feature 020 V11. The frozen seam contract places every lifecycle file at
+// `src/index_lifecycle/`, so that is where the files live. The module PATH is
+// a different question: a top-level `pub mod index_lifecycle;` would add
+// `symforge::index_lifecycle` to the public-API census that the refreeze
+// freezes for the whole preactivation period, and `introduced_v11_atoms` never
+// names it — the V11 surface is re-exported through `embed`, not through a
+// public lifecycle module. `#[path]` satisfies both: contract file location,
+// unchanged public API. At activation (T060) this declaration is deleted and
+// `lib.rs` gains a private `mod index_lifecycle;`, with the public types
+// re-exported from `embed.rs`. No file moves then.
+#[path = "../index_lifecycle/mod.rs"]
 pub mod index_lifecycle;
 pub mod knowledge_authority;
 pub mod knowledge_bridge;
