@@ -1095,9 +1095,14 @@ fn derive_native_lifecycle(
             },
         );
     }
-    // No declared status and no archive path: the lifecycle is genuinely unknown.
-    // Reporting `Active` here would assert a lifecycle with no evidence to cite,
-    // which the authority-hygiene contract forbids.
+    // No declared status, no archive path: nothing was observed, so nothing is
+    // claimed. This previously returned `Active` with `LifecycleEvidence::None`
+    // and the surface printed `lifecycle=active` as though it had been derived
+    // from evidence -- and `derive_voice` then consumed that invented `Active`
+    // to report `voice=current`. The hygiene contract is explicit that lifecycle
+    // always cites hash-valid policy or exact declared evidence and that code
+    // does not assign lifecycle, and `Unknown` is a legal value for exactly this
+    // case.
     (KnowledgeLifecycle::Unknown, LifecycleEvidence::None)
 }
 
@@ -2171,6 +2176,62 @@ content_hash = "hash"
         assert_eq!(view, build(&shared, AuthorityLimits::default()));
     }
 
+    /// A unit with no declared status and no archive path has no lifecycle
+    /// evidence, so the derived lifecycle must be `Unknown` rather than an
+    /// invented `Active`.
+    ///
+    /// Paired with the declared case in the same test: `status: active` still
+    /// yields `Active`, so this is not a guard that refuses everything. Without
+    /// that pairing, returning `Unknown` unconditionally would satisfy the
+    /// negative assertion perfectly.
+    #[test]
+    fn lifecycle_without_evidence_is_unknown_not_active() {
+        let (_root, shared) = fixture(&[
+            (
+                "docs/undeclared.md",
+                "# Current implementation\ncode_path = \"src/lib.rs\"\n",
+            ),
+            (
+                "docs/declared.md",
+                "# Current implementation\nstatus: active\ncode_path = \"src/lib.rs\"\n",
+            ),
+            ("src/lib.rs", "pub fn ready() {}\n"),
+        ]);
+
+        let view = build(&shared, AuthorityLimits::default());
+
+        let undeclared = view
+            .records
+            .iter()
+            .find(|record| record.unit.path.contains("undeclared"))
+            .expect("the undeclared unit is indexed");
+        assert_eq!(
+            undeclared.lifecycle,
+            KnowledgeLifecycle::Unknown,
+            "a unit with no declared status must not be reported as Active"
+        );
+        assert_eq!(
+            undeclared.voice,
+            KnowledgeVoice::Unknown,
+            "an unevidenced lifecycle must not be consumed as voice=current"
+        );
+        assert!(
+            matches!(undeclared.lifecycle_evidence, LifecycleEvidence::None),
+            "an Unknown lifecycle must not cite evidence it does not have"
+        );
+
+        let declared = view
+            .records
+            .iter()
+            .find(|record| record.unit.path.contains("declared.md"))
+            .expect("the declared unit is indexed");
+        assert_eq!(
+            declared.lifecycle,
+            KnowledgeLifecycle::Active,
+            "a declared status must still be honoured, or this guard is vacuous"
+        );
+    }
+
     #[test]
     fn code_authority_fixture_matrix_never_erases_intent_governance_operations_or_history() {
         let (_root, shared) = fixture(&[
@@ -2578,7 +2639,7 @@ content_hash = "hash"
     }
 
     #[test]
-    fn lifecycle_without_evidence_is_unknown_not_active() {
+    fn derive_native_lifecycle_unknown_declared_and_archive() {
         let (lifecycle, evidence) =
             native_lifecycle("docs/notes.md", "# Notes\nProse with no declared status.\n");
         assert_eq!(lifecycle, KnowledgeLifecycle::Unknown);
