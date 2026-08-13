@@ -5,7 +5,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
 <!-- SYMFORGE FEATURE020 REFREEZE V11 JSON START -->
 ```json
 {
-  "amendment_set_id": "060d31601b63c0294036d318f75514cfe311782defdd27c968be10de10efb3db",
+  "amendment_set_id": "8e45e52182cea45ce732d31aa6f1dce2602b17042fb1777233cebb29ce3ca694",
   "amendments": [
     {
       "amendment_id": "F020-V11-A01",
