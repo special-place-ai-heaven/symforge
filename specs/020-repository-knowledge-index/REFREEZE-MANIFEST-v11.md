@@ -1150,7 +1150,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/v10-authority-retirement-v11.md",
       "scope": "feature",
-      "sha256": "f003981fceba6f83abaad88493687b00229ec45f040184f7bf881748469b551c",
+      "sha256": "b351235786073dc02a1684f7209c9456a84b20a9a8198cfcbf2001ab847bfef2",
       "superseded_by": []
     },
     {
