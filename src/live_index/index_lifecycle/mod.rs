@@ -20,6 +20,7 @@
 //! The writer lanes that consume permits are Slice 4 activation work.
 
 pub mod authority;
+pub mod capacity;
 pub mod mutation;
 pub mod physical_root;
 pub mod transition;
