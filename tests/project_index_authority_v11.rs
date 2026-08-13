@@ -498,6 +498,13 @@ fn grant_provenance_matrix_accepts_only_a_live_current_publication() {
     }
 }
 
+/// Superseded by F020-V11-A20 and rewritten rather than deleted.
+///
+/// The pre-amendment rule was that only `Current` is queryable. A20 narrowed the
+/// invariant to COMPLETENESS: a `Refreshing` source keeps serving the complete
+/// generation it retained, because refusing bought no safety and took the source
+/// offline for the whole of a rebuild. What stays closed is that no partial,
+/// candidate, or remnant state is ever served.
 #[test]
 fn strict_queryability_is_closed_over_retained_generations() {
     // Loading retains nothing; only Current is queryable.
@@ -517,7 +524,13 @@ fn strict_queryability_is_closed_over_retained_generations() {
     assert_eq!(
         refreshing.live_publication(),
         None,
-        "a retained generation must not be queryable"
+        "a Refreshing source has no live Current publication"
+    );
+    // A20: but it IS queryable, from the complete generation it retained.
+    assert_eq!(
+        refreshing.queryable_generation(),
+        Some(retained),
+        "a refreshing source stopped serving its complete retained generation"
     );
 
     // Blocked and Stopping may retain zero or one.
@@ -539,6 +552,12 @@ fn strict_queryability_is_closed_over_retained_generations() {
     assert_eq!(
         SourceRuntime::stopping(Some(accounted), None).live_publication(),
         None
+    );
+    // A20: a remnant is not a refresh, so it is not queryable.
+    assert_eq!(
+        SourceRuntime::stopping(Some(accounted), None).queryable_generation(),
+        None,
+        "a stopping source served a remnant"
     );
 }
 
@@ -826,4 +845,75 @@ fn a_transition_refuses_to_install_over_a_live_permit() {
     )
     .expect("a drained source may transition");
     assert!(!lease_a.is_live());
+}
+
+/// F020-V11-R20A. Named by `contracts/lifecycle-acceptance-oracles-v11.md`; do not
+/// rename without amending that contract.
+///
+/// A refreshing source keeps serving the complete generation it retained. This is
+/// the availability half of A20: without it, every reindex takes the project
+/// offline for the duration of the rebuild.
+#[test]
+fn a_refreshing_source_still_serves_its_complete_retained_generation() {
+    let (mut runtime, _lease, live, _root) = current_source();
+    let served_before = runtime
+        .queryable_generation()
+        .expect("a Current source is queryable");
+
+    // Granting moves the source off Current and into Refreshing.
+    runtime
+        .request_mutation_grant(MutationGrantInput::LiveCurrent(live))
+        .expect("live Current must grant");
+    assert_eq!(runtime.phase(), PhaseName::Refreshing);
+    assert_eq!(runtime.live_publication(), None);
+
+    // It is still queryable, and from the SAME generation it served before: the
+    // reader sees no interruption and no different answer.
+    assert!(
+        runtime.is_queryable(),
+        "a refreshing source stopped serving, which takes the project offline"
+    );
+    assert_eq!(
+        runtime.queryable_generation(),
+        Some(served_before),
+        "a refreshing source served a different generation than the one it retained"
+    );
+}
+
+/// F020-V11-R20B. Named by `contracts/lifecycle-acceptance-oracles-v11.md`; do not
+/// rename without amending that contract.
+///
+/// The safety half of A20. A retention held by a source with no successor in
+/// flight is a remnant, not a refresh, and must never be served.
+#[test]
+fn blocked_and_stopping_retentions_are_never_queryable() {
+    let lease = PhysicalRootLease::take(tempfile::tempdir().expect("root").keep());
+    let binding = BindingAuthority::bind(lease.identity());
+    let retained = GenerationIdentity::fresh();
+
+    for runtime in [
+        SourceRuntime::blocked(binding.clone(), Some(retained)),
+        SourceRuntime::stopping(Some(retained), None),
+    ] {
+        // It retains something, for recovery and accounting...
+        assert_eq!(runtime.retained_generation(), Some(retained));
+        // ...and none of it is servable.
+        assert!(
+            !runtime.is_queryable(),
+            "{:?} served a remnant retention",
+            runtime.phase()
+        );
+        assert_eq!(runtime.queryable_generation(), None);
+    }
+
+    // Loading holds nothing at all.
+    let loading = SourceRuntime::loading(binding.clone());
+    assert_eq!(loading.retained_generation(), None);
+    assert!(!loading.is_queryable());
+
+    // Paired positive: a Refreshing source with the same retention IS queryable,
+    // so the refusals above are about having no successor in flight rather than
+    // a blanket refusal to ever serve a retention.
+    let refreshing = SourceRuntime::refreshing(binding, retained);
+    assert_eq!(refreshing.queryable_generation(), Some(retained));
 }

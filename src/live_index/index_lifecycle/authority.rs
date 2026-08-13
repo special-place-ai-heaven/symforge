@@ -732,6 +732,35 @@ impl SourceRuntime {
         }
     }
 
+    /// The generation a reader may be served from, if any (F020-V11-A20).
+    ///
+    /// Queryability closes on COMPLETENESS, not recency. `Current` is queryable.
+    /// So is the single generation `Refreshing` retains: it is the complete
+    /// verified generation that was `Current` immediately before the refresh
+    /// began, so serving it exposes no partial state, and refusing to serve it
+    /// would take the source offline for the whole of a rebuild while buying no
+    /// safety at all.
+    ///
+    /// `Blocked` and `Stopping` return `None` even when they retain something.
+    /// Neither has a successor in flight, so its retention is a remnant rather
+    /// than a refresh, and serving it would be serving the last thing that
+    /// happened to work rather than a generation something is actively replacing.
+    /// `Loading` has nothing.
+    pub fn queryable_generation(&self) -> Option<GenerationIdentity> {
+        match &self.phase {
+            SourcePhase::Current(publication) => Some(publication.generation()),
+            SourcePhase::Refreshing { retained, .. } => Some(*retained),
+            SourcePhase::Loading { .. }
+            | SourcePhase::Blocked { .. }
+            | SourcePhase::Stopping { .. } => None,
+        }
+    }
+
+    /// Whether a reader may currently be served at all.
+    pub fn is_queryable(&self) -> bool {
+        self.queryable_generation().is_some()
+    }
+
     /// The binding a non-`Current` phase is still bound to, if any.
     /// Every phase except `Stopping` is bound to a physical root.
     ///
