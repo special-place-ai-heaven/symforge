@@ -88,22 +88,22 @@ impl CapacityGrant {
     }
 }
 
-/// A live allocation. Holding one is what keeps capacity charged.
+/// A live permit. Holding one is what keeps capacity charged.
 ///
 /// Conservation is defined against the **physical** drop of this value, not
 /// against a logical "release" call: a caller that forgets to release still
-/// refunds when the allocation is dropped, and a caller that releases early
-/// cannot refund twice because the release consumes the allocation.
+/// refunds when the permit is dropped, and a caller that releases early
+/// cannot refund twice because the release consumes the permit.
 #[derive(Debug)]
-pub struct ChargedAllocation {
+pub struct CapacityPermit {
     owner: OwnerIdentity,
     bytes: u64,
     charge: PublicationIdentity,
-    ledger: Arc<CapacityLedger>,
+    ledger: Arc<ProcessCapacityPool>,
     refunded: bool,
 }
 
-impl ChargedAllocation {
+impl CapacityPermit {
     /// How many bytes this allocation holds charged.
     pub fn bytes(&self) -> u64 {
         self.bytes
@@ -125,7 +125,7 @@ impl ChargedAllocation {
     }
 }
 
-impl Drop for ChargedAllocation {
+impl Drop for CapacityPermit {
     fn drop(&mut self) {
         if !self.refunded {
             // The holder never released. Refund anyway: an un-refunded charge is
@@ -151,19 +151,19 @@ struct OwnerRow {
     parent: Option<OwnerIdentity>,
 }
 
-/// The process-wide capacity ledger.
+/// The process-wide capacity pool, kept as a ledger of charges.
 ///
 /// Hierarchical: a child owner's limit is backed by its parent's headroom, so
 /// the sum of everything charged beneath a root can never exceed that root.
 #[derive(Debug, Default)]
-pub struct CapacityLedger {
+pub struct ProcessCapacityPool {
     rows: std::sync::Mutex<BTreeMap<OwnerIdentity, OwnerRow>>,
     /// Refunds that named a charge the ledger did not have. A non-zero value
     /// means somebody is refunding capacity that was never charged.
     unknown_refunds: AtomicU64,
 }
 
-impl CapacityLedger {
+impl ProcessCapacityPool {
     /// A ledger with no owners.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -249,8 +249,8 @@ impl CapacityLedger {
     /// Redeem a grant into a live allocation.
     ///
     /// Consumes the grant by value, so one grant can never back two allocations.
-    pub fn redeem(self: &Arc<Self>, grant: CapacityGrant) -> ChargedAllocation {
-        ChargedAllocation {
+    pub fn redeem(self: &Arc<Self>, grant: CapacityGrant) -> CapacityPermit {
+        CapacityPermit {
             owner: grant.owner,
             bytes: grant.bytes,
             charge: grant.charge,

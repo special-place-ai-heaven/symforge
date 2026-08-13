@@ -99,6 +99,32 @@ open; all three are closed.
   activation. File location and module path answer to different contracts, and
   `#[path]` is what satisfies both. At T060 the declaration is deleted and
   `lib.rs` gains a private `mod index_lifecycle;`; no file moves then.
+- **Four Slice-2 types did not carry the names their own oracles pin.**
+  `ORACLE-CAPACITY-PHYSICAL-OWNERSHIP` and `ORACLE-EMBED-FOUNDATION` are
+  Slice-2 oracles, and their frozen `production_seams` name
+  `capacity.rs::ProcessCapacityPool`, `capacity.rs::CapacityPermit`,
+  `process_runtime.rs::ProcessIndexRuntime` and
+  `embedded.rs::EmbeddedSourceFactory`. The slice shipped that behaviour as
+  `CapacityLedger`, `ChargedAllocation`, `ProcessRuntime` and
+  `EmbeddedRegistration` — right conduct, wrong names, and a rename Slice 4
+  would have had to perform under the postactivation seam check. Renamed.
+  Every Slice 0, 1 and 2 seam anchor now resolves; the checker resolves them by
+  a plain walk of `src/**/*.rs`, so this is a property of file and symbol names
+  only, verified by re-running that resolution. `CapacityGrant` keeps its name:
+  no frozen seam claims it.
+- **The oracle the A20 regressions bind did not encode A20's availability half.**
+  `ORACLE-QUERY-ATOMIC-LEASE` asserted only refusal — "strict mode refuses
+  anything not proved Current and complete" — so a build that refused every read
+  during a refresh would have satisfied it, which is precisely the availability
+  regression A20 exists to prevent. Binding a regression to an oracle that
+  cannot fail when the amendment is violated is the reporting defect this
+  feature was written to prevent, in the contract rather than the code. The
+  oracle now asserts that a source refreshing a successor still leases the
+  complete generation it retains and that a retention with no successor in
+  flight is refused, and lists the refreshing state among the states its
+  preconditions make available. Both edits make the oracle strictly harder to
+  satisfy. Its frozen digest is regenerated, and the checker's own pin moves
+  with it.
 - **Two amendment regressions named oracles that do not exist.** `F020-V11-R20A`
   and `R20B` were written against invented IDs
   (`ORACLE-REFRESHING-SERVES-COMPLETE-RETENTION`,

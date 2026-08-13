@@ -5,7 +5,7 @@
 //! and Slice 0 already shipped three controls that passed for reasons unrelated
 //! to the property under test.
 
-use symforge::live_index::index_lifecycle::capacity::{CapacityLedger, CapacityRefusal};
+use symforge::live_index::index_lifecycle::capacity::{CapacityRefusal, ProcessCapacityPool};
 
 /// TEST-CAPACITY (T032). The name is pinned by
 /// `contracts/lifecycle-oracle-traceability-v11.md` as a `planned_exact` target;
@@ -20,7 +20,7 @@ use symforge::live_index::index_lifecycle::capacity::{CapacityLedger, CapacityRe
 /// not an accounting policy.
 #[test]
 fn capacity_is_conserved_until_physical_drop() {
-    let ledger = CapacityLedger::new();
+    let ledger = ProcessCapacityPool::new();
     let root = ledger.root(1_000);
 
     // Charged on reserve, and the reservation is visible immediately.
@@ -68,7 +68,7 @@ fn capacity_is_conserved_until_physical_drop() {
 /// charge reflects both.
 #[test]
 fn one_grant_backs_exactly_one_allocation() {
-    let ledger = CapacityLedger::new();
+    let ledger = ProcessCapacityPool::new();
     let root = ledger.root(1_000);
 
     let first = ledger.redeem(ledger.reserve(root, 100).expect("headroom"));
@@ -98,7 +98,7 @@ fn one_grant_backs_exactly_one_allocation() {
 /// Exhaustion refuses with the numbers, and does not charge on refusal.
 #[test]
 fn an_exhausted_owner_refuses_without_charging() {
-    let ledger = CapacityLedger::new();
+    let ledger = ProcessCapacityPool::new();
     let root = ledger.root(500);
     let held = ledger.redeem(ledger.reserve(root, 400).expect("headroom"));
 
@@ -132,7 +132,7 @@ fn an_exhausted_owner_refuses_without_charging() {
 /// given is charged to the parent immediately.
 #[test]
 fn a_child_owner_is_backed_by_its_parent() {
-    let ledger = CapacityLedger::new();
+    let ledger = ProcessCapacityPool::new();
     let root = ledger.root(1_000);
 
     // Negative: a child larger than the parent is refused.
@@ -183,7 +183,7 @@ fn a_child_owner_is_backed_by_its_parent() {
 /// child has actually stopped spending.
 #[test]
 fn a_child_cannot_be_released_while_it_is_still_spending() {
-    let ledger = CapacityLedger::new();
+    let ledger = ProcessCapacityPool::new();
     let root = ledger.root(1_000);
     let child = ledger.child(root, 600).expect("600 fits");
     assert_eq!(ledger.available(root), 400);
@@ -224,7 +224,7 @@ fn a_child_cannot_be_released_while_it_is_still_spending() {
 /// counted, rather than silently inventing capacity.
 #[test]
 fn a_refund_for_an_unknown_charge_invents_nothing() {
-    let ledger = CapacityLedger::new();
+    let ledger = ProcessCapacityPool::new();
     let root = ledger.root(1_000);
     let allocation = ledger.redeem(ledger.reserve(root, 300).expect("headroom"));
 
@@ -235,7 +235,7 @@ fn a_refund_for_an_unknown_charge_invents_nothing() {
 
     // A second allocation on a DIFFERENT ledger cannot refund against this one:
     // its charge is unknown here, so it must refund zero and be counted.
-    let other = CapacityLedger::new();
+    let other = ProcessCapacityPool::new();
     let other_root = other.root(1_000);
     let foreign = other.redeem(other.reserve(other_root, 100).expect("headroom"));
     drop(foreign);

@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::capacity::{CapacityLedger, CapacityRefusal, OwnerIdentity};
+use super::capacity::{CapacityRefusal, OwnerIdentity, ProcessCapacityPool};
 
 /// Identity of one construction of the process index machinery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,17 +91,17 @@ pub enum RuntimeRefusal {
 /// Holds the single capacity root every surface is charged against, and the
 /// registry of surfaces attached to the current incarnation.
 #[derive(Debug)]
-pub struct ProcessRuntime {
+pub struct ProcessIndexRuntime {
     incarnation: IncarnationIdentity,
-    ledger: Arc<CapacityLedger>,
+    ledger: Arc<ProcessCapacityPool>,
     root: OwnerIdentity,
     surfaces: std::sync::Mutex<HashMap<SurfaceKind, OwnerIdentity>>,
 }
 
-impl ProcessRuntime {
+impl ProcessIndexRuntime {
     /// Construct a fresh incarnation owning `process_bytes` of capacity.
     pub fn incarnate(process_bytes: u64) -> Arc<Self> {
-        let ledger = CapacityLedger::new();
+        let ledger = ProcessCapacityPool::new();
         let root = ledger.root(process_bytes);
         Arc::new(Self {
             incarnation: IncarnationIdentity::fresh(),
@@ -121,7 +121,7 @@ impl ProcessRuntime {
     }
 
     /// The process-wide capacity domain every surface shares.
-    pub fn ledger(&self) -> &Arc<CapacityLedger> {
+    pub fn ledger(&self) -> &Arc<ProcessCapacityPool> {
         &self.ledger
     }
 

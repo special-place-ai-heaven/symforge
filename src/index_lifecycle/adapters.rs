@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use super::authority::BindingAuthority;
 use super::capacity::OwnerIdentity;
-use super::process_runtime::{ProcessRuntime, SurfaceKind};
+use super::process_runtime::{ProcessIndexRuntime, SurfaceKind};
 use super::registry::{
     ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection, SlotIdentity, StatePlacement,
 };
@@ -87,7 +87,7 @@ pub enum AdapterRefusal {
 /// registry entry is created, and no capacity is charged: this is the
 /// behaviour-neutral half, and Slice 4 is what makes it act.
 pub fn plan_admission(
-    runtime: &Arc<ProcessRuntime>,
+    runtime: &Arc<ProcessIndexRuntime>,
     surface: SurfaceKind,
     key: ProjectKey,
     protection: RootProtection,

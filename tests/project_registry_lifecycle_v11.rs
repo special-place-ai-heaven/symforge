@@ -115,9 +115,11 @@ fn protected_membership_and_state_placement() {
 #[test]
 fn a_refused_or_cancelled_admission_leaves_nothing_behind() {
     use symforge::live_index::index_lifecycle::adapters::{self, AdapterRefusal};
-    use symforge::live_index::index_lifecycle::process_runtime::{ProcessRuntime, SurfaceKind};
+    use symforge::live_index::index_lifecycle::process_runtime::{
+        ProcessIndexRuntime, SurfaceKind,
+    };
 
-    let runtime = ProcessRuntime::incarnate(10_000);
+    let runtime = ProcessIndexRuntime::incarnate(10_000);
     let registry = ProjectRegistry::new();
     let owner = runtime
         .attach(SurfaceKind::Daemon, 4_000)

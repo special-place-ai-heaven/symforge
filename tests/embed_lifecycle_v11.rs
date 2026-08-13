@@ -2,7 +2,7 @@
 //!
 //! Every refusal asserts the accepting path in the same test.
 
-use symforge::live_index::index_lifecycle::embedded::{EmbedRefusal, EmbeddedRegistration};
+use symforge::live_index::index_lifecycle::embedded::{EmbedRefusal, EmbeddedSourceFactory};
 use symforge::live_index::index_lifecycle::registry::ProjectKey;
 
 /// TEST-EMBED-FOUNDATION (T031). The name is pinned by
@@ -16,7 +16,7 @@ use symforge::live_index::index_lifecycle::registry::ProjectKey;
 /// one dropped without closing would leak the source forever.
 #[test]
 fn one_handle_close_and_drop_coalesce() {
-    let registration = EmbeddedRegistration::new();
+    let registration = EmbeddedSourceFactory::new();
     let key = ProjectKey::new("embedded");
 
     let handle = registration.open(key.clone()).expect("first open succeeds");
@@ -92,7 +92,7 @@ fn one_handle_close_and_drop_coalesce() {
 /// refused rather than deadlocked.
 #[test]
 fn closing_from_within_a_finalizer_refuses_instead_of_waiting_on_itself() {
-    let registration = EmbeddedRegistration::new();
+    let registration = EmbeddedSourceFactory::new();
     let handle = registration
         .open(ProjectKey::new("self-wait"))
         .expect("opens");
@@ -115,7 +115,7 @@ fn closing_from_within_a_finalizer_refuses_instead_of_waiting_on_itself() {
 /// A panicking finalizer must not poison later closes on the same thread.
 #[test]
 fn a_panicking_finalizer_does_not_wedge_later_closes() {
-    let registration = EmbeddedRegistration::new();
+    let registration = EmbeddedSourceFactory::new();
     let handle = registration
         .open(ProjectKey::new("panicking"))
         .expect("opens");
@@ -137,7 +137,7 @@ fn a_panicking_finalizer_does_not_wedge_later_closes() {
 /// Reopening a released key mints a new identity; the old one is never revived.
 #[test]
 fn a_reopened_source_is_a_new_identity() {
-    let registration = EmbeddedRegistration::new();
+    let registration = EmbeddedSourceFactory::new();
     let key = ProjectKey::new("reopened");
 
     let first = registration.open(key.clone()).expect("opens");

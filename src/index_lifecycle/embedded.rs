@@ -91,14 +91,18 @@ thread_local! {
     static FINALIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The internal registration an embedder's process holds.
+/// Mints embedded source handles, and is the only thing that can.
+///
+/// Named by the frozen `ORACLE-EMBED-FOUNDATION` seam. Construction of a handle
+/// is private to this type, which is what makes "one incarnation owns at most
+/// one handle" enforceable rather than advisory.
 #[derive(Debug, Default)]
-pub struct EmbeddedRegistration {
+pub struct EmbeddedSourceFactory {
     open: std::sync::Mutex<HashMap<ProjectKey, EmbeddedIdentity>>,
     shutdown: AtomicBool,
 }
 
-impl EmbeddedRegistration {
+impl EmbeddedSourceFactory {
     /// A registration with nothing open.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -154,7 +158,7 @@ impl EmbeddedRegistration {
 pub struct EmbeddedSourceHandle {
     identity: EmbeddedIdentity,
     key: ProjectKey,
-    registration: Arc<EmbeddedRegistration>,
+    registration: Arc<EmbeddedSourceFactory>,
     closed: AtomicBool,
 }
 
