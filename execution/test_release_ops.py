@@ -185,6 +185,14 @@ class ReleaseOpsTests(unittest.TestCase):
         self.assertIn("Publish platform packages to npm", workflow)
         self.assertIn("Publish root package to npm", workflow)
 
+    def test_release_workflow_proves_skips_via_untagged_aware_helper(self) -> None:
+        root = release_ops.repo_root()
+        workflow = (root / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("python -I execution/prove_release_owed.py", workflow)
+        self.assertNotIn("LAST_TAG=\"$(git describe --tags --abbrev=0 --match 'v*'", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

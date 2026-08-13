@@ -1997,32 +1997,18 @@ jobs:
           manifest-file: .github/.release-please-manifest.json
 
       # release-please skipping is silent and indistinguishable from "nothing to
-      # release". It has now bitten this repo three times: two merge-strategy
-      # variants recorded in CLAUDE.md, and a `fix:` whose BODY the conventional
-      # parser rejected, which dropped the commit entirely and cut no version.
-      # Every one of them left this job green. A job may not report success for a
-      # release it did not observe, so prove the absence instead of assuming it.
+      # release". It has now bitten this repo four times: two merge-strategy
+      # variants recorded in CLAUDE.md, a `fix:` whose BODY the conventional
+      # parser rejected (dropped the commit, cut no version, job still green),
+      # and counting feat/fix since the previous tag after a release PR merged
+      # (release-please aborted "untagged, merged release PRs outstanding";
+      # this step then blocked Create GitHub release, so v10.2.0 never tagged).
+      # A job may not report success for a release it did not observe, so prove
+      # the absence — but an untagged merged release PR is the tagging path,
+      # not a silent skip. See execution/prove_release_owed.py.
       - name: Prove that no release was owed
         if: ${{ steps.release.outputs.prs_created != 'true' && (github.event_name != 'workflow_dispatch' || inputs.tag == '') }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          LAST_TAG="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
-          if [[ -z "$LAST_TAG" ]]; then
-            echo "No release tag yet; nothing to prove."
-            exit 0
-          fi
-          OWED="$(git log --no-merges --format=%s "${LAST_TAG}..HEAD" \
-            | grep -cE '^(feat|fix)(\([^)]*\))?!?: ' || true)"
-          if [[ "$OWED" -gt 0 ]]; then
-            echo "::error::${OWED} user-facing commit(s) since ${LAST_TAG} produced no release PR."
-            echo "::error::release-please parsed them away silently. Inspect the step log above for"
-            echo "::error::'commit could not be parsed' before assuming there was nothing to release."
-            git log --no-merges --format='  %h %s' "${LAST_TAG}..HEAD" \
-              | grep -E '(feat|fix)(\([^)]*\))?!?: ' || true
-            exit 1
-          fi
-          echo "No user-facing commits since ${LAST_TAG}; skipping is correct."
+        run: python -I execution/prove_release_owed.py
 
       - name: Auto-merge release PR
         if: ${{ steps.release.outputs.prs_created == 'true' }}

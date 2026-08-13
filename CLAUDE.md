@@ -157,6 +157,16 @@ reliable — but it does not fully eliminate the double-count risk above if
 history later happens to also sweep in that PR's inner commits, so prefer
 squash unless there's a specific reason not to.
 
+Release PRs themselves stay `--merge` (the workflow's auto-merge). With
+`skip-github-release: true`, release-please then aborts with "untagged,
+merged release PRs outstanding" until this workflow creates the tag. The
+"Prove that no release was owed" step must not treat that abort as a silent
+parse-away: counting feat/fix since the *previous* tag blocks tagging.
+That is how v10.2.0 never landed after #561 merged (as_of 2026-08-13).
+If HEAD has already moved past the untagged release commit, create `vX.Y.Z`
+at that merge SHA and label the PR `autorelease: tagged` — do not tag HEAD.
+Helper: `execution/prove_release_owed.py`.
+
 ## Architecture
 
 Rust MCP server providing symbol-aware code and repository-knowledge navigation, review, curation, and editing tools. The **default** MCP `tools/list` surface **advertises 39 tools** while **40 are registered** (as_of 2026-08-07). Registration count: `#[tool(` attribute sites — 33 in `tools.rs` + 7 in `edit_tools.rs` — equal to the 40 names in `SYMFORGE_TOOL_NAMES` (including `health_compact`, `search_knowledge`, `review_knowledge`, and `curate_knowledge`), pinned by `test_client_allow_lists_match_registered_tool_surface`. The advertised count is one lower because `list_tools_for_profile` filters the compact-only `symforge` facade out of the full profile (`src/protocol/surface_probe.rs:173`) — `symforge_retrieve` is its full-surface equivalent. Do not "fix" a client reporting 39; that is correct. the compact-3 surface (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
