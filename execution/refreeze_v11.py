@@ -55,7 +55,7 @@ GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 # be rejected, so the ceiling moves deliberately when an amendment is added.
 AMENDMENT_ID_RE = re.compile(r"^F020-V11-A(?:0[1-9]|1[0-9]|20)$")
 REQUIREMENT_ID_RE = re.compile(
-    r"^(?:(?:FR|SC)-[0-9]{3}|F020-V11-A(?:0[1-9]|1[0-9]))$"
+    r"^(?:(?:FR|SC)-[0-9]{3}|F020-V11-A(?:0[1-9]|1[0-9]|20))$"
 )
 PLAN_TASK_ID_RE = re.compile(r"^T[0-9]{3}$")
 REGRESSION_ID_RE = re.compile(r"^F020-V11-R[0-9]{2}[A-Z]?$")
