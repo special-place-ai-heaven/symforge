@@ -1069,3 +1069,74 @@ fn a_binding_cloned_before_the_stop_stops_authorizing_with_it() {
         }
     );
 }
+
+/// A transition must not attest a freeze it did not perform, or resurrect a
+/// source that is stopping.
+///
+/// Found by adversarial review. `freeze()` returns `None` for a phase with no
+/// publication to freeze, and `transition::apply` was its only caller and
+/// discarded the result — so on a `Stopping` source it pushed
+/// `TransitionStep::Freeze` and then installed `Current`, producing a receipt
+/// attesting a publication that never happened and making a revoked source
+/// queryable again. `Option` is not `#[must_use]`, so nothing warned.
+#[test]
+fn a_transition_refuses_a_phase_that_has_nothing_to_freeze() {
+    let lease_a = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
+    let lease_b = Arc::new(PhysicalRootLease::take(
+        tempfile::tempdir().expect("root").keep(),
+    ));
+    // Never attached to a permit, so it reports drained: the refusals below are
+    // about the freeze having nothing to publish, not about an outstanding
+    // permit.
+    let drain = PermitDrainSignal::new();
+    assert!(drain.has_ended());
+
+    for mut runtime in [
+        SourceRuntime::stopping(Some(GenerationIdentity::fresh()), None),
+        SourceRuntime::blocked(
+            BindingAuthority::bind(lease_a.identity()),
+            Some(GenerationIdentity::fresh()),
+        ),
+        SourceRuntime::loading(BindingAuthority::bind(lease_a.identity())),
+    ] {
+        let phase = runtime.phase();
+        assert_eq!(
+            transition::apply(
+                &mut runtime,
+                TransitionKind::Rebind,
+                &lease_a,
+                BindingAuthority::bind(lease_b.identity()),
+                ObserverToken::fresh(),
+                &drain,
+            )
+            .expect_err("a phase with nothing to freeze must not transition"),
+            AuthorityRefusal::PhaseNotCurrent { phase }
+        );
+        // Not promoted, not queryable, and the outgoing lease not revoked.
+        assert_eq!(runtime.phase(), phase);
+        assert!(!runtime.is_queryable());
+        assert!(lease_a.is_live(), "a refused transition revoked the root");
+    }
+
+    // Paired positive: a Current source, whose freeze does publish, transitions.
+    let (mut current, lease, _live, _root) = current_source();
+    let receipt = transition::apply(
+        &mut current,
+        TransitionKind::Rebind,
+        &lease,
+        BindingAuthority::bind(lease_b.identity()),
+        ObserverToken::fresh(),
+        &drain,
+    )
+    .expect("a Current source transitions");
+    assert_eq!(
+        receipt.steps(),
+        &[
+            TransitionStep::Freeze,
+            TransitionStep::Drain,
+            TransitionStep::Install,
+        ]
+    );
+}

@@ -93,7 +93,18 @@ pub fn apply(
     // permit record survive the transition. Constructing a fresh `SourceRuntime`
     // here would rewind the epoch to its initial value on every reload and
     // rebind, which would let a stale authority compare equal to a later one.
-    runtime.freeze();
+    // `freeze` returns `None` for a phase that has no publication to freeze —
+    // `Loading`, `Blocked`, `Stopping` — and this was the one caller, discarding
+    // it. Pushing `Freeze` and then installing `Current` on that path attested a
+    // publication that never happened AND resurrected a revoked `Stopping`
+    // source into a queryable one. `Option` is not `#[must_use]`, so the
+    // discarded value raised no warning: the reporting invariant, in the writer
+    // that owns `Current`.
+    if runtime.freeze().is_none() {
+        return Err(AuthorityRefusal::PhaseNotCurrent {
+            phase: runtime.phase(),
+        });
+    }
     steps.push(TransitionStep::Freeze);
 
     // Observed again after the freeze, so the recorded Drain step is an

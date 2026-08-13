@@ -86,6 +86,13 @@ pub enum CapacityRefusal {
 /// Deliberately not `Clone`: a grant that could be duplicated could be redeemed
 /// twice against one charge, which is how a process ends up believing it has
 /// capacity it already spent.
+///
+/// **Charged from the moment it exists, and refunded when it dies.** `reserve`
+/// charges the row, so a grant dropped on any path between reserve and redeem —
+/// a `?`, an early return, a panic — used to leak those bytes permanently, with
+/// no refund and no counter, and wedge `release_owner` for that owner forever.
+/// Conservation is defined against physical drop for the permit; there is no
+/// reason for the grant to be the one value in this module that escapes it.
 #[derive(Debug)]
 pub struct CapacityGrant {
     owner: OwnerIdentity,
@@ -96,6 +103,10 @@ pub struct CapacityGrant {
     /// forever while the redeemer counted an unknown refund — the loss recorded
     /// against the one account that did not lose anything.
     pool: PoolIdentity,
+    /// The issuing pool, so an abandoned grant can refund itself.
+    ledger: Arc<ProcessCapacityPool>,
+    /// Set when `redeem` takes the charge over, so redemption is not a refund.
+    redeemed: bool,
 }
 
 impl CapacityGrant {
@@ -112,6 +123,16 @@ impl CapacityGrant {
     /// The charge identity, which the refund must name.
     pub fn charge(&self) -> PublicationIdentity {
         self.charge
+    }
+}
+
+impl Drop for CapacityGrant {
+    fn drop(&mut self) {
+        // Redemption hands the charge to the permit, which owns the refund from
+        // then on. Only an abandoned grant refunds here.
+        if !self.redeemed {
+            self.ledger.refund(self.owner, self.charge, self.bytes);
+        }
     }
 }
 
@@ -275,10 +296,11 @@ impl ProcessCapacityPool {
         bytes: u64,
     ) -> Result<CapacityGrant, CapacityRefusal> {
         let mut rows = self.rows.lock().expect("capacity ledger mutex");
-        let row = rows.get_mut(&owner).ok_or(CapacityRefusal::Exhausted {
-            requested: bytes,
-            available: 0,
-        })?;
+        // An owner this pool does not have is not a full owner. Reporting
+        // `Exhausted { available: 0 }` for it gave one answer to two different
+        // questions, and the caller cannot tell "your account is spent" from
+        // "you have no account".
+        let row = rows.get_mut(&owner).ok_or(CapacityRefusal::UnknownOwner)?;
         let available = row.limit.saturating_sub(row.charged);
         if bytes > available {
             return Err(CapacityRefusal::Exhausted {
@@ -289,11 +311,14 @@ impl ProcessCapacityPool {
         let charge = PublicationIdentity::fresh();
         row.charged += bytes;
         row.outstanding.insert(charge, bytes);
+        drop(rows);
         Ok(CapacityGrant {
             owner,
             bytes,
             charge,
             pool: self.identity,
+            ledger: Arc::clone(self),
+            redeemed: false,
         })
     }
 
@@ -305,11 +330,17 @@ impl ProcessCapacityPool {
     /// that actually lost capacity would be the one reporting a clean account.
     pub fn redeem(
         self: &Arc<Self>,
-        grant: CapacityGrant,
+        mut grant: CapacityGrant,
     ) -> Result<CapacityPermit, CapacityRefusal> {
         if grant.pool != self.identity {
+            // Left un-redeemed on purpose: the refusal returns the grant's bytes
+            // to the pool that actually charged them, through the grant's own
+            // `Drop`, rather than stranding them because the wrong pool asked.
             return Err(CapacityRefusal::ForeignGrant);
         }
+        // The permit takes the charge over from here, so the grant's `Drop` must
+        // not also refund it.
+        grant.redeemed = true;
         Ok(CapacityPermit {
             owner: grant.owner,
             bytes: grant.bytes,

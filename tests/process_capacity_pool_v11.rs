@@ -327,9 +327,13 @@ fn a_grant_from_another_pool_is_refused_rather_than_honoured() {
         CapacityRefusal::ForeignGrant
     );
 
-    // The issuer still holds the charge, and nobody counted a phantom refund.
-    assert_eq!(issuer.charged(issuer_root), 300);
-    assert_eq!(issuer.outstanding_charges(issuer_root), 1);
+    // The refusal consumed the grant, so its `Drop` returned the bytes to the
+    // pool that charged them. The charge does not survive the refusal and it
+    // does not land in the wrong pool either — the two outcomes that would each
+    // leave one account describing capacity it does not have.
+    assert_eq!(issuer.charged(issuer_root), 0);
+    assert_eq!(issuer.outstanding_charges(issuer_root), 0);
+    assert_eq!(issuer.available(issuer_root), 1_000);
     assert_eq!(issuer.unknown_refunds(), 0);
     assert_eq!(other.unknown_refunds(), 0);
 
@@ -339,8 +343,69 @@ fn a_grant_from_another_pool_is_refused_rather_than_honoured() {
         .redeem(issuer.reserve(issuer_root, 100).expect("headroom"))
         .expect("own grant");
     assert_eq!(permit.release(), 100);
-    assert_eq!(issuer.charged(issuer_root), 300);
+    assert_eq!(issuer.charged(issuer_root), 0);
     assert_eq!(issuer.unknown_refunds(), 0);
+}
+
+/// A grant abandoned before redemption must return its charge.
+///
+/// Found by adversarial review, which reproduced it by execution. `reserve`
+/// charges the row and records the charge as outstanding, and only the PERMIT
+/// had a `Drop` — so a grant dropped on any path between reserve and redeem, a
+/// `?` or an early return or a panic, leaked those bytes permanently with no
+/// refund and no counter, and wedged `release_owner` for that owner forever.
+/// The module's stated invariant is that every charged byte is either held by a
+/// live allocation or refunded exactly once; a grant is neither.
+#[test]
+fn a_grant_abandoned_before_redemption_refunds_itself() {
+    let pool = ProcessCapacityPool::new();
+    let root = pool.root(1_000);
+
+    {
+        let grant = pool.reserve(root, 400).expect("headroom exists");
+        assert_eq!(grant.bytes(), 400);
+        // Charged from the moment it exists, not from redemption.
+        assert_eq!(pool.charged(root), 400);
+        assert_eq!(pool.outstanding_charges(root), 1);
+    }
+
+    // Dropped without redeeming: every byte comes back, exactly once, and the
+    // pool records no anomaly because nothing anomalous happened.
+    assert_eq!(pool.charged(root), 0);
+    assert_eq!(pool.available(root), 1_000);
+    assert_eq!(pool.outstanding_charges(root), 0);
+    assert_eq!(pool.unknown_refunds(), 0);
+
+    // The owner is releasable rather than wedged.
+    let child = pool.child(root, 200).expect("headroom");
+    drop(pool.reserve(child, 50).expect("headroom"));
+    assert_eq!(pool.release_owner(child).expect("nothing outstanding"), 200);
+
+    // Paired positive: redeeming keeps the charge, and the permit owns the
+    // refund from then on, so the grant's own drop must not also refund it.
+    let permit = pool
+        .redeem(pool.reserve(root, 300).expect("headroom"))
+        .expect("own grant");
+    assert_eq!(pool.charged(root), 300, "redemption refunded the charge");
+    assert_eq!(permit.release(), 300);
+    assert_eq!(pool.charged(root), 0);
+    assert_eq!(pool.unknown_refunds(), 0);
+
+    // And a grant refused by a foreign pool returns its bytes to the pool that
+    // charged them rather than stranding them.
+    let other = ProcessCapacityPool::new();
+    let grant = pool.reserve(root, 100).expect("headroom");
+    assert_eq!(
+        other.redeem(grant).expect_err("not this pool's grant"),
+        CapacityRefusal::ForeignGrant
+    );
+    assert_eq!(
+        pool.charged(root),
+        0,
+        "a refused redemption stranded the charge"
+    );
+    assert_eq!(pool.unknown_refunds(), 0);
+    assert_eq!(other.unknown_refunds(), 0);
 }
 
 /// TEST-CAPACITY-INTEGRATION (T069, Slice 4). Reserved name, empty of proof.

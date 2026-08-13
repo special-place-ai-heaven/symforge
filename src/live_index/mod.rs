@@ -15,9 +15,13 @@ mod health_view;
 // freezes for the whole preactivation period, and `introduced_v11_atoms` never
 // names it — the V11 surface is re-exported through `embed`, not through a
 // public lifecycle module. `#[path]` satisfies both: contract file location,
-// unchanged public API. At activation (T060) this declaration is deleted and
-// `lib.rs` gains a private `mod index_lifecycle;`, with the public types
-// re-exported from `embed.rs`. No file moves then.
+// unchanged public-API CENSUS — not unchanged public API. `live_index` is
+// itself public, so these modules and their types ARE reachable by a consumer;
+// the census counts only top-level `pub mod` in `lib.rs`, and that granularity
+// is the contract's, not a claim that nothing was exposed. At activation
+// (T060) this declaration is deleted and `lib.rs` gains a private
+// `mod index_lifecycle;`, with the public types re-exported from `embed.rs`.
+// No file moves then.
 #[path = "../index_lifecycle/mod.rs"]
 pub mod index_lifecycle;
 pub mod knowledge_authority;

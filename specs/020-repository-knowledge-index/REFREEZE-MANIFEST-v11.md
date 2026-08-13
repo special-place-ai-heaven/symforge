@@ -827,7 +827,10 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
     {
       "amendment_id": "F020-V11-A20",
       "contract_clause_ids": [
+        "contracts/knowledge-authority-hygiene.md#v11-lifecycle-acquisition-and-voice-filtering",
         "contracts/lifecycle-acceptance-oracles-v11.md#lifecycle-acceptance-oracles-v11",
+        "contracts/repository-mental-model.md#v11-lifecycle-amendment",
+        "contracts/search-knowledge.md#v11-lifecycle-acquisition",
         "contracts/source-binding-and-state.md#v11-lifecycle-amendment"
       ],
       "plan_task_ids": [

@@ -3384,7 +3384,12 @@ function runVerifiedCommand(spec, runtime = {}) {
   // already fixes, and those two rules drift.
   if (spec.expect_execution) {
     const combined = `${stdout.toString("utf8")}${stderr.toString("utf8")}`;
-    if (/^test .* \.\.\. ignored$/mu.test(combined)) return { ok: false, reason: "case_ignored" };
+    // `ignored\b`, not `ignored$`: `#[ignore = "reason"]` prints
+    // `... ignored, <reason>`, so anchoring at the end never matched the very
+    // shape this guard exists for. The refusal still happened, through the
+    // not-reported branch below, which is how a dead guard survives - it is
+    // named for a case another rule was quietly catching.
+    if (/^test .* \.\.\. ignored\b/mu.test(combined)) return { ok: false, reason: "case_ignored" };
     if (!/^test .* \.\.\. (?:ok|FAILED)$/mu.test(combined)) {
       return { ok: false, reason: "case_not_reported" };
     }

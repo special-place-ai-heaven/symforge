@@ -29,9 +29,9 @@ advisory until an explicit policy action is approved.
 The V10 hygiene, proof, policy, security, and remediation evidence remains applicable
 after strict lifecycle acquisition. `search_knowledge`, `review_knowledge`, map/context
 views, and curation preview acquire lifecycle `Current` for every required selected
-source through one sealed project query lease. If a resolved source is `Loading`,
-`Refreshing`, `Blocked`, `Stopping`, `Gapped`, or verification-overdue, the operation
-returns the exact `SourceRefusal`: `SourceUnavailable` for one source or
+source through one sealed project query lease, or what `Refreshing` retains while no
+mutation permit is outstanding, per F020-V11-A20. `Loading`, `Blocked`, `Stopping`,
+`Gapped`, and verification-overdue return the exact `SourceRefusal`, one source or
 `SelectionUnavailable` with bijective evidence for a selected set. Invalid or
 unauthorized selection retains its indistinguishable `InvalidSelection` form.
 
