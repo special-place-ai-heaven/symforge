@@ -996,7 +996,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/GOAL.md",
       "scope": "feature",
-      "sha256": "b3cc382f6dfa7113c47e1c66b7c907a47a46ced51ad06969e4f8f59309970c97",
+      "sha256": "0a624397a76b28d7cc545d60f765d205366ffaf6d00585fad665f4ccaa8cf382",
       "superseded_by": []
     },
     {
@@ -1100,7 +1100,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/lifecycle-acceptance-oracles-v11.md",
       "scope": "feature",
-      "sha256": "6503955454460f8444600efe8bd11846b8fda69e66aaa6947454874b46ad8e1e",
+      "sha256": "dec6debd34ea49490385016a154186f04bad304222665e36eb722be3a213de2c",
       "superseded_by": []
     },
     {
@@ -1156,7 +1156,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/data-model.md",
       "scope": "feature",
-      "sha256": "acf421dfb6d6ca3354a25b097eecf82b4f275a9799f48bc3509dfb61b8e34371",
+      "sha256": "634612ecbd64797c9e4934670ea803cd7561c1fea70bd4d0e882b02a29aeb2fa",
       "superseded_by": []
     },
     {
@@ -1456,7 +1456,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/spec.md",
       "scope": "feature",
-      "sha256": "f13a86c55a2414ba22b2897747df97e694e534ae7128fc6e3338b84636e9a48a",
+      "sha256": "44141690ff74b9be2eb8bdf4862c42eb7c856b79cb5682a4f234a89823ab533a",
       "superseded_by": []
     },
     {
