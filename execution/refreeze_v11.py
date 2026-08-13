@@ -51,7 +51,9 @@ MAX_APPROVAL_CHAIN_LENGTH = 128
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-AMENDMENT_ID_RE = re.compile(r"^F020-V11-A(?:0[1-9]|1[0-9])$")
+# A01-A20. Stays an exact enumeration rather than \d{2}: a typo'd id must still
+# be rejected, so the ceiling moves deliberately when an amendment is added.
+AMENDMENT_ID_RE = re.compile(r"^F020-V11-A(?:0[1-9]|1[0-9]|20)$")
 REQUIREMENT_ID_RE = re.compile(
     r"^(?:(?:FR|SC)-[0-9]{3}|F020-V11-A(?:0[1-9]|1[0-9]))$"
 )
