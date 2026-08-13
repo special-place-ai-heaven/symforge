@@ -172,7 +172,12 @@ class RefreezeFixture:
             RELEASE_EVIDENCE_REQUIREMENTS_PATH,
             repository_blob(RELEASE_EVIDENCE_REQUIREMENTS_PATH),
         )
-        baseline_lines = [f"baseline clause {index}\n" for index in range(1, 20)]
+        # 1..20, matching the exact A01-A20 set `_validate_amendments` requires.
+        # A20 raised that ceiling and this fixture was not moved with it, so
+        # every test here failed on AMENDMENT_COUNT_INVALID before reaching the
+        # check it was written for - 116 failures, none of them about the thing
+        # each test names.
+        baseline_lines = [f"baseline clause {index}\n" for index in range(1, 21)]
         self.write(f"{FEATURE_ROOT}/spec.md", "".join(baseline_lines).encode())
         self.write(DESIGN_PATH, b"cleared lifecycle design\n")
         self.write(CONTEXT_PATH, b"bound Feature 020 context\n")
@@ -182,7 +187,7 @@ class RefreezeFixture:
         self.baseline_tree = self.git_text("rev-parse", "HEAD^{tree}")
 
         target_lines = []
-        for index in range(1, 20):
+        for index in range(1, 21):
             amendment_id = f"F020-V11-A{index:02}"
             regressions = refreeze_v11.EXPECTED_AMENDMENT_MAPPINGS[amendment_id][
                 "regression_ids"
