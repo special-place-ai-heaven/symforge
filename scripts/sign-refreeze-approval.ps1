@@ -33,10 +33,17 @@ Write-Host "signature binds. If they do not match what the agent told you, stop.
 Write-Host ""
 
 # Offer the keys that actually exist, so there is nothing to remember.
+# This used to match `id_*` only, so a key named anything else -- vps_ai_ed25519,
+# say -- was invisible and had to be typed by hand. A private key is identified
+# by having a `.pub` sibling, not by its name.
 $candidates = @()
 if (Test-Path "$HOME\.ssh") {
     $candidates = Get-ChildItem "$HOME\.ssh" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^id_' -and $_.Name -notmatch '\.pub$' } |
+        Where-Object {
+            $_.Extension -ne '.pub' -and
+            $_.Name -notin @('known_hosts', 'known_hosts.old', 'config', 'authorized_keys') -and
+            (Test-Path "$($_.FullName).pub")
+        } |
         Select-Object -ExpandProperty FullName
 }
 
@@ -86,12 +93,18 @@ $allowed = Join-Path $ApprovalDir 'allowed_signers'
 if (Test-Path $allowed) {
     $identity = (Get-Content $allowed -First 1).Split(' ')[0]
     Write-Host "Verifying against $allowed as $identity ..." -ForegroundColor Cyan
-    Get-Content $approval -Raw -Encoding Byte | Out-Null
-    & ssh-keygen -Y verify -f $allowed -I $identity -n $Namespace -s $signature < $approval
-    if ($LASTEXITCODE -eq 0) {
+    # ssh-keygen reads the signed message from stdin. `< $approval` is a PARSE
+    # error in PowerShell -- '<' is reserved -- so the earlier spelling meant this
+    # whole script failed to parse and never ran once. Piping would also be wrong:
+    # it would re-encode the bytes the signature covers. Start-Process feeds the
+    # file itself.
+    $verification = Start-Process -FilePath 'ssh-keygen' -NoNewWindow -Wait -PassThru `
+        -ArgumentList @('-Y', 'verify', '-f', $allowed, '-I', $identity, '-n', $Namespace, '-s', $signature) `
+        -RedirectStandardInput $approval
+    if ($verification.ExitCode -eq 0) {
         Write-Host "VERIFIED." -ForegroundColor Green
     } else {
-        Write-Host "VERIFICATION FAILED (exit $LASTEXITCODE)." -ForegroundColor Red
+        Write-Host "VERIFICATION FAILED (exit $($verification.ExitCode))." -ForegroundColor Red
         Write-Host "The signature exists but does not verify. Tell the agent before proceeding."
         exit 1
     }
