@@ -109,10 +109,42 @@ def main() -> int:
         print(f"  {label}\n    {old}\n -> {new}")
         text = text.replace(old, new, 1)
 
+    # The amendment set digest covers every amendment INCLUDING its clause
+    # hashes, so it moves whenever a clause does. Computed by the verifier's own
+    # code rather than reimplemented here: a second implementation of a digest is
+    # a second thing that can disagree with the check it is meant to satisfy.
+    sys.path.insert(0, str(root / "execution"))
+    import refreeze_v11 as verifier  # noqa: PLC0415
+
+    git_objects = verifier.GitObjects(root, git_executable=None)
+    head = git_objects.resolve_commit("HEAD")
+    committed = verifier._parse_sentinel_json(
+        git_objects.read_blob(head, verifier.MANIFEST_PATH),
+        verifier.MANIFEST_START,
+        verifier.MANIFEST_END,
+    )
+    if not replacements:
+        _, amendment_digest = verifier._validate_amendments(
+            git_objects,
+            committed["amendments"],
+            baseline_commit=committed["baseline"]["commit"],
+            target_commit=head,
+        )
+        if amendment_digest != manifest["amendment_set_id"]:
+            print(
+                f"\n  amendment_set_id\n    {manifest['amendment_set_id']}\n"
+                f" -> {amendment_digest}"
+            )
+            if arguments.write:
+                text = text.replace(manifest["amendment_set_id"], amendment_digest, 1)
+                manifest_path.write_text(text, encoding="utf-8", newline="")
+                print("Rewrote the amendment set digest. Commit it, then run this again.")
+                return 0
+
     if replacements and arguments.write:
         manifest_path.write_text(text, encoding="utf-8", newline="")
         print(f"\nRewrote {len(replacements)} hash(es) in {MANIFEST}.")
-        print("Commit it, then run this again to repin the attestation.")
+        print("Commit it, then run this again for the amendment set digest.")
         return 0
 
     # The attestation pins the manifest, so it can only be repinned once the
