@@ -20,6 +20,6 @@ Knowledge evidence:
   source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e publication=<gen> content=<gen> target=symbol:src/code_target.rs:tally:fn:6
   counts total=3 shown=3 overflow=0 ambiguous=0 missing=0
   coverage bridge=complete authority=complete
-  1. snapshots/batch_rename.tally.dryrun.snap:7 bytes=250..255 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=7 resolution=resolved_exact lifecycle=active voice=unknown
-  2. snapshots/find_references.tally.snap:2 bytes=249..254 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=14 resolution=resolved_exact lifecycle=active voice=unknown
-  3. snapshots/get_symbol_context.tally.snap:8 bytes=231..236 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=18 resolution=resolved_exact lifecycle=active voice=unknown
+  1. snapshots/batch_rename.tally.dryrun.snap:7 bytes=250..255 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=7 resolution=resolved_exact lifecycle=unknown voice=unknown
+  2. snapshots/find_references.tally.snap:2 bytes=249..254 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=14 resolution=resolved_exact lifecycle=unknown voice=unknown
+  3. snapshots/get_symbol_context.tally.snap:8 bytes=231..236 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=18 resolution=resolved_exact lifecycle=unknown voice=unknown
