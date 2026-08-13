@@ -723,12 +723,15 @@ impl SymForgeServer {
     /// index is not `Ready` (loading/empty), nothing is appended — the footer is
     /// best-effort and never blocks a successful edit response.
     fn append_impact_footer(&self, output: &mut String, path: &str) {
-        let guard = self.index.read();
+        // T046: one capture — the dependency counts and the co-change rows in
+        // one footer describe the same publication.
+        let generation = self.index.published_generation();
+        let guard = &generation.live;
         if !matches!(guard.index_state(), IndexState::Ready) {
             return;
         }
-        let temporal = self.index.git_temporal();
-        let (deps, cochanges) = format::edit_impact_summary(&guard, &temporal, path);
+        let temporal = &generation.code_signals.temporal;
+        let (deps, cochanges) = format::edit_impact_summary(guard, temporal, path);
         output.push('\n');
         output.push_str(&format::impact_footer(deps, &cochanges));
     }

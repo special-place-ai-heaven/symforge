@@ -46,7 +46,58 @@ envelope oracle; clippy all targets denied warnings clean; embed 1332 passed
 0 failed; fmt clean. The checker still reports the expected `writers`-only
 mismatch; the single regeneration waits for PR 2's end.
 
-## T044 — the authority choice is explicit (PR 2)
+## T046 — per-caller single capture, and the one regeneration (PR 2)
+
+Every approved site now takes ONE `published_generation()` capture at entry and
+reads every axis — live rows, freshness, health counts, temporal, outline —
+off that capture, which is possible because every accessor already resolves
+through the bundle; the defect was per-call re-loading, not field scatter.
+
+Migrated: `health_for_runtime` and `health_compact_for_runtime` (four loads
+each → one), daemon `project_health` (freshness now describes the same
+publication as the counts beside it), the daemon call-evidence block and
+`local_project_evidence` (generation number, load_source, counts, and state
+all off `current_generation()`; the atomic counter is no longer a side
+channel), `search_symbols`, `search_text` (handler + renderer share the
+caller's capture through a new parameter), `search_files` (13 loads → 1),
+`find_references` (11 → 1), `append_impact_footer`, `edit_plan`, and
+`analyze_file_impact`, whose capture is taken BEFORE the sidecar await so the
+co-change footer describes a publication the impact result actually saw.
+`terminal_dispositions` was re-rooted from the raw `live` field onto the
+bundle, closing the store-order window where new content could pair with the
+old publication. The write-only `published_repo_outline` ArcSwap field was
+deleted after re-verifying zero loads on the current HEAD; the accessor and
+both its tests read the bundle and keep working.
+
+Left alone, by prior agreement: the read-MUTATE-read publish paths, watcher
+reconcile, Tier-3 mutex-held store functions, `what_changed` — same class as
+the search tools, recorded as OUT of this PR rather than silently expanded —
+and the `scout_plan` / `source_exclusions` / `project_state_dir` ArcSwaps,
+which the bundle has no fields for.
+
+Behavior neutrality: the full library suite passed 3166 to 0 with ZERO test
+adjustments — the RISK-B worry that tests pinned torn interleavings did not
+materialize, and the Slice-0 root-split oracle got strictly stronger and
+stayed green.
+
+**The one regeneration — prediction versus measurement.** The PR 2
+first-commit decision predicted FIVE categories dirty. Measured at the end:
+FOUR moved, `ccr` byte-identical, because CCR was trimmed out of T045 batch
+two by review. The regen updates exactly the four that moved:
+
+| category | before | after |
+|---|---|---|
+| writers | `5137cd7b…3af7dd` | `bafa517a…daeee1` |
+| callbacks | `48938137…97e8b22` | `026c548b…fe577b` |
+| publication_roots | `e37555ad…61e82d` | `b90b8d88…190b54` |
+| cache | `4eb220e8…5c18a38` | `6fb4cace…14fa095` |
+| ccr | `8ad77748…84ad246` | UNCHANGED |
+
+The checker's own second-order pin (`FROZEN_DIGESTS.retirement_records`) was
+regenerated through its emit opt-in the same way: old `4c118fab…76a6fb`, new
+`313dceda…9c21bf`. Checker reports OK after both.
+
+## T044 — the authority choice is explicit (PR 2)## T044 — the authority choice is explicit (PR 2)
 
 Observed RED first: both oracles failed `E0432` naming exactly the three new
 seam items and nothing else. Then the seam, in `src/protocol/read_gate.rs`,

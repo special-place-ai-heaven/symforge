@@ -3407,6 +3407,9 @@ fn apply_path_predicate_filter(
 #[allow(clippy::too_many_arguments)]
 fn render_search_text_output(
     server: &SymForgeServer,
+    // T046: the caller's entry capture — banner and parse-state come off the
+    // SAME publication that produced the rows, not fresh loads taken here.
+    generation: &std::sync::Arc<crate::live_index::store::PublishedGeneration>,
     result: Result<search::TextSearchResult, search::TextSearchError>,
     query: Option<&str>,
     structural: bool,
@@ -3419,7 +3422,7 @@ fn render_search_text_output(
 ) -> String {
     let envelope = match &result {
         Ok(result) if !result.files.is_empty() => {
-            let guard = server.index.read();
+            let guard = Arc::clone(&generation.live);
             Some(search_format::format_search_envelope(
                 &search_text_match_type_label(
                     structural,
@@ -3429,7 +3432,7 @@ fn render_search_text_output(
                     auto_corrected_regex,
                     options.ranked,
                 ),
-                search_format::SourceAuthority::from_freshness(&server.index.freshness_status()),
+                search_format::SourceAuthority::from_freshness(&generation.freshness),
                 search_parse_state_for_paths(
                     &guard,
                     result.files.iter().map(|file| file.path.as_str()),
@@ -5309,8 +5312,12 @@ impl SymForgeServer {
                 est, with_co
             );
         }
+        // T046: captured BEFORE the sidecar await — the co-change footer after
+        // the await uses THIS temporal, not a fresh load that could describe a
+        // publication the impact result never saw.
+        let generation = self.index.published_generation();
         {
-            let guard = self.index.read();
+            let guard = &generation.live;
             loading_guard!(guard);
         }
 
@@ -5332,7 +5339,7 @@ impl SymForgeServer {
 
         // Append co-changes if requested
         if params.0.include_co_changes.unwrap_or(false) {
-            let temporal = self.index.git_temporal();
+            let temporal = Arc::clone(&generation.code_signals.temporal);
             match temporal.state {
                 crate::live_index::git_temporal::GitTemporalState::Ready => {
                     let limit = params.0.co_changes_limit.unwrap_or(10) as usize;
@@ -5388,6 +5395,10 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn search_symbols(&self, params: Parameters<SearchSymbolsInput>) -> String {
+        // T046: one capture of the published generation at entry; rows,
+        // trust banner, parse-state, and temporal data all read off it so a
+        // publication landing mid-render cannot mix generations in one response.
+        let generation = self.index.published_generation();
         let query_str = params.0.query.as_deref().unwrap_or("").trim();
         let is_browse = query_str.is_empty();
         if is_browse && params.0.kind.is_none() && params.0.path_prefix.is_none() {
@@ -5409,7 +5420,7 @@ impl SymForgeServer {
             Err(message) => return message,
         };
         let result = {
-            let guard = self.index.read();
+            let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
             search::search_symbols_with_options(
                 &guard,
@@ -5419,7 +5430,7 @@ impl SymForgeServer {
             )
         };
         let hidden_noise_count = {
-            let guard = self.index.read();
+            let guard = Arc::clone(&generation.live);
             hidden_search_symbols_noise_count(
                 &guard,
                 query_str,
@@ -5435,10 +5446,10 @@ impl SymForgeServer {
         let envelope = if result.hits.is_empty() {
             None
         } else {
-            let guard = self.index.read();
+            let guard = Arc::clone(&generation.live);
             Some(search_format::format_search_envelope(
                 search_symbols_match_type_label(&result, is_browse),
-                search_format::SourceAuthority::from_freshness(&self.index.freshness_status()),
+                search_format::SourceAuthority::from_freshness(&generation.freshness),
                 search_parse_state_for_paths(
                     &guard,
                     result.hits.iter().map(|hit| hit.path.as_str()),
@@ -5466,7 +5477,7 @@ impl SymForgeServer {
             && result.hits.len() < options.result_limit.get() / 2
         {
             let text_fallback = {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 loading_guard!(guard);
                 let mut text_options = search::TextSearchOptions::for_current_code_search();
                 text_options.path_scope = options.path_scope.clone();
@@ -5745,6 +5756,10 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn search_text(&self, params: Parameters<SearchTextInput>) -> String {
+        // T046: one capture of the published generation at entry; rows,
+        // trust banner, parse-state, and temporal data all read off it so a
+        // publication landing mid-render cannot mix generations in one response.
+        let generation = self.index.published_generation();
         if let Some(result) = self.proxy_tool_call("search_text", &params.0).await {
             return result;
         }
@@ -5775,7 +5790,7 @@ impl SymForgeServer {
                 Err(message) => return message,
             };
             let mut result = {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 loading_guard!(guard);
                 let mut result = search::search_structural(&guard, pattern, &options);
                 resolve_text_search_enclosing_symbols(&guard, &mut result);
@@ -5789,6 +5804,7 @@ impl SymForgeServer {
             maybe_compact_text_search_result(&mut result, pattern);
             let output = render_search_text_output(
                 self,
+                &generation,
                 result,
                 Some(pattern),
                 true,
@@ -5841,7 +5857,7 @@ impl SymForgeServer {
         // Extract churn scores from GitTemporalIndex BEFORE acquiring the
         // LiveIndex read lock to avoid lock ordering issues.
         if options.ranked {
-            let git_temporal = self.index.git_temporal();
+            let git_temporal = Arc::clone(&generation.code_signals.temporal);
             if matches!(
                 git_temporal.state,
                 crate::live_index::git_temporal::GitTemporalState::Ready
@@ -5858,7 +5874,7 @@ impl SymForgeServer {
         }
 
         let mut result = {
-            let guard = self.index.read();
+            let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
             let mut r = search::search_text_with_options(
                 &guard,
@@ -5897,7 +5913,7 @@ impl SymForgeServer {
                 && let Some(fixed) = fix_common_double_escapes(query)
             {
                 let mut retry_result = {
-                    let guard = self.index.read();
+                    let guard = Arc::clone(&generation.live);
                     loading_guard!(guard);
                     let mut r = search::search_text_with_options(
                         &guard,
@@ -5926,6 +5942,7 @@ impl SymForgeServer {
                 {
                     let mut output = render_search_text_output(
                         self,
+                        &generation,
                         retry_result,
                         Some(fixed.as_str()),
                         false,
@@ -5954,6 +5971,7 @@ impl SymForgeServer {
         maybe_compact_text_search_result(&mut result, &compaction_query);
         let output = render_search_text_output(
             self,
+            &generation,
             result,
             params.0.query.as_deref(),
             false,
@@ -6080,6 +6098,10 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn search_files(&self, params: Parameters<SearchFilesInput>) -> String {
+        // T046: one capture of the published generation at entry; rows,
+        // trust banner, parse-state, and temporal data all read off it so a
+        // publication landing mid-render cannot mix generations in one response.
+        let generation = self.index.published_generation();
         if let Some(result) = self.proxy_tool_call("search_files", &params.0).await {
             return result;
         }
@@ -6103,7 +6125,7 @@ impl SymForgeServer {
                 return "search_files with resolve=true requires a non-empty `query`.".to_string();
             }
             let view = {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 loading_guard!(guard);
                 guard.capture_search_files_resolve_view_with_noise(
                     &params.0.query,
@@ -6114,19 +6136,17 @@ impl SymForgeServer {
             let hidden_noise_count = if include_vendor && include_personal_tooling {
                 0
             } else {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 let unfiltered = guard.capture_search_files_resolve_view(&params.0.query);
                 search_files_resolve_candidate_count(&unfiltered)
                     .saturating_sub(search_files_resolve_candidate_count(&view))
             };
             let envelope = match &view {
                 SearchFilesResolveView::Resolved { path } => {
-                    let guard = self.index.read();
+                    let guard = Arc::clone(&generation.live);
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_freshness(
-                            &self.index.freshness_status(),
-                        ),
+                        search_format::SourceAuthority::from_freshness(&generation.freshness),
                         search_parse_state_for_paths(&guard, std::iter::once(path.as_str())),
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -6142,9 +6162,7 @@ impl SymForgeServer {
                     // parse state honestly instead of the misleading "parsed".
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_freshness(
-                            &self.index.freshness_status(),
-                        ),
+                        search_format::SourceAuthority::from_freshness(&generation.freshness),
                         "metadata-only (not parsed)",
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -6160,12 +6178,10 @@ impl SymForgeServer {
                     overflow_count,
                     ..
                 } => {
-                    let guard = self.index.read();
+                    let guard = Arc::clone(&generation.live);
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_freshness(
-                            &self.index.freshness_status(),
-                        ),
+                        search_format::SourceAuthority::from_freshness(&generation.freshness),
                         search_parse_state_for_paths(
                             &guard,
                             matches.iter().map(std::string::String::as_str),
@@ -6223,7 +6239,7 @@ impl SymForgeServer {
         // Deprecated since v7.x: prefer `rank_by="path+cochange"` with `anchor_path`.
         // Keep this compatibility path behavior unchanged for one release cycle.
         if let Some(ref target_path) = params.0.changed_with {
-            let temporal = self.index.git_temporal();
+            let temporal = Arc::clone(&generation.code_signals.temporal);
             match temporal.state {
                 crate::live_index::git_temporal::GitTemporalState::Ready => {}
                 crate::live_index::git_temporal::GitTemporalState::Unavailable(ref reason) => {
@@ -6273,7 +6289,7 @@ impl SymForgeServer {
                                 hits: weak_hits,
                             });
                         let envelope = {
-                            let guard = self.index.read();
+                            let guard = Arc::clone(&generation.live);
                             search_format::format_search_envelope(
                                 "weak heuristic (git-temporal coupling)",
                                 search_format::SourceAuthority::never_collapse(
@@ -6328,7 +6344,7 @@ impl SymForgeServer {
                     hits,
                 });
                 let envelope = {
-                    let guard = self.index.read();
+                    let guard = Arc::clone(&generation.live);
                     search_format::format_search_envelope(
                         "heuristic (git-temporal coupling)",
                         search_format::SourceAuthority::never_collapse(
@@ -6383,7 +6399,7 @@ impl SymForgeServer {
             .then(|| self.capture_project_state_dir())
             .flatten();
         let mut view = {
-            let guard = self.index.read();
+            let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
             let cochange_resolution = if rank_by_path_cochange {
                 match params.0.anchor_path.as_deref() {
@@ -6590,7 +6606,7 @@ impl SymForgeServer {
                 overflow_count,
                 ..
             } => {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 let scope = match params.0.current_file.as_deref() {
                     Some(current_file) => {
                         format!("ranked indexed file paths; current file boost `{current_file}`")
@@ -6613,9 +6629,7 @@ impl SymForgeServer {
                             "current index + optional frecency history",
                         )
                     } else {
-                        search_format::SourceAuthority::from_freshness(
-                            &self.index.freshness_status(),
-                        )
+                        search_format::SourceAuthority::from_freshness(&generation.freshness)
                     },
                     search_parse_state_for_paths(&guard, hits.iter().map(|hit| hit.path.as_str())),
                     &search_completeness_label(*overflow_count, hidden_noise_count),
@@ -6981,7 +6995,13 @@ impl SymForgeServer {
         project_root: Option<PathBuf>,
         quarantine_window: format::QuarantineWindow,
     ) -> String {
-        let published = self.index.published_state();
+        // T046: ONE capture of the published set at entry; every axis of this
+        // report — health, live, temporal, source rows — reads off it, so a
+        // publication landing mid-render cannot mix generations inside one
+        // user-visible health report.
+        let source_set = self.index.published_source_set();
+        let generation = source_set.current_generation();
+        let published = Arc::clone(&generation.health);
         // Capture before `session_id` is consumed: a `Some` session id means the
         // report is served through a daemon session (membership authority
         // applies); local in-process reports carry `None`.
@@ -7051,14 +7071,17 @@ impl SymForgeServer {
         // Append git temporal summary.
         result.push('\n');
         result.push_str(&format::git_temporal_health_line(
-            &self.index.git_temporal(),
+            &generation.code_signals.temporal,
         ));
 
         let capabilities = {
             let repo_root = self.capture_repo_root();
             let project_state = self.capture_project_state_dir();
-            let guard = self.index.read();
-            capability_status_report(&guard, repo_root.as_deref(), project_state.as_ref())
+            capability_status_report(
+                &generation.live,
+                repo_root.as_deref(),
+                project_state.as_ref(),
+            )
         };
         result.push('\n');
         result.push_str(&capabilities.full_text());
@@ -7077,8 +7100,7 @@ impl SymForgeServer {
 
         // Feature 020 repository-knowledge health (M-001): manifest, dispositions,
         // source set, bridge, temporal, authority hygiene, plus source-binding/
-        // runtime state. All read from already-published state; nothing recomputed.
-        let source_set = self.index.published_source_set();
+        // runtime state. All read from the entry capture; nothing recomputed.
         let rk_placement = self.capture_state_placement();
         let rk_root = self.capture_repo_root();
         let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
@@ -7159,7 +7181,10 @@ impl SymForgeServer {
         session_id: Option<String>,
         project_root: Option<PathBuf>,
     ) -> String {
-        let published = self.index.published_state();
+        // T046: same single-capture shape as health_for_runtime.
+        let source_set = self.index.published_source_set();
+        let generation = source_set.current_generation();
+        let published = Arc::clone(&generation.health);
         let session_is_daemon = session_id.is_some();
         let runtime_status =
             self.runtime_status_for(&published, mode, project_id, session_id, project_root);
@@ -7212,7 +7237,7 @@ impl SymForgeServer {
             }
         }
 
-        let git_temporal = format::git_temporal_health_line(&self.index.git_temporal());
+        let git_temporal = format::git_temporal_health_line(&generation.code_signals.temporal);
         let git_temporal_summary = git_temporal
             .lines()
             .next()
@@ -7226,8 +7251,11 @@ impl SymForgeServer {
         let capabilities = {
             let repo_root = self.capture_repo_root();
             let project_state = self.capture_project_state_dir();
-            let guard = self.index.read();
-            capability_status_report(&guard, repo_root.as_deref(), project_state.as_ref())
+            capability_status_report(
+                &generation.live,
+                repo_root.as_deref(),
+                project_state.as_ref(),
+            )
         };
         result.push('\n');
         result.push_str(&capabilities.compact_text());
@@ -7244,8 +7272,8 @@ impl SymForgeServer {
         result.push('\n');
         result.push_str(&curation_health);
 
-        // Feature 020 repository-knowledge health (M-001), compact form.
-        let source_set = self.index.published_source_set();
+        // Feature 020 repository-knowledge health (M-001), compact form. Reads
+        // from the entry capture.
         let rk_placement = self.capture_state_placement();
         let rk_root = self.capture_repo_root();
         let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
@@ -7505,8 +7533,12 @@ impl SymForgeServer {
         &self,
     ) -> Option<crate::protocol::result_status::ProjectEvidence> {
         let root = self.capture_repo_root();
-        let published = self.index.published_state();
-        let load_source = self.index.read().load_source().label().to_string();
+        // T046: one capture; generation, load_source, counts, and index_state
+        // all describe the same publication. The atomic counter is not a
+        // freshness side channel.
+        let generation = self.index.published_generation();
+        let published = Arc::clone(&generation.health);
+        let load_source = generation.live.load_source().label().to_string();
         Some(crate::protocol::result_status::ProjectEvidence {
             project_id: root
                 .as_deref()
@@ -7514,7 +7546,7 @@ impl SymForgeServer {
                 .unwrap_or_else(|| "unbound".to_string()),
             project_name: self.project_name.clone(),
             canonical_root: root.map(|r| r.display().to_string().replace('\\', "/")),
-            generation: self.index.current_project_generation(),
+            generation: generation.project_generation,
             index_state: published.status_label().to_string(),
             load_source,
             index_files: published.file_count,
@@ -8884,11 +8916,10 @@ impl SymForgeServer {
                         return format::enforce_token_budget(with_warning, max_tokens);
                     }
                 }
-                // Suggest similar files from the index
-                let suggestions = {
-                    let guard = self.index.read();
-                    suggest_similar_files(&guard, &input.path)
-                };
+                // Suggest similar files from the SAME publication that produced
+                // the miss above — a fresh read() here could suggest from a
+                // different generation than the one that said not-found (T046).
+                let suggestions = suggest_similar_files(&generation.live, &input.path);
                 format::not_found_file_with_suggestions(&input.path, &suggestions)
             }
         }
@@ -9036,6 +9067,10 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn find_references(&self, params: Parameters<FindReferencesInput>) -> String {
+        // T046: one capture of the published generation at entry; rows,
+        // trust banner, parse-state, and temporal data all read off it so a
+        // publication landing mid-render cannot mix generations in one response.
+        let generation = self.index.published_generation();
         if let Some(result) = self.proxy_tool_call("find_references", &params.0).await {
             return result;
         }
@@ -9050,7 +9085,7 @@ impl SymForgeServer {
         if let Some(path) = input.path.as_deref() {
             let repo_root = self.capture_repo_root();
             let degraded = {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 loading_guard!(guard);
                 admission_tier_degradation_for_path(
                     &guard,
@@ -9068,17 +9103,17 @@ impl SymForgeServer {
 
         if mode == "implementations" {
             let view = {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 loading_guard!(guard);
                 guard.capture_implementations_view(&input.name, input.direction.as_deref())
             };
             let cap = input.limit.unwrap_or(200).min(500);
             let limits = format::OutputLimits::new(cap, cap);
             let envelope = if !view.entries.is_empty() {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 Some(search_format::format_search_envelope(
                     find_references_match_type_label(input, mode),
-                    search_format::SourceAuthority::from_freshness(&self.index.freshness_status()),
+                    search_format::SourceAuthority::from_freshness(&generation.freshness),
                     implementations_parse_state_for_paths(&guard, &view),
                     &implementations_completeness_label(&view, &limits),
                     &find_references_scope_summary(input, mode),
@@ -9089,7 +9124,7 @@ impl SymForgeServer {
             };
             let result = format::implementations_result_view(&view, &input.name, &limits);
             if view.entries.is_empty() {
-                let guard = self.index.read();
+                let guard = Arc::clone(&generation.live);
                 let is_concrete = guard.all_files().any(|(_, file)| {
                     file.symbols.iter().any(|s| {
                         s.name == input.name
@@ -9134,7 +9169,7 @@ impl SymForgeServer {
             format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(10));
         let collect_qualified_usages = should_collect_qualified_usages(input);
         let (result, indexed_ranges, qualified_usages) = {
-            let guard = self.index.read();
+            let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
             if let Some(path) = input.path.as_deref() {
                 (
@@ -9190,7 +9225,7 @@ impl SymForgeServer {
                 // claiming "full for current scope" over an unscanned file.
                 let tier2_disclosure = {
                     let repo_root = self.capture_repo_root();
-                    let guard = self.index.read();
+                    let guard = Arc::clone(&generation.live);
                     let candidates = guard.oversized_metadata_only_files();
                     tier2_reference_disclosure(
                         &candidates,
@@ -9200,7 +9235,7 @@ impl SymForgeServer {
                     )
                 };
                 let envelope = if !view.files.is_empty() {
-                    let guard = self.index.read();
+                    let guard = Arc::clone(&generation.live);
                     let mut completeness =
                         find_references_completeness_label(&view, &limits, input.kind.as_deref());
                     if tier2_disclosure.is_some() {
@@ -9208,9 +9243,7 @@ impl SymForgeServer {
                     }
                     Some(search_format::format_search_envelope(
                         find_references_match_type_label(input, mode),
-                        search_format::SourceAuthority::from_freshness(
-                            &self.index.freshness_status(),
-                        ),
+                        search_format::SourceAuthority::from_freshness(&generation.freshness),
                         search_parse_state_for_paths(
                             &guard,
                             view.files.iter().map(|file| file.file_path.as_str()),
@@ -9242,7 +9275,7 @@ impl SymForgeServer {
                     // it is bounded. A reverse symbol-name index would make it
                     // O(1) if this ever shows on a hot path.
                     let def_paths = {
-                        let guard = self.index.read();
+                        let guard = Arc::clone(&generation.live);
                         symbol_candidate_paths(&guard, &input.name)
                     };
                     if def_paths.len() > 1 {
@@ -9273,7 +9306,7 @@ impl SymForgeServer {
                 if view.files.is_empty() {
                     let text_options = search::TextSearchOptions::for_current_code_search();
                     let text_result = {
-                        let guard = self.index.read();
+                        let guard = Arc::clone(&generation.live);
                         search::search_text_with_options(
                             &guard,
                             Some(&input.name),
@@ -10624,9 +10657,11 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
-        let guard = self.index.read();
+        // T046: one capture — plan structure and co-change data agree.
+        let generation = self.index.published_generation();
+        let guard = Arc::clone(&generation.live);
         loading_guard!(guard);
-        let temporal = self.index.git_temporal();
+        let temporal = Arc::clone(&generation.code_signals.temporal);
         let output = crate::protocol::edit_plan::plan_edit(&guard, &temporal, &params.0.target);
         self.session_context.record_summary_output(
             "edit_plan",
