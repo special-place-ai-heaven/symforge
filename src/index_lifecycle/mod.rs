@@ -5,10 +5,14 @@
 //! this module samples separate fields to infer permission: a mutation is
 //! authorized by one whole, exact, consumed authority or it is refused.
 //!
-//! **Nothing in production calls this module.** `grep -rn index_lifecycle src/`
-//! returns no hit outside it other than its own declaration in
-//! `live_index/mod.rs` — a `#[path]` attribute and the `pub mod` line it
-//! decorates. Neither is a call edge.
+//! **Nothing in production calls this module.** The darkness property is about
+//! CALL EDGES, not grep hits: no code outside this directory names an item in
+//! it. The module's declaration in `live_index/mod.rs` — a `#[path]` attribute
+//! and the `pub mod` line it decorates — is not a call edge, and since T043 the
+//! doc comments of `src/lifecycle_identity.rs` mention this directory by name
+//! in prose, which is not one either. An earlier version of this paragraph
+//! stated the property as "grep returns no hit outside", which prose alone now
+//! falsifies; T051 formalizes the call-edge form into an executing test.
 //!
 //! An earlier version of this comment said "production integration is limited to
 //! the watcher/store mutation seam (T028)", which read as though T028 had wired

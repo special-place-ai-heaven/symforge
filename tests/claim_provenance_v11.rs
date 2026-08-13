@@ -1,3 +1,4 @@
+#![cfg(feature = "server")]
 //! Feature 020 V11, T041 — claim attribution and the `OperationContractV1`
 //! Cartesian negatives.
 //!
@@ -20,8 +21,8 @@
 use symforge::live_index::knowledge_bridge::DerivedLimitKind;
 use symforge::protocol::format::claim_provenance::{
     AtomicAuthority, Claim, ClaimInput, ClaimProvenance, ComparisonRelation, EvaluationProvenance,
-    ObservationLease, OperationKind, OperationReceipt, OutputCoverage, PhysicalRootLease,
-    RetryAdvice, SourceRefusalKind,
+    ObservationLease, ObservationTime, OperationKind, OperationReceipt, OutputCoverage,
+    PhysicalRootLease, RetryAdvice, SourceRefusalKind,
 };
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
@@ -85,9 +86,8 @@ fn every_authority_kind_reports_its_own_name_and_a_distinct_identity() {
         "all four authority kinds must be distinguishable by name: {names:?}"
     );
 
-    let mut identities: Vec<_> = authorities.iter().map(|a| a.identity()).collect();
-    identities.sort_unstable();
-    identities.dedup();
+    let identities: std::collections::HashSet<_> =
+        authorities.iter().map(|a| a.identity()).collect();
     assert_eq!(
         identities.len(),
         4,
@@ -101,7 +101,7 @@ fn every_authority_kind_reports_its_own_name_and_a_distinct_identity() {
 fn a_comparison_admits_exactly_two_authorities() {
     let lease = a_lease("root-a");
     let provenance = ClaimProvenance::comparison(
-        an_operation(OperationKind::Comparison),
+        an_operation(OperationKind::SearchText),
         ComparisonRelation::SameContent,
         a_generation(&lease),
         a_generation(&lease),
@@ -119,8 +119,9 @@ fn a_comparison_admits_exactly_two_authorities() {
 
 #[test]
 fn a_derivation_refuses_an_empty_input_set() {
-    let refusal = ClaimProvenance::derivation(an_operation(OperationKind::Derivation), Vec::new())
-        .expect_err("a derivation with no inputs proves nothing and must refuse");
+    let refusal =
+        ClaimProvenance::derivation(an_operation(OperationKind::SearchSymbols), Vec::new())
+            .expect_err("a derivation with no inputs proves nothing and must refuse");
 
     assert_eq!(refusal.kind(), SourceRefusalKind::InvalidSelection);
 }
@@ -133,7 +134,7 @@ fn a_derivation_is_n_ary_above_one() {
             .map(|_| ClaimInput::Authority(a_generation(&lease)))
             .collect();
         let provenance =
-            ClaimProvenance::derivation(an_operation(OperationKind::Derivation), inputs)
+            ClaimProvenance::derivation(an_operation(OperationKind::SearchSymbols), inputs)
                 .unwrap_or_else(|_| panic!("arity {arity} must be admitted"));
         assert_eq!(
             provenance.authority_count(),
@@ -147,8 +148,9 @@ fn a_derivation_is_n_ary_above_one() {
 fn a_selected_aggregate_refuses_a_selection_without_its_generation() {
     let lease = a_lease("root-a");
     let refusal = ClaimProvenance::selected_aggregate(
-        an_operation(OperationKind::SelectedAggregate),
+        an_operation(OperationKind::SearchText),
         vec![lease.selection_receipt("project-a")],
+        Vec::new(),
         Vec::new(),
     )
     .expect_err("a selection with no matching captured generation breaks the bijection");
@@ -165,7 +167,7 @@ fn a_selected_aggregate_refuses_an_extra_unselected_generation() {
     // mutation: disabling the length check alone survived the original suite.
     let lease = a_lease("root-a");
     let refusal = ClaimProvenance::selected_aggregate(
-        an_operation(OperationKind::SelectedAggregate),
+        an_operation(OperationKind::SearchText),
         vec![lease.selection_receipt("project-a")],
         vec![
             (
@@ -177,6 +179,7 @@ fn a_selected_aggregate_refuses_an_extra_unselected_generation() {
                 lease.admit_generation().expect("gen"),
             ),
         ],
+        Vec::new(),
     )
     .expect_err("an extra captured generation breaks the exact bijection");
 
@@ -189,17 +192,149 @@ fn a_selected_aggregate_admits_an_exact_bijection() {
     // about SelectedAggregate being unconstructible.
     let lease = a_lease("root-a");
     let provenance = ClaimProvenance::selected_aggregate(
-        an_operation(OperationKind::SelectedAggregate),
+        an_operation(OperationKind::SearchText),
         vec![lease.selection_receipt("project-a")],
         vec![(
             "project-a".to_string(),
             lease.admit_generation().expect("gen"),
         )],
+        Vec::new(),
     )
     .expect("an exact selection-to-generation bijection is admitted");
 
     assert_eq!(provenance.kind_name(), "SelectedAggregate");
     assert_eq!(provenance.authority_count(), 1);
+}
+
+#[test]
+fn a_comparison_across_two_roots_is_refused_rather_than_composed() {
+    // The derivation path had this oracle; the comparison path did not, so the
+    // comparison's own root gate could be deleted without failing any test —
+    // a mutation-surviving gap the audit found.
+    let left = a_lease("root-a");
+    let right = a_lease("root-b");
+    let refusal = ClaimProvenance::comparison(
+        an_operation(OperationKind::SearchText),
+        ComparisonRelation::SameContent,
+        a_generation(&left),
+        a_generation(&right),
+    )
+    .expect_err("two roots must not compose into one comparison");
+
+    assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
+}
+
+#[test]
+fn a_generation_authority_never_proves_repository_absence() {
+    // The no-widening loop covers the three OBSERVATION kinds; Generation
+    // legitimately proves generation-scoped absence, so it cannot join that
+    // loop — but its repository claim still needs pinning, which nothing did.
+    let lease = a_lease("root-a");
+    let generation = lease.admit_generation().expect("complete generation");
+
+    assert!(
+        generation.proves_generation_absence(),
+        "GREEN-CONTROL: one captured generation does prove generation-scoped absence"
+    );
+    assert!(
+        !generation.proves_repository_absence(),
+        "one captured generation is not the repository"
+    );
+}
+
+#[test]
+fn a_selected_aggregate_refuses_a_forged_duplicate_capture() {
+    // "Missing, extra, FORGED, or uncaptured inputs refuse". Two captures
+    // under one key are a forgery, and BTreeMap::from_iter would COLLAPSE the
+    // duplicate silently — the second entry vanishing rather than refusing.
+    let lease = a_lease("root-a");
+    let refusal = ClaimProvenance::selected_aggregate(
+        an_operation(OperationKind::SearchText),
+        vec![
+            lease.selection_receipt("project-a"),
+            lease.selection_receipt("project-b"),
+        ],
+        vec![
+            (
+                "project-a".to_string(),
+                lease.admit_generation().expect("gen"),
+            ),
+            (
+                "project-a".to_string(),
+                lease.admit_generation().expect("gen"),
+            ),
+        ],
+        Vec::new(),
+    )
+    .expect_err("a duplicate capture key is forged input and must refuse");
+
+    assert_eq!(refusal.kind(), SourceRefusalKind::InvalidSelection);
+}
+
+#[test]
+fn a_selected_aggregate_names_every_authority_it_retains() {
+    // authorities() yielded NOTHING for SelectedAggregate while
+    // authority_count() counted its generations — an aggregate that could not
+    // enumerate its own evidence. Both now come from one source of truth.
+    let lease = a_lease("root-a");
+    let provenance = ClaimProvenance::selected_aggregate(
+        an_operation(OperationKind::SearchText),
+        vec![lease.selection_receipt("project-a")],
+        vec![(
+            "project-a".to_string(),
+            lease.admit_generation().expect("gen"),
+        )],
+        vec![a_generation(&lease)],
+    )
+    .expect("bijection plus an additional authority is admitted");
+
+    assert_eq!(
+        provenance.authority_count(),
+        2,
+        "one captured generation plus one additional authority"
+    );
+    assert_eq!(
+        provenance.authorities().count(),
+        provenance.authority_count(),
+        "the enumeration and the count can never disagree"
+    );
+}
+
+#[test]
+fn a_selected_aggregate_refuses_an_empty_selection() {
+    // Global absence from zero selections would be a claim about everything
+    // derived from nothing. No lease is needed: the refusal happens before any
+    // evidence is examined.
+    let refusal = ClaimProvenance::selected_aggregate(
+        an_operation(OperationKind::SearchText),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect_err("an empty selection proves nothing and must refuse");
+
+    assert_eq!(refusal.kind(), SourceRefusalKind::InvalidSelection);
+}
+
+#[test]
+fn a_selected_aggregate_refuses_a_foreign_root_authority() {
+    // Everything the aggregate retains composes into one claim, so an
+    // additional authority from another root is the same defect as a
+    // mixed-root derivation.
+    let lease = a_lease("root-a");
+    let foreign = a_lease("root-b");
+    let refusal = ClaimProvenance::selected_aggregate(
+        an_operation(OperationKind::SearchText),
+        vec![lease.selection_receipt("project-a")],
+        vec![(
+            "project-a".to_string(),
+            lease.admit_generation().expect("gen"),
+        )],
+        vec![a_generation(&foreign)],
+    )
+    .expect_err("a foreign-root additional authority must not compose");
+
+    assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
 }
 
 // ── The OperationContractV1 Cartesian ──────────────────────────────────────
@@ -214,30 +349,25 @@ fn a_selected_aggregate_admits_an_exact_bijection() {
 #[test]
 fn operation_contract_cartesian_matrix() {
     let lease = a_lease("root-a");
-    let operations = [
-        OperationKind::Retrieval,
-        OperationKind::Comparison,
-        OperationKind::Derivation,
-        OperationKind::SelectedAggregate,
-    ];
-    let kinds = [
-        SourceRefusalKind::AdmissionUnavailable,
-        SourceRefusalKind::InvalidSelection,
-        SourceRefusalKind::SelectionUnavailable,
-        SourceRefusalKind::SourceUnavailable,
-    ];
-    let advices = [
-        RetryAdvice::Never,
-        RetryAdvice::AfterRebind,
-        RetryAdvice::AfterRefresh,
-    ];
+    // The evidence a refusal names must be evidence that was EXAMINED — the
+    // first draft minted a fresh identity inside refuse itself, fabricating
+    // evidence that existed nowhere, and the oracle blessed it by asserting
+    // only is_some. The audit caught both halves.
+    let examined = lease
+        .observe_missing_path("src/gone.rs", ObservationTime::fresh())
+        .expect("missing path");
 
     let mut seen = 0usize;
-    for operation_kind in operations {
-        for kind in kinds {
-            for advice in advices {
+    for operation_kind in OperationKind::ALL {
+        for kind in [
+            SourceRefusalKind::AdmissionUnavailable,
+            SourceRefusalKind::InvalidSelection,
+            SourceRefusalKind::SelectionUnavailable,
+            SourceRefusalKind::SourceUnavailable,
+        ] {
+            for advice in RetryAdvice::ALL {
                 let operation = an_operation(operation_kind);
-                let refusal = lease.refuse(operation, kind, advice);
+                let refusal = lease.refuse(operation, kind, advice, Some(examined.identity()));
 
                 assert_eq!(
                     refusal.kind(),
@@ -259,9 +389,10 @@ fn operation_contract_cartesian_matrix() {
                     OperationReceipt::SCHEMA_VERSION,
                     "the receipt rides the one V11 schema"
                 );
-                assert!(
-                    refusal.evidence_identity().is_some(),
-                    "a refusal carries the identity of the evidence it refused on"
+                assert_eq!(
+                    refusal.evidence_identity(),
+                    Some(examined.identity()),
+                    "the refusal names the EXACT evidence that was examined"
                 );
                 seen += 1;
             }
@@ -269,19 +400,20 @@ fn operation_contract_cartesian_matrix() {
     }
 
     assert_eq!(
-        seen, 48,
-        "control: the full 4x4x3 operation-contract Cartesian was exercised"
+        seen,
+        7 * 4 * 4,
+        "control: the full operations x kinds x advices Cartesian was exercised"
     );
 }
 
-// ── Evaluation provenance accompanies observable ordering ─────────────────
+// ── Evaluation provenance accompanies observable ordering// ── Evaluation provenance accompanies observable ordering ─────────────────
 
 #[test]
 fn an_ordered_result_carries_evaluation_provenance_and_an_unordered_one_does_not() {
     let lease = a_lease("root-a");
 
     let ranked = Claim::single_ranked(
-        an_operation(OperationKind::Retrieval),
+        an_operation(OperationKind::SearchText),
         a_generation(&lease),
         vec!["a", "b"],
         EvaluationProvenance::for_test(),
@@ -292,7 +424,7 @@ fn an_ordered_result_carries_evaluation_provenance_and_an_unordered_one_does_not
     );
 
     let unordered = Claim::single(
-        an_operation(OperationKind::Retrieval),
+        an_operation(OperationKind::SearchText),
         a_generation(&lease),
         (),
     );
@@ -313,7 +445,7 @@ fn truncated_coverage_requires_a_completed_strict_lease() {
 
     let truncated = render.truncate(vec![(DerivedLimitKind::Cards, 3)]);
     assert!(
-        matches!(truncated, OutputCoverage::Truncated { .. }),
+        matches!(truncated, OutputCoverage::Truncated(_)),
         "bounded rendering after a completed lease may report truncation"
     );
 }
@@ -331,11 +463,11 @@ fn truncation_uses_the_live_limit_kinds_not_a_second_enum() {
         (DerivedLimitKind::AmbiguousSamples, 2),
     ]);
 
-    let OutputCoverage::Truncated { breaches } = truncated else {
+    let OutputCoverage::Truncated(breaches) = truncated else {
         panic!("expected a truncated coverage");
     };
     assert_eq!(
-        breaches.len(),
+        breaches.breaches().len(),
         2,
         "both production-only limit kinds survive into the breach record"
     );
@@ -348,35 +480,57 @@ fn truncated_coverage_never_enters_a_claim_identity() {
     let truncated = render.truncate(vec![(DerivedLimitKind::Output, 1)]);
 
     let claim = Claim::single(
-        an_operation(OperationKind::Retrieval),
+        an_operation(OperationKind::SearchText),
         a_generation(&lease),
         (),
     );
     let before = claim.provenance().identity();
-    let rendered = claim.render_bounded(truncated);
+    let rendered = claim.render_bounded(truncated.clone());
 
     assert_eq!(
         rendered.provenance().identity(),
         before,
-        "bounded rendering does not change generation completeness, so it must not \
-         move the provenance identity that caches, CCR, and persistence key on"
+        "bounded rendering must not move the provenance identity that caches, CCR,          and persistence key on"
+    );
+    // The other half, which makes this oracle falsifiable: the coverage is
+    // RETAINED on the claim. The first draft discarded the argument, so the
+    // identity assertion above could never fail under any code change.
+    assert_eq!(
+        rendered.rendered_coverage(),
+        Some(&truncated),
+        "the bounded render retains the coverage it was given"
     );
 }
 
-// ── Retrieval voice never selects consistency ─────────────────────────────
+// ── Retrieval voice and the frozen voice model ────────────────────────────
 
 #[test]
-fn the_knowledge_voice_filter_never_selects_consistency() {
-    let selectable =
-        symforge::protocol::format::claim_provenance::KnowledgeVoiceFilter::selectable_voices();
+fn the_knowledge_voice_filter_selects_the_default_set_and_no_history() {
+    // "Never selects consistency" is STRUCTURAL: the frozen KnowledgeVoice
+    // enum has no consistency variant at all, so no runtime value could
+    // violate it. What CAN be asserted is the frozen default selection:
+    // Current, Intent, NeedsReview, Unknown — including the
+    // current-implementation voice the first draft dropped — and never
+    // HistoryOnly or Suppressed. The first draft instead invented a
+    // Consistency variant and validated its own invention; the audit caught it.
+    use symforge::protocol::format::claim_provenance::{KnowledgeVoice, KnowledgeVoiceFilter};
 
-    assert!(
-        !selectable.iter().any(|voice| voice.is_consistency()),
-        "retrieval voice must never select consistency; that is authority hygiene, \
-         not a retrieval filter"
+    let selectable = KnowledgeVoiceFilter::selectable_voices();
+    assert_eq!(
+        selectable,
+        vec![
+            KnowledgeVoice::Current,
+            KnowledgeVoice::Intent,
+            KnowledgeVoice::NeedsReview,
+            KnowledgeVoice::Unknown,
+        ],
+        "the default selection is exactly the four frozen default voices"
     );
     assert!(
-        !selectable.is_empty(),
-        "control: the filter does select SOMETHING, so the assertion above is not vacuous"
+        !selectable.iter().any(|voice| matches!(
+            voice,
+            KnowledgeVoice::HistoryOnly | KnowledgeVoice::Suppressed
+        )),
+        "history voices never enter the default selection"
     );
 }

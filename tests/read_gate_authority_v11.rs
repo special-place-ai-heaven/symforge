@@ -1,3 +1,4 @@
+#![cfg(feature = "server")]
 //! Feature 020 V11, T042 — cross-authority proof scoping.
 //!
 //! RED until T043 exists. Every test here pins ONE frozen rule: an authority
@@ -76,7 +77,7 @@ fn an_admitted_generation(lease: &ObservationLease) -> GenerationAuthority {
 }
 
 fn an_operation() -> OperationReceipt {
-    OperationReceipt::for_test(OperationKind::Comparison)
+    OperationReceipt::for_test(OperationKind::SearchText)
 }
 
 /// Derive one claim from two leases, which is the seam where root
@@ -273,7 +274,7 @@ fn a_failed_observation_refuses_without_disturbing_the_current_generation() {
     let before = generation.identity();
 
     let refusal = a_missing_path(&binding, "src/gone.rs", observed_now())
-        .into_failed_read()
+        .into_failed_read(an_operation())
         .expect_err("a failed pure observation returns a typed refusal");
 
     assert_eq!(

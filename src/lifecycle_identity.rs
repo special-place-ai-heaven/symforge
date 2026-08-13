@@ -42,9 +42,13 @@ pub(crate) fn next_identity() -> NonZeroU64 {
 }
 
 macro_rules! identity_newtype {
+    // No PartialOrd/Ord: with a monotonic counter, ordering identities exposes
+    // MINT ORDER, an inference channel nothing should read. An earlier draft
+    // added Ord so a test could sort identities; the test uses a HashSet now
+    // and the derive set matches the original authority.rs newtypes exactly.
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $name(NonZeroU64);
 
         impl $name {

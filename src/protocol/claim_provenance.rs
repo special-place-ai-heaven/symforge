@@ -43,24 +43,47 @@ pub use crate::lifecycle_identity::{
 
 // ── Operations ─────────────────────────────────────────────────────────────
 
-/// The closed set of operation shapes. Transport mapping derives from this one
-/// table, so a new operation cannot acquire a bespoke refusal vocabulary.
+/// The closed operation vocabulary, VERBATIM from the frozen contract:
+/// `contracts/public-api-v11.json` `type:embed:OperationKind` fixes exactly
+/// these seven variants. An earlier draft invented four provenance-shape
+/// variants under this name; that both diverged from the contract this module's
+/// own header declares authoritative AND squatted the name T047's runtime
+/// vocabulary owns. Provenance SHAPES are named by
+/// [`ClaimProvenance::kind_name`], not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OperationKind {
-    Retrieval,
-    Comparison,
-    Derivation,
-    SelectedAggregate,
+    AcquireRuntime,
+    CloseSource,
+    OpenEmbeddedSource,
+    RefreshSource,
+    SearchSymbols,
+    SearchText,
+    ShutdownRuntime,
 }
 
 impl OperationKind {
+    /// Every variant, once. The Cartesian oracle iterates this so a new
+    /// operation cannot be added without entering the matrix.
+    pub const ALL: [Self; 7] = [
+        Self::AcquireRuntime,
+        Self::CloseSource,
+        Self::OpenEmbeddedSource,
+        Self::RefreshSource,
+        Self::SearchSymbols,
+        Self::SearchText,
+        Self::ShutdownRuntime,
+    ];
+
     /// Stable display name. Part of the closed contract, not a debug string.
     pub fn kind_name(self) -> &'static str {
         match self {
-            Self::Retrieval => "Retrieval",
-            Self::Comparison => "Comparison",
-            Self::Derivation => "Derivation",
-            Self::SelectedAggregate => "SelectedAggregate",
+            Self::AcquireRuntime => "AcquireRuntime",
+            Self::CloseSource => "CloseSource",
+            Self::OpenEmbeddedSource => "OpenEmbeddedSource",
+            Self::RefreshSource => "RefreshSource",
+            Self::SearchSymbols => "SearchSymbols",
+            Self::SearchText => "SearchText",
+            Self::ShutdownRuntime => "ShutdownRuntime",
         }
     }
 }
@@ -146,14 +169,27 @@ pub enum SourceRefusalKind {
 
 /// What, if anything, would make a retry worth attempting. Advice only: it
 /// never authorizes the retry it describes.
+///
+/// Variants VERBATIM from `contracts/public-api-v11.json`
+/// `type:embed:RetryAdvice`. An earlier draft invented
+/// `{Never, AfterRebind, AfterRefresh}` in the same commit that declared the
+/// atoms authoritative; the audit caught the contradiction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RetryAdvice {
+    /// The same request may simply be retried.
+    Automatic,
     /// The request is wrong in a way repetition cannot fix.
     Never,
-    /// A rebind to the correct root could succeed.
-    AfterRebind,
-    /// A completed refresh could succeed.
-    AfterRefresh,
+    /// Retry after an observable event: a completed refresh, an installed
+    /// successor generation, a selection change.
+    OnEvent,
+    /// Retry requires an operator action, such as a rebind to the correct root.
+    Operator,
+}
+
+impl RetryAdvice {
+    /// Every variant, once, for the Cartesian oracle.
+    pub const ALL: [Self; 4] = [Self::Automatic, Self::Never, Self::OnEvent, Self::Operator];
 }
 
 /// A typed refusal. Opaque by construction: callers read it through the
@@ -299,21 +335,33 @@ impl ObservationLease {
         }
     }
 
-    /// Build a typed refusal against this lease's evidence.
+    /// Build a typed refusal, naming the evidence that was actually examined.
+    ///
+    /// `evidence` is the identity of an authority the CALLER examined, or
+    /// `None` when the request was rejected outright without examining any. An
+    /// earlier draft filled this with `AuthorityIdentity::fresh()` — an
+    /// identity corresponding to no evidence anywhere — which is fabrication,
+    /// the exact reporting defect this feature exists to prevent. The audit
+    /// caught it; the parameter now forces the caller to say what it examined.
     pub fn refuse(
         &self,
         operation: OperationReceipt,
         kind: SourceRefusalKind,
         retry: RetryAdvice,
+        evidence: Option<AuthorityIdentity>,
     ) -> SourceRefusal {
-        SourceRefusal::new(kind, operation, retry, Some(AuthorityIdentity::fresh()))
+        SourceRefusal::new(kind, operation, retry, evidence)
     }
 
     /// Authority to bound the rendering of an ALREADY complete leased result.
     ///
-    /// `OutputCoverage::Truncated` cannot be constructed without one of these,
-    /// which is what "post-lease only" means: truncation describes a response,
-    /// never a generation.
+    /// The SEAL is real and type-level: `OutputCoverage::Truncated` carries an
+    /// opaque [`TruncationBreaches`] payload with no public constructor, so it
+    /// cannot be built anywhere but [`CompletedRenderAuthority::truncate`].
+    /// The lease EVIDENCE behind this method is a Slice 3 stand-in: it returns
+    /// `Ok` unconditionally because the strict-lease machinery that would
+    /// refuse is Slice 4 work. Do not "complete" it with a fake check —
+    /// see the evidence document.
     pub fn completed_render_authority(&self) -> Result<CompletedRenderAuthority, SourceRefusal> {
         Ok(CompletedRenderAuthority { _sealed: () })
     }
@@ -396,11 +444,15 @@ impl DiskObservationReceipt {
 
     /// A read that failed is a typed refusal, never an absence. Reporting it as
     /// absence would let an I/O error masquerade as proof that a file is gone.
-    pub fn into_failed_read(self) -> Result<Self, SourceRefusal> {
+    ///
+    /// The caller supplies the operation that was being served: an earlier
+    /// draft minted a `for_test` receipt here, which put a fixture constructor
+    /// on a non-test path and fabricated the operation the refusal names.
+    pub fn into_failed_read(self, operation: OperationReceipt) -> Result<Self, SourceRefusal> {
         Err(SourceRefusal::new(
             SourceRefusalKind::SourceUnavailable,
-            OperationReceipt::for_test(OperationKind::Retrieval),
-            RetryAdvice::AfterRefresh,
+            operation,
+            RetryAdvice::OnEvent,
             Some(self.identity()),
         ))
     }
@@ -742,7 +794,12 @@ pub enum ClaimProvenance {
         identity: ProvenanceIdentity,
         operation: OperationReceipt,
         selections: Vec<SourceSelectionReceipt>,
-        generations: BTreeMap<String, GenerationAuthority>,
+        /// Stored as [`AtomicAuthority::Generation`] so [`ClaimProvenance::authorities`]
+        /// can NAME this variant's evidence — an aggregate that could not
+        /// enumerate what proves it was an audit finding.
+        generations: BTreeMap<String, AtomicAuthority>,
+        /// The frozen shape carries these; dropping them silently was another.
+        additional_authorities: Vec<AtomicAuthority>,
     },
 }
 
@@ -767,7 +824,7 @@ impl ClaimProvenance {
             return Err(SourceRefusal::new(
                 SourceRefusalKind::SourceUnavailable,
                 operation,
-                RetryAdvice::AfterRebind,
+                RetryAdvice::Operator,
                 Some(left.identity()),
             ));
         }
@@ -807,7 +864,7 @@ impl ClaimProvenance {
                     return Err(SourceRefusal::new(
                         SourceRefusalKind::SourceUnavailable,
                         operation,
-                        RetryAdvice::AfterRebind,
+                        RetryAdvice::Operator,
                         Some(first.identity()),
                     ));
                 }
@@ -822,11 +879,12 @@ impl ClaimProvenance {
 
     /// The only constructor for repository-wide absence. Requires an EXACT
     /// bijection between selections and captured generations: a missing, extra,
-    /// or unmatched entry refuses.
+    /// forged, or uncaptured entry refuses.
     pub fn selected_aggregate(
         operation: OperationReceipt,
         selections: Vec<SourceSelectionReceipt>,
         generations: Vec<(String, GenerationAuthority)>,
+        additional_authorities: Vec<AtomicAuthority>,
     ) -> Result<Self, SourceRefusal> {
         if selections.is_empty() {
             return Err(SourceRefusal::new(
@@ -836,7 +894,22 @@ impl ClaimProvenance {
                 None,
             ));
         }
-        let captured: BTreeMap<String, GenerationAuthority> = generations.into_iter().collect();
+        // A duplicate key is a forged capture, and BTreeMap::from_iter would
+        // COLLAPSE it silently — the second entry would vanish and the length
+        // check below would then blame the selection. Refuse it by name first.
+        let supplied = generations.len();
+        let captured: BTreeMap<String, AtomicAuthority> = generations
+            .into_iter()
+            .map(|(key, generation)| (key, AtomicAuthority::Generation(generation)))
+            .collect();
+        if captured.len() != supplied {
+            return Err(SourceRefusal::new(
+                SourceRefusalKind::InvalidSelection,
+                operation,
+                RetryAdvice::Never,
+                None,
+            ));
+        }
         if captured.len() != selections.len()
             || !selections
                 .iter()
@@ -845,15 +918,35 @@ impl ClaimProvenance {
             return Err(SourceRefusal::new(
                 SourceRefusalKind::SelectionUnavailable,
                 operation,
-                RetryAdvice::AfterRefresh,
+                RetryAdvice::OnEvent,
                 None,
             ));
+        }
+        // Root compatibility across EVERYTHING the aggregate retains: the
+        // captured generations and the additional authorities compose into one
+        // claim, so a foreign root here is the same defect as in a derivation.
+        let all: Vec<&AtomicAuthority> = captured
+            .values()
+            .chain(additional_authorities.iter())
+            .collect();
+        if let Some(first) = all.first() {
+            for other in &all[1..] {
+                if !roots_are_compatible(first, other) {
+                    return Err(SourceRefusal::new(
+                        SourceRefusalKind::SourceUnavailable,
+                        operation,
+                        RetryAdvice::Operator,
+                        Some(other.identity()),
+                    ));
+                }
+            }
         }
         Ok(Self::SelectedAggregate {
             identity: ProvenanceIdentity::fresh(),
             operation,
             selections,
             generations: captured,
+            additional_authorities,
         })
     }
 
@@ -876,7 +969,10 @@ impl ClaimProvenance {
     }
 
     /// Every atomic authority retained, in order. Inputs are never collapsed:
-    /// a claim must be able to name each thing it was derived from.
+    /// a claim must be able to name each thing it was derived from — INCLUDING
+    /// a SelectedAggregate's captured generations, which an earlier draft
+    /// yielded nothing for while counting them, an inconsistency the audit
+    /// flagged.
     pub fn authorities(&self) -> impl Iterator<Item = &AtomicAuthority> + '_ {
         let items: Vec<&AtomicAuthority> = match self {
             Self::Single { authority, .. } => vec![authority],
@@ -890,20 +986,22 @@ impl ClaimProvenance {
                     ClaimInput::Selection(_) => None,
                 })
                 .collect(),
-            Self::SelectedAggregate { .. } => Vec::new(),
+            Self::SelectedAggregate {
+                generations,
+                additional_authorities,
+                ..
+            } => generations
+                .values()
+                .chain(additional_authorities.iter())
+                .collect(),
         };
         items.into_iter()
     }
 
+    /// Defined as `authorities().count()` — one source of truth, so the two can
+    /// never disagree again.
     pub fn authority_count(&self) -> usize {
-        match self {
-            Self::Single { .. } => 1,
-            Self::Comparison { .. } => 2,
-            Self::Derivation {
-                nonempty_inputs, ..
-            } => nonempty_inputs.len(),
-            Self::SelectedAggregate { generations, .. } => generations.len(),
-        }
+        self.authorities().count()
     }
 }
 
@@ -946,10 +1044,32 @@ impl EvaluationProvenance {
 // ── Output coverage ────────────────────────────────────────────────────────
 
 /// Whether a RESPONSE was rendered whole. Never a statement about a generation.
+///
+/// `Truncated` carries an OPAQUE payload with no public constructor, so it is
+/// unbuildable outside this module. The first draft used a struct variant with
+/// pub fields, so `OutputCoverage::Truncated { breaches: vec![] }` compiled
+/// anywhere with no authority at all — while doc and commit message both
+/// claimed it sealed. The audit called that what it was: reporting an
+/// enforcement the type system did not provide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputCoverage {
     Complete,
-    Truncated { breaches: Vec<LimitBreach> },
+    Truncated(TruncationBreaches),
+}
+
+/// The limits a bounded rendering hit. Private field, no public constructor:
+/// the ONLY producer is [`CompletedRenderAuthority::truncate`], which is what
+/// makes "post-lease only" a property of the type rather than a promise in a
+/// comment. Consumers read through [`TruncationBreaches::breaches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncationBreaches {
+    breaches: Vec<LimitBreach>,
+}
+
+impl TruncationBreaches {
+    pub fn breaches(&self) -> &[LimitBreach] {
+        &self.breaches
+    }
 }
 
 /// Proof that a strict lease COMPLETED. Required to construct
@@ -972,12 +1092,12 @@ impl CompletedRenderAuthority {
         if breaches.is_empty() {
             return OutputCoverage::Complete;
         }
-        OutputCoverage::Truncated {
+        OutputCoverage::Truncated(TruncationBreaches {
             breaches: breaches
                 .into_iter()
                 .map(|(kind, omitted)| LimitBreach { kind, omitted })
                 .collect(),
-        }
+        })
     }
 }
 
@@ -991,6 +1111,12 @@ pub struct Claim<T> {
     provenance: ClaimProvenance,
     evaluation: Option<EvaluationProvenance>,
     producing_runtime_identity: ProducingRuntimeIdentity,
+    /// Coverage of the RENDERING, when a bounded render happened. `None` until
+    /// [`Claim::render_bounded`] runs. Kept OFF provenance identity — caches,
+    /// CCR, and persistence key on that — but retained readably here, because a
+    /// render that discarded its coverage argument made the retention oracle
+    /// unfalsifiable, which the audit flagged.
+    rendered_coverage: Option<OutputCoverage>,
 }
 
 impl<T> Claim<T> {
@@ -1002,6 +1128,7 @@ impl<T> Claim<T> {
             provenance: ClaimProvenance::single(authority),
             evaluation: None,
             producing_runtime_identity: ProducingRuntimeIdentity::fresh(),
+            rendered_coverage: None,
         }
     }
 
@@ -1018,6 +1145,7 @@ impl<T> Claim<T> {
             provenance: ClaimProvenance::single(authority),
             evaluation: Some(evaluation),
             producing_runtime_identity: ProducingRuntimeIdentity::fresh(),
+            rendered_coverage: None,
         }
     }
 
@@ -1034,6 +1162,7 @@ impl<T> Claim<T> {
             provenance,
             evaluation: None,
             producing_runtime_identity: ProducingRuntimeIdentity::fresh(),
+            rendered_coverage: None,
         })
     }
 
@@ -1060,33 +1189,40 @@ impl<T> Claim<T> {
         self.producing_runtime_identity
     }
 
-    /// Bound this claim's RENDERING. Deliberately does not touch provenance
-    /// identity: truncation describes a response, and caches, CCR, and
-    /// persistence key on provenance identity. Moving it here would make a
-    /// bounded render look like different evidence.
-    pub fn render_bounded(self, _coverage: OutputCoverage) -> Self {
+    /// Coverage of the last bounded rendering, if one happened.
+    pub fn rendered_coverage(&self) -> Option<&OutputCoverage> {
+        self.rendered_coverage.as_ref()
+    }
+
+    /// Bound this claim's RENDERING. The coverage is RETAINED — readable via
+    /// [`Claim::rendered_coverage`] — and provenance identity is deliberately
+    /// untouched: truncation describes a response, and caches, CCR, and
+    /// persistence key on provenance identity. Moving it there would make a
+    /// bounded render look like different evidence; DISCARDING it, as the first
+    /// draft did, made the retention oracle unfalsifiable.
+    pub fn render_bounded(mut self, coverage: OutputCoverage) -> Self {
+        self.rendered_coverage = Some(coverage);
         self
     }
 }
 
 // ── Retrieval voice ────────────────────────────────────────────────────────
 
-/// A knowledge voice a retrieval may select.
+/// A knowledge voice. Variants VERBATIM from `data-model.md` `KnowledgeVoice`
+/// — the first draft invented a `Consistency` variant and dropped `Current`,
+/// so its "never selects consistency" oracle validated a model that does not
+/// exist. There is NO consistency voice: "retrieval voice never selects
+/// consistency" is a structural fact of this enum, not a runtime filter — a
+/// stale document cannot acquire generation authority by being selected as a
+/// consistency voice because no such voice is expressible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KnowledgeVoice {
+    Current,
     Intent,
     NeedsReview,
     Unknown,
     HistoryOnly,
     Suppressed,
-    /// Consistency is an AUTHORITY HYGIENE verdict, never a retrieval filter.
-    Consistency,
-}
-
-impl KnowledgeVoice {
-    pub fn is_consistency(self) -> bool {
-        matches!(self, Self::Consistency)
-    }
 }
 
 /// Which voices retrieval may select.
@@ -1094,11 +1230,14 @@ impl KnowledgeVoice {
 pub struct KnowledgeVoiceFilter;
 
 impl KnowledgeVoiceFilter {
-    /// Consistency is absent by construction, not by filtering after the fact.
-    /// A stale document must not be able to acquire generation authority by
-    /// being selected as a consistency voice.
+    /// The default selection set: `Current`, `Intent`, `NeedsReview`, and
+    /// `Unknown`, per the data model's `authority_scope` default — which
+    /// INCLUDES the current-implementation voice and EXCLUDES `HistoryOnly`
+    /// and `Suppressed`. Explicit history scopes never promote non-current
+    /// evidence.
     pub fn selectable_voices() -> Vec<KnowledgeVoice> {
         vec![
+            KnowledgeVoice::Current,
             KnowledgeVoice::Intent,
             KnowledgeVoice::NeedsReview,
             KnowledgeVoice::Unknown,

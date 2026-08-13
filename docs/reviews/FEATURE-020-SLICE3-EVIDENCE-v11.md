@@ -91,6 +91,120 @@ the mutant was live, observed catching it, and kept.
   (censused; also `read_gate` is `pub(crate)` so the oracles — a separate crate —
   could not see the module through it).
 
+## The adversarial audit of the T043 draft, and what it changed
+
+A 5-agent audit ran against the committed draft `225b18bf` — four independent
+auditors over seam fidelity, atom coverage, task-text completeness, and embed
+cfg, then a synthesizing verdict, each verifying against the frozen corpus
+before promoting anything. Every finding below was RE-VERIFIED here before
+being acted on.
+
+**Fixed in the follow-up commit, each with its reason:**
+
+- **`OutputCoverage::Truncated` was FORGEABLE while claimed sealed** — a pub
+  struct variant, so `Truncated { breaches: vec![] }` compiled anywhere with no
+  authority, while doc and commit message claimed the seal. The audit named it
+  for what it was: reporting an enforcement the type system did not provide.
+  Now `Truncated(TruncationBreaches)` with a private field and no public
+  constructor; the ONLY producer is `CompletedRenderAuthority::truncate`.
+- **`RetryAdvice` and `OperationKind` violated the module's own atoms-win
+  rule.** The contract fixes `RetryAdvice = Automatic | Never | OnEvent |
+  Operator` and `OperationKind` as the SEVEN-variant runtime vocabulary; the
+  draft invented three retry variants and squatted the OperationKind name with
+  four provenance shapes. Both now verbatim from the contract; provenance
+  shapes are named by `ClaimProvenance::kind_name` alone.
+- **`ObservationLease::refuse` fabricated evidence** — it filled
+  `evidence_identity` with a fresh identity corresponding to nothing examined,
+  and the oracle blessed it by asserting only `is_some`. The parameter now
+  forces the caller to name what it examined, and the Cartesian asserts the
+  EXACT identity round-trips.
+- **`render_bounded` discarded its coverage argument**, making the retention
+  oracle unfalsifiable. Coverage is now retained on the claim, readable via
+  `rendered_coverage`, still off provenance identity.
+- **`KnowledgeVoice` validated an invented model** — a `Consistency` variant
+  that exists in no frozen document, while dropping `Current`, which the
+  frozen default selection MUST include. Now the frozen six; "never selects
+  consistency" is structural, since no such voice is expressible.
+- **`SelectedAggregate` could not name its own evidence** — `authorities()`
+  yielded nothing for it while `authority_count()` counted its generations, it
+  dropped the frozen `additional_authorities` field, did no root check, and
+  `BTreeMap::from_iter` silently collapsed forged duplicate keys.
+  `authority_count()` is now literally `authorities().count()`.
+- **`into_failed_read` minted a `for_test` receipt on a non-test path**; the
+  caller now supplies the operation being served.
+- **Identity newtypes had gained `Ord`**, making mint order observable — an
+  inference channel added only so a test could sort. Reverted to the original
+  derive set; the test uses a `HashSet`.
+- **Both oracle files lacked the sibling-convention `#![cfg(feature =
+  "server")]`** — invisible to the `--lib` embed gate but a break of the
+  documented all-targets embed invocation. Added.
+- **The darkness prose in `index_lifecycle/mod.rs` had become false** — it
+  claimed grep-level absence, which `lifecycle_identity.rs`'s doc comments now
+  violate in prose. Restated as the call-edge property T051 will formalize.
+
+**Mutation ledger, continued.** The three new guards were each flipped,
+observed caught BY NAME, and restored — final suite 29 green:
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M5 | comparison root gate disabled | `a_comparison_across_two_roots_is_refused_rather_than_composed`, alone |
+| M6 | duplicate-key forgery guard disabled | `a_selected_aggregate_refuses_a_forged_duplicate_capture` — via the KIND assertion, proving forgery is distinguishable from a selection mismatch |
+| M7 | aggregate root check disabled | `a_selected_aggregate_refuses_a_foreign_root_authority`, alone |
+
+**Deferred with records — the D-ledger:**
+
+- **D10 — receipt-field simplifications vs the frozen data model.** The Slice 3
+  receipts drop `parent_identity`, `stable_read`/`ByteDigest`, `FileStamp`,
+  `policy_versions`, `started_at`/`finished_at`, `manifest_digest` and
+  `stable_entry_count` on scope coverage, `repository_id`/`resolved_from`/
+  `object` on Git receipts, and use `String` where the model has
+  `CatalogPath`/`PhysicalRootIdentity` typed paths. All prose-only — no atom,
+  oracle, or seam pins them — and the machinery that makes them load-bearing
+  is Slice 4. NOTE: the `String` paths cannot carry non-UTF8 opaque paths,
+  which collides with T053's lossless opaque-path oracle; Slice 4 must widen.
+- **D9 append** — every `ClaimProvenance` variant carries `identity` per the
+  atom `ClaimProvenance::identity`, which the data-model prose lacks.
+- **D11 — duplicate `PhysicalRootLease` name.** The provenance fixture
+  coexists with the real `index_lifecycle/physical_root.rs` type the data
+  model references. The recon census wrongly listed it as nonexistent, which
+  caused the duplication. Reconciliation belongs to the Slice 4 wiring that
+  connects provenance to the real lease; no enforced check breaks today.
+- **D12 — activation-time surface unwind.** The module is mounted at
+  `symforge::protocol::format::claim_provenance`, and `OutputCoverage`
+  publicly exposes `live_index::LimitBreach` — both forbidden by negative
+  assertions AT ACTIVATION, both legal today because `observed_graph.status`
+  is `pre_activation_required`. T048's embed boundary must wrap or unwind.
+- **D13 — atom accessor shapes are the EMBED boundary's problem.** The
+  contract fixes `&str` identity returns, reference returns, `Display` +
+  `Error` on `SourceRefusal`, and opaque structs where this module has enums.
+  The atoms describe `symforge::embed::*`; T048's re-export layer wraps the
+  internal types into contract shapes, and T049's dependent-positive fixture
+  is the enforcement. Recorded so T048 does not assume a 1:1 re-export.
+- **D14 — one T042 clause is currently unfalsifiable.** The
+  preserving-Current half compares an immutable local identity to itself; it
+  becomes falsifiable when T047's runtime exists. T052's review must not count
+  it as coverage until then.
+- **D15 — compile-fail harness sequencing.** `cases.json`'s T043-era subjects
+  resolve only after T048's re-exports; T049 must not run before T048. The
+  harness has zero `OutputCoverage` cases; the seal fix above is what makes
+  them writable.
+- **ClaimContext / `acquire_claim_context` are still absent** — named by
+  T043's task text, needed by T042's rebind clauses. They are the NEXT chunk
+  of T043, not a deferral.
+
+**Dogfood catch — a symforge defect observed by an auditor.** `get_symbol` for
+`LimitBreach` returned `Decision: cache_hit` with "Reuse the content already
+loaded in this session" and `session_age_secs=5402` — in a subagent session
+that had never loaded that content. A cache voucher pointing at content the
+requesting context never observed is symforge's own reporting-invariant
+failure class; `force_refresh=true` was the workaround. Reported separately;
+not a campaign item.
+
+**Audit-environment lesson.** Two auditors read this worktree WHILE the
+mutation loop held a live mutant and promoted the mutant to a blocker. Any
+audit fanned out into a mutation-owned worktree must read from a pinned
+`git show SHA:` baseline, not the working tree.
+
 ## The traceability catalog caught an invented name (T041)
 
 First run of `node scripts/validate-lifecycle-oracle-traceability.cjs` on the
