@@ -781,7 +781,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-01",
           "end_line": 1179,
           "path": "specs/020-repository-knowledge-index/spec.md",
-          "sha256": "a96f61287d65eff1f9efb409b82640dced1fbef1051d0c93af7122f4f84c4be5",
+          "sha256": "6087dd97fd72f04019b6b8b3938ef8b8788f763cd093cd46e5348d1cd1a22a61",
           "source": "target",
           "start_line": 130
         },
@@ -789,7 +789,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-02",
           "end_line": 48,
           "path": "specs/020-repository-knowledge-index/contracts/knowledge-authority-hygiene.md",
-          "sha256": "85940c1037f28191f40b07de8afb245122f5a0a623516672a774cee792958284",
+          "sha256": "3481f4e61a1031013477c4d0b57ea96f2dd93430ca7b96448627b7c5834010fe",
           "source": "target",
           "start_line": 27
         },
@@ -797,7 +797,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-03",
           "end_line": 31,
           "path": "specs/020-repository-knowledge-index/contracts/repository-mental-model.md",
-          "sha256": "8f6300bf336ff3ceaecc38fcdcc5e91f1c89f6ef75b5c37c0f72e8d6911bd061",
+          "sha256": "fe93bbf871ebd2f3aeb26d8d3a761bce8340a2eff4ea113b5eadcbd6157b864c",
           "source": "target",
           "start_line": 18
         },
@@ -805,7 +805,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-04",
           "end_line": 77,
           "path": "specs/020-repository-knowledge-index/contracts/search-knowledge.md",
-          "sha256": "35efce51642f40f9ce0f37dce85c5009df84d8149e0ef2474a79a1c27f80f8d2",
+          "sha256": "2824effea36327cc43083db11e752c0b3cea65e98bba9b7616a15ff172bc2a2b",
           "source": "target",
           "start_line": 57
         },
@@ -813,7 +813,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A19-TARGET-05",
           "end_line": 52,
           "path": "specs/020-repository-knowledge-index/contracts/source-binding-and-state.md",
-          "sha256": "eab5f4f5d5413a51cf0de332949e3fb75b35539ea53654432bfa075b5c3ad37e",
+          "sha256": "9a7a5a514202c8c3323a2b39390caca6127dc0d1c9ab427b09f3a184f61701e6",
           "source": "target",
           "start_line": 18
         }
@@ -858,7 +858,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A20-TARGET-01",
           "end_line": 17,
           "path": "specs/020-repository-knowledge-index/spec.md",
-          "sha256": "f0e62f4259c7a2263510224d19c02c52ade25588aede9a64a6fd5058c987ae99",
+          "sha256": "d4ba26432f63ca9bf5bbe99a9fd1fb7de54ea06e2ef5b9a0c3991a517cd38e77",
           "source": "target",
           "start_line": 14
         },
@@ -866,7 +866,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
           "clause_id": "F020-V11-A20-TARGET-02",
           "end_line": 1549,
           "path": "specs/020-repository-knowledge-index/data-model.md",
-          "sha256": "44ecb1d41674cbb1829a99ff0f641599ad7ee43397c62ad63da44d619dad95b2",
+          "sha256": "cfd9385d848fd974c1f42feda8430f8d7f7c6930898a6f6c857c544b629c0628",
           "source": "target",
           "start_line": 1539
         }
@@ -1001,7 +1001,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/GOAL.md",
       "scope": "feature",
-      "sha256": "35d55a0c53bdcd6930e231547c4bfd71dcd21f6f7a186b1af0ce7f8baf6dabde",
+      "sha256": "ac6c7fc1fc0665969c3a90543d84400d7307cc7aa3206bcf4edeb141ec182b7c",
       "superseded_by": []
     },
     {
@@ -1097,7 +1097,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/knowledge-authority-hygiene.md",
       "scope": "feature",
-      "sha256": "cbc293614a045cee62331ae74f15310735c16191af0ebf907dc65f440453cfad",
+      "sha256": "a2b7fc4f421258ec64b967003b69c8371619be6f06fcee914c996714ef362af1",
       "superseded_by": []
     },
     {
@@ -1105,7 +1105,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/lifecycle-acceptance-oracles-v11.md",
       "scope": "feature",
-      "sha256": "db23d0390a92bcf0917869df35c54ab0b561db1da79da30c6ade1f7668df46de",
+      "sha256": "8419acdae0090af35fe70280ae8b99b7beabebf2e0a0fb74754966fba91da802",
       "superseded_by": []
     },
     {
@@ -1129,7 +1129,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/repository-mental-model.md",
       "scope": "feature",
-      "sha256": "c1b5f6acebdced699c0198d7fd10fc1c920bf058dbe37f50a9edd3a61db29049",
+      "sha256": "2fc29d35c9ad74eed00e7f39ac41812916d1657cb8040755cd054eef44456530",
       "superseded_by": []
     },
     {
@@ -1137,7 +1137,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/search-knowledge.md",
       "scope": "feature",
-      "sha256": "fdb3b5325b46842d2a0384e01cdb80ecc19a087acb1585bd6adc0f832000d3ce",
+      "sha256": "00e15bd6ca781bbf7a6c47966e20dbc401469caa9ff7d1130a1392999ae2d14e",
       "superseded_by": []
     },
     {
@@ -1145,7 +1145,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/source-binding-and-state.md",
       "scope": "feature",
-      "sha256": "f0e2c5f476480bc805cdd38670af08ac9d052df4f5fc86cb5c4fa70bfc0a6e84",
+      "sha256": "dda10ee172851aa11efaa363d3db9ce2a8c2e29dd6351c8cbef0a7703d306bf7",
       "superseded_by": []
     },
     {
@@ -1161,7 +1161,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/data-model.md",
       "scope": "feature",
-      "sha256": "bf4504b32c3b5f465395ee112b155d7de51f1c8cc8ce2fc24e76c6a6291f0868",
+      "sha256": "5f637686d820e8e85355478deca9f31a8131e8b18b779771b33cc4b6bc180637",
       "superseded_by": []
     },
     {
@@ -1409,7 +1409,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/plan.md",
       "scope": "feature",
-      "sha256": "8c1027033b5c6a66c327f75fd8d8b5091921cfa619a43e2f4f53dc486cea5a9a",
+      "sha256": "ae92c4b19a9a37bd246a4aeda3061ed68e61185fdc83139606a39ae328694698",
       "superseded_by": []
     },
     {
@@ -1417,7 +1417,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/quickstart.md",
       "scope": "feature",
-      "sha256": "df17cd68b6642eb51c7df1ceb96f1c53d7f0d430752a0241b8010ade62dbb631",
+      "sha256": "78461b5fb41f8b674ff09aad444fb61acc3198d49c65fbf46e1379698a311cee",
       "superseded_by": []
     },
     {
@@ -1461,7 +1461,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/spec.md",
       "scope": "feature",
-      "sha256": "d255c7f715e655043f6794e902e10ca45ff7ae9b04d231cf44f9293809373edb",
+      "sha256": "bf5b22b521ffcb3c2660c5b8dd541ecf5300b7c3fdd1b38ef394983ae4c276e8",
       "superseded_by": []
     },
     {
