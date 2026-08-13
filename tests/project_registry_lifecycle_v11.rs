@@ -11,7 +11,9 @@ use symforge::live_index::index_lifecycle::registry::{
 };
 
 fn binding() -> BindingAuthority {
-    BindingAuthority::bind(PhysicalRootLease::take(std::env::temp_dir()).identity())
+    BindingAuthority::bind(
+        PhysicalRootLease::take(tempfile::tempdir().expect("root").keep()).identity(),
+    )
 }
 
 /// TEST-REGISTRY (T030). The name is pinned by

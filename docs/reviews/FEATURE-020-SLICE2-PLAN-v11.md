@@ -8,6 +8,38 @@ the plan *after* that correction, not the fit report's own recommendations.
 Nothing here is written from spec prose alone. Where a claim is inherited rather
 than verified, it says so.
 
+## PROGRESS LEDGER — durable, does not depend on session state
+
+A harness task list is not a ledger; it may not survive a context compaction.
+This section, the git history, and the agentmemory `[symforge]` bootstrap are the
+things that do. Update this when a step lands.
+
+| Step | State | Evidence |
+|---|---|---|
+| Step 0 — widen `authority.rs` to the frozen shape | DONE | 19 pre-existing + 5 new oracles green |
+| `capacity.rs` (T032/T035/T036) | DONE | 6 oracles, incl. pinned `capacity_is_conserved_until_physical_drop` |
+| `process_runtime.rs` (T034) | DONE | one capacity domain across four surfaces; spawns nothing |
+| `registry.rs` (T033) | DONE | 5 oracles, incl. pinned `protected_membership_and_state_placement`; revocation enforced |
+| `embedded.rs` (T037) | WRITTEN, oracles pending | pinned name `one_handle_close_and_drop_coalesce` not yet written |
+| `adapters.rs` (T038) | NOT STARTED | |
+| T039 refusal/cancellation proofs | NOT STARTED | |
+| T040 evidence + adversarial review | NOT STARTED | |
+
+### Deferrals closed rather than carried
+
+The standing rule is that no known gap crosses a slice boundary.
+
+- **Temp-before-replace proved only a receipt label** (grok-4-5). Closed: the
+  write is staged and committed in two steps, an oracle observes the target
+  holding its preimage while the stage exists, and the mutation sweep now reverts
+  real I/O instead of a label.
+- **Oracles leased the machine's shared temp directory** and left probe files in
+  it. Closed: every test owns its root.
+- **TOCTOU in root confinement.** Closed properly with a `cap-std` directory
+  capability — every path is opened relative to the handle, so a link swapped in
+  after a check cannot be followed. This replaced a documented hazard with an
+  enforced one.
+
 ## BLOCKER — V11's frozen semantics contradict currently-shipping behaviour
 
 This is the finding that matters, and it is not fixable inside Slice 2.
