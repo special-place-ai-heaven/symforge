@@ -1,5 +1,79 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-8 review and its repairs (PR 3)
+
+Round 8 attacked the round-7 repairs: **0 blockers, 4 confirmed majors,
+0 refuted, 1 note**. The inert-comment rule again survived untouched —
+all four majors landed on the two round-7 artifacts themselves: the
+depth-aware stripper (two distinct evasion paths) and the gate pin (two
+silent-pass classes plus its falsified "fails loudly" sentence).
+
+- **MAJOR — whitespace collapse fabricated `/*` openers.** The round-7
+  pipeline deleted all whitespace FIRST, then stripped comments — gluing
+  non-adjacent `/ *` into an opener the Rust lexer never saw. Three live
+  rustc-verified constructs evaded both views: a spaced comment interior
+  (`use std::/* / * */include as inc;`), a divide-by-deref (`let a = b /
+  *c;` preceding a commented alias), and the same glue defeating the
+  `#[path` arm. Repair: `strip_block_comments` now runs on the RAW line,
+  before any collapse — on a quote-free line, raw-text `/*` adjacency is
+  a real comment opener to the lexer too. Mutation **M44** (the spaced-
+  interior alias, compiling) observed caught, restored.
+- **MAJOR — the depth-0 `*/` clear deleted flagged prefixes.** A `*/`
+  later on the line as string or trailing-line-comment content wiped an
+  already-collected `::include` prefix from the stripped view while the
+  balanced comment hid it from the plain view (`use std::/*c*/include as
+  x; let s = "*/";` — live, silent). Repair: the stripper never discards
+  collected output; a depth-0 `*/` is skipped and everything kept (over-
+  flag only). Mutation **M45** (the trailing-`*/` form) observed caught.
+  With both stripper repairs in, one class remained that the round-8
+  probes implied but did not cite: string CONTENT (`"/*"`) can poison
+  any line-local comment tracking and hide a splice from every view. The
+  repair closes it as a class, not an instance — the new AMBIGUITY ARM
+  flags outright any line carrying a `"` alongside a `/*` or `*/` plus a
+  splice token, so the views only ever judge lines whose comment
+  delimiters are real. Zero existing `src/` lines trip the arm (the
+  allowlists and dual-count binds are unchanged). Mutations **M46** (the
+  string-poisoned alias, observed caught by the ambiguity arm
+  specifically), **M47** (comment-interleaved `#[path]`, the F4 form),
+  and **M48** (the round-7 nested control, still caught) all observed,
+  restored. The `r#` strip also became a pair of EXTRA views instead of
+  an in-place edit — removal can fabricate or destroy adjacency, and an
+  extra view only ever adds a flag.
+- **MAJOR — the gate-pin tokenizer had three silent-pass gaps** (sibling
+  `--tests` on the same line masking a bare `cargo test`; `.yaml`
+  workflows invisible to the `.yml`-only filter; `cargo  test` with a
+  doubled space not counted), and — the fourth major — **the STATED
+  BOUND's "fails loudly" sentence was falsified** by a `.yaml` gate and
+  by a wrapped `run:` block, neither carved out as a residual. One
+  repair for both: `no_gate_builds_doctests` now parses every `run:`
+  scalar in `*.yml`/`*.yaml` (inline, literal `|`, folded `>`), joins
+  shell continuations, splits compound commands into segments, and
+  judges each `cargo … test` segment on its own tokens — the excluding
+  selector must sit before any bare `--` (a trailing `--test` is a
+  libtest filter, not a selector), `--doc` anywhere is an offense. The
+  walk was observed finding exactly 7 invocations on the real workflows
+  (floor probe), and the pin's REAL residuals are now stated in the
+  header: indirection (script/make/composite action) and `run:` values
+  assembled from YAML anchors or `${{ }}` expressions. Mutations
+  **M49a** (sibling masking) / **M49b** (`.yaml` + `--doc`) / **M49c**
+  (double space) / **M49d** (backslash-wrapped invocation) / **M49e**
+  (folded-block split) each observed caught against the mutated
+  workflows, all restored.
+- **Note:** the T051 section still said "two executing tests"
+  present-tense; bracket-amended at the spot (the file has held four
+  since round 7).
+
+## Gate results for the round-8 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; allowlist dual-counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| gate-walk anti-vacuity | observed 7 invocations across ci.yml/release.yml via the floor probe |
+| mutations | M44–M48 (matcher) and M49a–M49e (gate walk) each observed caught, restored; `git status` clean but for the test file and this document |
+
 ## Round-7 review and its repairs (PR 3)
 
 Round 7 attacked the round-6 repairs: **0 blockers, 2 confirmed majors,
@@ -17,9 +91,13 @@ Both majors were repairable without touching the rule.
   claimed "comment interleaving" coverage, not a stated residual. Repair:
   `strip_block_comments` is now a single linear scan tracking NESTING
   DEPTH — an unclosed `/*` still comments out the rest, a dangling `*/`
-  (depth zero) discards the prefix. Mutation **M42** (the exact nested
-  spelling) observed caught; **M38 replanted** as the non-nested control
-  to prove the rewrite regressed nothing — also caught.
+  (depth zero) discards the prefix [round 8: that discard was itself an
+  evasion — a later string or trailing line comment carrying `*/` wiped
+  an already-flagged prefix; the stripper now runs on the raw line
+  before any collapse and never discards collected output]. Mutation
+  **M42** (the exact nested spelling) observed caught; **M38 replanted**
+  as the non-nested control to prove the rewrite regressed nothing —
+  also caught.
 - **MAJOR — my round-6 refutation ground was false as written.** The
   Round-6 section's parenthetical said a `///` line "genuinely cannot
   execute code"; the verifier ran one — rustdoc extracts fenced
@@ -34,8 +112,12 @@ Both majors were repairable without touching the rule.
   snapshot — new test `no_gate_builds_doctests` pins every `cargo test`
   line in the CI workflows to a doctest-excluding target selector and
   forbids `--doc`, with the test-file header carrying the STATED BOUND
-  paragraph. Mutations **M43a** (selector dropped from a gate line) and
-  **M43b** (`--doc` added) each observed caught, restored.
+  paragraph [round 8: this first walk had three silent-pass gaps
+  (`.yaml` invisible, sibling-token masking, spacing/wrapping); it now
+  parses `run:` scalars into command segments, and the pin's own
+  residuals — indirection and expression-built commands — are stated in
+  the header]. Mutations **M43a** (selector dropped from a gate line)
+  and **M43b** (`--doc` added) each observed caught, restored.
 - **Docs minor:** the round-1 amendment bracket still said "eight
   allowlist entries count-pinned" present-tense; since round 6 the
   sibling sweep pins nine. Bracket-amended at the spot.
@@ -72,7 +154,9 @@ survive adjudication.
   ci.yml/release.yml carries `--all-targets`/`--lib`/`--test`), and a
   doctest edge resolves only the recorded still-public paths. That bound
   is now OBSERVED, not hand-checked: `no_gate_builds_doctests` pins every
-  gate invocation to a doctest-excluding selector]; it is a
+  gate invocation to a doctest-excluding selector — round 8 hardened the
+  pin's walk (run-scalar parsing, both extensions, segments) and stated
+  its residuals (indirection, expression-built commands)]; it is a
   lexically different construction, and the header's "Rust permits no code
   after a line-start `//`" was false as written. The repair closes the
   whole class, not the instance: Rust has exactly two lexeme kinds that
@@ -97,7 +181,14 @@ survive adjudication.
   the whitespace-and-`r#`-collapsed form, and that form with `/*…*/`
   spans removed (unclosed `/*` comments out the rest of the line, a
   dangling `*/` the start) — and flags on EITHER, so over-removal on
-  pathological string content can only over-flag. A block comment
+  pathological string content can only over-flag [round 8 falsified the
+  bracketed mechanics AND that last clause: collapsing before stripping
+  fabricated openers, the dangling-`*/` discard deleted flagged
+  prefixes, and string content CAN under-flag by poisoning the tracking
+  while comment bytes blind the plain view. The stripper now runs raw
+  and never discards, the `r#` strip became extra views, and
+  quote-plus-delimiter lines with splice tokens are flagged outright by
+  the ambiguity arm instead of judged]. A block comment
   SPANNING lines is the already-stated split residual and the header now
   names it as such, along with the split+concat compound. Mutations
   **M38** (comment-interleaved alias creation) and **M40** (the exact
@@ -452,7 +543,12 @@ under the embed gate). Each stays visible in the review findings document.
 
 `tests/preventive_runtime_dark_v11.rs` exists now — its creation is T051's
 own act, held back from every earlier chunk on purpose — and it turns the
-darkness paragraph of `index_lifecycle/mod.rs` into two executing tests.
+darkness paragraph of `index_lifecycle/mod.rs` into two executing tests
+[amended after round 8: "two" was the count at this section's writing and
+went stale — the file has held four tests since round 7: the two darkness
+sweeps this section describes, plus `source_splicing_is_allowlisted`
+(the C9 tripwire, round 1) and `no_gate_builds_doctests` (the doctest
+bound pin, round 7)].
 
 **The sweep rule is fail-closed.** A line naming the dark surface outside
 its directory passes only as prose or as one of the exactly-two
