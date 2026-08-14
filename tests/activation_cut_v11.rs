@@ -71,6 +71,34 @@ const SURFACE_CATEGORIES: &[&str] = &[
     "writers",
 ];
 
+/// Surface-category members that are NOT ingress, and so resolve no typed
+/// authority branch at all. Round-16 shape change: a member can sit in a
+/// surface category for owner and seams while doing work no branch describes —
+/// mutating a `SharedIndex` is the case that forced it. Carrying `None` here is
+/// a positive, pinned claim with a basis, not the absence of a row; the join
+/// below requires every surface slot to be in EXACTLY ONE of this list or the
+/// overlay, so a member cannot be quietly dropped from both.
+const NON_INGRESS_EXCEPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "writers",
+        "src/live_index/single_file.rs::update_file_from_disk",
+        "writers assertion 2 (`No writer mutates a V10 SharedIndex`) is what this member IS: it \
+         calls `admit_and_index_single_path(.., shared, expected_gen)` (single_file.rs:669). It \
+         writes no repository-source bytes and no ProjectStateDir, so neither MutationPermitted \
+         nor StateWriteAuthorized reaches it; and a generation ARGUMENT is not GenerationLeased, \
+         which INV-SURFACE defines as the branch holding a ProjectQueryLease. T064 routes the \
+         equivalent work through the candidate pipeline WITHOUT a permit.",
+    ),
+    (
+        "writers",
+        "src/live_index/single_file.rs::remove_file",
+        "Same ground as `update_file_from_disk`: it calls \
+         `shared.remove_file_at_generation(.., shared.current_project_generation())` \
+         (single_file.rs:680) — a SharedIndex mutation, not repository-source I/O, not \
+         ProjectStateDir, and not a query lease.",
+    ),
+];
+
 /// The one member string the frozen inventory files under two categories, with
 /// different owner sets. Pinned so a future edit that collapses it — or adds a
 /// second dual-homed member — fails instead of quietly changing the matrix's
@@ -234,9 +262,10 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "trace_symbol",
         &["GenerationLeased", "Refused"],
         "compatibility_aliases assertion: `trace_symbol` cannot reach V10 symbol caches and uses \
-         GenerationLeased ONLY for a complete Current publication — the word `only` bounds the \
-         lease to that case, so an incomplete publication is an unavailability this ingress \
-         terminates on rather than a lease it may take",
+         GenerationLeased ONLY for a complete Current publication. The `only` forbids the lease \
+         on an incomplete publication but does not name the other outcome; ORACLE-INGRESS-CLOSED-\
+         SURFACE and INV-SURFACE do — Refused is the branch that terminates selection. \
+         {GenerationLeased} alone would claim this alias can never refuse.",
     ),
     // ---- writers (22/25; 3 brought back, see the T050 decision list) ----
     // Split per writers assertion 3, which draws the line the branches encode:
@@ -244,6 +273,17 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     // ProjectStateDir and post-image team-artifact writes remain permit-free
     // (StateWriteAuthorized). Family membership is cited per member, not
     // inherited from the module.
+    (
+        "writers",
+        "src/cli/init.rs::run_init_with_paths",
+        &["MutationPermitted", "StateWriteAuthorized"],
+        "writers assertion 3, both halves, by the same wrapping pattern as edit_tools over \
+         edit.rs: init calls `gitignore_hygiene::reconcile_project_gitignore` (init.rs ~375/381), \
+         the source-authorized write already overlayed on that member, and \
+         `paths::ensure_runtime_symforge_dir` (init.rs ~388), a ProjectStateDir write. Its \
+         host-config I/O (`~/.claude.json`, desktop and cursor configs) is outside MODEL-SURFACE \
+         entirely — that is not a ninth branch and does not eject the member.",
+    ),
     (
         "writers",
         "src/gitignore_hygiene.rs::atomic_replace",
@@ -342,45 +382,51 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         &["MutationPermitted"],
         "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
     ),
-    (
-        "writers",
-        "src/protocol/knowledge_curation.rs::KnowledgeCurationCoordinator::apply",
-        &["StateWriteAuthorized"],
-        "writers assertion 3: ProjectStateDir and post-image team-artifact writes remain \
-         permit-free — apply writes under state_dir/CURATION_STATE_DIR (knowledge_curation.rs:351)",
-    ),
+    // The policy file is `repo_root.join(POLICY_FILE)` (knowledge_curation.rs:31,
+    // :541, :544, :607, :904) — NORMAL SOURCE, not `.symforge/` state, so FR-037
+    // requires a SourceMutationPermit before that write. The "post-image
+    // team-artifact state writes" of assertion 3 are FR-037 completion
+    // finalization in ProjectStateDir once the source already matches the
+    // post-image; they are not the ledger write itself. Rows that do both carry
+    // both branches.
     (
         "writers",
         "src/protocol/knowledge_curation.rs::KnowledgeCurationCoordinator::write_policy",
-        &["StateWriteAuthorized"],
-        "writers assertion 3: post-image team-artifact write — the `.symforge-knowledge.toml` \
-         policy post-image (knowledge_curation.rs:31, :629)",
+        &["MutationPermitted"],
+        "FR-037: writes `repo_root.join(POLICY_FILE)` = `.symforge-knowledge.toml` \
+         (knowledge_curation.rs:31, :541), which the data model calls normal source, so the \
+         write requires a SourceMutationPermit. It is not a ProjectStateDir write.",
     ),
     (
         "writers",
-        "src/protocol/knowledge_curation.rs::apply_reviewed_mutation",
-        &["StateWriteAuthorized"],
-        "writers assertion 3: ProjectStateDir curation state write, permit-free",
+        "src/protocol/knowledge_curation.rs::KnowledgeCurationCoordinator::apply",
+        &["MutationPermitted", "StateWriteAuthorized"],
+        "Does both: the source policy write via write_policy (FR-037, repo_root POLICY_FILE) and \
+         the ProjectStateDir curation state under state_dir/CURATION_STATE_DIR \
+         (knowledge_curation.rs:351), which is the permit-free half of writers assertion 3",
     ),
     (
         "writers",
         "src/protocol/knowledge_curation.rs::durable_replace",
-        &["StateWriteAuthorized"],
-        "writers assertion 3: the durable writer for curation state and the policy post-image; \
-         every call site (knowledge_curation.rs:629, :1808, :1888, :1901) is state or team artifact",
+        &["MutationPermitted", "StateWriteAuthorized"],
+        "The durable writer for both halves: the policy post-image at repo_root \
+         (knowledge_curation.rs:629, source, FR-037) and the curation lineage/record/quarantine \
+         state under ProjectStateDir (:1808, :1888, :1901)",
     ),
     (
         "writers",
         "src/protocol/knowledge_curation.rs::durable_replace_io",
-        &["StateWriteAuthorized"],
-        "writers assertion 3: the io half of durable_replace, same call sites, same ground",
+        &["MutationPermitted", "StateWriteAuthorized"],
+        "The io half of durable_replace, reached from the same call sites, so it spans the same \
+         two write kinds",
     ),
     (
         "writers",
         "src/protocol/tools.rs::SymForgeServer::curate_knowledge",
-        &["StateWriteAuthorized"],
-        "writers assertion 3: tool ingress for curation; its writes are ProjectStateDir and the \
-         post-image team artifact, both permit-free",
+        &["MutationPermitted", "StateWriteAuthorized"],
+        "Tool ingress for curation: it dispatches the source policy write and the ProjectStateDir \
+         finalization, so its allowed set is the union of what it dispatches, not a weaker \
+         singleton",
     ),
 ];
 
@@ -580,10 +626,38 @@ fn all_ingress_uses_exact_typed_authority_branch() {
         );
     }
 
+    // The pinned non-ingress exceptions, checked against the same frozen slots
+    // and required to be disjoint from the overlay: a member may be exempt or
+    // branch-bearing, never both and never neither.
+    let mut exceptions: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    for (category, member, basis) in NON_INGRESS_EXCEPTIONS {
+        assert!(
+            surface.contains(category),
+            "`{category}::{member}` is pinned as a non-ingress exception, but `{category}` is not \
+             a surface category — non-surface members already carry no branch"
+        );
+        assert!(
+            !basis.trim().is_empty(),
+            "`{category}::{member}` is exempt with no basis; an exemption that cannot say why is \
+             the parking this test exists to prevent"
+        );
+        assert!(
+            exceptions.insert((*category, *member), *basis).is_none(),
+            "`{category}::{member}` is pinned as an exception twice"
+        );
+        assert!(
+            !overlay.contains_key(&(*category, *member)),
+            "`{category}::{member}` is both branch-bearing and exempt; pick one"
+        );
+    }
+
     let mut missing = Vec::new();
     let mut wrongly_present = Vec::new();
     for (category, member) in &inventory.slots {
         let key = (category.as_str(), member.as_str());
+        if exceptions.contains_key(&key) {
+            continue;
+        }
         match (surface.contains(category.as_str()), overlay.get(&key)) {
             (true, None) => missing.push(format!("{category}::{member}")),
             (false, Some(_)) => wrongly_present.push(format!("{category}::{member}")),
@@ -617,6 +691,13 @@ fn all_ingress_uses_exact_typed_authority_branch() {
     assert!(
         unknown.is_empty(),
         "overlay names slots the frozen inventory does not have: {unknown:?}"
+    );
+    let exception_slots: BTreeSet<(&str, &str)> = exceptions.keys().copied().collect();
+    let unknown_exceptions: Vec<_> = exception_slots.difference(&frozen_slots).collect();
+    assert!(
+        unknown_exceptions.is_empty(),
+        "non-ingress exceptions name slots the frozen inventory does not have: \
+         {unknown_exceptions:?}"
     );
     assert!(
         wrongly_present.is_empty(),
