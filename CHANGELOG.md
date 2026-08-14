@@ -26,6 +26,19 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.5.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.4.1...v10.5.0) (2026-08-14)
+
+
+### Features
+
+* **feature-020:** Slice 3 PR 1 — provenance types on the frozen contract ([#573](https://github.com/special-place-ai-heaven/symforge/issues/573)) ([1f8dcff](https://github.com/special-place-ai-heaven/symforge/commit/1f8dcffb50be38fe84f127f9db765de015c6ed2e))
+* **feature-020:** Slice 3 PR 2 — named read stores and single-capture seams ([#575](https://github.com/special-place-ai-heaven/symforge/issues/575)) ([e15848a](https://github.com/special-place-ai-heaven/symforge/commit/e15848a220994fc90e73e40e6adf78893294a949))
+
+
+### Bug Fixes
+
+* **release:** teardown tolerates a fixture path that is already gone ([#576](https://github.com/special-place-ai-heaven/symforge/issues/576)) ([fc8761c](https://github.com/special-place-ai-heaven/symforge/commit/fc8761c73440aa3dc86334a0fd4484b5eb741e2a))
+
 ## [10.4.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.4.0...v10.4.1) (2026-08-13)
 
 
