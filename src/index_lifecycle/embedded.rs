@@ -144,6 +144,7 @@ impl EmbeddedSourceFactory {
             key,
             registration: Arc::clone(self),
             closed: AtomicBool::new(false),
+            _not_unwind_safe: std::marker::PhantomData,
         })
     }
 
@@ -180,6 +181,8 @@ pub struct EmbeddedSourceHandle {
     key: ProjectKey,
     registration: Arc<EmbeddedSourceFactory>,
     closed: AtomicBool,
+    // T049: the contract pins the handle NOT UnwindSafe/RefUnwindSafe.
+    _not_unwind_safe: super::public_api::NotUnwindSafe,
 }
 
 impl EmbeddedSourceHandle {
@@ -235,6 +238,7 @@ impl EmbeddedSourceHandle {
         SourceCloseReceipt {
             identity: self.identity,
             performed_shutdown: performed,
+            _not_unwind_safe: std::marker::PhantomData,
         }
     }
 
@@ -253,21 +257,30 @@ impl EmbeddedSourceHandle {
 
     /// V11 (E1): symbol search under the contract shape. No generation is
     /// bound to a dark handle, so this REFUSES honestly — an empty result
-    /// would be a claim about content that does not exist.
+    /// would be a claim about content that does not exist. The Ok arm is the
+    /// contract's `Claim<SymbolSearchResult>` (T049): a result that carries
+    /// how it was produced, which nothing dark can mint.
     pub fn search_symbols(
         &self,
         _request: &super::public_api::SymbolSearchRequest,
-    ) -> Result<super::public_api::SymbolSearchResult, super::public_api::EmbedSourceRefusal> {
+    ) -> Result<
+        super::public_api::EmbedClaim<super::public_api::SymbolSearchResult>,
+        super::public_api::EmbedSourceRefusal,
+    > {
         Err(super::public_api::dark_unbound_refusal(
             crate::lifecycle_identity::OperationKind::SearchSymbols,
         ))
     }
 
-    /// V11 (E1): text search under the contract shape; same honest refusal.
+    /// V11 (E1): text search under the contract shape; same honest refusal,
+    /// same claim-carrying Ok arm (T049).
     pub fn search_text(
         &self,
         _request: &super::public_api::TextSearchRequest,
-    ) -> Result<super::public_api::TextSearchResult, super::public_api::EmbedSourceRefusal> {
+    ) -> Result<
+        super::public_api::EmbedClaim<super::public_api::TextSearchResult>,
+        super::public_api::EmbedSourceRefusal,
+    > {
         Err(super::public_api::dark_unbound_refusal(
             crate::lifecycle_identity::OperationKind::SearchText,
         ))
@@ -317,10 +330,34 @@ impl EmbeddedSourceHandle {
 /// lives in V11, so the error is typed rather than a deadlock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptWaitError {
+    /// The deadline passed before the wait completed. A CONTRACT variant
+    /// (T049): dark waits complete immediately, so nothing in Slice 3 can
+    /// produce it — Slice 4's real waits can. T047's transcription omitted
+    /// it, the same defect class as the invented `ServerExit::Clean`, caught
+    /// by the dependent-positive fixture once its feature gate was honest.
+    DeadlineElapsed,
     /// The wait was attempted from inside this source's own finalizer:
     /// waiting there is waiting on the calling thread itself.
     WouldSelfWait,
 }
+
+// T049: `Display` and `Error` are contract-pinned direct impls on this atom.
+impl std::fmt::Display for ReceiptWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadlineElapsed => {
+                write!(f, "the deadline passed before the wait completed")
+            }
+            Self::WouldSelfWait => write!(
+                f,
+                "waiting on this receipt from inside its own source's finalizer \
+                 would wait on the calling thread itself"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReceiptWaitError {}
 
 /// Receipt for a V11 `begin_close`. Nothing is spawned in the dark modules,
 /// so the wait completes immediately — but it still owns the self-wait guard.
@@ -328,10 +365,33 @@ pub enum ReceiptWaitError {
 pub struct SourceCloseReceipt {
     identity: EmbeddedIdentity,
     performed_shutdown: bool,
+    // T049: the contract pins the receipt NOT UnwindSafe/RefUnwindSafe.
+    _not_unwind_safe: super::public_api::NotUnwindSafe,
 }
 
 impl SourceCloseReceipt {
-    /// Wait for the close to finalize. Refuses a self-wait; completes
+    /// The contract wait (T049): refuses a self-wait, completes immediately
+    /// otherwise — the close performed synchronously and nothing is spawned
+    /// in the dark modules, so the deadline can never be reached and is
+    /// deliberately unused. `already_terminal` reports whether this close
+    /// JOINED an already-terminal source rather than performing the
+    /// shutdown; the dark source version is 0, same truth the runtime view
+    /// reports.
+    pub fn wait(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> Result<super::public_api::SourceCloseReport, ReceiptWaitError> {
+        if FINALIZING.with(std::cell::Cell::get) == Some(self.identity) {
+            return Err(ReceiptWaitError::WouldSelfWait);
+        }
+        Ok(super::public_api::SourceCloseReport {
+            already_terminal: !self.performed_shutdown,
+            terminal_source_version: 0,
+        })
+    }
+
+    /// Wait for the close to finalize, reporting the INTERNAL observation
+    /// record (T047's oracle shape). Refuses a self-wait; completes
     /// immediately otherwise, because the close performed synchronously and
     /// only observed completions may be reported.
     pub fn wait_for_test(&self) -> Result<SourceCloseReport, ReceiptWaitError> {

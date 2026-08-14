@@ -25,10 +25,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::lifecycle_identity::{
-    OperationKind, OperationReceipt, RetryAdvice, SourceRefusal, SourceRefusalKind,
-};
+use crate::lifecycle_identity::{OperationReceipt, SourceRefusal};
+// T049: the contract's three enum atoms ARE the lifecycle_identity enums —
+// minted contract-verbatim, so the wrap is nameability, not reshaping. This
+// module is the boundary that makes them nameable; `lifecycle_identity` stays
+// `pub(crate)` and invisible to the census.
+pub use crate::lifecycle_identity::{OperationKind, RetryAdvice, SourceRefusalKind};
 
+use super::embedded::ReceiptWaitError;
 use super::process_runtime::ProcessIndexRuntime;
 
 /// The provisional process-byte budget behind the contract's zero-argument
@@ -42,6 +46,13 @@ pub const PROVISIONAL_ACQUIRE_PROCESS_BYTES: u64 = 256 * 1024 * 1024;
 /// identities always render as `<kind>-<digits>`, so this token is outside the
 /// renderer's image by construction.
 pub const EVIDENCE_ABSENT: &str = "evidence-absent";
+
+/// Auto-trait opt-out carried by every V11 handle type (T049). The frozen
+/// contract pins the five handles `Send + Sync + Unpin` but NOT
+/// `UnwindSafe`/`RefUnwindSafe` — the activated runtime's internals will not
+/// be — so the dark stand-ins must already refuse those two impls, or the
+/// activation cut would change the public trait surface.
+pub(crate) type NotUnwindSafe = std::marker::PhantomData<Box<dyn std::any::Any + Send + Sync>>;
 
 // ── Identity rendering ─────────────────────────────────────────────────────
 
@@ -212,6 +223,7 @@ pub struct EmbedRefreshTicket {
     ticket_identity: String,
     operation: EmbedOperationReceipt,
     requested_source_version: u64,
+    _not_unwind_safe: NotUnwindSafe,
 }
 
 impl EmbedRefreshTicket {
@@ -225,6 +237,155 @@ impl EmbedRefreshTicket {
 
     pub fn requested_source_version(&self) -> u64 {
         self.requested_source_version
+    }
+}
+
+// ── The claim family, contract-shaped (T049 wrap list) ─────────────────────
+//
+// Dark handles refuse every operation, so nothing in Slice 3 can mint a
+// claim, an authority, or an evaluation — these types exist so the
+// `Result<Claim<..>, ..>` signatures are contract-true and the Slice 4
+// wiring changes evidence, not shape. No constructor is public; none is
+// needed until something can honestly observe what these types report.
+
+/// The contract-shaped atomic authority: `&str` identity over a string
+/// rendered at wrap time, plus the stable kind name.
+#[derive(Debug)]
+pub struct EmbedAtomicAuthority {
+    identity: String,
+    kind_name: &'static str,
+}
+
+impl EmbedAtomicAuthority {
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        self.kind_name
+    }
+}
+
+/// The contract-shaped claim provenance: the closed authority set that was
+/// actually examined. The count is measured from the set, never stored
+/// separately — two fields that can disagree are one field too many.
+#[derive(Debug)]
+pub struct EmbedClaimProvenance {
+    authorities: Vec<EmbedAtomicAuthority>,
+    identity: String,
+    kind_name: &'static str,
+}
+
+impl EmbedClaimProvenance {
+    pub fn authorities(&self) -> &[EmbedAtomicAuthority] {
+        &self.authorities
+    }
+
+    pub fn authority_count(&self) -> usize {
+        self.authorities.len()
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        self.kind_name
+    }
+}
+
+/// The contract-shaped evaluation provenance.
+#[derive(Debug)]
+pub struct EmbedEvaluationProvenance {
+    identity: String,
+}
+
+impl EmbedEvaluationProvenance {
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+}
+
+/// The contract-shaped claim: a value carrying HOW it was produced.
+#[derive(Debug)]
+pub struct EmbedClaim<T> {
+    value: T,
+    provenance: EmbedClaimProvenance,
+    operation: EmbedOperationReceipt,
+    evaluation: Option<EmbedEvaluationProvenance>,
+    producing_runtime_identity: String,
+}
+
+impl<T> EmbedClaim<T> {
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn provenance(&self) -> &EmbedClaimProvenance {
+        &self.provenance
+    }
+
+    pub fn operation(&self) -> &EmbedOperationReceipt {
+        &self.operation
+    }
+
+    pub fn evaluation(&self) -> Option<&EmbedEvaluationProvenance> {
+        self.evaluation.as_ref()
+    }
+
+    pub fn producing_runtime_identity(&self) -> &str {
+        &self.producing_runtime_identity
+    }
+}
+
+// ── The source spec and the report shapes (T049 wrap list) ─────────────────
+
+/// The contract-shaped source spec: how an embedder names a source to open.
+#[derive(Debug)]
+pub struct EmbeddedSourceSpec {
+    root: std::path::PathBuf,
+}
+
+impl EmbeddedSourceSpec {
+    /// The contract constructor: the current worktree rooted at `root`.
+    pub fn current_worktree(root: std::path::PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+/// The contract-shaped shutdown report: observed counts only.
+#[derive(Debug)]
+pub struct ShutdownReport {
+    pub closed_sources: u64,
+    pub joined_workers: u64,
+}
+
+/// The contract-shaped source-close report. Distinct from the internal
+/// `embedded::SourceCloseReport` (T047's observation record): this is the
+/// PUBLIC field-for-field contract record the boundary's `wait` returns.
+#[derive(Debug)]
+pub struct SourceCloseReport {
+    pub already_terminal: bool,
+    pub terminal_source_version: u64,
+}
+
+/// The contract-shaped shutdown receipt. The DARK runtime spawns nothing and
+/// closes no holder's source, so the wait completes immediately and reports
+/// the counts it observed — zeros, honestly, not a claim of teardown work
+/// nothing performed. Slice 4 wires the real lifecycle behind this shape.
+#[derive(Debug)]
+pub struct EmbedShutdownReceipt {
+    _not_unwind_safe: NotUnwindSafe,
+}
+
+impl EmbedShutdownReceipt {
+    /// The contract wait. Nothing is spawned in the dark modules, so the
+    /// deadline can never be reached and is deliberately unused.
+    pub fn wait(&self, _deadline: std::time::Instant) -> Result<ShutdownReport, ReceiptWaitError> {
+        Ok(ShutdownReport {
+            closed_sources: 0,
+            joined_workers: 0,
+        })
     }
 }
 
@@ -253,9 +414,23 @@ pub(crate) fn dark_unbound_refusal(kind: OperationKind) -> EmbedSourceRefusal {
 
 /// The contract-shaped process runtime: zero-argument `acquire` delegating to
 /// the explicit-budget `incarnate` with the named provisional constant.
-#[derive(Debug)]
+///
+/// `Clone` and `Drop` are CONTRACT-pinned direct impls, not conveniences: the
+/// frozen trait_impls record both, so the dark stand-in carries them or the
+/// activation cut would change the public trait surface.
+#[derive(Debug, Clone)]
 pub struct ProcessRuntimeApi {
     _inner: std::sync::Arc<ProcessIndexRuntime>,
+    factory: std::sync::Arc<super::embedded::EmbeddedSourceFactory>,
+    _not_unwind_safe: NotUnwindSafe,
+}
+
+impl Drop for ProcessRuntimeApi {
+    fn drop(&mut self) {
+        // The contract pins a literal `Drop` on this atom. The dark runtime
+        // owns no workers, so there is nothing to join yet; Slice 4 gives
+        // this body its real teardown.
+    }
 }
 
 impl ProcessRuntimeApi {
@@ -266,7 +441,48 @@ impl ProcessRuntimeApi {
     pub fn acquire() -> Result<Self, EmbedSourceRefusal> {
         Ok(Self {
             _inner: ProcessIndexRuntime::incarnate(PROVISIONAL_ACQUIRE_PROCESS_BYTES),
+            factory: super::embedded::EmbeddedSourceFactory::new(),
+            _not_unwind_safe: std::marker::PhantomData,
         })
+    }
+
+    /// Open the sole handle for the source `spec` names (T049). Dark behavior
+    /// is the registration-level truth: sole-handle admission works, and a
+    /// second open of a source already held refuses — the selected source is
+    /// unavailable until its holder closes, hence `SelectionUnavailable` with
+    /// `OnEvent` retry. No authority is examined at registration level, so
+    /// the evidence renders the closed sentinel.
+    pub fn open_embedded_source(
+        &self,
+        spec: EmbeddedSourceSpec,
+    ) -> Result<super::embedded::EmbeddedSourceHandle, EmbedSourceRefusal> {
+        let key = super::registry::ProjectKey::new(spec.root.to_string_lossy());
+        self.factory.open(key).map_err(|refusal| {
+            let kind = match refusal {
+                super::embedded::EmbedRefusal::SourceAlreadyOpen { .. } => {
+                    SourceRefusalKind::SelectionUnavailable
+                }
+                super::embedded::EmbedRefusal::WouldSelfWait
+                | super::embedded::EmbedRefusal::AlreadyClosed => {
+                    SourceRefusalKind::SourceUnavailable
+                }
+            };
+            EmbedSourceRefusal::wrap(&SourceRefusal::for_runtime(
+                kind,
+                OperationReceipt::for_test(OperationKind::OpenEmbeddedSource),
+                RetryAdvice::OnEvent,
+                None,
+            ))
+        })
+    }
+
+    /// Begin process shutdown (T049). The dark runtime closes no holder's
+    /// source and joins no workers — the receipt's wait reports the observed
+    /// zeros rather than teardown work nothing performed.
+    pub fn begin_shutdown(&self) -> EmbedShutdownReceipt {
+        EmbedShutdownReceipt {
+            _not_unwind_safe: std::marker::PhantomData,
+        }
     }
 
     /// Fixture probe: the wrapper's honest dark refusal, for shape oracles.
@@ -282,9 +498,9 @@ impl ProcessRuntimeApi {
 ///
 /// * `"wrapped-here"` — a contract-shaped wrapper exists in this module or on
 ///   the SEAM-pinned handle, exercised by the shape oracle.
-/// * `"wrap-planned-t049"` — the internal type's shape diverges from the
-///   contract record (the D13 list) and its wrapper lands with the T049
-///   harness or the activation cut; recorded so it cannot be forgotten.
+/// * `"wrap-planned-t049"` — RETIRED vocabulary: T048 recorded the nine
+///   shape-diverging types (the D13 list) under it so they could not be
+///   forgotten; T049 discharged all nine into `"wrapped-here"` wrappers.
 /// * `"keyword-flip"` — `server_api`: a real `pub(crate)` module whose
 ///   activation is one keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,15 +514,15 @@ pub fn wrap_table() -> &'static [WrapEntry] {
     const TABLE: &[WrapEntry] = &[
         WrapEntry {
             atom: "symforge::embed::AtomicAuthority",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::Claim",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::ClaimProvenance",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::EmbeddedSourceHandle",
@@ -314,11 +530,11 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::EmbeddedSourceSpec",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::EvaluationProvenance",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::OperationKind",
@@ -338,7 +554,7 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::RefreshTicket",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::RetryAdvice",
@@ -346,11 +562,11 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::ShutdownReceipt",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::ShutdownReport",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::SourceCloseReceipt",
@@ -358,7 +574,7 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::SourceCloseReport",
-            obligation: "wrap-planned-t049",
+            obligation: "wrapped-here",
         },
         WrapEntry {
             atom: "symforge::embed::SourceRefusal",

@@ -111,15 +111,15 @@
   "obligations": [
     {
       "atom": "symforge::embed::AtomicAuthority",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::Claim",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::ClaimProvenance",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::EmbeddedSourceHandle",
@@ -127,11 +127,11 @@
     },
     {
       "atom": "symforge::embed::EmbeddedSourceSpec",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::EvaluationProvenance",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::OperationKind",
@@ -151,7 +151,7 @@
     },
     {
       "atom": "symforge::embed::RefreshTicket",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::RetryAdvice",
@@ -159,11 +159,11 @@
     },
     {
       "atom": "symforge::embed::ShutdownReceipt",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::ShutdownReport",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::SourceCloseReceipt",
@@ -171,7 +171,7 @@
     },
     {
       "atom": "symforge::embed::SourceCloseReport",
-      "obligation": "wrap-planned-t049"
+      "obligation": "wrapped-here"
     },
     {
       "atom": "symforge::embed::SourceRefusal",

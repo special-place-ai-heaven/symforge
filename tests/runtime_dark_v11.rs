@@ -1,6 +1,8 @@
 //! Feature 020 V11, T047 — the dark source runtime, RED before `runtime.rs` exists.
 //!
-//! Eleven oracles over the frozen five-state machine and its leases, written
+//! Ten T047 oracles over the frozen five-state machine and its leases (an
+//! earlier draft of this header said eleven; the honest count was ten), plus
+//! one T049 oracle over the embed boundary's contract waits — written
 //! against `data-model.md:1379-1595` and `:2101-2140`, the queryability clause
 //! REFREEZE-pinned as F020-V11-A20 (`data-model.md:1539-1554`), FR-043
 //! (`contracts/source-binding-and-state.md:310-314`), and the runtime atoms of
@@ -17,7 +19,8 @@
 
 use std::sync::Arc;
 
-use symforge::live_index::index_lifecycle::embedded::EmbeddedSourceFactory;
+use symforge::live_index::index_lifecycle::embedded::{EmbeddedSourceFactory, ReceiptWaitError};
+use symforge::live_index::index_lifecycle::public_api::{EmbeddedSourceSpec, ProcessRuntimeApi};
 use symforge::live_index::index_lifecycle::registry::ProjectKey;
 use symforge::live_index::index_lifecycle::runtime::{
     DarkRuntimeFactory, ProjectIndexRuntime, SourceRuntimePhase,
@@ -322,4 +325,60 @@ fn shutdown_report_reflects_observed_counts_only() {
         "nothing was spawned, so nothing was joined; any other number is a \
          report of an unobserved completion"
     );
+}
+
+// ── T049: the boundary's contract waits and the open refusal mapping ───────
+
+#[test]
+fn contract_waits_guard_self_wait_and_open_refuses_a_held_source() {
+    // The T049 wrap list gave the boundary its contract-shaped lanes; each
+    // guard gets its refusing case AND its accepting pair here.
+
+    // begin_close's receipt: the contract wait refuses from inside the
+    // source's own finalizer, and completes with the observed truth outside
+    // it. A close that PERFORMED the shutdown is not already-terminal.
+    let factory = EmbeddedSourceFactory::new();
+    let handle = factory
+        .open(ProjectKey::new("src-close"))
+        .expect("an open registry admits a fresh key");
+    let receipt = handle.begin_close();
+    let error = handle
+        .finalize(|| receipt.wait(std::time::Instant::now()))
+        .expect_err("the contract wait carries the self-wait guard, not just wait_for_test");
+    assert_eq!(error, ReceiptWaitError::WouldSelfWait);
+    let report = receipt
+        .wait(std::time::Instant::now())
+        .expect("outside the finalizer the same wait completes");
+    assert!(
+        !report.already_terminal,
+        "this close performed the shutdown, so reporting it as joined-terminal \
+         would be a false claim about who tore the source down"
+    );
+    assert_eq!(
+        report.terminal_source_version, 0,
+        "dark sources hold version 0"
+    );
+
+    // The process runtime's shutdown receipt reports observed zeros — the
+    // dark runtime closed no holder's source and joined no workers.
+    let runtime = ProcessRuntimeApi::acquire().expect("the dark acquisition admits");
+    let shutdown = runtime
+        .begin_shutdown()
+        .wait(std::time::Instant::now())
+        .expect("a shutdown that owned nothing completes");
+    assert_eq!(shutdown.closed_sources, 0);
+    assert_eq!(shutdown.joined_workers, 0);
+
+    // open_embedded_source: sole-handle admission is the accepting case; a
+    // second open of the held source refuses as SelectionUnavailable — the
+    // selection exists but is unavailable until its holder closes.
+    let root = std::path::PathBuf::from("dark-open-root");
+    let held = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.clone()))
+        .expect("the first open of a source admits");
+    let refusal = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(root))
+        .expect_err("the sole handle is out; a second open must refuse");
+    assert_eq!(refusal.kind_name(), "SelectionUnavailable");
+    drop(held);
 }
