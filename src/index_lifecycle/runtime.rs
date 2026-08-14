@@ -53,13 +53,17 @@ pub struct DarkRuntimeFactory {
 impl DarkRuntimeFactory {
     /// Fixture constructor: the real root lease arrives with Slice 4.
     ///
-    /// C3 ruling: every `*_for_test` probe carries
-    /// `#[cfg(any(test, feature = "server"))]` so it CANNOT survive into an
-    /// activated embed surface. Plain `#[cfg(test)]` is not compilable here —
-    /// the Slice 3 oracles live in `tests/`, an external crate built without
-    /// the lib's `test` cfg — so the `server` disjunct keeps the oracles
-    /// building while the embed build sheds every probe; the divergence
-    /// register carries the remainder as the activation trim list.
+    /// Every `*_for_test` probe carries
+    /// `#[cfg(any(test, feature = "server"))]`. Per the Slice 0 predicate
+    /// rule, `any(...)` is test-only ONLY when every disjunct is — with
+    /// `server` in the default set these probes SHIP in the published server
+    /// binary; only the embed build sheds them. Plain `#[cfg(test)]` is not
+    /// compilable here — the Slice 3 oracles live in `tests/`, an external
+    /// crate built without the lib's `test` cfg — which is the whole reason
+    /// this leak exists. ACTIVATION PRECONDITION, not a trim-list optional:
+    /// before the keyword flip these become `all(test, feature = "server")`
+    /// by moving their oracles in-crate, or they sit behind a dedicated
+    /// non-server test feature.
     #[cfg(any(test, feature = "server"))]
     pub fn for_test_root(root: &str) -> Self {
         Self {

@@ -66,9 +66,10 @@ pub enum ServerExit {
 }
 
 /// The contract entry point, `run(args) -> Result<ServerExit,
-/// ServerBootstrapError>`. A STAND-IN: it refuses with `ActivationPending`
-/// and consumes nothing — reporting a server run nothing performed would be
-/// the invariant violation this feature exists to prevent. Slice 4 wires it.
+/// ServerBootstrapError>`. A STAND-IN: it refuses with the opaque
+/// activation-pending bootstrap error and consumes nothing — reporting a
+/// server run nothing performed would be the invariant violation this
+/// feature exists to prevent. Slice 4 wires it.
 pub fn run(_args: Vec<OsString>) -> Result<ServerExit, ServerBootstrapError> {
     Err(ServerBootstrapError::activation_pending())
 }
@@ -140,11 +141,20 @@ mod tests {
             .split(struct_needle.as_str())
             .nth(1)
             .expect("declaration present");
-        let body_start = declaration.find('{').expect("struct body opens");
-        let body_end = declaration.find('}').expect("struct body closes");
-        let body = &declaration[body_start + 1..body_end];
+        // A tuple struct (`pub struct X(pub ...)`) has no brace body, and a
+        // naive `find('{')` would silently scan some LATER block — so the
+        // brace must be the first non-whitespace after the name (round-2
+        // hardening of this pin).
+        let after_name = declaration.trim_start();
         assert!(
-            !body.contains("pub"),
+            after_name.starts_with('{'),
+            "the declaration must open a brace body immediately — a tuple \
+             struct's parenthesized fields would evade the field scan"
+        );
+        let body_end = after_name.find('}').expect("struct body closes");
+        let body = &after_name[1..body_end];
+        assert!(
+            !body.contains("pub "),
             "has_nonpublic_fields: every field stays private, got: {body}"
         );
     }

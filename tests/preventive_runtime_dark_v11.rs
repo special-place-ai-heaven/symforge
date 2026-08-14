@@ -17,12 +17,15 @@
 //! human decision — safe friction, never silent tolerance.
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source across
-//! directory boundaries, and a `concat!`/`env!("OUT_DIR")` argument can name
-//! the dark directory without ever writing its token — that construction is
-//! uncatchable by any token scan, and this file does not claim to catch it.
-//! What it does instead is fail closed on the MECHANISMS: every `include!`
-//! and `#[path]` in `src/` must be on the exact allowlist below, so a new
-//! splice site cannot appear silently.
+//! directory boundaries. The mechanism sweep names every `include!`
+//! regardless of delimiter, every `#[path` attribute head, and every
+//! attribute line carrying a `path =`/`path=` argument — but it is still a
+//! TEXT scan: a `concat!`/`env!("OUT_DIR")` argument can name the dark
+//! directory without writing its token, and an attribute spelled to match
+//! none of those patterns escapes it. Those residuals are accepted and
+//! stated here rather than parsed away; what the sweep guarantees is only
+//! that a splice site using the named spellings cannot appear without a
+//! deliberate allowlist change.
 
 use std::path::{Path, PathBuf};
 
@@ -43,9 +46,12 @@ fn rust_files_under(root: &Path, out: &mut Vec<PathBuf>) {
 
 /// Byte offset of the first `//` that sits OUTSIDE any string literal (C8:
 /// a `//` inside a string must not launder the rest of the line as prose).
-/// The tracker is deliberately conservative: a `'"'` char literal flips the
-/// string state wrongly, which can only HIDE a comment start — the token is
-/// then treated as code and flagged, never silently tolerated.
+/// Char literals are consumed so a `'"'` cannot flip the string tracker —
+/// round 2 proved the flip could FABRICATE a comment start inside a real
+/// string and launder a call edge, not merely hide comments. The remaining
+/// known misparse is a hash-delimited raw string with interior quotes, which
+/// desyncs toward NOT finding a comment — the token is then treated as code
+/// and flagged, the fail-closed direction.
 fn comment_start_outside_strings(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut in_string = false;
@@ -54,6 +60,19 @@ fn comment_start_outside_strings(line: &str) -> Option<usize> {
         match bytes[i] {
             b'\\' if in_string => i += 1,
             b'"' => in_string = !in_string,
+            b'\'' if !in_string => {
+                // Char literal or lifetime. `'\...'` scans to its closing
+                // quote; `'c'` skips three bytes; anything else is a
+                // lifetime and consumes only the tick.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                    i += 2;
+                }
+            }
             b'/' if !in_string && i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
                 return Some(i);
             }
@@ -64,14 +83,6 @@ fn comment_start_outside_strings(line: &str) -> Option<usize> {
     None
 }
 
-/// A line passes for `token` when every occurrence sits after a real `//`.
-fn only_in_line_comment(line: &str, token: &str) -> bool {
-    match comment_start_outside_strings(line) {
-        Some(comment_start) => !line[..comment_start].contains(token),
-        None => false,
-    }
-}
-
 struct Sweep {
     violations: Vec<String>,
     allowlisted_seen: Vec<&'static str>,
@@ -79,8 +90,12 @@ struct Sweep {
     files_scanned: usize,
 }
 
+/// `matches_line` names the guarded pattern a line contains, or `None`. The
+/// prose rule is PREFIX-exact: a matched line is tolerated only when the
+/// text before the first real `//` no longer matches — so a conjunction
+/// pattern is judged on the code portion alone, never token-by-token.
 fn sweep(
-    tokens: &[&str],
+    matches_line: &dyn Fn(&str) -> Option<&'static str>,
     exclude_dir: Option<&Path>,
     exclude_file: Option<&Path>,
     allowlist: &[(&'static str, &'static str)],
@@ -108,7 +123,7 @@ fn sweep(
             .to_string_lossy()
             .replace('\\', "/");
         for (number, line) in text.lines().enumerate() {
-            let Some(token) = tokens.iter().find(|t| line.contains(**t)) else {
+            let Some(token) = matches_line(line) else {
                 continue;
             };
             if let Some((_, allowed)) = allowlist
@@ -118,7 +133,9 @@ fn sweep(
                 result.allowlisted_seen.push(allowed);
                 continue;
             }
-            if tokens.iter().all(|t| only_in_line_comment(line, t)) {
+            if let Some(comment_start) = comment_start_outside_strings(line)
+                && matches_line(&line[..comment_start]).is_none()
+            {
                 result.prose_lines += 1;
                 continue;
             }
@@ -130,6 +147,10 @@ fn sweep(
         }
     }
     result
+}
+
+fn contains_token(token: &'static str) -> impl Fn(&str) -> Option<&'static str> {
+    move |line: &str| line.contains(token).then_some(token)
 }
 
 /// The seven ingress lanes the task names, as paths that must EXIST — if one
@@ -157,7 +178,7 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
     }
 
     let result = sweep(
-        &["index_lifecycle"],
+        &contains_token("index_lifecycle"),
         Some(&src_root().join("index_lifecycle")),
         None,
         &[
@@ -206,7 +227,7 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
     // individually below, so a real `use`/call edge from `index_lifecycle`
     // into the stub cannot hide behind a directory exemption.
     let result = sweep(
-        &["server_api"],
+        &contains_token("server_api"),
         None,
         Some(&src_root().join("server_api.rs")),
         &[
@@ -271,10 +292,27 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
 #[test]
 fn source_splicing_is_allowlisted() {
     // C9 ruling: fail closed on the splice MECHANISMS across all of src/,
-    // the dark directory included. The residual — a concat!-constructed
-    // path — is stated in the file header, not silently absorbed.
+    // the dark directory included. Round 2 proved the first token set was
+    // evadable by invocation form (`include! {`, `#[cfg_attr(..., path =`),
+    // so the matcher now names: any `include!` regardless of delimiter, any
+    // `#[path` attribute head, and any line carrying a `path =`/`path=`
+    // argument inside an attribute. The residuals — a concat!-constructed
+    // path, and an attribute form matching none of these spellings — are
+    // stated in the file header, not silently absorbed.
+    let splice_matcher = |line: &str| -> Option<&'static str> {
+        if line.contains("include!") {
+            return Some("include!");
+        }
+        if line.contains("#[path") {
+            return Some("#[path");
+        }
+        if (line.contains("path =") || line.contains("path=")) && line.contains("#[") {
+            return Some("attribute path=");
+        }
+        None
+    };
     let result = sweep(
-        &["include!(", "#[path"],
+        &splice_matcher,
         None,
         None,
         &[
