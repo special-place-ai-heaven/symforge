@@ -26,12 +26,23 @@
 //! laundered a call edge through some literal form; this rule has no
 //! lexer to be wrong.
 //!
+//! STATED BOUND (round 7): an inert `///` line does not execute in the
+//! CRATE's compilation, but rustdoc extracts fenced doc-comment text into
+//! separate doctest crates that plain `cargo test` (or `--doc`) would
+//! build and RUN — an executing edge this sweep would tolerate as prose.
+//! The bound holds because no gate here builds doctests, and that is not
+//! left as a hand-checked snapshot: `no_gate_builds_doctests` below pins
+//! every `cargo test` invocation in the CI workflows to a doctest-excluding
+//! target flag, so a gate change that opens the lane fails loudly and
+//! revisits this exemption deliberately.
+//!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
 //! across directory boundaries. The mechanism sweep is a fail-closed
 //! TRIPWIRE over known spellings, not a completeness proof. Every arm
 //! judges two views of the line — whitespace-and-`r#`-collapsed, and that
-//! view with `/*…*/` block-comment spans removed (round 6: comments are
-//! token separators the whitespace collapse never saw) — and flags: any
+//! view with `/*…*/` block-comment spans removed DEPTH-AWARE (round 6:
+//! comments are token separators the whitespace collapse never saw;
+//! round 7: they NEST, so span removal counts depth) — and flags: any
 //! `include!` spelling, any `include` in path-segment position on its
 //! declaration line (`::include`/`{include`/`,include` after collapse —
 //! the form every single-line alias-creation site must write, whatever
@@ -366,23 +377,32 @@ fn source_splicing_is_allowlisted() {
         }
         false
     }
-    // Remove minimal `/*…*/` spans repeatedly; an unclosed `/*` comments
-    // out the rest of the line, a dangling `*/` comments out the start.
-    // Over-removal on pathological string content is harmless because the
-    // arms also run on the unstripped view.
+    // Remove `/*…*/` spans DEPTH-AWARE — Rust block comments nest, and
+    // round 7 proved minimal-span pairing mis-pairs `/*x/*y*/z*/` and eats
+    // the `::` opener with it. One linear scan tracking nesting depth: an
+    // unclosed `/*` comments out the rest of the line, a dangling `*/`
+    // (depth already zero) means the line began inside a comment, so
+    // everything before it is discarded. Over-removal on pathological
+    // string content is harmless because the arms also run on the
+    // unstripped view.
     fn strip_block_comments(collapsed: &str) -> String {
-        let mut out = collapsed.to_string();
-        while let Some(open) = out.find("/*") {
-            match out[open + 2..].find("*/") {
-                Some(close) => out.replace_range(open..open + 2 + close + 2, ""),
-                None => {
-                    out.truncate(open);
-                    break;
+        let mut out = String::new();
+        let mut depth = 0usize;
+        let mut chars = collapsed.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                depth += 1;
+            } else if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                if depth == 0 {
+                    out.clear();
+                } else {
+                    depth -= 1;
                 }
+            } else if depth == 0 {
+                out.push(c);
             }
-        }
-        if let Some(close) = out.find("*/") {
-            out.replace_range(..close + 2, "");
         }
         out
     }
@@ -453,5 +473,60 @@ fn source_splicing_is_allowlisted() {
          allowlist entry; a duplicate or a new splice site is a deliberate \
          allowlist change, got: {:?}",
         result.allowlisted_seen
+    );
+}
+
+#[test]
+fn no_gate_builds_doctests() {
+    // Round 7: rustdoc extracts fenced doc-comment text into doctest
+    // crates that a bare `cargo test` (or `--doc`) builds and RUNS — an
+    // executing edge the prose exemption above would tolerate. The
+    // inert-comment rule is therefore bounded by the gates never opening
+    // the doctest lane, and this test OBSERVES that bound instead of
+    // asserting it from memory: every `cargo test` invocation in the CI
+    // workflows must carry a doctest-excluding target selector, and none
+    // may pass `--doc`. (`--test-threads` is a distinct token and does
+    // not satisfy `--test`.)
+    let repo = src_root().parent().expect("src has a parent").to_path_buf();
+    let workflows = repo.join(".github").join("workflows");
+    let excluding = ["--all-targets", "--lib", "--tests", "--bins", "--test"];
+    let mut invocations = 0usize;
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(&workflows).expect("read workflows dir") {
+        let path = entry.expect("workflow entry").path();
+        if path.extension().is_none_or(|e| e != "yml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read workflow");
+        for (number, line) in text.lines().enumerate() {
+            if !line.contains("cargo test") {
+                continue;
+            }
+            invocations += 1;
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let opens_doctests =
+                tokens.contains(&"--doc") || !tokens.iter().any(|t| excluding.contains(t));
+            if opens_doctests {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    path.file_name().expect("file name").to_string_lossy(),
+                    number + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "gate invocations that would build doctests (see the STATED BOUND in \
+         this file's header — a doctest is an executing edge the prose \
+         exemption tolerates):\n{}",
+        offenders.join("\n")
+    );
+    assert!(
+        invocations >= 5,
+        "only {invocations} `cargo test` lines found across the CI \
+         workflows — the gate walk is broken or CI moved; update this test \
+         with the workflows"
     );
 }

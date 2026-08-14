@@ -1,5 +1,55 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-7 review and its repairs (PR 3)
+
+Round 7 attacked the round-6 repairs: **0 blockers, 2 confirmed majors,
+1 confirmed docs minor, 0 refuted**. The headline is what did NOT break:
+the inert-comment rule survived its direct assault — the code verifier
+probed every `//`-leading spanning-lexeme tail construction and confirmed
+each one that returns to code carries its `"` or `*/` closer on the line.
+Both majors were repairable without touching the rule.
+
+- **MAJOR — nested block comments defeated the stripper.** Rust block
+  comments NEST; the round-6 stripper did minimal non-nested pairing, so
+  `use std::/*x/*y*/z*/include as inc;` (one legal nested comment, a live
+  alias, rustc-verified) evaded both views — it mis-paired `/*x/*y*/`,
+  then the dangling-`*/` branch ate the `::` opener. That sat inside the
+  claimed "comment interleaving" coverage, not a stated residual. Repair:
+  `strip_block_comments` is now a single linear scan tracking NESTING
+  DEPTH — an unclosed `/*` still comments out the rest, a dangling `*/`
+  (depth zero) discards the prefix. Mutation **M42** (the exact nested
+  spelling) observed caught; **M38 replanted** as the non-nested control
+  to prove the rewrite regressed nothing — also caught.
+- **MAJOR — my round-6 refutation ground was false as written.** The
+  Round-6 section's parenthetical said a `///` line "genuinely cannot
+  execute code"; the verifier ran one — rustdoc extracts fenced
+  doc-comment text into doctest crates that a bare `cargo test` (or
+  `--doc`) builds and RUNS, and the dark directory is publicly nameable,
+  so a fenced doctest line would be a tolerated, compiling, executing
+  edge. The true ground is narrower: no gate in this repo builds doctests
+  (all seven `cargo test` invocations across ci.yml/release.yml carry
+  `--all-targets`/`--lib`/`--test`), and a doctest resolves only the
+  recorded public surface. Repaired in BOTH directions: the sentence now
+  states the narrow ground, and the bound stopped being a hand-checked
+  snapshot — new test `no_gate_builds_doctests` pins every `cargo test`
+  line in the CI workflows to a doctest-excluding target selector and
+  forbids `--doc`, with the test-file header carrying the STATED BOUND
+  paragraph. Mutations **M43a** (selector dropped from a gate line) and
+  **M43b** (`--doc` added) each observed caught, restored.
+- **Docs minor:** the round-1 amendment bracket still said "eight
+  allowlist entries count-pinned" present-tense; since round 6 the
+  sibling sweep pins nine. Bracket-amended at the spot.
+
+## Gate results for the round-7 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed (the suite grew `no_gate_builds_doctests`), 0 failed |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| mutations | M42 (nested-comment alias) and the M38 replant (non-nested control) each observed caught; M43a (gate selector dropped) and M43b (`--doc` added) each observed caught against the mutated ci.yml; all restored |
+
 ## Round-6 review and its repairs (PR 3)
 
 Round 6 verified the round-5 repairs adversarially: **2 confirmed
@@ -14,7 +64,15 @@ survive adjudication.
   string CONTENT and still execute code after the literal's closing quote:
   `let _s = "` / `//"; <live call edge>;` compiled, ran, and was counted
   as tolerated prose by all three sweeps. This is NOT round 4's refuted
-  doctest attack (a `///` line genuinely cannot execute code); it is a
+  doctest attack [amended after round 7: this parenthetical originally
+  said "a `///` line genuinely cannot execute code", which is FALSE —
+  rustdoc extracts fenced doc-comment text into doctest crates that a
+  bare `cargo test` or `--doc` builds and RUNS. The true ground is
+  narrower: no gate in this repo builds doctests (every `cargo test` in
+  ci.yml/release.yml carries `--all-targets`/`--lib`/`--test`), and a
+  doctest edge resolves only the recorded still-public paths. That bound
+  is now OBSERVED, not hand-checked: `no_gate_builds_doctests` pins every
+  gate invocation to a doctest-excluding selector]; it is a
   lexically different construction, and the header's "Rust permits no code
   after a line-start `//`" was false as written. The repair closes the
   whole class, not the instance: Rust has exactly two lexeme kinds that
@@ -429,7 +487,9 @@ round 1: the original version allowlisted only the lib.rs line and EXCLUDED
 the dark directory by a transitivity argument; C10 ruled that exemption
 away, so the sweep now covers the dark directory with its seven wrap-table
 string lines allowlisted individually, eight allowlist entries
-count-pinned.]
+count-pinned.] [Amended after round 7: the pin is NINE since round 6 — the
+quote-narrowed prose exemption surfaced one quote-bearing doc comment in
+`public_api.rs`, allowlisted with the dual-count bind at (9, 9).]
 
 **Mutation ledger.** M24 (planted
 `use crate::live_index::index_lifecycle::registry::ProjectKey;` in
