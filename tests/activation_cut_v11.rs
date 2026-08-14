@@ -216,7 +216,173 @@ const FROZEN: &[FrozenEntry] = &[
 /// EMPTY ON PURPOSE at T050's RED. Filling it is the next commit, one member at
 /// a time with its basis; a member that cannot take an honest set is brought
 /// back as a decision rather than parked on a plausible row.
-const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[];
+const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
+    // ---- compatibility_aliases (2/2) ----
+    // The calibration rows: the frozen entry states an allowed SET for one
+    // alias and forbids a branch by name, which is the shape every row below
+    // follows.
+    (
+        "compatibility_aliases",
+        "detect_changes",
+        &["GitObserved", "WorktreeScopeObserved"],
+        "compatibility_aliases assertion: `detect_changes` returns GitObserved for committed-ref \
+         diffs or WorktreeScopeObserved for worktree diffs, and never acquires a ProjectQueryLease \
+         or upgrades observation evidence to GenerationLeased",
+    ),
+    (
+        "compatibility_aliases",
+        "trace_symbol",
+        &["GenerationLeased", "Refused"],
+        "compatibility_aliases assertion: `trace_symbol` cannot reach V10 symbol caches and uses \
+         GenerationLeased ONLY for a complete Current publication — the word `only` bounds the \
+         lease to that case, so an incomplete publication is an unavailability this ingress \
+         terminates on rather than a lease it may take",
+    ),
+    // ---- writers (22/25; 3 brought back, see the T050 decision list) ----
+    // Split per writers assertion 3, which draws the line the branches encode:
+    // repository-source bytes are source-authorized (MutationPermitted), while
+    // ProjectStateDir and post-image team-artifact writes remain permit-free
+    // (StateWriteAuthorized). Family membership is cited per member, not
+    // inherited from the module.
+    (
+        "writers",
+        "src/gitignore_hygiene.rs::atomic_replace",
+        &["MutationPermitted"],
+        "writers assertion 3 names gitignore hygiene source-authorized; this is its byte writer",
+    ),
+    (
+        "writers",
+        "src/gitignore_hygiene.rs::reconcile_project_gitignore",
+        &["MutationPermitted"],
+        "writers assertion 3: gitignore hygiene is source-authorized; writes the project .gitignore",
+    ),
+    (
+        "writers",
+        "src/gitignore_hygiene.rs::reconcile_root_gitignore",
+        &["MutationPermitted"],
+        "writers assertion 3: gitignore hygiene is source-authorized; writes the root .gitignore",
+    ),
+    (
+        "writers",
+        "src/live_index/persist.rs::ensure_gitattributes_merge_hint",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer — writes `.gitattributes` under \
+         project_root (persist.rs:1067), a committed repository file, so it is source-authorized \
+         on the same ground as gitignore hygiene",
+    ),
+    (
+        "writers",
+        "src/protocol/edit.rs::atomic_write_file",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer",
+    ),
+    (
+        "writers",
+        "src/protocol/edit.rs::guarded_atomic_write_file",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer",
+    ),
+    (
+        "writers",
+        "src/protocol/edit.rs::execute_batch_edit",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer",
+    ),
+    (
+        "writers",
+        "src/protocol/edit.rs::execute_batch_insert",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer",
+    ),
+    (
+        "writers",
+        "src/protocol/edit.rs::execute_batch_rename",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer",
+    ),
+    (
+        "writers",
+        "src/protocol/edit_tools.rs::SymForgeServer::batch_edit",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    (
+        "writers",
+        "src/protocol/edit_tools.rs::SymForgeServer::batch_insert",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    (
+        "writers",
+        "src/protocol/edit_tools.rs::SymForgeServer::batch_rename",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    (
+        "writers",
+        "src/protocol/edit_tools.rs::SymForgeServer::delete_symbol",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    (
+        "writers",
+        "src/protocol/edit_tools.rs::SymForgeServer::edit_within_symbol",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    (
+        "writers",
+        "src/protocol/edit_tools.rs::SymForgeServer::insert_symbol",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    (
+        "writers",
+        "src/protocol/edit_tools.rs::SymForgeServer::replace_symbol_body",
+        &["MutationPermitted"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    (
+        "writers",
+        "src/protocol/knowledge_curation.rs::KnowledgeCurationCoordinator::apply",
+        &["StateWriteAuthorized"],
+        "writers assertion 3: ProjectStateDir and post-image team-artifact writes remain \
+         permit-free — apply writes under state_dir/CURATION_STATE_DIR (knowledge_curation.rs:351)",
+    ),
+    (
+        "writers",
+        "src/protocol/knowledge_curation.rs::KnowledgeCurationCoordinator::write_policy",
+        &["StateWriteAuthorized"],
+        "writers assertion 3: post-image team-artifact write — the `.symforge-knowledge.toml` \
+         policy post-image (knowledge_curation.rs:31, :629)",
+    ),
+    (
+        "writers",
+        "src/protocol/knowledge_curation.rs::apply_reviewed_mutation",
+        &["StateWriteAuthorized"],
+        "writers assertion 3: ProjectStateDir curation state write, permit-free",
+    ),
+    (
+        "writers",
+        "src/protocol/knowledge_curation.rs::durable_replace",
+        &["StateWriteAuthorized"],
+        "writers assertion 3: the durable writer for curation state and the policy post-image; \
+         every call site (knowledge_curation.rs:629, :1808, :1888, :1901) is state or team artifact",
+    ),
+    (
+        "writers",
+        "src/protocol/knowledge_curation.rs::durable_replace_io",
+        &["StateWriteAuthorized"],
+        "writers assertion 3: the io half of durable_replace, same call sites, same ground",
+    ),
+    (
+        "writers",
+        "src/protocol/tools.rs::SymForgeServer::curate_knowledge",
+        &["StateWriteAuthorized"],
+        "writers assertion 3: tool ingress for curation; its writes are ProjectStateDir and the \
+         post-image team artifact, both permit-free",
+    ),
+];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
