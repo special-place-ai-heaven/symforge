@@ -1,5 +1,61 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-15 review and its repairs (PR 3)
+
+Round 15 attacked the round-14 repairs: **0 blockers, 4 confirmed
+majors, 2 confirmed minors, 2 refuted, 2 notes**. For the first time
+since round 8, **not one finding is a hole in the mechanism.** Every
+confirmed item is a false or self-contradictory claim in comments and
+prose, and all of them are mine.
+
+- **MAJOR — the doc-comment theft was not repaired; it changed hands.**
+  Round 14's fix gave `CARGO_CONFIG` its own doc block but inserted
+  `WORKFLOW_FINGERPRINTS` into the same slot, so the allowlist's doc
+  comment — "WITH THE NUMBER OF TIMES it must occur … Grouped by why,
+  so the judgement is auditable" — now documented a two-entry
+  fingerprint list, and `CARGO_LINES` had no doc at all. The
+  adjudicator proved the mechanism I had missed both times: **a blank
+  line does not end a `///` run; only an intervening item does**, so
+  the separation that reads like a fix is inert. Repair: the block was
+  MOVED to sit immediately above `CARGO_LINES`, with a note telling the
+  next editor to put new constants below it. Verified by compiler, not
+  by reading — a `deny(missing_docs)` probe passes on the repaired
+  shape and fails on the defective one.
+- **MAJOR — the two residual lists contradicted each other.** The
+  header listed two residuals and explicitly retired a third; the test
+  body said "Three, matching the header." Worse, the retired one was
+  provably caught: `if: false` above a gate turns the test RED via the
+  fingerprint. The body also stated residual 1 more narrowly than the
+  header — conditioning it on the line naming neither `cargo` nor
+  `rustdoc`, when the real boundary is where the BEHAVIOUR lives (the
+  allowlisted `python execution/release_ops.py publish-cargo` names
+  cargo and is pinned, yet what that script runs is not). Both lists
+  are now the same two residuals, stated by effect-location.
+- **MINOR ×2 — two more claims wider than the code.** "Every `.cargo`
+  config IN the tree is pinned" ignores the walk's own skip list, and a
+  config in `node_modules/` or `target/` measurably leaves the suite
+  green; the bound is *committable* configs, which is what those three
+  gitignored directories are excluded on. And the header still listed
+  the bidi-mark flag as an arm of the splice tripwire when round 12
+  moved that decision into `sweep` — the file said so correctly in
+  three other places.
+- **REFUTED ×2:** that the Round-14 section misattributes three of its
+  prose findings, and that a residual-list amendment is stale.
+- **Both retired residuals were re-verified by mutation** rather than
+  left as claims: a descendant config (M57a) and `if: false` (M58) each
+  observed RED.
+
+## Gate results for the round-15 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; dual counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| doc attachment | `deny(missing_docs)` probe passes on the repaired shape, fails on the defective one |
+| mutations | M57a (descendant cargo config) and M58 (`if: false` on a gate) each observed caught; all restored |
+
 ## Round-14 review and its repairs (PR 3)
 
 Round 14 attacked the round-13 repairs: **0 blockers, 7 confirmed

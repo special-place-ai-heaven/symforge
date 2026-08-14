@@ -36,8 +36,10 @@
 //! `.yml`/`.yaml` workflow that mentions cargo OR rustdoc —
 //! case-insensitively — against a verbatim allowlist a human judged
 //! doctest-free, binds each line's OCCURRENCE COUNT plus the total, the
-//! distinct set and the workflow-file count, pins EVERY `.cargo` config
-//! in the tree (the root one verbatim, any other forbidden), and
+//! distinct set and the workflow-file count, pins every COMMITTABLE
+//! `.cargo` config in the tree (the root one verbatim, any other
+//! forbidden; the walk skips `target`, `.git` and `node_modules`, all
+//! gitignored, so nothing placed there can be committed), and
 //! fingerprints each workflow file whole. Rounds 8–11 each falsified a scan
 //! that tried to read the command out of the file and judge it; round
 //! 11's `cargo rustdoc -- --test` builds and runs doctests while naming
@@ -101,9 +103,13 @@
 //! stripping. That is the claim — a direction, not an exactness. The
 //! arms flag: any `include!` spelling, any `include` at one of FOUR
 //! enumerated openers on its declaration line — `::include`,
-//! `{include`, `,include`, and `useinclude` after collapse — any
-//! `#[path`/`path=` attribute spelling, and any U+200E/U+200F bidi mark
-//! outright. The fourth opener is round 9's: Rust 2018 uniform paths
+//! `{include`, `,include`, and `useinclude` after collapse — and any
+//! `#[path`/`path=` attribute spelling. (U+200E/U+200F bidi marks are
+//! flagged outright too, but NOT by an arm of this tripwire: round 12
+//! moved that decision into `sweep`, ahead of the allowlist and the
+//! prose exemption, because a matcher that merely names a mark still
+//! lets the exemption forgive it. This paragraph listed it as an arm
+//! until round 15.) The fourth opener is round 9's: Rust 2018 uniform paths
 //! let `use include as mount;` bind the prelude macro with no leading
 //! path, which is live on this crate's edition and wrote none of the
 //! first three. The claim is the ENUMERATION, not a universal — round 9
@@ -601,19 +607,6 @@ fn source_splicing_is_allowlisted() {
     );
 }
 
-/// Every line of every CI workflow that mentions cargo OR rustdoc,
-/// normalized (trimmed, runs of ASCII space and tab collapsed), WITH
-/// THE NUMBER OF TIMES it must occur. This is the pin: a human read
-/// each one and judged that it cannot build doctests. Grouped by why,
-/// so the judgement is auditable rather than asserted.
-///
-/// Round 12: the counts are per line because a (total, distinct) pair
-/// is only a bijection when the two are EQUAL. Four of these lines
-/// legitimately occur twice, so at (30, 26) a compensated edit — delete
-/// one copy of a gate, add a duplicate of some other allowlisted line —
-/// held both numbers while removing `cargo test --all-targets` from PR
-/// CI entirely. The multiset is what was always meant; now it is what
-/// is checked.
 /// Each CI workflow's whole-file fingerprint, `<fnv1a-64>:<bytes>` over
 /// LF-normalized content. Round 14's backstop: the checks below read
 /// lines, CI executes YAML scalars, and that seam leaked twice — so no
@@ -640,6 +633,27 @@ const CARGO_CONFIG: &str = "\
 target-dir = \"target\"
 ";
 
+/// Every line of every CI workflow that mentions cargo OR rustdoc,
+/// normalized (trimmed, runs of ASCII space and tab collapsed), WITH
+/// THE NUMBER OF TIMES it must occur. This is the pin: a human read
+/// each one and judged that it cannot build doctests. Grouped by why,
+/// so the judgement is auditable rather than asserted.
+///
+/// Round 12: the counts are per line because a (total, distinct) pair
+/// is only a bijection when the two are EQUAL. Four of these lines
+/// legitimately occur twice, so at (30, 26) a compensated edit — delete
+/// one copy of a gate, add a duplicate of some other allowlisted line —
+/// held both numbers while removing `cargo test --all-targets` from PR
+/// CI entirely. The multiset is what was always meant; now it is what
+/// is checked.
+///
+/// Round 15: this block belongs HERE, immediately above the constant it
+/// describes. Rounds 13 and 14 each inserted a new const into this slot
+/// and left the doc attached to the newcomer, so rustdoc documented a
+/// two-entry fingerprint list as the per-line cargo allowlist. A blank
+/// line does NOT end a `///` run — only an intervening item does — so
+/// the separation that reads like a fix is inert. Put new constants
+/// BELOW this one.
 const CARGO_LINES: &[(&str, usize)] = &[
     // Prose and configuration — never a command.
     (
@@ -761,13 +775,25 @@ fn no_gate_builds_doctests() {
     // KNOWN RESIDUALS — what has been probed, NOT a proof of
     // exhaustiveness (round 9 wrote "the only two" and round 10 produced
     // a third the same day; round 11 produced a fourth; round 13 broke
-    // the check that was meant to retire one). Three, matching the
-    // header: a gate reaching the doctest lane with neither `cargo` nor
-    // `rustdoc` on the line (a script, make target, or composite action
-    // running it out of sight); a cargo config outside the repo; and a
-    // gate DISABLED rather than edited, since `if: false` on a step
-    // changes no line this pin reads. The repo's own
-    // `.cargo/config.toml` is not among them — it is pinned below.
+    // the check that was meant to retire one). TWO, and they are the
+    // header's two:
+    //   * A gate whose EFFECT lives outside these files — a script, make
+    //     target, or composite action. Note this is about where the
+    //     BEHAVIOUR lives, not whether the line says `cargo`: the
+    //     allowlisted `python execution/release_ops.py publish-cargo`
+    //     names cargo and is pinned, yet what that script runs is not.
+    //     Round 15 corrected an earlier wording here that conditioned
+    //     the residual on the line naming neither `cargo` nor `rustdoc`,
+    //     which described a narrower set than the header's.
+    //   * A cargo config OUTSIDE the repo — `~/.cargo/config.toml`,
+    //     `$CARGO_HOME`, or an ancestor of the checkout.
+    // Two former residuals are NOT on this list because they are now
+    // caught, both proven by mutation: every in-tree `.cargo` config is
+    // pinned below, and a gate disabled with `if: false` changes no
+    // cargo line but does change the file, which the fingerprints see.
+    // An earlier version of this comment claimed THREE residuals
+    // "matching the header" while the header listed two and retired the
+    // third — the contradiction was the tell.
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     let workflows = repo.join(".github").join("workflows");
     // ROUND 14, THE BACKSTOP. Everything below reads LINES; what CI
@@ -925,8 +951,15 @@ fn no_gate_builds_doctests() {
                 continue;
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            // `target` is gitignored build output and can be enormous;
-            // `.git` is not source. Neither can carry a committed config.
+            // Three directories are skipped, and the reason is the same
+            // for all three: every one is gitignored, so a config placed
+            // there cannot be COMMITTED, and the round-14 exploit needed
+            // a committed file. `target` is build output and can be tens
+            // of gigabytes, which is also why walking it is not an
+            // option. Round 15: a config dropped in any of them is
+            // therefore invisible here — that is a deliberate bound, not
+            // "every config in the tree", which is what the prose used
+            // to claim.
             if name == "target" || name == ".git" || name == "node_modules" {
                 continue;
             }
