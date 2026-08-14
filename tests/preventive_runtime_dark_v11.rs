@@ -32,17 +32,24 @@
 //! (or `--doc`) would build and RUN — an executing edge this sweep would
 //! tolerate as prose. The bound holds because no gate here builds
 //! doctests, and that is not left as a hand-checked snapshot:
-//! `no_gate_builds_doctests` below parses every `run:` scalar in the CI
-//! workflows (both the `.yml` and `.yaml` extensions, inline values,
-//! literal `|` and folded `>` blocks, shell continuations joined,
-//! compound commands split into segments) and requires each `cargo test`
-//! segment to carry a doctest-excluding target selector before any bare
-//! `--` and never `--doc`. A gate change of any shape that walk can read
-//! fails loudly. STATED RESIDUALS of the pin, not covered by it: a gate
-//! reaching `cargo test` through indirection (a script, make target, or
-//! composite action), and a `run:` value assembled from YAML anchors or
-//! `${{ }}` expressions — both change what the runner executes without
-//! changing any `run:` scalar the walk reads.
+//! `no_gate_builds_doctests` below scans every PHYSICAL LINE of every
+//! `.yml`/`.yaml` workflow, erases YAML quoting and flow punctuation
+//! before tokenizing, splits compound commands into segments, and
+//! judges every segment naming `cargo`. Round 9 killed the previous
+//! `run:`-scalar parser, which missed quoted scalars, plain multi-line
+//! scalars, flow mappings, an extra space after the list dash, and the
+//! `cargo t` alias: a scan that must model YAML to find the command
+//! loses to YAML, exactly as the mid-line-comment lexers lost to Rust
+//! in rounds 1–3. The rule is fail-closed instead: a `cargo` segment
+//! must resolve to a subcommand ON THAT LINE — one that does not (any
+//! line-spanning wrap, folded or shell-continued) is an OFFENSE, not a
+//! skip — and a `test`/`t` subcommand must carry a doctest-excluding
+//! selector before any bare `--` and must not carry `--doc`. STATED
+//! RESIDUALS of the pin, and now the only two: a gate reaching cargo
+//! through INDIRECTION (a script, make target, or composite action), and
+//! a command assembled from YAML anchors or `${{ }}` expressions. Both
+//! change what the runner executes without putting the command in any
+//! line this scan reads.
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
 //! across directory boundaries. The mechanism sweep is a fail-closed
@@ -57,19 +64,31 @@
 //! prefixes), and each of those with `r#` removed as EXTRA views, since
 //! in-place removal could fabricate or destroy an adjacency. A match on
 //! ANY view flags. A line carrying a `"` together with a block-comment
-//! delimiter and a splice token is flagged OUTRIGHT (round 8): string
-//! content can poison any line-local comment tracking, so such lines
-//! are surfaced, never judged — and on the quote-free lines that remain,
-//! a raw-text `/*` adjacency is a real comment opener to the Rust lexer
-//! too, so the stripped view's removals there are real comment interior
-//! (or the delimiters themselves, whose removal over-flags only). The
-//! arms flag: any `include!` spelling, any `include` in path-segment
-//! position on its declaration line (`::include`/`{include`/`,include`
-//! after collapse — the form every single-line alias-creation site must
-//! write, whatever its visibility, spacing, grouping, comment
-//! interleaving, or `r#` raw spelling), any `#[path`/`path=` attribute
-//! spelling, and any U+200E/U+200F bidi mark outright. What escapes a
-//! line-based text scan
+//! delimiter and a SPLICE TOKEN is flagged OUTRIGHT (round 8): string
+//! content can poison any line-local comment tracking, so a line where
+//! that poison could matter is surfaced, never judged. Round 9 measured
+//! what that arm does and does NOT establish, and the honest statement
+//! is narrower than round 8's: lines carrying a quote and a delimiter
+//! but NO splice token still reach the views (two exist in `src/`
+//! today), and a quote-free line can be the INTERIOR of a multi-line
+//! string where a raw `/*` is content, not an opener — so the stripped
+//! view's removals are not always real comment interior. Both errors
+//! run in the OVER-flag direction only: an under-flag would need a live
+//! single-line splice whose `include`/`path` token is hidden, and the
+//! ambiguity arm tests for those tokens in RAW text, before any
+//! stripping. That is the claim — a direction, not an exactness. The
+//! arms flag: any `include!` spelling, any `include` at one of FOUR
+//! enumerated openers on its declaration line — `::include`,
+//! `{include`, `,include`, and `useinclude` after collapse — any
+//! `#[path`/`path=` attribute spelling, and any U+200E/U+200F bidi mark
+//! outright. The fourth opener is round 9's: Rust 2018 uniform paths
+//! let `use include as mount;` bind the prelude macro with no leading
+//! path, which is live on this crate's edition and wrote none of the
+//! first three. The claim is the ENUMERATION, not a universal — round 9
+//! falsified "the form every alias site must write, whatever its
+//! visibility, spacing, grouping, comment interleaving, or `r#` raw
+//! spelling", and an enumeration that has been widened four times is a
+//! tripwire, not a proof. What escapes a line-based text scan
 //! by construction: a declaration or invocation split across physical
 //! lines (a block comment or string spanning the boundary is the same
 //! class), a `concat!`/`env!("OUT_DIR")` argument naming the dark
@@ -372,21 +391,28 @@ fn source_splicing_is_allowlisted() {
     // they have no legitimate use in this source. The alias arm (round 5,
     // after a use-prefix test and a raw word-boundary test each proved
     // wrong — the first evadable, the second flooded by prose) flags
-    // `include` in PATH-SEGMENT position, which every SINGLE-LINE
-    // alias-creation site must write at its first hop from the std/core
-    // root, whatever its visibility, spacing, grouping, comment
-    // interleaving, or `r#` spelling; a declaration split across physical
-    // lines is the stated split residual of the file header.
-    // The macro name `include` in path-segment position: preceded by `::`,
-    // `{`, or `,` on the collapsed line. The tail check is deliberately
-    // BROADER than "non-identifier or glued `as`": end-of-line counts as
-    // boundary-clear, any non-ASCII character counts as non-identifier,
-    // and any tail beginning `as` matches — so a hypothetical
-    // `::includeastro` segment flags too. All three widenings over-flag
-    // only, never under-flag. `include_filtered`/`include_str!` carry a
-    // `_` at the boundary and stay unmatched.
+    // `include` in a position where a use-declaration can bind it, at
+    // FOUR enumerated openers on the collapsed line: `::include`,
+    // `{include`, `,include`, and — round 9 — `useinclude`. That last
+    // one is not a stylistic variant: Rust 2018 UNIFORM PATHS let a use
+    // declaration name a prelude macro with no leading path at all, so
+    // `use include as mount;` is a live single-line splice alias on this
+    // crate's own edition (2024) and wrote none of the first three
+    // openers. Round 9 proved it compiles AND executes, and proved the
+    // sweeps could not tell clean HEAD from a HEAD carrying it. The claim
+    // here is now the enumerated one — these four openers, not "whatever
+    // an alias site must write" — because that universal quantifier is
+    // what round 9 falsified. A declaration split across physical lines
+    // remains the stated split residual of the file header.
+    // The tail check is deliberately BROADER than "non-identifier or
+    // glued `as`": end-of-line counts as boundary-clear, any non-ASCII
+    // character counts as non-identifier, and any tail beginning `as`
+    // matches — so a hypothetical `::includeastro` segment flags too.
+    // All three widenings over-flag only, never under-flag.
+    // `include_filtered`/`include_str!` carry a `_` at the boundary and
+    // stay unmatched.
     fn names_include_segment(collapsed: &str) -> bool {
-        for opener in ["::include", "{include", ",include"] {
+        for opener in ["::include", "{include", ",include", "useinclude"] {
             let mut search_from = 0;
             while let Some(position) = collapsed[search_from..].find(opener) {
                 let end = search_from + position + opener.len();
@@ -444,9 +470,15 @@ fn source_splicing_is_allowlisted() {
         // and the poisoned stripped view can hide a live splice the
         // comment bytes simultaneously hide from the plain view. Such
         // lines are not judged — they are flagged outright whenever the
-        // splice tokens are present at all. Every string form carries a
-        // `"`, so the views below only ever judge lines whose raw-text
-        // `/*` adjacency is a real comment opener to the Rust lexer too.
+        // splice tokens are present at all. Round 9 pinned down what
+        // this does NOT buy: lines with a quote and a delimiter but no
+        // splice token still reach the views, and a quote-free line can
+        // be the interior of a multi-line string, so a judged line's
+        // delimiters are not always real. What holds is the DIRECTION —
+        // a fake delimiter can only remove text and over-flag, while an
+        // under-flag would need a live single-line splice whose
+        // `include`/`path` token is hidden, and the test below runs on
+        // RAW text before any stripping can hide one.
         if line.contains('"')
             && (line.contains("/*") || line.contains("*/"))
             && (line.contains("include")
@@ -532,60 +564,45 @@ fn no_gate_builds_doctests() {
     // executing edge the prose exemption above would tolerate. The
     // inert-comment rule is therefore bounded by the gates never opening
     // the doctest lane, and this test OBSERVES that bound instead of
-    // asserting it from memory. Round 8 falsified the first scan (a
-    // physical-line `contains("cargo test")` over `*.yml` only): a
-    // `.yaml` workflow was invisible, a sibling command's `--tests` on
-    // the same line masked a bare `cargo test`, a doubled space broke
-    // the match, and a wrapped or folded `run:` block hid the invocation
-    // across physical lines. So the walk now parses what CI executes:
-    // every `run:` scalar in `*.yml`/`*.yaml` (inline, literal `|`, and
-    // folded `>` blocks), shell line continuations joined, split into
-    // command segments on `&&`/`||`/`;`/`|`/newline. A segment whose
-    // tokens say `cargo` … `test` before any bare `--` is an invocation;
-    // its doctest-excluding target selector must also sit BEFORE the
-    // bare `--` (after it, tokens belong to libtest — a trailing
-    // `--test` is a filter string, not a selector), and `--doc` anywhere
-    // in the segment is an offense. (`--test-threads` is a distinct
-    // token and does not satisfy `--test`.) The pin's own residuals —
-    // indirection and expression-built commands — are STATED in the
-    // file header.
-    fn run_scalars(text: &str) -> Vec<String> {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            let line = lines[i];
-            let trimmed = line.trim_start();
-            let indent = line.len() - trimmed.len();
-            let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-            if let Some(value) = key.strip_prefix("run:") {
-                let value = value.trim();
-                if value.starts_with('|') || value.starts_with('>') {
-                    let folded = value.starts_with('>');
-                    let mut block = Vec::new();
-                    let mut j = i + 1;
-                    while j < lines.len() {
-                        let body = lines[j];
-                        if body.trim().is_empty() {
-                            j += 1;
-                            continue;
-                        }
-                        if body.len() - body.trim_start().len() <= indent {
-                            break;
-                        }
-                        block.push(body.trim().to_string());
-                        j += 1;
-                    }
-                    out.push(block.join(if folded { " " } else { "\n" }));
-                    i = j;
-                    continue;
-                }
-                out.push(value.to_string());
-            }
-            i += 1;
-        }
-        out
-    }
+    // asserting it from memory. Round 8 falsified the first scan and
+    // round 9 falsified its replacement: a `run:`-scalar walk missed
+    // quoted scalars (`run: "cargo test"` — the token was `"cargo`),
+    // plain multi-line scalars, a flow mapping (`- {run: cargo test}`),
+    // an extra space after the list dash, and the `cargo t` builtin
+    // alias. Each shape was a real CI gate the walk read as nothing.
+    //
+    // The lesson is round 3's, arriving a second time: a scan that must
+    // MODEL a syntax to find the command loses to that syntax. So this
+    // no longer parses YAML at all. It is a fail-closed PHYSICAL-LINE
+    // scan, and the rule is: a line that mentions `cargo` must resolve,
+    // on that line alone, to a subcommand this test can name.
+    //   * YAML/flow punctuation (`"`, `'`, `{`, `}`, `,`) becomes
+    //     whitespace first, so a quoted scalar and a flow mapping
+    //     tokenize exactly like the bare form. No quoting spelling can
+    //     hide the command, because quoting is erased before tokens.
+    //   * Each line splits into command segments on `&&`/`||`/`;`/`|`,
+    //     so a sibling command's selector cannot mask a bare gate.
+    //   * A segment holding the token `cargo` with NO subcommand token
+    //     after it — the shape produced by every line-spanning wrap,
+    //     YAML-folded or shell-continued — is an OFFENSE, not a skip.
+    //     That is the fail-closed core: the walk refuses to guess what a
+    //     wrapped command becomes, and says so loudly. A future gate
+    //     that legitimately wraps must inline the command or update this
+    //     test deliberately, which is the friction the whole file is
+    //     built on.
+    //   * A subcommand of `test` (or the `t` builtin alias) is an
+    //     invocation. It must carry a doctest-excluding target selector
+    //     BEFORE any bare `--` (after it, tokens belong to libtest — a
+    //     trailing `--test` is a filter string, not a selector), and
+    //     `--doc` anywhere in the segment is an offense.
+    //     (`--test-threads` is a distinct token and does not satisfy
+    //     `--test`.) Any other subcommand — `build`, `clippy`, `check`,
+    //     `metadata`, `tree` — is not this test's business.
+    // The residuals are now the honest two, and they are the two no
+    // line-based scan can reach: indirection (a script, make target, or
+    // composite action that runs cargo out of the walk's sight) and a
+    // command assembled from YAML anchors or `${{ }}` expressions. Both
+    // are STATED in the file header.
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     let workflows = repo.join(".github").join("workflows");
     let excluding = ["--all-targets", "--lib", "--tests", "--bins", "--test"];
@@ -597,34 +614,43 @@ fn no_gate_builds_doctests() {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("read workflow");
-        for scalar in run_scalars(&text) {
-            let joined = scalar.replace("\\\n", " ");
-            for segment in joined
+        for (number, line) in text.lines().enumerate() {
+            let unquoted = line.replace(['"', '\'', '{', '}', ','], " ");
+            for segment in unquoted
                 .replace("&&", "\n")
                 .replace("||", "\n")
                 .replace([';', '|'], "\n")
                 .lines()
             {
                 let tokens: Vec<&str> = segment.split_whitespace().filter(|t| *t != "\\").collect();
-                let dashdash = tokens
-                    .iter()
-                    .position(|t| *t == "--")
-                    .unwrap_or(tokens.len());
-                let Some(cargo_at) = tokens[..dashdash].iter().position(|t| *t == "cargo") else {
+                let Some(cargo_at) = tokens.iter().position(|t| *t == "cargo") else {
                     continue;
                 };
-                if !tokens[cargo_at..dashdash].contains(&"test") {
+                let after = &tokens[cargo_at + 1..];
+                let dashdash = after.iter().position(|t| *t == "--").unwrap_or(after.len());
+                let mut report = |what: &str| {
+                    offenders.push(format!(
+                        "{}:{}: [{what}] {}",
+                        path.file_name().expect("file name").to_string_lossy(),
+                        number + 1,
+                        segment.trim()
+                    ));
+                };
+                let Some(subcommand) = after[..dashdash]
+                    .iter()
+                    .find(|t| !t.starts_with('-') && !t.starts_with('$'))
+                else {
+                    report("cargo invocation does not resolve on one line");
+                    continue;
+                };
+                if *subcommand != "test" && *subcommand != "t" {
                     continue;
                 }
                 invocations += 1;
-                let opens_doctests = tokens.contains(&"--doc")
-                    || !tokens[..dashdash].iter().any(|t| excluding.contains(t));
-                if opens_doctests {
-                    offenders.push(format!(
-                        "{}: {}",
-                        path.file_name().expect("file name").to_string_lossy(),
-                        segment.trim()
-                    ));
+                if after.contains(&"--doc") {
+                    report("--doc builds the doctest lane");
+                } else if !after[..dashdash].iter().any(|t| excluding.contains(t)) {
+                    report("no doctest-excluding target selector before `--`");
                 }
             }
         }

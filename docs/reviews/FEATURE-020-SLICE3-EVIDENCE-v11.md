@@ -1,12 +1,97 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-9 review and its repairs (PR 3)
+
+Round 9 attacked the round-8 repairs: **0 blockers, 3 confirmed majors,
+2 confirmed minors, 1 refuted, 2 notes**. The inert-comment rule survived
+a ninth round untouched, and the round-8 stripper repairs were confirmed
+sound by an independent battery (544 comment-interleave candidates over 8
+live splice templates; every enumerated template had ZERO live escapes).
+But the review found a hole in the centre of the alias arm, and killed
+the gate pin's parsing approach outright.
+
+- **MAJOR — `use include as X;` is a live splice alias that evaded every
+  view.** Rust 2018 UNIFORM PATHS let a use declaration name a prelude
+  macro with no leading path, so the first segment needs no `::` at all.
+  The adjudicator verified it on this crate's own edition (2024):
+  `use include as mount;` + `mount!("payload.rs");` compiles and executes
+  the splice, while the matcher returns `None` on both lines. **The
+  decisive probe:** a copy of the REAL `src/` (172 files) with those two
+  lines appended to `daemon.rs` (an asserted ingress lane) and a shim
+  outside `src/` calling `index_lifecycle::dark_entry()` produced sweep
+  output IDENTICAL to clean HEAD — violations=0, (4,4)/(9,9)/(6,6). The
+  suite could not distinguish clean HEAD from HEAD carrying a live dark
+  splice. This was not a stated residual: one physical line, a literal
+  path, an edition property of the crate we compile today. Repair: a
+  FOURTH opener, `useinclude`, and — equally the point — the universal
+  claim ("the form every alias site must write, whatever its visibility,
+  spacing, grouping, comment interleaving, or `r#` spelling") is retired
+  for the ENUMERATION it always was. An opener set widened four times is
+  a tripwire, not a proof, and now says so. Mutations **M50** (the bare
+  uniform-path alias) and **M51** (its comment-interleaved variant)
+  observed caught, restored.
+- **MAJOR ×2 — the gate pin's `run:`-scalar parser missed six ordinary
+  spellings**, confirmed by two independent adjudicators against two
+  independent YAML parsers: `run: "cargo test"` (the token was `"cargo`),
+  `run: 'cargo test …'`, a plain multi-line scalar, `-   run:` with an
+  extra space after the dash, `- {run: cargo test}` as a flow mapping,
+  and `cargo t` (a real cargo builtin alias that runs doctests). Worse
+  than a miscount: an ADDED doctest gate in flow-mapping form left
+  `invocations` at 7, so the anti-vacuity floor gave zero tell. The
+  second major is the same defect in the prose — the STATED BOUND's
+  "parses every `run:` scalar" and the evidence doc's "the pin's REAL
+  residuals" were both false.
+  **Repair — the pin stopped parsing YAML.** This is round 3's lesson
+  arriving a second time: a scan that must MODEL a syntax to find the
+  command loses to that syntax, exactly as the mid-line-comment lexers
+  lost to Rust. The walk is now a fail-closed PHYSICAL-LINE scan that
+  erases YAML quoting and flow punctuation before tokenizing (so quoting
+  cannot hide a command), splits compound commands into segments, and
+  treats a `cargo` segment with no resolvable subcommand — the shape
+  every line-spanning wrap produces — as an OFFENSE rather than a skip.
+  It refuses to guess and says so. Observed: still exactly 7 invocations
+  on the real workflows; mutations **M52a–M52f** (double-quoted,
+  single-quoted, flow mapping, dash-space, `cargo t`, plain multi-line
+  scalar) each observed caught, and all five round-8 controls
+  (**M49a–M49e**) re-observed caught under the new design. A wrap that
+  keeps `cargo test --all-targets` intact on its line still passes — the
+  friction fires only where the command genuinely cannot be resolved.
+- **MINOR ×2 — two stale mechanics in prose.** The round-6 `r#include`
+  bullet still said the collapse strips `r#` "in both views" (round 8
+  made it four views and moved the strip out of the collapse), and the
+  round-8 claim that the views "only ever judge lines whose delimiters
+  are real" was false in two ways: quote-bearing lines WITHOUT a splice
+  token still reach the views (two such lines exist in `src/`), and a
+  quote-free line can be the interior of a multi-line string. Both
+  errors run in the over-flag direction only — an under-flag would need
+  a live splice whose `include`/`path` token is hidden, and the
+  ambiguity arm tests raw text before any stripping. Repaired to state
+  the DIRECTION rather than an exactness, in both the header and here.
+- **REFUTED:** "the `>= 5` floor against 7 observed lets two invocations
+  vanish silently." Adjudicated not-real.
+- **Note:** the round-8 summary said the gate pin had "two silent-pass
+  classes" while its own bullet listed three; corrected below.
+
+## Gate results for the round-9 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; dual counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| gate-walk anti-vacuity | observed 7 invocations under the rewritten walk (floor probe) |
+| mutations | M50/M51 (uniform-path alias, bare and comment-interleaved) and M52a–M52f (six gate spellings) each observed caught; M49a–M49e re-observed caught under the new walk; all restored |
+
 ## Round-8 review and its repairs (PR 3)
 
 Round 8 attacked the round-7 repairs: **0 blockers, 4 confirmed majors,
 0 refuted, 1 note**. The inert-comment rule again survived untouched —
 all four majors landed on the two round-7 artifacts themselves: the
-depth-aware stripper (two distinct evasion paths) and the gate pin (two
-silent-pass classes plus its falsified "fails loudly" sentence).
+depth-aware stripper (two distinct evasion paths) and the gate pin
+(three silent-pass classes plus its falsified "fails loudly" sentence —
+this line said "two" while the bullet below listed three; corrected
+after round 9).
 
 - **MAJOR — whitespace collapse fabricated `/*` openers.** The round-7
   pipeline deleted all whitespace FIRST, then stripped comments — gluing
@@ -31,7 +116,14 @@ silent-pass classes plus its falsified "fails loudly" sentence).
   repair closes it as a class, not an instance — the new AMBIGUITY ARM
   flags outright any line carrying a `"` alongside a `/*` or `*/` plus a
   splice token, so the views only ever judge lines whose comment
-  delimiters are real. Zero existing `src/` lines trip the arm (the
+  delimiters are real [amended after round 9: that last clause was false
+  in two ways — quote-bearing lines WITHOUT a splice token still reach
+  the views, and a quote-free line can be the interior of a multi-line
+  string. What the arm buys is a DIRECTION, not an exactness: a fake
+  delimiter can only remove text and over-flag, while an under-flag
+  would need a live splice whose `include`/`path` token is hidden, and
+  the arm tests raw text before any stripping]. Zero existing `src/`
+  lines trip the arm (the
   allowlists and dual-count binds are unchanged). Mutations **M46** (the
   string-poisoned alias, observed caught by the ambiguity arm
   specifically), **M47** (comment-interleaved `#[path]`, the F4 form),
@@ -54,7 +146,12 @@ silent-pass classes plus its falsified "fails loudly" sentence).
   walk was observed finding exactly 7 invocations on the real workflows
   (floor probe), and the pin's REAL residuals are now stated in the
   header: indirection (script/make/composite action) and `run:` values
-  assembled from YAML anchors or `${{ }}` expressions. Mutations
+  assembled from YAML anchors or `${{ }}` expressions [amended after
+  round 9: "REAL residuals" was an overclaim — six more spellings
+  (quoted scalars, plain multi-line scalars, flow mappings, dash-space,
+  `cargo t`) were invisible to this walk and named nowhere. The parser
+  was replaced by a fail-closed physical-line scan; see the Round-9
+  section]. Mutations
   **M49a** (sibling masking) / **M49b** (`.yaml` + `--doc`) / **M49c**
   (double space) / **M49d** (backslash-wrapped invocation) / **M49e**
   (folded-block split) each observed caught against the mutated
@@ -196,7 +293,11 @@ survive adjudication.
 - **MAJOR — `r#include` is a resolvable alias-creation spelling.**
   `use std::r#include as inc;` compiles and wrote no matchable opener
   (`r#` broke the `::include` adjacency). The collapse now strips `r#`
-  sequences in both views; mutation **M39** observed caught, restored.
+  sequences in both views [amended after round 9: superseded twice over
+  — the collapse filters whitespace only, and `r#`-removal became a pair
+  of EXTRA views (four total) in round 8 so that removal can never
+  destroy an adjacency. Do not restore the in-place strip]; mutation
+  **M39** observed caught, restored.
 - **REFUTED:** "the compiler-backstop claim is false — an innocuous-alias
   double `#[path]` mount compiles cleanly." The adjudicator reproduced
   the opposite: this tree's `authority.rs` references
