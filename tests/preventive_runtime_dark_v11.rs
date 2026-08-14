@@ -36,8 +36,9 @@
 //! `.yml`/`.yaml` workflow that mentions cargo OR rustdoc —
 //! case-insensitively — against a verbatim allowlist a human judged
 //! doctest-free, binds each line's OCCURRENCE COUNT plus the total, the
-//! distinct set and the workflow-file count, and pins the repo's
-//! `.cargo/config.toml` verbatim. Rounds 8–11 each falsified a scan
+//! distinct set and the workflow-file count, pins EVERY `.cargo` config
+//! in the tree (the root one verbatim, any other forbidden), and
+//! fingerprints each workflow file whole. Rounds 8–11 each falsified a scan
 //! that tried to read the command out of the file and judge it; round
 //! 11's `cargo rustdoc -- --test` builds and runs doctests while naming
 //! neither `test` nor `--doc` where the walk looked, and
@@ -56,14 +57,18 @@
 //! exhaustiveness, because round 9 called its list "the only two",
 //! round 10 produced a third, round 11 a fourth, round 12 showed one of
 //! them was never a residual at all, and round 13 broke the check that
-//! replaced it: a gate reaching the doctest lane with neither `cargo`
-//! nor `rustdoc` on the line (a script, make target, or composite
-//! action running it out of sight); a cargo config OUTSIDE the repo
+//! replaced it, and round 14 walked through the seam between a LINE and
+//! the YAML SCALAR that actually executes: a gate reaching the doctest
+//! lane from OUTSIDE these files (a script, make target, or composite
+//! action running it out of sight), and a cargo config outside the repo
 //! (`~/.cargo/config.toml`, `$CARGO_HOME`, or an ancestor of the
-//! checkout); and a gate DISABLED rather than edited — `if: false` on a
-//! step changes no cargo line, so this pin cannot see a gate switched
-//! off. The repo's own `.cargo/config.toml` is NOT a residual: it is
-//! pinned verbatim, and the legacy `.cargo/config` must not exist.
+//! checkout). Two former residuals are now covered rather than
+//! conceded: every `.cargo` config IN the tree is pinned (round 14 —
+//! cargo merges configs from the working directory upward, so a
+//! descendant config plus `working-directory:` re-pointed a gate and
+//! ran a `///` line's doctest into the dark directory), and a gate
+//! DISABLED with `if: false` changes no cargo line but does change the
+//! file, which the fingerprints see.
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
 //! across directory boundaries. The mechanism sweep is a fail-closed
@@ -419,11 +424,12 @@ fn source_splicing_is_allowlisted() {
     // (round 8): string content can poison the depth tracking. The two
     // Pattern_White_Space extras the Rust lexer also accepts (the
     // U+200E/U+200F bidi marks, the round-4 dodge) are flagged OUTRIGHT —
-    // they have no legitimate use in this source. Round 12: "outright"
-    // now means what it says. This arm names the mark, but `sweep` used
-    // to hand the line on to the prose exemption, which forgave a
-    // U+200E sitting on a `//` line; the check that decides now lives in
-    // `sweep` AHEAD of every exemption, allowlist included.
+    // they have no legitimate use in this source. That check is NOT in
+    // this matcher: round 12 moved it into `sweep`, ahead of the
+    // allowlist and the prose exemption, because a matcher that merely
+    // NAMES a mark still lets the exemption forgive it. Round 13 deleted
+    // the copy that was left here, so "outright" is decided in exactly
+    // one place.
     // The alias arm (round 5,
     // after a use-prefix test and a raw word-boundary test each proved
     // wrong — the first evadable, the second flooded by prose) flags
@@ -595,11 +601,11 @@ fn source_splicing_is_allowlisted() {
     );
 }
 
-/// Every line of every CI workflow that mentions cargo, normalized
-/// (trimmed, internal whitespace collapsed), WITH THE NUMBER OF TIMES
-/// it must occur. This is the pin: a human read each one and judged
-/// that it cannot build doctests. Grouped by why, so the judgement is
-/// auditable rather than asserted.
+/// Every line of every CI workflow that mentions cargo OR rustdoc,
+/// normalized (trimmed, runs of ASCII space and tab collapsed), WITH
+/// THE NUMBER OF TIMES it must occur. This is the pin: a human read
+/// each one and judged that it cannot build doctests. Grouped by why,
+/// so the judgement is auditable rather than asserted.
 ///
 /// Round 12: the counts are per line because a (total, distinct) pair
 /// is only a bijection when the two are EQUAL. Four of these lines
@@ -608,6 +614,19 @@ fn source_splicing_is_allowlisted() {
 /// held both numbers while removing `cargo test --all-targets` from PR
 /// CI entirely. The multiset is what was always meant; now it is what
 /// is checked.
+/// Each CI workflow's whole-file fingerprint, `<fnv1a-64>:<bytes>` over
+/// LF-normalized content. Round 14's backstop: the checks below read
+/// lines, CI executes YAML scalars, and that seam leaked twice — so no
+/// workflow byte may change without a human revisiting the judgement
+/// that no gate builds doctests. A change detector, not a security
+/// boundary: FNV-1a is not collision-resistant, and whoever edits a
+/// workflow can edit this too. What it buys is that the edit is never
+/// silent.
+const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
+    ("ci.yml", "a45c1a8754a91cac:13452"),
+    ("release.yml", "6e996401bbb76142:110465"),
+];
+
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
 /// `[alias]` table here re-points a gate command without touching a
 /// workflow line, and every syntax-matching attempt at finding one has
@@ -725,13 +744,19 @@ fn no_gate_builds_doctests() {
     // not this test's to reimplement.
     //
     // So it stopped reading commands. Every line of every workflow that
-    // mentions cargo — case-insensitively, so `CARGO_*` counts — must
-    // appear VERBATIM in `CARGO_LINES` above, normalized only by
-    // trimming and collapsing whitespace. A human judged each of those
-    // lines doctest-free; anything else, in any spelling, quoting,
-    // grouping or subcommand, fails and forces that judgement to be made
-    // again. There is no word model left to be wrong about: an unknown
-    // cargo line is an offense whatever it says.
+    // mentions cargo OR rustdoc — case-insensitively, so `CARGO_*`
+    // counts — must appear VERBATIM in `CARGO_LINES` above, normalized
+    // by trimming and collapsing runs of ASCII space and tab, which is
+    // what bash's default IFS splits on within a line. A human judged
+    // each of those lines doctest-free; anything else, in any spelling,
+    // quoting, grouping or subcommand, fails and forces that judgement
+    // to be made again. Round 11 claimed "there is no word model left
+    // to be wrong about" here; round 13 falsified it (normalization is
+    // itself a word model, and it disagreed with bash over U+00A0), and
+    // round 14 showed the deeper seam — the unit compared is a LINE
+    // while the unit executed is a YAML scalar. The line checks are
+    // kept for the auditable judgement they record; the whole-file
+    // fingerprints below are what make a change impossible to miss.
     //
     // KNOWN RESIDUALS — what has been probed, NOT a proof of
     // exhaustiveness (round 9 wrote "the only two" and round 10 produced
@@ -745,9 +770,35 @@ fn no_gate_builds_doctests() {
     // `.cargo/config.toml` is not among them — it is pinned below.
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     let workflows = repo.join(".github").join("workflows");
+    // ROUND 14, THE BACKSTOP. Everything below reads LINES; what CI
+    // executes is a YAML scalar, and round 14 walked through that gap
+    // twice — a pinned line extended by a continuation that is itself a
+    // pinned line (`cargo test --all-targets -- --test-threads=1` +
+    // `python execution/release_ops.py publish-cargo`, which libtest
+    // swallows as extra filters, exit 0), and a gate RELOCATED from
+    // ci.yml to release.yml, which the flat cross-file multiset cannot
+    // see. Both leave every line pinned and every count matching.
+    // Patching the line walk a fourth time would just move the seam, so
+    // the whole file is fingerprinted: the checks below still record
+    // WHY each cargo line is doctest-free, and this one guarantees no
+    // workflow byte changed without a human revisiting that judgement.
+    // This is a CHANGE DETECTOR, not a security boundary — FNV-1a is
+    // not collision-resistant, and anyone editing a workflow can edit
+    // this constant too. The property it buys is that the edit cannot
+    // be SILENT.
+    fn fingerprint(text: &str) -> String {
+        let normalized = text.replace("\r\n", "\n");
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in normalized.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{hash:016x}:{}", normalized.len())
+    }
     let mut seen: Vec<String> = Vec::new();
     let mut offenders = Vec::new();
     let mut files = 0usize;
+    let mut fingerprints: Vec<(String, String)> = Vec::new();
     for entry in std::fs::read_dir(&workflows).expect("read workflows dir") {
         let path = entry.expect("workflow entry").path();
         if path.extension().is_none_or(|e| e != "yml" && e != "yaml") {
@@ -755,6 +806,13 @@ fn no_gate_builds_doctests() {
         }
         files += 1;
         let text = std::fs::read_to_string(&path).expect("read workflow");
+        fingerprints.push((
+            path.file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned(),
+            fingerprint(&text),
+        ));
         for (number, line) in text.lines().enumerate() {
             // Round 13: `rustdoc` selects too. The file already named it as
             // an equally sufficient spelling of the doctest lane — and then
@@ -796,10 +854,13 @@ fn no_gate_builds_doctests() {
          tolerates:\n{}",
         offenders.join("\n")
     );
-    // `--doc` and `rustdoc` are the two spellings that open the lane
+    // `--doc` and `rustdoc` are two spellings that open the lane
     // without a `cargo test` in sight, so they are ALSO named directly.
-    // The allowlist above already fails on them; this is a second,
-    // orthogonal reading, so a careless allowlist addition still trips.
+    // Not the only two — round 14 pointed out `cargo t` opens it as
+    // well, and the round-13 `[alias]` work proved an aliased `fmt`
+    // does. This is a cheap second reading over the allowlist, so a
+    // careless ADDITION trips on the obvious spellings; the allowlist
+    // itself, and the fingerprints below, are what actually bind.
     let named: Vec<&(&str, usize)> = CARGO_LINES
         .iter()
         .filter(|(l, _)| l.contains("--doc") || l.contains("rustdoc"))
@@ -845,6 +906,62 @@ fn no_gate_builds_doctests() {
          it exactly like config.toml, so it can carry an [alias] table this \
          pin does not cover — fold it into config.toml or pin it here"
     );
+    // Round 14: cargo merges `.cargo/config.toml` from the CWD and every
+    // ancestor, so a config one directory DOWN is honoured the moment a
+    // step sets `working-directory:`. Pinning the ROOT config alone left
+    // that open, and the adjudicator drove it end to end: an alias in
+    // `execution/.cargo/config.toml` turned `cargo fmt --check` into a
+    // doctest run, an inert `///` line called into the dark directory,
+    // and the marker file was written — the darkness guarantee failing
+    // with the tripwire reporting all-clear. So every `.cargo` directory
+    // in the tree is found, not just the root one.
+    fn cargo_configs_under(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            // `target` is gitignored build output and can be enormous;
+            // `.git` is not source. Neither can carry a committed config.
+            if name == "target" || name == ".git" || name == "node_modules" {
+                continue;
+            }
+            if name == ".cargo" {
+                for candidate in ["config.toml", "config"] {
+                    if path.join(candidate).is_file() {
+                        found.push(path.join(candidate));
+                    }
+                }
+                continue;
+            }
+            cargo_configs_under(&path, found);
+        }
+    }
+    let mut configs = Vec::new();
+    cargo_configs_under(&repo, &mut configs);
+    let stray: Vec<String> = configs
+        .iter()
+        .filter(|p| **p != cargo_config)
+        .map(|p| {
+            p.strip_prefix(&repo)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a cargo config lives somewhere other than the pinned repo root. \
+         Cargo merges `.cargo/config.toml` from the working directory and \
+         every ancestor, so a descendant config plus a `working-directory:` \
+         on any gate re-points that gate — read these and pin them \
+         deliberately:\n{}",
+        stray.join("\n")
+    );
     // The MULTISET binds, per line. Round 12: (total, distinct) is only a
     // bijection when the two are equal — at (30, 26) a compensated edit
     // deleted `cargo test --all-targets` from PR CI while both numbers
@@ -874,6 +991,23 @@ fn no_gate_builds_doctests() {
          CARGO_LINES with the workflows deliberately, never by loosening \
          this pin:\n{}",
         drifted.join("\n")
+    );
+    // The backstop assertion. Any byte of either workflow moving lands
+    // here even when every line above still matches — a relocation
+    // across files, a continuation extending a pinned command, an `if:`
+    // switching a gate off, a `working-directory:` added to one.
+    fingerprints.sort();
+    let declared_prints: Vec<(String, String)> = WORKFLOW_FINGERPRINTS
+        .iter()
+        .map(|(f, p)| ((*f).to_string(), (*p).to_string()))
+        .collect();
+    assert_eq!(
+        fingerprints, declared_prints,
+        "a CI workflow file changed. Every cargo line may still be \
+         allowlisted and every count may still match — a gate moved \
+         between files, a continuation extended a pinned command, or a \
+         step was disabled — so read the diff, confirm no gate builds \
+         doctests, and update WORKFLOW_FINGERPRINTS in the same change"
     );
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(

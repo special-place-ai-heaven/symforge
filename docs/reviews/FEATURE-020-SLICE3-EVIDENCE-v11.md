@@ -1,5 +1,71 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-14 review and its repairs (PR 3)
+
+Round 14 attacked the round-13 repairs: **0 blockers, 7 confirmed
+majors, 3 confirmed minors, 1 refuted, 3 notes**. Three majors are new
+holes in the gate pin; four are prose I wrote in the round-13 commit
+itself. The first is the most serious finding of the whole review, and
+the only one so far to demonstrate the darkness guarantee failing end
+to end.
+
+- **MAJOR — a DESCENDANT `.cargo/config.toml` re-points a gate, and the
+  full laundering chain was executed.** Cargo merges configs from the
+  working directory and every ancestor, so my round-13 root pin left
+  every subdirectory open. The adjudicator committed
+  `execution/.cargo/config.toml` with an aliased `fmt`, added
+  `working-directory: execution` to the fmt step, and drove it through:
+  the gate ran `cargo test --doc`, an inert `///` line calling
+  `index_lifecycle` was tolerated as prose by the sweep, the doctest
+  executed, and the dark-directory marker file was written — exit 0,
+  all four tests GREEN, both workflows byte-unchanged, `git check-ignore`
+  confirming both new files are committable. That is the STATED BOUND
+  failing with the tripwire reporting all-clear. Repair: every `.cargo`
+  directory in the tree is found (skipping `target`, `.git`,
+  `node_modules`); the root config must match its verbatim pin and no
+  other config may exist. Mutations **M57a** and **M57a2** (descendant
+  `config.toml` and legacy `config`) observed caught.
+- **MAJOR ×2 — the pin's unit is a LINE; what executes is a YAML
+  scalar.** A continuation line that is itself pinned extends a pinned
+  command (`cargo test --all-targets -- --test-threads=1` +
+  `python execution/release_ops.py publish-cargo`, which libtest
+  swallows as extra filters, exit 0) — the case both horns of round
+  13's refutation missed. And the occurrence counts are file-blind: a
+  gate RELOCATED from ci.yml to release.yml keeps every count and the
+  whole triple while PR CI loses it. Patching the line walk a fourth
+  time would only move the seam, so **each workflow file is
+  fingerprinted whole**. The line checks stay for the auditable
+  judgement they record; the fingerprint is what makes any change
+  impossible to miss. It is a change detector, not a security boundary,
+  and says so. Mutations **M57b**, **M57c** and **M57d**
+  (`working-directory` added to a gate) observed caught.
+- **MAJOR ×4 + MINOR ×3 — prose, all of it mine, all from the round-13
+  commit.** The retired "no word model left to be wrong about" survived
+  verbatim in the in-test summary because I fixed only the header copy;
+  my new `CARGO_CONFIG` constant was inserted directly above
+  `CARGO_LINES` and stole its doc comment, so it was documented as the
+  thing it is not; my Round-11 amendment asserted a `rustdoc` line is a
+  residual one round after making `rustdoc` a selector; "`--doc` and
+  `rustdoc` are the two spellings that open the lane" is falsified by
+  `cargo t` and by an aliased `fmt`; and the deleted bidi branch was
+  still described in the present tense. Each is corrected against what
+  the code now does, and the residual lists in both the header and the
+  test body were rewritten rather than spot-patched — spot-patching is
+  what produced this cluster three rounds running.
+- **REFUTED:** that the Round-11 section's major count is unaccounted
+  for.
+
+## Gate results for the round-14 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; dual counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| gate pin | per-line multiset, (30, 26, 2), verbatim root cargo config, no other `.cargo` config in the tree, and both workflow fingerprints all bound |
+| mutations | M57a/M57a2 (descendant cargo configs), M57b (relocation shape), M57c (continuation extending a pinned command), M57d (`working-directory` on a gate) each observed caught; root `[ alias ]`, the uniform-path alias and bidi-on-prose re-observed as controls; all restored |
+
 ## Round-13 review and its repairs (PR 3)
 
 Round 13 attacked the round-12 repairs: **0 blockers, 4 confirmed
@@ -56,7 +122,12 @@ matching a syntax with a literal string instead of pinning the file.
   `if: false` on a step disables a gate with no line change at all,
   which is now a STATED residual rather than an unexamined gap.
 - **REFUTED:** that a plain multi-line YAML continuation defeats the
-  per-line pin.
+  per-line pin. [Overturned by round 14, which found the case both
+  round-13 horns missed: a continuation line that is ITSELF pinned.
+  Appending `python execution/release_ops.py publish-cargo` to the
+  `cargo test --all-targets` scalar left every line allowlisted and
+  every count matching, and libtest swallowed the trailing words as
+  filters, exit 0.]
 
 ## Gate results for the round-13 repair chunk
 
@@ -180,7 +251,13 @@ So the walk was deleted.
   doctests: prose and configuration, commands with no test harness, and
   the seven test gates with their selectors. There is no word model left
   to be wrong about — an unrecognized cargo line fails whatever it says,
-  in any quoting, grouping, or subcommand. A second, orthogonal check
+  in any quoting, grouping, or subcommand. [Amended after rounds 13–14:
+  that sentence is false twice over. Normalization is itself a word
+  model (round 13, U+00A0), and the unit compared is a LINE while the
+  unit executed is a YAML scalar (round 14) — a continuation extended a
+  pinned command and a relocation moved a gate between files, both with
+  every line pinned. Whole-file fingerprints are the backstop now.] A
+  second, orthogonal check
   rejects any allowlist entry naming `--doc` or `rustdoc`, so a careless
   addition still trips. Residuals are now the two no line-based scan can
   reach: a gate with no `cargo` on the line at all, and a
@@ -189,8 +266,11 @@ So the walk was deleted.
   a residual — it is a file this test can open, and it is now pinned
   verbatim after round 12's `[alias]`-search replacement was defeated by
   three TOML spellings and the legacy `.cargo/config`. The residual list
-  is also longer than "two": a `rustdoc` line names no cargo, and
-  `if: false` disables a gate without changing any line. See the
+  is also longer than "two". [Corrected after round 14: the two examples
+  this amendment reached for were both wrong by the time it was written
+  — round 13 had already made `rustdoc` a SELECTOR, so a rustdoc line is
+  caught rather than residual, and round 14's whole-file fingerprints
+  see an `if: false` even though it changes no cargo line.] See the
   Round-13 section.]
 - **MINOR ×5, all prose, all mine.** The "quoting cannot hide a command"
   absolute survived unamended in the doc; the retired universal alias
