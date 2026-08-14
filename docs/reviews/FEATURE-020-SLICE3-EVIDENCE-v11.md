@@ -1,9 +1,79 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-10 review and its repairs (PR 3)
+
+Round 10 attacked the round-9 repairs: **0 blockers, 2 confirmed majors,
+4 confirmed minors, 1 major REFUTED, 4 notes**. Both majors are one
+defect — the gate walk's subcommand finder — and four of the six
+findings are errors in prose I had written one commit earlier.
+
+- **MAJOR ×2 — `cargo +nightly test --doc` walked straight past the
+  pin.** The walk named "the first token after `cargo` that starts with
+  neither `-` nor `$`" as THE subcommand. Cargo accepts arguments before
+  its subcommand: a rustup override (`+nightly`) starts with `+`, and a
+  global option's value (`--color always`, `--config k=v`, `-Z x`) is a
+  plain word. The finder therefore resolved to `+nightly`/`always`/`k=v`,
+  decided it was not a test invocation, and skipped in silence —
+  measured at `invocations=7 offenders=0`, byte-identical to clean HEAD,
+  for seven distinct shapes. Liveness was proven rather than assumed: in
+  a probe crate whose doctest writes a marker file, `cargo +1.96.0 test
+  --doc`, `cargo --color always test --doc`, and bare `cargo +stable
+  test` all ran the Doc-tests lane with the marker present; this CI
+  provisions with `rustup toolchain install`, so `+toolchain` is live on
+  the runner. The docs half of the pair is the same defect in prose: the
+  header's "STATED RESIDUALS of the pin, and now the only two".
+  **Repair — the subcommand finder is deleted.** Identifying *which*
+  token is the subcommand was one more thing to be wrong about, so the
+  walk stopped asking and now asks only: does a `test`/`t` token appear
+  before the bare `--`? (`--tests` is a distinct token, so sibling
+  masking still fails.) Closed alongside it: every `cargo` in a segment
+  is judged, not just the first; `&` joins the split set; cargo spelled
+  as a path or as `cargo.exe` counts as cargo; and `\t`/`\n`/`\r`
+  escapes are un-glued before tokenizing. The residual list is now kept
+  as HISTORY — three known classes, never "the only" — because round 9
+  wrote "the only two" and round 10 produced a third the same day.
+- **The anti-vacuity floor became a pin.** `invocations >= 5` was how a
+  silently ADDED gate hid twice: round 9's flow mapping and round 10's
+  `+toolchain` shape both left the count at 7. It now asserts exactly 7,
+  so a gate added, removed, or reworded fails loudly and updates this
+  test deliberately. Mutation **M53j** (a real gate line rewritten to
+  `cargo build`) observed the pin fire at 6.
+- **MINOR ×4, all mine, all the same habit.** "No quoting spelling can
+  hide the command" was an absolute falsified by a YAML escape
+  (`run: "cargo\ttest"` left one glued token); "two such lines exist in
+  `src/`" was really **76**, asserted without measuring in the very
+  paragraph written to replace an overclaim with a measurement; the
+  retired universal alias claim survived in three more places; and a
+  round-7 bracket still described the `run:`-scalar parser that round 9
+  deleted. Each is repaired against a measurement taken on this tree —
+  76 counted with the arm's own predicate, 184 `.rs` files (the earlier
+  "172" was a scan count mislabelled as a file count), one Note bullet
+  in the Round-9 section (which said two).
+- **REFUTED:** "macro-token indirection defeats both the `include!` and
+  `#[path]` arms on single physical lines, with no `concat!`."
+  Adjudicated not-real.
+- **Notes accepted as friction, not defects:** the scan can flag
+  non-command lines (step names, `if:` expressions, YAML comments) — now
+  narrowed by skipping those non-executing keys — and the `useinclude`
+  opener can flag an English word ending in "-use" adjacent to
+  "include" inside a string. Over-flagging forces a human decision,
+  which is the friction this file is built on.
+
+## Gate results for the round-10 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; dual counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| gate-walk count | pinned at exactly 7, observed |
+| mutations | M53a–M53e (`+toolchain`, `+version`, `--color always`, `--config k=v`, `-Z x`), M53f/g (path-spelled cargo), M53h (escape glue), M53i (`cargo.exe`), M53j (the count pin) each observed caught; M52a/M52c/M52e and M49a/M49e re-observed caught under the new walk; all restored |
+
 ## Round-9 review and its repairs (PR 3)
 
 Round 9 attacked the round-8 repairs: **0 blockers, 3 confirmed majors,
-2 confirmed minors, 1 refuted, 2 notes**. The inert-comment rule survived
+2 confirmed minors, 1 refuted, 1 note**. The inert-comment rule survived
 a ninth round untouched, and the round-8 stripper repairs were confirmed
 sound by an independent battery (544 comment-interleave candidates over 8
 live splice templates; every enumerated template had ZERO live escapes).
@@ -16,7 +86,10 @@ the gate pin's parsing approach outright.
   The adjudicator verified it on this crate's own edition (2024):
   `use include as mount;` + `mount!("payload.rs");` compiles and executes
   the splice, while the matcher returns `None` on both lines. **The
-  decisive probe:** a copy of the REAL `src/` (172 files) with those two
+  decisive probe:** a copy of the REAL `src/` (184 `.rs` files; the "172"
+  written here in round 9 was the first sweep's SCANNED count, which
+  excludes the dark directory — a scan count mislabelled as a file
+  count) with those two
   lines appended to `daemon.rs` (an asserted ingress lane) and a shim
   outside `src/` calling `index_lifecycle::dark_entry()` produced sweep
   output IDENTICAL to clean HEAD — violations=0, (4,4)/(9,9)/(6,6). The
@@ -61,7 +134,10 @@ the gate pin's parsing approach outright.
   made it four views and moved the strip out of the collapse), and the
   round-8 claim that the views "only ever judge lines whose delimiters
   are real" was false in two ways: quote-bearing lines WITHOUT a splice
-  token still reach the views (two such lines exist in `src/`), and a
+  token still reach the views (76 such lines exist in `src/`, counted
+  with the arm's own predicate at 0f41db7f — round 9 wrote "two" without
+  measuring, inside the paragraph added to replace an overclaim with a
+  measurement), and a
   quote-free line can be the interior of a multi-line string. Both
   errors run in the over-flag direction only — an under-flag would need
   a live splice whose `include`/`path` token is hidden, and the
@@ -213,7 +289,10 @@ Both majors were repairable without touching the rule.
   (`.yaml` invisible, sibling-token masking, spacing/wrapping); it now
   parses `run:` scalars into command segments, and the pin's own
   residuals — indirection and expression-built commands — are stated in
-  the header]. Mutations **M43a** (selector dropped from a gate line)
+  the header. Superseded twice since: round 9 deleted the `run:`-scalar
+  parser for a fail-closed physical-line scan, and round 10 deleted that
+  scan's subcommand finder. The residual list is now kept as history,
+  never as "the only"]. Mutations **M43a** (selector dropped from a gate line)
   and **M43b** (`--doc` added) each observed caught, restored.
 - **Docs minor:** the round-1 amendment bracket still said "eight
   allowlist entries count-pinned" present-tense; since round 6 the
@@ -357,7 +436,12 @@ majors (one defect seen by both verifiers), 0 refuted, 4 minor/note**.
   `include` in path-segment position on the collapsed line (after `::`,
   `{`, or `,`), boundary-clear or followed by the glued `as` keyword —
   which every resolvable aliasing form must write at its first hop from
-  the std/core root. Zero flags on the tree; mutation **M36**
+  the std/core root [amended after round 9: that universal is FALSE.
+  Rust 2018 uniform paths let `use include as mount;` bind the macro
+  with no first hop at all — live on this crate's edition, and the
+  sweeps could not see it. A fourth opener, `useinclude`, was added; the
+  arm is an enumeration of four spellings, not a proof about every
+  form]. Zero flags on the tree; mutation **M36**
   (attribute-prefixed, `pub(crate)`, tab- and space-riddled alias)
   observed caught.
 - Minors folded: the dead bidi exclusions inside the collapse are gone
@@ -402,6 +486,10 @@ gaps in the splice TRIPWIRE and the register:
   falsified — the use-PREFIX test missed `pub(crate)`, tabs, and leading
   attributes; the arm now flags `include` in path-segment position on the
   collapsed line, which every resolvable aliasing form must write.]
+  [Amended again after round 9: that replacement universal was false too
+  — uniform paths (`use include as mount;`) write no path segment. The
+  arm now enumerates four openers (`::include`, `{include`, `,include`,
+  `useinclude`) and claims the enumeration, not the universe.]
   Mutation **M34** observed caught.
 - **Register:** `EmbedOperationReceipt`'s `Clone` added, and the entry
   gains an explicit scope note for the boundary's scaffolding items.

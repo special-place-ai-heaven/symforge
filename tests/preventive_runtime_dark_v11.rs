@@ -40,16 +40,20 @@
 //! scalars, flow mappings, an extra space after the list dash, and the
 //! `cargo t` alias: a scan that must model YAML to find the command
 //! loses to YAML, exactly as the mid-line-comment lexers lost to Rust
-//! in rounds 1–3. The rule is fail-closed instead: a `cargo` segment
-//! must resolve to a subcommand ON THAT LINE — one that does not (any
-//! line-spanning wrap, folded or shell-continued) is an OFFENSE, not a
-//! skip — and a `test`/`t` subcommand must carry a doctest-excluding
-//! selector before any bare `--` and must not carry `--doc`. STATED
-//! RESIDUALS of the pin, and now the only two: a gate reaching cargo
-//! through INDIRECTION (a script, make target, or composite action), and
-//! a command assembled from YAML anchors or `${{ }}` expressions. Both
-//! change what the runner executes without putting the command in any
-//! line this scan reads.
+//! in rounds 1–3. The rule is fail-closed instead: a `cargo` naming no
+//! plain word before the bare `--` (any line-spanning wrap, folded or
+//! shell-continued) is an OFFENSE, not a skip — and a `test`/`t` token
+//! there makes the line an invocation that must carry a doctest-excluding
+//! selector and must not carry `--doc`. Round 10 deleted the walk's
+//! subcommand FINDER, which `cargo +nightly test --doc` and
+//! `cargo --color always test --doc` had both walked straight past.
+//! KNOWN RESIDUALS of the pin — what has been probed, NOT a proof of
+//! exhaustiveness, because round 9 called its list "the only two" and
+//! round 10 produced a third: (1) a gate reaching cargo through
+//! INDIRECTION (a script, make target, or composite action); (2) a
+//! command assembled from YAML anchors or `${{ }}` expressions; (3) a
+//! command glued into one token by a YAML escape this scan does not
+//! un-glue (`\t`/`\n`/`\r` are un-glued; a ` ` form would survive).
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
 //! across directory boundaries. The mechanism sweep is a fail-closed
@@ -69,8 +73,11 @@
 //! that poison could matter is surfaced, never judged. Round 9 measured
 //! what that arm does and does NOT establish, and the honest statement
 //! is narrower than round 8's: lines carrying a quote and a delimiter
-//! but NO splice token still reach the views (two exist in `src/`
-//! today), and a quote-free line can be the INTERIOR of a multi-line
+//! but NO splice token still reach the views (76 of them at 0f41db7f,
+//! counted with the arm's own predicate — the "two" written here in
+//! round 9 was asserted, not measured, in the very paragraph added to
+//! replace an overclaim with a measurement), and a quote-free line can
+//! be the INTERIOR of a multi-line
 //! string where a raw `/*` is content, not an opener — so the stripped
 //! view's removals are not always real comment interior. Both errors
 //! run in the OVER-flag direction only: an under-flag would need a live
@@ -576,33 +583,38 @@ fn no_gate_builds_doctests() {
     // no longer parses YAML at all. It is a fail-closed PHYSICAL-LINE
     // scan, and the rule is: a line that mentions `cargo` must resolve,
     // on that line alone, to a subcommand this test can name.
-    //   * YAML/flow punctuation (`"`, `'`, `{`, `}`, `,`) becomes
-    //     whitespace first, so a quoted scalar and a flow mapping
-    //     tokenize exactly like the bare form. No quoting spelling can
-    //     hide the command, because quoting is erased before tokens.
-    //   * Each line splits into command segments on `&&`/`||`/`;`/`|`,
-    //     so a sibling command's selector cannot mask a bare gate.
-    //   * A segment holding the token `cargo` with NO subcommand token
-    //     after it — the shape produced by every line-spanning wrap,
-    //     YAML-folded or shell-continued — is an OFFENSE, not a skip.
-    //     That is the fail-closed core: the walk refuses to guess what a
-    //     wrapped command becomes, and says so loudly. A future gate
-    //     that legitimately wraps must inline the command or update this
-    //     test deliberately, which is the friction the whole file is
-    //     built on.
-    //   * A subcommand of `test` (or the `t` builtin alias) is an
-    //     invocation. It must carry a doctest-excluding target selector
-    //     BEFORE any bare `--` (after it, tokens belong to libtest — a
-    //     trailing `--test` is a filter string, not a selector), and
-    //     `--doc` anywhere in the segment is an offense.
-    //     (`--test-threads` is a distinct token and does not satisfy
-    //     `--test`.) Any other subcommand — `build`, `clippy`, `check`,
-    //     `metadata`, `tree` — is not this test's business.
-    // The residuals are now the honest two, and they are the two no
-    // line-based scan can reach: indirection (a script, make target, or
-    // composite action that runs cargo out of the walk's sight) and a
-    // command assembled from YAML anchors or `${{ }}` expressions. Both
-    // are STATED in the file header.
+    //   * YAML/flow punctuation (`"`, `'`, `{`, `}`, `,`) and the escape
+    //     sequences `\t`/`\n`/`\r` become whitespace first, so a quoted
+    //     scalar, a flow mapping, and an escape-glued command tokenize
+    //     like the bare form. (Round 10: `run: "cargo\ttest"` had left
+    //     one glued token and no `cargo` at all.)
+    //   * Each line splits into command segments on `&&`/`||`/`;`/`|`/`&`,
+    //     and EVERY cargo in a segment is judged, so no sibling command
+    //     can mask a bare gate.
+    //   * Cargo spelled as a path (`/usr/bin/cargo`, `$HOME/.cargo/bin/
+    //     cargo`) counts as cargo.
+    //   * A cargo naming NO plain word before the bare `--` — the shape
+    //     every line-spanning wrap produces, YAML-folded or
+    //     shell-continued — is an OFFENSE, not a skip. That is the
+    //     fail-closed core: the walk refuses to guess what a wrapped
+    //     command becomes, and says so loudly. A future gate that
+    //     legitimately wraps must inline the command or update this test
+    //     deliberately, which is the friction the whole file is built on.
+    //   * A `test` or `t` token before the bare `--` makes it an
+    //     invocation, which must carry a doctest-excluding target
+    //     selector there (after the `--`, tokens belong to libtest — a
+    //     trailing `--test` is a filter string, not a selector) and must
+    //     not carry `--doc`. (`--test-threads` and `--tests` are distinct
+    //     tokens and satisfy neither test.)
+    // KNOWN RESIDUALS — a list of what has been probed, NOT a proof of
+    // exhaustiveness. Round 9 wrote "the honest two" and round 10 found a
+    // third the same day; the lesson is the alias arm's, so this list
+    // claims only its own history: (1) indirection — a script, make
+    // target, or composite action that runs cargo out of the walk's
+    // sight; (2) a command assembled from YAML anchors or `${{ }}`
+    // expressions; (3) a command glued into one token by a YAML escape
+    // this scan does not un-glue (it un-glues `\t`, `\n`, `\r`; a
+    // ` ` form would survive). All three are STATED in the header.
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     let workflows = repo.join(".github").join("workflows");
     let excluding = ["--all-targets", "--lib", "--tests", "--bins", "--test"];
@@ -615,19 +627,29 @@ fn no_gate_builds_doctests() {
         }
         let text = std::fs::read_to_string(&path).expect("read workflow");
         for (number, line) in text.lines().enumerate() {
-            let unquoted = line.replace(['"', '\'', '{', '}', ','], " ");
+            let trimmed = line.trim_start();
+            let key = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
+            // A YAML comment and the `name:`/`if:` keys never reach a shell,
+            // so scanning them only manufactures false friction. Skipped only
+            // when the line carries no `run:` of its own — a flow mapping
+            // (`- {name: x, run: cargo test}`) must not hide behind the key.
+            if trimmed.starts_with('#')
+                || ((key.starts_with("name:") || key.starts_with("if:")) && !line.contains("run:"))
+            {
+                continue;
+            }
+            let unquoted = line
+                .replace("\\t", " ")
+                .replace("\\n", " ")
+                .replace("\\r", " ")
+                .replace(['"', '\'', '{', '}', ','], " ");
             for segment in unquoted
                 .replace("&&", "\n")
                 .replace("||", "\n")
-                .replace([';', '|'], "\n")
+                .replace([';', '|', '&'], "\n")
                 .lines()
             {
                 let tokens: Vec<&str> = segment.split_whitespace().filter(|t| *t != "\\").collect();
-                let Some(cargo_at) = tokens.iter().position(|t| *t == "cargo") else {
-                    continue;
-                };
-                let after = &tokens[cargo_at + 1..];
-                let dashdash = after.iter().position(|t| *t == "--").unwrap_or(after.len());
                 let mut report = |what: &str| {
                     offenders.push(format!(
                         "{}:{}: [{what}] {}",
@@ -636,21 +658,53 @@ fn no_gate_builds_doctests() {
                         segment.trim()
                     ));
                 };
-                let Some(subcommand) = after[..dashdash]
-                    .iter()
-                    .find(|t| !t.starts_with('-') && !t.starts_with('$'))
-                else {
-                    report("cargo invocation does not resolve on one line");
-                    continue;
-                };
-                if *subcommand != "test" && *subcommand != "t" {
-                    continue;
-                }
-                invocations += 1;
-                if after.contains(&"--doc") {
-                    report("--doc builds the doctest lane");
-                } else if !after[..dashdash].iter().any(|t| excluding.contains(t)) {
-                    report("no doctest-excluding target selector before `--`");
+                for (index, token) in tokens.iter().enumerate() {
+                    // EVERY cargo in the segment is judged, and cargo spelled
+                    // as a path counts (round 10: `/usr/bin/cargo test --doc`
+                    // never matched a bare-token test).
+                    let names_cargo = *token == "cargo"
+                        || *token == "cargo.exe"
+                        || token.ends_with("/cargo")
+                        || token.ends_with("\\cargo")
+                        || token.ends_with("/cargo.exe")
+                        || token.ends_with("\\cargo.exe");
+                    if !names_cargo {
+                        continue;
+                    }
+                    let after = &tokens[index + 1..];
+                    let dashdash = after.iter().position(|t| *t == "--").unwrap_or(after.len());
+                    let head = &after[..dashdash];
+                    // Fail-closed, unchanged in spirit: a cargo that names no
+                    // plain word at all — every line-spanning wrap — is an
+                    // offense, not a skip.
+                    if !head
+                        .iter()
+                        .any(|t| !t.starts_with('-') && !t.starts_with('+') && !t.starts_with('$'))
+                    {
+                        report("cargo invocation does not resolve on one line");
+                        continue;
+                    }
+                    // Round 10 deleted the subcommand FINDER. Cargo accepts a
+                    // `+toolchain` override and space-separated global option
+                    // values (`--color always`, `--config k=v`, `-Z x`) before
+                    // its subcommand, so "the first plain word after cargo" was
+                    // `+nightly`/`always`/`k=v` — a non-subcommand that made the
+                    // walk skip a live `cargo +nightly test --doc` in silence.
+                    // Every rule for stepping over those prefixes is one more
+                    // thing to be wrong about, so the walk stopped asking WHICH
+                    // token is the subcommand and asks the only question it
+                    // needs: does a test-ish token appear before the bare `--`?
+                    // (`--tests` is a distinct token, so a sibling
+                    // `cargo build --tests` still does not count.)
+                    if !head.contains(&"test") && !head.contains(&"t") {
+                        continue;
+                    }
+                    invocations += 1;
+                    if after.contains(&"--doc") {
+                        report("--doc builds the doctest lane");
+                    } else if !head.iter().any(|t| excluding.contains(t)) {
+                        report("no doctest-excluding target selector before `--`");
+                    }
                 }
             }
         }
@@ -662,10 +716,16 @@ fn no_gate_builds_doctests() {
          exemption tolerates):\n{}",
         offenders.join("\n")
     );
-    assert!(
-        invocations >= 5,
-        "only {invocations} `cargo test` invocations found across the CI \
-         workflows — the gate walk is broken or CI moved; update this test \
-         with the workflows"
+    // Round 10: the count is PINNED, not floored. A floor is exactly how a
+    // silently-added doctest gate hid twice — round 9's flow mapping and
+    // round 10's `+toolchain` shape both left the count at 7 while adding a
+    // live invocation, so `>= 5` could never have told anyone. Seven is what
+    // the walk observes on this tree; a gate added, removed, or reworded
+    // moves it and updates this pin in the same deliberate change.
+    assert_eq!(
+        invocations, 7,
+        "the CI workflows hold seven `cargo test` invocations; this walk saw \
+         {invocations}. A gate was added, removed, or reworded (or the walk \
+         broke) — reconcile the two deliberately, never by loosening this pin"
     );
 }
