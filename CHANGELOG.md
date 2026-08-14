@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.6.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.5.0...v10.6.0) (2026-08-14)
+
+
+### Features
+
+* **feature-020:** Slice 3 PR 3 — dark runtime, wrap table, AAP receipt, and call-edge proof ([#578](https://github.com/special-place-ai-heaven/symforge/issues/578)) ([6d1c58d](https://github.com/special-place-ai-heaven/symforge/commit/6d1c58df731910b6e8ee6c5a61a5d01f9e3be8ae))
+
 ## [10.5.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.4.1...v10.5.0) (2026-08-14)
 
 
