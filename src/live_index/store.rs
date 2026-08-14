@@ -1302,8 +1302,8 @@ pub struct PreUpdateSymbol {
 /// index, then atomically publish derived state. A failed mutation is simply discarded —
 /// readers never observe a partially-mutated index.
 ///
-/// `published_state`, `published_repo_outline`, and `git_temporal` also use `ArcSwap`
-/// for contention-free reads (previously `RwLock<Arc<T>>`).
+/// `published_state` and `git_temporal` also use `ArcSwap` for contention-free
+/// reads (previously `RwLock<Arc<T>>`).
 pub struct SharedIndexHandle {
     live: ArcSwap<LiveIndex>,
     published_source_set: ArcSwap<PublishedSourceSet>,
@@ -1326,7 +1326,6 @@ pub struct SharedIndexHandle {
     /// sidecar's per-file baseline cache out of order.
     impact_mutex: tokio::sync::Mutex<()>,
     published_state: ArcSwap<PublishedIndexState>,
-    published_repo_outline: ArcSwap<RepoOutlineView>,
     /// Publish-versioning counter for `PublishedIndexState`; bumped on every publish.
     next_generation: AtomicU64,
     /// Project-identity counter for fencing stale watcher mutations; bumped only on reload.
@@ -1521,7 +1520,6 @@ impl SharedIndexHandle {
             write_mutex: Mutex::new(()),
             impact_mutex: tokio::sync::Mutex::new(()),
             published_state: ArcSwap::new(published_state),
-            published_repo_outline: ArcSwap::new(published_repo_outline),
             next_generation: AtomicU64::new(1),
             project_generation: AtomicU64::new(0),
             last_reset_project_generation: AtomicU64::new(0),
@@ -2066,9 +2064,14 @@ impl SharedIndexHandle {
     pub(crate) fn terminal_dispositions(
         &self,
     ) -> Arc<Vec<(String, crate::domain::FileDisposition)>> {
+        // T046: re-rooted on the published bundle. This was the ONLY lock-free
+        // reader of the raw `live` field, which `swap_and_publish` stores four
+        // lines before `published_source_set` — so a caller pairing this with
+        // any bundle-derived accessor could see new content against the old
+        // publication. Off the bundle, the pair is coherent by construction.
         Arc::new(
-            self.live
-                .load_full()
+            self.published_generation()
+                .live
                 .manifest_entries
                 .iter()
                 .map(|entry| {
@@ -3308,7 +3311,6 @@ impl SharedIndexHandle {
         self.live.store(live);
         after_live_swap();
         self.published_state.store(published_state);
-        self.published_repo_outline.store(published_repo_outline);
         self.published_source_set.store(published_source_set);
     }
 

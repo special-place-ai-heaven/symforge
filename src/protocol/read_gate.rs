@@ -17,12 +17,81 @@
 //! `file_at_ref` reads beside it stayed ungated, disclosing a demoted file's
 //! symbol names and signatures out of git objects. Policy and classification
 //! are shared by both lanes precisely so the next store added cannot repeat it.
+//!
+//! **T044 — the authority CHOICE is explicit.** Serving bytes the generation
+//! PUBLISHED and observing what is on disk RIGHT NOW are different claims with
+//! different scopes, and before this split the choice between them was implicit
+//! in which function a lane reached for: a lane meaning to serve generation
+//! content could take an index miss and silently backfill from disk. The two
+//! lanes are now named — [`resolve_generation_bytes`], which NEVER touches
+//! disk, and [`observe_disk_beneath`], which always does, confined beneath the
+//! workspace root — so a caller states which authority its answer rides on.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::domain::{FileDisposition, IndexTargets, LanguageId, MetadataOnlyReason};
 use crate::live_index::LiveIndex;
 use crate::protocol::format;
+
+/// What the generation has to say about one path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GenerationResolution<'a> {
+    /// The bytes the generation PUBLISHED for this path — index-resident,
+    /// served with zero disk I/O, exactly as `IndexedFile.content` promises.
+    Published(&'a [u8]),
+    /// The generation holds no content for this path. A miss, and ONLY a
+    /// miss: it is never permission to observe the disk. The caller that
+    /// wants current disk bytes says so by calling [`observe_disk_beneath`].
+    NotInGeneration,
+}
+
+/// Resolve the bytes the generation published for `relative_path`.
+///
+/// This function cannot read the disk — it has no path to it. A generation
+/// miss surfaces as [`GenerationResolution::NotInGeneration`] so the
+/// authority choice lands on the caller, in the open.
+pub fn resolve_generation_bytes<'a>(
+    live: &'a LiveIndex,
+    relative_path: &str,
+) -> GenerationResolution<'a> {
+    match live.get_file(relative_path) {
+        Some(file) => GenerationResolution::Published(&file.content),
+        None => GenerationResolution::NotInGeneration,
+    }
+}
+
+/// Deliberately observe `relative_path` on disk RIGHT NOW, confined beneath
+/// `workspace_root`, admitted by the same policy and classification as every
+/// other content read.
+///
+/// Confinement is lexical and refuses BEFORE any read: an absolute path, a
+/// drive or root prefix, or any `..` component is an escape however it is
+/// spelled, and the refusal never carries the escaped content.
+// ponytail: lexical confinement only — a symlink beneath the root that points
+// outside it is governed by the crate's existing never-follow walk policy, not
+// re-checked here; canonicalize-and-compare is the upgrade path if that policy
+// ever changes.
+pub fn observe_disk_beneath(
+    live: &LiveIndex,
+    workspace_root: &Path,
+    relative_path: &str,
+) -> Result<Vec<u8>, String> {
+    let candidate = Path::new(relative_path);
+    let escapes = candidate.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
+    if escapes || candidate.is_absolute() {
+        return Err(format!(
+            "{relative_path} [error: path escapes the workspace root; a disk \
+             observation is confined beneath it]"
+        ));
+    }
+    let full_path = workspace_root.join(candidate);
+    admit_disk_read(live, relative_path, &full_path)
+}
 
 /// Working-tree text for `relative_path`, admitted by [`admit_disk_read`].
 ///

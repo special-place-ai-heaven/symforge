@@ -1,5 +1,151 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## T045 — the lanes and the measured envelope (PR 2)
+
+**Batch one** routed the three disk lanes through `observe_disk_beneath` and
+closed D8 by routing `detect_impact`'s base seed through `admit_git_text`,
+deleting the tripwire's sentinel allowlist outright. The `writers` drift was
+OBSERVED, not assumed: the checker was run after the first `tools.rs` edit and
+reported `RETIREMENT_CLOSURE_MISMATCH` for `writers` and for `writers` alone.
+
+**Batch two — the forgeable envelope axis.** `format_search_envelope` collapsed
+to the compact `Trust:` banner on `source_authority == "current index"` — a
+string equality any caller could satisfy by assertion. Two lanes did exactly
+that: the context bundle passed the literal whenever it had not disk-refreshed,
+and `what_changed`'s Timestamp arm passed it unconditionally — both collapsing
+the envelope while the index could be Verifying or Degraded. The second lane
+was found by the COMPILER during the migration, not by the census.
+
+The collapse now rides on `SourceAuthority`, a type honest by construction:
+`from_freshness` is the only constructor that can produce a collapsible value
+and it takes the index's measured `FreshnessStatus`; `never_collapse` covers
+disk-refreshed, composite, and git authorities whose labels are display only.
+A lying literal is UNREPRESENTABLE — no constructor accepts a caller-chosen
+string and marks it collapsible. Behavior is byte-identical for measured
+Current and for every already-loud lane; the sanctioned change is that the two
+asserting lanes now go loud with the honest label when freshness is not
+Current. Composite labels keep their existing text, including the recorded
+wart that they say "current" unconditionally — a text change was not in scope.
+
+Mutation M13 flipped the Degraded arm to collapsible and was caught by
+`a_measured_degraded_authority_never_collapses_however_clean_the_rest_is`
+alone, then restored. Twelve mutations across the slice: eleven caught by
+name, one survivor that forced its oracle, one guard proven structural.
+
+**D16 — `ProjectEvidence` and the structured `_meta` surface stay untyped in
+this PR, deliberately.** The MCP `_meta` object already carries an untyped
+provenance record with `generation` / `load_source` / `index_state`. Replacing
+it with `Claim`/`ClaimProvenance` is a client-visible schema change, not a
+read-gate migration, and no frozen atom requires it preactivation. Recorded
+here next to D12/D13 as T048/structured-activation work: the competitor is
+untyped strings versus the provenance types, and the swap belongs to the
+activation surface, not to T045's task-text word "structured".
+
+Gates on the batch-two tree: lib suite 3166 passed 0 failed including the new
+envelope oracle; clippy all targets denied warnings clean; embed 1332 passed
+0 failed; fmt clean. At the time batch two landed, the checker reported the
+expected `writers`-only mismatch; the regeneration has since HAPPENED — the
+T046 section's before/after table is the truth, and the pins are clean.
+
+## T046 — per-caller single capture, and the one regeneration (PR 2)
+
+Every approved site now takes ONE `published_generation()` capture at entry and
+reads every axis — live rows, freshness, health counts, temporal, outline —
+off that capture, which is possible because every accessor already resolves
+through the bundle; the defect was per-call re-loading, not field scatter.
+
+Migrated: `health_for_runtime` and `health_compact_for_runtime` (four loads
+each → one), daemon `project_health` (freshness now describes the same
+publication as the counts beside it), the daemon call-evidence block and
+`local_project_evidence` (generation number, load_source, counts, and state
+all off `current_generation()`; the atomic counter is no longer a side
+channel — including `runtime_status_for`, whose reported project-generation
+is now a caller-supplied parameter: the health pair passes its captured
+bundle's value, and the two capture-less callers pass the atomic EXPLICITLY,
+named at the site), `search_symbols`, `search_text` (handler + renderer share the
+caller's capture through a new parameter), `search_files` (13 loads → 1),
+`find_references` (11 → 1), `append_impact_footer`, `edit_plan`, and
+`analyze_file_impact`, whose capture is taken BEFORE the sidecar await so the
+co-change footer describes a publication the impact result actually saw.
+`terminal_dispositions` was re-rooted from the raw `live` field onto the
+bundle, closing the store-order window where new content could pair with the
+old publication. The write-only `published_repo_outline` ArcSwap field was
+deleted after re-verifying zero loads on the current HEAD; the accessor and
+both its tests read the bundle and keep working.
+
+Left alone, by prior agreement: the read-MUTATE-read publish paths, watcher
+reconcile, Tier-3 mutex-held store functions, `what_changed` — same class as
+the search tools, recorded as OUT of this PR rather than silently expanded —
+and the `scout_plan` / `source_exclusions` / `project_state_dir` ArcSwaps,
+which the bundle has no fields for.
+
+Behavior neutrality: the full library suite passed 3166 to 0 with ZERO test
+adjustments — the RISK-B worry that tests pinned torn interleavings did not
+materialize, and the Slice-0 root-split oracle got strictly stronger and
+stayed green.
+
+**The one regeneration — prediction versus measurement.** The PR 2
+first-commit decision predicted FIVE categories dirty. Measured at the end:
+FOUR moved, `ccr` byte-identical, because CCR was trimmed out of T045 batch
+two by review. The regen updates exactly the four that moved:
+
+| category | before | first regen | after re-crank (HEAD) |
+|---|---|---|---|
+| writers | `5137cd7b…3af7dd` | `bafa517a…daeee1` | `565e4227…bf3e31` |
+| callbacks | `48938137…97e8b22` | `026c548b…fe577b` | unchanged |
+| publication_roots | `e37555ad…61e82d` | `b90b8d88…190b54` | unchanged |
+| cache | `4eb220e8…5c18a38` | `6fb4cace…14fa095` | unchanged |
+| ccr | `8ad77748…84ad246` | UNCHANGED | unchanged |
+
+The checker's own second-order pin (`FROZEN_DIGESTS.retirement_records`) was
+regenerated through its emit opt-in the same way: `4c118fab…76a6fb` →
+`313dceda…9c21bf` at the first regen, → `d86bd17b…e5ce29` after the
+re-crank. Checker reports OK after each.
+
+**Correction, on review.** The re-crank commit's message claimed "the
+evidence table now carries the final writers value" while touching only the
+contract and the checker — the table had NOT been updated, which is the same
+reporting class as a stale pin: the thing that reported was not the thing
+that knew. This row-level history is the repair, added as a docs-only commit
+after the full suite went green on the re-cranked tree, so the receipt and
+the table describe the same HEAD.
+
+## T044 — the authority choice is explicit (PR 2)
+
+Observed RED first: both oracles failed `E0432` naming exactly the three new
+seam items and nothing else. Then the seam, in `src/protocol/read_gate.rs`,
+on the policy/bytes/git/disk split #571 carved:
+
+- `resolve_generation_bytes` — serves `IndexedFile.content`, the bytes the
+  generation PUBLISHED. **The defect it exists to prevent is structurally
+  unrepresentable in it**: the function takes no workspace root, so an
+  in-function disk backfill cannot even locate a file, and its return borrows
+  from the index, so owned disk bytes cannot be returned without a deliberate
+  leak. This is recorded INSTEAD of a mutation for the never-reads-disk
+  guard, because the only writable mutant is one whose `fs::read` cannot find
+  the fixture and therefore survives for reasons unrelated to the property —
+  a theatrical mutant would be evidence-shaped noise. The oracle still pins
+  the behavior: published bytes survive a disk rewrite, and an unindexed
+  file resolves `NotInGeneration`, never disk content.
+- `observe_disk_beneath` — the deliberate lane, lexically confined beneath
+  the workspace root, refusing absolute paths, prefixes, and `..` components
+  BEFORE any read; the refusal never carries escaped content. Symlink policy
+  deliberately remains the crate's existing never-follow walk; the ceiling
+  and upgrade path are marked in the code.
+- Both re-exported through `claim_provenance` the same way as the identities,
+  because `read_gate` is crate-private and the oracles are a separate crate.
+  No `protocol/mod.rs` edit; no census atom.
+
+Mutation M12 — confinement disabled — caught by
+`a_disk_observation_is_confined_beneath_its_root` alone, restored. Eleven
+mutations across the slice so far: ten caught by name, one survivor that
+forced a new oracle, plus one guard proven structural rather than mutated.
+
+Gates on the T044 tree: oracle files 36 passed 0 failed; clippy all targets
+denied warnings clean; embed 1332 passed 0 failed; fmt clean; traceability
+OK; all five closure digests byte-identical — T044 touched only uncensused
+files, per the PR 2 first-commit decision.
+
 Living document for the slice; T052 completes it. Every claim here was observed,
 not inferred. Where a command is cited, it was run on the named tree.
 

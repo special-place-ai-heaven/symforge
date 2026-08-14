@@ -215,6 +215,48 @@ Consequences the plan binds:
   UNCENSUSED parent — see the PR 1 section. Add the `mod` line to
   `src/protocol/mod.rs` and PR 1 moves `publication_roots`.
 
+## PR 2 FIRST-COMMIT DECISION — five digests regenerate, not four
+
+Made here, before any PR 2 code, per the rule that a digest regeneration is a
+deliberate act and never a gate-time discovery. Grounds are the two recon
+censuses, both verified against code at the time they ran:
+
+**The answer is FIVE.** T046's read-site migration necessarily spills beyond
+`store.rs` into `src/daemon.rs`, `src/watcher/mod.rs`, `src/live_index/persist.rs`,
+and `src/live_index/git_temporal.rs` — all four inside the `callbacks` closure
+path list — because the torn readers live at the call sites, not in the store.
+The Tier-1 torn readers alone (`health_for_runtime`, `health_compact_for_runtime`,
+`DaemonState::project_health`, the search-tool trust banners) span `tools.rs`
+and `daemon.rs`. So `callbacks` moves along with `writers`, `cache`, `ccr`, and
+`publication_roots`. All five regenerate ONCE, at the end of PR 2, each with
+before/after digests recorded in the evidence document.
+
+Scope resolutions bound with the decision:
+
+1. **T045 is bounded to `src/protocol/` by its own task text**, which resolves
+   the one unresolvable lane name: "persistence" means the protocol-side
+   persistence surfaces — the embedded cache payload rendering and the session
+   read-cache — NOT `src/live_index/persist.rs`, which is index persistence and
+   Slice 4 writer-migration territory.
+2. **T046's named file is wrong and the correction is recorded**: `tasks.md:923`
+   says `src/live_index/view.rs`, which contains zero of the nine `ArcSwap`
+   fields and zero reads of them — it is the Feature-012 base+overlay spike.
+   The work lands in `store.rs` and the reader call sites. The frozen tasks
+   file is NOT edited; this paragraph is the record.
+3. **Five of the nine fields are already consolidated** behind
+   `published_source_set` on the public read surface. The residual defect is
+   HOW MANY TIMES one caller loads the set, so T046 is per-caller
+   single-capture, not a field migration.
+4. **`published_repo_outline` is write-only dead state** — stored on every
+   publish, loaded nowhere. T046 deletes it outright.
+5. **`terminal_dispositions()` ordering hazard**: the only lock-free reader of
+   the raw `live` field, which `swap_and_publish` stores four lines BEFORE
+   `published_source_set` — a caller pairing the two can see new content
+   against the old publication. T046 re-roots it on the captured set.
+6. **The read-MUTATE-read sites are exclusions, not candidates** — the
+   before/after samples enumerated in the recon findings doc stay untouched,
+   listed in the evidence with the reason.
+
 ## Two risks, both now measured rather than assumed
 
 **RISK-A — cache identity under T045. SETTLED, and it is benign.**

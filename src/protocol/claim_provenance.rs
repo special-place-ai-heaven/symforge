@@ -41,6 +41,14 @@ pub use crate::lifecycle_identity::{
     ProvenanceIdentity, WorktreeScanId,
 };
 
+// T044's explicit authority choice, re-exported the same way and for the same
+// reason as the identities: `read_gate` is a crate-private module, and the
+// Slice 3 oracles are a separate crate that must SEE the seam to pin it. A
+// `pub use` outside `src/embed.rs` adds no public-API census atom.
+pub use crate::protocol::read_gate::{
+    GenerationResolution, observe_disk_beneath, resolve_generation_bytes,
+};
+
 // ── Operations ─────────────────────────────────────────────────────────────
 
 /// The closed operation vocabulary, VERBATIM from the frozen contract:

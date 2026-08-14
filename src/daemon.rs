@@ -1403,7 +1403,11 @@ impl DaemonState {
     pub fn project_health(&self, project_id: &str) -> Option<ProjectHealth> {
         let slot = self.projects.read().get(project_id).cloned()?;
         let project = slot.metadata.read();
-        let published = project.index.published_state();
+        // T046: one capture — the freshness verdict below describes the SAME
+        // publication as the counts it is printed beside, not one from a
+        // separate load 50 lines later.
+        let generation = project.index.published_generation();
+        let published = std::sync::Arc::clone(&generation.health);
         let durability = *project.persistence_health.read();
         let durable_mutation = match durability {
             CapabilityStatus::Available => CapabilityStatus::Available,
@@ -1456,7 +1460,7 @@ impl DaemonState {
             file_count: published.file_count,
             symbol_count: published.symbol_count,
             index_state: published.status_label().to_string(),
-            freshness: project.index.freshness_status().as_ref().clone(),
+            freshness: generation.freshness.as_ref().clone(),
             durability,
             capabilities: ProjectCapabilities {
                 persistent_snapshots: durability,
@@ -4119,7 +4123,11 @@ async fn call_tool_handler(
     // header so the human-readable body stays byte-identical; the adapter
     // parses it into the typed receipt and attaches it to `_meta`.
     let call_evidence_json = {
-        let published = runtime.index.published_state();
+        // T046: one capture. `generation`, `load_source`, the counts, and
+        // `index_state` all come off the SAME published bundle — the atomic
+        // project-generation counter is not consulted, so the evidence cannot
+        // pair a newer generation number with an older publication's counts.
+        let generation = runtime.index.published_generation();
         serde_json::to_string(&crate::protocol::result_status::ProjectEvidence {
             project_id: runtime.project_id.clone(),
             project_name: runtime
@@ -4129,11 +4137,11 @@ async fn call_tool_handler(
                 .unwrap_or("project")
                 .to_string(),
             canonical_root: Some(normalized_path_string(&runtime.canonical_root)),
-            generation: runtime.index.current_project_generation(),
-            index_state: published.status_label().to_string(),
-            load_source: runtime.index.read().load_source().label().to_string(),
-            index_files: published.file_count,
-            index_symbols: published.symbol_count,
+            generation: generation.project_generation,
+            index_state: generation.health.status_label().to_string(),
+            load_source: generation.live.load_source().label().to_string(),
+            index_files: generation.health.file_count,
+            index_symbols: generation.health.symbol_count,
         })
         .ok()
     };
