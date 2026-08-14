@@ -1,5 +1,71 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-11 review and its repairs (PR 3)
+
+Round 11 attacked the round-10 repairs: **0 blockers, 4 confirmed
+majors, 5 confirmed minors, 1 refuted, 2 notes**. Every major landed on
+the gate walk, for the fourth round running, and the pattern is now the
+finding: a scan that must MODEL the shell's word rules to locate the
+command keeps losing to the shell. So the walk was deleted.
+
+- **MAJOR — `cargo rustdoc -- --test` cleared the walk.** It puts
+  `rustdoc` before the bare `--` and `--test` after it, so the head held
+  a plain word (no offense), contained neither `test` nor `t` (not an
+  invocation), and `--doc` never appeared. Liveness was proven with a
+  marker-writing doctest: it compiles the doctest lane, RUNS it, and
+  fails the step on failure — a real gate. Worse, appended in place to
+  the existing gate line it measured byte-identical to clean HEAD, so
+  the round-10 count pin gave no backstop either.
+- **MAJOR — the tokenizer's word model was not the shell's.** Quote
+  erasure SPLITS words the shell JOINS: `cargo te"st" --doc` tokenized
+  as `te`/`st`, and `car"go" test --doc` split the cargo token itself so
+  nothing matched at all. In the other direction, shell grouping GLUED
+  tokens the walk needed whole — `X=$(cargo test --doc)` and
+  `(cargo test --doc)` were invisible. All four are valid YAML, all four
+  ran the doctest lane under bash, all four measured green.
+- **MAJOR — my own round-10 line-skip hid an executing gate.** I added
+  a `name:`/`if:`/`#` skip to reduce friction a *note* complained about.
+  The test is key-shaped but ran on every physical line, including shell
+  content inside a `run: |` block, where `if:` is a legal bash function
+  name: `if:() { cargo test --doc; }` measured 7/0 under the new walk
+  and 8/1 under the old one. I traded away over-flagging for tidiness
+  and it cost exactly what this file keeps saying it costs.
+- **Repair — the walk is gone; the lines are pinned.** Every line of
+  every workflow that mentions cargo, case-insensitively, must appear
+  VERBATIM in a `CARGO_LINES` allowlist (30 lines, 26 distinct, across 2
+  files — all three counts bound), grouped by why each cannot build
+  doctests: prose and configuration, commands with no test harness, and
+  the seven test gates with their selectors. There is no word model left
+  to be wrong about — an unrecognized cargo line fails whatever it says,
+  in any quoting, grouping, or subcommand. A second, orthogonal check
+  rejects any allowlist entry naming `--doc` or `rustdoc`, so a careless
+  addition still trips. Residuals are now the two no line-based scan can
+  reach: a gate with no `cargo` on the line at all, and a
+  `.cargo/config.toml` `[alias]` re-pointing an allowlisted line.
+- **MINOR ×5, all prose, all mine.** The "quoting cannot hide a command"
+  absolute survived unamended in the doc; the retired universal alias
+  claim survived in a third place my round-10 sweep missed because the
+  phrase wraps across two lines; the in-test rule summary still
+  described the subcommand finder deleted twelve lines below it; "the
+  shape every line-spanning wrap produces" was a universal a wrap
+  keeping `cargo test` intact falsifies; and the residual-3 exemplar had
+  lost its backslash in both places, leaving "a ` ` form would survive"
+  — an example that named nothing. All are moot or amended.
+- **REFUTED:** "`--test-threads` and `--tests` satisfy neither test" —
+  the reviewer read a contradiction with the selector allow-list;
+  adjudicated not-real.
+
+## Gate results for the round-11 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; dual counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| gate pin | (30, 26, 2) observed — total lines, distinct lines, workflow files |
+| mutations | M54a (`cargo rustdoc -- --test`), M54b (quote-split word), M54c (`$(...)` grouping), M54d (`if:()` shell function), M54e (selector dropped from a real gate), M54f (gate line deleted), M54g (careless allowlist addition, caught by the orthogonal check) each observed caught; M53a/M53i and M52a re-observed caught under the pin; all restored |
+
 ## Round-10 review and its repairs (PR 3)
 
 Round 10 attacked the round-9 repairs: **0 blockers, 2 confirmed majors,
@@ -52,12 +118,18 @@ findings are errors in prose I had written one commit earlier.
 - **REFUTED:** "macro-token indirection defeats both the `include!` and
   `#[path]` arms on single physical lines, with no `concat!`."
   Adjudicated not-real.
-- **Notes accepted as friction, not defects:** the scan can flag
+- **Notes accepted as friction, not defects** (two of the four; the
+  other two were the count-vs-list mismatch and a mislabelled scan
+  count, both folded into the minors above): the scan can flag
   non-command lines (step names, `if:` expressions, YAML comments) — now
   narrowed by skipping those non-executing keys — and the `useinclude`
   opener can flag an English word ending in "-use" adjacent to
   "include" inside a string. Over-flagging forces a human decision,
-  which is the friction this file is built on.
+  which is the friction this file is built on. [Amended after round 11:
+  that narrowing was a MISTAKE and is gone. The key-shaped skip ran on
+  shell content inside `run: |` blocks too, where `if:()` is a legal
+  bash function name, and it hid a live doctest gate. Trading
+  over-flagging for tidiness is the one trade this file must not make.]
 
 ## Gate results for the round-10 repair chunk
 
@@ -122,7 +194,12 @@ the gate pin's parsing approach outright.
   cannot hide a command), splits compound commands into segments, and
   treats a `cargo` segment with no resolvable subcommand — the shape
   every line-spanning wrap produces — as an OFFENSE rather than a skip.
-  It refuses to guess and says so. Observed: still exactly 7 invocations
+  It refuses to guess and says so. [Amended after round 11: both
+  parentheticals are FALSE. Quoting INSIDE a word (`cargo te"st" --doc`)
+  made the erasure split a word the shell joins, hiding the command; and
+  "the shape every line-spanning wrap produces" was a universal that a
+  wrap keeping `cargo test` intact falsifies. The whole scan was
+  replaced in round 11 — see that section.] Observed: still exactly 7 invocations
   on the real workflows; mutations **M52a–M52f** (double-quoted,
   single-quoted, flow mapping, dash-space, `cargo t`, plain multi-line
   scalar) each observed caught, and all five round-8 controls
@@ -399,7 +476,12 @@ survive adjudication.
   deliberate widenings (end-of-line, non-ASCII, `as`-prefixed identifiers
   — all over-flag only); "every resolvable alias-creation site must
   write" is qualified to SINGLE-LINE sites, with the split declaration
-  named as the header's stated residual.
+  named as the header's stated residual. [Amended after round 11 — the
+  third and last instance of this universal, missed by round 10's sweep
+  because the phrase wraps across two lines: qualifying it to
+  single-line sites did not save it. `use include as mount;` is one
+  physical line and writes no path segment at all. The arm enumerates
+  four openers and claims the enumeration, not the universe.]
 
 ## Gate results for the round-6 repair chunk
 
