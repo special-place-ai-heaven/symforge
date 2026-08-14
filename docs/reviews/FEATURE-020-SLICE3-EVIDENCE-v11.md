@@ -1,5 +1,119 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-1 adversarial review and its repairs (PR 3)
+
+Five refute-stance reviewers over the five PR-3 commits, every
+blocker/major independently re-verified: **18 confirmed (1 blocker, 17
+major), 0 refuted, 20 minor/note, no dimension clean** — all in territory
+the machine gates structurally could not see. Full verbatim record:
+`docs/reviews/REVIEW-FINDINGS-claude-fable-slice3-pr3-2026-08-14.md`. The
+repairs landed as one commit under the operator's per-finding rulings; the
+dispositions in brief:
+
+- **C1 (blocker), fixed:** `ServerBootstrapError` was a public enum; the
+  frozen contract pins an OPAQUE STRUCT. The third T043-class invention in
+  `server_api.rs` alone — and the shape of the miss matters: the trait-level
+  oracles all passed, because item kind and constructability are invisible
+  to them. Corrected to a private-field struct; the item kind is now pinned
+  by a source assertion whose needles are built at runtime so the pin
+  cannot match its own string literals.
+- **C2, fixed; D4 AMENDED by ruling:** `server_api` gains
+  `#[cfg(feature = "server")]` — the frozen contract pins its availability
+  `feature=server` and the embed-v11 projection excludes it, so "activation
+  is one keyword" is now TRUE because the gate is already present. D4's
+  "std-only so the embed build compiles it unused" sentence is amended;
+  every "one keyword, ungated" claim rewritten (module doc, lib.rs, delta
+  renderer + regenerated JSON, sweep pin comment). Embed lib gate drops to
+  1332 accordingly — the module and its tests correctly shed.
+- **C3, recorded + gated:** the full public-member and derive superset is
+  in the receipt's divergence register as the activation trim list; every
+  `*_for_test` probe now carries `#[cfg(any(test, feature = "server"))]`.
+  Deviation, stated: the ruling said `cfg(test)`, which is not compilable —
+  the Slice 3 oracles live in `tests/`, an external crate built without
+  the lib's `test` cfg — so the `server` disjunct keeps the oracles
+  building while the embed build sheds every probe. Consequence found by
+  the embed check and fixed: `GenerationIdentity`'s import in `runtime.rs`
+  became probe-only and is gated with them (the CLAUDE.md embed-gate
+  unused-import class, caught before commit this time).
+- **C4, fixed + oracle:** a closed handle's `runtime_view` reports
+  `Stopped` from the flag the handle owns, never `Loading`; asserted both
+  ways in the boundary oracle.
+- **C5, fixed per ruling (rename, do not hash):**
+  `OperationReceipt::for_dark_refusal(kind)` replaces `for_test` on every
+  production-shaped refusal lane; the canonical hash covers the kind alone
+  because hashing arguments the lane never examined would claim a binding
+  that did not happen — recorded in the receipt's register. The runtime's
+  refusal helper also threads the ACTUAL operation kind per call site
+  (grant refusals say RefreshSource, not AcquireRuntime).
+- **C7, fixed with the ruled third word + one real wrap:**
+  `verbatim-reexport` covers exactly the three contract-verbatim enums, and
+  the delta oracle verifies the actual `pub use` in the module source —
+  never the table's self-report. `SourceRuntimePhase` was NOT that word: a
+  public field typed `runtime::SourceRuntimePhase` was a D12 path-identity
+  leak, so the boundary now owns its own six-variant enum and the view uses
+  it.
+- **C8/C9/C10, sweeps hardened:** the comment rule is string-aware (a `//`
+  inside a string literal no longer launders a call edge; the conservative
+  char-literal misparse can only FLAG, never hide); every `include!` and
+  `#[path]` in `src/` is on an exact fail-closed allowlist with the
+  concat-splice residual STATED in the file header instead of the old
+  "real call edges cannot pass" overclaim; the `server_api` sweep now
+  covers the dark directory with its seven wrap-table string lines
+  allowlisted individually, so a real dark→stub call edge cannot hide
+  behind a directory exemption.
+- **C11, rewritten:** the vacuous post-grant `Refreshing` assert became
+  `permit_grant_is_itself_a_publication` — the grant must move the
+  publication root to a fresh identity, which a side-band-state-only grant
+  fails; the before-side-effects half is stated as unobservable until
+  Slice 4's real side-effect lane exists.
+- **C13, accepting pair added:** a second `begin_close` joins the terminal
+  source and its report says `already_terminal == true`.
+- **C14, fixed twice honestly:** the renderer now PERFORMS the exact-match
+  subtraction it claims (`introduced_minus_live`, all 64 today) — a first
+  repair keyed it on the top-level module and wrongly subtracted all 60
+  embed item atoms because V10's `pub mod embed` exists; caught by reading
+  the regen diff, corrected, and pinned by an independent recomputation in
+  the oracle. The write-mode tautology is dead: a regeneration run asserts
+  against the PRE-write content, so it fails while repairing and the
+  opt-in-free rerun verifies.
+- **C6/C12/C15/C16/C17/C18, harness honesty:** `--check` exits nonzero on
+  any unmet gated expectation; diagnostics are `package_id`-attributed so a
+  dependency error cannot masquerade as a case result; nine closed
+  NEGATIVE cfg sentinels complement the positive six (M27 observed
+  caught); worktree cleanliness is recorded and check-gated; recorded
+  paths are sanitized; the machine artifact is committed as
+  `docs/reviews/AAP-MIGRATION-RECEIPT-v11.json` with its executable
+  `rerun_command` inside it.
+
+**Minors triage (after the majors, not instead):** fixed in this chunk —
+the census-parser whitespace divergence (both legs now split-whitespace
+tolerant), contract-normative parameter names (`request`, `deadline` — the
+underscore prefixes were rustdoc-visible name changes), the
+write-then-compare tautology, the runtime refusal kinds, and the E0425
+citation in the receipt (now cited from the artifact, not asserted).
+Recorded, deliberately not changed: the in-band zero sentinels
+(`source_version`/`observer_epoch` 0 — honest dark values, contract-shaped
+fields; a typed absence is an activation-shape question), the `held_by`
+evidence discard (D18: surfacing it would mint), `wait_for_test` returning
+the internal report (T047's oracle shape, probe-gated), and the
+runtime_dark test file's server-path imports (integration tests never build
+under the embed gate). Each stays visible in the review findings document.
+
+## Gate results for the repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| lib suite (server default) | 3168 passed, 0 failed (+1: the item-kind pin) |
+| embed lib gate | 1332 passed, 0 failed — server_api correctly shed by the C2 gate |
+| plain embed build (`cargo check --no-default-features --features embed`) | clean, after the probe-import gate fix |
+| three oracle suites | 11 + 2 + 3 passed, 0 failed |
+| export delta | regenerated; write-mode run FAILED on the pre-write content as designed, verify run clean; 64/64 atoms survive the exact-match subtraction |
+| harness `--stage full --check` | one failure: worktree dirty (the docs being written); case results identical — 35/35 adapter expected-failures, positive compiles; the clean-tree rerun lands with the committed artifact |
+| traceability checker | OK (78 requirements, 24 oracles, 13 categories) |
+| mutations | M27 evaluator (nine negative sentinels + exit 1); M20–M26 remain as recorded |
+
 ## T051 — the call-edge proof (PR 3)
 
 `tests/preventive_runtime_dark_v11.rs` exists now — its creation is T051's
