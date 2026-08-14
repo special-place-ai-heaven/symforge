@@ -1,5 +1,65 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## T047 — the dark runtime, RED to GREEN (PR 3)
+
+Observed RED first, twice honestly: the initial file failed for three reasons,
+two of which were MY invented constructors where real ones existed —
+`ProjectKey::for_test` for `ProjectKey::new`, `EmbeddedSourceFactory::
+for_test_root`/`open_for_test` for `new`/`open` — repaired in the tests before
+any src work, the transcription discipline applied to my own file. Final RED:
+the unresolved `runtime` module plus the two genuinely-new handle members.
+
+**The E7 relocation was proof-driven, exactly as ruled.** `runtime.rs` was
+written importing its refusal vocabulary from `lifecycle_identity`, which did
+not yet hold it; the first compile NAMED the set — `OperationKind`,
+`OperationReceipt`, `RetryAdvice`, `SourceRefusal`, `SourceRefusalKind` — and
+exactly those five (plus `CanonicalArgumentHash`, embedded in the receipt)
+moved to the shared ungated home, with `claim_provenance` re-exporting so
+every oracle path kept resolving. `GenerationAuthority` moved the same way per
+the explicit E7 ruling, its provenance-only promotion staying behind as a
+same-crate inherent impl. `SourceRefusal::for_runtime` is the crate-visible
+mint the dark runtime uses; nothing outside the crate can construct one.
+
+**The binding embed obligation is retired on this commit**: 1332 passed,
+0 failed — green BECAUSE the relocation kept `runtime.rs` off `protocol`,
+which the naming errors proved rather than speculation.
+
+What landed: `DarkRuntimeFactory` as the single door;
+`ProjectIndexRuntime` + `ProjectPublicationRoot` (SEAM-pinned names); the
+private five-state machine with the frozen state names and the public
+six-variant `SourceRuntimePhase`, `Stopped` derived from the registry
+tombstone; `VerifiedGeneration` retaining ONE exact authority Arc;
+`acquire_strict` closed on completeness per F020-V11-A20/R20A/R20B; FR-043
+across ended and proven-no-op permits; per-source sealed republish preserving
+sibling Arcs under a never-reused publication identity; the validated
+`capture_source_view` that never invents a token; and the V11
+`begin_close`/`SourceCloseReceipt`/`ReceiptWaitError` family on the
+SEAM-pinned `embedded.rs` handle with the self-wait guard relocated to the
+wait. Payload simplifications versus the frozen machine (observer phases,
+mutation epochs, revocation packages, `NonCurrentWork`) are Slice 4
+obligations, recorded here as D17. The remaining four V11 handle methods —
+`request_refresh`, `runtime_view`, `search_symbols`, `search_text` — land
+with T048's wrapper chunk where their contract shapes get pinned, deliberately
+not as untested surface now.
+
+**Mutation ledger, continued** — suite 46 oracle tests green after restores:
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M14 | permit-holding refresh still leases its retention | CAUGHT TWICE — `refreshing_serves_retained_only…` AND `no_terminal_permit_path…`, which is correct: that lease IS a restore path |
+| M15 | tombstone never derives `Stopped` | `stopped_phase_derives_from_tombstone…`, alone |
+| M16 | republish re-mints every sibling record | `sealed_transition_rebases_one_source…`, alone |
+| M17 | self-wait guard at the wait disabled | `begin_close_is_infallible…`, alone |
+
+Seventeen mutations across the slice: sixteen caught by name, one historical
+survivor that forced its oracle, one guard proven structural.
+
+Gates on the T047 tree: oracle files 46 passed 0 failed; full lib suite 3166
+passed 0 failed; embed gate 1332 passed 0 failed — THE binding run for this
+commit; clippy all targets denied warnings clean after two lint-only test
+fixes; fmt clean; traceability checker OK; all five closure digests
+byte-identical — every touched file is uncensused.
+
 ## T045 — the lanes and the measured envelope (PR 2)
 
 **Batch one** routed the three disk lanes through `observe_disk_beneath` and

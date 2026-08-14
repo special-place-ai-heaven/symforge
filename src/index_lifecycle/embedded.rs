@@ -213,6 +213,34 @@ impl EmbeddedSourceHandle {
         })
     }
 
+    /// V11 (T047, E1 ruling): begin the close INFALLIBLY. The Slice 2 `close`
+    /// refuses a self-wait AT CLOSE; the V11 contract relocates that guard to
+    /// the WAIT — beginning a close is always legal, and only waiting on your
+    /// own close from inside the finalizer refuses. An already-closed source
+    /// yields a receipt that joined rather than performed, same as `Drop`
+    /// coalescing.
+    pub fn begin_close(&self) -> SourceCloseReceipt {
+        let performed = if self.closed.swap(true, Ordering::AcqRel) {
+            false
+        } else {
+            let (performed, _final_owner) = self.registration.close_one(&self.key, self.identity);
+            performed
+        };
+        SourceCloseReceipt {
+            identity: self.identity,
+            performed_shutdown: performed,
+        }
+    }
+
+    /// Fixture probe for the relocated guard: arms the finalizer for THIS
+    /// source and attempts to wait on its own close receipt from inside it —
+    /// which must refuse with [`ReceiptWaitError::WouldSelfWait`] rather than
+    /// deadlock.
+    pub fn self_wait_probe_for_test(&self) -> Result<SourceCloseReport, ReceiptWaitError> {
+        let receipt = self.begin_close();
+        self.finalize(|| receipt.wait_for_test())
+    }
+
     /// Run `finalizer` with self-wait detection armed for THIS source.
     ///
     /// A finalizer that tries to close this source is refused rather than
@@ -230,6 +258,55 @@ impl EmbeddedSourceHandle {
         }
         let _guard = Guard(FINALIZING.with(|flag| flag.replace(Some(self.identity))));
         finalizer()
+    }
+}
+
+/// Waiting on a receipt can refuse; the wait is where the self-wait guard
+/// lives in V11, so the error is typed rather than a deadlock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptWaitError {
+    /// The wait was attempted from inside this source's own finalizer:
+    /// waiting there is waiting on the calling thread itself.
+    WouldSelfWait,
+}
+
+/// Receipt for a V11 `begin_close`. Nothing is spawned in the dark modules,
+/// so the wait completes immediately — but it still owns the self-wait guard.
+#[derive(Debug)]
+pub struct SourceCloseReceipt {
+    identity: EmbeddedIdentity,
+    performed_shutdown: bool,
+}
+
+impl SourceCloseReceipt {
+    /// Wait for the close to finalize. Refuses a self-wait; completes
+    /// immediately otherwise, because the close performed synchronously and
+    /// only observed completions may be reported.
+    pub fn wait_for_test(&self) -> Result<SourceCloseReport, ReceiptWaitError> {
+        if FINALIZING.with(std::cell::Cell::get) == Some(self.identity) {
+            return Err(ReceiptWaitError::WouldSelfWait);
+        }
+        Ok(SourceCloseReport {
+            finalized: true,
+            performed_shutdown: self.performed_shutdown,
+        })
+    }
+}
+
+/// What the close wait OBSERVED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceCloseReport {
+    finalized: bool,
+    performed_shutdown: bool,
+}
+
+impl SourceCloseReport {
+    pub fn finalized(&self) -> bool {
+        self.finalized
+    }
+
+    pub fn performed_shutdown(&self) -> bool {
+        self.performed_shutdown
     }
 }
 

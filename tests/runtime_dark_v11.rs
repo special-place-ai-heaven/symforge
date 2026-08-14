@@ -31,7 +31,7 @@ use symforge::protocol::format::claim_provenance::SourceRefusalKind;
 // shapes, unconditional admission, Slice 4 supplies the refusing evidence.
 
 fn a_project_key(name: &str) -> ProjectKey {
-    ProjectKey::for_test(name)
+    ProjectKey::new(name)
 }
 
 fn a_dark_runtime(root: &str) -> ProjectIndexRuntime {
@@ -134,7 +134,7 @@ fn permit_grant_publishes_refreshing_before_side_effects() {
     );
     // The permit has not started its side effect yet; the publication came
     // first by construction, which is the property.
-    drop(permit);
+    let _ends_without_committing = permit;
 }
 
 // ── FR-043: no terminal permit path restores the prior Current ─────────────
@@ -154,7 +154,8 @@ fn no_terminal_permit_path_restores_prior_current() {
     let permit = runtime
         .grant_mutation_permit_for_test(&source)
         .expect("grant");
-    drop(permit);
+    // Terminal path one: the permit simply ENDS, uncommitted.
+    let _ = permit;
     assert!(
         runtime.acquire_strict(&source).is_err(),
         "a dropped permit must not restore the prior publication"
@@ -280,8 +281,10 @@ fn begin_close_is_infallible_and_self_wait_fails_at_wait() {
     // public-api-v11.json:1284-1296: begin_close(&self) -> SourceCloseReceipt
     // is infallible; the guard against waiting on yourself moved to the WAIT,
     // which returns ReceiptWaitError rather than deadlocking.
-    let factory = EmbeddedSourceFactory::for_test_root("root-a");
-    let handle = factory.open_for_test("src-a");
+    let factory = EmbeddedSourceFactory::new();
+    let handle = factory
+        .open(a_project_key("src-a"))
+        .expect("an open registry admits a fresh key");
 
     let receipt = handle.begin_close();
     let report = receipt
@@ -289,7 +292,9 @@ fn begin_close_is_infallible_and_self_wait_fails_at_wait() {
         .expect("an ordinary wait on the close receipt completes");
     assert!(report.finalized());
 
-    let handle_b = factory.open_for_test("src-b");
+    let handle_b = factory
+        .open(a_project_key("src-b"))
+        .expect("an open registry admits a second key");
     let error = handle_b
         .self_wait_probe_for_test()
         .expect_err("waiting on your own close from inside the finalizer refuses");
