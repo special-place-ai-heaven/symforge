@@ -1,5 +1,88 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-6 review and its repairs (PR 3)
+
+Round 6 verified the round-5 repairs adversarially: **2 confirmed
+BLOCKERS, 1 confirmed major, 1 refuted, 2 confirmed docs minors, 3
+notes**. Both blockers landed on the same recurrence class — insignificant
+separators the line-based rules never modeled — and one of them refuted
+the load-bearing prose rule itself, the first breach of that rule to
+survive adjudication.
+
+- **BLOCKER — the prose rule was refutable (string-tail masquerade).** A
+  line-spanning string literal's continuation line may begin with `//` as
+  string CONTENT and still execute code after the literal's closing quote:
+  `let _s = "` / `//"; <live call edge>;` compiled, ran, and was counted
+  as tolerated prose by all three sweeps. This is NOT round 4's refuted
+  doctest attack (a `///` line genuinely cannot execute code); it is a
+  lexically different construction, and the header's "Rust permits no code
+  after a line-start `//`" was false as written. The repair closes the
+  whole class, not the instance: Rust has exactly two lexeme kinds that
+  span physical lines — string literals (plain, raw, byte, C — every form
+  closes with a `"`) and block comments (every level closes with `*/`) —
+  and handing control back to code mid-line requires that closing
+  delimiter on the line. The exemption is now the INERT full-line comment:
+  first non-whitespace bytes `//`, no `"`, no `*/`. Four legitimate
+  quoting comments across the three sweeps lost the exemption and are
+  allowlisted individually (dual-count binds updated to (4,4)/(9,9)/(6,6)).
+  Mutations **M37** (the exact string-tail smuggle, compiling, planted in
+  `src/lib.rs`) and **M41** (the block-comment-tail variant `/* m41` /
+  `// tail */ <live type edge>;`, which the reviewer's `"`-only framing
+  would have missed) each observed caught, restored.
+- **BLOCKER — block comments are token separators the collapse never
+  removed.** `use std::/*c*/include as inc;`, `include/*c*/!("dark.rs")`,
+  and `#/*c*/[path = ...]` all compiled and evaded every arm — the third
+  insignificant-separator class after round-3 whitespace and round-4 bidi
+  marks, including the composite `include/*c*/!(concat!(...))` that also
+  defeats the token sweep and therefore sat strictly outside the stated
+  concat residual. Repair: every arm now judges TWO views of the line —
+  the whitespace-and-`r#`-collapsed form, and that form with `/*…*/`
+  spans removed (unclosed `/*` comments out the rest of the line, a
+  dangling `*/` the start) — and flags on EITHER, so over-removal on
+  pathological string content can only over-flag. A block comment
+  SPANNING lines is the already-stated split residual and the header now
+  names it as such, along with the split+concat compound. Mutations
+  **M38** (comment-interleaved alias creation) and **M40** (the exact
+  composite, cfg-gated so it compiles) observed caught, restored.
+- **MAJOR — `r#include` is a resolvable alias-creation spelling.**
+  `use std::r#include as inc;` compiles and wrote no matchable opener
+  (`r#` broke the `::include` adjacency). The collapse now strips `r#`
+  sequences in both views; mutation **M39** observed caught, restored.
+- **REFUTED:** "the compiler-backstop claim is false — an innocuous-alias
+  double `#[path]` mount compiles cleanly." The adjudicator reproduced
+  the opposite: this tree's `authority.rs` references
+  `PhysicalRootIdentity` by ABSOLUTE path while `registry.rs`/`mutation.rs`
+  type the same values by relative path, so an alias double-mount makes
+  the two paths resolve to distinct types and rustc rejects it ("similar
+  names, but are actually distinct types") while the single mount
+  compiles. The round-5 sentence stands, with its honest residual stated:
+  the backstop is contingent on `authority.rs` keeping its absolute
+  paths — the `(total, distinct)` bind, not the compiler, is the stated
+  catch.
+- Docs minors repaired: the receipt's round-5 scope note wrongly called
+  `embedded.rs::SourceCloseReport` Slice-2-owned (it is T047's — and its
+  contract twin `symforge::embed::SourceCloseReport` IS a real atom, so
+  provenance matters there most) and omitted `EmbeddedSourceHandle` from
+  the Slice-2-publics enumeration — both corrected in place; the round-4
+  "fixed twice over" bullet now carries its bracketed amendment (round 5
+  deleted the dead bidi exclusions the sentence still claimed).
+- Notes folded: the path-segment tail-check comment now states its three
+  deliberate widenings (end-of-line, non-ASCII, `as`-prefixed identifiers
+  — all over-flag only); "every resolvable alias-creation site must
+  write" is qualified to SINGLE-LINE sites, with the split declaration
+  named as the header's stated residual.
+
+## Gate results for the round-6 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 3 passed, 0 failed; the four new allowlist entries were the complete flag set on first run |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| `server_api` lib tests | 2 passed, 0 failed |
+| mutations | M37, M38, M39, M40, M41 each observed caught (each plant COMPILES — the lib built clean before every sweep run); restored |
+
 ## Round-5 review and its repairs (PR 3)
 
 Round 5 attacked the round-4 repairs: **1 confirmed BLOCKER, 2 confirmed
@@ -58,6 +141,11 @@ gaps in the splice TRIPWIRE and the register:
   the collapse. Fixed twice over: the collapse now removes the lexer's set,
   AND any line containing a bidi mark is flagged outright (they have no
   legitimate use in this source). Mutation **M33** observed caught.
+  [Amended after round 6: "twice over" lasted one round — round 5's minors
+  deliberately deleted the dead bidi exclusions from the collapse (the
+  outright flag owns U+200E/U+200F entirely), so the collapse filters only
+  `char::is_whitespace` again. The guarantee is unchanged; do not re-add
+  the exclusions.]
 - **Alias route:** `use std::include as inc;` then `inc!(...)` was a
   single-line ASCII splice with no matching spelling. [Amended after round
   5: this bullet's "any use-declaration naming `include`" claim was
@@ -95,8 +183,10 @@ and revived the polarity flip; `include ! (` spacing evaded the matcher),
 and one showing the trim register still omitted the common derives. Fixes:
 
 - **The lexer is GONE (C8 ruling, second arm).** Prose is now only a
-  FULL-LINE comment — first non-whitespace bytes `//`, after which Rust
-  permits no code on the line — so a real call edge structurally cannot be
+  FULL-LINE comment — first non-whitespace bytes `//` [amended after round
+  6: that alone was refutable via a line-spanning string or block-comment
+  tail; the exemption now also requires no `"` and no `*/` on the line] —
+  so a real call edge structurally cannot be
   tolerated and there is no scanner left to be wrong. The whole tree passes
   with zero new flags, proving every legitimate prose mention was already a
   full-line comment. Mutation **M31** (the round-3 raw-string laundering
@@ -313,9 +403,16 @@ mount-declaration lines in `src/live_index/mod.rs`. [Amended after rounds
 successive mid-line-comment lexers each laundered an edge through some
 literal form — string literals, char-literal polarity, raw-string quote
 parity. Round 3 took the C8 ruling's second arm and DROPPED the mid-line
-comment exception: prose is now only a FULL-LINE comment, after which Rust
-permits no code on the line, so the tolerance rule has no lexer to be
-wrong.] A string-literal or trailing-comment mention FAILS and forces a
+comment exception: prose is now only a FULL-LINE comment.] [Amended after
+round 6: "after which Rust permits no code on the line" was itself false —
+the tail line of a line-spanning string literal or block comment may begin
+with `//` as CONTENT and execute code after its closing delimiter on the
+same line. The exemption is now the INERT form: first non-whitespace bytes
+`//` AND neither `"` nor `*/` anywhere on the line — every string form
+closes with a `"` and every block-comment level with `*/`, so a line free
+of both cannot hand control back to code. The two legitimate quoting
+comments this surfaced are allowlisted, not silently tolerated.] A
+string-literal or trailing-comment mention FAILS and forces a
 human decision rather than being silently tolerated. The seven task-named ingress lanes (daemon, stdio,
 serve, embed, snapshot, observer, mutation) are all `src/` production code,
 so one sweep covers them; their roots are asserted to EXIST so a moved lane
