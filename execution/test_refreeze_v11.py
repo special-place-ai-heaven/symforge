@@ -526,8 +526,17 @@ class RefreezeV11Tests(unittest.TestCase):
             path: str,
             _error: object,
         ) -> None:
-            os.chmod(path, stat.S_IWRITE)
-            function(path)
+            # Windows read-only git objects need a chmod before the unlink can
+            # retry. A path that is ALREADY GONE is rmtree's goal state, not a
+            # failure: the Linux release runner hit a teardown race where a
+            # `.git/objects/*` entry vanished mid-walk and the chmod of the
+            # missing path turned cleanup into the ERROR that blocked
+            # prepare-release before release-please ever ran.
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                function(path)
+            except FileNotFoundError:
+                return
 
         for path in reversed(created):
             if path.exists():
