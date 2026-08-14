@@ -1,0 +1,1878 @@
+{
+  "kind": "symforge.t049_aap_migration_receipt_run",
+  "schema_version": 1,
+  "stage": "full",
+  "repo_commit": "0797b02f6f97394aac4c4ab0fe0d0e549eac89c2",
+  "worktree_dirty": false,
+  "worktree_dirty_paths": 0,
+  "claims_v11_exports_live": false,
+  "c_compiler": "clang-cl",
+  "rerun_command": "python execution/aap_migration_receipt_v11.py --stage full --check",
+  "all_cfg_inventory_sha256": "826b9c4f0ebd966d56d22d7b9de0adc18c8e33acb7ea800be853832a6fb36c84",
+  "all_cfg_sentinels": {
+    "target-only": {
+      "required_symbols": [
+        "Aarch64Only",
+        "LinuxOnly",
+        "MacosOnly",
+        "WindowsOnly"
+      ],
+      "missing_from_union": [],
+      "satisfied": true
+    },
+    "negative-cfg": {
+      "required_symbols": [
+        "NoAtomic128",
+        "NotServer",
+        "PureEmbed"
+      ],
+      "missing_from_union": [],
+      "satisfied": true
+    },
+    "trait-impl": {
+      "required_symbols": [
+        "CompletenessTrait for CompletenessSubject"
+      ],
+      "missing_from_union": [],
+      "satisfied": true
+    },
+    "associated-item": {
+      "required_symbols": [
+        "CompletenessTrait::MARKER",
+        "CompletenessTrait::Output",
+        "CompletenessTrait::apply"
+      ],
+      "missing_from_union": [],
+      "satisfied": true
+    },
+    "auto-trait": {
+      "required_symbols": [
+        "CompletenessAutoTraits",
+        "CompletenessNotSendSync"
+      ],
+      "missing_from_union": [],
+      "satisfied": true
+    },
+    "macro-export": {
+      "required_symbols": [
+        "completeness_exported_macro"
+      ],
+      "missing_from_union": [],
+      "satisfied": true
+    }
+  },
+  "all_cfg_cell_count": 26,
+  "all_cfg_negative_sentinels": [
+    {
+      "symbol": "WindowsOnly",
+      "cell": "x86_64-unknown-linux-gnu__embed",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "Aarch64Only",
+      "cell": "x86_64-pc-windows-msvc__server",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "MacosOnly",
+      "cell": "x86_64-unknown-linux-musl__embed",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "MsvcOnly",
+      "cell": "x86_64-unknown-linux-gnu__embed",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "NotServer",
+      "cell": "x86_64-pc-windows-msvc__server",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "PureEmbed",
+      "cell": "x86_64-unknown-linux-gnu__server-embed",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "Atomic128",
+      "cell": "x86_64-unknown-linux-gnu__embed",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "EmbedEnabled",
+      "cell": "x86_64-apple-darwin__server",
+      "absent_as_expected": true
+    },
+    {
+      "symbol": "CbmSpikeEnabled",
+      "cell": "x86_64-unknown-linux-gnu__embed",
+      "absent_as_expected": true
+    }
+  ],
+  "adapter": {
+    "exit_code": 0,
+    "primary_code": null,
+    "error_count": 0,
+    "dependency_error": false,
+    "first_errors": [],
+    "stderr_tail": ""
+  },
+  "dependent_positive": {
+    "exit_code": 0,
+    "primary_code": null,
+    "error_count": 0,
+    "dependency_error": false,
+    "first_errors": [],
+    "stderr_tail": "",
+    "outcome": "compiles"
+  },
+  "case_results": [
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 0,
+      "subject": "symforge::embed::AtomicAuthority",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `AtomicAuthority` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 0,
+      "subject": "symforge::embed::AtomicAuthority",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `AtomicAuthority: serde::Deserialize<'de>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 1,
+      "subject": "symforge::embed::Claim<()>",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `Claim` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 1,
+      "subject": "symforge::embed::Claim<()>",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `Claim<()>: serde::Deserialize<'de>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 2,
+      "subject": "symforge::embed::ClaimProvenance",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ClaimProvenance` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 2,
+      "subject": "symforge::embed::ClaimProvenance",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `ClaimProvenance: serde::Deserialize<'de>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 3,
+      "subject": "symforge::embed::EvaluationProvenance",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EvaluationProvenance` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 3,
+      "subject": "symforge::embed::EvaluationProvenance",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `EvaluationProvenance: serde::Deserialize<'de>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 4,
+      "subject": "symforge::embed::OperationReceipt",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `OperationReceipt` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 4,
+      "subject": "symforge::embed::OperationReceipt",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `OperationReceipt: serde::Deserialize<'de>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 5,
+      "subject": "symforge::embed::SourceRefusal",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `SourceRefusal` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-01-not-deserialize",
+      "index": 5,
+      "subject": "symforge::embed::SourceRefusal",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `SourceRefusal: serde::Deserialize<'de>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 0,
+      "subject": "symforge::embed::AtomicAuthority",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `AtomicAuthority` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 0,
+      "subject": "symforge::embed::AtomicAuthority",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `AtomicAuthority: Default` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 1,
+      "subject": "symforge::embed::Claim<()>",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `Claim` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 1,
+      "subject": "symforge::embed::Claim<()>",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `Claim<()>: Default` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 2,
+      "subject": "symforge::embed::ClaimProvenance",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ClaimProvenance` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 2,
+      "subject": "symforge::embed::ClaimProvenance",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `ClaimProvenance: Default` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 3,
+      "subject": "symforge::embed::EvaluationProvenance",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EvaluationProvenance` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 3,
+      "subject": "symforge::embed::EvaluationProvenance",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `EvaluationProvenance: Default` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 4,
+      "subject": "symforge::embed::OperationReceipt",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `OperationReceipt` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 4,
+      "subject": "symforge::embed::OperationReceipt",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `OperationReceipt: Default` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 5,
+      "subject": "symforge::embed::SourceRefusal",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `SourceRefusal` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-02-not-default",
+      "index": 5,
+      "subject": "symforge::embed::SourceRefusal",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `SourceRefusal: Default` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "embedded-source-handle-not-clone",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EmbeddedSourceHandle` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "embedded-source-handle-not-clone",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `EmbeddedSourceHandle: Clone` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EmbeddedSourceHandle` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may contain interior mutability and a reference may not be safely transferable across a catch_unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ProcessIndexRuntime` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may contain interior mutability and a reference may not be safely transferable across a catch_unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 2,
+      "subject": "symforge::embed::RefreshTicket",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `RefreshTicket` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 2,
+      "subject": "symforge::embed::RefreshTicket",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may contain interior mutability and a reference may not be safely transferable across a catch_unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 3,
+      "subject": "symforge::embed::ShutdownReceipt",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ShutdownReceipt` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 3,
+      "subject": "symforge::embed::ShutdownReceipt",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may contain interior mutability and a reference may not be safely transferable across a catch_unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 4,
+      "subject": "symforge::embed::SourceCloseReceipt",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `SourceCloseReceipt` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-ref-unwind-safe",
+      "index": 4,
+      "subject": "symforge::embed::SourceCloseReceipt",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may contain interior mutability and a reference may not be safely transferable across a catch_unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EmbeddedSourceHandle` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may not be safely transferred across an unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ProcessIndexRuntime` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may not be safely transferred across an unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 2,
+      "subject": "symforge::embed::RefreshTicket",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `RefreshTicket` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 2,
+      "subject": "symforge::embed::RefreshTicket",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may not be safely transferred across an unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 3,
+      "subject": "symforge::embed::ShutdownReceipt",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ShutdownReceipt` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 3,
+      "subject": "symforge::embed::ShutdownReceipt",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may not be safely transferred across an unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 4,
+      "subject": "symforge::embed::SourceCloseReceipt",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `SourceCloseReceipt` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "handle-not-unwind-safe",
+      "index": 4,
+      "subject": "symforge::embed::SourceCloseReceipt",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the type `(dyn Any + Send + Sync + 'static)` may not be safely transferred across an unwind boundary"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 0,
+      "subject": "symforge::embed::AtomicAuthority",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `AtomicAuthority` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 0,
+      "subject": "symforge::embed::AtomicAuthority",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `AtomicAuthority: From<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 1,
+      "subject": "symforge::embed::Claim<()>",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `Claim` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 1,
+      "subject": "symforge::embed::Claim<()>",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `Claim<()>: From<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 2,
+      "subject": "symforge::embed::ClaimProvenance",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ClaimProvenance` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 2,
+      "subject": "symforge::embed::ClaimProvenance",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `ClaimProvenance: From<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 3,
+      "subject": "symforge::embed::EvaluationProvenance",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EvaluationProvenance` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 3,
+      "subject": "symforge::embed::EvaluationProvenance",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `EvaluationProvenance: From<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 4,
+      "subject": "symforge::embed::OperationReceipt",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `OperationReceipt` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 4,
+      "subject": "symforge::embed::OperationReceipt",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `OperationReceipt: From<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 5,
+      "subject": "symforge::embed::SourceRefusal",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `SourceRefusal` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "authority-types-03-not-from",
+      "index": 5,
+      "subject": "symforge::embed::SourceRefusal",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `SourceRefusal: From<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-as-ref",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EmbeddedSourceHandle` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-as-ref",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `EmbeddedSourceHandle: AsRef<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-as-ref",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ProcessIndexRuntime` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-as-ref",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `ProcessIndexRuntime: AsRef<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-borrow",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EmbeddedSourceHandle` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-borrow",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `EmbeddedSourceHandle: Borrow<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-borrow",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ProcessIndexRuntime` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-borrow",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `ProcessIndexRuntime: Borrow<Probe>` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-deref",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `EmbeddedSourceHandle` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-deref",
+      "index": 0,
+      "subject": "symforge::embed::EmbeddedSourceHandle",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `EmbeddedSourceHandle: Deref` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-deref",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "resolution-failure",
+      "primary_code": "E0425",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0425",
+        "text": "cannot find type `ProcessIndexRuntime` in module `symforge::embed`"
+      }
+    },
+    {
+      "assertion_id": "runtime-handle-no-deref",
+      "index": 1,
+      "subject": "symforge::embed::ProcessIndexRuntime",
+      "feature_vector": "embed",
+      "lane": "adapter",
+      "expected_error_codes": [
+        "E0277"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0277",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0277",
+        "text": "the trait bound `ProcessIndexRuntime: Deref` is not satisfied"
+      }
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 0,
+      "subject": "symforge::analytics",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 1,
+      "subject": "symforge::capability",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 2,
+      "subject": "symforge::cli",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 3,
+      "subject": "symforge::daemon",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 4,
+      "subject": "symforge::discovery",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 5,
+      "subject": "symforge::domain",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 6,
+      "subject": "symforge::edit_safety",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 7,
+      "subject": "symforge::git",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 8,
+      "subject": "symforge::gitignore_hygiene",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 9,
+      "subject": "symforge::hash",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 10,
+      "subject": "symforge::idempotency",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 11,
+      "subject": "symforge::knowledge",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 12,
+      "subject": "symforge::live_index",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 13,
+      "subject": "symforge::observability",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 14,
+      "subject": "symforge::parsing",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 15,
+      "subject": "symforge::path_shadow",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 16,
+      "subject": "symforge::paths",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 17,
+      "subject": "symforge::process_util",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 18,
+      "subject": "symforge::protocol",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 19,
+      "subject": "symforge::server",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 20,
+      "subject": "symforge::sidecar",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 21,
+      "subject": "symforge::stel",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 22,
+      "subject": "symforge::stel_core",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 23,
+      "subject": "symforge::version_registry",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 24,
+      "subject": "symforge::watcher",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 25,
+      "subject": "symforge::watcher_state",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-crate-root-modules",
+      "index": 26,
+      "subject": "symforge::worktree",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-deep-embed-reexports",
+      "index": 0,
+      "subject": "symforge::embed::domain",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-deep-embed-reexports",
+      "index": 1,
+      "subject": "symforge::embed::git",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-deep-embed-reexports",
+      "index": 2,
+      "subject": "symforge::embed::live_index",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-raw-deep-embed-reexports",
+      "index": 3,
+      "subject": "symforge::embed::parsing",
+      "feature_vector": "embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-rust-health-api",
+      "index": 0,
+      "subject": "symforge::health",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0432",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0432",
+        "text": "unresolved import `symforge::health`"
+      }
+    },
+    {
+      "assertion_id": "no-rust-health-api",
+      "index": 1,
+      "subject": "symforge::server_api::health",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0432",
+      "error_count": 2,
+      "first_error": {
+        "code": "E0432",
+        "text": "unresolved import `symforge::server_api::health`"
+      }
+    },
+    {
+      "assertion_id": "no-stel-public-api",
+      "index": 0,
+      "subject": "symforge::embed::stel",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "expected-failure",
+      "primary_code": "E0432",
+      "error_count": 1,
+      "first_error": {
+        "code": "E0432",
+        "text": "unresolved import `symforge::embed::stel`"
+      }
+    },
+    {
+      "assertion_id": "no-stel-public-api",
+      "index": 1,
+      "subject": "symforge::stel",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    },
+    {
+      "assertion_id": "no-stel-public-api",
+      "index": 2,
+      "subject": "symforge::stel_core",
+      "feature_vector": "server-embed",
+      "lane": "real",
+      "expected_error_codes": [
+        "E0432",
+        "E0603"
+      ],
+      "outcome": "compiles",
+      "primary_code": null,
+      "error_count": 0,
+      "first_error": null
+    }
+  ],
+  "case_summary": {
+    "real:resolution-failure": 35,
+    "adapter:expected-failure": 35,
+    "real:compiles": 33,
+    "real:expected-failure": 3
+  },
+  "case_count": 71,
+  "check_failures": []
+}
