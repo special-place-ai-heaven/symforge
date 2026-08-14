@@ -35,20 +35,27 @@
 //! `no_gate_builds_doctests` below PINS every line of every
 //! `.yml`/`.yaml` workflow that mentions cargo — case-insensitively —
 //! against a verbatim allowlist a human judged doctest-free, and binds
-//! its total, its distinct set, and the workflow-file count. Rounds
-//! 8–11 each falsified a scan that tried to read the command out of the
-//! file and judge it; round 11's `cargo rustdoc -- --test` builds and
-//! runs doctests while naming neither `test` nor `--doc` where the walk
-//! looked, and `cargo te"st" --doc` was split by the scan's own
-//! quote-erasure into words the shell joins. There is no word model
-//! left to be wrong about: an unrecognized cargo line fails whatever it
-//! says. KNOWN RESIDUALS of the pin — what has been probed, NOT a proof
-//! of exhaustiveness, because round 9 called its list "the only two",
-//! round 10 produced a third and round 11 a fourth: a gate that reaches
-//! cargo with no `cargo` on the line (a script, make target, or
-//! composite action running it out of sight) and a `[alias]` in
-//! `.cargo/config.toml` re-pointing an allowlisted line at a
-//! doctest-running command. Both are outside any line-based scan.
+//! each line's OCCURRENCE COUNT, plus the total, the distinct set, and
+//! the workflow-file count. Rounds 8–11 each falsified a scan that
+//! tried to read the command out of the file and judge it; round 11's
+//! `cargo rustdoc -- --test` builds and runs doctests while naming
+//! neither `test` nor `--doc` where the walk looked, and
+//! `cargo te"st" --doc` was split by the scan's own quote-erasure into
+//! words the shell joins. There is no word model left to be wrong
+//! about: an unrecognized cargo line fails whatever it says. The
+//! per-line counts are round 12's: `(total, distinct)` binds a
+//! bijection only when the two are EQUAL, and at `(30, 26)` a
+//! compensated edit deleted a real test gate while both numbers held.
+//! KNOWN RESIDUALS of the pin — what has been probed, NOT a proof of
+//! exhaustiveness, because round 9 called its list "the only two",
+//! round 10 produced a third, round 11 a fourth, and round 12 showed
+//! one of them was never a residual at all: a gate that reaches cargo
+//! with no `cargo` on the line (a script, make target, or composite
+//! action running it out of sight), and a USER-level `[alias]` in
+//! `~/.cargo/config.toml`, which is outside the repo (CI runners have
+//! none). The repo's own `.cargo/config.toml` was listed here as
+//! unreachable while sitting in a file this test can open, so it is
+//! opened: an `[alias]` table there fails.
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
 //! across directory boundaries. The mechanism sweep is a fail-closed
@@ -177,6 +184,20 @@ fn sweep(
             .to_string_lossy()
             .replace('\\', "/");
         for (number, line) in text.lines().enumerate() {
+            // Bidi marks are flagged before ANY exemption. Round 12 caught
+            // the file claiming they are "flagged OUTRIGHT" while the prose
+            // exemption below silently absorbed one sitting on a `//` line:
+            // the matcher named it and the sweep then forgave it. They have
+            // no legitimate use in this source — `src/` holds zero — so
+            // neither prose nor an allowlist entry may carry one.
+            if line.contains('\u{200E}') || line.contains('\u{200F}') {
+                result.violations.push(format!(
+                    "{display}:{}: [bidi mark] {}",
+                    number + 1,
+                    line.trim()
+                ));
+                continue;
+            }
             let Some(token) = matches_line(line) else {
                 continue;
             };
@@ -390,7 +411,12 @@ fn source_splicing_is_allowlisted() {
     // (round 8): string content can poison the depth tracking. The two
     // Pattern_White_Space extras the Rust lexer also accepts (the
     // U+200E/U+200F bidi marks, the round-4 dodge) are flagged OUTRIGHT —
-    // they have no legitimate use in this source. The alias arm (round 5,
+    // they have no legitimate use in this source. Round 12: "outright"
+    // now means what it says. This arm names the mark, but `sweep` used
+    // to hand the line on to the prose exemption, which forgave a
+    // U+200E sitting on a `//` line; the check that decides now lives in
+    // `sweep` AHEAD of every exemption, allowlist included.
+    // The alias arm (round 5,
     // after a use-prefix test and a raw word-boundary test each proved
     // wrong — the first evadable, the second flooded by prose) flags
     // `include` in a position where a use-declaration can bind it, at
@@ -560,41 +586,94 @@ fn source_splicing_is_allowlisted() {
 }
 
 /// Every line of every CI workflow that mentions cargo, normalized
-/// (trimmed, internal whitespace collapsed). This is the pin: a human
-/// read each one and judged that it cannot build doctests. Grouped by
-/// why, so the judgement is auditable rather than asserted.
-const CARGO_LINES: &[&str] = &[
+/// (trimmed, internal whitespace collapsed), WITH THE NUMBER OF TIMES
+/// it must occur. This is the pin: a human read each one and judged
+/// that it cannot build doctests. Grouped by why, so the judgement is
+/// auditable rather than asserted.
+///
+/// Round 12: the counts are per line because a (total, distinct) pair
+/// is only a bijection when the two are EQUAL. Four of these lines
+/// legitimately occur twice, so at (30, 26) a compensated edit — delete
+/// one copy of a gate, add a duplicate of some other allowlisted line —
+/// held both numbers while removing `cargo test --all-targets` from PR
+/// CI entirely. The multiset is what was always meant; now it is what
+/// is checked.
+const CARGO_LINES: &[(&str, usize)] = &[
     // Prose and configuration — never a command.
-    "# `cargo check` used to run here as its own full dev-profile pass. Clippy",
-    "# here silently loses when rust-toolchain.toml is bumped: cargo follows",
-    "# lints, and more targets (`cargo check` covers lib+bins only). Keeping",
-    "# types. `cargo tree -d` cannot distinguish this (it lists any",
-    "- name: Run cargo check",
-    "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
-    "SYMFORGE_LIFECYCLE_CARGO_EXECUTABLE: ${{ steps.trusted-tools.outputs.cargo }}",
-    "cargo-publish:",
-    "environment: cargo-publish",
+    (
+        "# `cargo check` used to run here as its own full dev-profile pass. Clippy",
+        1,
+    ),
+    (
+        "# here silently loses when rust-toolchain.toml is bumped: cargo follows",
+        1,
+    ),
+    (
+        "# lints, and more targets (`cargo check` covers lib+bins only). Keeping",
+        1,
+    ),
+    (
+        "# types. `cargo tree -d` cannot distinguish this (it lists any",
+        1,
+    ),
+    ("- name: Run cargo check", 1),
+    (
+        "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
+        1,
+    ),
+    (
+        "SYMFORGE_LIFECYCLE_CARGO_EXECUTABLE: ${{ steps.trusted-tools.outputs.cargo }}",
+        1,
+    ),
+    ("cargo-publish:", 1),
+    ("environment: cargo-publish", 1),
     // Commands that invoke no test harness at all.
-    "[\"cargo\", \"metadata\", \"--format-version\", \"1\"],",
-    "echo \"cargo=$(resolve_tool cargo)\" >> \"$GITHUB_OUTPUT\"",
-    "python execution/release_ops.py publish-cargo",
-    "run: cargo build --no-default-features --features embed",
-    "run: cargo build --no-default-features --features embed --target x86_64-unknown-linux-musl",
-    "run: cargo build --release",
-    "run: cargo build --release --target ${{ matrix.target }}",
-    "run: cargo check",
-    "run: cargo clippy --all-targets -- -D warnings",
-    "run: cargo clippy --no-default-features --features embed --lib -- -D warnings",
-    "run: cargo clippy --no-default-features --features embed --target x86_64-unknown-linux-musl --lib -- -D warnings",
-    "run: cargo fmt --check",
-    // The seven test gates. Each carries a doctest-excluding target
-    // selector before its bare `--`, which is why the doctest lane stays
-    // shut; drop one and the line no longer matches this pin.
-    "run: cargo test --all-targets -- --test-threads=1",
-    "run: cargo test --no-default-features --features embed --lib -- --test-threads=1",
-    "run: cargo test --release --test coupling_calibration calibrate_current_repo_smoke -- --ignored --test-threads=1 --nocapture",
-    "run: cargo test --release --test live_index_integration test_load_perf_1000_files -- --ignored --test-threads=1",
-    "run: cargo test --test serve_port -- --test-threads=1",
+    ("[\"cargo\", \"metadata\", \"--format-version\", \"1\"],", 1),
+    (
+        "echo \"cargo=$(resolve_tool cargo)\" >> \"$GITHUB_OUTPUT\"",
+        1,
+    ),
+    ("python execution/release_ops.py publish-cargo", 1),
+    ("run: cargo build --no-default-features --features embed", 2),
+    (
+        "run: cargo build --no-default-features --features embed --target x86_64-unknown-linux-musl",
+        1,
+    ),
+    ("run: cargo build --release", 2),
+    (
+        "run: cargo build --release --target ${{ matrix.target }}",
+        1,
+    ),
+    ("run: cargo check", 1),
+    ("run: cargo clippy --all-targets -- -D warnings", 1),
+    (
+        "run: cargo clippy --no-default-features --features embed --lib -- -D warnings",
+        1,
+    ),
+    (
+        "run: cargo clippy --no-default-features --features embed --target x86_64-unknown-linux-musl --lib -- -D warnings",
+        1,
+    ),
+    ("run: cargo fmt --check", 1),
+    // The seven test gates, five distinct — two run in both workflows.
+    // Each carries a doctest-excluding target selector before its bare
+    // `--`, which is why the doctest lane stays shut; drop one and the
+    // line no longer matches this pin, and drop one COPY and its count
+    // no longer matches either.
+    ("run: cargo test --all-targets -- --test-threads=1", 2),
+    (
+        "run: cargo test --no-default-features --features embed --lib -- --test-threads=1",
+        2,
+    ),
+    (
+        "run: cargo test --release --test coupling_calibration calibrate_current_repo_smoke -- --ignored --test-threads=1 --nocapture",
+        1,
+    ),
+    (
+        "run: cargo test --release --test live_index_integration test_load_perf_1000_files -- --ignored --test-threads=1",
+        1,
+    ),
+    ("run: cargo test --test serve_port -- --test-threads=1", 1),
 ];
 
 #[test]
@@ -656,7 +735,7 @@ fn no_gate_builds_doctests() {
                 continue;
             }
             let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
-            if CARGO_LINES.contains(&normalized.as_str()) {
+            if CARGO_LINES.iter().any(|(l, _)| *l == normalized) {
                 seen.push(normalized);
                 continue;
             }
@@ -679,9 +758,9 @@ fn no_gate_builds_doctests() {
     // without a `cargo test` in sight, so they are ALSO named directly.
     // The allowlist above already fails on them; this is a second,
     // orthogonal reading, so a careless allowlist addition still trips.
-    let named: Vec<&&str> = CARGO_LINES
+    let named: Vec<&(&str, usize)> = CARGO_LINES
         .iter()
-        .filter(|l| l.contains("--doc") || l.contains("rustdoc"))
+        .filter(|(l, _)| l.contains("--doc") || l.contains("rustdoc"))
         .collect();
     assert!(
         named.is_empty(),
@@ -689,10 +768,53 @@ fn no_gate_builds_doctests() {
          -- --test` runs doctests and fails the step on failure, exactly like \
          `--doc`:\n{named:?}"
     );
-    // Both counts bind, as everywhere else in this file: the total says a
-    // line was not deleted, the distinct set says a duplicate did not
-    // absorb a deletion. Round 10 made the old count a pin after a floor
-    // let two silently-added gates hide; this keeps that lesson.
+    // A `[alias]` table in the repo's own cargo config could re-point an
+    // allowlisted line at a doctest-running command (`cargo test` -> an
+    // alias for `rustdoc -- --test`). Round 12 pointed out this was
+    // stated as an unreachable residual while sitting in a file this
+    // test can simply read — so it is read. A USER-level alias
+    // (~/.cargo/config.toml) stays a residual: it is outside the repo,
+    // and CI runners have none.
+    let cargo_config = repo.join(".cargo").join("config.toml");
+    if let Ok(config) = std::fs::read_to_string(&cargo_config) {
+        assert!(
+            !config.lines().any(|l| l.trim().starts_with("[alias]")),
+            "`.cargo/config.toml` declares an [alias] table. An alias can \
+             re-point an allowlisted gate line at a doctest-running command \
+             without changing the line, which is exactly what CARGO_LINES \
+             cannot see — read the aliases and decide deliberately"
+        );
+    }
+    // The MULTISET binds, per line. Round 12: (total, distinct) is only a
+    // bijection when the two are equal — at (30, 26) a compensated edit
+    // deleted `cargo test --all-targets` from PR CI while both numbers
+    // held, because the deleted string survived via its twin in the other
+    // workflow. Comparing observed counts to the declared ones catches a
+    // deletion, a rewording, and a duplicate individually.
+    let mut observed: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for line in &seen {
+        *observed.entry(line.as_str()).or_default() += 1;
+    }
+    let declared: std::collections::BTreeMap<&str, usize> =
+        CARGO_LINES.iter().map(|(l, n)| (*l, *n)).collect();
+    let drifted: Vec<String> = declared
+        .iter()
+        .filter(|(l, n)| observed.get(**l).copied().unwrap_or(0) != **n)
+        .map(|(l, n)| {
+            format!(
+                "expected {n}x, saw {}x: {l}",
+                observed.get(*l).copied().unwrap_or(0)
+            )
+        })
+        .collect();
+    assert!(
+        drifted.is_empty(),
+        "CI workflow cargo lines drifted from their pinned occurrence \
+         counts. A gate was removed, reworded, or duplicated — reconcile \
+         CARGO_LINES with the workflows deliberately, never by loosening \
+         this pin:\n{}",
+        drifted.join("\n")
+    );
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),

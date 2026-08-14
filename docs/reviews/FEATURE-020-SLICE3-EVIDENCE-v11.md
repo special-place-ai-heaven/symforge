@@ -1,12 +1,78 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-12 review and its repairs (PR 3)
+
+Round 12 attacked the round-11 repair: **0 blockers, 1 confirmed major,
+4 confirmed minors, 2 refuted, 2 notes**. The pinned-allowlist design
+held — no evasion was found that adds a doctest-building gate — and the
+one major is a counting flaw in how the pin detects DELETION, not a hole
+in what it admits.
+
+- **MAJOR — compensated deletion held both counts.** Four allowlisted
+  lines legitimately occur twice (two test gates, two builds, each in
+  both workflows), so at `(30, 26, 2)` the pair is not a bijection:
+  delete one copy of a gate and add a duplicate of any other allowlisted
+  line, and the total stays 30 while the distinct set stays 26, because
+  the deleted string survives via its twin. Verified live — replacing
+  ci.yml:143 (`cargo test --all-targets`) with a second `cargo fmt
+  --check` left the test GREEN, deleting the entire Rust test gate from
+  PR CI. The adjudicator added the boundary: uncompensated deletion is
+  caught (29), rewording a 1× line is caught (25 distinct), and only the
+  four 2× lines are blind, only under a compensating edit. The comment
+  claiming "as everywhere else in this file" was the tell — everywhere
+  else `total == distinct`, which forces the bijection this pair does
+  not. Repair: `CARGO_LINES` now carries a per-line occurrence count and
+  the observed multiset must equal the declared one exactly, so a
+  deletion, a rewording, and a duplicate each fail individually and the
+  message names both halves of the drift. Mutations **M55a** and
+  **M55b** (compensated deletion of each duplicated gate) observed
+  caught.
+- **MINOR — the `[alias]` residual was reachable all along.** The header
+  listed a `.cargo/config.toml` `[alias]` re-pointing an allowlisted
+  line as outside any line-based scan — while sitting in a file this
+  test can simply open. It now reads it and fails on an `[alias]` table.
+  A user-level `~/.cargo/config.toml` alias stays a real residual: it is
+  outside the repo, and CI runners have none. Mutation **M55d**
+  observed caught.
+- **MINOR — "bidi marks are flagged OUTRIGHT" was false.** The matcher
+  named them, and then the prose exemption forgave them: a U+200E on a
+  `//` line counted as tolerated prose. The bidi check now runs before
+  every exemption, allowlist included, which makes the claim true rather
+  than restated — `src/` holds zero such marks, so the stronger rule
+  costs nothing. Mutation **M55c** observed caught.
+- **MINOR ×2 — prose, both mine.** "Every major landed on the gate walk,
+  for the fourth round running" is falsified by this document's own
+  Round-9 section, where the uniform-path major was an alias-arm
+  finding; and round 11 left the Round-10 section describing the deleted
+  walk in the present tense. Both amended at the spot.
+- **REFUTED ×2:** that the orthogonal `--doc`/`rustdoc` check fails to
+  cover the likeliest careless allowlist addition, and that dropping
+  round 10's escape-glue residual left a gap (the pinned design makes
+  escape-glued lines fail as unrecognized).
+
+## Gate results for the round-12 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; dual counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| gate pin | per-line multiset observed equal to the declared counts; (30, 26, 2) still bound |
+| mutations | M55a/M55b (compensated deletions), M55c (bidi on an inert comment), M55d (`[alias]` table) each observed caught; `cargo rustdoc -- --test`, `cargo +nightly test --doc` and the uniform-path alias re-observed caught as controls; all restored |
+
 ## Round-11 review and its repairs (PR 3)
 
 Round 11 attacked the round-10 repairs: **0 blockers, 4 confirmed
-majors, 5 confirmed minors, 1 refuted, 2 notes**. Every major landed on
-the gate walk, for the fourth round running, and the pattern is now the
-finding: a scan that must MODEL the shell's word rules to locate the
-command keeps losing to the shell. So the walk was deleted.
+majors, 5 confirmed minors, 1 refuted, 2 notes (neither enumerated
+below — they were folded into the minors)**. All four majors landed
+on the gate walk [amended after round 12: the original sentence said
+"every major … for the fourth round running", which this document's own
+Round-9 section falsifies — round 9's uniform-path `use include as X;`
+major was an ALIAS ARM finding. Rounds 10 and 11 were gate-walk-only;
+round 9 was not], and the pattern is the finding: a scan that must MODEL
+the shell's word rules to locate the command keeps losing to the shell.
+So the walk was deleted.
 
 - **MAJOR — `cargo rustdoc -- --test` cleared the walk.** It puts
   `rustdoc` before the bare `--` and `--test` after it, so the head held
@@ -98,12 +164,18 @@ findings are errors in prose I had written one commit earlier.
   escapes are un-glued before tokenizing. The residual list is now kept
   as HISTORY — three known classes, never "the only" — because round 9
   wrote "the only two" and round 10 produced a third the same day.
+  [This whole bullet describes a walk that no longer exists: round 11
+  deleted it after `cargo rustdoc -- --test` and shell word-splitting
+  defeated it. Read it as history, not as the current mechanism.]
 - **The anti-vacuity floor became a pin.** `invocations >= 5` was how a
   silently ADDED gate hid twice: round 9's flow mapping and round 10's
   `+toolchain` shape both left the count at 7. It now asserts exactly 7,
   so a gate added, removed, or reworded fails loudly and updates this
   test deliberately. Mutation **M53j** (a real gate line rewritten to
-  `cargo build`) observed the pin fire at 6.
+  `cargo build`) observed the pin fire at 6. [Superseded twice: round 11
+  replaced the invocation count with the (30, 26, 2) line triple, and
+  round 12 replaced that with per-line occurrence counts after a
+  compensated deletion held both numbers.]
 - **MINOR ×4, all mine, all the same habit.** "No quoting spelling can
   hide the command" was an absolute falsified by a YAML escape
   (`run: "cargo\ttest"` left one glued token); "two such lines exist in
