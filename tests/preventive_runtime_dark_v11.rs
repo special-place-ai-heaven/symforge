@@ -13,22 +13,25 @@
 //! The rule is fail-closed and LEXER-FREE (C8 ruling, second arm): a line
 //! mentioning a guarded surface passes only as a FULL-LINE comment — first
 //! non-whitespace bytes `//`, after which Rust permits no code on the line
-//! — or as an exactly-allowlisted line. Everything else, string literals
-//! and trailing comments included, is treated as code and FAILS, forcing a
+//! — or as an exactly-allowlisted line. Every mention on a CODE line,
+//! string literals and trailing comments included, FAILS and forces a
 //! human decision. Rounds 1–3 proved every attempted mid-line-comment
 //! lexer laundered a call edge through some literal form; this rule has no
-//! lexer to be wrong.
+//! lexer to be wrong, and round 4's adversarial attack on it was refuted.
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
-//! across directory boundaries. The mechanism sweep judges each line with
-//! whitespace removed, naming any `include!` invocation, any `#[path`
-//! attribute head, and any attribute line carrying a `path=` argument. It
-//! is still a LINE-based text scan: an invocation split across lines, or a
-//! `concat!`/`env!("OUT_DIR")` argument that names the dark directory
-//! without writing its token, escapes it. Those residuals are accepted and
-//! stated rather than parsed away; the guarantee is only that a
-//! single-line splice site in the named spellings cannot appear without a
-//! deliberate allowlist change.
+//! across directory boundaries. The mechanism sweep is a fail-closed
+//! TRIPWIRE over known spellings, not a completeness proof: it names any
+//! `include!` invocation (judged with the LEXER'S whitespace removed, bidi
+//! marks flagged outright), any use-declaration aliasing `include`, any
+//! `#[path` attribute head, and any attribute line carrying a `path=`
+//! argument. What escapes a line-based text scan by construction: an
+//! invocation split across lines, a `concat!`/`env!("OUT_DIR")` argument
+//! naming the dark directory without its token, an alias INVOCATION site
+//! (its mandatory creation site in `src/` is what trips), and any future
+//! spelling not enumerated here. The load-bearing darkness guarantee is
+//! NOT this tripwire — it is the full-line-comment rule of the sweeps
+//! above, applied to every line that lives in `src/`.
 
 use std::path::{Path, PathBuf};
 
@@ -62,7 +65,7 @@ fn is_full_line_comment(line: &str) -> bool {
 
 struct Sweep {
     violations: Vec<String>,
-    allowlisted_seen: Vec<&'static str>,
+    allowlisted_seen: Vec<(&'static str, &'static str)>,
     prose_lines: usize,
     files_scanned: usize,
 }
@@ -101,11 +104,11 @@ fn sweep(
             let Some(token) = matches_line(line) else {
                 continue;
             };
-            if let Some((_, allowed)) = allowlist
+            if let Some(entry) = allowlist
                 .iter()
                 .find(|(f, l)| *f == display && *l == line.trim())
             {
-                result.allowlisted_seen.push(allowed);
+                result.allowlisted_seen.push(*entry);
                 continue;
             }
             if is_full_line_comment(line) {
@@ -172,12 +175,13 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
     // both halves of the one permitted mount, the prose mentions that prove
     // comments are tolerated rather than never encountered, and a file count
     // that says the walk actually walked.
+    let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
-        result.allowlisted_seen.len(),
+        seen.len(),
         2,
         "the live_index mount declaration is the ONE permitted code mention, \
-         in exactly two lines; a moved or reworded mount must update this test \
-         deliberately"
+         in exactly two DISTINCT lines; a moved or reworded mount must update \
+         this test deliberately"
     );
     assert!(
         result.prose_lines > 0,
@@ -245,7 +249,7 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
     assert!(
         result
             .allowlisted_seen
-            .contains(&"pub(crate) mod server_api;"),
+            .contains(&("src/lib.rs", "pub(crate) mod server_api;")),
         "lib.rs no longer declares server_api as pub(crate); if this is the \
          activation cut, update this pin in the same change — if it is not, \
          the census just widened by four atoms"
@@ -253,11 +257,13 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
     // The wrap-table string lines must ALL have been seen: an edited atom
     // string falls off the allowlist and fails above, and a silently deleted
     // one fails here.
+    let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
-        result.allowlisted_seen.len(),
+        seen.len(),
         8,
-        "one lib.rs declaration plus seven wrap-table/delta string lines; an \
-         edit to any of them updates this allowlist deliberately, got: {:?}",
+        "one lib.rs declaration plus seven wrap-table/delta string lines, each \
+         seen as a DISTINCT allowlist entry; an edit to any of them updates \
+         this allowlist deliberately, got: {:?}",
         result.allowlisted_seen
     );
 }
@@ -272,14 +278,31 @@ fn source_splicing_is_allowlisted() {
     // argument inside an attribute. The residuals — a concat!-constructed
     // path, and an attribute form matching none of these spellings — are
     // stated in the file header, not silently absorbed.
-    // Round 3: whitespace is insignificant in macro invocations and
-    // attributes, so the matcher judges the line with ALL whitespace
-    // removed — `include ! (`, `#[ path`, and `path =` collapse to the
-    // canonical spellings and cannot dodge by spacing.
+    // Rounds 3–4: whitespace is insignificant in macro invocations and
+    // attributes, so the matcher judges the line with the LEXER'S
+    // whitespace set removed — `char::is_whitespace` is Unicode
+    // White_Space, but Rust lexes Pattern_White_Space, which additionally
+    // holds the U+200E/U+200F bidi marks (the round-4 dodge). Those two
+    // are also flagged OUTRIGHT: they have no legitimate use in this
+    // source. Round 4 further proved `use std::include as inc;` an
+    // all-ASCII alias route, so any use-declaration naming `include` is
+    // flagged at the alias-creation site.
     let splice_matcher = |line: &str| -> Option<&'static str> {
-        let collapsed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if line.contains('\u{200E}') || line.contains('\u{200F}') {
+            return Some("bidi mark");
+        }
+        let collapsed: String = line
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{200E}' && *c != '\u{200F}')
+            .collect();
         if collapsed.contains("include!") {
             return Some("include!");
+        }
+        let trimmed = line.trim_start();
+        if (trimmed.starts_with("use ") || trimmed.starts_with("pub use "))
+            && collapsed.contains("include")
+        {
+            return Some("use ...include alias");
         }
         if collapsed.contains("#[path") {
             return Some("#[path");
@@ -313,11 +336,13 @@ fn source_splicing_is_allowlisted() {
         "unallowlisted source-splice mechanisms:\n{}",
         result.violations.join("\n")
     );
+    let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
-        result.allowlisted_seen.len(),
+        seen.len(),
         5,
-        "three test-fixture include!(concat!( sites and two #[path] mounts; \
-         a new splice site is a deliberate allowlist change, got: {:?}",
+        "three test-fixture include!(concat!( sites and two #[path] mounts, \
+         each seen as a DISTINCT (file, line) allowlist entry; a new splice \
+         site is a deliberate allowlist change, got: {:?}",
         result.allowlisted_seen
     );
 }

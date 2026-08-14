@@ -181,9 +181,14 @@ does not read them.
    `ServerExit`'s five derives (`Debug`/`Clone`/`Copy`/`PartialEq`/`Eq`,
    likewise unlisted, behind the server gate); and derives
    beyond the contract elsewhere (`Clone`/`PartialEq`/`Eq` on
-   request/result/view records, `Clone`/`Copy`/`PartialEq`/`Eq` on
-   `ReceiptWaitError` and `SourceRuntimePhase`, `Debug` broadly — the
-   Slice 3 oracles need `Debug`). The `*_for_test` probes carry
+   request/result/view records, `Clone` on `EmbedOperationReceipt`,
+   `Clone`/`Copy`/`PartialEq`/`Eq` on `ReceiptWaitError` and
+   `SourceRuntimePhase`, `Debug` broadly — the Slice 3 oracles need
+   `Debug`). Scope note: this entry covers atom-destined TYPES; the
+   boundary module's own scaffolding items — `wrap_table`, `WrapEntry`,
+   `render_export_delta`, the two named constants — are harness/oracle
+   surface that retires with the module's role at activation, not
+   candidates for the embed graph. The `*_for_test` probes carry
    `#[cfg(any(test, feature = "server"))]`: per the Slice 0 predicate rule
    that is PRODUCTION — the probes ship in the published server binary and
    only the embed build sheds them; plain `cfg(test)` is not compilable

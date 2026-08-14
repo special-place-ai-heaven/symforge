@@ -1,5 +1,44 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-4 review and its repairs (PR 3)
+
+Round 4 attacked the round-3 repairs: **3 confirmed majors, 1 refuted, 3
+minor/note**. The refutation is the important one — the adversarial attack
+on the structural prose rule itself (a doctest carrying a call edge on a
+`///` line) was REFUTED, so the load-bearing full-line-comment guarantee
+held its first direct assault. The three confirmed were all completeness
+gaps in the splice TRIPWIRE and the register:
+
+- **Lexer-whitespace gap:** `char::is_whitespace` is Unicode White_Space,
+  but Rust lexes Pattern_White_Space, which additionally holds the
+  U+200E/U+200F bidi marks — `include\u{200E}!(...)` was legal and survived
+  the collapse. Fixed twice over: the collapse now removes the lexer's set,
+  AND any line containing a bidi mark is flagged outright (they have no
+  legitimate use in this source). Mutation **M33** observed caught.
+- **Alias route:** `use std::include as inc;` then `inc!(...)` was a
+  single-line ASCII splice with no matching spelling. Any use-declaration
+  naming `include` is now flagged at the mandatory alias-creation site.
+  Mutation **M34** observed caught.
+- **Register:** `EmbedOperationReceipt`'s `Clone` added, and the entry
+  gains an explicit scope note for the boundary's scaffolding items.
+- The residual statement is REFRAMED to what it is: the splice sweep is a
+  fail-closed tripwire over known spellings, never a completeness proof —
+  the load-bearing darkness guarantee is the full-line-comment rule over
+  everything living in `src/`. The allowlist coverage asserts now count
+  DISTINCT (file, line) pairs, so a duplicate sighting cannot satisfy a
+  coverage claim, and the prose-rule header no longer overstates what
+  string literals do on comment lines.
+
+## Gate results for the round-4 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 3 passed, 0 failed; zero new flags on the tree |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| mutations | M33, M34 each observed caught; restored |
+
 ## Round-3 review and its repairs (PR 3)
 
 Round 3 verified the five round-2 repairs adversarially: **4 confirmed
