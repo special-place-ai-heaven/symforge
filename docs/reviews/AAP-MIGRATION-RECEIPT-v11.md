@@ -188,7 +188,11 @@ does not read them.
    boundary module's own scaffolding items — `wrap_table`, `WrapEntry`,
    `render_export_delta`, the two named constants — are harness/oracle
    surface that retires with the module's role at activation, not
-   candidates for the embed graph. The `*_for_test` probes carry
+   candidates for the embed graph; and `embedded.rs`'s Slice-2 publics
+   (`EmbeddedSourceFactory`, `EmbeddedIdentity`, `CloseReceipt`,
+   `EmbedRefusal`, the internal `SourceCloseReport`) are Slice-2-owned
+   carriers at internal paths, never embed atoms — the activation cut
+   inherits them on the same trim list. The `*_for_test` probes carry
    `#[cfg(any(test, feature = "server"))]`: per the Slice 0 predicate rule
    that is PRODUCTION — the probes ship in the published server binary and
    only the embed build sheds them; plain `cfg(test)` is not compilable

@@ -1,5 +1,48 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-5 review and its repairs (PR 3)
+
+Round 5 attacked the round-4 repairs: **1 confirmed BLOCKER, 2 confirmed
+majors (one defect seen by both verifiers), 0 refuted, 4 minor/note**.
+
+- **The blocker was mine and it was sharp:** round 4's switch from
+  total-count to distinct-count allowlist asserts DELETED round 3's
+  multiplicity bind — an exact duplicate of an allowlisted line (a second
+  `#[path]` mount of the dark directory under an innocuous alias being the
+  worst case) would be silently absorbed with every test green. Fixed by
+  binding BOTH: `(total, distinct) == (N, N)`, so a duplicate and a
+  masked deletion each fail. The compiler independently rejects the
+  double-mount case (duplicate type identities), but duplicable STRING
+  lines were live — mutation **M35** (a duplicated allowlisted delta
+  line, which compiles) observed caught at `(9, 8) != (8, 8)`. This also
+  discharges the same-text-new-site minor.
+- **The alias arm took three attempts to be honest.** The round-4
+  use-prefix test missed `pub(crate)`, tabs, and leading attributes
+  (falsifying "any use-declaration"); a raw word-boundary replacement
+  FLOODED on English prose in assert strings; a naive collapsed
+  path-segment test glued `include as` into `includeas`. The landed form:
+  `include` in path-segment position on the collapsed line (after `::`,
+  `{`, or `,`), boundary-clear or followed by the glued `as` keyword —
+  which every resolvable aliasing form must write at its first hop from
+  the std/core root. Zero flags on the tree; mutation **M36**
+  (attribute-prefixed, `pub(crate)`, tab- and space-riddled alias)
+  observed caught.
+- Minors folded: the dead bidi exclusions inside the collapse are gone
+  (the outright flag owns them); the "LEXER'S whitespace set" comment
+  reworded to what the code does; the register's scope note now covers
+  `embedded.rs`'s Slice-2 publics; the round-4 alias bullet in this
+  document carries its amendment.
+
+## Gate results for the round-5 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 3 passed, 0 failed; zero flags on the tree |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| mutations | M35, M36 each observed caught; restored (M35's double-mount variant additionally rejected by the compiler itself) |
+
 ## Round-4 review and its repairs (PR 3)
 
 Round 4 attacked the round-3 repairs: **3 confirmed majors, 1 refuted, 3
@@ -16,8 +59,11 @@ gaps in the splice TRIPWIRE and the register:
   AND any line containing a bidi mark is flagged outright (they have no
   legitimate use in this source). Mutation **M33** observed caught.
 - **Alias route:** `use std::include as inc;` then `inc!(...)` was a
-  single-line ASCII splice with no matching spelling. Any use-declaration
-  naming `include` is now flagged at the mandatory alias-creation site.
+  single-line ASCII splice with no matching spelling. [Amended after round
+  5: this bullet's "any use-declaration naming `include`" claim was
+  falsified — the use-PREFIX test missed `pub(crate)`, tabs, and leading
+  attributes; the arm now flags `include` in path-segment position on the
+  collapsed line, which every resolvable aliasing form must write.]
   Mutation **M34** observed caught.
 - **Register:** `EmbedOperationReceipt`'s `Clone` added, and the entry
   gains an explicit scope note for the boundary's scaffolding items.

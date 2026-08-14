@@ -21,11 +21,12 @@
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
 //! across directory boundaries. The mechanism sweep is a fail-closed
-//! TRIPWIRE over known spellings, not a completeness proof: it names any
-//! `include!` invocation (judged with the LEXER'S whitespace removed, bidi
-//! marks flagged outright), any use-declaration aliasing `include`, any
-//! `#[path` attribute head, and any attribute line carrying a `path=`
-//! argument. What escapes a line-based text scan by construction: an
+//! TRIPWIRE over known spellings, not a completeness proof: it flags any
+//! collapsed-whitespace `include!` spelling, any `include` in path-segment
+//! position (`::include`/`{include`/`,include` after collapse — the form
+//! every resolvable alias-creation site must write, whatever its
+//! visibility, spacing, or grouping), any `#[path`/`path=` attribute
+//! spelling, and any U+200E/U+200F bidi mark outright. What escapes a line-based text scan by construction: an
 //! invocation split across lines, a `concat!`/`env!("OUT_DIR")` argument
 //! naming the dark directory without its token, an alias INVOCATION site
 //! (its mandatory creation site in `src/` is what trips), and any future
@@ -175,13 +176,17 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
     // both halves of the one permitted mount, the prose mentions that prove
     // comments are tolerated rather than never encountered, and a file count
     // that says the walk actually walked.
+    // Round 5 (blocker): BOTH counts bind. Distinct alone let an exact
+    // DUPLICATE of an allowlisted line — a second mount of the dark
+    // directory under an innocuous alias — be absorbed silently; total
+    // alone could not tell a deletion masked by a duplicate elsewhere.
     let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
-        seen.len(),
-        2,
-        "the live_index mount declaration is the ONE permitted code mention, \
-         in exactly two DISTINCT lines; a moved or reworded mount must update \
-         this test deliberately"
+        (result.allowlisted_seen.len(), seen.len()),
+        (2, 2),
+        "the live_index mount declaration is the ONE permitted code mention: \
+         exactly two allowlisted lines, each seen exactly once; a duplicate \
+         mount or a moved/reworded mount must update this test deliberately"
     );
     assert!(
         result.prose_lines > 0,
@@ -259,10 +264,10 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
     // one fails here.
     let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
-        seen.len(),
-        8,
+        (result.allowlisted_seen.len(), seen.len()),
+        (8, 8),
         "one lib.rs declaration plus seven wrap-table/delta string lines, each \
-         seen as a DISTINCT allowlist entry; an edit to any of them updates \
+         seen EXACTLY ONCE; a duplicate or an edit to any of them updates \
          this allowlist deliberately, got: {:?}",
         result.allowlisted_seen
     );
@@ -278,31 +283,50 @@ fn source_splicing_is_allowlisted() {
     // argument inside an attribute. The residuals — a concat!-constructed
     // path, and an attribute form matching none of these spellings — are
     // stated in the file header, not silently absorbed.
-    // Rounds 3–4: whitespace is insignificant in macro invocations and
-    // attributes, so the matcher judges the line with the LEXER'S
-    // whitespace set removed — `char::is_whitespace` is Unicode
-    // White_Space, but Rust lexes Pattern_White_Space, which additionally
-    // holds the U+200E/U+200F bidi marks (the round-4 dodge). Those two
-    // are also flagged OUTRIGHT: they have no legitimate use in this
-    // source. Round 4 further proved `use std::include as inc;` an
-    // all-ASCII alias route, so any use-declaration naming `include` is
-    // flagged at the alias-creation site.
+    // Rounds 3–5: whitespace is insignificant in macro invocations and
+    // attributes, so every arm judges the line with Unicode White_Space
+    // removed; the two Pattern_White_Space extras the Rust lexer also
+    // accepts (the U+200E/U+200F bidi marks, the round-4 dodge) are
+    // flagged OUTRIGHT — they have no legitimate use in this source. The
+    // alias arm (round 5, after a use-prefix test and a raw word-boundary
+    // test each proved wrong — the first evadable, the second flooded by
+    // prose) flags `include` in PATH-SEGMENT position, which every
+    // resolvable aliasing form must write at its first hop from the
+    // std/core root, whatever its visibility, spacing, or grouping; the
+    // collapse restores adjacency that spacing games remove.
+    // The macro name `include` in path-segment position: preceded by `::`,
+    // `{`, or `,` on the collapsed line, and followed by a non-identifier
+    // character OR by the glued keyword `as` (collapse turns `include as
+    // inc` into `includeasinc`). `include_filtered`/`include_str!` carry a
+    // `_` at the boundary and stay unmatched.
+    fn names_include_segment(collapsed: &str) -> bool {
+        for opener in ["::include", "{include", ",include"] {
+            let mut search_from = 0;
+            while let Some(position) = collapsed[search_from..].find(opener) {
+                let end = search_from + position + opener.len();
+                let tail = &collapsed[end..];
+                let boundary_clear = !tail
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                if boundary_clear || tail.starts_with("as") {
+                    return true;
+                }
+                search_from = end;
+            }
+        }
+        false
+    }
     let splice_matcher = |line: &str| -> Option<&'static str> {
         if line.contains('\u{200E}') || line.contains('\u{200F}') {
             return Some("bidi mark");
         }
-        let collapsed: String = line
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '\u{200E}' && *c != '\u{200F}')
-            .collect();
+        let collapsed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
         if collapsed.contains("include!") {
             return Some("include!");
         }
-        let trimmed = line.trim_start();
-        if (trimmed.starts_with("use ") || trimmed.starts_with("pub use "))
-            && collapsed.contains("include")
-        {
-            return Some("use ...include alias");
+        if names_include_segment(&collapsed) {
+            return Some("include path segment");
         }
         if collapsed.contains("#[path") {
             return Some("#[path");
@@ -338,11 +362,11 @@ fn source_splicing_is_allowlisted() {
     );
     let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
-        seen.len(),
-        5,
+        (result.allowlisted_seen.len(), seen.len()),
+        (5, 5),
         "three test-fixture include!(concat!( sites and two #[path] mounts, \
-         each seen as a DISTINCT (file, line) allowlist entry; a new splice \
-         site is a deliberate allowlist change, got: {:?}",
+         each seen EXACTLY ONCE as a (file, line) allowlist entry; a duplicate \
+         or a new splice site is a deliberate allowlist change, got: {:?}",
         result.allowlisted_seen
     );
 }
