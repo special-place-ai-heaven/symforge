@@ -4,19 +4,25 @@
 //! not grep hits: no code outside that directory names an item in it; the
 //! `#[path]` mount in `live_index/mod.rs` is a declaration, not a call edge;
 //! prose mentions are not edges either. This file formalizes that paragraph
-//! into an executing test, per lane: the daemon, stdio, serve, embed,
+//! into executing tests, per lane: the daemon, stdio, serve, embed,
 //! snapshot, observer, and mutation entry points are all `src/` production
 //! code, so one sweep over `src/` minus the dark directory covers every one
 //! of them — and the lane roots are asserted to EXIST so a moved file cannot
 //! make the claim vacuously true.
 //!
-//! The rule is deliberately fail-closed, no lexer: a line mentioning the
-//! dark surface passes only if the mention sits after `//` on its own line
-//! (prose) or the line is one of the exactly-known mount declarations. A
-//! new string literal or block comment naming the surface in production code
-//! will FAIL this test and force a human decision — safe friction, never a
-//! silent tolerance. Real call edges (`use`/qualified paths) always carry
-//! the token before any `//` and cannot pass.
+//! The rule is fail-closed, no full lexer: a line mentioning a guarded
+//! surface passes only as prose (the token strictly after a `//` that sits
+//! OUTSIDE any string literal — C8 ruling) or as an exactly-allowlisted
+//! line. A novel string literal or block-comment mention FAILS and forces a
+//! human decision — safe friction, never silent tolerance.
+//!
+//! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source across
+//! directory boundaries, and a `concat!`/`env!("OUT_DIR")` argument can name
+//! the dark directory without ever writing its token — that construction is
+//! uncatchable by any token scan, and this file does not claim to catch it.
+//! What it does instead is fail closed on the MECHANISMS: every `include!`
+//! and `#[path]` in `src/` must be on the exact allowlist below, so a new
+//! splice site cannot appear silently.
 
 use std::path::{Path, PathBuf};
 
@@ -35,10 +41,32 @@ fn rust_files_under(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// A line passes for `token` when every occurrence sits after a `//` — the
-/// prose form — so comments and doc comments are tolerated and code is not.
+/// Byte offset of the first `//` that sits OUTSIDE any string literal (C8:
+/// a `//` inside a string must not launder the rest of the line as prose).
+/// The tracker is deliberately conservative: a `'"'` char literal flips the
+/// string state wrongly, which can only HIDE a comment start — the token is
+/// then treated as code and flagged, never silently tolerated.
+fn comment_start_outside_strings(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A line passes for `token` when every occurrence sits after a real `//`.
 fn only_in_line_comment(line: &str, token: &str) -> bool {
-    match line.find("//") {
+    match comment_start_outside_strings(line) {
         Some(comment_start) => !line[..comment_start].contains(token),
         None => false,
     }
@@ -52,8 +80,8 @@ struct Sweep {
 }
 
 fn sweep(
-    token: &str,
-    exclude_dir: &Path,
+    tokens: &[&str],
+    exclude_dir: Option<&Path>,
     exclude_file: Option<&Path>,
     allowlist: &[(&'static str, &'static str)],
 ) -> Sweep {
@@ -67,7 +95,9 @@ fn sweep(
         files_scanned: 0,
     };
     for file in &files {
-        if file.starts_with(exclude_dir) || exclude_file.is_some_and(|f| file == f) {
+        if exclude_dir.is_some_and(|d| file.starts_with(d))
+            || exclude_file.is_some_and(|f| file == f)
+        {
             continue;
         }
         result.files_scanned += 1;
@@ -78,9 +108,9 @@ fn sweep(
             .to_string_lossy()
             .replace('\\', "/");
         for (number, line) in text.lines().enumerate() {
-            if !line.contains(token) {
+            let Some(token) = tokens.iter().find(|t| line.contains(**t)) else {
                 continue;
-            }
+            };
             if let Some((_, allowed)) = allowlist
                 .iter()
                 .find(|(f, l)| *f == display && *l == line.trim())
@@ -88,13 +118,15 @@ fn sweep(
                 result.allowlisted_seen.push(allowed);
                 continue;
             }
-            if only_in_line_comment(line, token) {
+            if tokens.iter().all(|t| only_in_line_comment(line, t)) {
                 result.prose_lines += 1;
                 continue;
             }
-            result
-                .violations
-                .push(format!("{display}:{}: {}", number + 1, line.trim()));
+            result.violations.push(format!(
+                "{display}:{}: [{token}] {}",
+                number + 1,
+                line.trim()
+            ));
         }
     }
     result
@@ -125,8 +157,8 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
     }
 
     let result = sweep(
-        "index_lifecycle",
-        &src_root().join("index_lifecycle"),
+        &["index_lifecycle"],
+        Some(&src_root().join("index_lifecycle")),
         None,
         &[
             (
@@ -169,15 +201,42 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
 #[test]
 fn the_flip_ready_module_is_declared_once_and_never_called() {
     // `server_api::run` staying uncalled is the SIBLING assertion to the
-    // directory sweep above, not a substitute for it. The dark directory is
-    // excluded here by transitivity: it is proven unreachable by the sibling
-    // test, so nothing inside it can be a production ingress to the stub —
-    // its wrap-table STRINGS name the atoms without calling anything.
+    // directory sweep above, not a substitute for it. C10 ruling: the dark
+    // directory is swept too — its wrap-table STRING lines are allowlisted
+    // individually below, so a real `use`/call edge from `index_lifecycle`
+    // into the stub cannot hide behind a directory exemption.
     let result = sweep(
-        "server_api",
-        &src_root().join("index_lifecycle"),
+        &["server_api"],
+        None,
         Some(&src_root().join("server_api.rs")),
-        &[("src/lib.rs", "pub(crate) mod server_api;")],
+        &[
+            ("src/lib.rs", "pub(crate) mod server_api;"),
+            (
+                "src/index_lifecycle/public_api.rs",
+                "atom: \"symforge::server_api\",",
+            ),
+            (
+                "src/index_lifecycle/public_api.rs",
+                "atom: \"symforge::server_api::ServerBootstrapError\",",
+            ),
+            (
+                "src/index_lifecycle/public_api.rs",
+                "atom: \"symforge::server_api::ServerExit\",",
+            ),
+            (
+                "src/index_lifecycle/public_api.rs",
+                "atom: \"symforge::server_api::run\",",
+            ),
+            ("src/index_lifecycle/public_api.rs", "\"server_api\": {"),
+            (
+                "src/index_lifecycle/public_api.rs",
+                "\"form\": \"cfg feature=server gated pub(crate) mod server_api in src/lib.rs, std-only stub\",",
+            ),
+            (
+                "src/index_lifecycle/public_api.rs",
+                "\"activation\": \"one keyword behind the already-present server cfg gate: pub(crate) becomes pub, and the census gains the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them\"",
+            ),
+        ],
     );
 
     assert!(
@@ -189,11 +248,60 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
     // premature keyword flip changes the line, drops it from the allowlist,
     // and fails this test — activation flips the keyword AND this pin in the
     // same deliberate change, never as a tidy-up.
-    assert_eq!(
-        result.allowlisted_seen,
-        vec!["pub(crate) mod server_api;"],
+    assert!(
+        result
+            .allowlisted_seen
+            .contains(&"pub(crate) mod server_api;"),
         "lib.rs no longer declares server_api as pub(crate); if this is the \
          activation cut, update this pin in the same change — if it is not, \
          the census just widened by four atoms"
+    );
+    // The wrap-table string lines must ALL have been seen: an edited atom
+    // string falls off the allowlist and fails above, and a silently deleted
+    // one fails here.
+    assert_eq!(
+        result.allowlisted_seen.len(),
+        8,
+        "one lib.rs declaration plus seven wrap-table/delta string lines; an \
+         edit to any of them updates this allowlist deliberately, got: {:?}",
+        result.allowlisted_seen
+    );
+}
+
+#[test]
+fn source_splicing_is_allowlisted() {
+    // C9 ruling: fail closed on the splice MECHANISMS across all of src/,
+    // the dark directory included. The residual — a concat!-constructed
+    // path — is stated in the file header, not silently absorbed.
+    let result = sweep(
+        &["include!(", "#[path"],
+        None,
+        None,
+        &[
+            ("src/live_index/coupling/lifecycle.rs", "include!(concat!("),
+            ("src/live_index/coupling/walker.rs", "include!(concat!("),
+            ("src/live_index/persist.rs", "include!(concat!("),
+            (
+                "src/live_index/mod.rs",
+                "#[path = \"../index_lifecycle/mod.rs\"]",
+            ),
+            (
+                "src/protocol/format.rs",
+                "#[path = \"claim_provenance.rs\"]",
+            ),
+        ],
+    );
+
+    assert!(
+        result.violations.is_empty(),
+        "unallowlisted source-splice mechanisms:\n{}",
+        result.violations.join("\n")
+    );
+    assert_eq!(
+        result.allowlisted_seen.len(),
+        5,
+        "three test-fixture include!(concat!( sites and two #[path] mounts; \
+         a new splice site is a deliberate allowlist change, got: {:?}",
+        result.allowlisted_seen
     );
 }

@@ -16,14 +16,19 @@ pub mod knowledge;
 // would widen a surface Slice 3 must leave frozen. Modules that expose one of
 // these types publicly re-export it instead.
 pub(crate) mod lifecycle_identity;
-// Feature 020 V11, D4: the REAL server_api module, flip-ready. `pub(crate)` is
-// load-bearing exactly like lifecycle_identity above — the frozen public-API
-// census counts only plain `pub mod` lines, so this adds no atom today, and
-// activation is one keyword. Std-only; no `pub use` anywhere; no call edge
-// into index_lifecycle. Do NOT "tidy" this to `pub mod` before the cut.
+// Feature 020 V11, D4, amended by the C2 ruling (2026-08-14): the REAL
+// server_api module, flip-ready. TWO gates are load-bearing: `pub(crate)`
+// keeps it out of the census until activation flips that one keyword, and
+// the `cfg(feature = "server")` matches the frozen contract's availability
+// column — the embed-v11 projection EXCLUDES this module, so embed cells
+// must never grow its four atoms. D4's earlier "std-only so the embed build
+// compiles it unused" sentence is amended: std-only stays true, but the
+// module no longer compiles under embed at all. No `pub use` anywhere; no
+// call edge into index_lifecycle. Do NOT "tidy" either gate before the cut.
 pub mod live_index;
 pub mod parsing;
 pub mod paths;
+#[cfg(feature = "server")]
 pub(crate) mod server_api;
 // Watcher state snapshot types (data only) — used by engine health stats; the
 // notify-based watcher runtime lives in the server-gated `watcher` module.

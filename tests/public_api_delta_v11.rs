@@ -152,14 +152,20 @@ fn export_delta_matches_frozen_contract_atoms() {
     // flip-ready, invisible to the census until activation.
     let lib = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("lib.rs");
+    // Whitespace-tolerant, aligned with the checker's regex rather than a
+    // literal prefix (the census-parser divergence minor).
     let live_mods: BTreeSet<String> = lib
         .lines()
         .filter_map(|line| {
-            let trimmed = line.trim_start();
-            trimmed
-                .strip_prefix("pub mod ")
-                .and_then(|rest| rest.strip_suffix(';'))
-                .map(|name| format!("symforge::{name}"))
+            let mut words = line.split_whitespace();
+            if words.next() != Some("pub") || words.next() != Some("mod") {
+                return None;
+            }
+            let name = words.next()?.strip_suffix(';')?;
+            if words.next().is_some() || name.is_empty() {
+                return None;
+            }
+            Some(format!("symforge::{name}"))
         })
         .collect();
     assert!(
@@ -188,21 +194,85 @@ fn export_delta_matches_frozen_contract_atoms() {
         "D12/D13: no embed atom may be satisfied by a 1:1 re-export of an internal path"
     );
 
-    // The checked-in delta equals the recomputation. Regeneration is a
-    // DELIBERATE act behind the same env opt-in pattern as the closure
-    // census: the write happens, and the comparison below still runs.
-    let recomputed = public_api::render_export_delta(&contract_text, &lib);
+    // C7 ruling: `verbatim-reexport` covers EXACTLY the three enums minted
+    // contract-verbatim in lifecycle_identity, and the claim is checked
+    // against the module's SOURCE — an actual `pub use` — never trusted as a
+    // self-report in the table.
+    let verbatim: BTreeSet<&str> = table
+        .iter()
+        .filter(|e| e.obligation == "verbatim-reexport")
+        .map(|e| e.atom)
+        .collect();
+    assert_eq!(
+        verbatim,
+        [
+            "symforge::embed::OperationKind",
+            "symforge::embed::RetryAdvice",
+            "symforge::embed::SourceRefusalKind",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>(),
+        "the third vocabulary word covers exactly the contract-verbatim enums"
+    );
+    let module_source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/index_lifecycle/public_api.rs"
+    ))
+    .expect("boundary module source");
+    let reexport_line = module_source
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .starts_with("pub use crate::lifecycle_identity::")
+        })
+        .expect("the nameability re-export exists in the boundary module");
+    for name in ["OperationKind", "RetryAdvice", "SourceRefusalKind"] {
+        assert!(
+            reexport_line.contains(name),
+            "the re-export names {name}: {reexport_line}"
+        );
+    }
+
+    // The checked-in delta equals the recomputation. The comparison binds
+    // the PRE-WRITE checked-in content (C14 ruling): a regeneration run on a
+    // stale artifact FAILS while writing the fix, and the rerun WITHOUT the
+    // opt-in is the verification — never a write-then-compare tautology.
+    let checked_in_text = std::fs::read_to_string(delta_path).expect("delta file exists");
+    let recomputed_text = public_api::render_export_delta(&contract_text, &lib);
     if std::env::var("SYMFORGE_WRITE_DELTA").as_deref() == Ok("1") {
-        std::fs::write(delta_path, &recomputed).expect("write regenerated delta");
+        std::fs::write(delta_path, &recomputed_text).expect("write regenerated delta");
     }
     let checked_in: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(delta_path).expect("delta file exists"))
-            .expect("delta is closed JSON");
+        serde_json::from_str(&checked_in_text).expect("delta is closed JSON");
     let recomputed: serde_json::Value =
-        serde_json::from_str(&recomputed).expect("recomputed delta is closed JSON");
+        serde_json::from_str(&recomputed_text).expect("recomputed delta is closed JSON");
     assert_eq!(
         checked_in, recomputed,
-        "the checked-in delta must equal the recomputation from the frozen \
-         contract minus the live census; regenerate deliberately if this fails"
+        "the checked-in delta must equal the recomputation; regenerate \
+         deliberately if this fails — a write-mode run asserts against the \
+         PRE-write content, so it reports the drift it just repaired"
+    );
+
+    // C14's subtraction, pinned INDEPENDENTLY of the renderer: this leg's
+    // own contract atoms minus this leg's own census must equal the
+    // artifact's field — exact match, so V10's live `pub mod embed` must
+    // never launder the 60 missing embed item atoms out of the delta.
+    let expected_minus: Vec<&String> = atoms
+        .iter()
+        .filter(|atom| !live_mods.contains(*atom))
+        .collect();
+    let recorded_minus: Vec<&str> = recomputed["introduced_minus_live"]
+        .as_array()
+        .expect("introduced_minus_live array")
+        .iter()
+        .map(|value| value.as_str().expect("atom string"))
+        .collect();
+    assert_eq!(
+        recorded_minus,
+        expected_minus
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        "the artifact's subtraction must equal an independent recomputation"
     );
 }

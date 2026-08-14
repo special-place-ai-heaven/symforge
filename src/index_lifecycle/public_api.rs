@@ -380,13 +380,29 @@ pub struct EmbedShutdownReceipt {
 
 impl EmbedShutdownReceipt {
     /// The contract wait. Nothing is spawned in the dark modules, so the
-    /// deadline can never be reached and is deliberately unused.
-    pub fn wait(&self, _deadline: std::time::Instant) -> Result<ShutdownReport, ReceiptWaitError> {
+    /// deadline can never be reached; the parameter keeps its contract name
+    /// and the dark lane records that it does not read it.
+    pub fn wait(&self, deadline: std::time::Instant) -> Result<ShutdownReport, ReceiptWaitError> {
+        let _ = deadline;
         Ok(ShutdownReport {
             closed_sources: 0,
             joined_workers: 0,
         })
     }
+}
+
+/// The public runtime phase, contract-verbatim, OWNED BY THE BOUNDARY (C7
+/// ruling): `runtime::SourceRuntimePhase` is an internal path, and a public
+/// field typed by it would be a D12 path-identity leak through the embed
+/// surface. Same six variants; the mapping is total and explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRuntimePhase {
+    Blocked,
+    Current,
+    Loading,
+    Refreshing,
+    Stopped,
+    Stopping,
 }
 
 /// The public view of one source's runtime state, contract field-for-field.
@@ -395,7 +411,7 @@ pub struct SourceRuntimeView {
     pub binding_identity: String,
     pub current_publication_identity: Option<String>,
     pub observer_epoch: u64,
-    pub phase: super::runtime::SourceRuntimePhase,
+    pub phase: SourceRuntimePhase,
     pub source_version: u64,
 }
 
@@ -404,7 +420,7 @@ pub struct SourceRuntimeView {
 pub(crate) fn dark_unbound_refusal(kind: OperationKind) -> EmbedSourceRefusal {
     EmbedSourceRefusal::wrap(&SourceRefusal::for_runtime(
         SourceRefusalKind::SourceUnavailable,
-        OperationReceipt::for_test(kind),
+        OperationReceipt::for_dark_refusal(kind),
         RetryAdvice::OnEvent,
         None,
     ))
@@ -458,18 +474,18 @@ impl ProcessRuntimeApi {
     ) -> Result<super::embedded::EmbeddedSourceHandle, EmbedSourceRefusal> {
         let key = super::registry::ProjectKey::new(spec.root.to_string_lossy());
         self.factory.open(key).map_err(|refusal| {
-            let kind = match refusal {
-                super::embedded::EmbedRefusal::SourceAlreadyOpen { .. } => {
-                    SourceRefusalKind::SelectionUnavailable
-                }
-                super::embedded::EmbedRefusal::WouldSelfWait
-                | super::embedded::EmbedRefusal::AlreadyClosed => {
-                    SourceRefusalKind::SourceUnavailable
-                }
+            // D18, ratified and NARROWED: open() refuses only SourceAlreadyOpen
+            // (M14 pinned that), so the two arms that mapped refusals open()
+            // cannot produce are deleted rather than given dead kind mappings.
+            // The held_by identity is an EmbeddedIdentity, not an
+            // AuthorityIdentity — surfacing it as refusal evidence would MINT,
+            // so the sentinel stands.
+            let super::embedded::EmbedRefusal::SourceAlreadyOpen { .. } = refusal else {
+                unreachable!("EmbeddedSourceFactory::open refuses only SourceAlreadyOpen")
             };
             EmbedSourceRefusal::wrap(&SourceRefusal::for_runtime(
-                kind,
-                OperationReceipt::for_test(OperationKind::OpenEmbeddedSource),
+                SourceRefusalKind::SelectionUnavailable,
+                OperationReceipt::for_dark_refusal(OperationKind::OpenEmbeddedSource),
                 RetryAdvice::OnEvent,
                 None,
             ))
@@ -486,6 +502,7 @@ impl ProcessRuntimeApi {
     }
 
     /// Fixture probe: the wrapper's honest dark refusal, for shape oracles.
+    #[cfg(any(test, feature = "server"))]
     pub fn refusal_probe_for_test(&self) -> Result<(), EmbedSourceRefusal> {
         Err(dark_unbound_refusal(OperationKind::SearchSymbols))
     }
@@ -498,6 +515,12 @@ impl ProcessRuntimeApi {
 ///
 /// * `"wrapped-here"` — a contract-shaped wrapper exists in this module or on
 ///   the SEAM-pinned handle, exercised by the shape oracle.
+/// * `"verbatim-reexport"` — the C7 ruling's third word: the internal type
+///   was MINTED contract-verbatim (the `lifecycle_identity` enums) and this
+///   module makes it nameable by an actual `pub use` — which the delta
+///   oracle verifies against the source, never trusting this self-report.
+///   Distinct from the banned `"direct-reexport"`: nothing pre-existing
+///   leaks; the type exists only because the contract named it.
 /// * `"wrap-planned-t049"` — RETIRED vocabulary: T048 recorded the nine
 ///   shape-diverging types (the D13 list) under it so they could not be
 ///   forgotten; T049 discharged all nine into `"wrapped-here"` wrappers.
@@ -538,7 +561,7 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::OperationKind",
-            obligation: "wrapped-here",
+            obligation: "verbatim-reexport",
         },
         WrapEntry {
             atom: "symforge::embed::OperationReceipt",
@@ -558,7 +581,7 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::RetryAdvice",
-            obligation: "wrapped-here",
+            obligation: "verbatim-reexport",
         },
         WrapEntry {
             atom: "symforge::embed::ShutdownReceipt",
@@ -582,7 +605,7 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::SourceRefusalKind",
-            obligation: "wrapped-here",
+            obligation: "verbatim-reexport",
         },
         WrapEntry {
             atom: "symforge::embed::SourceRuntimePhase",
@@ -652,13 +675,18 @@ pub fn render_export_delta(contract_text: &str, lib_text: &str) -> String {
         .collect();
     let live_mods: BTreeSet<String> = lib_text
         .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            trimmed
-                .strip_prefix("pub mod ")
-                .and_then(|rest| rest.strip_suffix(';'))
-                .map(|name| format!("symforge::{name}"))
-        })
+        .filter_map(parse_pub_mod)
+        .map(|name| format!("symforge::{name}"))
+        .collect();
+    // C14: the subtraction the artifact CLAIMS is the subtraction the
+    // renderer PERFORMS — exact-match only: an atom drops out when it
+    // appears VERBATIM in the live pub-mod census. A first draft keyed this
+    // on the top-level module and wrongly subtracted all embed item atoms
+    // because V10's `pub mod embed` exists — module existence is not item
+    // existence.
+    let introduced_minus_live: Vec<&String> = atoms
+        .iter()
+        .filter(|atom| !live_mods.contains(*atom))
         .collect();
 
     let obligations: Vec<serde_json::Value> = wrap_table()
@@ -675,9 +703,10 @@ pub fn render_export_delta(contract_text: &str, lib_text: &str) -> String {
         "kind": "symforge-feature-020-export-delta",
         "schema_version": 1,
         "contract_sha256": contract_sha,
-        "computed_as": "public-api-v11.json introduced_v11_atoms minus the live pub-mod census of src/lib.rs",
+        "computed_as": "introduced_v11_atoms listed verbatim; introduced_minus_live is that list with every atom that already appears verbatim in the live pub-mod census of src/lib.rs subtracted",
         "live_census_pub_mods": live_mods.iter().collect::<Vec<_>>(),
         "introduced_atoms": atoms,
+        "introduced_minus_live": introduced_minus_live,
         "obligations": obligations,
         "forbidden_at_activation": [
             {
@@ -690,9 +719,23 @@ pub fn render_export_delta(contract_text: &str, lib_text: &str) -> String {
             }
         ],
         "server_api": {
-            "form": "pub(crate) mod server_api in src/lib.rs, std-only stub",
-            "activation": "one keyword: pub(crate) becomes pub; the census gains the four server_api atoms at that instant and never before"
+            "form": "cfg feature=server gated pub(crate) mod server_api in src/lib.rs, std-only stub",
+            "activation": "one keyword behind the already-present server cfg gate: pub(crate) becomes pub, and the census gains the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them"
         }
     });
     serde_json::to_string_pretty(&delta).expect("delta serializes")
+}
+
+/// Parse one `pub mod NAME;` census line, tolerant of interior whitespace —
+/// aligned with the checker's regex rather than a stricter literal prefix.
+fn parse_pub_mod(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace();
+    if words.next() != Some("pub") || words.next() != Some("mod") {
+        return None;
+    }
+    let name = words.next()?.strip_suffix(';')?;
+    if words.next().is_some() || name.is_empty() {
+        return None;
+    }
+    Some(name)
 }

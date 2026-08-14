@@ -217,7 +217,18 @@ impl OperationReceipt {
     }
 
     /// Fixture constructor for oracles that do not vary the arguments.
+    #[cfg(any(test, feature = "server"))]
     pub fn for_test(operation_kind: OperationKind) -> Self {
+        Self::for_dark_refusal(operation_kind)
+    }
+
+    /// Mint the receipt for a DARK refusal lane (C5 ruling). The lane did
+    /// not examine its arguments, so hashing them would claim a binding that
+    /// did not happen — the canonical hash covers the OPERATION KIND alone,
+    /// and the D-ledger records that argument identity is NOT claimed on
+    /// these lanes. Slice 4 replaces this with `normalized` at the point a
+    /// lane actually reads its arguments.
+    pub(crate) fn for_dark_refusal(operation_kind: OperationKind) -> Self {
         Self::normalized(operation_kind, operation_kind.kind_name().as_bytes())
     }
 

@@ -244,13 +244,22 @@ impl EmbeddedSourceHandle {
 
     /// V11 (E1): the public view of this source's runtime state, contract
     /// field-for-field. A dark handle has NO publication and NO observer, and
-    /// the view says so rather than inventing either.
+    /// the view says so rather than inventing either. The phase comes from
+    /// the flag this handle OWNS (C4 ruling): a closed source reports
+    /// `Stopped` — the dark close performs synchronously, so nothing is ever
+    /// observably `Stopping` — and reporting `Loading` for it would be a
+    /// claim about a source that no longer exists.
     pub fn runtime_view(&self) -> super::public_api::SourceRuntimeView {
+        let phase = if self.closed.load(Ordering::Acquire) {
+            super::public_api::SourceRuntimePhase::Stopped
+        } else {
+            super::public_api::SourceRuntimePhase::Loading
+        };
         super::public_api::SourceRuntimeView {
             binding_identity: format!("source-{}", self.identity.raw()),
             current_publication_identity: None,
             observer_epoch: 0,
-            phase: super::runtime::SourceRuntimePhase::Loading,
+            phase,
             source_version: 0,
         }
     }
@@ -262,11 +271,15 @@ impl EmbeddedSourceHandle {
     /// how it was produced, which nothing dark can mint.
     pub fn search_symbols(
         &self,
-        _request: &super::public_api::SymbolSearchRequest,
+        request: &super::public_api::SymbolSearchRequest,
     ) -> Result<
         super::public_api::EmbedClaim<super::public_api::SymbolSearchResult>,
         super::public_api::EmbedSourceRefusal,
     > {
+        // The dark lane does not read the request — consistent with the C5
+        // ruling that argument identity is not claimed by these refusals —
+        // but the parameter keeps its contract-normative name.
+        let _ = request;
         Err(super::public_api::dark_unbound_refusal(
             crate::lifecycle_identity::OperationKind::SearchSymbols,
         ))
@@ -276,11 +289,12 @@ impl EmbeddedSourceHandle {
     /// same claim-carrying Ok arm (T049).
     pub fn search_text(
         &self,
-        _request: &super::public_api::TextSearchRequest,
+        request: &super::public_api::TextSearchRequest,
     ) -> Result<
         super::public_api::EmbedClaim<super::public_api::TextSearchResult>,
         super::public_api::EmbedSourceRefusal,
     > {
+        let _ = request;
         Err(super::public_api::dark_unbound_refusal(
             crate::lifecycle_identity::OperationKind::SearchText,
         ))
@@ -301,6 +315,7 @@ impl EmbeddedSourceHandle {
     /// source and attempts to wait on its own close receipt from inside it —
     /// which must refuse with [`ReceiptWaitError::WouldSelfWait`] rather than
     /// deadlock.
+    #[cfg(any(test, feature = "server"))]
     pub fn self_wait_probe_for_test(&self) -> Result<SourceCloseReport, ReceiptWaitError> {
         let receipt = self.begin_close();
         self.finalize(|| receipt.wait_for_test())
@@ -379,8 +394,9 @@ impl SourceCloseReceipt {
     /// reports.
     pub fn wait(
         &self,
-        _deadline: std::time::Instant,
+        deadline: std::time::Instant,
     ) -> Result<super::public_api::SourceCloseReport, ReceiptWaitError> {
+        let _ = deadline;
         if FINALIZING.with(std::cell::Cell::get) == Some(self.identity) {
             return Err(ReceiptWaitError::WouldSelfWait);
         }
@@ -394,6 +410,7 @@ impl SourceCloseReceipt {
     /// record (T047's oracle shape). Refuses a self-wait; completes
     /// immediately otherwise, because the close performed synchronously and
     /// only observed completions may be reported.
+    #[cfg(any(test, feature = "server"))]
     pub fn wait_for_test(&self) -> Result<SourceCloseReport, ReceiptWaitError> {
         if FINALIZING.with(std::cell::Cell::get) == Some(self.identity) {
             return Err(ReceiptWaitError::WouldSelfWait);

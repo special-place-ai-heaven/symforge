@@ -31,9 +31,13 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 
 use crate::lifecycle_identity::{
-    AuthorityIdentity, GenerationAuthority, GenerationIdentity, ObserverToken, OperationKind,
-    OperationReceipt, PublicationIdentity, RetryAdvice, SourceRefusal, SourceRefusalKind,
+    AuthorityIdentity, GenerationAuthority, ObserverToken, OperationKind, OperationReceipt,
+    PublicationIdentity, RetryAdvice, SourceRefusal, SourceRefusalKind,
 };
+// Consumed only by the C3-gated probes; the plain embed build sheds it with
+// them (the embed-gate unused-import class CLAUDE.md documents).
+#[cfg(any(test, feature = "server"))]
+use crate::lifecycle_identity::GenerationIdentity;
 
 use super::registry::ProjectKey;
 
@@ -48,6 +52,15 @@ pub struct DarkRuntimeFactory {
 
 impl DarkRuntimeFactory {
     /// Fixture constructor: the real root lease arrives with Slice 4.
+    ///
+    /// C3 ruling: every `*_for_test` probe carries
+    /// `#[cfg(any(test, feature = "server"))]` so it CANNOT survive into an
+    /// activated embed surface. Plain `#[cfg(test)]` is not compilable here —
+    /// the Slice 3 oracles live in `tests/`, an external crate built without
+    /// the lib's `test` cfg — so the `server` disjunct keeps the oracles
+    /// building while the embed build sheds every probe; the divergence
+    /// register carries the remainder as the activation trim list.
+    #[cfg(any(test, feature = "server"))]
     pub fn for_test_root(root: &str) -> Self {
         Self {
             root: root.to_string(),
@@ -246,6 +259,7 @@ impl DarkMutationPermit {
     /// A proven no-op rollback. Consumes the permit; the source stays
     /// non-current, because FR-043 forbids restoring the prior publication
     /// even when nothing was written.
+    #[cfg(any(test, feature = "server"))]
     pub fn rollback_with_no_side_effect_proof_for_test(self) {}
 }
 
@@ -257,6 +271,7 @@ pub struct DarkShutdownReceipt {
 }
 
 impl DarkShutdownReceipt {
+    #[cfg(any(test, feature = "server"))]
     pub fn wait_for_test(self) -> Result<DarkShutdownReport, SourceRefusal> {
         Ok(DarkShutdownReport { joined_workers: 0 })
     }
@@ -296,12 +311,14 @@ impl ProjectIndexRuntime {
 
     /// Admit a source that is still loading: it retains NOTHING and is
     /// therefore not queryable.
+    #[cfg(any(test, feature = "server"))]
     pub fn admit_loading_source_for_test(&self, _name: &str) -> DarkSourceHandle {
         self.insert_source(SourceRuntimeState::Loading)
     }
 
     /// Admit a source straight at `Current` with a complete verified
     /// generation — the fixture family's unconditional evidence.
+    #[cfg(any(test, feature = "server"))]
     pub fn admit_current_source_for_test(&self, _name: &str) -> DarkSourceHandle {
         let generation = Arc::new(VerifiedGeneration {
             generation_authority: Arc::new(GenerationAuthority::captured(
@@ -316,6 +333,7 @@ impl ProjectIndexRuntime {
 
     /// Enter a reload-shaped refresh: the current generation becomes the
     /// retention, untouched, and stays a queryable lane until a permit exists.
+    #[cfg(any(test, feature = "server"))]
     pub fn begin_reload_refresh_for_test(&self, source: &DarkSourceHandle) {
         self.transition(source, |state| match state {
             SourceRuntimeState::Current { generation } => SourceRuntimeState::Refreshing {
@@ -328,6 +346,7 @@ impl ProjectIndexRuntime {
 
     /// Grant the refresh its mutation permit. From this instant the retention
     /// stops being a lane (R20A), BEFORE any side effect can run.
+    #[cfg(any(test, feature = "server"))]
     pub fn grant_mutation_permit_for_test(
         &self,
         source: &DarkSourceHandle,
@@ -346,10 +365,11 @@ impl ProjectIndexRuntime {
         if granted {
             Ok(DarkMutationPermit { _sealed: () })
         } else {
-            Err(self.refusal(None))
+            Err(self.refusal(OperationKind::RefreshSource, None))
         }
     }
 
+    #[cfg(any(test, feature = "server"))]
     pub fn block_source_for_test(&self, source: &DarkSourceHandle) {
         self.transition(source, |state| {
             let retained = retained_of(state);
@@ -359,6 +379,7 @@ impl ProjectIndexRuntime {
         });
     }
 
+    #[cfg(any(test, feature = "server"))]
     pub fn stop_source_for_test(&self, source: &DarkSourceHandle) {
         self.transition(source, |state| {
             let retained = retained_of(state);
@@ -370,6 +391,7 @@ impl ProjectIndexRuntime {
 
     /// Complete the stop: the REGISTRY tombstones the source. The machine
     /// itself never holds a `Stopped` state — the public phase derives it.
+    #[cfg(any(test, feature = "server"))]
     pub fn complete_stop_for_test(&self, source: &DarkSourceHandle) {
         let mut sources = self.sources.lock().expect("runtime lock");
         if let Some(entry) = sources.get_mut(&source.0) {
@@ -385,10 +407,10 @@ impl ProjectIndexRuntime {
     pub fn acquire_strict(&self, source: &DarkSourceHandle) -> Result<StrictLease, SourceRefusal> {
         let sources = self.sources.lock().expect("runtime lock");
         let Some(entry) = sources.get(&source.0) else {
-            return Err(self.refusal(None));
+            return Err(self.refusal(OperationKind::AcquireRuntime, None));
         };
         if entry.tombstoned {
-            return Err(self.refusal(None));
+            return Err(self.refusal(OperationKind::AcquireRuntime, None));
         }
         match &entry.state {
             SourceRuntimeState::Current { generation } => Ok(StrictLease {
@@ -403,10 +425,12 @@ impl ProjectIndexRuntime {
             SourceRuntimeState::Refreshing {
                 retained,
                 permit_issued: true,
-            } => Err(self.refusal(Some(retained.identity()))),
+            } => Err(self.refusal(OperationKind::AcquireRuntime, Some(retained.identity()))),
             SourceRuntimeState::Loading
             | SourceRuntimeState::Blocked { .. }
-            | SourceRuntimeState::Stopping { .. } => Err(self.refusal(None)),
+            | SourceRuntimeState::Stopping { .. } => {
+                Err(self.refusal(OperationKind::AcquireRuntime, None))
+            }
         }
     }
 
@@ -439,13 +463,13 @@ impl ProjectIndexRuntime {
     ) -> Result<SourceView, SourceRefusal> {
         let first = self.publication.load();
         if first.source_publication(source).is_none() {
-            return Err(self.refusal(None));
+            return Err(self.refusal(OperationKind::AcquireRuntime, None));
         }
         let revalidated = self.publication.load();
         if revalidated.publication_identity() != first.publication_identity() {
             // Drift between load and revalidate: refuse rather than compose
             // two publications; the retrying capture is Slice 4 work.
-            return Err(self.refusal(None));
+            return Err(self.refusal(OperationKind::AcquireRuntime, None));
         }
         Ok(SourceView {
             publication_identity: revalidated.publication_identity(),
@@ -455,6 +479,7 @@ impl ProjectIndexRuntime {
 
     /// Begin the dark shutdown. Nothing was spawned, so there is nothing to
     /// signal; the receipt's wait reports what was observed: zero joins.
+    #[cfg(any(test, feature = "server"))]
     pub fn begin_shutdown_for_test(&self) -> DarkShutdownReceipt {
         DarkShutdownReceipt { _sealed: () }
     }
@@ -531,10 +556,13 @@ impl ProjectIndexRuntime {
     /// A strict-acquisition refusal, naming the evidence that was examined
     /// when there was any: a permit-holding refresh names its retention; the
     /// evidence-free states name nothing rather than minting.
-    fn refusal(&self, evidence: Option<AuthorityIdentity>) -> SourceRefusal {
+    /// Mint the runtime's honest dark refusal. The receipt is the C5-ruled
+    /// dark constructor — argument identity is NOT claimed on these lanes —
+    /// and the kind names the operation that actually refused, per call site.
+    fn refusal(&self, kind: OperationKind, evidence: Option<AuthorityIdentity>) -> SourceRefusal {
         SourceRefusal::for_runtime(
             SourceRefusalKind::SourceUnavailable,
-            OperationReceipt::for_test(OperationKind::AcquireRuntime),
+            OperationReceipt::for_dark_refusal(kind),
             RetryAdvice::OnEvent,
             evidence,
         )

@@ -57,12 +57,27 @@ pub mod embed {
         EmbedShutdownReceipt as ShutdownReceipt, EmbedSourceRefusal as SourceRefusal,
         EmbeddedSourceSpec, OperationKind, ProcessRuntimeApi as ProcessIndexRuntime,
         RetryAdvice, ShutdownReport, SourceCloseReport, SourceRefusalKind,
-        SourceRuntimeView, SymbolMatch, SymbolSearchRequest, SymbolSearchResult,
-        TextMatch, TextSearchRequest, TextSearchResult,
+        SourceRuntimePhase, SourceRuntimeView, SymbolMatch, SymbolSearchRequest,
+        SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult,
     };
-    pub use symforge::live_index::index_lifecycle::runtime::SourceRuntimePhase;
 }
 """
+
+# C16: the positive sentinels only prove PRESENCE in the union, which an
+# over-inclusive cfg evaluator satisfies trivially. These are closed expected
+# ABSENCES, hand-derived from graph-cover.json's own target/feature facts —
+# an evaluator that says yes to everything fails every row.
+NEGATIVE_SENTINELS = [
+    ("WindowsOnly", "x86_64-unknown-linux-gnu__embed"),
+    ("Aarch64Only", "x86_64-pc-windows-msvc__server"),
+    ("MacosOnly", "x86_64-unknown-linux-musl__embed"),
+    ("MsvcOnly", "x86_64-unknown-linux-gnu__embed"),
+    ("NotServer", "x86_64-pc-windows-msvc__server"),
+    ("PureEmbed", "x86_64-unknown-linux-gnu__server-embed"),
+    ("Atomic128", "x86_64-unknown-linux-gnu__embed"),
+    ("EmbedEnabled", "x86_64-apple-darwin__server"),
+    ("CbmSpikeEnabled", "x86_64-unknown-linux-gnu__embed"),
+]
 
 RESOLUTION_CODES = {"E0412", "E0425", "E0432", "E0433", "E0603"}
 
@@ -275,6 +290,16 @@ def build_env():
 
 CARGO_ENV = None
 
+# (needle, replacement) pairs applied to every recorded diagnostic so the
+# committed artifact carries no machine-specific absolute paths.
+SANITIZE = []
+
+
+def sanitize(text: str) -> str:
+    for needle, replacement in SANITIZE:
+        text = text.replace(needle, replacement)
+    return text
+
 
 def cargo_check(ws_root: Path, package: str, target_dir: Path):
     global CARGO_ENV
@@ -294,6 +319,7 @@ def cargo_check(ws_root: Path, package: str, target_dir: Path):
         errors="replace",
     )
     errors = []
+    dependency_error = False
     for line in proc.stdout.splitlines():
         try:
             msg = json.loads(line)
@@ -304,15 +330,21 @@ def cargo_check(ws_root: Path, package: str, target_dir: Path):
         message = msg.get("message", {})
         if message.get("level") != "error":
             continue
+        # C15: an error raised while compiling a DEPENDENCY must not be
+        # attributed to the case under test.
+        if package not in str(msg.get("package_id", "")):
+            dependency_error = True
+            continue
         code = (message.get("code") or {}).get("code")
-        errors.append({"code": code, "text": message.get("message", "")})
+        errors.append({"code": code, "text": sanitize(message.get("message", ""))})
     primary = next((e["code"] for e in errors if e["code"]), None)
     return {
         "exit_code": proc.returncode,
         "primary_code": primary,
         "error_count": len(errors),
+        "dependency_error": dependency_error,
         "first_errors": errors[:3],
-        "stderr_tail": proc.stderr[-1200:] if proc.returncode != 0 else "",
+        "stderr_tail": sanitize(proc.stderr[-1200:]) if proc.returncode != 0 else "",
     }
 
 
@@ -373,26 +405,46 @@ def expand_cases(fixture_dir: Path):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--work", type=Path, required=True)
+    parser.add_argument("--work", type=Path, default=None,
+                        help="scratch root; defaults to <repo>/target/aap-harness")
     parser.add_argument("--stage", choices=("red", "full"), default="full")
-    parser.add_argument("--json-out", type=Path, required=True)
+    parser.add_argument("--json-out", type=Path, default=None,
+                        help="defaults to <repo>/docs/reviews/AAP-MIGRATION-RECEIPT-v11.json")
+    parser.add_argument("--check", action="store_true",
+                        help="C12: exit nonzero unless every gated expectation held")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
-    work = args.work.resolve()
+    work = (args.work or repo / "target" / "aap-harness").resolve()
+    json_out = (args.json_out or repo / "docs" / "reviews" / "AAP-MIGRATION-RECEIPT-v11.json").resolve()
+    SANITIZE.extend([
+        (str(work), "<work>"),
+        (work.as_posix(), "<work>"),
+        (str(repo), "<repo>"),
+        (repo.as_posix(), "<repo>"),
+    ])
     fixture_dir = repo / "tests" / "fixtures" / "public-api-v11-consumer"
     commit = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
+    # C17: repo_commit names a commit; the tree must be OBSERVED to be that
+    # commit, so cleanliness is recorded — and gated in check mode.
+    dirty_lines = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()
 
     report = {
         "kind": "symforge.t049_aap_migration_receipt_run",
         "schema_version": 1,
         "stage": args.stage,
         "repo_commit": commit,
+        "worktree_dirty": bool(dirty_lines),
+        "worktree_dirty_paths": len(dirty_lines),
         "claims_v11_exports_live": False,
         "c_compiler": build_env().get("CC", "toolchain-default"),
+        "rerun_command": "python execution/aap_migration_receipt_v11.py --stage full --check",
     }
 
     # The generated all-cfg inventory (no compiler required — pure cfg math
@@ -401,6 +453,14 @@ def main() -> int:
     report["all_cfg_inventory_sha256"] = inventory_sha
     report["all_cfg_sentinels"] = inventory["sentinels"]
     report["all_cfg_cell_count"] = inventory["cell_count"]
+    report["all_cfg_negative_sentinels"] = [
+        {
+            "symbol": symbol,
+            "cell": cell,
+            "absent_as_expected": symbol not in inventory["cells"][cell],
+        }
+        for symbol, cell in NEGATIVE_SENTINELS
+    ]
     (work / "all-cfg-inventory.json").parent.mkdir(parents=True, exist_ok=True)
     (work / "all-cfg-inventory.json").write_text(
         json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8"
@@ -479,9 +539,10 @@ def main() -> int:
     report["dependent_positive"]["outcome"] = classify(report["dependent_positive"], [])
 
     if args.stage == "red":
-        args.json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        print(f"[t049] RED stage written to {args.json_out}", file=sys.stderr)
-        return 0
+        report["check_failures"] = check_failures(report)
+        json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"[t049] RED stage written to {json_out}", file=sys.stderr)
+        return finish(args, report)
 
     results = []
     for number, case in enumerate(cases, 1):
@@ -519,9 +580,48 @@ def main() -> int:
     report["case_results"] = results
     report["case_summary"] = summary
     report["case_count"] = len(cases)
-    args.json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"[t049] full run written to {args.json_out}", file=sys.stderr)
+    report["check_failures"] = check_failures(report)
+    json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"[t049] full run written to {json_out}", file=sys.stderr)
     print(json.dumps(summary, indent=2))
+    return finish(args, report)
+
+
+def check_failures(report):
+    """C12: the harness has explicit failure modes — every gated expectation
+    that did not hold, so 'the receipt says so' is backed by an exit code."""
+    failures = []
+    if report.get("worktree_dirty"):
+        failures.append("worktree dirty: repo_commit does not name the observed tree")
+    for sentinel_id, sentinel in report.get("all_cfg_sentinels", {}).items():
+        if not sentinel["satisfied"]:
+            failures.append(f"sentinel {sentinel_id} unsatisfied")
+    for row in report.get("all_cfg_negative_sentinels", []):
+        if not row["absent_as_expected"]:
+            failures.append(
+                f"negative sentinel: {row['symbol']} present in {row['cell']}"
+            )
+    if report.get("adapter", {}).get("exit_code") != 0:
+        failures.append("adapter failed to compile")
+    if report.get("dependent_positive", {}).get("outcome") != "compiles":
+        failures.append("dependent-positive did not compile")
+    for row in report.get("case_results", []):
+        if row["lane"] == "adapter" and row["outcome"] != "expected-failure":
+            failures.append(
+                f"adapter case {row['assertion_id']}[{row['index']}]: {row['outcome']}"
+            )
+        if row["lane"] == "real" and row["outcome"] == "other-failure":
+            failures.append(
+                f"real case {row['assertion_id']}[{row['index']}]: other-failure"
+            )
+    return failures
+
+
+def finish(args, report) -> int:
+    if args.check and report["check_failures"]:
+        for failure in report["check_failures"]:
+            print(f"[t049] CHECK FAIL: {failure}", file=sys.stderr)
+        return 1
     return 0
 
 

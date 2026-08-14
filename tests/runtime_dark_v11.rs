@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use symforge::live_index::index_lifecycle::embedded::{EmbeddedSourceFactory, ReceiptWaitError};
-use symforge::live_index::index_lifecycle::public_api::{EmbeddedSourceSpec, ProcessRuntimeApi};
+use symforge::live_index::index_lifecycle::public_api::{
+    EmbeddedSourceSpec, ProcessRuntimeApi, SourceRuntimePhase as PublicSourceRuntimePhase,
+};
 use symforge::live_index::index_lifecycle::registry::ProjectKey;
 use symforge::live_index::index_lifecycle::runtime::{
     DarkRuntimeFactory, ProjectIndexRuntime, SourceRuntimePhase,
@@ -114,29 +116,38 @@ fn refreshing_serves_retained_only_until_a_permit_is_granted() {
     assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
 }
 
-// ── The permit publishes non-current BEFORE side effects ───────────────────
+// ── The grant is ITSELF a publication ──────────────────────────────────────
 
 #[test]
-fn permit_grant_publishes_refreshing_before_side_effects() {
-    // contracts/source-binding-and-state.md:275-278: granting the permit
-    // atomically publishes non-current Refreshing BEFORE any side effect can
-    // run — an observer that looks between grant and first write must already
-    // see non-current.
+fn permit_grant_is_itself_a_publication() {
+    // contracts/source-binding-and-state.md:275-278 says granting the permit
+    // atomically PUBLISHES non-current Refreshing before any side effect can
+    // run. The dark runtime has no side-effect lane yet, so the
+    // before-side-effects half is unobservable until Slice 4 — an earlier
+    // draft of this test asserted post-grant `Refreshing`, which was already
+    // true BEFORE the grant and therefore observed nothing (the C11 review
+    // finding). What IS observable and falsifiable now: the grant goes
+    // through the publication root — a fresh never-reused publication
+    // identity — and the retention's refusal is thereby a PUBLISHED fact,
+    // not side-band state.
     let runtime = a_dark_runtime("root-a");
     let source = runtime.admit_current_source_for_test("src-a");
     runtime.begin_reload_refresh_for_test(&source);
 
+    let before = runtime.publication_root().load().publication_identity();
     let permit = runtime
         .grant_mutation_permit_for_test(&source)
         .expect("grant");
-    assert_eq!(
-        runtime.source_phase(&source),
-        SourceRuntimePhase::Refreshing,
-        "the phase observed AFTER grant and BEFORE start_side_effect is already \
-         non-current"
+    let after = runtime.publication_root().load().publication_identity();
+    assert_ne!(
+        before, after,
+        "the grant must PUBLISH — a grant that only flips side-band state \
+         leaves the publication identity unchanged and fails here"
     );
-    // The permit has not started its side effect yet; the publication came
-    // first by construction, which is the property.
+    assert!(
+        runtime.acquire_strict(&source).is_err(),
+        "after the published grant the retention stops being a lane"
+    );
     let _ends_without_committing = permit;
 }
 
@@ -341,7 +352,20 @@ fn contract_waits_guard_self_wait_and_open_refuses_a_held_source() {
     let handle = factory
         .open(ProjectKey::new("src-close"))
         .expect("an open registry admits a fresh key");
+    // C4: the view's phase comes from the flag the handle OWNS — open means
+    // Loading, and after the close below it must say Stopped, because
+    // reporting Loading for a torn-down source is a claim about something
+    // that no longer exists.
+    assert_eq!(
+        handle.runtime_view().phase,
+        PublicSourceRuntimePhase::Loading
+    );
     let receipt = handle.begin_close();
+    assert_eq!(
+        handle.runtime_view().phase,
+        PublicSourceRuntimePhase::Stopped,
+        "a closed handle must not report Loading"
+    );
     let error = handle
         .finalize(|| receipt.wait(std::time::Instant::now()))
         .expect_err("the contract wait carries the self-wait guard, not just wait_for_test");
@@ -357,6 +381,17 @@ fn contract_waits_guard_self_wait_and_open_refuses_a_held_source() {
     assert_eq!(
         report.terminal_source_version, 0,
         "dark sources hold version 0"
+    );
+    // C13, the accepting pair: a SECOND begin_close on the same source JOINS
+    // an already-terminal close, and its report must say so.
+    let joined = handle
+        .begin_close()
+        .wait(std::time::Instant::now())
+        .expect("joining an already-terminal close completes");
+    assert!(
+        joined.already_terminal,
+        "the second close joined a terminal source; reporting it as having \
+         performed the shutdown would claim work this call did not do"
     );
 
     // The process runtime's shutdown receipt reports observed zeros — the
