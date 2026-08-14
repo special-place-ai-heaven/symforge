@@ -219,6 +219,14 @@ impl CcrStore {
         self.total_bytes = self.total_bytes.saturating_sub(len);
         true
     }
+
+    pub(crate) fn remove_blob(&mut self, handle: &str) -> bool {
+        let Some(blob) = self.blobs.remove(handle) else {
+            return false;
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(blob.formatted_bytes.len());
+        true
+    }
 }
 
 fn mint_handle(tool_name: &str, formatted: &str) -> String {

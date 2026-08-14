@@ -805,6 +805,12 @@ impl SymForgeServer {
         &self.stel_ledger
     }
 
+    /// Test-only: drop a stored CCR blob so the next matching read must re-serve.
+    #[doc(hidden)]
+    pub fn drop_ccr_blob_for_tests(&self, handle: &str) -> bool {
+        self.ccr_store.lock().remove_blob(handle)
+    }
+
     /// Return the MCP tool definitions advertised by this server.
     ///
     /// This is a read-only view over the generated router metadata so integration
@@ -974,9 +980,10 @@ impl SymForgeServer {
         &self,
         meta: &crate::protocol::session::SessionCacheHitMeta,
         reason: &str,
-    ) -> String {
+    ) -> Option<String> {
+        self.ccr_store.lock().get(&meta.retrieve_handle)?;
         self.session_context.record_cache_hit();
-        format::format_session_cache_hit_body(meta, reason)
+        Some(format::format_session_cache_hit_body(meta, reason))
     }
 
     pub(crate) fn compression_economics(&self) -> crate::protocol::ccr::CcrEconomics {

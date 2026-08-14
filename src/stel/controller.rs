@@ -795,13 +795,14 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_hit_for_prefetched_symbol() {
+    fn session_prefetch_does_not_stel_cache_hit_get_symbol() {
         let session = SessionContext::new();
         session.record_symbol_fetch(
             "src/lib.rs",
             "cfg_if",
-            crate::protocol::session::hash_symbol_params(None, None, None),
+            crate::protocol::session::hash_symbol_params(None, None, None, 0, "unavailable", 0, 0),
             128,
+            "deadbeefcafe",
         );
         let plan = StelPlan {
             plan_id: "cache".to_string(),
@@ -820,10 +821,12 @@ mod tests {
         };
         let request = StelRequest::default();
         let decision = evaluate_plan_with_session(&request, &plan, Some(&session));
-        assert_eq!(decision.decision, AdmissionDecision::CacheHit);
-        let cache = decision.cache.as_ref().expect("cache body");
-        assert_eq!(cache.kind, "symbol");
-        assert_eq!(cache.prior_tokens, 128);
+        assert_ne!(
+            decision.decision,
+            AdmissionDecision::CacheHit,
+            "plan layer has no generation identity; the primitive must run"
+        );
+        assert!(decision.cache.is_none());
     }
 
     #[test]

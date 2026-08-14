@@ -5840,6 +5840,7 @@ pub fn format_session_cache_hit_body(
         "name": meta.name,
         "prior_tokens": meta.prior_tokens,
         "session_age_secs": meta.session_age_secs,
+        "retrieve_handle": meta.retrieve_handle,
     });
     let json = serde_json::to_string_pretty(&cache).expect("cache payload serializes");
     let target = if meta.name.is_empty() {
@@ -5853,11 +5854,13 @@ pub fn format_session_cache_hit_body(
          Session cache: {} {target} (prior_tokens={}, session_age_secs={})\n\
          \n\
          SymForge did not re-execute the read for this request.\n\
-         Reuse the content already loaded in this session, or pass force_refresh=true.\n\
+         These bytes were served earlier on this MCP connection; that is not proof they are in your context.\n\
+         retrieve: symforge_retrieve with hash=\"{}\"\n\
+         force_refresh=true re-reads the live index and is not the recovery path for missing bytes.\n\
          \n\
          --- cache payload ---\n\
          {json}",
-        meta.kind, meta.prior_tokens, meta.session_age_secs,
+        meta.kind, meta.prior_tokens, meta.session_age_secs, meta.retrieve_handle,
     )
 }
 

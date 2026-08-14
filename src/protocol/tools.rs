@@ -4367,31 +4367,45 @@ impl SymForgeServer {
         }
 
         let force_refresh = params.0.force_refresh == Some(true);
+        // Capture freshness and the immutable publication before consulting the
+        // repeat-read cache. The same request against a later watcher publication
+        // must be a cache miss, and the bytes below must come from this exact
+        // captured generation rather than a second live-index read.
+        let generation = self.index.published_source_set().current_generation();
+        if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            return message;
+        }
+        let source_id = generation
+            .source
+            .as_ref()
+            .map(|source| source.source_id.as_str())
+            .unwrap_or("unavailable");
         let params_hash = crate::protocol::session::hash_symbol_params(
             params.0.kind.as_deref(),
             params.0.symbol_line,
             params.0.max_tokens,
+            generation.project_generation,
+            source_id,
+            generation.publication_generation,
+            generation.content_generation,
         );
         if let Some(meta) = self.session_context.try_symbol_cache_hit(
             &params.0.path,
             &params.0.name,
             params_hash,
             force_refresh,
-        ) {
-            return self.format_read_cache_hit(&meta, "session_repeat_read");
+        ) && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
+        {
+            return hit;
         }
 
-        let file = {
-            // The single-project overlay READ was REMOVED: it was redundant (the
-            // shared live index already holds the edit via reindex_after_write) and
-            // carried a narrow staleness shadow risk (overlay-first with no freshness
-            // gate could shadow a base advanced by a watcher event). The base read is
-            // always at-least-as-fresh. See
-            // docs/reviews/overlay-redundancy-decision.md.
-            let guard = self.index.read();
-            loading_guard!(guard);
-            guard.capture_shared_file(&params.0.path)
-        };
+        // The single-project overlay READ was REMOVED: it was redundant (the
+        // shared live index already holds the edit via reindex_after_write) and
+        // carried a narrow staleness shadow risk (overlay-first with no freshness
+        // gate could shadow a base advanced by a watcher event). The base read is
+        // always at-least-as-fresh. See
+        // docs/reviews/overlay-redundancy-decision.md.
+        let file = generation.live.capture_shared_file(&params.0.path);
 
         // Honest Tier-2/Tier-3 response before any miss handling: a path like
         // package-lock.json EXISTS but is admitted metadata-only, so it has no
@@ -4400,15 +4414,11 @@ impl SymForgeServer {
         // the index (Tier-1 files resolve above).
         if file.is_none() {
             let repo_root = self.capture_repo_root();
-            let degraded = {
-                let guard = self.index.read();
-                loading_guard!(guard);
-                admission_tier_file_degradation_for_path(
-                    &guard,
-                    repo_root.as_deref(),
-                    &params.0.path,
-                )
-            };
+            let degraded = admission_tier_file_degradation_for_path(
+                generation.live.as_ref(),
+                repo_root.as_deref(),
+                &params.0.path,
+            );
             if let Some(result) = degraded {
                 return result;
             }
@@ -4468,12 +4478,6 @@ impl SymForgeServer {
                 } else {
                     None
                 };
-                self.session_context.record_symbol_fetch(
-                    &params.0.path,
-                    &params.0.name,
-                    params_hash,
-                    tokens,
-                );
                 // Frecency bump — commitment tool, single-symbol happy path.
                 // Collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
@@ -4487,13 +4491,21 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
+                let handle = self
+                    .ccr_store
+                    .lock()
+                    .insert("get_symbol", final_output.clone());
+                self.session_context.record_symbol_fetch(
+                    &params.0.path,
+                    &params.0.name,
+                    params_hash,
+                    tokens,
+                    &handle,
+                );
                 final_output
             }
             None => {
-                let suggestions = {
-                    let guard = self.index.read();
-                    suggest_similar_files(&guard, &params.0.path)
-                };
+                let suggestions = suggest_similar_files(&generation.live, &params.0.path);
                 format::not_found_file_with_suggestions(&params.0.path, &suggestions)
             }
         }
@@ -4712,8 +4724,9 @@ impl SymForgeServer {
             &params.0.path,
             params_hash,
             force_refresh,
-        ) {
-            return self.format_read_cache_hit(&meta, "session_repeat_read");
+        ) && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
+        {
+            return hit;
         }
         // Honest Tier-2/Tier-3 response: the path may EXIST on disk but be
         // deliberately admitted as metadata-only (e.g. package-lock.json) or
@@ -4823,8 +4836,16 @@ impl SymForgeServer {
                 context_max_tokens,
             );
             let tokens = (output.len() / 4) as u32;
-            self.session_context
-                .record_file_context_fetch(&params.0.path, params_hash, tokens);
+            let handle = self
+                .ccr_store
+                .lock()
+                .insert("get_file_context", output.clone());
+            self.session_context.record_file_context_fetch(
+                &params.0.path,
+                params_hash,
+                tokens,
+                &handle,
+            );
             self.session_context
                 .record_listed_file(&params.0.path, tokens);
             self.bump_frecency(&[PathBuf::from(&params.0.path)]);
@@ -4881,10 +4902,6 @@ impl SymForgeServer {
                 } else {
                     None
                 };
-                self.session_context
-                    .record_file_context_fetch(&params.0.path, params_hash, tokens);
-                self.session_context
-                    .record_listed_file(&params.0.path, tokens);
                 if let Some(prior) = prior_dedup {
                     output = format::append_dedup_hint_footer(
                         output,
@@ -4893,6 +4910,18 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
+                let handle = self
+                    .ccr_store
+                    .lock()
+                    .insert("get_file_context", output.clone());
+                self.session_context.record_file_context_fetch(
+                    &params.0.path,
+                    params_hash,
+                    tokens,
+                    &handle,
+                );
+                self.session_context
+                    .record_listed_file(&params.0.path, tokens);
                 // Frecency bump — commitment tool. Reached only on the happy
                 // path after a successful outline fetch; collection policy is
                 // resolved inside bump_frecency. See wiki `[[SymForge Frecency-Weighted
@@ -8959,8 +8988,9 @@ impl SymForgeServer {
         if let Some(meta) =
             self.session_context
                 .try_file_content_cache_hit(&input.path, params_hash, force_refresh)
+            && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
         {
-            return self.format_read_cache_hit(&meta, "session_repeat_read");
+            return hit;
         }
         let mode_annotation = match (
             &options.content_context.mode_name,
@@ -9005,8 +9035,6 @@ impl SymForgeServer {
                 } else {
                     None
                 };
-                self.session_context
-                    .record_file_content_fetch(&input.path, params_hash, tokens);
                 self.bump_frecency(&[PathBuf::from(&input.path)]);
                 if let Some(prior) = prior_dedup {
                     final_output = format::append_dedup_hint_footer(
@@ -9016,6 +9044,16 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
+                let handle = self
+                    .ccr_store
+                    .lock()
+                    .insert("get_file_content", final_output.clone());
+                self.session_context.record_file_content_fetch(
+                    &input.path,
+                    params_hash,
+                    tokens,
+                    &handle,
+                );
                 final_output
             }
             None => {

@@ -18,24 +18,37 @@ mode flags — any param that changes formatted output.
 
 ## Hit behavior
 
-When cache hit and `force_refresh` is false:
+When cache hit and `force_refresh` is false **and** the CCR blob for that
+serve is still retrievable:
 
 1. Do **not** re-execute index query/format for full body.
-2. Return body shaped like STEL cache-hit:
+2. Return a small redeemable hit body:
 
 ```text
 Decision: cache_hit
 Economics: cache_hit (session_repeat_read)
 Session cache: {kind} {target} (prior_tokens={n}, session_age_secs={s})
 
-SymForge did not re-execute a legacy tool for this request.
-Reuse the content already loaded in this session.
+SymForge did not re-execute the read for this request.
+These bytes were served earlier on this MCP connection; that is not proof they are in your context.
+retrieve: symforge_retrieve with hash="{hash}"
+force_refresh=true re-reads the live index and is not the recovery path for missing bytes.
 
 --- cache payload ---
-{StelCacheBody JSON}
+{cache JSON including retrieve_handle}
 ```
 
-3. Record ledger `cache_hit=true` when STEL economics path active.
+3. A caller who does not have those bytes (for example a Cursor subagent
+   sharing the parent's MCP connection) recovers them with existing
+   `symforge_retrieve`, paying once. Do not re-execute the read tool and do
+   not use `force_refresh=true` as byte recovery.
+4. If the fetch record exists but `ccr_store.get(handle)` is `None` (evicted),
+   that is a **miss** — re-serve and re-insert. Never return `cache_hit` for
+   bytes that cannot be handed back.
+5. Record ledger `cache_hit=true` when STEL economics path active.
+
+STEL compact admission does **not** cache-hit these tools: the plan layer has
+no generation identity. The primitive applies the generation-aware key.
 
 ## Miss behavior
 
