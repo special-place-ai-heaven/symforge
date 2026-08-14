@@ -56,6 +56,17 @@ macro_rules! identity_newtype {
             pub fn fresh() -> Self {
                 Self($crate::lifecycle_identity::next_identity())
             }
+
+            /// Raw counter value, crate-only, for the embed boundary's
+            /// kind-prefixed RENDERING and nothing else — deriving order or
+            /// permission from it is the inference channel the derive set
+            /// deliberately excludes. The allow is macro-wide: only the
+            /// identities the boundary renders consume it today, and a
+            /// per-kind opt-in would fork the macro for a lint.
+            #[allow(dead_code)]
+            pub(crate) fn raw_for_render(&self) -> u64 {
+                self.0.get()
+            }
         }
     };
 }
@@ -113,6 +124,275 @@ identity_newtype!(
     /// Identity of the runtime publication that produced a claim.
     ProducingRuntimeIdentity
 );
+
+/// The closed operation vocabulary, VERBATIM from the frozen contract:
+/// `contracts/public-api-v11.json` `type:embed:OperationKind` fixes exactly
+/// these seven variants. An earlier draft invented four provenance-shape
+/// variants under this name; that both diverged from the contract this module's
+/// own header declares authoritative AND squatted the name T047's runtime
+/// vocabulary owns. Provenance SHAPES are named by
+/// [`ClaimProvenance::kind_name`], not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OperationKind {
+    AcquireRuntime,
+    CloseSource,
+    OpenEmbeddedSource,
+    RefreshSource,
+    SearchSymbols,
+    SearchText,
+    ShutdownRuntime,
+}
+
+impl OperationKind {
+    /// Every variant, once. The Cartesian oracle iterates this so a new
+    /// operation cannot be added without entering the matrix.
+    pub const ALL: [Self; 7] = [
+        Self::AcquireRuntime,
+        Self::CloseSource,
+        Self::OpenEmbeddedSource,
+        Self::RefreshSource,
+        Self::SearchSymbols,
+        Self::SearchText,
+        Self::ShutdownRuntime,
+    ];
+
+    /// Stable display name. Part of the closed contract, not a debug string.
+    pub fn kind_name(self) -> &'static str {
+        match self {
+            Self::AcquireRuntime => "AcquireRuntime",
+            Self::CloseSource => "CloseSource",
+            Self::OpenEmbeddedSource => "OpenEmbeddedSource",
+            Self::RefreshSource => "RefreshSource",
+            Self::SearchSymbols => "SearchSymbols",
+            Self::SearchText => "SearchText",
+            Self::ShutdownRuntime => "ShutdownRuntime",
+        }
+    }
+}
+
+/// Hash of the normalized request arguments. Binds a claim to the exact
+/// question asked, so a cached answer cannot be replayed for a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalArgumentHash(u64);
+
+impl CanonicalArgumentHash {
+    /// Build from already-normalized argument bytes.
+    pub fn of_normalized(bytes: &[u8]) -> Self {
+        // FNV-1a. Deterministic across runs, which a DefaultHasher is not.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        Self(hash)
+    }
+
+    /// Diagnostic value.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// One normalized operation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationReceipt {
+    identity: OperationIdentity,
+    operation_kind: OperationKind,
+    schema_version: u32,
+    canonical_argument_hash: CanonicalArgumentHash,
+}
+
+impl OperationReceipt {
+    /// The schema version every V11 receipt is minted at.
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    /// Bind a normalized request.
+    pub fn normalized(operation_kind: OperationKind, normalized_arguments: &[u8]) -> Self {
+        Self {
+            identity: OperationIdentity::fresh(),
+            operation_kind,
+            schema_version: Self::SCHEMA_VERSION,
+            canonical_argument_hash: CanonicalArgumentHash::of_normalized(normalized_arguments),
+        }
+    }
+
+    /// Fixture constructor for oracles that do not vary the arguments.
+    #[cfg(any(test, feature = "server"))]
+    pub fn for_test(operation_kind: OperationKind) -> Self {
+        Self::for_dark_refusal(operation_kind)
+    }
+
+    /// Mint the receipt for a DARK refusal lane (C5 ruling). The lane did
+    /// not examine its arguments, so hashing them would claim a binding that
+    /// did not happen — the canonical hash covers the OPERATION KIND alone,
+    /// and the D-ledger records that argument identity is NOT claimed on
+    /// these lanes. Slice 4 replaces this with `normalized` at the point a
+    /// lane actually reads its arguments.
+    pub(crate) fn for_dark_refusal(operation_kind: OperationKind) -> Self {
+        Self::normalized(operation_kind, operation_kind.kind_name().as_bytes())
+    }
+
+    pub fn identity(&self) -> OperationIdentity {
+        self.identity
+    }
+
+    pub fn operation_kind(&self) -> OperationKind {
+        self.operation_kind
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn canonical_argument_hash(&self) -> CanonicalArgumentHash {
+        self.canonical_argument_hash
+    }
+}
+
+// ── Refusals ───────────────────────────────────────────────────────────────
+
+/// The closed refusal algebra. Identical names in both frozen documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SourceRefusalKind {
+    AdmissionUnavailable,
+    InvalidSelection,
+    SelectionUnavailable,
+    SourceUnavailable,
+}
+
+/// What, if anything, would make a retry worth attempting. Advice only: it
+/// never authorizes the retry it describes.
+///
+/// Variants VERBATIM from `contracts/public-api-v11.json`
+/// `type:embed:RetryAdvice`. An earlier draft invented
+/// `{Never, AfterRebind, AfterRefresh}` in the same commit that declared the
+/// atoms authoritative; the audit caught the contradiction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RetryAdvice {
+    /// The same request may simply be retried.
+    Automatic,
+    /// The request is wrong in a way repetition cannot fix.
+    Never,
+    /// Retry after an observable event: a completed refresh, an installed
+    /// successor generation, a selection change.
+    OnEvent,
+    /// Retry requires an operator action, such as a rebind to the correct root.
+    Operator,
+}
+
+impl RetryAdvice {
+    /// Every variant, once, for the Cartesian oracle.
+    pub const ALL: [Self; 4] = [Self::Automatic, Self::Never, Self::OnEvent, Self::Operator];
+}
+
+/// A typed refusal. Opaque by construction: callers read it through the
+/// accessors the activation contract names, and cannot assemble one themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRefusal {
+    kind: SourceRefusalKind,
+    operation: OperationReceipt,
+    retry: RetryAdvice,
+    evidence_identity: Option<AuthorityIdentity>,
+}
+
+impl SourceRefusal {
+    pub(crate) fn new(
+        kind: SourceRefusalKind,
+        operation: OperationReceipt,
+        retry: RetryAdvice,
+        evidence_identity: Option<AuthorityIdentity>,
+    ) -> Self {
+        Self {
+            kind,
+            operation,
+            retry,
+            evidence_identity,
+        }
+    }
+
+    /// Crate-visible mint for the dark runtime, which cannot reach the
+    /// provenance lease constructors and must still refuse honestly.
+    pub(crate) fn for_runtime(
+        kind: SourceRefusalKind,
+        operation: OperationReceipt,
+        retry: RetryAdvice,
+        evidence_identity: Option<AuthorityIdentity>,
+    ) -> Self {
+        Self::new(kind, operation, retry, evidence_identity)
+    }
+
+    pub fn kind(&self) -> SourceRefusalKind {
+        self.kind
+    }
+
+    pub fn operation(&self) -> OperationReceipt {
+        self.operation
+    }
+
+    pub fn retry(&self) -> RetryAdvice {
+        self.retry
+    }
+
+    /// Identity of the evidence the refusal was decided on. Present whenever a
+    /// refusal was reached by examining an authority rather than by rejecting a
+    /// malformed request outright.
+    pub fn evidence_identity(&self) -> Option<AuthorityIdentity> {
+        self.evidence_identity
+    }
+}
+
+/// One complete captured generation — THE authority type shared by provenance
+/// capture and the V11 lifecycle runtime (E7 ruling: one type, one home).
+///
+/// It lives HERE, not in `claim_provenance`, because `index_lifecycle` compiles
+/// under the embed feature while `protocol` does not: the runtime holding an
+/// `Arc<GenerationAuthority>` inside `VerifiedGeneration` must reach it without
+/// a lifecycle→protocol edge. `claim_provenance` RE-EXPORTS it, so every
+/// existing oracle path keeps resolving, and its provenance-specific methods
+/// stay in `claim_provenance` as a same-crate inherent impl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationAuthority {
+    identity: AuthorityIdentity,
+    generation: GenerationIdentity,
+    physical_root: String,
+}
+
+impl GenerationAuthority {
+    /// Sealed capture constructor: crate-only, used by the provenance lease
+    /// and the dark runtime. Nothing outside the crate can mint one.
+    pub(crate) fn captured(
+        identity: AuthorityIdentity,
+        generation: GenerationIdentity,
+        physical_root: String,
+    ) -> Self {
+        Self {
+            identity,
+            generation,
+            physical_root,
+        }
+    }
+
+    pub fn identity(&self) -> AuthorityIdentity {
+        self.identity
+    }
+
+    pub fn generation(&self) -> GenerationIdentity {
+        self.generation
+    }
+
+    pub fn physical_root(&self) -> &str {
+        &self.physical_root
+    }
+
+    /// A generation miss covers ONE captured generation, not the repository.
+    pub fn proves_generation_absence(&self) -> bool {
+        true
+    }
+
+    pub fn proves_repository_absence(&self) -> bool {
+        false
+    }
+}
 
 /// A monotonic observation instant.
 ///

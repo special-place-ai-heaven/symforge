@@ -1,0 +1,304 @@
+{
+  "computed_as": "introduced_v11_atoms listed verbatim; introduced_minus_live is that list with every atom that already appears verbatim in the live pub-mod census of src/lib.rs subtracted",
+  "contract_sha256": "5e5b47b110b27f57f5cb83506130131be772047b03a0f4cacc3412e60718f5a9",
+  "forbidden_at_activation": [
+    {
+      "citizen": "symforge::protocol::format::claim_provenance",
+      "rule": "D12: the internal provenance mount must not surface as a public module path; the embed boundary wraps it"
+    },
+    {
+      "citizen": "symforge::live_index::knowledge_bridge::LimitBreach through TruncationBreaches",
+      "rule": "D12/D13: a deep internal type must not leak through the embed surface; the boundary wraps or unwinds it"
+    }
+  ],
+  "introduced_atoms": [
+    "symforge::embed::AtomicAuthority",
+    "symforge::embed::AtomicAuthority::identity",
+    "symforge::embed::AtomicAuthority::kind_name",
+    "symforge::embed::Claim",
+    "symforge::embed::Claim::evaluation",
+    "symforge::embed::Claim::operation",
+    "symforge::embed::Claim::producing_runtime_identity",
+    "symforge::embed::Claim::provenance",
+    "symforge::embed::Claim::value",
+    "symforge::embed::ClaimProvenance",
+    "symforge::embed::ClaimProvenance::authorities",
+    "symforge::embed::ClaimProvenance::authority_count",
+    "symforge::embed::ClaimProvenance::identity",
+    "symforge::embed::ClaimProvenance::kind_name",
+    "symforge::embed::EmbeddedSourceHandle",
+    "symforge::embed::EmbeddedSourceHandle::begin_close",
+    "symforge::embed::EmbeddedSourceHandle::request_refresh",
+    "symforge::embed::EmbeddedSourceHandle::runtime_view",
+    "symforge::embed::EmbeddedSourceHandle::search_symbols",
+    "symforge::embed::EmbeddedSourceHandle::search_text",
+    "symforge::embed::EmbeddedSourceSpec",
+    "symforge::embed::EmbeddedSourceSpec::current_worktree",
+    "symforge::embed::EvaluationProvenance",
+    "symforge::embed::EvaluationProvenance::identity",
+    "symforge::embed::OperationKind",
+    "symforge::embed::OperationReceipt",
+    "symforge::embed::OperationReceipt::canonical_argument_hash",
+    "symforge::embed::OperationReceipt::identity",
+    "symforge::embed::OperationReceipt::operation_kind",
+    "symforge::embed::OperationReceipt::schema_version",
+    "symforge::embed::ProcessIndexRuntime",
+    "symforge::embed::ProcessIndexRuntime::acquire",
+    "symforge::embed::ProcessIndexRuntime::begin_shutdown",
+    "symforge::embed::ProcessIndexRuntime::open_embedded_source",
+    "symforge::embed::ReceiptWaitError",
+    "symforge::embed::RefreshTicket",
+    "symforge::embed::RefreshTicket::operation",
+    "symforge::embed::RefreshTicket::requested_source_version",
+    "symforge::embed::RefreshTicket::ticket_identity",
+    "symforge::embed::RetryAdvice",
+    "symforge::embed::ShutdownReceipt",
+    "symforge::embed::ShutdownReceipt::wait",
+    "symforge::embed::ShutdownReport",
+    "symforge::embed::SourceCloseReceipt",
+    "symforge::embed::SourceCloseReceipt::wait",
+    "symforge::embed::SourceCloseReport",
+    "symforge::embed::SourceRefusal",
+    "symforge::embed::SourceRefusal::evidence_identity",
+    "symforge::embed::SourceRefusal::kind",
+    "symforge::embed::SourceRefusal::operation",
+    "symforge::embed::SourceRefusal::retry",
+    "symforge::embed::SourceRefusalKind",
+    "symforge::embed::SourceRuntimePhase",
+    "symforge::embed::SourceRuntimeView",
+    "symforge::embed::SymbolMatch",
+    "symforge::embed::SymbolSearchRequest",
+    "symforge::embed::SymbolSearchResult",
+    "symforge::embed::TextMatch",
+    "symforge::embed::TextSearchRequest",
+    "symforge::embed::TextSearchResult",
+    "symforge::server_api",
+    "symforge::server_api::ServerBootstrapError",
+    "symforge::server_api::ServerExit",
+    "symforge::server_api::run"
+  ],
+  "introduced_minus_live": [
+    "symforge::embed::AtomicAuthority",
+    "symforge::embed::AtomicAuthority::identity",
+    "symforge::embed::AtomicAuthority::kind_name",
+    "symforge::embed::Claim",
+    "symforge::embed::Claim::evaluation",
+    "symforge::embed::Claim::operation",
+    "symforge::embed::Claim::producing_runtime_identity",
+    "symforge::embed::Claim::provenance",
+    "symforge::embed::Claim::value",
+    "symforge::embed::ClaimProvenance",
+    "symforge::embed::ClaimProvenance::authorities",
+    "symforge::embed::ClaimProvenance::authority_count",
+    "symforge::embed::ClaimProvenance::identity",
+    "symforge::embed::ClaimProvenance::kind_name",
+    "symforge::embed::EmbeddedSourceHandle",
+    "symforge::embed::EmbeddedSourceHandle::begin_close",
+    "symforge::embed::EmbeddedSourceHandle::request_refresh",
+    "symforge::embed::EmbeddedSourceHandle::runtime_view",
+    "symforge::embed::EmbeddedSourceHandle::search_symbols",
+    "symforge::embed::EmbeddedSourceHandle::search_text",
+    "symforge::embed::EmbeddedSourceSpec",
+    "symforge::embed::EmbeddedSourceSpec::current_worktree",
+    "symforge::embed::EvaluationProvenance",
+    "symforge::embed::EvaluationProvenance::identity",
+    "symforge::embed::OperationKind",
+    "symforge::embed::OperationReceipt",
+    "symforge::embed::OperationReceipt::canonical_argument_hash",
+    "symforge::embed::OperationReceipt::identity",
+    "symforge::embed::OperationReceipt::operation_kind",
+    "symforge::embed::OperationReceipt::schema_version",
+    "symforge::embed::ProcessIndexRuntime",
+    "symforge::embed::ProcessIndexRuntime::acquire",
+    "symforge::embed::ProcessIndexRuntime::begin_shutdown",
+    "symforge::embed::ProcessIndexRuntime::open_embedded_source",
+    "symforge::embed::ReceiptWaitError",
+    "symforge::embed::RefreshTicket",
+    "symforge::embed::RefreshTicket::operation",
+    "symforge::embed::RefreshTicket::requested_source_version",
+    "symforge::embed::RefreshTicket::ticket_identity",
+    "symforge::embed::RetryAdvice",
+    "symforge::embed::ShutdownReceipt",
+    "symforge::embed::ShutdownReceipt::wait",
+    "symforge::embed::ShutdownReport",
+    "symforge::embed::SourceCloseReceipt",
+    "symforge::embed::SourceCloseReceipt::wait",
+    "symforge::embed::SourceCloseReport",
+    "symforge::embed::SourceRefusal",
+    "symforge::embed::SourceRefusal::evidence_identity",
+    "symforge::embed::SourceRefusal::kind",
+    "symforge::embed::SourceRefusal::operation",
+    "symforge::embed::SourceRefusal::retry",
+    "symforge::embed::SourceRefusalKind",
+    "symforge::embed::SourceRuntimePhase",
+    "symforge::embed::SourceRuntimeView",
+    "symforge::embed::SymbolMatch",
+    "symforge::embed::SymbolSearchRequest",
+    "symforge::embed::SymbolSearchResult",
+    "symforge::embed::TextMatch",
+    "symforge::embed::TextSearchRequest",
+    "symforge::embed::TextSearchResult",
+    "symforge::server_api",
+    "symforge::server_api::ServerBootstrapError",
+    "symforge::server_api::ServerExit",
+    "symforge::server_api::run"
+  ],
+  "kind": "symforge-feature-020-export-delta",
+  "live_census_pub_mods": [
+    "symforge::analytics",
+    "symforge::capability",
+    "symforge::cli",
+    "symforge::daemon",
+    "symforge::discovery",
+    "symforge::domain",
+    "symforge::edit_safety",
+    "symforge::embed",
+    "symforge::git",
+    "symforge::gitignore_hygiene",
+    "symforge::hash",
+    "symforge::idempotency",
+    "symforge::knowledge",
+    "symforge::live_index",
+    "symforge::observability",
+    "symforge::parsing",
+    "symforge::path_shadow",
+    "symforge::paths",
+    "symforge::process_util",
+    "symforge::protocol",
+    "symforge::server",
+    "symforge::sidecar",
+    "symforge::stel",
+    "symforge::stel_core",
+    "symforge::version_registry",
+    "symforge::watcher",
+    "symforge::watcher_state",
+    "symforge::worktree"
+  ],
+  "obligations": [
+    {
+      "atom": "symforge::embed::AtomicAuthority",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::Claim",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::ClaimProvenance",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::EmbeddedSourceHandle",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::EmbeddedSourceSpec",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::EvaluationProvenance",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::OperationKind",
+      "obligation": "verbatim-reexport"
+    },
+    {
+      "atom": "symforge::embed::OperationReceipt",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::ProcessIndexRuntime",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::ReceiptWaitError",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::RefreshTicket",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::RetryAdvice",
+      "obligation": "verbatim-reexport"
+    },
+    {
+      "atom": "symforge::embed::ShutdownReceipt",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::ShutdownReport",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SourceCloseReceipt",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SourceCloseReport",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SourceRefusal",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SourceRefusalKind",
+      "obligation": "verbatim-reexport"
+    },
+    {
+      "atom": "symforge::embed::SourceRuntimePhase",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SourceRuntimeView",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SymbolMatch",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SymbolSearchRequest",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::SymbolSearchResult",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::TextMatch",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::TextSearchRequest",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::TextSearchResult",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::server_api",
+      "obligation": "keyword-flip"
+    },
+    {
+      "atom": "symforge::server_api::ServerBootstrapError",
+      "obligation": "keyword-flip"
+    },
+    {
+      "atom": "symforge::server_api::ServerExit",
+      "obligation": "keyword-flip"
+    },
+    {
+      "atom": "symforge::server_api::run",
+      "obligation": "keyword-flip"
+    }
+  ],
+  "schema_version": 1,
+  "server_api": {
+    "activation": "one keyword behind the already-present server cfg gate: pub(crate) becomes pub, and the census gains the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them",
+    "form": "cfg feature=server gated pub(crate) mod server_api in src/lib.rs, std-only stub"
+  }
+}

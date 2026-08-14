@@ -36,9 +36,9 @@ use crate::live_index::knowledge_bridge::{DerivedLimitKind, LimitBreach};
 // `pub` item typed by a merely crate-visible type trips `private_interfaces`
 // under `-D warnings`. A `pub use` outside `src/embed.rs` adds no census atom.
 pub use crate::lifecycle_identity::{
-    AuthorityIdentity, EvaluationIdentity, GenerationIdentity, InvalidationSequence,
-    ObservationTime, ObserverEpoch, OperationIdentity, ProducingRuntimeIdentity,
-    ProvenanceIdentity, WorktreeScanId,
+    AuthorityIdentity, EvaluationIdentity, GenerationAuthority, GenerationIdentity,
+    InvalidationSequence, ObservationTime, ObserverEpoch, OperationIdentity,
+    ProducingRuntimeIdentity, ProvenanceIdentity, WorktreeScanId,
 };
 
 // T044's explicit authority choice, re-exported the same way and for the same
@@ -49,201 +49,16 @@ pub use crate::protocol::read_gate::{
     GenerationResolution, observe_disk_beneath, resolve_generation_bytes,
 };
 
-// ── Operations ─────────────────────────────────────────────────────────────
-
-/// The closed operation vocabulary, VERBATIM from the frozen contract:
-/// `contracts/public-api-v11.json` `type:embed:OperationKind` fixes exactly
-/// these seven variants. An earlier draft invented four provenance-shape
-/// variants under this name; that both diverged from the contract this module's
-/// own header declares authoritative AND squatted the name T047's runtime
-/// vocabulary owns. Provenance SHAPES are named by
-/// [`ClaimProvenance::kind_name`], not here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum OperationKind {
-    AcquireRuntime,
-    CloseSource,
-    OpenEmbeddedSource,
-    RefreshSource,
-    SearchSymbols,
-    SearchText,
-    ShutdownRuntime,
-}
-
-impl OperationKind {
-    /// Every variant, once. The Cartesian oracle iterates this so a new
-    /// operation cannot be added without entering the matrix.
-    pub const ALL: [Self; 7] = [
-        Self::AcquireRuntime,
-        Self::CloseSource,
-        Self::OpenEmbeddedSource,
-        Self::RefreshSource,
-        Self::SearchSymbols,
-        Self::SearchText,
-        Self::ShutdownRuntime,
-    ];
-
-    /// Stable display name. Part of the closed contract, not a debug string.
-    pub fn kind_name(self) -> &'static str {
-        match self {
-            Self::AcquireRuntime => "AcquireRuntime",
-            Self::CloseSource => "CloseSource",
-            Self::OpenEmbeddedSource => "OpenEmbeddedSource",
-            Self::RefreshSource => "RefreshSource",
-            Self::SearchSymbols => "SearchSymbols",
-            Self::SearchText => "SearchText",
-            Self::ShutdownRuntime => "ShutdownRuntime",
-        }
-    }
-}
-
-/// Hash of the normalized request arguments. Binds a claim to the exact
-/// question asked, so a cached answer cannot be replayed for a different one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CanonicalArgumentHash(u64);
-
-impl CanonicalArgumentHash {
-    /// Build from already-normalized argument bytes.
-    pub fn of_normalized(bytes: &[u8]) -> Self {
-        // FNV-1a. Deterministic across runs, which a DefaultHasher is not.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x1000_0000_01b3);
-        }
-        Self(hash)
-    }
-
-    /// Diagnostic value.
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-/// One normalized operation request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OperationReceipt {
-    identity: OperationIdentity,
-    operation_kind: OperationKind,
-    schema_version: u32,
-    canonical_argument_hash: CanonicalArgumentHash,
-}
-
-impl OperationReceipt {
-    /// The schema version every V11 receipt is minted at.
-    pub const SCHEMA_VERSION: u32 = 1;
-
-    /// Bind a normalized request.
-    pub fn normalized(operation_kind: OperationKind, normalized_arguments: &[u8]) -> Self {
-        Self {
-            identity: OperationIdentity::fresh(),
-            operation_kind,
-            schema_version: Self::SCHEMA_VERSION,
-            canonical_argument_hash: CanonicalArgumentHash::of_normalized(normalized_arguments),
-        }
-    }
-
-    /// Fixture constructor for oracles that do not vary the arguments.
-    pub fn for_test(operation_kind: OperationKind) -> Self {
-        Self::normalized(operation_kind, operation_kind.kind_name().as_bytes())
-    }
-
-    pub fn identity(&self) -> OperationIdentity {
-        self.identity
-    }
-
-    pub fn operation_kind(&self) -> OperationKind {
-        self.operation_kind
-    }
-
-    pub fn schema_version(&self) -> u32 {
-        self.schema_version
-    }
-
-    pub fn canonical_argument_hash(&self) -> CanonicalArgumentHash {
-        self.canonical_argument_hash
-    }
-}
-
-// ── Refusals ───────────────────────────────────────────────────────────────
-
-/// The closed refusal algebra. Identical names in both frozen documents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SourceRefusalKind {
-    AdmissionUnavailable,
-    InvalidSelection,
-    SelectionUnavailable,
-    SourceUnavailable,
-}
-
-/// What, if anything, would make a retry worth attempting. Advice only: it
-/// never authorizes the retry it describes.
-///
-/// Variants VERBATIM from `contracts/public-api-v11.json`
-/// `type:embed:RetryAdvice`. An earlier draft invented
-/// `{Never, AfterRebind, AfterRefresh}` in the same commit that declared the
-/// atoms authoritative; the audit caught the contradiction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RetryAdvice {
-    /// The same request may simply be retried.
-    Automatic,
-    /// The request is wrong in a way repetition cannot fix.
-    Never,
-    /// Retry after an observable event: a completed refresh, an installed
-    /// successor generation, a selection change.
-    OnEvent,
-    /// Retry requires an operator action, such as a rebind to the correct root.
-    Operator,
-}
-
-impl RetryAdvice {
-    /// Every variant, once, for the Cartesian oracle.
-    pub const ALL: [Self; 4] = [Self::Automatic, Self::Never, Self::OnEvent, Self::Operator];
-}
-
-/// A typed refusal. Opaque by construction: callers read it through the
-/// accessors the activation contract names, and cannot assemble one themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceRefusal {
-    kind: SourceRefusalKind,
-    operation: OperationReceipt,
-    retry: RetryAdvice,
-    evidence_identity: Option<AuthorityIdentity>,
-}
-
-impl SourceRefusal {
-    fn new(
-        kind: SourceRefusalKind,
-        operation: OperationReceipt,
-        retry: RetryAdvice,
-        evidence_identity: Option<AuthorityIdentity>,
-    ) -> Self {
-        Self {
-            kind,
-            operation,
-            retry,
-            evidence_identity,
-        }
-    }
-
-    pub fn kind(&self) -> SourceRefusalKind {
-        self.kind
-    }
-
-    pub fn operation(&self) -> OperationReceipt {
-        self.operation
-    }
-
-    pub fn retry(&self) -> RetryAdvice {
-        self.retry
-    }
-
-    /// Identity of the evidence the refusal was decided on. Present whenever a
-    /// refusal was reached by examining an authority rather than by rejecting a
-    /// malformed request outright.
-    pub fn evidence_identity(&self) -> Option<AuthorityIdentity> {
-        self.evidence_identity
-    }
-}
+// ── Operations and refusals ────────────────────────────────────────────────
+// The operation vocabulary and the refusal algebra LIVE in
+// `crate::lifecycle_identity` — relocated when the dark runtime's first
+// compile named them (it must not import from `protocol`, which is absent
+// under embed). Re-exported here so every existing oracle path keeps
+// resolving; `pub use` outside `embed.rs` adds no census atom.
+pub use crate::lifecycle_identity::{
+    CanonicalArgumentHash, OperationKind, OperationReceipt, RetryAdvice, SourceRefusal,
+    SourceRefusalKind,
+};
 
 // ── Physical root and observation leases ───────────────────────────────────
 
@@ -328,11 +143,11 @@ impl ObservationLease {
 
     /// Capture one complete generation under this lease.
     pub fn admit_generation(&self) -> Result<GenerationAuthority, SourceRefusal> {
-        Ok(GenerationAuthority {
-            identity: AuthorityIdentity::fresh(),
-            generation: GenerationIdentity::fresh(),
-            physical_root: self.root.root().to_string(),
-        })
+        Ok(GenerationAuthority::captured(
+            AuthorityIdentity::fresh(),
+            GenerationIdentity::fresh(),
+            self.root.root().to_string(),
+        ))
     }
 
     /// A receipt naming one selected project source.
@@ -662,40 +477,15 @@ impl GitObservationReceipt {
     }
 }
 
-/// One complete captured generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GenerationAuthority {
-    identity: AuthorityIdentity,
-    generation: GenerationIdentity,
-    physical_root: String,
-}
-
+/// One complete captured generation. The TYPE lives in
+/// `crate::lifecycle_identity` (E7: one authority type shared with the dark
+/// runtime, in the ungated home); this module re-exports it and keeps the
+/// provenance-specific promotion as a same-crate inherent impl.
 impl GenerationAuthority {
-    pub fn identity(&self) -> AuthorityIdentity {
-        self.identity
-    }
-
-    pub fn generation(&self) -> GenerationIdentity {
-        self.generation
-    }
-
-    pub fn physical_root(&self) -> &str {
-        &self.physical_root
-    }
-
-    /// A generation miss covers ONE captured generation, not the repository.
-    pub fn proves_generation_absence(&self) -> bool {
-        true
-    }
-
-    pub fn proves_repository_absence(&self) -> bool {
-        false
-    }
-
     /// Promote to the one authority that may speak for the whole selection.
     pub fn into_selected_aggregate(self) -> SelectedAggregateAuthority {
         SelectedAggregateAuthority {
-            _generation: self.generation,
+            _generation: self.generation(),
         }
     }
 }

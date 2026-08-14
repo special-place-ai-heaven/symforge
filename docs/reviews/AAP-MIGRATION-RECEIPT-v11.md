@@ -1,0 +1,239 @@
+# AAP migration receipt — Feature 020 V11 (T049)
+
+**Status: pre-activation. This receipt does NOT claim the V11 exports are
+live.** `symforge::embed::*` does not carry the introduced V11 atoms and
+`symforge::server_api` is `pub(crate)` behind the contract's
+`feature = "server"` gate; every observation below was made against the DARK
+Slice 3 boundary through harness scaffolding, and the machine artifact
+records `"claims_v11_exports_live": false`.
+
+This document DESCRIBES the check-mode run of
+`execution/aap_migration_receipt_v11.py`; the script generates only the
+machine artifact, the committed `docs/reviews/AAP-MIGRATION-RECEIPT-v11.json`,
+and every number in this prose is transcribed from it. The artifact's own
+`rerun_command` reproduces the observations:
+
+    python execution/aap_migration_receipt_v11.py --stage full --check
+
+A rerun regenerates fresh operation identities, so it re-verifies the
+OBSERVATIONS rather than byte-reproducing the artifact — and because check
+mode gates on a clean worktree, rerunning after a rerun requires committing
+or discarding the regenerated artifact's diff first.
+
+Check mode (C12 ruling) makes the harness FAIL — nonzero exit — when any
+gated expectation does not hold: adapter or dependent-positive compile
+failure, any adapter-lane case not failing for its contract reason, any
+real-lane case failing for an unclassified reason, any positive or negative
+cfg sentinel violated, or a dirty worktree (C17: `repo_commit` names a
+commit only when the observed tree IS that commit; recorded in the artifact
+as `worktree_dirty`). Diagnostics are attributed by cargo `package_id`
+(C15), so a dependency's error can never masquerade as a case result, and
+recorded paths are sanitized to `<repo>`/`<work>` placeholders.
+
+## Environment
+
+- `CC=CXX=clang-cl` is pinned for every harness compile, and the receipt
+  records why as a finding in its own right: **a cold build of this
+  repository currently fails under the default Windows toolchain.** MSVC
+  `cl.exe` 14.51.36231 rejects tree-sitter-scss's GCC-style
+  `-Wno-unused-parameter` (`invalid numeric argument`), and the repo's own
+  gates only pass because every checkout's `target/` carries a warm scanner
+  object. Any `cargo clean` on this machine makes the repo unbuildable until
+  the toolchain question is settled. This is a latent repo hazard
+  independent of Feature 020.
+- Case crates live in two cargo workspaces (embed vector; server-embed
+  vector) with separate target directories, so feature sets never share an
+  artifact tree.
+
+## Leg 1 — the generated all-cfg inventory
+
+No compiler involved: every item of the synthetic completeness crate
+(`all-cfg/src/lib.rs`) is parsed with its `cfg` predicate and evaluated
+against all **26** target/feature cells enumerated by `graph-cover.json`,
+using that file's own target facts and resolved feature vectors.
+
+All **six completeness sentinels** are satisfied by the resulting inventory,
+and — C16 ruling — the check is two-sided: a closed table of **nine
+expected ABSENCES** (`WindowsOnly` absent from linux cells, `NotServer`
+absent from server cells, `Atomic128` absent where the target lacks the
+width, and so on) is asserted per cell, so an over-inclusive evaluator
+cannot pass by saying yes to everything. Mutation **M27** (evaluator forced
+to `True`) was observed to fail all nine negative sentinels with a nonzero
+check exit, and the restored evaluator passes. The inventory SHA-256 and
+per-cell membership live in the machine artifact; the frozen
+`fixture-manifest.json` keeps its `null` execution facts — the corpus is not
+edited by this task.
+
+## Leg 2 — dependent-positive against the dark adapter
+
+The fixture's `symforge::embed::*` paths are mapped through
+`symforge-v11-dark-adapter`, a harness-only crate that re-exports the dark
+boundary (`symforge::live_index::index_lifecycle::{public_api, embedded}`)
+under the contract's atom names. The adapter is scaffolding for this
+receipt, NOT the activation mapping, and must never ship.
+
+**Result: the dependent-positive crate COMPILES against the dark adapter** —
+all 27 embed items, all inherent members, the trait edges, and the
+auto-trait matrix the fixture encodes.
+
+That claim is proven non-vacuous the hard way:
+
+- The first materialization omitted the fixture's `embed` feature, so
+  `#[cfg(feature = "embed")]` silenced the whole consumer module and
+  "compiles" was a claim about an empty lib. Mutation **M22** (a
+  fixture-pinned method removed from `EmbedClaim`) still passed, exposing
+  the vacuity; with the feature honest the same mutant fails `E0599` on
+  exactly the removed method, and the restored tree compiles.
+- The honest fixture then caught two transcription defects, and the round-1
+  adversarial review caught a third the fixture structurally could not:
+  1. `ServerExit` carried an invented `Clean` variant; the frozen record
+     pins `RefusedToStart`/`Success`. Corrected.
+  2. `ReceiptWaitError` omitted the contract's `DeadlineElapsed` variant.
+     Added; unproducible by dark waits, documented at the site.
+  3. `ServerBootstrapError` shipped as a public ENUM where the frozen
+     record pins an OPAQUE STRUCT (`kind: "struct"`, no public fields) — a
+     kind mismatch invisible to trait-level probes, found only by reading
+     the record (review finding C1). Corrected, and the item kind is now
+     source-pinned by `server_api::tests::bootstrap_error_is_an_opaque_struct_not_an_enum`.
+
+## Leg 3 — the 71 atomic compile-fail cases
+
+Two lanes. The REAL lane compiles each subject verbatim against the live
+crate and records the pre-activation truth; the ADAPTER lane (embed-vector
+trait/impl groups) maps the subject through the wrap layer so the case can
+fail for its CONTRACT reason. Acceptance follows the corpus rule: only the
+primary diagnostic code counts, and only diagnostics attributed to the case
+crate itself.
+
+| Group | Cases | Real lane (today's truth) | Adapter lane |
+|---|---|---|---|
+| authority-types-01/02/03 (Deserialize/Default/From) | 18 | resolution-failure | **expected-failure E0277** |
+| embedded-source-handle-not-clone | 1 | resolution-failure | **expected-failure E0277** |
+| handle-not-(ref-)unwind-safe | 10 | resolution-failure | **expected-failure E0277** |
+| runtime-handle no-AsRef/Borrow/Deref | 6 | resolution-failure | **expected-failure E0277** |
+| no-raw-crate-root-modules | 27 | compiles (V10 roots still public) | — |
+| no-raw-deep-embed-reexports | 4 | compiles (`embed` still re-exports `domain`/`git`/`live_index`/`parsing`) | — |
+| no-rust-health-api | 2 | **expected-failure** | — |
+| no-stel-public-api | 3 | 1 expected (`embed::stel`); 2 compile (`stel`, `stel_core` still public) | — |
+
+Totals: adapter lane **35/35 expected-failure**; real lane 35
+resolution-failure + 33 compiles + 3 expected-failure. The exact per-case
+primary codes are in the machine artifact — cited from there, not asserted
+here.
+
+Honesty notes on the real lane:
+
+- The 35 resolution failures are D15's prediction: pre-activation,
+  `symforge::embed::<atom>` does not resolve, so the E0277 the corpus wants
+  cannot yet be produced there. The adapter lane exists to produce it.
+- The 33 `compiles` outcomes are the measured statement that the V10 public
+  surface is still standing. Retiring those paths is the activation cut's
+  work, not T049's.
+- `no-rust-health-api`'s `symforge::server_api::health` case passes TODAY
+  because `server_api` is `pub(crate)` and server-gated (the whole path is
+  dark), not yet because a public `server_api` lacks `health`. The case
+  must re-run at activation to hold for the contract's reason.
+
+## The wrap-list discharge (what T049 built in the dark tree)
+
+All nine former `wrap-planned-t049` obligations are discharged, and the
+obligations vocabulary is three-valued (C7 ruling), verified by the delta
+oracle against the module SOURCE, never self-reported:
+
+- `wrapped-here` — a contract-shaped wrapper exists in the boundary:
+  `EmbedAtomicAuthority`, `EmbedClaim<T>`, `EmbedClaimProvenance`,
+  `EmbedEvaluationProvenance`, `EmbeddedSourceSpec`, `EmbedRefreshTicket`,
+  `EmbedShutdownReceipt`, `ShutdownReport`, `SourceCloseReport`, the
+  search/view records, the handle lanes — and `SourceRuntimePhase`, which
+  is now a boundary-owned enum because typing a public field with
+  `runtime::SourceRuntimePhase` was a D12 path-identity leak (review
+  finding C7b).
+- `verbatim-reexport` — the three enums minted contract-verbatim in
+  `lifecycle_identity` (`OperationKind`, `RetryAdvice`,
+  `SourceRefusalKind`), made nameable by an actual `pub use` that the
+  oracle reads out of the source.
+- `keyword-flip` — the four `server_api` atoms: a real module, opaque-error
+  shape included, behind `cfg(feature = "server")` + `pub(crate)`;
+  activation is one keyword BECAUSE the cfg gate is already there (C2
+  ruling, amending D4), and no embed cell may ever grow these atoms.
+
+Contract conformance details: the five handle types carry a
+`PhantomData<Box<dyn Any + Send + Sync>>` marker (Send+Sync+Unpin positive,
+UnwindSafe/RefUnwindSafe negative, proven by the ten adapter-lane unwind
+cases); `ReceiptWaitError` carries its pinned `Display`+`Error`;
+`ProcessRuntimeApi` carries contract-pinned `Clone`+`Drop`; contract method
+parameters keep their contract names, with each dark lane recording that it
+does not read them.
+
+## Divergence register (recorded, not hidden)
+
+1. **Public-member superset (C3, the activation trim list).** Beyond the
+   contract's closed inherent-impl and 17-entry direct-impl lists, the
+   atom-destined types carry: Slice-2 handle members `identity()`, `key()`,
+   `is_open()`, `close()`, `finalize()` (recorded, not deleted — Slice 2
+   oracles own them); `EmbedSourceRefusal::kind_name()`; on the three
+   `verbatim-reexport` enums, members the contract's variant-only records
+   never grant — `OperationKind::ALL`, `OperationKind::kind_name()`,
+   `RetryAdvice::ALL`, and the FULL derive set on all three
+   (`Debug`/`Clone`/`Copy`/`PartialEq`/`Eq`/`PartialOrd`/`Ord`/`Hash` — the
+   contract's 17-entry impl list has no entry for any of them, so every one
+   is beyond-contract, the ordering and hashability most of all);
+   `ServerExit`'s five derives (`Debug`/`Clone`/`Copy`/`PartialEq`/`Eq`,
+   likewise unlisted, behind the server gate); and derives
+   beyond the contract elsewhere (`Clone`/`PartialEq`/`Eq` on
+   request/result/view records, `Clone` on `EmbedOperationReceipt`,
+   `Clone`/`Copy`/`PartialEq`/`Eq` on `ReceiptWaitError` and
+   `SourceRuntimePhase`, `Debug` broadly — the Slice 3 oracles need
+   `Debug`). Scope note: this entry covers atom-destined TYPES; the
+   boundary module's own scaffolding items — `wrap_table`, `WrapEntry`,
+   `render_export_delta`, the two named constants — are harness/oracle
+   surface that retires with the module's role at activation, not
+   candidates for the embed graph; and `embedded.rs`'s never-an-atom
+   carriers at internal paths land on the same trim list — its Slice-2
+   publics (`EmbeddedSourceFactory`, `EmbeddedIdentity`,
+   `EmbeddedSourceHandle`, `CloseReceipt`, `EmbedRefusal`) plus the
+   internal `SourceCloseReport`, which is THIS slice's (T047's observation
+   record, not Slice 2's — its contract twin `symforge::embed::
+   SourceCloseReport` is a real atom, so the provenance matters). [Round 6:
+   this sentence previously called `SourceCloseReport` Slice-2-owned and
+   omitted `EmbeddedSourceHandle`; both corrected.] The `*_for_test` probes carry
+   `#[cfg(any(test, feature = "server"))]`: per the Slice 0 predicate rule
+   that is PRODUCTION — the probes ship in the published server binary and
+   only the embed build sheds them; plain `cfg(test)` is not compilable
+   because the oracles are an external `tests/` crate, which is the whole
+   reason this leak exists. ACTIVATION PRECONDITION, not a trim-list
+   optional: before the keyword flip the probes become
+   `all(test, feature = "server")` by moving their oracles in-crate, or
+   they sit behind a dedicated non-server test feature. The activation
+   graph proof owns the remaining trim decisions.
+2. **Refusal mapping (D18, ratified and narrowed).** `open_embedded_source`
+   maps `SourceAlreadyOpen` → `SelectionUnavailable` + `OnEvent` + the
+   `evidence-absent` sentinel — `held_by` is an `EmbeddedIdentity`, not an
+   `AuthorityIdentity`, so surfacing it as refusal evidence would mint. The
+   two arms for refusals `open()` cannot produce are deleted.
+3. **Dark receipts claim no argument identity (C5 ruling).** Refusal lanes
+   mint `OperationReceipt::for_dark_refusal(kind)` — the canonical hash
+   covers the operation kind alone, because hashing arguments the lane
+   never examined would claim a binding that did not happen. Slice 4
+   replaces this at the point a lane actually reads its arguments.
+4. **server_api leg.** No external crate can compile against
+   `symforge::server_api` before the keyword flip — that unreachability is
+   D4's design — so the server-consumer shapes are pinned by the in-crate
+   tests (`dark_run_refuses_and_the_contract_shapes_hold`,
+   `bootstrap_error_is_an_opaque_struct_not_an_enum`) and the fixture's
+   `server` half stays cfg'd out.
+
+## Mutation observations (this task's ledger entries)
+
+- **M20** — self-wait guard removed from the contract `wait`: caught by the
+  named runtime oracle alone.
+- **M21** — refusal mapping flipped: caught by the same oracle's kind
+  assertion.
+- **M22** — fixture-pinned method removed: first exposed the vacuous
+  positive leg, then, with the feature honest, caught as `E0599`.
+- **M23** — `EmbedRefreshTicket`'s unwind marker removed: the RefUnwindSafe
+  adapter case COMPILES under the mutant and refuses E0277 restored.
+- **M27** — cfg evaluator forced to `True`: all nine negative sentinels
+  fail with a nonzero check exit; restored, the run is clean.
+
+All mutants restored; the committed tree is the accepting state.

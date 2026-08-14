@@ -33,4 +33,10 @@ pub mod mutation;
 pub mod physical_root;
 pub mod process_runtime;
 pub mod registry;
+// T047: the dark V11 runtime. In-directory consumption only; the dark factory
+// is the single door and Slice 4's activation cut is the only planned caller.
+pub mod runtime;
+// T048: the embed boundary's dark rehearsal — wrap table, contract-shaped
+// wrappers, and the export delta renderer.
+pub mod public_api;
 pub mod transition;
