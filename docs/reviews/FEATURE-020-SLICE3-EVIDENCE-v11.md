@@ -89,17 +89,26 @@ first-commit decision predicted FIVE categories dirty. Measured at the end:
 FOUR moved, `ccr` byte-identical, because CCR was trimmed out of T045 batch
 two by review. The regen updates exactly the four that moved:
 
-| category | before | after |
-|---|---|---|
-| writers | `5137cd7b…3af7dd` | `bafa517a…daeee1` |
-| callbacks | `48938137…97e8b22` | `026c548b…fe577b` |
-| publication_roots | `e37555ad…61e82d` | `b90b8d88…190b54` |
-| cache | `4eb220e8…5c18a38` | `6fb4cace…14fa095` |
-| ccr | `8ad77748…84ad246` | UNCHANGED |
+| category | before | first regen | after re-crank (HEAD) |
+|---|---|---|---|
+| writers | `5137cd7b…3af7dd` | `bafa517a…daeee1` | `565e4227…bf3e31` |
+| callbacks | `48938137…97e8b22` | `026c548b…fe577b` | unchanged |
+| publication_roots | `e37555ad…61e82d` | `b90b8d88…190b54` | unchanged |
+| cache | `4eb220e8…5c18a38` | `6fb4cace…14fa095` | unchanged |
+| ccr | `8ad77748…84ad246` | UNCHANGED | unchanged |
 
 The checker's own second-order pin (`FROZEN_DIGESTS.retirement_records`) was
-regenerated through its emit opt-in the same way: old `4c118fab…76a6fb`, new
-`313dceda…9c21bf`. Checker reports OK after both.
+regenerated through its emit opt-in the same way: `4c118fab…76a6fb` →
+`313dceda…9c21bf` at the first regen, → `d86bd17b…e5ce29` after the
+re-crank. Checker reports OK after each.
+
+**Correction, on review.** The re-crank commit's message claimed "the
+evidence table now carries the final writers value" while touching only the
+contract and the checker — the table had NOT been updated, which is the same
+reporting class as a stale pin: the thing that reported was not the thing
+that knew. This row-level history is the repair, added as a docs-only commit
+after the full suite went green on the re-cranked tree, so the receipt and
+the table describe the same HEAD.
 
 ## T044 — the authority choice is explicit (PR 2)
 
