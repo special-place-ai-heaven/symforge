@@ -16,9 +16,15 @@ pub mod knowledge;
 // would widen a surface Slice 3 must leave frozen. Modules that expose one of
 // these types publicly re-export it instead.
 pub(crate) mod lifecycle_identity;
+// Feature 020 V11, D4: the REAL server_api module, flip-ready. `pub(crate)` is
+// load-bearing exactly like lifecycle_identity above — the frozen public-API
+// census counts only plain `pub mod` lines, so this adds no atom today, and
+// activation is one keyword. Std-only; no `pub use` anywhere; no call edge
+// into index_lifecycle. Do NOT "tidy" this to `pub mod` before the cut.
 pub mod live_index;
 pub mod parsing;
 pub mod paths;
+pub(crate) mod server_api;
 // Watcher state snapshot types (data only) — used by engine health stats; the
 // notify-based watcher runtime lives in the server-gated `watcher` module.
 pub mod watcher_state;

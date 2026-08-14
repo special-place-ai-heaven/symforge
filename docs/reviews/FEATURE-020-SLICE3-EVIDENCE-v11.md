@@ -1,6 +1,53 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
-## T047 — the dark runtime, RED to GREEN (PR 3)
+## T048 — the wrap table, the flip-ready module, and the delta (PR 3)
+
+RED first: one unresolved import, the absent `public_api` module; then, at
+the test-binary compile, the four missing E1 handle methods named by the
+compiler.
+
+**Every escalation ruling is code now.** `EmbedSourceRefusal` and
+`EmbedOperationReceipt` render KIND-PREFIXED identity strings stored at wrap
+time (E3), with `EVIDENCE_ABSENT` as the closed sentinel a renderer that
+always emits `<kind>-<digits>` cannot produce (E2), and `Display` + `Error`
+implemented as the contract's trait_impls demand. `ProcessRuntimeApi::
+acquire()` takes no arguments and delegates to `incarnate` with
+`PROVISIONAL_ACQUIRE_PROCESS_BYTES` — a named constant, 256 MiB, recorded
+here as PROVISIONAL and not policy; deliberately not the live V10 env budget
+(E4). The four V11 handle methods live on the SEAM-pinned `embedded.rs`
+handle (E1) under the transcribed contract shapes and REFUSE honestly in the
+dark — an empty search result would be a claim about content that does not
+exist. `server_api` is a REAL `pub(crate)` module in `lib.rs` (D4): std-only,
+no `pub use`, no `index_lifecycle` edge, `run` refusing with
+`ActivationPending` rather than pretending a server ran; activation is one
+keyword. Its scoped `allow(dead_code)` carries its receipt in the file.
+
+**The delta is closed JSON, recomputed never trusted.**
+`docs/reviews/FEATURE-020-EXPORT-DELTA-v11.json` carries the contract SHA,
+all 64 atoms, the live pub-mod census, per-atom D12/D13 obligations from the
+wrap table — the module's own shape judgment, never path identity — and the
+two forbidden citizens: the `claim_provenance` mount and `LimitBreach`
+through `TruncationBreaches`. The oracle recomputes it from
+`public-api-v11.json` minus the live census; regeneration is the same env
+opt-in pattern as the closure census, write-then-still-compare. The wrap
+table asserts coverage of exactly the 30 top-level atoms and that NO embed
+atom claims `direct-reexport`; the `wrap-planned-t049` entries are the
+inherited work list, recorded so they cannot be forgotten.
+
+**Mutations M18/M19** — the sentinel replaced by a minted `auth-0`, and an
+embed atom claiming direct re-export — each caught by its named oracle
+alone, restored. Nineteen mutations across the slice: eighteen caught by
+name, one historical survivor that forced its oracle, one guard structural.
+One clippy catch: the constant assertion on the provisional budget was
+rightly refused as always-true and replaced with the honest pin — acquire
+delegated, the runtime exists, the value lives in this ledger.
+
+Gates on the T048 tree: both T048 oracles green plus the ten T047 oracles;
+embed gate 1332 passed 0 failed — the obligation for this commit; lib 3166
+passed 0 failed; clippy denied warnings clean; fmt clean; checker OK; all
+five closure digests byte-identical.
+
+## T047 — the dark runtime, RED to GREEN (PR 3)## T047 — the dark runtime, RED to GREEN (PR 3)
 
 Observed RED first, twice honestly: the initial file failed for three reasons,
 two of which were MY invented constructors where real ones existed —

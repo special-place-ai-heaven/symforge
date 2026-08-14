@@ -35,6 +35,12 @@ impl EmbeddedIdentity {
         let raw = NEXT_EMBEDDED.fetch_add(1, Ordering::Relaxed);
         Self(std::num::NonZeroU64::new(raw).expect("embedded counter starts at 1"))
     }
+
+    /// Raw counter value, crate-only, for the embed boundary's kind-prefixed
+    /// rendering and nothing else.
+    pub(crate) fn raw(&self) -> u64 {
+        self.0.get()
+    }
 }
 
 /// Why an embedded request was refused.
@@ -230,6 +236,52 @@ impl EmbeddedSourceHandle {
             identity: self.identity,
             performed_shutdown: performed,
         }
+    }
+
+    /// V11 (E1): the public view of this source's runtime state, contract
+    /// field-for-field. A dark handle has NO publication and NO observer, and
+    /// the view says so rather than inventing either.
+    pub fn runtime_view(&self) -> super::public_api::SourceRuntimeView {
+        super::public_api::SourceRuntimeView {
+            binding_identity: format!("source-{}", self.identity.raw()),
+            current_publication_identity: None,
+            observer_epoch: 0,
+            phase: super::runtime::SourceRuntimePhase::Loading,
+            source_version: 0,
+        }
+    }
+
+    /// V11 (E1): symbol search under the contract shape. No generation is
+    /// bound to a dark handle, so this REFUSES honestly — an empty result
+    /// would be a claim about content that does not exist.
+    pub fn search_symbols(
+        &self,
+        _request: &super::public_api::SymbolSearchRequest,
+    ) -> Result<super::public_api::SymbolSearchResult, super::public_api::EmbedSourceRefusal> {
+        Err(super::public_api::dark_unbound_refusal(
+            crate::lifecycle_identity::OperationKind::SearchSymbols,
+        ))
+    }
+
+    /// V11 (E1): text search under the contract shape; same honest refusal.
+    pub fn search_text(
+        &self,
+        _request: &super::public_api::TextSearchRequest,
+    ) -> Result<super::public_api::TextSearchResult, super::public_api::EmbedSourceRefusal> {
+        Err(super::public_api::dark_unbound_refusal(
+            crate::lifecycle_identity::OperationKind::SearchText,
+        ))
+    }
+
+    /// V11 (E1): request a refresh. A dark refresh cannot run — there is no
+    /// generation, no observer, and no candidate lane — so the ticket is
+    /// refused rather than minted for work nothing will perform.
+    pub fn request_refresh(
+        &self,
+    ) -> Result<super::public_api::EmbedRefreshTicket, super::public_api::EmbedSourceRefusal> {
+        Err(super::public_api::dark_unbound_refusal(
+            crate::lifecycle_identity::OperationKind::RefreshSource,
+        ))
     }
 
     /// Fixture probe for the relocated guard: arms the finalizer for THIS

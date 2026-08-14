@@ -56,6 +56,17 @@ macro_rules! identity_newtype {
             pub fn fresh() -> Self {
                 Self($crate::lifecycle_identity::next_identity())
             }
+
+            /// Raw counter value, crate-only, for the embed boundary's
+            /// kind-prefixed RENDERING and nothing else — deriving order or
+            /// permission from it is the inference channel the derive set
+            /// deliberately excludes. The allow is macro-wide: only the
+            /// identities the boundary renders consume it today, and a
+            /// per-kind opt-in would fork the macro for a lint.
+            #[allow(dead_code)]
+            pub(crate) fn raw_for_render(&self) -> u64 {
+                self.0.get()
+            }
         }
     };
 }
