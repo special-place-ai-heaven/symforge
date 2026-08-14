@@ -33,29 +33,37 @@
 //! tolerate as prose. The bound holds because no gate here builds
 //! doctests, and that is not left as a hand-checked snapshot:
 //! `no_gate_builds_doctests` below PINS every line of every
-//! `.yml`/`.yaml` workflow that mentions cargo — case-insensitively —
-//! against a verbatim allowlist a human judged doctest-free, and binds
-//! each line's OCCURRENCE COUNT, plus the total, the distinct set, and
-//! the workflow-file count. Rounds 8–11 each falsified a scan that
-//! tried to read the command out of the file and judge it; round 11's
-//! `cargo rustdoc -- --test` builds and runs doctests while naming
+//! `.yml`/`.yaml` workflow that mentions cargo OR rustdoc —
+//! case-insensitively — against a verbatim allowlist a human judged
+//! doctest-free, binds each line's OCCURRENCE COUNT plus the total, the
+//! distinct set and the workflow-file count, and pins the repo's
+//! `.cargo/config.toml` verbatim. Rounds 8–11 each falsified a scan
+//! that tried to read the command out of the file and judge it; round
+//! 11's `cargo rustdoc -- --test` builds and runs doctests while naming
 //! neither `test` nor `--doc` where the walk looked, and
 //! `cargo te"st" --doc` was split by the scan's own quote-erasure into
-//! words the shell joins. There is no word model left to be wrong
-//! about: an unrecognized cargo line fails whatever it says. The
-//! per-line counts are round 12's: `(total, distinct)` binds a
+//! words the shell joins. The pin recognizes LINES, not commands: an
+//! unrecognized one fails whatever it says. Round 11 wrote "there is no
+//! word model left to be wrong about" and round 13 falsified it —
+//! normalization IS a word model, and `split_whitespace` (Unicode
+//! White_Space) disagreed with bash's IFS, so a line carrying U+00A0
+//! normalized onto a pinned gate that bash would have run differently.
+//! Splitting is now ASCII space and tab, which is what bash splits on.
+//! The per-line counts are round 12's: `(total, distinct)` binds a
 //! bijection only when the two are EQUAL, and at `(30, 26)` a
 //! compensated edit deleted a real test gate while both numbers held.
 //! KNOWN RESIDUALS of the pin — what has been probed, NOT a proof of
 //! exhaustiveness, because round 9 called its list "the only two",
-//! round 10 produced a third, round 11 a fourth, and round 12 showed
-//! one of them was never a residual at all: a gate that reaches cargo
-//! with no `cargo` on the line (a script, make target, or composite
-//! action running it out of sight), and a USER-level `[alias]` in
-//! `~/.cargo/config.toml`, which is outside the repo (CI runners have
-//! none). The repo's own `.cargo/config.toml` was listed here as
-//! unreachable while sitting in a file this test can open, so it is
-//! opened: an `[alias]` table there fails.
+//! round 10 produced a third, round 11 a fourth, round 12 showed one of
+//! them was never a residual at all, and round 13 broke the check that
+//! replaced it: a gate reaching the doctest lane with neither `cargo`
+//! nor `rustdoc` on the line (a script, make target, or composite
+//! action running it out of sight); a cargo config OUTSIDE the repo
+//! (`~/.cargo/config.toml`, `$CARGO_HOME`, or an ancestor of the
+//! checkout); and a gate DISABLED rather than edited — `if: false` on a
+//! step changes no cargo line, so this pin cannot see a gate switched
+//! off. The repo's own `.cargo/config.toml` is NOT a residual: it is
+//! pinned verbatim, and the legacy `.cargo/config` must not exist.
 //!
 //! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
 //! across directory boundaries. The mechanism sweep is a fail-closed
@@ -489,9 +497,11 @@ fn source_splicing_is_allowlisted() {
         out
     }
     let splice_matcher = |line: &str| -> Option<&'static str> {
-        if line.contains('\u{200E}') || line.contains('\u{200F}') {
-            return Some("bidi mark");
-        }
+        // The bidi arm used to sit here. Round 12 moved the decision into
+        // `sweep`, ahead of every exemption, which left this copy
+        // unreachable — round 13 called that out as dead code still
+        // describing itself in the present tense, so it is deleted rather
+        // than left to read like the live rule.
         // Round 8, the ambiguity arm: string content can poison any
         // line-local comment tracking (a `"/*"` literal opens a span the
         // lexer never saw; a `"*/"` literal closes one it never opened),
@@ -598,6 +608,19 @@ fn source_splicing_is_allowlisted() {
 /// held both numbers while removing `cargo test --all-targets` from PR
 /// CI entirely. The multiset is what was always meant; now it is what
 /// is checked.
+/// The repo's cargo config, verbatim. Pinned rather than parsed: an
+/// `[alias]` table here re-points a gate command without touching a
+/// workflow line, and every syntax-matching attempt at finding one has
+/// lost to the syntax (round 13 broke three spellings of the table
+/// header). Update this constant in the same change that edits the file.
+const CARGO_CONFIG: &str = "\
+# Build artifacts stay beside the checkout, on whatever drive the repo is on
+# (see CLAUDE.md, Windows build cache). Not a fixed drive: this said \"on E:\" while
+# the checkout lived there, which went stale when it moved.
+[build]
+target-dir = \"target\"
+";
+
 const CARGO_LINES: &[(&str, usize)] = &[
     // Prose and configuration — never a command.
     (
@@ -712,12 +735,14 @@ fn no_gate_builds_doctests() {
     //
     // KNOWN RESIDUALS — what has been probed, NOT a proof of
     // exhaustiveness (round 9 wrote "the only two" and round 10 produced
-    // a third the same day; round 11 produced a fourth): a gate that
-    // reaches cargo without the string `cargo` on the line — a script,
-    // make target, or composite action that runs it out of sight, or a
-    // `[alias]` in `.cargo/config.toml` re-pointing an allowlisted line
-    // at a doctest-running command. Both are outside any line-based
-    // scan of these files.
+    // a third the same day; round 11 produced a fourth; round 13 broke
+    // the check that was meant to retire one). Three, matching the
+    // header: a gate reaching the doctest lane with neither `cargo` nor
+    // `rustdoc` on the line (a script, make target, or composite action
+    // running it out of sight); a cargo config outside the repo; and a
+    // gate DISABLED rather than edited, since `if: false` on a step
+    // changes no line this pin reads. The repo's own
+    // `.cargo/config.toml` is not among them — it is pinned below.
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     let workflows = repo.join(".github").join("workflows");
     let mut seen: Vec<String> = Vec::new();
@@ -731,10 +756,26 @@ fn no_gate_builds_doctests() {
         files += 1;
         let text = std::fs::read_to_string(&path).expect("read workflow");
         for (number, line) in text.lines().enumerate() {
-            if !line.to_ascii_lowercase().contains("cargo") {
+            // Round 13: `rustdoc` selects too. The file already named it as
+            // an equally sufficient spelling of the doctest lane — and then
+            // applied that knowledge only to the ALLOWLIST, never to the
+            // workflow text, so a first-class `run: rustdoc --test src/lib.rs`
+            // step (no cargo anywhere) walked past the filter entirely.
+            let lowered = line.to_ascii_lowercase();
+            if !lowered.contains("cargo") && !lowered.contains("rustdoc") {
                 continue;
             }
-            let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Split on ASCII space and tab ONLY, which is what bash's
+            // default IFS splits on. Round 13: `split_whitespace` uses the
+            // Unicode White_Space property, so a U+00A0 between `--` and
+            // `--test-threads=1` normalized to exactly the pinned gate
+            // while bash saw a single glued word — the pin could not tell
+            // the pinned command from one that is not it.
+            let normalized = line
+                .split([' ', '\t'])
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
             if CARGO_LINES.iter().any(|(l, _)| *l == normalized) {
                 seen.push(normalized);
                 continue;
@@ -748,10 +789,11 @@ fn no_gate_builds_doctests() {
     }
     assert!(
         offenders.is_empty(),
-        "CI workflow lines mentioning cargo that this test has never seen. \
-         Each one must be read and added to CARGO_LINES with the group that \
-         says why it cannot build doctests — a doctest is an executing edge \
-         the prose exemption in this file's header tolerates:\n{}",
+        "CI workflow lines mentioning cargo or rustdoc that this test has \
+         never seen. Each one must be read and added to CARGO_LINES with the \
+         group that says why it cannot build doctests — a doctest is an \
+         executing edge the prose exemption in this file's header \
+         tolerates:\n{}",
         offenders.join("\n")
     );
     // `--doc` and `rustdoc` are the two spellings that open the lane
@@ -768,23 +810,41 @@ fn no_gate_builds_doctests() {
          -- --test` runs doctests and fails the step on failure, exactly like \
          `--doc`:\n{named:?}"
     );
-    // A `[alias]` table in the repo's own cargo config could re-point an
-    // allowlisted line at a doctest-running command (`cargo test` -> an
-    // alias for `rustdoc -- --test`). Round 12 pointed out this was
-    // stated as an unreachable residual while sitting in a file this
-    // test can simply read — so it is read. A USER-level alias
-    // (~/.cargo/config.toml) stays a residual: it is outside the repo,
-    // and CI runners have none.
+    // The repo's cargo config is PINNED VERBATIM, not searched for an
+    // `[alias]` table. Round 12 added that search; round 13 defeated it
+    // three ways in one afternoon — TOML accepts `[ alias ]` and
+    // `["alias"]` as the same table header, a root-level `alias.fmt =
+    // [...]` dotted key declares it with no header at all, and cargo
+    // still honours the legacy extensionless `.cargo/config`, which the
+    // search never opened. Weaponized, `[ alias ]` + `fmt = ["test",
+    // "--doc", "--", "--skip"]` turned the allowlisted `run: cargo fmt
+    // --check` into a full doctest run that exited 0 with both workflow
+    // files byte-unchanged. (Aliases cannot shadow BUILT-IN subcommands,
+    // so `cargo test` is not re-pointable — `fmt` and `clippy` are
+    // external subcommands and are.) Matching TOML syntax is the same
+    // mistake as matching YAML or shell syntax, one file format later,
+    // so it is not matched: the whole file is pinned, and the legacy
+    // path must not exist. STATED RESIDUAL: a config OUTSIDE the repo —
+    // `~/.cargo/config.toml`, `$CARGO_HOME`, or an ancestor directory of
+    // the checkout. CI runners have none, and a `CARGO_ALIAS_*` env var
+    // in a workflow would carry `cargo` in its name and be caught above.
     let cargo_config = repo.join(".cargo").join("config.toml");
-    if let Ok(config) = std::fs::read_to_string(&cargo_config) {
-        assert!(
-            !config.lines().any(|l| l.trim().starts_with("[alias]")),
-            "`.cargo/config.toml` declares an [alias] table. An alias can \
-             re-point an allowlisted gate line at a doctest-running command \
-             without changing the line, which is exactly what CARGO_LINES \
-             cannot see — read the aliases and decide deliberately"
-        );
-    }
+    let config = std::fs::read_to_string(&cargo_config)
+        .expect("read .cargo/config.toml — the pin below cannot vouch for a file it did not read");
+    assert_eq!(
+        config.replace("\r\n", "\n"),
+        CARGO_CONFIG,
+        "`.cargo/config.toml` differs from its pin. Any change here can \
+         re-point an allowlisted gate line at a doctest-running command \
+         without touching a workflow — read the diff and update this pin \
+         deliberately"
+    );
+    assert!(
+        !repo.join(".cargo").join("config").exists(),
+        "`.cargo/config` (the legacy extensionless path) exists. Cargo reads \
+         it exactly like config.toml, so it can carry an [alias] table this \
+         pin does not cover — fold it into config.toml or pin it here"
+    );
     // The MULTISET binds, per line. Round 12: (total, distinct) is only a
     // bijection when the two are equal — at (30, 26) a compensated edit
     // deleted `cargo test --all-targets` from PR CI while both numbers

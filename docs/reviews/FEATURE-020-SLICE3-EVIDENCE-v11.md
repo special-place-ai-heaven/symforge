@@ -1,9 +1,79 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## Round-13 review and its repairs (PR 3)
+
+Round 13 attacked the round-12 repairs: **0 blockers, 4 confirmed
+majors, 3 confirmed minors, 1 major refuted, 5 notes**. Two majors are
+the code half and docs half of one defect — the `[alias]` check added
+one round earlier — and it is the same mistake in a third file format:
+matching a syntax with a literal string instead of pinning the file.
+
+- **MAJOR — the `[alias]` check was a literal-prefix match on one
+  filename.** `starts_with("[alias]")` misses three valid TOML spellings
+  of the same table — `[ alias ]`, `["alias"]`, and a root-level
+  `alias.fmt = [...]` dotted key — and never opens the legacy
+  extensionless `.cargo/config`, which cargo still honours. Weaponized
+  and verified against real cargo: `[ alias ]` plus
+  `fmt = ["test", "--doc", "--", "--skip"]` turns the allowlisted
+  `run: cargo fmt --check` into a full doctest run that exits 0, with
+  both workflow files byte-unchanged, every per-line count matching, and
+  the test green. (Aliases cannot shadow BUILT-IN subcommands, so
+  `cargo test` is not re-pointable — `fmt` and `clippy` are external
+  subcommands and are, which also falsified my own rationale comment.)
+  Two further holes, same root: `if let Ok(...)` made the whole check
+  no-op silently when the file was absent, and the legacy path was never
+  read. **Repair: the config is pinned VERBATIM**, the read must
+  succeed, and `.cargo/config` must not exist. Mutations **M56a–M56e**
+  (three spellings, legacy path, absent file) each observed caught.
+- **MAJOR — the line filter selected on `cargo` alone.** The file named
+  `rustdoc` as an equally sufficient spelling of the doctest lane in its
+  own orthogonal check, then applied that knowledge only to the
+  allowlist and never to the workflow text. A first-class
+  `run: rustdoc --test src/lib.rs` step — no cargo anywhere — walked
+  past the filter and left all counts untouched. Verified live: it runs
+  the doctest. Repair: the filter selects `cargo` OR `rustdoc`.
+  Mutation **M56f** observed caught.
+- **MAJOR — "there is no word model left to be wrong about" was false.**
+  Normalization IS a word model: `split_whitespace` uses Unicode
+  White_Space while bash's IFS is space/tab/newline, so a line with
+  U+00A0 between `--` and `--test-threads=1` normalized onto the pinned
+  gate while bash would have run a different command. The reviewer was
+  scrupulous about the limit — gluing can only merge tokens of
+  allowlisted entries, and no merge yields a doctest-running command —
+  so the safety property survived and only the sentence was false.
+  Repair: split on ASCII space and tab, which is what bash splits on;
+  the sentence now says the pin recognizes lines, not commands.
+  Mutation **M56g** observed caught, with the NBSP verified at byte
+  level rather than assumed.
+- **MINOR ×3 —** the in-test residual list still called the repo's
+  `.cargo/config.toml` unreachable fifty lines above the code that reads
+  it; the `[alias]` rationale used an impossible exemplar (`cargo test`
+  cannot be aliased); and the Round-11 section repeated the same retired
+  residual. All corrected against what cargo actually does.
+- **Notes acted on:** the bidi branch inside `splice_matcher` became
+  unreachable when round 12 moved the decision into `sweep`, so it is
+  deleted rather than left describing itself in the present tense; and
+  `if: false` on a step disables a gate with no line change at all,
+  which is now a STATED residual rather than an unexamined gap.
+- **REFUTED:** that a plain multi-line YAML continuation defeats the
+  per-line pin.
+
+## Gate results for the round-13 repair chunk
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `preventive_runtime_dark_v11` | 4 passed, 0 failed; dual counts unchanged at (4,4)/(9,9)/(6,6) |
+| `runtime_dark_v11` + `public_api_delta_v11` | 11 + 2 passed, 0 failed |
+| gate pin | per-line multiset, (30, 26, 2), and the verbatim `.cargo/config.toml` all bound |
+| mutations | M56a–M56c (three TOML alias spellings), M56d (legacy `.cargo/config`), M56e (config absent — the old check no-opped silently), M56f (bare `rustdoc --test` step), M56g (U+00A0 normalization collision, NBSP verified at byte level) each observed caught; M55a/M55c and the uniform-path alias re-observed as controls; all restored |
+
 ## Round-12 review and its repairs (PR 3)
 
 Round 12 attacked the round-11 repair: **0 blockers, 1 confirmed major,
-4 confirmed minors, 2 refuted, 2 notes**. The pinned-allowlist design
+4 confirmed minors, 2 refuted, 2 notes (not enumerated below; both were
+observations rather than defects)**. The pinned-allowlist design
 held — no evasion was found that adds a doctest-building gate — and the
 one major is a counting flaw in how the pin detects DELETION, not a hole
 in what it admits.
@@ -33,7 +103,14 @@ in what it admits.
   test can simply open. It now reads it and fails on an `[alias]` table.
   A user-level `~/.cargo/config.toml` alias stays a real residual: it is
   outside the repo, and CI runners have none. Mutation **M55d**
-  observed caught.
+  observed caught. [Amended after round 13: that read was a literal
+  `starts_with("[alias]")`, which three valid TOML spellings and the
+  legacy `.cargo/config` walked straight past, and which no-opped
+  silently when the file was absent. The file is now pinned verbatim.
+  Also corrected there: the rationale's exemplar was impossible — cargo
+  refuses to let an alias shadow a BUILT-IN subcommand, so `cargo test`
+  is not re-pointable; `fmt` and `clippy` are external subcommands and
+  are.]
 - **MINOR — "bidi marks are flagged OUTRIGHT" was false.** The matcher
   named them, and then the prose exemption forgave them: a U+200E on a
   `//` line counted as tolerated prose. The bidi check now runs before
@@ -108,6 +185,13 @@ So the walk was deleted.
   addition still trips. Residuals are now the two no line-based scan can
   reach: a gate with no `cargo` on the line at all, and a
   `.cargo/config.toml` `[alias]` re-pointing an allowlisted line.
+  [Amended after rounds 12–13: the repo's `.cargo/config.toml` was never
+  a residual — it is a file this test can open, and it is now pinned
+  verbatim after round 12's `[alias]`-search replacement was defeated by
+  three TOML spellings and the legacy `.cargo/config`. The residual list
+  is also longer than "two": a `rustdoc` line names no cargo, and
+  `if: false` disables a gate without changing any line. See the
+  Round-13 section.]
 - **MINOR ×5, all prose, all mine.** The "quoting cannot hide a command"
   absolute survived unamended in the doc; the retired universal alias
   claim survived in a third place my round-10 sweep missed because the
