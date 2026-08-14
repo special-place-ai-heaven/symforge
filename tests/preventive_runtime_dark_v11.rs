@@ -10,21 +10,24 @@
 //! of them — and the lane roots are asserted to EXIST so a moved file cannot
 //! make the claim vacuously true.
 //!
-//! The rule is fail-closed, no full lexer: a line mentioning a guarded
-//! surface passes only as prose (the token strictly after a `//` that sits
-//! OUTSIDE any string literal — C8 ruling) or as an exactly-allowlisted
-//! line. A novel string literal or block-comment mention FAILS and forces a
-//! human decision — safe friction, never silent tolerance.
+//! The rule is fail-closed and LEXER-FREE (C8 ruling, second arm): a line
+//! mentioning a guarded surface passes only as a FULL-LINE comment — first
+//! non-whitespace bytes `//`, after which Rust permits no code on the line
+//! — or as an exactly-allowlisted line. Everything else, string literals
+//! and trailing comments included, is treated as code and FAILS, forcing a
+//! human decision. Rounds 1–3 proved every attempted mid-line-comment
+//! lexer laundered a call edge through some literal form; this rule has no
+//! lexer to be wrong.
 //!
-//! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source across
-//! directory boundaries. The mechanism sweep names every `include!`
-//! regardless of delimiter, every `#[path` attribute head, and every
-//! attribute line carrying a `path =`/`path=` argument — but it is still a
-//! TEXT scan: a `concat!`/`env!("OUT_DIR")` argument can name the dark
-//! directory without writing its token, and an attribute spelled to match
-//! none of those patterns escapes it. Those residuals are accepted and
-//! stated here rather than parsed away; what the sweep guarantees is only
-//! that a splice site using the named spellings cannot appear without a
+//! STATED RESIDUAL (C9 ruling): `include!`/`#[path]` can mount source
+//! across directory boundaries. The mechanism sweep judges each line with
+//! whitespace removed, naming any `include!` invocation, any `#[path`
+//! attribute head, and any attribute line carrying a `path=` argument. It
+//! is still a LINE-based text scan: an invocation split across lines, or a
+//! `concat!`/`env!("OUT_DIR")` argument that names the dark directory
+//! without writing its token, escapes it. Those residuals are accepted and
+//! stated rather than parsed away; the guarantee is only that a
+//! single-line splice site in the named spellings cannot appear without a
 //! deliberate allowlist change.
 
 use std::path::{Path, PathBuf};
@@ -44,43 +47,17 @@ fn rust_files_under(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Byte offset of the first `//` that sits OUTSIDE any string literal (C8:
-/// a `//` inside a string must not launder the rest of the line as prose).
-/// Char literals are consumed so a `'"'` cannot flip the string tracker —
-/// round 2 proved the flip could FABRICATE a comment start inside a real
-/// string and launder a call edge, not merely hide comments. The remaining
-/// known misparse is a hash-delimited raw string with interior quotes, which
-/// desyncs toward NOT finding a comment — the token is then treated as code
-/// and flagged, the fail-closed direction.
-fn comment_start_outside_strings(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
-    let mut in_string = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if in_string => i += 1,
-            b'"' => in_string = !in_string,
-            b'\'' if !in_string => {
-                // Char literal or lifetime. `'\...'` scans to its closing
-                // quote; `'c'` skips three bytes; anything else is a
-                // lifetime and consumes only the tick.
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != b'\'' {
-                        i += 1;
-                    }
-                } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
-                    i += 2;
-                }
-            }
-            b'/' if !in_string && i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                return Some(i);
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+/// The prose rule, made unarguable (C8 ruling's second arm: drop the
+/// comment exception). Three rounds of review proved a mid-line-comment
+/// lexer is an arms race this file cannot win — string literals, then char
+/// literals, then raw-string quote parity each laundered a call edge. So
+/// there is no lexer and no mid-line tolerance at all: a line is prose ONLY
+/// when its first non-whitespace bytes are `//`. Rust cannot place code
+/// after a line-start `//` on the same line, so a real call edge can never
+/// satisfy this predicate — a trailing comment that mentions a guarded
+/// surface is treated as code and must be allowlisted, safe friction.
+fn is_full_line_comment(line: &str) -> bool {
+    line.trim_start().starts_with("//")
 }
 
 struct Sweep {
@@ -90,10 +67,8 @@ struct Sweep {
     files_scanned: usize,
 }
 
-/// `matches_line` names the guarded pattern a line contains, or `None`. The
-/// prose rule is PREFIX-exact: a matched line is tolerated only when the
-/// text before the first real `//` no longer matches — so a conjunction
-/// pattern is judged on the code portion alone, never token-by-token.
+/// `matches_line` names the guarded pattern a line contains, or `None`. A
+/// matched line passes only as a FULL-LINE comment or by exact allowlist.
 fn sweep(
     matches_line: &dyn Fn(&str) -> Option<&'static str>,
     exclude_dir: Option<&Path>,
@@ -133,9 +108,7 @@ fn sweep(
                 result.allowlisted_seen.push(allowed);
                 continue;
             }
-            if let Some(comment_start) = comment_start_outside_strings(line)
-                && matches_line(&line[..comment_start]).is_none()
-            {
+            if is_full_line_comment(line) {
                 result.prose_lines += 1;
                 continue;
             }
@@ -299,14 +272,19 @@ fn source_splicing_is_allowlisted() {
     // argument inside an attribute. The residuals — a concat!-constructed
     // path, and an attribute form matching none of these spellings — are
     // stated in the file header, not silently absorbed.
+    // Round 3: whitespace is insignificant in macro invocations and
+    // attributes, so the matcher judges the line with ALL whitespace
+    // removed — `include ! (`, `#[ path`, and `path =` collapse to the
+    // canonical spellings and cannot dodge by spacing.
     let splice_matcher = |line: &str| -> Option<&'static str> {
-        if line.contains("include!") {
+        let collapsed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if collapsed.contains("include!") {
             return Some("include!");
         }
-        if line.contains("#[path") {
+        if collapsed.contains("#[path") {
             return Some("#[path");
         }
-        if (line.contains("path =") || line.contains("path=")) && line.contains("#[") {
+        if collapsed.contains("path=") && collapsed.contains("#[") {
             return Some("attribute path=");
         }
         None

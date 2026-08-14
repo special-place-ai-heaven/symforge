@@ -174,8 +174,12 @@ does not read them.
    oracles own them); `EmbedSourceRefusal::kind_name()`; on the three
    `verbatim-reexport` enums, members the contract's variant-only records
    never grant — `OperationKind::ALL`, `OperationKind::kind_name()`,
-   `RetryAdvice::ALL`, and `PartialOrd`/`Ord`/`Hash` derives on all three
-   (an ordering and hashability the contract does not pin); and derives
+   `RetryAdvice::ALL`, and the FULL derive set on all three
+   (`Debug`/`Clone`/`Copy`/`PartialEq`/`Eq`/`PartialOrd`/`Ord`/`Hash` — the
+   contract's 17-entry impl list has no entry for any of them, so every one
+   is beyond-contract, the ordering and hashability most of all);
+   `ServerExit`'s five derives (`Debug`/`Clone`/`Copy`/`PartialEq`/`Eq`,
+   likewise unlisted, behind the server gate); and derives
    beyond the contract elsewhere (`Clone`/`PartialEq`/`Eq` on
    request/result/view records, `Clone`/`Copy`/`PartialEq`/`Eq` on
    `ReceiptWaitError` and `SourceRuntimePhase`, `Debug` broadly — the
