@@ -659,6 +659,59 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         &["GenerationLeased"],
         "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
     ),
+    // ---- hooks (6 of 7; PreTool is unruled) ----
+    // Routing confirmed from `endpoint_for` (cli/hook.rs:944), NOT from
+    // `workflow_for_subcommand`, which says it does not change routing yet.
+    // Fail-open (`fail_open_json`, empty additionalContext) adds no branch: it
+    // is not Refused and, per hooks assertion 3, carries no false Current.
+    (
+        "hooks",
+        "hook:Read",
+        &["GenerationLeased"],
+        "endpoint_for routes Read to `/outline` (hook.rs ~957) — the file-outline read, the same \
+         generation-backed set as `get_file_context`, not repo-map. hooks assertion 1: \
+         GenerationLeased only for generation-backed context.",
+    ),
+    (
+        "hooks",
+        "hook:SessionStart",
+        &["GenerationLeased"],
+        "endpoint_for routes SessionStart to `/repo-map`, so it takes the set of `get_repo_map`",
+    ),
+    (
+        "hooks",
+        "hook:PromptSubmit",
+        &["GenerationLeased"],
+        "endpoint_for routes PromptSubmit to `/prompt-context`, whose handler is generation-backed \
+         — `require_queryable_sidecar_index` then `capture_queryable_sidecar_generation` \
+         (sidecar/handlers.rs:2274+)",
+    ),
+    (
+        "hooks",
+        "hook:Grep",
+        &["GenerationLeased", "RuntimeHealthObserved"],
+        "A genuine fork inside one ingress, like detect_changes: endpoint_for sends a plausible \
+         symbol name to `/symbol-context` (generation-backed) and everything else to `/health` \
+         (hook.rs ~984-990), so the allowed set is the union of the two lanes the call may take",
+    ),
+    (
+        "hooks",
+        "hook:Edit",
+        &["DiskObserved", "GitObserved"],
+        "endpoint_for routes Edit to `/impact`, the `analyze_file_impact` lanes. It CANNOT be \
+         MutationPermitted — hooks assertion 2: Edit and Write notifications cannot publish, mint \
+         a SourceMutationPermit, or bypass mutation authority. Refused is dropped from the tool's \
+         set because THIS process does not terminate selection: the hook fails open with empty \
+         additionalContext (hook.rs:8, :314), and the caller_root guard that could refuse belongs \
+         to the sidecar, not to this ingress.",
+    ),
+    (
+        "hooks",
+        "hook:Write",
+        &["DiskObserved", "GitObserved"],
+        "Same `/impact` route as hook:Edit with `new_file=true`, same assertion 2 prohibition, and \
+         the same fail-open reason for dropping Refused",
+    ),
     // ---- resources (7 of 10; glossary and tools/catalog are unruled) ----
     // A resource wrapper starts from the set of the tool it wraps, then drops
     // the lanes that invocation cannot take. It never gains one: resources
