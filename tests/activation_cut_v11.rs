@@ -91,6 +91,19 @@ const NON_INGRESS_EXCEPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "writers",
+        "src/protocol/knowledge_curation.rs::apply_reviewed_mutation",
+        "Staging and guards, with the branch at the writer. `prepare_mutation` calls it \
+         (knowledge_curation.rs:938) while staging a BTreeMap; it performs no disk write and \
+         holds no SourceMutationPermit. FR-037 puts the permit on the source-content side effect \
+         — `write_policy`/`apply`, both overlayed — so MutationPermitted here would tell Slice 4 \
+         to take a permit on a step that must stay permit-free. Its terminating errors \
+         (unknown_action_id, action_preconditions_unmet, stale_target_guard, \
+         unreproduced_evidence) are review/precondition failures, not INV-SURFACE Refused, which \
+         is ingress selection against Current/Stale/Unavailable/foreign-root; and \
+         `validate_target_on_disk` is a hash guard, not a DiskObserved ingress.",
+    ),
+    (
+        "writers",
         "src/live_index/single_file.rs::remove_file",
         "Same ground as `update_file_from_disk`: it calls \
          `shared.remove_file_at_generation(.., shared.current_project_generation())` \
@@ -381,6 +394,42 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "src/protocol/edit_tools.rs::SymForgeServer::replace_symbol_body",
         &["MutationPermitted"],
         "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+    ),
+    // ---- the health trio + its resource (4) ----
+    // Runtime health is the one family that reports on the runtime itself
+    // rather than on indexed content, so it takes its lease-free observed
+    // branch and never a ProjectQueryLease. Family membership is a basis, not a
+    // default: each member cites why it is in the family.
+    (
+        "tools",
+        "health",
+        &["RuntimeHealthObserved"],
+        "tools assertion 4 (RuntimeHealthObserved keeps committed-generation fields separate from \
+         bounded attempt and runtime-work fields) is about this tool's report; tools assertion 3 \
+         (only GenerationLeased acquires a ProjectQueryLease) keeps it lease-free",
+    ),
+    (
+        "tools",
+        "health_compact",
+        &["RuntimeHealthObserved"],
+        "The compact projection of `health`, reporting the same runtime-health fields under tools \
+         assertion 4, and lease-free by tools assertion 3",
+    ),
+    (
+        "tools",
+        "status",
+        &["RuntimeHealthObserved"],
+        "Reports index/daemon runtime state, not indexed content, so it is a runtime-health \
+         observation under tools assertion 4 and acquires no ProjectQueryLease (tools assertion 3)",
+    ),
+    (
+        "resources",
+        "symforge://repo/health",
+        &["RuntimeHealthObserved"],
+        "resources assertion 2 (pure disk, worktree-scope, git and runtime-health resources use \
+         their lease-free observed branches with typed provenance) plus assertion 3 \
+         (RuntimeHealthObserved resources cannot mix attempt-only fields into committed-generation \
+         truth) — the resource form of the same family",
     ),
     // The policy file is `repo_root.join(POLICY_FILE)` (knowledge_curation.rs:31,
     // :541, :544, :607, :904) — NORMAL SOURCE, not `.symforge/` state, so FR-037
