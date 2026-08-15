@@ -631,6 +631,58 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         &["GenerationLeased"],
         "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
     ),
+    // ---- resources (7 of 10; glossary and tools/catalog are unruled) ----
+    // A resource wrapper starts from the set of the tool it wraps, then drops
+    // the lanes that invocation cannot take. It never gains one: resources
+    // assertion 5 says template expansion preserves the selected branch and
+    // never upgrades an observation into Current.
+    (
+        "resources",
+        "symforge://file/content",
+        &["GenerationLeased"],
+        "Wraps `get_file_content`, whose set is {GenerationLeased}; resources assertion 1 \
+         (generation-backed resources use GenerationLeased and pin one V11 publication)",
+    ),
+    (
+        "resources",
+        "symforge://file/context",
+        &["GenerationLeased"],
+        "Wraps `get_file_context`, same set, same ground as file/content",
+    ),
+    (
+        "resources",
+        "symforge://symbol/detail",
+        &["GenerationLeased"],
+        "Wraps `get_symbol`, whose set is {GenerationLeased} (resources assertion 1)",
+    ),
+    (
+        "resources",
+        "symforge://symbol/context",
+        &["GenerationLeased"],
+        "Wraps `get_symbol_context`, same set, same ground as symbol/detail",
+    ),
+    (
+        "resources",
+        "symforge://repo/map",
+        &["GenerationLeased"],
+        "Wraps `get_repo_map`, whose set is {GenerationLeased} (resources assertion 1)",
+    ),
+    (
+        "resources",
+        "symforge://repo/outline",
+        &["GenerationLeased"],
+        "The same `get_repo_map` invocation at detail=full, so the same set — a detail level is \
+         not a different authority branch",
+    ),
+    (
+        "resources",
+        "symforge://repo/changes/uncommitted",
+        &["WorktreeScopeObserved"],
+        "Wraps `what_changed` with `git_ref: None`, which is the worktree-diff lane ONLY, so the \
+         wrapper drops GitObserved (that lane needs a committed ref this invocation cannot \
+         supply) and drops Refused (no caller-supplied selector to refuse). resources assertion 2: \
+         worktree-scope resources use their lease-free observed branch.",
+    ),
     // ---- the health trio + its resource (4) ----
     // Runtime health is the one family that reports on the runtime itself
     // rather than on indexed content, so it takes its lease-free observed
