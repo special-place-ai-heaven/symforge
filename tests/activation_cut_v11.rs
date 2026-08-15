@@ -143,6 +143,46 @@ const AUTHORITY_FREE_INGRESS: &[(&str, &str, &str)] = &[
          branch, and this one has none.",
     ),
     (
+        "prompts",
+        "symforge-admin",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen. This one also probes `resolve_running_dashboard_url` off the runtime (prompts.rs:284) - operator-server LIVENESS, the `hook:PreTool` shape, not INV-HEALTH's committed-vs-attempt fields, so not RuntimeHealthObserved.",
+    ),
+    (
+        "prompts",
+        "symforge-architecture",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen.",
+    ),
+    (
+        "prompts",
+        "symforge-debug",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen.",
+    ),
+    (
+        "prompts",
+        "symforge-knowledge-hygiene",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen. Its `guard_query` on `path_prefix` is INPUT SAFETY, not assertion 3's unavailable-context selection, so it takes no Refused.",
+    ),
+    (
+        "prompts",
+        "symforge-onboard",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen.",
+    ),
+    (
+        "prompts",
+        "symforge-refactor",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen.",
+    ),
+    (
+        "prompts",
+        "symforge-review",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen.",
+    ),
+    (
+        "prompts",
+        "symforge-triage",
+        "V10 does not fetch: the handler emits instruction text and attaches `PromptMessage::new_resource_link` URIs for the CLIENT to read. A resource link is not a `resources/read` inside `get_prompt`, and the linked resources carry their own overlay rows - leasing the prompt for naming a URI would tell Slice 4 to take a ProjectQueryLease in a handler that never fetches, and would double-count the resource. No handler reaches `self.index` or a published generation. Frozen prompts assertions 1 and 3 govern how generation-backed CONTEXT is selected when a prompt fetches it; the half that matches this tree is that static prompt text carries no publication authority, so 1 and 3 are a stated residual for T066 rather than a lease that does not happen.",
+    ),
+    (
         "resources",
         "symforge://glossary",
         "`render_glossary` is static markdown with no index access. It SUCCEEDS, so Refused would \
