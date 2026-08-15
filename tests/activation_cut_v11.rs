@@ -570,7 +570,7 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
          get_repo_map/get_file_context/get_file_content/get_symbol/search_*/explore/\
          find_references/find_dependents/search_knowledge/symforge_retrieve. GitObserved + \
          WorktreeScopeObserved: `route_impact` plans `detect_impact` (planner.rs:1101-1108) and \
-         FindChanges routes via `route_tool_name` (smart_query.rs:613) to `what_changed`, whose \n         `default_args_for_tool` is `json!({})` (planner.rs:1203) - empty args still take the \n         worktree lane through `since.is_none() && has_repo_root` (tools.rs:839), so that pair \n         holds; `smart_query.rs:575` is `route_invocation`, a DISPLAY string, not the route. \n         `inject_find_fusion_cochange_anchor` (call tools.rs:11029, def :6776) and \n         `append_impact_intent_cochanges` (call :11123, def :11171) are further GitObserved here. \n         RuntimeHealthObserved: `index health` plans `health_compact` (planner.rs:879-886). \
+         FindChanges routes via `route_tool_name` (smart_query.rs:613) to `what_changed`, whose \n         `default_args_for_tool` is `json!({})` (src/stel/planner.rs:1203) - empty args still take the \n         worktree lane through `since.is_none() && has_repo_root` (tools.rs:839), so that pair \n         holds; `smart_query.rs:575` is `route_invocation`, a DISPLAY string, not the route. \n         `inject_find_fusion_cochange_anchor` (call tools.rs:11029, def :6776) and \n         `append_impact_intent_cochanges` (call :11123, def :11171) are further GitObserved here. \n         RuntimeHealthObserved: `index health` plans `health_compact` (planner.rs:879-886). \
          Refused: `foreign_project_refusal` and a set-valued `projects` on THIS handler — the \
          empty-query and compact-surface gates are InvalidRequest, not INV-SURFACE Refused. \
          ToolHelp routes to `ask` (not `render_tool_catalog`), and `ask` may reach the catalog; \
@@ -781,13 +781,13 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "sidecar",
         "GET /health",
         &["RuntimeHealthObserved"],
-        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Standalone route. NO Refused: `caller_root_guard` is installed on the router but SKIPS this path by name (handlers.rs:336-340 — \"liveness probes and the hook's fail-open target must never 409\"), and the daemon twin `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4247). Assertion 3 does not reach a path the guard is written to ignore.",
+        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Standalone route. NO Refused: `caller_root_guard` is installed on the router but SKIPS this path by name (handlers.rs:336-340 — \"liveness probes and the hook's fail-open target must never 409\"), and the daemon twin `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4269). Assertion 3 does not reach a path the guard is written to ignore.",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/health",
         &["RuntimeHealthObserved"],
-        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Session-scoped twin, same handler. NO Refused, and NOT via the router's skip list: that list matches the exact paths `/health` and `/stats` on the SIDECAR router, which this proxied path is not. The honest reason is the daemon handler — `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4247).",
+        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Session-scoped twin, same handler. NO Refused, and NOT via the router's skip list: that list matches the exact paths `/health` and `/stats` on the SIDECAR router, which this proxied path is not. The honest reason is the daemon handler — `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4269).",
     ),
     (
         "sidecar",

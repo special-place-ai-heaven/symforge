@@ -3,12 +3,70 @@
 ## T052 — slice closure: gates and post-slice review (PR 4)
 
 Run-and-review only: no production code, no frozen-corpus edit, no Slice 4.
-Every command below was executed on the tree at the T050 green, working tree
-clean. Live branch/PR/SHA state is deliberately NOT quoted here — run
+
+**Every observation below states its relationship to the current candidate.**
+VOID records an observation whose compiled source is unknown; the other labels
+name the source tree they actually observed:
+
+- **PRE-PATCH** — T050 green, overlay as first authored. `src/` is untouched by
+  every later PR 4 change, which remains confined to `tests/` and `docs/`.
+- **VOID** — observed, but not binding as a gate because its compiled source is
+  unknown; the row says why.
+- **POST-PATCH (round 1)** — after the 29-assignment-row `Refused` fix.
+- **SUPERSEDED POST-ROUND-2** — the initial depth-aware `target` repair,
+  observed directly but superseded by the follow-up hardening.
+- **ROUND-2 CANDIDATE** — after the case, traversal-error, and skip-proof
+  hardening that precedes round 3.
+
+Live branch/PR/SHA state is deliberately NOT quoted here — run
 `pwsh scripts/campaign-state.ps1` for that; the SHAs that do appear are
 historical and already fixed.
 
-### 1. Provenance round trips
+### Round 1 of the post-slice review, and what it moved
+
+The T052 gates were run first, then the overlay review ran against them. It was
+not prose-only, so the assignment this slice carries is NOT the one the gates
+below first saw. Recording that here because the section that reports has to be
+the section that knows.
+
+**MAJOR — `Refused` was keyed off input-struct docs, not handler bodies.** The
+generation-backed family carried the basis "its input documents no refusing
+project selector, so Refused is not sprayed on". The binding rule was the
+opposite: body-level typed refusal counts, and the seven-struct list was never
+closed. This is the `run_init_with_paths` / `index_folder` partial read
+INVERTED — the docs were read and the handler was not.
+
+**29 assignment rows gained `Refused`** (fixed in the round-1 patch commit):
+
+- `foreign_project_refusal` — `get_symbol`, `get_repo_map`, `get_file_context`,
+  `get_symbol_context`, `search_files`, `get_file_content`, `find_dependents`,
+  `validate_file_syntax`, the seven edit tools, and their seven
+  `edit_tools.rs` writers rows.
+- `local_cross_project_refusal` (same selector class, `tools.rs:7636`) —
+  `search_symbols`, `search_text`, `find_references`, `search_knowledge`,
+  `review_knowledge`, and `curate_knowledge` on BOTH its tools row and its
+  `tools.rs::SymForgeServer::curate_knowledge` writers row. The refusal lives on
+  the tool handler, so `write_policy` / `apply` / `durable_replace*` keep their
+  sets.
+
+**Bases were rewritten, not concatenated.** A row asserting both "Refused is not
+sprayed on" and "Refused is a BODY fact" contradicts itself. The four rows that
+remain singleton (`conventions`, `context_inventory`, `inspect_match`,
+`symforge_retrieve`) now state the reason — no `project` parameter, or no
+selector-refusal call — instead of the retired wording. Downstream citations
+were corrected rather than left lagging: the six resource wrappers and the hooks
+now say they DROP `Refused` (`project: None` at `resources.rs:160+`; hook
+fail-open), the two `symforge` co-change citations were unswapped, `FindChanges`
+now cites `route_tool_name` (`smart_query.rs:613`) plus
+`src/stel/planner.rs:1203` and
+`tools.rs:839` rather than the display string at `smart_query.rs:575`, and the
+session `/health` and `/stats` twins cite the daemon handlers (`daemon.rs:4269`,
+`:4439`) rather than a router skip list that matches only the exact sidecar
+paths.
+
+None of this was visible to T050's green (see M63c below).
+
+### 1. Provenance round trips — PRE-PATCH
 
 | Command | Result |
 |---|---|
@@ -16,11 +74,11 @@ historical and already fixed.
 | `cargo test --test read_gate_authority_v11 -- --test-threads=1` | 15 passed, 0 failed |
 | `cargo test --test claim_provenance_v11 operation_contract_cartesian_matrix -- --exact` | 1 passed, 20 filtered |
 
-### 2. Cfg matrix and 3. public-API harness
+### 2. Cfg matrix and 3. public-API harness — PRE-PATCH
 
 | Command | Result |
 |---|---|
-| `python execution/aap_migration_receipt_v11.py --stage full --check` | exit 0; 71 cases — 35 real:resolution-failure, 35 adapter:expected-failure, 33 real:compiles, 3 real:expected-failure |
+| `python execution/aap_migration_receipt_v11.py --stage full --check` | exit 0; real lane: 71 cases — 35 resolution-failure, 33 compiles, 3 expected-failure; adapter lane: 35 expected-failure rows (106 result rows total) |
 | `cargo test --test public_api_delta_v11 -- --test-threads=1` | 2 passed, 0 failed |
 | `python execution/refreeze_v11.py verify-internal --target-ref HEAD` | passed |
 | `node scripts/validate-lifecycle-oracle-traceability.cjs` | OK — 78 requirements, 24 acceptance oracles, 13 retirement categories |
@@ -32,49 +90,194 @@ diff was discarded** — T052 does not mint a receipt — and
 
 ### 4. Unchanged-V10 behaviour
 
+**PRE-PATCH** — `src/` is untouched by the overlay patch, which is tests-only.
+
+| Command | Result |
+|---|---|
+| `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` | 4 passed, 0 failed |
+| `cargo test --test runtime_dark_v11 -- --test-threads=1` | 11 passed, 0 failed |
+| `cargo test --no-default-features --features embed --lib -- --test-threads=1` (separate run) | **exit 0**, 1332 passed / 0 failed / 4 ignored. `--lib` builds the library target only and never compiles `tests/activation_cut_v11.rs`, so a tests-only overlay patch cannot change this result and it needs no re-run. |
+
+**VOID — not the slice-level gate.**
+
+| Command | Status |
+|---|---|
+| `cargo test --all-targets -- --test-threads=1` (first run) | exit 0, 538s, 123 matched events, lib 3168/0/5 — kept as a historical observation only. It was launched before the overlay patch and compiled while `tests/activation_cut_v11.rs` was being edited, so what rustc had already built is unknown. Superseded by the re-run below, not reconstructed from incremental state. |
+
+**POST-PATCH (round 1)** — overlay after the 29-row fix.
+
 | Command | Result |
 |---|---|
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --all-targets -- -D warnings` | exit 0 |
-| `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` | 4 passed, 0 failed |
-| `cargo test --test runtime_dark_v11 -- --test-threads=1` | 11 passed, 0 failed |
 | `cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact` | 1 passed, 4 filtered (the four T058 stand-ins) |
-| `cargo test --all-targets -- --test-threads=1` (Terminal Commander) | **exit 0**, 538s, 123 test binaries; lib 3168 passed / 0 failed / 5 ignored |
-| `cargo test --no-default-features --features embed --lib -- --test-threads=1` (separate run) | **exit 0**, 1332 passed / 0 failed / 4 ignored |
+| `cargo test --all-targets -- --test-threads=1` (re-run, post round-1) | exit 0, 440s, 123 matched events, lib 3168/0/5. Covers the patched OVERLAY — `activation_cut_v11` reported 1 passed / 4 ignored inside this run — but predates the round-2 walk fix, so it is not the final gate. |
 
-The two feature sets were run sequentially, never interleaved in one
-`target/`, and no `E0786` / ICE / missing-crate signal appeared in either.
-No `cargo clean`. The four ignored T058 names are NOT execution evidence.
+**SUPERSEDED POST-ROUND-2 OBSERVATION.** Terminal Commander first returned
+`exit_code: 0` with `outcome_trust: reconstructed`, `restarted: true`, and
+approximately 18 seconds of daemon uptime. That zero was discarded and the gate
+was rerun. `reconstructed` was honest tool reporting; banking a green that no
+live process witnessed would have violated the reporting invariant. The rerun
+was observed directly:
+
+| Command | Historical result |
+|---|---|
+| `cargo test --all-targets -- --test-threads=1` (pre-hardening round-2 candidate) | exit 0; 431,689 ms; 123 matched events; lib 3168/0/5; `activation_cut_v11` 1 passed / 4 ignored; `outcome_trust: observed`; `restarted: false` |
+
+A later second Terminal Commander daemon restart evicted that job record. Both
+daemon restarts are operational history, not Slice 3 residuals. The walk repair
+below supersedes this result, so it is not used as the candidate gate.
+
+**ROUND-2 CANDIDATE** — after the approved walk hardening.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --all-targets -- -D warnings` | exit 0; 11,973 ms; `outcome_trust: observed`; `restarted: false` |
+| `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` | 4 passed / 0 failed |
+| `cargo test --test activation_cut_v11 -- --test-threads=1` | 1 passed / 0 failed / 4 ignored |
+| `cargo test --test runtime_dark_v11 -- --test-threads=1` | 11 passed / 0 failed |
+| `cargo test --test public_api_delta_v11 -- --test-threads=1` | 2 passed / 0 failed |
+| `cargo test --all-targets -- --test-threads=1` (repaired round-2 candidate) | exit 0; 669,434 ms; 123 matched events; lib 3168/0/5; `activation_cut_v11` 1 passed / 4 ignored; `outcome_trust: observed`; `restarted: false` |
+
+The first full-suite attempt on the hardened candidate was an observed RED, not
+discarded noise: exit 101 after 211,024 ms with 6 matched events; lib reported
+3167 passed / 1 failed / 5 ignored. The failing invariant was
+`process_util::tests::test_no_raw_command_spawns_outside_hidden_command`, which
+identified both new raw `Command` spawns in the preventive test. Both were
+repaired to use `symforge::process_util::hidden_command`; the exact invariant
+then passed 1/0, the preventive suite passed 4/0, and the clippy and full-suite
+rows above were rerun on those repaired bytes.
+
+Both feature sets were run sequentially, never interleaved in one `target/`, and
+across the gate runs tabulated above no `E0786` / ICE / missing-crate signal
+appeared. No `cargo clean`.
+The four ignored T058 names are NOT execution evidence.
+
+The embed `--lib` row stays PRE-PATCH for the same reason it did after round 1:
+`--lib` builds the library target only, and all later PR 4 changes are confined
+to `tests/` and `docs/`.
+
+`cargo build --release` is explicitly deferred to PR CI; it is not claimed as
+an observed local T052 gate.
+
+### Round 2 of the post-slice review, and the hardening it triggered
+
+Round 2's persisted output contains four confirmed entries: the same `target`
+defect reported in both code and docs, plus two unique minors. Its executable
+was a stale PR 3 / round-15 prompt, so those findings are evidence, but silence
+elsewhere is not coverage. A corrected round 3 must review one committed SHA,
+with no concurrent edits and with notes adjudicated.
+
+**MAJOR — the `target` skip was depth-blind while its justification assumed
+otherwise.** The round-15 comment said the three skipped directories shared one
+reason: "every one is gitignored, so a config placed there cannot be COMMITTED".
+The conclusion holds for `.git` because it is repository metadata and for
+`node_modules` because `.gitignore:22` is unanchored, but it is **false for
+`target`**: `.gitignore:1` is `/target`, ROOT-ANCHORED. Measured with Git rather
+than inferred — `git check-ignore` reports
+`execution/target/.cargo/config.toml` and `npm/target/.cargo/config.toml` as not
+ignored, while `target/.cargo/config.toml` and
+`npm/node_modules/.cargo/config.toml` are ignored. The repository's own
+`.gitignore:23 spacetime/*/target/` exists precisely because line 1 does not
+reach nested targets. Since the walk skipped `name == "target"` at every depth,
+moving the round-14 exploit file into `execution/target/.cargo/` made it
+invisible while the suite stayed green.
+
+**Repair: the walk and its claimed bound.** "Committable" for this pin means
+normally add-visible: `git check-ignore` does not ignore the path, so an ordinary
+`git add` would see it. Force-add is outside the bound, like a config outside
+the repository. `.git` and `node_modules` remain skipped at any depth; `target`
+is skipped only as the repository root's own child. A nested `target/` is walked
+because it can be committable. Mutation **M64** placed
+`execution/target/.cargo/config.toml`, observed it caught by name, restored it,
+and confirmed that the root `target` skip still holds.
+
+The pre-round-3 audit then hardened three more parts of the same bound:
+
+- `.cargo` matching is ASCII-case-insensitive on Windows and when Git records a
+  case-insensitive checkout, closing the Windows `.CARGO` false green without
+  pruning an ordinary upper-case directory on Linux. Skip-name matching for
+  `.git`, `node_modules`, and root `target` follows Git's `core.ignorecase` for
+  the same normal-add boundary.
+- Directory, entry, and metadata observation failures now fail closed instead
+  of returning, flattening, or becoming a false `is_file == false`.
+- The exact `/target` and `node_modules/` lines and the whole `.gitignore` file
+  are pinned as change detectors. `git ls-files` must also report no tracked
+  path below a skipped directory, so an ignored-after-tracking config cannot
+  hide there.
+
+The two unique round-2 minors were reporting errors and are repaired here too:
+the AAP row now separates its 71 real-lane cases from the 35 adapter-lane rows,
+and the universal "every in-tree config/directory" comments are narrowed to the
+actual normally add-visible, in-repository, non-`.cargo`-CWD bound.
+
+The hardening was exercised with three fresh RED/control mutations, all
+restored before the candidate gates:
+
+- **M65 — Windows case alias.** Planting the normally add-visible
+  `execution/.CARGO/config.toml` made `no_gate_builds_doctests` fail and name the
+  path; removing it restored the focused test to 1/0.
+- **M66 — skip-rule drift.** Changing `.gitignore`'s exact `/target` line to
+  `/target/` preserved the relevant ignore behavior but changed the whole-file
+  fingerprint; the focused test failed with the observed and expected
+  fingerprints, then passed after the exact file was restored.
+- **M67 — tracked-then-ignored path.** An isolated temporary Git index made
+  `target/slice3-tracked-skip-probe/config.toml` tracked without touching the
+  real index. The tracked-under-skips guard failed and named the path; the
+  temporary index and probe were removed, and the focused suite passed 4/0.
+
+The traversal now panics on directory, entry, and metadata observation errors.
+That fail-closed behavior is covered by source inspection and the compiled
+gates above; no Windows permission mutation is claimed.
 
 ### Residuals carried out of Slice 3
 
-**What T050's green does not prove.** It proves the join is bijective over the
-244 frozen slots, that every surface member is pinned in exactly one of
-overlay / `NON_INGRESS_EXCEPTIONS` / `AUTHORITY_FREE_INGRESS` with a non-empty
-basis, that no allowed set names a branch outside `MODEL-SURFACE`, and that the
-union of the surface sets is all eight. It does **not** prove any individual
-member's set is exactly right: dropping `Refused` from `symforge_edit` leaves
-the suite green, because the union still closes on other rows (mutation M63c).
-Per-member correctness rests on the cited bases and on review. Do not add a
-ninth `MODEL-SURFACE` name to make M63c fail.
+**T051's Cargo/workflow pin remains deliberately bounded.** It does not cover a
+doctest-running effect hidden behind a script, make target, or composite action;
+a Cargo config outside the repository; or `.cargo/.cargo/config.toml` when the
+outer `.cargo` itself becomes the working directory. No pinned CI gate uses a
+`.cargo` directory as its working directory. Workflow discovery accepts exact
+lower-case `.yml` and `.yaml`; mixed-case suffixes on Windows remain a stated
+residual, not a second pin, because GitHub's case-sensitive runner discovery
+does not treat them as workflow files. The walk deliberately enters ignored
+trees other than its three named skips, so configs below `/target-*/`, `/.*/`,
+`**/.symforge/`, `/mcps/`, or `spacetime/*/target/` can over-flag. The source
+splice sweep likewise remains a fail-closed tripwire over known spellings, not
+a completeness proof for every possible `include!` or `#[path]` construction.
 
-**Eleven authority-free ingress members vs `INV-SURFACE`.** `symforge://glossary`,
+**What T050's green does not prove.** The three-way surface split closes over
+116 slots: 102 `SURFACE_OVERLAY` rows — 2 compatibility aliases, 6 hooks,
+8 resources, 24 sidecar members, 40 tools, and 22 writers — plus
+3 `NON_INGRESS_EXCEPTIONS` and 11 `AUTHORITY_FREE_INGRESS` members. Separately,
+the authority join is bijective over the 244 frozen operation slots; every
+surface member appears in exactly one of those three surface sets with a
+non-empty basis; no allowed set names a branch outside `MODEL-SURFACE`; and the
+union of the allowed sets contains all eight branches. It does **not** prove any
+individual member's set is exactly right: dropping `Refused` from
+`symforge_edit` leaves the suite green because the union still closes on other
+rows (mutation M63c). Per-member correctness rests on the cited bases and on
+review. Do not add a ninth `MODEL-SURFACE` name to make M63c fail.
+
+**Approved T066 residual — eleven authority-free ingress members vs
+`INV-SURFACE`.** `symforge://glossary`,
 `symforge://tools/catalog`, `hook:PreTool` and the eight prompts are ingress
 that run, succeed, pin no publication and observe no source. That falsifies
 "every ingress resolves exactly one typed authority branch" as written.
-Recorded, not papered over: Slice 4 (T066) must either exclude these from the
+Recorded rather than silently crossed: T066 must either exclude these from the
 invariant or add a branch. Frozen prompts assertions 1 and 3 belong to the same
-residual — they govern how generation-backed prompt context is selected WHEN a
-prompt fetches it, and no V10 prompt fetches; V10 emits instruction text plus
-`resource_link` URIs the client may read.
+approved residual — they govern how generation-backed prompt context is selected
+WHEN a prompt fetches it, and no V10 prompt fetches; V10 emits instruction text
+plus `resource_link` URIs the client may read.
 
 **D14 is still unfalsifiable, and is not coverage.**
 `read_gate_authority_v11.rs::a_failed_observation_refuses_without_disturbing_the_current_generation`
 takes `let before = generation.identity();` and then asserts
 `generation.identity() == before`. The refusal path (`into_failed_read`) never
 touches `generation`, so no behaviour could make that assertion fail. It is
-recorded as a residual for T047/Slice 4, was not counted toward any gate above,
-and was not "completed" with a fake observer.
+owned by live-observer invalidation under T056/T063, not the T047 stand-in. It
+was not counted toward any gate above and was not "completed" with a fake
+observer.
 
 
 ## Round-15 review and its repairs (PR 3)
@@ -109,10 +312,11 @@ prose, and all of them are mine.
   cargo and is pinned, yet what that script runs is not). Both lists
   are now the same two residuals, stated by effect-location.
 - **MINOR ×2 — two more claims wider than the code.** "Every `.cargo`
-  config IN the tree is pinned" ignores the walk's own skip list, and a
-  config in `node_modules/` or `target/` measurably leaves the suite
-  green; the bound is *committable* configs, which is what those three
-  gitignored directories are excluded on. And the header still listed
+  config IN the tree is pinned" ignored the walk's own skip list. Round
+  15 narrowed the claim to *committable* configs but still incorrectly
+  treated `.git`, `node_modules`, and every `target` as one uniformly
+  ignored class; the round-2 candidate repair above records the corrected
+  normal-add bound. And the header still listed
   the bidi-mark flag as an arm of the splice tripwire when round 12
   moved that decision into `sweep` — the file said so correctly in
   three other places.
@@ -166,8 +370,9 @@ to end.
   13's refutation missed. And the occurrence counts are file-blind: a
   gate RELOCATED from ci.yml to release.yml keeps every count and the
   whole triple while PR CI loses it. Patching the line walk a fourth
-  time would only move the seam, so **each workflow file is
-  fingerprinted whole**. The line checks stay for the auditable
+  time would only move the seam, so **`no_gate_builds_doctests` fingerprints
+  each accepted lower-case `.yml`/`.yaml` file under `.github/workflows/`
+  whole**. The line checks stay for the auditable
   judgement they record; the fingerprint is what makes any change
   impossible to miss. It is a change detector, not a security boundary,
   and says so. Mutations **M57b**, **M57c** and **M57d**
@@ -1777,9 +1982,10 @@ observed caught BY NAME, and restored — final suite 29 green:
   internal types into contract shapes, and T049's dependent-positive fixture
   is the enforcement. Recorded so T048 does not assume a 1:1 re-export.
 - **D14 — one T042 clause is currently unfalsifiable.** The
-  preserving-Current half compares an immutable local identity to itself; it
-  becomes falsifiable when T047's runtime exists. T052's review must not count
-  it as coverage until then.
+  preserving-Current half compares an immutable local identity to itself.
+  T047's stand-in never touches that generation, so the assertion remains
+  unfalsifiable after T047. Closure belongs to live-observer invalidation in
+  T056/T063. T052's review must not count it as coverage until then.
 - **D15 — compile-fail harness sequencing.** `cases.json`'s T043-era subjects
   resolve only after T048's re-exports; T049 must not run before T048. The
   harness has zero `OutputCoverage` cases; the seal fix above is what makes

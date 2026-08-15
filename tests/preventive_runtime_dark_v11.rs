@@ -36,11 +36,21 @@
 //! `.yml`/`.yaml` workflow that mentions cargo OR rustdoc —
 //! case-insensitively — against a verbatim allowlist a human judged
 //! doctest-free, binds each line's OCCURRENCE COUNT plus the total, the
-//! distinct set and the workflow-file count, pins every COMMITTABLE
-//! `.cargo` config in the tree (the root one verbatim, any other
-//! forbidden; the walk skips `target`, `.git` and `node_modules`, all
-//! gitignored, so nothing placed there can be committed), and
-//! fingerprints each workflow file whole. Rounds 8–11 each falsified a scan
+//! distinct set and the workflow-file count, pins the root Cargo config
+//! verbatim, and forbids any other config found by the bounded walk.
+//! "Committable" here means visible to a normal `git add`; force-added
+//! ignored paths are outside the bound, like configs outside the repo.
+//! Round 16 corrected the walk's skip list: `.gitignore`'s `/target` is
+//! ROOT-ANCHORED, so a nested `target/` can be committable and is now
+//! WALKED; only the repo root's own `target`, `.git` (repository
+//! metadata), and `node_modules` (ignored at every depth) are skipped. The exact
+//! `/target` and `node_modules/` rules are pinned, and `git ls-files`
+//! must show no tracked path under a skipped directory. The round-15
+//! claim that all three were skipped for one reason — "nothing placed
+//! there can be committed" — was false for `target`, and hid a
+//! committable config one directory from the round-14 exploit path. The
+//! guard also fingerprints each selected lower-case `.yml`/`.yaml` workflow
+//! file whole. Rounds 8–11 each falsified a scan
 //! that tried to read the command out of the file and judge it; round
 //! 11's `cargo rustdoc -- --test` builds and runs doctests while naming
 //! neither `test` nor `--doc` where the walk looked, and
@@ -64,8 +74,14 @@
 //! lane from OUTSIDE these files (a script, make target, or composite
 //! action running it out of sight), and a cargo config outside the repo
 //! (`~/.cargo/config.toml`, `$CARGO_HOME`, or an ancestor of the
-//! checkout). Two former residuals are now covered rather than
-//! conceded: every `.cargo` config IN the tree is pinned (round 14 —
+//! checkout) or below an existing `.cargo` directory (which Cargo reads
+//! only when that outer `.cargo` is itself the working directory; no CI
+//! gate does that). The walk also deliberately enters ignored trees
+//! other than its three named skips, so configs under `/target-*/`,
+//! `/.*/`, `**/.symforge/`, `/mcps/`, or `spacetime/*/target/` over-flag.
+//! Two former residuals are now covered rather than conceded: every
+//! normally add-visible `.cargo` config relevant to an in-repo,
+//! non-`.cargo` working directory is pinned (round 14 —
 //! cargo merges configs from the working directory upward, so a
 //! descendant config plus `working-directory:` re-pointed a gate and
 //! ran a `///` line's doctest into the dark directory), and a gate
@@ -732,6 +748,12 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ("run: cargo test --test serve_port -- --test-threads=1", 1),
 ];
 
+/// Exact ignore rules that justify the two source-tree skips below. This is a
+/// readable basis, not a Gitignore parser. The whole-file fingerprint catches
+/// a later negation or other semantic drift elsewhere in the file.
+const CARGO_CONFIG_SKIP_GITIGNORE_LINES: &[&str] = &["/target", "node_modules/"];
+const GITIGNORE_FINGERPRINT: &str = "46fa5caf712e6b65:692";
+
 #[test]
 fn no_gate_builds_doctests() {
     // Round 7: rustdoc extracts fenced doc-comment text into doctest
@@ -772,11 +794,11 @@ fn no_gate_builds_doctests() {
     // kept for the auditable judgement they record; the whole-file
     // fingerprints below are what make a change impossible to miss.
     //
-    // KNOWN RESIDUALS — what has been probed, NOT a proof of
+    // KNOWN UNDER-COVERAGE RESIDUALS — what has been probed, NOT a proof of
     // exhaustiveness (round 9 wrote "the only two" and round 10 produced
     // a third the same day; round 11 produced a fourth; round 13 broke
-    // the check that was meant to retire one). TWO, and they are the
-    // header's two:
+    // the check that was meant to retire one). The current two behavioural
+    // coverage bounds are:
     //   * A gate whose EFFECT lives outside these files — a script, make
     //     target, or composite action. Note this is about where the
     //     BEHAVIOUR lives, not whether the line says `cargo`: the
@@ -786,11 +808,16 @@ fn no_gate_builds_doctests() {
     //     the residual on the line naming neither `cargo` nor `rustdoc`,
     //     which described a narrower set than the header's.
     //   * A cargo config OUTSIDE the repo — `~/.cargo/config.toml`,
-    //     `$CARGO_HOME`, or an ancestor of the checkout.
+    //     `$CARGO_HOME`, or an ancestor of the checkout — or below an
+    //     existing `.cargo` directory, which matters only when that outer
+    //     `.cargo` is itself the CWD. No pinned CI gate does that.
+    // The header separately records ignored-tree OVER-FLAGS: they create
+    // safe friction rather than a false green, so they are not a third gap.
     // Two former residuals are NOT on this list because they are now
-    // caught, both proven by mutation: every in-tree `.cargo` config is
-    // pinned below, and a gate disabled with `if: false` changes no
-    // cargo line but does change the file, which the fingerprints see.
+    // caught, both proven by mutation: every normally add-visible config
+    // relevant to an in-repo, non-`.cargo` working directory is pinned
+    // below, and a gate disabled with `if: false` changes no cargo line
+    // but does change the file, which the fingerprints see.
     // An earlier version of this comment claimed THREE residuals
     // "matching the header" while the header listed two and retired the
     // third — the contradiction was the tell.
@@ -927,10 +954,94 @@ fn no_gate_builds_doctests() {
          deliberately"
     );
     assert!(
-        !repo.join(".cargo").join("config").exists(),
+        !repo
+            .join(".cargo")
+            .join("config")
+            .try_exists()
+            .expect("observe whether legacy .cargo/config exists"),
         "`.cargo/config` (the legacy extensionless path) exists. Cargo reads \
          it exactly like config.toml, so it can carry an [alias] table this \
          pin does not cover — fold it into config.toml or pin it here"
+    );
+    let gitignore = std::fs::read_to_string(repo.join(".gitignore"))
+        .expect("read .gitignore — the directory-skip pin cannot vouch for unread rules");
+    assert_eq!(
+        fingerprint(&gitignore),
+        GITIGNORE_FINGERPRINT,
+        "`.gitignore` changed. Its `/target` and `node_modules/` rules justify \
+         directories this Cargo-config walk does not enter, so re-audit the \
+         skip boundary before updating GITIGNORE_FINGERPRINT"
+    );
+    let observed_skip_lines: Vec<&str> = gitignore
+        .lines()
+        .filter(|line| CARGO_CONFIG_SKIP_GITIGNORE_LINES.contains(line))
+        .collect();
+    assert_eq!(
+        observed_skip_lines.as_slice(),
+        CARGO_CONFIG_SKIP_GITIGNORE_LINES,
+        "the exact `.gitignore` rules that justify skipping root `target` and every \
+         `node_modules` directory changed. Re-establish the normal-add visibility \
+         bound before updating CARGO_CONFIG_SKIP_GITIGNORE_LINES"
+    );
+    let tracked_output = symforge::process_util::hidden_command("git")
+        .args(["ls-files", "-z", "--"])
+        .current_dir(&repo)
+        .output()
+        .expect("run `git ls-files` for skipped-directory coverage");
+    assert!(
+        tracked_output.status.success(),
+        "`git ls-files` failed while checking skipped directories: {}",
+        String::from_utf8_lossy(&tracked_output.stderr)
+    );
+    let tracked_paths = String::from_utf8(tracked_output.stdout)
+        .expect("`git ls-files -z` returned a non-UTF-8 tracked path");
+    let ignore_case_output = symforge::process_util::hidden_command("git")
+        .args(["config", "--bool", "--default=false", "core.ignorecase"])
+        .current_dir(&repo)
+        .output()
+        .expect("read Git's case-sensitivity setting for directory-name comparisons");
+    assert!(
+        ignore_case_output.status.success(),
+        "`git config --bool --default=false core.ignorecase` failed: {}",
+        String::from_utf8_lossy(&ignore_case_output.stderr)
+    );
+    let git_ignores_case = String::from_utf8(ignore_case_output.stdout)
+        .expect("Git returned a non-UTF-8 core.ignorecase value")
+        .trim()
+        .parse::<bool>()
+        .expect("Git returned a non-boolean core.ignorecase value");
+    fn component_matches(actual: &str, expected: &str, ignore_case: bool) -> bool {
+        if ignore_case {
+            actual.eq_ignore_ascii_case(expected)
+        } else {
+            actual == expected
+        }
+    }
+    fn cargo_directory_matches(actual: &str, git_ignores_case: bool) -> bool {
+        // Cargo follows the filesystem: Windows folds even if core.ignorecase
+        // was manually misconfigured; other platforms follow the Git checkout.
+        component_matches(actual, ".cargo", cfg!(windows) || git_ignores_case)
+    }
+    let tracked_under_skips: Vec<&str> = tracked_paths
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter(|path| {
+            let components: Vec<&str> = path.split('/').collect();
+            components
+                .first()
+                .is_some_and(|part| component_matches(part, "target", git_ignores_case))
+                || components.iter().any(|part| {
+                    component_matches(part, ".git", git_ignores_case)
+                        || component_matches(part, "node_modules", git_ignores_case)
+                })
+        })
+        .collect();
+    assert!(
+        tracked_under_skips.is_empty(),
+        "tracked paths exist below directories the Cargo-config walk skips. An \
+         ignored-after-tracking config could hide there; move or untrack these \
+         paths before relying on the skip:\n{}",
+        tracked_under_skips.join("\n")
     );
     // Round 14: cargo merges `.cargo/config.toml` from the CWD and every
     // ancestor, so a config one directory DOWN is honoured the moment a
@@ -939,43 +1050,72 @@ fn no_gate_builds_doctests() {
     // `execution/.cargo/config.toml` turned `cargo fmt --check` into a
     // doctest run, an inert `///` line called into the dark directory,
     // and the marker file was written — the darkness guarantee failing
-    // with the tripwire reporting all-clear. So every `.cargo` directory
-    // in the tree is found, not just the root one.
-    fn cargo_configs_under(dir: &Path, found: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
+    // with the tripwire reporting all-clear. So the bounded walk must find
+    // each `.cargo` directory relevant to an in-repo source working directory,
+    // not just the root one. It intentionally does not recurse inside a
+    // `.cargo` directory: `.cargo/.cargo/config.toml` matters only if the outer
+    // `.cargo` itself becomes the CWD, which the pinned workflows do not do.
+    fn cargo_configs_under(
+        dir: &Path,
+        repo: &Path,
+        git_ignores_case: bool,
+        found: &mut Vec<PathBuf>,
+    ) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read directory {}: {error}", dir.display()));
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|error| panic!("read entry below {}: {error}", dir.display()));
             let path = entry.path();
-            if !path.is_dir() {
+            let metadata = std::fs::metadata(&path)
+                .unwrap_or_else(|error| panic!("read metadata for {}: {error}", path.display()));
+            if !metadata.is_dir() {
                 continue;
             }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            // Three directories are skipped, and the reason is the same
-            // for all three: every one is gitignored, so a config placed
-            // there cannot be COMMITTED, and the round-14 exploit needed
-            // a committed file. `target` is build output and can be tens
-            // of gigabytes, which is also why walking it is not an
-            // option. Round 15: a config dropped in any of them is
-            // therefore invisible here — that is a deliberate bound, not
-            // "every config in the tree", which is what the prose used
-            // to claim.
-            if name == "target" || name == ".git" || name == "node_modules" {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Round 16: the skip is NOT uniform, and the round-15 comment
+            // claiming one reason for all three was false. `.gitignore:1`
+            // is `/target` — ROOT-ANCHORED — so only `<repo>/target` is
+            // ignored; `execution/target/.cargo/config.toml` is
+            // committable, and `git check-ignore` says so. (The repo's own
+            // `.gitignore:23 spacetime/*/target/` exists precisely because
+            // line 1 does not reach nested targets.) Skipping `target` at
+            // every depth therefore hid a committable config one directory
+            // from the round-14 exploit path.
+            //
+            // So: `.git` (never source) and `node_modules` (`.gitignore:22`
+            // is unanchored, ignored at every depth) are skipped anywhere;
+            // `target` is skipped ONLY as the repo root's own child, which
+            // is exactly what the gitignore rule covers and the one that is
+            // tens of gigabytes. A nested `target/` is WALKED, because it
+            // can be committed. If a gitignored nested target ever holds a
+            // config, this over-flags — safe friction, and a human decides.
+            if component_matches(&name, ".git", git_ignores_case)
+                || component_matches(&name, "node_modules", git_ignores_case)
+                || (component_matches(&name, "target", git_ignores_case) && dir == repo)
+            {
                 continue;
             }
-            if name == ".cargo" {
+            if cargo_directory_matches(&name, git_ignores_case) {
                 for candidate in ["config.toml", "config"] {
-                    if path.join(candidate).is_file() {
-                        found.push(path.join(candidate));
+                    let candidate = path.join(candidate);
+                    match std::fs::metadata(&candidate) {
+                        Ok(metadata) if metadata.is_file() => found.push(candidate),
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            panic!("read metadata for {}: {error}", candidate.display())
+                        }
                     }
                 }
                 continue;
             }
-            cargo_configs_under(&path, found);
+            cargo_configs_under(&path, repo, git_ignores_case, found);
         }
     }
     let mut configs = Vec::new();
-    cargo_configs_under(&repo, &mut configs);
+    cargo_configs_under(&repo, &repo, git_ignores_case, &mut configs);
     let stray: Vec<String> = configs
         .iter()
         .filter(|p| **p != cargo_config)
