@@ -682,14 +682,14 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "sidecar",
         "GET /health",
-        &["Refused", "RuntimeHealthObserved"],
-        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["RuntimeHealthObserved"],
+        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Standalone route. NO Refused: `caller_root_guard` is installed on the router but SKIPS this path by name (handlers.rs:336-340 — \"liveness probes and the hook's fail-open target must never 409\"), and the daemon twin `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4247). Assertion 3 does not reach a path the guard is written to ignore.",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/health",
-        &["Refused", "RuntimeHealthObserved"],
-        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). session-scoped twin of the standalone route, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["RuntimeHealthObserved"],
+        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Session-scoped twin, same handler. NO Refused: `caller_root_guard` is installed on the router but SKIPS this path by name (handlers.rs:336-340 — \"liveness probes and the hook's fail-open target must never 409\"), and the daemon twin `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4247). Assertion 3 does not reach a path the guard is written to ignore.",
     ),
     (
         "sidecar",
@@ -742,14 +742,14 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "sidecar",
         "GET /stats",
-        &["Refused", "RuntimeHealthObserved"],
-        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) - sidecar PROCESS work state, no publication pinned and no source observed. Sidecar assertion 1 enumerates runtime-health as the matching typed branch, and assertion 2's committed-vs-work separation is exactly what this endpoint reports. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["RuntimeHealthObserved"],
+        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) — INV-HEALTH's runtime-WORK half: fires, estimated savings, tool-call counts. Assertion 2 exists precisely so those fields never mix into committed-generation truth, and the `health` tool already reports token savings on this branch. Live process counters, so not authority-free. Standalone route. NO Refused: the guard skips `/stats` by name (handlers.rs:336-340) and the daemon twin `sidecar_stats_handler` never calls `guard_session_caller_root` (daemon.rs:4439).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/stats",
-        &["Refused", "RuntimeHealthObserved"],
-        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) - sidecar PROCESS work state, no publication pinned and no source observed. Sidecar assertion 1 enumerates runtime-health as the matching typed branch, and assertion 2's committed-vs-work separation is exactly what this endpoint reports. session-scoped twin of the standalone route, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["RuntimeHealthObserved"],
+        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) — INV-HEALTH's runtime-WORK half: fires, estimated savings, tool-call counts. Assertion 2 exists precisely so those fields never mix into committed-generation truth, and the `health` tool already reports token savings on this branch. Live process counters, so not authority-free. Session-scoped twin, same handler. NO Refused: the guard skips `/stats` by name (handlers.rs:336-340) and the daemon twin `sidecar_stats_handler` never calls `guard_session_caller_root` (daemon.rs:4439).",
     ),
     (
         "sidecar",
