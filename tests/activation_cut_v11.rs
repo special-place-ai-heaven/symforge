@@ -395,6 +395,202 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         &["MutationPermitted"],
         "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
     ),
+    // ---- tools: edit family (7), the same sets as their writers rows ----
+    (
+        "tools",
+        "batch_edit",
+        &["MutationPermitted"],
+        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::batch_edit, which edits repository source bytes",
+    ),
+    (
+        "tools",
+        "batch_insert",
+        &["MutationPermitted"],
+        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::batch_insert, which edits repository source bytes",
+    ),
+    (
+        "tools",
+        "batch_rename",
+        &["MutationPermitted"],
+        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::batch_rename, which edits repository source bytes",
+    ),
+    (
+        "tools",
+        "delete_symbol",
+        &["MutationPermitted"],
+        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::delete_symbol, which edits repository source bytes",
+    ),
+    (
+        "tools",
+        "edit_within_symbol",
+        &["MutationPermitted"],
+        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::edit_within_symbol, which edits repository source bytes",
+    ),
+    (
+        "tools",
+        "insert_symbol",
+        &["MutationPermitted"],
+        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::insert_symbol, which edits repository source bytes",
+    ),
+    (
+        "tools",
+        "replace_symbol_body",
+        &["MutationPermitted"],
+        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::replace_symbol_body, which edits repository source bytes",
+    ),
+    (
+        "tools",
+        "curate_knowledge",
+        &["MutationPermitted", "StateWriteAuthorized"],
+        "Same set as its writers row: the source policy write at repo_root POLICY_FILE (FR-037) plus the ProjectStateDir curation finalization",
+    ),
+    // ---- tools: git/worktree observation, pinned by the detect_changes row ----
+    (
+        "tools",
+        "detect_impact",
+        &["GitObserved", "WorktreeScopeObserved"],
+        "The target detect_changes delegates to (compatibility_aliases assertion): GitObserved for committed-ref diffs, WorktreeScopeObserved for worktree diffs, and never a ProjectQueryLease",
+    ),
+    (
+        "tools",
+        "what_changed",
+        &["GitObserved", "WorktreeScopeObserved", "Refused"],
+        "Same observation pair as detect_impact; WhatChangedInput additionally documents a project selector that refuses a non-matching value (tools.rs), which is INV-SURFACE Refused terminating selection",
+    ),
+    // ---- tools: dual-lane ----
+    (
+        "tools",
+        "validate_file_syntax",
+        &["GenerationLeased", "DiskObserved"],
+        "Its own body carries both lanes: an indexed read off the published generation and an AUTHORITATIVE disk-read lane taken when the same-project publication is refused (tools.rs:8968-8983, permits_authoritative_disk_fallback)",
+    ),
+    // ---- tools: generation-backed reads ----
+    (
+        "tools",
+        "ask",
+        &["GenerationLeased", "Refused"],
+        "resources/tools assertion 3: a generation-backed read pinning one V11 publication, so it holds the ProjectQueryLease; SmartQueryInput documents a project selector that refuses a non-matching value, which is INV-SURFACE Refused",
+    ),
+    (
+        "tools",
+        "diff_symbols",
+        &["GenerationLeased", "Refused"],
+        "resources/tools assertion 3: a generation-backed read pinning one V11 publication, so it holds the ProjectQueryLease; DiffSymbolsInput documents a project selector that refuses a non-matching value, which is INV-SURFACE Refused",
+    ),
+    (
+        "tools",
+        "edit_plan",
+        &["GenerationLeased", "Refused"],
+        "resources/tools assertion 3: a generation-backed read pinning one V11 publication, so it holds the ProjectQueryLease; EditPlanInput documents a project selector that refuses a non-matching value, which is INV-SURFACE Refused",
+    ),
+    (
+        "tools",
+        "explore",
+        &["GenerationLeased", "Refused"],
+        "resources/tools assertion 3: a generation-backed read pinning one V11 publication, so it holds the ProjectQueryLease; ExploreInput documents a project selector that refuses a non-matching value, which is INV-SURFACE Refused",
+    ),
+    (
+        "tools",
+        "investigation_suggest",
+        &["GenerationLeased", "Refused"],
+        "resources/tools assertion 3: a generation-backed read pinning one V11 publication, so it holds the ProjectQueryLease; InvestigationInput documents a project selector that refuses a non-matching value, which is INV-SURFACE Refused",
+    ),
+    (
+        "tools",
+        "context_inventory",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "conventions",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "find_dependents",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "find_references",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "get_file_content",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "get_file_context",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "get_repo_map",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "get_symbol",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "get_symbol_context",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "inspect_match",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "review_knowledge",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "search_files",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "search_knowledge",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "search_symbols",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "search_text",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
+    (
+        "tools",
+        "symforge_retrieve",
+        &["GenerationLeased"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+    ),
     // ---- the health trio + its resource (4) ----
     // Runtime health is the one family that reports on the runtime itself
     // rather than on indexed content, so it takes its lease-free observed
