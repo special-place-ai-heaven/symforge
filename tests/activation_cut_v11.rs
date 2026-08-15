@@ -112,6 +112,34 @@ const NON_INGRESS_EXCEPTIONS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Ingress that carries NO source-authority branch: it succeeds, pins no
+/// publication, and observes no source. A third kind, forced by the tree
+/// rather than chosen — overlaying any of the eight would lie about what the
+/// call did, and exempting these as non-ingress would lie about what they are.
+///
+/// This is a FINDING ABOUT `INV-SURFACE`, recorded here rather than papered
+/// over: "every ingress resolves exactly one typed authority branch" has no
+/// honest member for static catalog text. T050 closes with the residual
+/// stated; Slice 4 must either exclude static catalog from that invariant or
+/// add a branch for it. Inventing one here is not this slice's to do.
+const STATIC_CATALOG: &[(&str, &str, &str)] = &[
+    (
+        "resources",
+        "symforge://glossary",
+        "`render_glossary` is static markdown with no index access. It SUCCEEDS, so Refused would \
+         misreport the outcome; it pins no publication, so GenerationLeased would be a false \
+         Current; and resources assertion 4 (static catalog resources cannot disclose raw runtime \
+         state) forbids the observed branches. None of the eight is honest.",
+    ),
+    (
+        "resources",
+        "symforge://tools/catalog",
+        "`render_tool_catalog` walks `tool_catalog_groups()` — the advertised surface, not runtime \
+         state, which resources assertion 4 forbids disclosing. Same shape as glossary: a \
+         succeeding ingress with no publication to lease and no source observed.",
+    ),
+];
+
 /// The one member string the frozen inventory files under two categories, with
 /// different owner sets. Pinned so a future edit that collapses it — or adds a
 /// second dual-homed member — fails instead of quietly changing the matrix's
@@ -988,11 +1016,37 @@ fn all_ingress_uses_exact_typed_authority_branch() {
         );
     }
 
+    // The static-catalog list, held to the same standard as the exceptions and
+    // disjoint from both other lists: every surface slot lands in EXACTLY ONE
+    // of overlay, non-ingress exception, or static catalog.
+    let mut statics: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    for (category, member, basis) in STATIC_CATALOG {
+        assert!(
+            surface.contains(category),
+            "`{category}::{member}` is pinned as static catalog, but `{category}` is not a \
+             surface category"
+        );
+        assert!(
+            !basis.trim().is_empty(),
+            "`{category}::{member}` is pinned as static catalog with no basis"
+        );
+        assert!(
+            statics.insert((*category, *member), *basis).is_none(),
+            "`{category}::{member}` is pinned as static catalog twice"
+        );
+        assert!(
+            !overlay.contains_key(&(*category, *member))
+                && !exceptions.contains_key(&(*category, *member)),
+            "`{category}::{member}` is pinned in more than one of overlay / non-ingress \
+             exception / static catalog; the three are exclusive"
+        );
+    }
+
     let mut missing = Vec::new();
     let mut wrongly_present = Vec::new();
     for (category, member) in &inventory.slots {
         let key = (category.as_str(), member.as_str());
-        if exceptions.contains_key(&key) {
+        if exceptions.contains_key(&key) || statics.contains_key(&key) {
             continue;
         }
         match (surface.contains(category.as_str()), overlay.get(&key)) {
@@ -1035,6 +1089,12 @@ fn all_ingress_uses_exact_typed_authority_branch() {
         unknown_exceptions.is_empty(),
         "non-ingress exceptions name slots the frozen inventory does not have: \
          {unknown_exceptions:?}"
+    );
+    let static_slots: BTreeSet<(&str, &str)> = statics.keys().copied().collect();
+    let unknown_statics: Vec<_> = static_slots.difference(&frozen_slots).collect();
+    assert!(
+        unknown_statics.is_empty(),
+        "static-catalog pins name slots the frozen inventory does not have: {unknown_statics:?}"
     );
     assert!(
         wrongly_present.is_empty(),
