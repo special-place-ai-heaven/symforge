@@ -1,5 +1,82 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
+## T052 — slice closure: gates and post-slice review (PR 4)
+
+Run-and-review only: no production code, no frozen-corpus edit, no Slice 4.
+Every command below was executed on the tree at the T050 green, working tree
+clean. Live branch/PR/SHA state is deliberately NOT quoted here — run
+`pwsh scripts/campaign-state.ps1` for that; the SHAs that do appear are
+historical and already fixed.
+
+### 1. Provenance round trips
+
+| Command | Result |
+|---|---|
+| `cargo test --test claim_provenance_v11 -- --test-threads=1` | 21 passed, 0 failed |
+| `cargo test --test read_gate_authority_v11 -- --test-threads=1` | 15 passed, 0 failed |
+| `cargo test --test claim_provenance_v11 operation_contract_cartesian_matrix -- --exact` | 1 passed, 20 filtered |
+
+### 2. Cfg matrix and 3. public-API harness
+
+| Command | Result |
+|---|---|
+| `python execution/aap_migration_receipt_v11.py --stage full --check` | exit 0; 71 cases — 35 real:resolution-failure, 35 adapter:expected-failure, 33 real:compiles, 3 real:expected-failure |
+| `cargo test --test public_api_delta_v11 -- --test-threads=1` | 2 passed, 0 failed |
+| `python execution/refreeze_v11.py verify-internal --target-ref HEAD` | passed |
+| `node scripts/validate-lifecycle-oracle-traceability.cjs` | OK — 78 requirements, 24 acceptance oracles, 13 retirement categories |
+
+`--check` regenerated `AAP-MIGRATION-RECEIPT-v11.json` with a one-line diff:
+`repo_commit` only, because operation identities are recomputed fresh. **That
+diff was discarded** — T052 does not mint a receipt — and
+`claims_v11_exports_live: false` is unchanged.
+
+### 4. Unchanged-V10 behaviour
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --all-targets -- -D warnings` | exit 0 |
+| `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` | 4 passed, 0 failed |
+| `cargo test --test runtime_dark_v11 -- --test-threads=1` | 11 passed, 0 failed |
+| `cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact` | 1 passed, 4 filtered (the four T058 stand-ins) |
+| `cargo test --all-targets -- --test-threads=1` (Terminal Commander) | **exit 0**, 538s, 123 test binaries; lib 3168 passed / 0 failed / 5 ignored |
+| `cargo test --no-default-features --features embed --lib -- --test-threads=1` (separate run) | **exit 0**, 1332 passed / 0 failed / 4 ignored |
+
+The two feature sets were run sequentially, never interleaved in one
+`target/`, and no `E0786` / ICE / missing-crate signal appeared in either.
+No `cargo clean`. The four ignored T058 names are NOT execution evidence.
+
+### Residuals carried out of Slice 3
+
+**What T050's green does not prove.** It proves the join is bijective over the
+244 frozen slots, that every surface member is pinned in exactly one of
+overlay / `NON_INGRESS_EXCEPTIONS` / `AUTHORITY_FREE_INGRESS` with a non-empty
+basis, that no allowed set names a branch outside `MODEL-SURFACE`, and that the
+union of the surface sets is all eight. It does **not** prove any individual
+member's set is exactly right: dropping `Refused` from `symforge_edit` leaves
+the suite green, because the union still closes on other rows (mutation M63c).
+Per-member correctness rests on the cited bases and on review. Do not add a
+ninth `MODEL-SURFACE` name to make M63c fail.
+
+**Eleven authority-free ingress members vs `INV-SURFACE`.** `symforge://glossary`,
+`symforge://tools/catalog`, `hook:PreTool` and the eight prompts are ingress
+that run, succeed, pin no publication and observe no source. That falsifies
+"every ingress resolves exactly one typed authority branch" as written.
+Recorded, not papered over: Slice 4 (T066) must either exclude these from the
+invariant or add a branch. Frozen prompts assertions 1 and 3 belong to the same
+residual — they govern how generation-backed prompt context is selected WHEN a
+prompt fetches it, and no V10 prompt fetches; V10 emits instruction text plus
+`resource_link` URIs the client may read.
+
+**D14 is still unfalsifiable, and is not coverage.**
+`read_gate_authority_v11.rs::a_failed_observation_refuses_without_disturbing_the_current_generation`
+takes `let before = generation.identity();` and then asserts
+`generation.identity() == before`. The refusal path (`into_failed_read`) never
+touches `generation`, so no behaviour could make that assertion fail. It is
+recorded as a residual for T047/Slice 4, was not counted toward any gate above,
+and was not "completed" with a fake observer.
+
+
 ## Round-15 review and its repairs (PR 3)
 
 Round 15 attacked the round-14 repairs: **0 blockers, 4 confirmed

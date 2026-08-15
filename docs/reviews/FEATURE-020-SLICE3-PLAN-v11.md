@@ -8,18 +8,18 @@ compiles, is tested, and is provably unreachable from every production entry poi
 
 | Task | State |
 |---|---|
-| T041 RED provenance/contract negatives | not started |
-| T042 RED cross-authority | not started |
-| T043 sealed provenance types | not started |
-| T044 read_gate authority split | not started |
-| T045 protocol lane migration | not started |
-| T046 published-source-set consolidation | not started |
-| T047 dark runtime | not started |
-| T048 dark public API + export delta | not started |
-| T049 AAP migration receipt | not started |
-| T050 activation-cut matrix | not started |
-| T051 dark unreachability | not started |
-| T052 gates + adversarial review | not started |
+| T041 RED provenance/contract negatives | landed (PR 1) |
+| T042 RED cross-authority | landed (PR 1) |
+| T043 sealed provenance types | landed (PR 2) |
+| T044 read_gate authority split | landed (PR 2) |
+| T045 protocol lane migration | landed (PR 2) |
+| T046 published-source-set consolidation | landed (PR 2) |
+| T047 dark runtime | landed (PR 3, squashed as 6d1c58df) |
+| T048 dark public API + export delta | landed (PR 3, squashed as 6d1c58df) |
+| T049 AAP migration receipt | landed (PR 3, squashed as 6d1c58df) |
+| T050 activation-cut matrix | landed (PR 4, unpushed) - green, 116 surface slots |
+| T051 dark unreachability | landed (PR 3, squashed as 6d1c58df) |
+| T052 gates + adversarial review | in progress (PR 4, unpushed) |
 
 Entry state, verified at `10e036b5` (not inherited):
 
