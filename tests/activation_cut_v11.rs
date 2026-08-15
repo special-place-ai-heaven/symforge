@@ -112,17 +112,36 @@ const NON_INGRESS_EXCEPTIONS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Ingress that carries NO source-authority branch: it succeeds, pins no
-/// publication, and observes no source. A third kind, forced by the tree
-/// rather than chosen — overlaying any of the eight would lie about what the
-/// call did, and exempting these as non-ingress would lie about what they are.
+/// Ingress that carries NO source-authority branch: it runs, it succeeds, and
+/// it pins no publication and observes no source. A third kind, forced by the
+/// tree rather than chosen — overlaying any of the eight would lie about what
+/// the call did, and exempting these as non-ingress would lie about what they
+/// are.
+///
+/// Named for the PROPERTY, not for catalogs: `hook:PreTool` belongs here too,
+/// and a name like `STATIC_CATALOG` would invite a fourth bucket for "hooks
+/// that look like catalogs". The property is the absence of an authority
+/// branch, whatever the ingress kind.
 ///
 /// This is a FINDING ABOUT `INV-SURFACE`, recorded here rather than papered
 /// over: "every ingress resolves exactly one typed authority branch" has no
-/// honest member for static catalog text. T050 closes with the residual
-/// stated; Slice 4 must either exclude static catalog from that invariant or
-/// add a branch for it. Inventing one here is not this slice's to do.
-const STATIC_CATALOG: &[(&str, &str, &str)] = &[
+/// honest member for these. T050 closes with the residual stated; Slice 4 must
+/// either exclude them from that invariant or add a branch. Inventing one here
+/// is not this slice's to do.
+const AUTHORITY_FREE_INGRESS: &[(&str, &str, &str)] = &[
+    (
+        "hooks",
+        "hook:PreTool",
+        "Still ingress — PreToolUse ran and the process returned `Ok(())`; choosing no output is \
+         fail-open without Current (hooks assertion 3), not a non-event, so NON_INGRESS_EXCEPTIONS \
+         would be wrong. But no branch fits: it is handled before `endpoint_for` and makes no \
+         sidecar call on any path (hook.rs:257-276). `read_sidecar_endpoint` is a liveness gate on \
+         control state — not RuntimeHealthObserved, which INV-HEALTH scopes to committed-vs-attempt \
+         fields — and it writes nothing, so not StateWriteAuthorized. `pre_tool_suggestion` formats \
+         the stdin `tool_name`/path strings; it pins no publication and observes no source bytes, \
+         so neither GenerationLeased nor DiskObserved. hooks assertion 1 leaves each hook its exact \
+         branch, and this one has none.",
+    ),
     (
         "resources",
         "symforge://glossary",
@@ -1073,7 +1092,7 @@ fn all_ingress_uses_exact_typed_authority_branch() {
     // disjoint from both other lists: every surface slot lands in EXACTLY ONE
     // of overlay, non-ingress exception, or static catalog.
     let mut statics: BTreeMap<(&str, &str), &str> = BTreeMap::new();
-    for (category, member, basis) in STATIC_CATALOG {
+    for (category, member, basis) in AUTHORITY_FREE_INGRESS {
         assert!(
             surface.contains(category),
             "`{category}::{member}` is pinned as static catalog, but `{category}` is not a \
@@ -1081,17 +1100,17 @@ fn all_ingress_uses_exact_typed_authority_branch() {
         );
         assert!(
             !basis.trim().is_empty(),
-            "`{category}::{member}` is pinned as static catalog with no basis"
+            "`{category}::{member}` is pinned as authority-free ingress with no basis"
         );
         assert!(
             statics.insert((*category, *member), *basis).is_none(),
-            "`{category}::{member}` is pinned as static catalog twice"
+            "`{category}::{member}` is pinned as authority-free ingress twice"
         );
         assert!(
             !overlay.contains_key(&(*category, *member))
                 && !exceptions.contains_key(&(*category, *member)),
             "`{category}::{member}` is pinned in more than one of overlay / non-ingress \
-             exception / static catalog; the three are exclusive"
+             exception / authority-free ingress; the three are exclusive"
         );
     }
 
@@ -1147,7 +1166,7 @@ fn all_ingress_uses_exact_typed_authority_branch() {
     let unknown_statics: Vec<_> = static_slots.difference(&frozen_slots).collect();
     assert!(
         unknown_statics.is_empty(),
-        "static-catalog pins name slots the frozen inventory does not have: {unknown_statics:?}"
+        "authority-free ingress pins name slots the frozen inventory does not have: \n         {unknown_statics:?}"
     );
     assert!(
         wrongly_present.is_empty(),
