@@ -38,6 +38,25 @@
 //! strings into this file would create a second inventory that drifts from the
 //! frozen one silently. Only the thirteen entry-level shapes are pinned here,
 //! so a change to an owner set or a production seam fails loudly.
+//!
+//! WHAT THIS TEST'S GREEN DOES NOT PROVE. It proves the join is bijective over
+//! the 244 frozen slots, that every surface member is pinned in exactly one of
+//! the three lists with a non-empty basis, that no allowed set names a branch
+//! outside `MODEL-SURFACE`, and that the union of the surface sets is all
+//! eight. It does NOT prove any individual member's set is exactly right:
+//! dropping `Refused` from `symforge_edit` leaves the suite green, because the
+//! union still closes on other rows. Per-member correctness rests on the basis
+//! strings and on review, which is why every row cites a frozen assertion, an
+//! `INV-*`/`FR-*` id, or a call site rather than asserting a branch bare.
+//!
+//! STATED RESIDUAL — `INV-SURFACE` vs `AUTHORITY_FREE_INGRESS`. Eleven members
+//! are ingress that resolve no typed authority branch at all. That falsifies
+//! "every ingress resolves exactly one typed authority branch" as written, and
+//! it is recorded rather than papered over: Slice 4 (T066) must either exclude
+//! these from the invariant or add a branch for them. Frozen prompts
+//! assertions 1 and 3 are part of the same residual — they govern how
+//! generation-backed prompt context is selected WHEN a prompt fetches it, and
+//! no V10 prompt fetches.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -530,6 +549,47 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "curate_knowledge",
         &["MutationPermitted", "StateWriteAuthorized"],
         "Same set as its writers row: the source policy write at repo_root POLICY_FILE (FR-037) plus the ProjectStateDir curation finalization",
+    ),
+    // ---- tools: the two facades, closed last as the union of what they
+    // dispatch. Production compact serve is `build_plan` ->
+    // `dispatch_tool_for_tests(&step.tool)`; `probe_legacy_tool` is
+    // harness-only, so the union is over the steps the PLANNER emits, not over
+    // every tool name a probe could pass.
+    (
+        "tools",
+        "symforge",
+        &[
+            "GenerationLeased",
+            "GitObserved",
+            "Refused",
+            "RuntimeHealthObserved",
+            "WorktreeScopeObserved",
+        ],
+        "Union of the planned steps. GenerationLeased: the planner emits \
+         get_repo_map/get_file_context/get_file_content/get_symbol/search_*/explore/\
+         find_references/find_dependents/search_knowledge/symforge_retrieve. GitObserved + \
+         WorktreeScopeObserved: `route_impact` plans `detect_impact` (planner.rs:1101-1108) and \
+         FindChanges routes to `what_changed(uncommitted=true)` (smart_query.rs:575), whose \
+         overlays are that pair; `append_impact_intent_cochanges` (tools.rs:11028) and \
+         `inject_find_fusion_cochange_anchor` (:11123) are further GitObserved on this handler. \
+         RuntimeHealthObserved: `index health` plans `health_compact` (planner.rs:879-886). \
+         Refused: `foreign_project_refusal` and a set-valued `projects` on THIS handler — the \
+         empty-query and compact-surface gates are InvalidRequest, not INV-SURFACE Refused. \
+         ToolHelp routes to `ask` (not `render_tool_catalog`), and `ask` may reach the catalog; \
+         that arm carries no source-authority branch, which is init's host-config shape — a \
+         facade may dispatch into an authority-free arm without the member becoming \
+         authority-free, and it adds no ninth state.",
+    ),
+    (
+        "tools",
+        "symforge_edit",
+        &["MutationPermitted", "Refused"],
+        "`build_edit_plan` emits only `replace_symbol_body`, `insert_symbol` and \
+         `edit_within_symbol` (edit_planner.rs:150-179), all MutationPermitted; preview goes \
+         through those same tools and apply is those tools committing, so preview adds no branch. \
+         Refused is `foreign_project_refusal` on this handler (tools.rs:~11255). Not \
+         GenerationLeased — the edit planner emits no generation-backed read — and not \
+         curate_knowledge, which is its own member.",
     ),
     // ---- tools: the three that needed the whole body read ----
     // Each of these was nearly mis-assigned from a partial read, the same way
