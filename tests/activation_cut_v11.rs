@@ -444,6 +444,46 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         &["MutationPermitted", "StateWriteAuthorized"],
         "Same set as its writers row: the source policy write at repo_root POLICY_FILE (FR-037) plus the ProjectStateDir curation finalization",
     ),
+    // ---- tools: the three that needed the whole body read ----
+    // Each of these was nearly mis-assigned from a partial read, the same way
+    // `run_init_with_paths` was. Publication and reload are NOT GenerationLeased:
+    // that branch is the one holding a ProjectQueryLease.
+    (
+        "tools",
+        "index_folder",
+        &["MutationPermitted", "StateWriteAuthorized", "Refused"],
+        "Three lanes, all in the body. MutationPermitted: it calls \
+         `gitignore_hygiene::reconcile_project_gitignore` (tools.rs:7889) — the source write SC-018 \
+         and `explicit_normal_index_folder_reconciles_existing_root_gitignore` exist for. \
+         StateWriteAuthorized: `persist::reset_snapshot_state` (tools.rs:7843) plus the \
+         idempotency records under control state (tools.rs:~7816). Refused: the typed refusal arms \
+         — daemon unreachable, Unbound, `add:true`, and `Refused to index sensitive system path` \
+         (tools.rs:7794). Publication and `reload_for_state_placement` stay OUTSIDE the set, the \
+         way host-config I/O does on init.",
+    ),
+    (
+        "tools",
+        "checkpoint_now",
+        &["MutationPermitted", "StateWriteAuthorized"],
+        "Traced, not assumed: `export_artifact=true` reaches `persist::export_artifact`, which \
+         calls `ensure_gitattributes_merge_hint` (persist.rs:1040) — the repository-source write \
+         already overlayed on that writers member. The snapshot and `index.bin.zst` are \
+         ProjectStateDir (FR-051, where the excluded artifact is persistence). No Refused: FR-052 \
+         `applied=false` is the state-write lane reporting unavailability, not ingress \
+         termination.",
+    ),
+    (
+        "tools",
+        "analyze_file_impact",
+        &["DiskObserved", "GitObserved", "Refused"],
+        "Refused is `foreign_project_refusal(params.0.project)` at the top of the body. \
+         `File not found on disk` is path-local DiskObserved (T042), NOT Refused. Co-changes read \
+         `git_temporal::GitTemporalState` when that lane runs, which is GitObserved. \
+         `published_generation()` is the T046 footer capture, not a ProjectQueryLease — \
+         GenerationLeased here would tell Slice 4 to lease a post-edit reindex that must run while \
+         the source is non-Current, and the index update itself is T064 candidate work, the same \
+         class as the `single_file` exceptions rather than a branch.",
+    ),
     // ---- tools: git/worktree observation, pinned by the detect_changes row ----
     (
         "tools",
