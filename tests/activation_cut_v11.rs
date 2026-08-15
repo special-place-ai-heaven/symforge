@@ -95,8 +95,9 @@ const SURFACE_CATEGORIES: &[&str] = &[
 /// surface category for owner and seams while doing work no branch describes —
 /// mutating a `SharedIndex` is the case that forced it. Carrying `None` here is
 /// a positive, pinned claim with a basis, not the absence of a row; the join
-/// below requires every surface slot to be in EXACTLY ONE of this list or the
-/// overlay, so a member cannot be quietly dropped from both.
+/// below requires every surface slot to be in EXACTLY ONE of this list, the
+/// overlay, or `AUTHORITY_FREE_INGRESS`, so a member cannot be quietly dropped
+/// from all three.
 const NON_INGRESS_EXCEPTIONS: &[(&str, &str, &str)] = &[
     (
         "writers",
@@ -360,9 +361,9 @@ const FROZEN: &[FrozenEntry] = &[
 /// basis for that set — a frozen assertion, an `INV-*` id, or a named V10
 /// contract. Non-surface members are absent by construction and carry `None`.
 ///
-/// EMPTY ON PURPOSE at T050's RED. Filling it is the next commit, one member at
-/// a time with its basis; a member that cannot take an honest set is brought
-/// back as a decision rather than parked on a plausible row.
+/// Authored one member at a time, each with its basis; members that could not
+/// take an honest set were brought back as decisions rather than parked on a
+/// plausible row, and landed on one of the other two lists.
 const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     // ---- compatibility_aliases (2/2) ----
     // The calibration rows: the frozen entry states an allowed SET for one
@@ -462,93 +463,93 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::batch_edit",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+        &["MutationPermitted", "Refused"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::batch_insert",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+        &["MutationPermitted", "Refused"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::batch_rename",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+        &["MutationPermitted", "Refused"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::delete_symbol",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+        &["MutationPermitted", "Refused"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::edit_within_symbol",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+        &["MutationPermitted", "Refused"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::insert_symbol",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+        &["MutationPermitted", "Refused"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::replace_symbol_body",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs)",
+        &["MutationPermitted", "Refused"],
+        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     // ---- tools: edit family (7), the same sets as their writers rows ----
     (
         "tools",
         "batch_edit",
-        &["MutationPermitted"],
-        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::batch_edit, which edits repository source bytes",
+        &["MutationPermitted", "Refused"],
+        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "batch_insert",
-        &["MutationPermitted"],
-        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::batch_insert, which edits repository source bytes",
+        &["MutationPermitted", "Refused"],
+        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "batch_rename",
-        &["MutationPermitted"],
-        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::batch_rename, which edits repository source bytes",
+        &["MutationPermitted", "Refused"],
+        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "delete_symbol",
-        &["MutationPermitted"],
-        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::delete_symbol, which edits repository source bytes",
+        &["MutationPermitted", "Refused"],
+        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "edit_within_symbol",
-        &["MutationPermitted"],
-        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::edit_within_symbol, which edits repository source bytes",
+        &["MutationPermitted", "Refused"],
+        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "insert_symbol",
-        &["MutationPermitted"],
-        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::insert_symbol, which edits repository source bytes",
+        &["MutationPermitted", "Refused"],
+        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "replace_symbol_body",
-        &["MutationPermitted"],
-        "tools assertion 3 (only repository-source MutationPermitted operations acquire a SourceMutationPermit); the tool-name form of the writers row src/protocol/edit_tools.rs::SymForgeServer::replace_symbol_body, which edits repository source bytes",
+        &["MutationPermitted", "Refused"],
+        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "curate_knowledge",
-        &["MutationPermitted", "StateWriteAuthorized"],
-        "Same set as its writers row: the source policy write at repo_root POLICY_FILE (FR-037) plus the ProjectStateDir curation finalization",
+        &["MutationPermitted", "Refused", "StateWriteAuthorized"],
+        "Same write set as its writers row: the source policy write at repo_root POLICY_FILE (FR-037) plus the permit-free ProjectStateDir finalization; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
     ),
     // ---- tools: the two facades, closed last as the union of what they
     // dispatch. Production compact serve is `build_plan` ->
@@ -569,10 +570,7 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
          get_repo_map/get_file_context/get_file_content/get_symbol/search_*/explore/\
          find_references/find_dependents/search_knowledge/symforge_retrieve. GitObserved + \
          WorktreeScopeObserved: `route_impact` plans `detect_impact` (planner.rs:1101-1108) and \
-         FindChanges routes to `what_changed(uncommitted=true)` (smart_query.rs:575), whose \
-         overlays are that pair; `append_impact_intent_cochanges` (tools.rs:11028) and \
-         `inject_find_fusion_cochange_anchor` (:11123) are further GitObserved on this handler. \
-         RuntimeHealthObserved: `index health` plans `health_compact` (planner.rs:879-886). \
+         FindChanges routes via `route_tool_name` (smart_query.rs:613) to `what_changed`, whose \n         `default_args_for_tool` is `json!({})` (planner.rs:1203) - empty args still take the \n         worktree lane through `since.is_none() && has_repo_root` (tools.rs:839), so that pair \n         holds; `smart_query.rs:575` is `route_invocation`, a DISPLAY string, not the route. \n         `inject_find_fusion_cochange_anchor` (call tools.rs:11029, def :6776) and \n         `append_impact_intent_cochanges` (call :11123, def :11171) are further GitObserved here. \n         RuntimeHealthObserved: `index health` plans `health_compact` (planner.rs:879-886). \
          Refused: `foreign_project_refusal` and a set-valued `projects` on THIS handler — the \
          empty-query and compact-surface gates are InvalidRequest, not INV-SURFACE Refused. \
          ToolHelp routes to `ask` (not `render_tool_catalog`), and `ask` may reach the catalog; \
@@ -648,8 +646,8 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "tools",
         "validate_file_syntax",
-        &["GenerationLeased", "DiskObserved"],
-        "Its own body carries both lanes: an indexed read off the published generation and an AUTHORITATIVE disk-read lane taken when the same-project publication is refused (tools.rs:8968-8983, permits_authoritative_disk_fallback)",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Both lanes are in the body: an indexed read off the published generation and an AUTHORITATIVE disk-read lane taken when the same-project publication is refused (tools.rs:8968-8983, permits_authoritative_disk_fallback); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     // ---- tools: generation-backed reads ----
     (
@@ -686,97 +684,97 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "tools",
         "context_inventory",
         &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: its input carries no `project` parameter.",
     ),
     (
         "tools",
         "conventions",
         &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: its input carries no `project` parameter.",
     ),
     (
         "tools",
         "find_dependents",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "find_references",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "get_file_content",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "get_file_context",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "get_repo_map",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "get_symbol",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "get_symbol_context",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "inspect_match",
         &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: `InspectMatchInput` has no `project` field and the handler calls no selector refusal.",
     ),
     (
         "tools",
         "review_knowledge",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "search_files",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "search_knowledge",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "search_symbols",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "search_text",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        &["GenerationLeased", "Refused"],
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "symforge_retrieve",
         &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it is the branch that holds a ProjectQueryLease; its input documents no refusing project selector, so Refused is not sprayed on",
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: `SymforgeRetrieveInput` has no `project` field and the handler calls no selector refusal.",
     ),
     // ---- sidecar (24/24): 12 routes, each paired with its session twin ----
     (
@@ -789,7 +787,7 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/health",
         &["RuntimeHealthObserved"],
-        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Session-scoped twin, same handler. NO Refused: `caller_root_guard` is installed on the router but SKIPS this path by name (handlers.rs:336-340 — \"liveness probes and the hook's fail-open target must never 409\"), and the daemon twin `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4247). Assertion 3 does not reach a path the guard is written to ignore.",
+        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Session-scoped twin, same handler. NO Refused, and NOT via the router's skip list: that list matches the exact paths `/health` and `/stats` on the SIDECAR router, which this proxied path is not. The honest reason is the daemon handler — `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4247).",
     ),
     (
         "sidecar",
@@ -849,7 +847,7 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/stats",
         &["RuntimeHealthObserved"],
-        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) — INV-HEALTH's runtime-WORK half: fires, estimated savings, tool-call counts. Assertion 2 exists precisely so those fields never mix into committed-generation truth, and the `health` tool already reports token savings on this branch. Live process counters, so not authority-free. Session-scoped twin, same handler. NO Refused: the guard skips `/stats` by name (handlers.rs:336-340) and the daemon twin `sidecar_stats_handler` never calls `guard_session_caller_root` (daemon.rs:4439).",
+        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) - INV-HEALTH's runtime-WORK half: fires, estimated savings, tool-call counts, which assertion 2 keeps out of committed-generation truth. Live process counters, so not authority-free. Session-scoped twin. NO Refused, and NOT via the sidecar router's skip list - that list matches the exact paths `/health` and `/stats` on the SIDECAR router, which this proxied path is not. The reason is the daemon handler: `sidecar_stats_handler` never calls `guard_session_caller_root` (daemon.rs:4439).",
     ),
     (
         "sidecar",
@@ -923,7 +921,7 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         &["GenerationLeased", "Refused"],
         "Thin alias (sidecar assertion 4): workflow_source_read_handler calls outline_handler (handlers.rs:634), so it takes `/outline`'s set exactly. session-scoped twin, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
     ),
-    // ---- hooks (6 of 7; PreTool is unruled) ----
+    // ---- hooks (6 overlay; PreTool is authority-free, below) ----
     // Routing confirmed from `endpoint_for` (cli/hook.rs:944), NOT from
     // `workflow_for_subcommand`, which says it does not change routing yet.
     // Fail-open (`fail_open_json`, empty additionalContext) adds no branch: it
@@ -932,31 +930,25 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "hooks",
         "hook:Read",
         &["GenerationLeased"],
-        "endpoint_for routes Read to `/outline` (hook.rs ~957) — the file-outline read, the same \
-         generation-backed set as `get_file_context`, not repo-map. hooks assertion 1: \
-         GenerationLeased only for generation-backed context.",
+        "endpoint_for routes this hook to `/outline` (cli/hook.rs:944+), the generation-backed lane of `get_file_context`. Refused is DROPPED: this process does not terminate selection - it fails open with empty additionalContext (hook.rs:8, :314) - and the caller_root guard that could refuse belongs to the sidecar.",
     ),
     (
         "hooks",
         "hook:SessionStart",
         &["GenerationLeased"],
-        "endpoint_for routes SessionStart to `/repo-map`, so it takes the set of `get_repo_map`",
+        "endpoint_for routes this hook to `/repo-map` (cli/hook.rs:944+), the generation-backed lane of `get_repo_map`. Refused is DROPPED: this process does not terminate selection - it fails open with empty additionalContext (hook.rs:8, :314) - and the caller_root guard that could refuse belongs to the sidecar.",
     ),
     (
         "hooks",
         "hook:PromptSubmit",
         &["GenerationLeased"],
-        "endpoint_for routes PromptSubmit to `/prompt-context`, whose handler is generation-backed \
-         — `require_queryable_sidecar_index` then `capture_queryable_sidecar_generation` \
-         (sidecar/handlers.rs:2274+)",
+        "endpoint_for routes this hook to `/prompt-context` (cli/hook.rs:944+), the generation-backed lane of `prompt_context_handler`. Refused is DROPPED: this process does not terminate selection - it fails open with empty additionalContext (hook.rs:8, :314) - and the caller_root guard that could refuse belongs to the sidecar.",
     ),
     (
         "hooks",
         "hook:Grep",
         &["GenerationLeased", "RuntimeHealthObserved"],
-        "A genuine fork inside one ingress, like detect_changes: endpoint_for sends a plausible \
-         symbol name to `/symbol-context` (generation-backed) and everything else to `/health` \
-         (hook.rs ~984-990), so the allowed set is the union of the two lanes the call may take",
+        "A genuine fork inside one ingress, like detect_changes: endpoint_for sends a plausible symbol name to `/symbol-context` (generation-backed) and everything else to `/health` (hook.rs ~984-990), so the set is the union of the two lanes. Refused is DROPPED for the same fail-open reason as the other hooks.",
     ),
     (
         "hooks",
@@ -976,7 +968,7 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "Same `/impact` route as hook:Edit with `new_file=true`, same assertion 2 prohibition, and \
          the same fail-open reason for dropping Refused",
     ),
-    // ---- resources (7 of 10; glossary and tools/catalog are unruled) ----
+    // ---- resources (7 overlay; glossary and tools/catalog are authority-free) ----
     // A resource wrapper starts from the set of the tool it wraps, then drops
     // the lanes that invocation cannot take. It never gains one: resources
     // assertion 5 says template expansion preserves the selected branch and
@@ -985,39 +977,37 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         "resources",
         "symforge://file/content",
         &["GenerationLeased"],
-        "Wraps `get_file_content`, whose set is {GenerationLeased}; resources assertion 1 \
-         (generation-backed resources use GenerationLeased and pin one V11 publication)",
+        "Wraps `get_file_content`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
     ),
     (
         "resources",
         "symforge://file/context",
         &["GenerationLeased"],
-        "Wraps `get_file_context`, same set, same ground as file/content",
+        "Wraps `get_file_context`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
     ),
     (
         "resources",
         "symforge://symbol/detail",
         &["GenerationLeased"],
-        "Wraps `get_symbol`, whose set is {GenerationLeased} (resources assertion 1)",
+        "Wraps `get_symbol`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
     ),
     (
         "resources",
         "symforge://symbol/context",
         &["GenerationLeased"],
-        "Wraps `get_symbol_context`, same set, same ground as symbol/detail",
+        "Wraps `get_symbol_context`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
     ),
     (
         "resources",
         "symforge://repo/map",
         &["GenerationLeased"],
-        "Wraps `get_repo_map`, whose set is {GenerationLeased} (resources assertion 1)",
+        "Wraps `get_repo_map`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
     ),
     (
         "resources",
         "symforge://repo/outline",
         &["GenerationLeased"],
-        "The same `get_repo_map` invocation at detail=full, so the same set — a detail level is \
-         not a different authority branch",
+        "Wraps `get_repo_map`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication. repo/outline is that same invocation at detail=full, and a detail level is not a different branch.",
     ),
     (
         "resources",
@@ -1105,10 +1095,8 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "writers",
         "src/protocol/tools.rs::SymForgeServer::curate_knowledge",
-        &["MutationPermitted", "StateWriteAuthorized"],
-        "Tool ingress for curation: it dispatches the source policy write and the ProjectStateDir \
-         finalization, so its allowed set is the union of what it dispatches, not a weaker \
-         singleton",
+        &["MutationPermitted", "Refused", "StateWriteAuthorized"],
+        "writers assertion 3, both halves: the source policy write at repo_root POLICY_FILE (FR-037) and the permit-free ProjectStateDir finalization; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination. The selector refusal lives on this tool handler, not on write_policy/apply/durable_replace*.",
     ),
 ];
 
@@ -1333,14 +1321,14 @@ fn all_ingress_uses_exact_typed_authority_branch() {
         );
     }
 
-    // The static-catalog list, held to the same standard as the exceptions and
+    // The authority-free list, held to the same standard as the exceptions and
     // disjoint from both other lists: every surface slot lands in EXACTLY ONE
-    // of overlay, non-ingress exception, or static catalog.
+    // of overlay, non-ingress exception, or authority-free ingress.
     let mut statics: BTreeMap<(&str, &str), &str> = BTreeMap::new();
     for (category, member, basis) in AUTHORITY_FREE_INGRESS {
         assert!(
             surface.contains(category),
-            "`{category}::{member}` is pinned as static catalog, but `{category}` is not a \
+            "`{category}::{member}` is pinned as authority-free ingress, but `{category}` is not a \
              surface category"
         );
         assert!(
