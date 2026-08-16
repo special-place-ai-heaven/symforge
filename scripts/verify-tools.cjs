@@ -10,7 +10,11 @@
  *   PASS    answer matches the oracle (grep) or the frozen snapshot
  *   REVIEW  answer differs from the grep oracle — a human looks (grep over-matches
  *           strings/comments vs symbol-aware tools, so a diff is NOT auto-wrong)
- *   FAIL    snapshot regression on an exact-output tool, or the tool errored / went empty
+ *   FAIL    snapshot regression on an exact-output tool, a required `must_contain` anchor is absent,
+ *           or a directly called tool errored / went empty. Legacy reads relayed through the A-019
+ *           compatibility path carry raw renderer text and no typed `isError`; oracle cases therefore
+ *           require either the compact `Trust:` / expanded `Source authority:` success envelope or an
+ *           exact case-declared empty-result prefix.
  *
  * Council guardrail (Hotz): this stays ONE script + data (cases.jsonl + *.snap).
  * No config system, no plugin seam. If it grows one, it has become the bug.
@@ -48,9 +52,11 @@ const BIN_ARG =
   path.join(REPO_ROOT, process.platform === "win32" ? "target/debug/symforge.exe" : "target/debug/symforge");
 const BIN = path.resolve(REPO_ROOT, BIN_ARG);
 
-// Legacy tools reached via the compact `symforge` facade's deterministic probe
-// relay (_probe_legacy_tool/_probe_legacy_args) so we test the TOOL, not the NL
-// router. batch_rename is full-surface-only but the relay dispatches it on compact.
+// Legacy tools reached via the compact `symforge` facade's deterministic,
+// source-mutation-safe measurement relay (_probe_legacy_tool/_probe_legacy_args)
+// so we test the TOOL, not the NL router. The compatibility relay preserves raw
+// renderer text and deliberately does not fabricate a semantic result status.
+// batch_rename is full-surface-only but the relay permits only its dry-run case.
 const READ_TOOLS = new Set([
   "search_symbols",
   "search_text",
@@ -82,6 +88,113 @@ function grepOracle(pattern) {
     .filter((l) => l.trim())
     .map((l) => l.trim());
   return { hits, grepMissing: false };
+}
+
+function normalizeOracleText(text) {
+  return process.platform === "win32" ? text.replace(/\\/g, "/") : text;
+}
+
+function grepHitAnchor(hit) {
+  const match = normalizeOracleText(hit).match(/^(.*?):(\d+):/);
+  return match ? `${match[1]}:${match[2]}` : null;
+}
+
+function toolOutputAnchors(text) {
+  const anchors = new Set();
+  let groupedPath = null;
+  for (const rawLine of normalizeOracleText(text).split("\n")) {
+    const line = rawLine.trim();
+    const fileHeader = line.match(/^([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+)$/);
+    if (fileHeader) groupedPath = fileHeader[1];
+
+    for (const match of line.matchAll(/(?:^|[`(\s])([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+):(\d+)(?=$|[`),:\s])/g)) {
+      anchors.add(`${match[1]}:${match[2]}`);
+    }
+    const groupedLine = line.match(/^(?:>\s*)?(\d+):/);
+    if (groupedPath && groupedLine) anchors.add(`${groupedPath}:${groupedLine[1]}`);
+    const lineThenPath = line.match(/^(\d+):.*\(([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+)\)/);
+    if (lineThenPath) anchors.add(`${lineThenPath[2]}:${lineThenPath[1]}`);
+  }
+  return anchors;
+}
+
+function judgeOracleResult(text, c, hits, grepMissing) {
+  if (grepMissing) {
+    return { verdict: "REVIEW", reason: "rg not on PATH — grep oracle skipped", text };
+  }
+
+  const envelopeLines = text.split("\n").slice(0, 6);
+  const hasSuccessEnvelope = envelopeLines.some(
+    (line) => line.startsWith("Trust: ") || line.startsWith("Source authority: ")
+  );
+  const hasDeclaredEmptyResult =
+    typeof c.allow_empty === "string" && text.startsWith(c.allow_empty);
+  if (!hasSuccessEnvelope && !hasDeclaredEmptyResult) {
+    return {
+      verdict: "FAIL",
+      reason: "successful search terminal absent (expected envelope or declared empty result)",
+      text,
+      oracle: hits,
+    };
+  }
+  if (hasDeclaredEmptyResult) {
+    return {
+      verdict: "PASS",
+      reason: `declared empty result; grep saw ${hits.length} raw hit(s)`,
+      text,
+      oracle: hits,
+    };
+  }
+
+  const anchors = [...new Set(hits.map(grepHitAnchor).filter(Boolean))];
+  if (hits.length && !anchors.length) {
+    return {
+      verdict: "REVIEW",
+      reason: `could not derive path:line anchors from ${hits.length} grep hit(s)`,
+      text,
+      oracle: hits,
+    };
+  }
+  const observedAnchors = toolOutputAnchors(text);
+  const missingAnchors = anchors.filter((anchor) => !observedAnchors.has(anchor));
+  if (missingAnchors.length) {
+    const sample = missingAnchors.slice(0, 3).join(", ");
+    const more = missingAnchors.length > 3 ? ` (+${missingAnchors.length - 3} more)` : "";
+    return {
+      verdict: "REVIEW",
+      reason: `tool omitted ${missingAnchors.length}/${anchors.length} grep path:line anchor(s): ${sample}${more}`,
+      text,
+      oracle: hits,
+    };
+  }
+
+  return {
+    verdict: "PASS",
+    reason: `tool contains all ${anchors.length} grep path:line anchor(s)`,
+    text,
+    oracle: hits,
+  };
+}
+
+function runOracleComparatorSelfTest() {
+  const c = { allow_empty: "No references found" };
+  const hits = ["src/a.rs:2:fn alpha() {}", "src/b.rs:5:fn beta() {}"];
+  const complete = judgeOracleResult(
+    "Trust: exact | current index\nsrc/a.rs\n  > 2: alpha\nsrc/b.rs\n  5: beta",
+    {},
+    hits,
+    false
+  );
+  const omitted = judgeOracleResult(
+    "Trust: exact | current index\nsrc/a.rs\n  > 2: alpha",
+    {},
+    hits,
+    false
+  );
+  const declaredEmpty = judgeOracleResult("No references found for alpha", c, hits, false);
+  if (complete.verdict !== "PASS" || omitted.verdict !== "REVIEW" || declaredEmpty.verdict !== "PASS") {
+    throw new Error("grep path:line oracle comparator self-test failed");
+  }
 }
 
 // Redact ONLY fields tied to LIVE index-generation state; everything else stays
@@ -128,7 +241,7 @@ async function startSession(READINESS_PROBE) {
     // explains a readiness/cold-start failure. Safe — tracing writes to stderr
     // (src/observability.rs), and the JSON-RPC stream this harness parses is stdout-only.
     stdio: ["pipe", "pipe", "inherit"],
-    // symforge_edit REQUIRES the compact surface; read tools reached via probe relay.
+    // symforge_edit REQUIRES the compact surface; read tools use the raw A-019 relay.
     // Pin the root to the fixture (else find_project_root walks up to the parent
     // symforge repo and indexes 620 files, making every oracle mismatch). NO_DAEMON=1
     // keeps the index in-process so the pin holds.
@@ -283,15 +396,13 @@ async function runCase(session, c) {
 
   // must_contain: every listed substring has to appear, whatever the judge.
   const missing = (c.must_contain || []).filter((s) => !text.includes(s));
+  if (missing.length) {
+    return { verdict: "FAIL", reason: `expected substrings absent: ${missing.join(", ")}`, text };
+  }
 
   if (c.judge === "oracle") {
     const { hits, grepMissing } = grepOracle(c.oracle_grep);
-    if (grepMissing) return { verdict: "REVIEW", reason: "rg not on PATH — grep oracle skipped", text };
-    if (missing.length) {
-      return { verdict: "REVIEW", reason: `expected substrings absent: ${missing.join(", ")}`, text, oracle: hits };
-    }
-    // Tool answered and contains what we required; grep count is only a tripwire.
-    return { verdict: "PASS", reason: `grep saw ${hits.length} raw hit(s); tool contains required anchors`, text, oracle: hits };
+    return judgeOracleResult(text, c, hits, grepMissing);
   }
 
   if (c.judge === "snapshot" || c.judge === "write_snapshot") {
@@ -341,6 +452,11 @@ function firstDiff(a, b) {
 }
 
 (async () => {
+  if (ARGV.includes("--self-test-oracle")) {
+    runOracleComparatorSelfTest();
+    console.log("verify-tools oracle comparator self-test: PASS");
+    return;
+  }
   if (!fs.existsSync(BIN)) {
     console.error(`No binary at ${BIN}. Build it: cargo build`);
     process.exit(2);
@@ -377,7 +493,7 @@ function firstDiff(a, b) {
   console.log("  " + "-".repeat(96));
   console.log(`  ${tally.PASS} PASS   ${tally.REVIEW} REVIEW   ${tally.FAIL} FAIL\n`);
   if (tally.REVIEW) console.log("  REVIEW = a human reads the diff (grep over-matches vs symbol-aware tools). Not a failure.");
-  if (tally.FAIL) console.log("  FAIL = a real regression: exact-output tool changed, or tool errored/went empty.\n");
+  if (tally.FAIL) console.log("  FAIL = a real regression: exact output/must-contain changed, a direct tool errored, or output went empty.\n");
   // The one number the council named: REVIEW + FAIL. Drive it down. Exit nonzero only on FAIL.
   process.exit(tally.FAIL > 0 ? 1 : 0);
 })();

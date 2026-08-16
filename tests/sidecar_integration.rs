@@ -428,7 +428,7 @@ async fn test_hook_binary_latency() {
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
-        None,
+        Some(tmp.path().to_path_buf()),
         Some(control_state.clone()),
     )
     .await

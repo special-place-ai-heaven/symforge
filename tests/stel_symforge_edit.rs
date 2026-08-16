@@ -500,6 +500,55 @@ async fn symforge_edit_preview_then_apply_writes_once() {
     assert!(!on_disk.contains("old"), "disk after apply: {on_disk}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn symforge_edit_apply_never_trims_target_path_identity() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join(".git")).expect("create .git");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).expect("create src");
+    let plain = src.join("exact.rs");
+    let spaced = src.join("exact.rs ");
+    let plain_before = b"fn target() { plain_old }\n";
+    let spaced_before = b"fn target() { spaced_old }\n";
+    std::fs::write(&plain, plain_before).expect("write plain file");
+    std::fs::write(&spaced, spaced_before).expect("write spaced file");
+    let server = server_for_repo(dir.path(), "edit-exact-path-bytes");
+
+    let result = dispatch_symforge_edit_result(
+        &server,
+        &StelEditRequest {
+            path: "src/exact.rs ".to_string(),
+            symbol: Some("target".to_string()),
+            body: Some("fn target() { spaced_new }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(&plain).expect("read plain file"),
+        plain_before,
+        "a trailing-space target must never be trimmed into a write to the plain path"
+    );
+    let spaced_after = std::fs::read(&spaced).expect("read spaced file");
+    if outcome_class(&result) == "found" {
+        assert_eq!(
+            spaced_after, b"fn target() { spaced_new }\n",
+            "a successful apply must change only the exact target"
+        );
+    } else {
+        assert_eq!(
+            spaced_after, spaced_before,
+            "a safe refusal must leave the exact unsupported target unchanged"
+        );
+    }
+}
+
 #[tokio::test]
 async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;

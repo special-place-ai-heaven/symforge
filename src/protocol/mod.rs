@@ -1030,6 +1030,127 @@ impl SymForgeServer {
         self.analytics_recorder.read().status()
     }
 
+    fn restore_local_project_evidence(&self) {
+        if let Some(evidence) = self.local_project_evidence() {
+            result_status::record_project_evidence(evidence);
+        } else {
+            result_status::clear_project_evidence();
+        }
+    }
+
+    /// Bind a daemon receipt to the selector serialized for this exact call.
+    /// Set-valued reads cannot be represented by the single-project evidence
+    /// schema, and a scalar mismatch must never inherit authority merely
+    /// because the transport returned a syntactically valid header.
+    fn validate_daemon_project_evidence(
+        &self,
+        params: &serde_json::Value,
+        expected_project_id: Option<&str>,
+    ) {
+        // Any present set-valued selector is outside the single-project receipt
+        // schema, including empty/malformed sets that a downstream decoder will
+        // reject. Likewise, a present non-string scalar must not be treated as
+        // omission and inherit the daemon ACTIVE project's receipt.
+        if params
+            .get("projects")
+            .is_some_and(|projects| !projects.is_null())
+        {
+            result_status::clear_project_evidence();
+            return;
+        }
+        let selector = match params.get("project") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(project)) => {
+                Some(project.as_str()).filter(|project| !project.trim().is_empty())
+            }
+            Some(_) => {
+                result_status::clear_project_evidence();
+                return;
+            }
+        };
+        let receipt_selector = expected_project_id.or(selector);
+        let valid = result_status::current_project_evidence().is_some_and(|evidence| {
+            result_status::project_evidence_matches_selector(&evidence, receipt_selector)
+        });
+        if !valid {
+            result_status::clear_project_evidence();
+        }
+    }
+
+    /// Seed the dispatch scope only when the raw request still targets this
+    /// adapter's local project. This runs before router deserialization, so a
+    /// malformed foreign request or admitted relay cannot inherit HOME merely
+    /// because it returned before the handler-level selector guard.
+    async fn initial_project_evidence_for_call(
+        &self,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<result_status::ProjectEvidence> {
+        fn object_matches_local(
+            object: &serde_json::Map<String, serde_json::Value>,
+            local: &result_status::ProjectEvidence,
+        ) -> bool {
+            if object
+                .get("projects")
+                .is_some_and(|projects| !projects.is_null())
+            {
+                return false;
+            }
+            if let Some(project) = object.get("project")
+                && !project.is_null()
+            {
+                let Some(project) = project.as_str() else {
+                    return false;
+                };
+                if !project.trim().is_empty()
+                    && !result_status::project_evidence_matches_selector(local, Some(project))
+                {
+                    return false;
+                }
+            }
+            if let Some(nested) = object
+                .get("_probe_legacy_args")
+                .and_then(serde_json::Value::as_object)
+                && !object_matches_local(nested, local)
+            {
+                return false;
+            }
+            true
+        }
+
+        fn explicit_scalar_selector(
+            object: &serde_json::Map<String, serde_json::Value>,
+        ) -> Option<&str> {
+            object
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+                .filter(|project| !project.trim().is_empty())
+                .or_else(|| {
+                    object
+                        .get("_probe_legacy_args")
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(explicit_scalar_selector)
+                })
+        }
+
+        let local = self.local_project_evidence()?;
+        if arguments.is_some_and(|arguments| !object_matches_local(arguments, &local)) {
+            return None;
+        }
+        if let Some(daemon_lock) = self.daemon_client.as_ref() {
+            let client = daemon_lock.read().await;
+            let targets_home = match arguments.and_then(explicit_scalar_selector) {
+                Some(selector) => client
+                    .opened_project_for_selector(Some(selector))
+                    .is_some_and(|(_, _, is_home)| is_home),
+                None => client.active_project_is_home(),
+            };
+            if !targets_home {
+                return None;
+            }
+        }
+        Some(local)
+    }
+
     /// Forward a tool call to the daemon. Returns:
     /// - `Some(result)` on success
     /// - `None` on connection failure (after one reconnect attempt), signalling
@@ -1049,10 +1170,124 @@ impl SymForgeServer {
 
         let was_degraded = self.daemon_degraded.lock().degraded;
 
-        let value = match serde_json::to_value(params) {
+        let mut value = match serde_json::to_value(params) {
             Ok(value) => value,
             Err(error) => return Some(format!("Daemon proxy serialization failed: {error}")),
         };
+        // A daemon session may target an ACTIVE sibling even when the caller
+        // omitted `project`. If transport recovery ultimately fails, executing
+        // the same request against this adapter's immutable HOME would return
+        // or mutate the wrong repository. Precompute the safe fallback policy
+        // from the exact serialized selector and the client's pinned working
+        // set; a successful initial/retry daemon call is unaffected.
+        let (local_fallback_refusal, expected_daemon_project_id) = {
+            let client = daemon_lock.read().await;
+            let has_project_topology =
+                client.project_root().is_some() || client.activated_root().is_some();
+            if value
+                .get("projects")
+                .is_some_and(|projects| !projects.is_null())
+            {
+                (
+                    Some(format!(
+                        "Error: project_routing: a set-valued daemon request cannot fall back to \
+                         adapter HOME project '{}'. Restore daemon routing and retry.",
+                        client.project_id()
+                    )),
+                    None,
+                )
+            } else {
+                match value.get("project") {
+                    Some(serde_json::Value::String(selector)) if !selector.trim().is_empty() => {
+                        match client.opened_project_for_selector(Some(selector)) {
+                            Some((project_id, _, true)) => (None, Some(project_id)),
+                            Some((project_id, _, false)) => (
+                                Some(format!(
+                                    "Error: project_routing: daemon project '{project_id}' cannot \
+                                     fall back to adapter HOME project '{}'. Restore daemon routing \
+                                     and retry.",
+                                    client.project_id()
+                                )),
+                                Some(project_id),
+                            ),
+                            None => (
+                                Some(format!(
+                                    "Error: project_routing: project selector '{}' cannot be resolved \
+                                     for safe HOME fallback. Restore daemon routing and retry.",
+                                    selector
+                                )),
+                                Some(if has_project_topology {
+                                    // NUL cannot occur in an OS path-derived project ID or
+                                    // name. Keep this non-empty so selector normalization can
+                                    // never reinterpret an unresolved explicit selector as
+                                    // omission.
+                                    "\0unresolved-project-selector".to_string()
+                                } else {
+                                    selector.to_string()
+                                }),
+                            ),
+                        }
+                    }
+                    Some(serde_json::Value::Null) | None => {
+                        let active_project_id = client.active_project_id();
+                        (
+                            (!client.active_project_is_home()).then(|| {
+                                format!(
+                                    "Error: project_routing: ACTIVE daemon project '{}' cannot fall \
+                                     back to adapter HOME project '{}'. Restore daemon routing and \
+                                     retry.",
+                                    active_project_id,
+                                    client.project_id()
+                                )
+                            }),
+                            has_project_topology.then_some(active_project_id),
+                        )
+                    }
+                    Some(_) => (
+                        Some(format!(
+                            "Error: project_routing: a malformed project selector cannot inherit \
+                             adapter HOME project '{}'. Correct the selector and retry.",
+                            client.project_id()
+                        )),
+                        None,
+                    ),
+                }
+            }
+        };
+        // Omission means the session ACTIVE project, but ACTIVE can change in
+        // another concurrent request after the snapshot above. Pin every
+        // selector-capable scalar call to that canonical project ID before the
+        // first attempt and reuse the same value for the reconnect retry. A
+        // post-call receipt check is too late for structural edits: it cannot
+        // undo a write that raced onto a newly activated sibling.
+        if let Some(object) = value.as_object_mut() {
+            // Never forward a caller-supplied internal route pin. Only this
+            // trusted adapter seam may synthesize it from the connection's
+            // canonical ACTIVE snapshot.
+            object.remove(crate::daemon::PRIVATE_PROJECT_ROUTE_PIN);
+            if let Some(project) = object.get_mut("project")
+                && project.is_null()
+                && let Some(expected_project_id) = expected_daemon_project_id.as_ref()
+            {
+                *project = serde_json::Value::String(expected_project_id.clone());
+            } else if !object.contains_key("project")
+                && crate::daemon::private_project_routed_tool(tool_name)
+                && let Some(expected_project_id) = expected_daemon_project_id.as_ref()
+            {
+                // These tools deliberately have no public selector. Carry a
+                // daemon-private pin so a concurrent ACTIVE change cannot move
+                // the already-snapshotted operation onto another repository.
+                object.insert(
+                    crate::daemon::PRIVATE_PROJECT_ROUTE_PIN.to_string(),
+                    serde_json::Value::String(expected_project_id.clone()),
+                );
+            }
+        }
+        // The call seam seeds this slot with adapter-local evidence. Once a
+        // daemon hop begins, only a fully observed daemon receipt may describe
+        // a successful proxy result. Clear HOME up front; explicit local
+        // fallback paths restore a fresh local capture below.
+        result_status::clear_project_evidence();
 
         // First attempt.
         // IMPORTANT: The read lock on daemon_lock is held for the duration of
@@ -1075,6 +1310,10 @@ impl SymForgeServer {
             .await
             {
                 Ok(Ok(result)) => {
+                    self.validate_daemon_project_evidence(
+                        &value,
+                        expected_daemon_project_id.as_deref(),
+                    );
                     self.note_daemon_recovered();
                     return Some(result);
                 }
@@ -1114,13 +1353,31 @@ impl SymForgeServer {
                     tool = tool_name,
                     "daemon proxy probe failed while degraded (reconnect cooldown active), falling back to local execution"
                 );
+                if let Some(refusal) = local_fallback_refusal.clone() {
+                    result_status::clear_project_evidence();
+                    return Some(refusal);
+                }
                 self.ensure_local_index().await;
+                self.restore_local_project_evidence();
                 return None;
             }
             tracing::info!(
                 "daemon degraded past reconnect cooldown; attempting bounded rediscovery"
             );
         }
+
+        // A generic reconnect replaces the daemon session and restores the
+        // ACTIVE project from the adapter mirror. It must not interpose after
+        // an `index_folder` daemon response but before that call records its
+        // mirror. The index-folder handler already owns this lane; every other
+        // tool takes it before the daemon-client write lock. Lock order is
+        // therefore always activation lane -> daemon client.
+        let _reconnect_activation_guard = if tool_name == "index_folder" {
+            None
+        } else {
+            let lane = daemon_lock.read().await.activation_lane();
+            Some(lane.lock_owned().await)
+        };
 
         // Reconnect attempt — take a write lock so only one caller does this.
         let reconnected = {
@@ -1152,13 +1409,20 @@ impl SymForgeServer {
                         client.base_url(),
                         format!("reconnect failed: {reconnect_error}"),
                     );
-                    self.ensure_local_index().await;
+                    if local_fallback_refusal.is_none() {
+                        self.ensure_local_index().await;
+                    }
                     false
                 }
             }
         };
 
         if !reconnected {
+            if let Some(refusal) = local_fallback_refusal.clone() {
+                result_status::clear_project_evidence();
+                return Some(refusal);
+            }
+            self.restore_local_project_evidence();
             return None;
         }
 
@@ -1167,11 +1431,15 @@ impl SymForgeServer {
             let client = daemon_lock.read().await;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                client.call_tool_value(tool_name, value),
+                client.call_tool_value(tool_name, value.clone()),
             )
             .await
             {
                 Ok(Ok(result)) => {
+                    self.validate_daemon_project_evidence(
+                        &value,
+                        expected_daemon_project_id.as_deref(),
+                    );
                     self.note_daemon_recovered();
                     Some(result)
                 }
@@ -1181,7 +1449,12 @@ impl SymForgeServer {
                         "daemon proxy call failed after reconnect, falling back to local: {error}"
                     );
                     self.note_daemon_failure(client.base_url(), error.to_string());
+                    if let Some(refusal) = local_fallback_refusal.clone() {
+                        result_status::clear_project_evidence();
+                        return Some(refusal);
+                    }
                     self.ensure_local_index().await;
+                    self.restore_local_project_evidence();
                     None
                 }
                 Err(_elapsed) => {
@@ -1193,7 +1466,12 @@ impl SymForgeServer {
                         client.base_url(),
                         "post-reconnect call timed out after 30s".to_string(),
                     );
+                    if let Some(refusal) = local_fallback_refusal {
+                        result_status::clear_project_evidence();
+                        return Some(refusal);
+                    }
                     self.ensure_local_index().await;
+                    self.restore_local_project_evidence();
                     None
                 }
             }
@@ -1423,10 +1701,16 @@ impl SymForgeServer {
         // The env override always wins (case skipped) so `env > roots` holds, and
         // a local (non-proxy) server keeps its exact prior behavior: it returns
         // here whenever it is already bound, never reloading a loaded index.
+        let env_is_authoritative = crate::discovery::workspace_root_env_is_authoritative();
+        if env_is_authoritative {
+            tracing::debug!(
+                "workspace environment authority prevents client-roots retarget or fallback"
+            );
+            return;
+        }
         if self.capture_repo_root().is_some() {
-            let bound_from_env = crate::discovery::workspace_root_env_override().is_some();
             let is_daemon_proxy = self.daemon_client.is_some();
-            if bound_from_env || !is_daemon_proxy {
+            if !is_daemon_proxy {
                 return;
             }
             tracing::debug!(
@@ -1512,7 +1796,10 @@ impl SymForgeServer {
         tracing::info!(outcome = %result, "workspace bind from client roots complete");
     }
 
-    /// Test-only dispatcher that routes a tool call by name and JSON payload.
+    /// Legacy-renderer dispatcher used by tests and the constrained A-019 relay.
+    ///
+    /// This broad dispatcher is not the production safety boundary. The facade
+    /// relay checks its source-mutation-safe allowlist before calling here.
     ///
     /// Mirrors the tool-name match in `daemon::execute_tool_call`, but takes
     /// `&self` so parity tests can exercise handlers directly without a live
@@ -1777,12 +2064,33 @@ impl ServerHandler for SymForgeServer {
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         surface_probe::enforce_compact_surface(request.name.as_ref())?;
+        // The admitted A-019 relay deliberately returns exact legacy renderer
+        // bytes with no semantic result status. Record that fact from the typed
+        // request before the router consumes it: the central plain-String
+        // error heuristic must not reinterpret valid source text such as a file
+        // beginning `Error:`. Denied or malformed relay requests remain outside
+        // this exemption and retain their typed InvalidRequest result.
+        let admitted_raw_measurement_relay = request.name.as_ref() == "symforge"
+            && request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| {
+                    serde_json::from_value::<crate::stel::SymforgeCallInput>(
+                        serde_json::Value::Object(arguments.clone()),
+                    )
+                    .ok()
+                })
+                .and_then(|input| Some((input.probe_legacy_tool?, input.probe_legacy_args?)))
+                .is_some_and(|(tool, args)| Self::facade_probe_is_measurement_safe(&tool, &args));
+        let initial_project_evidence = self
+            .initial_project_evidence_for_call(request.arguments.as_ref())
+            .await;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         // Task 7: bind the selected-project evidence slot for this dispatch,
         // seeded with the LOCAL bound project; the daemon proxy layer
         // overwrites it with the daemon's receipt when it answers. Statused
         // results attach whatever is current at render time.
-        result_status::with_project_evidence_scope(self.local_project_evidence(), async {
+        result_status::with_project_evidence_scope(initial_project_evidence, async {
             let response = self.tool_router.call(tcc).await;
             // FR-319 central evidence attachment (plan D1): statused results
             // already attached evidence inside `into_call_tool_result`
@@ -1801,7 +2109,7 @@ impl ServerHandler for SymForgeServer {
                     // as success". Reclassify centrally via the ONE shared
                     // error-shape predicate so every tool inherits it without
                     // per-handler signature churn.
-                    if result.is_error != Some(true) {
+                    if !admitted_raw_measurement_relay && result.is_error != Some(true) {
                         let body = result
                             .content
                             .iter()
@@ -1899,9 +2207,11 @@ impl ServerHandler for SymForgeServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::Router;
-    use axum::extract::State;
+    use axum::extract::{Path as AxumPath, State};
+    use axum::http::{HeaderMap, HeaderValue};
     use axum::routing::post;
+    use axum::{Json, Router};
+    use rmcp::handler::server::wrapper::Parameters;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
@@ -1944,6 +2254,896 @@ mod tests {
                 .await;
         });
         (base_url, shutdown_tx, calls)
+    }
+
+    #[derive(Clone)]
+    struct BlockingIndexFolderState {
+        calls: Arc<AtomicUsize>,
+        paths: Arc<Mutex<Vec<String>>>,
+        first_entered: Arc<tokio::sync::Notify>,
+        second_entered: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Notify>,
+    }
+
+    async fn blocking_index_folder_handler(
+        State(state): State<BlockingIndexFolderState>,
+        Json(args): Json<serde_json::Value>,
+    ) -> String {
+        let call = state.calls.fetch_add(1, Ordering::SeqCst);
+        state.paths.lock().push(
+            args.get("path")
+                .and_then(serde_json::Value::as_str)
+                .expect("index_folder path")
+                .to_string(),
+        );
+        if call == 0 {
+            state.first_entered.notify_one();
+            state.release_first.notified().await;
+        } else {
+            state.second_entered.notify_one();
+        }
+        "Indexed 0 files, 0 symbols.".to_string()
+    }
+
+    async fn spawn_blocking_index_folder_server() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        BlockingIndexFolderState,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blocking index-folder server");
+        let base_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        let state = BlockingIndexFolderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            paths: Arc::new(Mutex::new(Vec::new())),
+            first_entered: Arc::new(tokio::sync::Notify::new()),
+            second_entered: Arc::new(tokio::sync::Notify::new()),
+            release_first: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = Router::new()
+            .route(
+                "/v1/sessions/{session_id}/tools/index_folder",
+                post(blocking_index_folder_handler),
+            )
+            .with_state(state.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let shutdown = async move {
+                let _ = shutdown_rx.await;
+            };
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        (base_url, shutdown_tx, state)
+    }
+
+    #[derive(Clone)]
+    struct ProjectEchoState {
+        requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        evidence_project_override: Option<String>,
+        omit_evidence_for_tool: Option<String>,
+        different_generation_for_tool: Option<String>,
+        malformed_evidence_for_tool: Option<String>,
+        incoherent_evidence_for_tool: Option<String>,
+    }
+
+    async fn project_echo_handler(
+        AxumPath((_session_id, tool_name)): AxumPath<(String, String)>,
+        State(state): State<ProjectEchoState>,
+        Json(args): Json<serde_json::Value>,
+    ) -> (HeaderMap, String) {
+        state
+            .requests
+            .lock()
+            .push((tool_name.clone(), args.clone()));
+        let project = args
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<daemon-home>");
+        let evidence_project = state
+            .evidence_project_override
+            .as_deref()
+            .unwrap_or(project);
+        let canonical_root = format!("C:/FOREIGN_ROOT/{evidence_project}");
+        let evidence = crate::protocol::result_status::ProjectEvidence {
+            project_id: if state.incoherent_evidence_for_tool.as_deref() == Some(tool_name.as_str())
+            {
+                "project-v1-incoherent".to_string()
+            } else {
+                crate::daemon::project_key(std::path::Path::new(&canonical_root))
+            },
+            project_name: evidence_project.to_string(),
+            canonical_root: Some(canonical_root),
+            generation: if state.different_generation_for_tool.as_deref()
+                == Some(tool_name.as_str())
+            {
+                8
+            } else {
+                7
+            },
+            index_state: "Ready".to_string(),
+            load_source: "fake-daemon".to_string(),
+            index_files: 11,
+            index_symbols: 13,
+        };
+        let mut headers = HeaderMap::new();
+        if state.malformed_evidence_for_tool.as_deref() == Some(tool_name.as_str()) {
+            headers.insert(
+                crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
+                HeaderValue::from_static("{"),
+            );
+        } else if state.omit_evidence_for_tool.as_deref() != Some(tool_name.as_str()) {
+            headers.insert(
+                crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
+                HeaderValue::from_str(
+                    &serde_json::to_string(&evidence).expect("serialize fake project evidence"),
+                )
+                .expect("fake project evidence is a valid header value"),
+            );
+        }
+        let body = if tool_name == "index_folder" {
+            "Indexed 0 files, 0 symbols.".to_string()
+        } else {
+            format!("selected-project={project}; tool={tool_name}")
+        };
+        (headers, body)
+    }
+
+    async fn spawn_project_echo_tool_server() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        spawn_project_echo_tool_server_with_policy(None, None, None, None, None).await
+    }
+
+    async fn spawn_project_echo_tool_server_with_evidence_project(
+        evidence_project_override: Option<&str>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        spawn_project_echo_tool_server_with_policy(
+            evidence_project_override,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_project_echo_tool_server_with_policy(
+        evidence_project_override: Option<&str>,
+        omit_evidence_for_tool: Option<&str>,
+        different_generation_for_tool: Option<&str>,
+        malformed_evidence_for_tool: Option<&str>,
+        incoherent_evidence_for_tool: Option<&str>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind project echo daemon tool server");
+        let base_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/v1/sessions/{session_id}/tools/{tool_name}",
+                post(project_echo_handler),
+            )
+            .with_state(ProjectEchoState {
+                requests: Arc::clone(&requests),
+                evidence_project_override: evidence_project_override.map(str::to_string),
+                omit_evidence_for_tool: omit_evidence_for_tool.map(str::to_string),
+                different_generation_for_tool: different_generation_for_tool.map(str::to_string),
+                malformed_evidence_for_tool: malformed_evidence_for_tool.map(str::to_string),
+                incoherent_evidence_for_tool: incoherent_evidence_for_tool.map(str::to_string),
+            });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let shutdown = async move {
+                let _ = shutdown_rx.await;
+            };
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        (base_url, shutdown_tx, requests)
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_resolves_index_folder_path_once_before_dispatch_and_mirroring() {
+        let cwd = std::env::current_dir().expect("test current directory");
+        let target = tempfile::Builder::new()
+            .prefix("symforge-index-folder-relative-")
+            .tempdir_in(&cwd)
+            .expect("relative index target under the adapter cwd");
+        let relative = target
+            .path()
+            .strip_prefix(&cwd)
+            .expect("temp target is beneath adapter cwd")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            std::path::Path::new(&relative).is_relative(),
+            "fixture must exercise a relative caller spelling: {relative}"
+        );
+
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let client_state = client.clone();
+        let server = SymForgeServer::new_daemon_proxy(client);
+
+        let result = server
+            .index_folder(Parameters(crate::protocol::tools::IndexFolderInput {
+                path: relative,
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        assert!(result.starts_with("Indexed 0 files"), "{result}");
+
+        let expected = target.path().canonicalize().expect("canonical test target");
+        {
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].0, "index_folder");
+            let forwarded = captured[0]
+                .1
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::PathBuf::from)
+                .expect("index_folder forwards a path string");
+            assert!(
+                forwarded.is_absolute(),
+                "the daemon must never resolve the caller's relative spelling: {}",
+                forwarded.display()
+            );
+            assert_eq!(forwarded, expected);
+            assert_eq!(
+                client_state.activated_root().as_deref(),
+                Some(expected.as_path()),
+                "the adapter ACTIVE mirror must record the exact root sent to the daemon"
+            );
+        }
+
+        let missing = target.path().join("missing-project");
+        let missing_relative = missing
+            .strip_prefix(&cwd)
+            .expect("missing target is beneath adapter cwd")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!missing.try_exists().expect("observe missing fixture"));
+        let refused = server
+            .index_folder(Parameters(crate::protocol::tools::IndexFolderInput {
+                path: missing_relative,
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        assert!(refused.starts_with("Path does not exist:"), "{refused}");
+        assert_eq!(
+            requests.lock().len(),
+            1,
+            "an unresolved relative path must fail before any daemon request"
+        );
+        assert_eq!(
+            client_state.activated_root().as_deref(),
+            Some(expected.as_path()),
+            "a failed preflight must preserve the prior ACTIVE mirror"
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_index_folder_serializes_response_and_active_mirror_order() {
+        let first_root = tempfile::TempDir::new().expect("first index root");
+        let second_root = tempfile::TempDir::new().expect("second index root");
+        let first_root = first_root
+            .path()
+            .canonicalize()
+            .expect("canonical first root");
+        let second_root = second_root
+            .path()
+            .canonicalize()
+            .expect("canonical second root");
+        let (base_url, shutdown, fake) = spawn_blocking_index_folder_server().await;
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let client_state = client.clone();
+        let server = SymForgeServer::new_daemon_proxy(client);
+
+        let first = tokio::spawn({
+            let server = server.clone();
+            let path = first_root.to_string_lossy().into_owned();
+            async move {
+                server
+                    .index_folder(Parameters(crate::protocol::tools::IndexFolderInput {
+                        path,
+                        idempotency_key: None,
+                        add: None,
+                        allow_protected_root: None,
+                    }))
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fake.first_entered.notified(),
+        )
+        .await
+        .expect("first daemon request entered");
+
+        // Queue a daemon-client writer behind the in-flight proxy read. Once
+        // the HTTP response is released, Tokio's fair RwLock gives the queued
+        // writer priority, deterministically holding the first index call in
+        // the response-to-mirror gap.
+        let writer_started = Arc::new(tokio::sync::Notify::new());
+        let writer_acquired = Arc::new(tokio::sync::Notify::new());
+        let release_writer = Arc::new(tokio::sync::Notify::new());
+        let writer = tokio::spawn({
+            let slot = server.daemon_client_slot().expect("daemon client slot");
+            let writer_started = Arc::clone(&writer_started);
+            let writer_acquired = Arc::clone(&writer_acquired);
+            let release_writer = Arc::clone(&release_writer);
+            async move {
+                writer_started.notify_one();
+                let _guard = slot.write().await;
+                writer_acquired.notify_one();
+                release_writer.notified().await;
+            }
+        });
+        writer_started.notified().await;
+        tokio::task::yield_now().await;
+        fake.release_first.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            writer_acquired.notified(),
+        )
+        .await
+        .expect("queued writer acquired after the proxy response");
+        assert!(
+            client_state.activation_lane().try_lock().is_err(),
+            "the activation lane must remain held until the ACTIVE mirror write completes"
+        );
+
+        let second = tokio::spawn({
+            let server = server.clone();
+            let path = second_root.to_string_lossy().into_owned();
+            async move {
+                server
+                    .index_folder(Parameters(crate::protocol::tools::IndexFolderInput {
+                        path,
+                        idempotency_key: None,
+                        add: None,
+                        allow_protected_root: None,
+                    }))
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                fake.second_entered.notified(),
+            )
+            .await
+            .is_err(),
+            "the second default open must not reach the daemon while the first mirror is pending"
+        );
+
+        release_writer.notify_one();
+        writer.await.expect("writer task");
+        let first_result = first.await.expect("first index task");
+        assert!(
+            first_result.starts_with("Indexed 0 files"),
+            "{first_result}"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fake.second_entered.notified(),
+        )
+        .await
+        .expect("second daemon request entered after the first mirror");
+        let second_result = second.await.expect("second index task");
+        assert!(
+            second_result.starts_with("Indexed 0 files"),
+            "{second_result}"
+        );
+
+        assert_eq!(
+            fake.paths.lock().as_slice(),
+            &[
+                first_root.to_string_lossy().into_owned(),
+                second_root.to_string_lossy().into_owned(),
+            ]
+        );
+        assert_eq!(
+            client_state.activated_root().as_deref(),
+            Some(second_root.as_path()),
+            "daemon and adapter ACTIVE order must match completed call order"
+        );
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_ask_routes_the_whole_query_after_the_local_no_echo_guard() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(client);
+
+        let explicit = server
+            .ask(Parameters(crate::protocol::tools::SmartQueryInput {
+                project: Some("foreign-project".to_string()),
+                query: "which tool should I use for impact analysis?".to_string(),
+                max_tokens: None,
+            }))
+            .await;
+        assert_eq!(
+            explicit, "selected-project=foreign-project; tool=ask",
+            "the selected daemon project must own ask route classification"
+        );
+
+        let implicit = server
+            .ask(Parameters(crate::protocol::tools::SmartQueryInput {
+                project: None,
+                query: "which tool should I use for code search?".to_string(),
+                max_tokens: None,
+            }))
+            .await;
+        assert_eq!(
+            implicit, "selected-project=<daemon-home>; tool=ask",
+            "an omitted selector must still proxy the whole ask request"
+        );
+
+        let canary = ["runtime", "-", "ask", "-", "canary"].concat();
+        let rejected = server
+            .ask(Parameters(crate::protocol::tools::SmartQueryInput {
+                project: Some("foreign-project".to_string()),
+                query: format!("token={canary}"),
+                max_tokens: None,
+            }))
+            .await;
+        assert!(rejected.contains("sensitive query rejected"), "{rejected}");
+        assert!(!rejected.contains(&canary), "sensitive input must not echo");
+
+        let captured = requests.lock();
+        assert_eq!(
+            captured.len(),
+            2,
+            "the safety guard must reject before the daemon hop"
+        );
+        assert!(captured.iter().all(|(tool, _)| tool == "ask"));
+        assert_eq!(captured[0].1["project"], "foreign-project");
+        assert!(captured[1].1["project"].is_null());
+
+        drop(captured);
+        let _ = shutdown.send(());
+    }
+
+    async fn spawn_truncated_project_evidence_server(
+        evidence: crate::protocol::result_status::ProjectEvidence,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated daemon tool server");
+        let base_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept daemon tool call");
+            let mut request_prefix = [0u8; 4096];
+            let _ = socket
+                .read(&mut request_prefix)
+                .await
+                .expect("read daemon request prefix");
+            let receipt = serde_json::to_string(&evidence).expect("serialize project evidence");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n{}: {}\r\n\
+                 content-length: 256\r\nconnection: close\r\n\r\npartial-body",
+                crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
+                receipt
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write deliberately truncated daemon response");
+            socket.shutdown().await.expect("close truncated response");
+        });
+        (base_url, task)
+    }
+
+    #[tokio::test]
+    async fn daemon_receipt_is_not_recorded_before_body_is_observed() {
+        let target_evidence = crate::protocol::result_status::ProjectEvidence {
+            project_id: "foreign-project-id".to_string(),
+            project_name: "foreign-project".to_string(),
+            canonical_root: Some("C:/FOREIGN_ROOT/foreign-project".to_string()),
+            generation: 7,
+            index_state: "Ready".to_string(),
+            load_source: "truncated-daemon".to_string(),
+            index_files: 11,
+            index_symbols: 13,
+        };
+        let (base_url, server_task) =
+            spawn_truncated_project_evidence_server(target_evidence).await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let home_evidence = crate::protocol::result_status::ProjectEvidence {
+            project_id: "home-project-id".to_string(),
+            project_name: "home-project".to_string(),
+            canonical_root: Some("C:/HOME_ROOT/home-project".to_string()),
+            generation: 3,
+            index_state: "Ready".to_string(),
+            load_source: "home-seed".to_string(),
+            index_files: 5,
+            index_symbols: 8,
+        };
+
+        crate::protocol::result_status::with_project_evidence_scope(Some(home_evidence), async {
+            // The facade clears HOME immediately before a foreign daemon hop.
+            crate::protocol::result_status::clear_project_evidence();
+            daemon_client
+                .call_tool_value("find_references", serde_json::json!({}))
+                .await
+                .expect_err("a truncated response body must fail observation");
+            assert!(
+                crate::protocol::result_status::current_project_evidence().is_none(),
+                "a receipt is not trustworthy until its response body is fully observed"
+            );
+        })
+        .await;
+        server_task.await.expect("truncated daemon server task");
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_success_without_receipt_does_not_reuse_home_evidence() {
+        let (base_url, shutdown, calls) =
+            spawn_fake_tool_server("daemon-read-without-receipt").await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let home_evidence = crate::protocol::result_status::ProjectEvidence {
+            project_id: "home-project-id".to_string(),
+            project_name: "home-project".to_string(),
+            canonical_root: Some("C:/HOME_ROOT/home-project".to_string()),
+            generation: 3,
+            index_state: "Ready".to_string(),
+            load_source: "home-seed".to_string(),
+            index_files: 5,
+            index_symbols: 8,
+        };
+
+        crate::protocol::result_status::with_project_evidence_scope(Some(home_evidence), async {
+            let body = server
+                .proxy_tool_call("find_references", &serde_json::json!({ "name": "cfg_if" }))
+                .await;
+            assert_eq!(body.as_deref(), Some("daemon-read-without-receipt"));
+            assert!(
+                crate::protocol::result_status::current_project_evidence().is_none(),
+                "a successful proxy response without a daemon receipt must not reuse HOME"
+            );
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_rejects_mismatched_or_set_valued_project_evidence() {
+        let (base_url, shutdown, requests) =
+            spawn_project_echo_tool_server_with_evidence_project(Some("home-project")).await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let home_evidence = crate::protocol::result_status::ProjectEvidence {
+            project_id: "home-project-id".to_string(),
+            project_name: "home-project".to_string(),
+            canonical_root: Some("C:/HOME".to_string()),
+            generation: 3,
+            index_state: "Ready".to_string(),
+            load_source: "home-seed".to_string(),
+            index_files: 5,
+            index_symbols: 8,
+        };
+        let cases = [
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "project": "foreign-project",
+            }),
+            serde_json::json!({
+                "query": "thing",
+                "projects": ["foreign-project", "other-project"],
+            }),
+            serde_json::json!({
+                "query": "thing",
+                "project": 7,
+            }),
+            serde_json::json!({
+                "query": "thing",
+                "projects": [],
+            }),
+            serde_json::json!({
+                "query": "thing",
+                "projects": [""],
+            }),
+            serde_json::json!({
+                "query": "thing",
+                "projects": "foreign-project",
+            }),
+        ];
+
+        for params in cases {
+            let (body, evidence, meta) =
+                crate::protocol::result_status::with_project_evidence_scope(
+                    Some(home_evidence.clone()),
+                    async {
+                        let body = server
+                            .proxy_tool_call("search_text", &params)
+                            .await
+                            .expect("fake daemon response");
+                        let evidence = crate::protocol::result_status::current_project_evidence();
+                        let mut meta = None;
+                        crate::protocol::result_status::attach_project_evidence_meta(&mut meta);
+                        (body, evidence, meta)
+                    },
+                )
+                .await;
+            assert!(body.contains("tool=search_text"), "fake body: {body}");
+            assert!(
+                evidence.is_none(),
+                "a scalar mismatch or set-valued result cannot carry one project receipt"
+            );
+            let meta = serde_json::to_value(meta).expect("serialize project evidence metadata");
+            assert_eq!(
+                meta["symforge/project_evidence"],
+                serde_json::json!({
+                    "bound": false,
+                    "reason": "project_evidence_unavailable",
+                }),
+                "the public seam must disclose unavailable evidence exactly: {meta}"
+            );
+        }
+        assert_eq!(requests.lock().len(), 6);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_binds_an_omitted_selector_to_the_active_project() {
+        let (base_url, shutdown, requests) =
+            spawn_project_echo_tool_server_with_evidence_project(Some("home-project")).await;
+        let active = tempfile::TempDir::new().expect("active sibling root");
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        client.record_opened_root(active.path().to_path_buf());
+        client.record_active_root(active.path().to_path_buf());
+        let expected_active_id = client.active_project_id();
+        assert_ne!(expected_active_id, client.project_id());
+        let server = SymForgeServer::new_daemon_proxy(client);
+
+        let (body, evidence, meta) =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let body = server
+                    .proxy_tool_call(
+                        "replace_symbol_body",
+                        &serde_json::json!({
+                            "path": "src/lib.rs",
+                            "name": "thing",
+                            "body": "fn thing() {}",
+                            "project": null,
+                        }),
+                    )
+                    .await
+                    .expect("fake daemon response");
+                let evidence = crate::protocol::result_status::current_project_evidence();
+                let mut meta = None;
+                crate::protocol::result_status::attach_project_evidence_meta(&mut meta);
+                (body, evidence, meta)
+            })
+            .await;
+
+        assert!(
+            body.contains("tool=replace_symbol_body"),
+            "fake body: {body}"
+        );
+        assert!(
+            evidence.is_none(),
+            "an omitted selector must accept only the ACTIVE project's canonical receipt"
+        );
+        let meta = serde_json::to_value(meta).expect("serialize project evidence metadata");
+        assert_eq!(
+            meta["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            })
+        );
+        {
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                captured[0].1["project"], expected_active_id,
+                "the omitted edit must be pinned to the ACTIVE snapshot before dispatch"
+            );
+        }
+
+        for tool_name in [
+            "inspect_match",
+            "checkpoint_now",
+            "detect_impact",
+            "conventions",
+            "health",
+            "health_compact",
+            "status",
+            "context_inventory",
+        ] {
+            let body = server
+                .proxy_tool_call(tool_name, &serde_json::json!({}))
+                .await
+                .expect("fake daemon response");
+            assert!(body.contains(&format!("tool={tool_name}")), "{body}");
+        }
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 9);
+        for (tool_name, args) in requests.iter().skip(1) {
+            assert_eq!(
+                args[crate::daemon::PRIVATE_PROJECT_ROUTE_PIN],
+                expected_active_id,
+                "selector-less {tool_name} must carry the canonical ACTIVE snapshot"
+            );
+            assert!(
+                args.get("project").is_none(),
+                "the private route pin must not widen the public {tool_name} schema"
+            );
+        }
+        drop(requests);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn call_scope_does_not_seed_home_evidence_for_omitted_active_sibling_requests() {
+        let active = tempfile::TempDir::new().expect("active sibling root");
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        client.record_opened_root(active.path().to_path_buf());
+        client.record_active_root(active.path().to_path_buf());
+        let server = SymForgeServer::new_daemon_proxy(client);
+        let omitted = serde_json::json!({"query": "invalid early request"})
+            .as_object()
+            .expect("arguments object")
+            .clone();
+        assert!(
+            server
+                .initial_project_evidence_for_call(Some(&omitted))
+                .await
+                .is_none(),
+            "an omitted selector targets ACTIVE, so an active sibling cannot inherit HOME evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_rejects_a_coherent_receipt_for_an_unresolved_selector() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let active = tempfile::TempDir::new().expect("active sibling root");
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        client.record_opened_root(active.path().to_path_buf());
+        client.record_active_root(active.path().to_path_buf());
+        let server = SymForgeServer::new_daemon_proxy(client);
+
+        crate::protocol::result_status::with_project_evidence_scope(None, async {
+            let body = server
+                .proxy_tool_call(
+                    "search_text",
+                    &serde_json::json!({
+                        "query": "thing",
+                        "project": "not-an-open-project",
+                    }),
+                )
+                .await
+                .expect("fake daemon response");
+            assert!(body.contains("selected-project=not-an-open-project"));
+            assert!(
+                crate::protocol::result_status::current_project_evidence().is_none(),
+                "a syntactically coherent receipt cannot authorize an unresolved selector"
+            );
+        })
+        .await;
+        assert_eq!(requests.lock().len(), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_never_falls_back_to_home_for_an_active_sibling() {
+        let active = tempfile::TempDir::new().expect("active sibling root");
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        client.record_opened_root(active.path().to_path_buf());
+        client.record_active_root(active.path().to_path_buf());
+        assert!(!client.active_project_is_home());
+        let server = SymForgeServer::new_daemon_proxy(client);
+        {
+            let mut degraded = server.daemon_degraded.lock();
+            degraded.degraded = true;
+            degraded.last_reconnect_attempt = Some(std::time::Instant::now());
+        }
+
+        let (result, evidence) = crate::protocol::result_status::with_project_evidence_scope(
+            server.local_project_evidence(),
+            async {
+                let result = server
+                    .proxy_tool_call(
+                        "search_text",
+                        &serde_json::json!({"query": "active sibling marker"}),
+                    )
+                    .await;
+                let evidence = crate::protocol::result_status::current_project_evidence();
+                (result, evidence)
+            },
+        )
+        .await;
+        let refusal = result.expect(
+            "an unqualified ACTIVE-sibling call must refuse instead of falling back to HOME",
+        );
+        assert!(
+            refusal.starts_with("Error: project_routing:")
+                && refusal.contains("ACTIVE daemon project"),
+            "unexpected active-project fallback refusal: {refusal}"
+        );
+        assert!(
+            evidence.is_none(),
+            "a failed ACTIVE-sibling route must never retain HOME evidence"
+        );
     }
 
     #[tokio::test]
@@ -2139,6 +3339,822 @@ mod tests {
             recent[0].session_id, "stdio-daemon-test",
             "the durable row carries the proxy store's session id"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_omission_routes_active_selectorless_steps_without_public_project() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let active = tempfile::tempdir().expect("active project root");
+        let active_root = active.path().canonicalize().expect("canonical active root");
+        let active_id = crate::daemon::project_key(&active_root);
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        daemon_client.record_opened_root(active_root.clone());
+        daemon_client.record_active_root(active_root);
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+
+        for (query, intent) in [
+            (
+                "show the repository blast radius",
+                crate::stel::IntentBucket::Impact,
+            ),
+            (
+                "show current context inventory",
+                crate::stel::IntentBucket::Meta,
+            ),
+        ] {
+            let request = crate::stel::StelRequest {
+                query: query.to_string(),
+                intent: Some(intent),
+                ..Default::default()
+            };
+            let result = server
+                .symforge_stel_handler(&request)
+                .await
+                .expect("omitted-project facade dispatch");
+            let serialized = serde_json::to_value(&result).expect("serialize facade result");
+            let text = serialized["content"][0]["text"]
+                .as_str()
+                .expect("facade result text");
+            assert!(
+                !text.contains("cannot be routed through this plan"),
+                "an omitted selector must use session routing instead of the explicit-selector refusal: {text}"
+            );
+        }
+
+        let _ = shutdown.send(());
+        let captured = requests.lock();
+        assert_eq!(captured.len(), 2, "both selectorless plans must dispatch");
+        assert_eq!(captured[0].0, "detect_impact");
+        assert_eq!(
+            captured[0]
+                .1
+                .get(crate::daemon::PRIVATE_PROJECT_ROUTE_PIN)
+                .and_then(serde_json::Value::as_str),
+            Some(active_id.as_str()),
+            "selectorless project-bound tools use the private ACTIVE pin"
+        );
+        assert!(captured[0].1.get("project").is_none());
+        assert_eq!(captured[1].0, "context_inventory");
+        assert!(captured[1].1.get("project").is_none());
+        assert_eq!(
+            captured[1]
+                .1
+                .get(crate::daemon::PRIVATE_PROJECT_ROUTE_PIN)
+                .and_then(serde_json::Value::as_str),
+            Some(active_id.as_str()),
+            "selectorless session metadata is privately pinned to the snapshotted ACTIVE project"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_routes_foreign_project_into_served_primitive() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        server.daemon_degraded.lock().degraded = true;
+        let home_root = tempfile::tempdir().expect("home-project root");
+        server.set_repo_root(Some(home_root.path().to_path_buf()));
+        let request = crate::stel::StelRequest {
+            query: "who references cfg_if".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(
+            None,
+            server.symforge_stel_handler(&request),
+        )
+        .await
+        .expect("healthy daemon facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize facade result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("facade result has text");
+        let home = home_root.path().display().to_string().replace('\\', "/");
+        assert!(
+            text.contains("project_root: C:/FOREIGN_ROOT/foreign-project"),
+            "the facade must render the selected daemon project's root receipt: {text}"
+        );
+        assert!(
+            !text.contains(&format!("project_root: {home}")),
+            "the facade must not label a foreign result with its home root: {text}"
+        );
+        let evidence = &serialized["_meta"]["symforge/project_evidence"];
+        assert_eq!(
+            evidence["project_name"], "foreign-project",
+            "typed evidence must name the selected daemon project: {serialized}"
+        );
+        assert_eq!(
+            evidence["canonical_root"], "C:/FOREIGN_ROOT/foreign-project",
+            "typed evidence must carry the selected daemon root: {serialized}"
+        );
+        let _ = shutdown.send(());
+
+        let requests = requests.lock();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the healthy daemon facade must dispatch exactly one planned primitive"
+        );
+        let (tool, args) = &requests[0];
+        assert_eq!(tool, "find_references");
+        assert_eq!(
+            args.get("project").and_then(serde_json::Value::as_str),
+            Some("foreign-project"),
+            "the facade must inject the selected project before daemon dispatch"
+        );
+        assert!(
+            server.daemon_degradation_snapshot().is_none(),
+            "a successful routed probe must recover the compact facade"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_never_reuses_home_evidence_when_foreign_receipt_is_missing() {
+        let (base_url, shutdown, calls) =
+            spawn_fake_tool_server("references to cfg_if:\n  foreign/src/lib.rs:1").await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let home_root = tempfile::tempdir().expect("home-project root");
+        server.set_repo_root(Some(home_root.path().to_path_buf()));
+        let home = home_root.path().display().to_string().replace('\\', "/");
+        let home_evidence = crate::protocol::result_status::ProjectEvidence {
+            project_id: "home-project-id".to_string(),
+            project_name: "home-project".to_string(),
+            canonical_root: Some(home.clone()),
+            generation: 3,
+            index_state: "Ready".to_string(),
+            load_source: "home-seed".to_string(),
+            index_files: 5,
+            index_symbols: 8,
+        };
+        let request = crate::stel::StelRequest {
+            query: "who references cfg_if".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(
+            Some(home_evidence),
+            async {
+                let mut result = server.symforge_stel_handler(&request).await?;
+                crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+                Ok::<_, rmcp::ErrorData>(result)
+            },
+        )
+        .await
+        .expect("foreign facade dispatch without daemon evidence receipt");
+        let serialized = serde_json::to_value(&result).expect("serialize foreign facade result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("foreign facade result has text");
+        assert!(
+            text.contains(
+                "project_root: (routed project foreign-project; daemon receipt unavailable)"
+            ),
+            "missing target evidence must be disclosed without substituting HOME: {text}"
+        );
+        assert!(
+            !text.contains(&home),
+            "foreign response body must never inherit the adapter home root: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "foreign result without a target receipt must disclose unavailable evidence: {serialized}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_rejects_a_mismatched_foreign_project_receipt() {
+        let (base_url, shutdown, requests) =
+            spawn_project_echo_tool_server_with_evidence_project(Some("home-project")).await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let request = crate::stel::StelRequest {
+            query: "who references cfg_if".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(None, async {
+            let mut result = server.symforge_stel_handler(&request).await?;
+            crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+            Ok::<_, rmcp::ErrorData>(result)
+        })
+        .await
+        .expect("foreign facade dispatch with mismatched daemon receipt");
+        let serialized = serde_json::to_value(&result).expect("serialize foreign facade result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("foreign facade result has text");
+        assert!(
+            text.contains(
+                "project_root: (routed project foreign-project; daemon receipt unavailable)"
+            ),
+            "a mismatched receipt must be rejected rather than relabeled: {text}"
+        );
+        assert!(
+            !text.contains("C:/FOREIGN_ROOT/home-project"),
+            "a mismatched receipt must not leak into the response body: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "a mismatched receipt must disclose unavailable typed evidence: {serialized}"
+        );
+        assert_eq!(requests.lock().len(), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_requires_one_consistent_receipt_for_every_foreign_step() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
+            None,
+            Some("search_files"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let request = crate::stel::StelRequest {
+            query: "widget routing".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(None, async {
+            let mut result = server.symforge_stel_handler(&request).await?;
+            crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+            Ok::<_, rmcp::ErrorData>(result)
+        })
+        .await
+        .expect("foreign fused-find facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize foreign facade result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("foreign facade result has text");
+        assert!(
+            text.contains("selected-project=foreign-project; tool=search_files")
+                && text.contains("selected-project=foreign-project; tool=search_text"),
+            "both foreign steps must remain visible in the semantic body: {text}"
+        );
+        assert!(
+            text.contains(
+                "project_root: (routed project foreign-project; daemon receipt unavailable)"
+            ),
+            "one unattested step makes the aggregate receipt unavailable: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "the public seam must disclose unavailable aggregate evidence exactly: {serialized}"
+        );
+        let captured = requests.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0, "search_files");
+        assert_eq!(captured[1].0, "search_text");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_requires_one_consistent_receipt_for_every_home_step() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
+            None,
+            Some("search_files"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let request = crate::stel::StelRequest {
+            query: "widget routing".to_string(),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(None, async {
+            let mut result = server.symforge_stel_handler(&request).await?;
+            crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+            Ok::<_, rmcp::ErrorData>(result)
+        })
+        .await
+        .expect("home fused-find facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize home facade result");
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "one unattested HOME step makes the aggregate receipt unavailable: {serialized}"
+        );
+        let captured = requests.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0, "search_files");
+        assert_eq!(captured[1].0, "search_text");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_rejects_same_project_receipts_from_different_generations() {
+        let (base_url, shutdown, requests) =
+            spawn_project_echo_tool_server_with_policy(None, None, Some("search_text"), None, None)
+                .await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let request = crate::stel::StelRequest {
+            query: "widget routing".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(None, async {
+            let mut result = server.symforge_stel_handler(&request).await?;
+            crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+            Ok::<_, rmcp::ErrorData>(result)
+        })
+        .await
+        .expect("foreign fused-find facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize foreign facade result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("foreign facade result has text");
+        assert!(
+            text.contains(
+                "project_root: (routed project foreign-project; daemon receipt unavailable)"
+            ),
+            "same-project receipts from different generations cannot attest one body: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "cross-generation aggregate evidence must be unavailable: {serialized}"
+        );
+        let captured = requests.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0, "search_files");
+        assert_eq!(captured[1].0, "search_text");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_does_not_reuse_home_evidence_for_a_malformed_receipt() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
+            None,
+            None,
+            None,
+            Some("find_references"),
+            None,
+        )
+        .await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let home_evidence = crate::protocol::result_status::ProjectEvidence {
+            project_id: "home-project-id".to_string(),
+            project_name: "home-project".to_string(),
+            canonical_root: Some("C:/HOME".to_string()),
+            generation: 3,
+            index_state: "Ready".to_string(),
+            load_source: "home-seed".to_string(),
+            index_files: 5,
+            index_symbols: 8,
+        };
+        let request = crate::stel::StelRequest {
+            query: "who references cfg_if".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(
+            Some(home_evidence),
+            async {
+                let mut result = server.symforge_stel_handler(&request).await?;
+                crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+                Ok::<_, rmcp::ErrorData>(result)
+            },
+        )
+        .await
+        .expect("foreign facade dispatch with malformed receipt");
+        let serialized = serde_json::to_value(&result).expect("serialize foreign facade result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("foreign facade result has text");
+        assert!(
+            text.contains(
+                "project_root: (routed project foreign-project; daemon receipt unavailable)"
+            ) && !text.contains("C:/HOME"),
+            "malformed target evidence must never retain HOME: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "malformed target evidence must be unavailable at the public seam: {serialized}"
+        );
+        assert_eq!(requests.lock().len(), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_rejects_a_selector_matching_receipt_with_an_incoherent_root() {
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
+            None,
+            None,
+            None,
+            None,
+            Some("find_references"),
+        )
+        .await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let request = crate::stel::StelRequest {
+            query: "who references cfg_if".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::protocol::result_status::with_project_evidence_scope(None, async {
+            let mut result = server.symforge_stel_handler(&request).await?;
+            crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+            Ok::<_, rmcp::ErrorData>(result)
+        })
+        .await
+        .expect("foreign facade dispatch with incoherent receipt");
+        let serialized = serde_json::to_value(&result).expect("serialize foreign facade result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("foreign facade result has text");
+        assert!(
+            text.contains(
+                "project_root: (routed project foreign-project; daemon receipt unavailable)"
+            ),
+            "a selector name cannot bless an incoherent ID/root pair: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"],
+            serde_json::json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "an incoherent receipt must be unavailable: {serialized}"
+        );
+        assert_eq!(requests.lock().len(), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_never_augments_foreign_impact_with_home_cochanges() {
+        use crate::live_index::git_temporal::{
+            CoChangeEntry, CommitSummary, GitFileHistory, GitTemporalIndex, GitTemporalState,
+            GitTemporalStats,
+        };
+
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let home_root = tempfile::tempdir().expect("home-project root");
+        server.set_repo_root(Some(home_root.path().to_path_buf()));
+        let home_history = GitFileHistory {
+            commit_count: 7,
+            churn_score: 0.9,
+            last_commit: CommitSummary {
+                hash: "abc1234".to_string(),
+                timestamp: "2026-06-01T12:00:00Z".to_string(),
+                author: "Tester".to_string(),
+                message_head: "touch widget".to_string(),
+                days_ago: 2.0,
+            },
+            contributors: vec![],
+            co_changes: vec![CoChangeEntry {
+                path: "src/HOME_ONLY_PARTNER.rs".to_string(),
+                coupling_score: 0.71,
+                shared_commits: 5,
+            }],
+            weak_co_changes: vec![],
+        };
+        server.index.update_git_temporal(GitTemporalIndex {
+            files: std::collections::HashMap::from([("src/widget.rs".to_string(), home_history)]),
+            stats: GitTemporalStats {
+                total_commits_analyzed: 14,
+                analysis_window_days: 90,
+                hotspots: vec![],
+                most_coupled: vec![],
+                computed_at: std::time::SystemTime::now(),
+                compute_duration: std::time::Duration::ZERO,
+            },
+            state: GitTemporalState::Ready,
+        });
+
+        let foreign = crate::stel::StelRequest {
+            query: "impact cfg_if".to_string(),
+            intent: Some(crate::stel::IntentBucket::Impact),
+            symbol: Some("cfg_if".to_string()),
+            path: Some("src/widget.rs".to_string()),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+        let result = crate::protocol::result_status::with_project_evidence_scope(
+            None,
+            server.symforge_stel_handler(&foreign),
+        )
+        .await
+        .expect("foreign impact facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize foreign impact result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("foreign impact result has text");
+        assert!(
+            text.contains("selected-project=foreign-project; tool=find_dependents"),
+            "the foreign impact result must come from the selected daemon project: {text}"
+        );
+        assert!(
+            !text.contains("HOME_ONLY_PARTNER") && !text.contains("Co-changing files"),
+            "foreign impact must not be augmented from the facade's home index: {text}"
+        );
+
+        let home = crate::stel::StelRequest {
+            project: None,
+            path: Some("src/widget.rs".to_string()),
+            ..foreign
+        };
+        let result = crate::protocol::result_status::with_project_evidence_scope(
+            None,
+            server.symforge_stel_handler(&home),
+        )
+        .await
+        .expect("home impact facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize home impact result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("home impact result has text");
+        assert!(
+            text.contains("HOME_ONLY_PARTNER") && text.contains("Co-changing files"),
+            "home impact must retain the existing local co-change augmentation: {text}"
+        );
+
+        let _ = shutdown.send(());
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, "find_dependents");
+        assert_eq!(requests[1].0, "find_dependents");
+        assert_eq!(
+            requests[0]
+                .1
+                .get("project")
+                .and_then(serde_json::Value::as_str),
+            Some("foreign-project")
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_never_rewrites_foreign_find_with_a_home_anchor() {
+        let home_root = tempfile::tempdir().expect("home project root");
+        std::fs::create_dir_all(home_root.path().join("src")).expect("home src directory");
+        std::fs::write(
+            home_root.path().join("src/homeanchor.rs"),
+            "pub fn homeanchor() {}\n",
+        )
+        .expect("home anchor source");
+
+        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        let mut server = SymForgeServer::new_daemon_proxy(daemon_client);
+        server.index =
+            crate::live_index::LiveIndex::load(home_root.path()).expect("load home project index");
+
+        let foreign = crate::stel::StelRequest {
+            query: "homeanchor routing".to_string(),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+        let result = crate::protocol::result_status::with_project_evidence_scope(
+            None,
+            server.symforge_stel_handler(&foreign),
+        )
+        .await
+        .expect("foreign fused-find facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize fused-find result");
+        let text = serialized["content"][0]["text"]
+            .as_str()
+            .expect("fused-find result has text");
+        assert!(
+            text.contains("project_root: C:/FOREIGN_ROOT/foreign-project"),
+            "equal receipts from every foreign step may attest the aggregate: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"]["project_name"],
+            "foreign-project"
+        );
+        let foreign_requests = requests.lock().clone();
+        assert_eq!(foreign_requests.len(), 2);
+        let (tool, args) = &foreign_requests[0];
+        assert_eq!(tool, "search_files");
+        assert_eq!(
+            args.get("project").and_then(serde_json::Value::as_str),
+            Some("foreign-project")
+        );
+        assert_eq!(
+            args.get("query").and_then(serde_json::Value::as_str),
+            Some("homeanchor routing"),
+            "a foreign find must retain the caller's query"
+        );
+        assert!(
+            args.get("anchor_path")
+                .is_none_or(serde_json::Value::is_null)
+                && args.get("rank_by").is_none_or(serde_json::Value::is_null),
+            "a foreign find must not carry a home-derived co-change anchor: {args}"
+        );
+        assert_eq!(foreign_requests[1].0, "search_text");
+        assert_eq!(
+            foreign_requests[1]
+                .1
+                .get("project")
+                .and_then(serde_json::Value::as_str),
+            Some("foreign-project")
+        );
+
+        requests.lock().clear();
+        let home = crate::stel::StelRequest {
+            project: None,
+            ..foreign
+        };
+        crate::protocol::result_status::with_project_evidence_scope(
+            None,
+            server.symforge_stel_handler(&home),
+        )
+        .await
+        .expect("home fused-find facade dispatch");
+        let home_requests = requests.lock().clone();
+        assert_eq!(home_requests.len(), 2);
+        let (tool, args) = &home_requests[0];
+        assert_eq!(tool, "search_files");
+        assert_eq!(
+            args.get("query").and_then(serde_json::Value::as_str),
+            Some("homeanchor")
+        );
+        assert_eq!(
+            args.get("anchor_path").and_then(serde_json::Value::as_str),
+            Some("src/homeanchor.rs")
+        );
+        assert_eq!(
+            args.get("rank_by").and_then(serde_json::Value::as_str),
+            Some("path+cochange")
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_facade_never_grounds_foreign_economics_from_home_bytes() {
+        let home_root = tempfile::tempdir().expect("home project root");
+        std::fs::create_dir_all(home_root.path().join("src")).expect("home src directory");
+        let mut source = "// home-only economics bytes\n".repeat(4_096);
+        source.push_str("pub fn shared() {}\n");
+        std::fs::write(home_root.path().join("src/shared.rs"), source).expect("large home source");
+
+        let (base_url, shutdown, _requests) = spawn_project_echo_tool_server().await;
+        let make_server = || {
+            let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+                base_url.clone(),
+                "home-project-id".to_string(),
+                "session-id".to_string(),
+                "home-project".to_string(),
+            );
+            let mut server = SymForgeServer::new_daemon_proxy(daemon_client);
+            server.index = crate::live_index::LiveIndex::load(home_root.path())
+                .expect("load home project index");
+            server
+        };
+
+        let foreign = crate::stel::StelRequest {
+            query: "read shared file".to_string(),
+            intent: Some(crate::stel::IntentBucket::Read),
+            path: Some("src/shared.rs".to_string()),
+            project: Some("foreign-project".to_string()),
+            ..Default::default()
+        };
+        let floor_plan = crate::stel::planner::build_plan(&foreign);
+        assert!(floor_plan.steps[0].index_refs.is_empty());
+        let floor = crate::stel::controller::estimate_economics(&floor_plan);
+
+        let foreign_server = make_server();
+        crate::protocol::result_status::with_project_evidence_scope(
+            None,
+            foreign_server.symforge_stel_handler(&foreign),
+        )
+        .await
+        .expect("foreign read facade dispatch");
+        let foreign_event = foreign_server
+            .stel_ledger()
+            .lock()
+            .last()
+            .expect("foreign facade ledger event");
+        assert_eq!(
+            foreign_event.manual_baseline_tokens, floor.predicted_manual_tokens,
+            "foreign economics must retain the ungrounded target-plan floor"
+        );
+        assert_eq!(
+            foreign_event.predicted_response_tokens, floor.predicted_response_tokens,
+            "foreign response economics must not use home file bytes"
+        );
+
+        let home_server = make_server();
+        let home = crate::stel::StelRequest {
+            project: None,
+            ..foreign
+        };
+        crate::protocol::result_status::with_project_evidence_scope(
+            None,
+            home_server.symforge_stel_handler(&home),
+        )
+        .await
+        .expect("home read facade dispatch");
+        let home_event = home_server
+            .stel_ledger()
+            .lock()
+            .last()
+            .expect("home facade ledger event");
+        assert_ne!(
+            home_event.manual_baseline_tokens, floor.predicted_manual_tokens,
+            "home reads must retain real-byte economics grounding"
+        );
+
+        let _ = shutdown.send(());
     }
 
     // ── ensure_local_index: root-mismatch invalidation (M2) ──────────────────

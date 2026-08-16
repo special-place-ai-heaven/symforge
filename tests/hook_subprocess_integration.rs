@@ -382,11 +382,10 @@ fn run_hook_index_not_ready_uses_ready_daemon_fallback() {
     let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
     let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
     let tmp = TempDir::new().expect("tempdir creation");
-    let canonical_root = std::fs::canonicalize(tmp.path())
-        .unwrap_or_else(|_| tmp.path().to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
-    let daemon_thread = thread::spawn(move || serve_mock_daemon(daemon, &canonical_root));
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
+    let daemon_thread =
+        thread::spawn(move || serve_mock_daemon(daemon, &canonical_root, &project_id));
 
     let home = TempDir::new().expect("control-state tempdir creation");
     write_sidecar_descriptor(home.path(), tmp.path(), sidecar_port);
@@ -433,14 +432,13 @@ fn run_hook_daemon_index_not_ready_uses_daemon_session_error() {
     let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
     let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
     let tmp = TempDir::new().expect("tempdir creation");
-    let canonical_root = std::fs::canonicalize(tmp.path())
-        .unwrap_or_else(|_| tmp.path().to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
     let daemon_thread = thread::spawn(move || {
         serve_mock_daemon_with_enrichment(
             daemon,
             &canonical_root,
+            &project_id,
             "503 Service Unavailable",
             DAEMON_PARTIAL,
         )
@@ -490,12 +488,16 @@ fn run_hook_daemon_root_conflict_uses_daemon_session_error() {
     let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
     let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
     let tmp = TempDir::new().expect("tempdir creation");
-    let canonical_root = std::fs::canonicalize(tmp.path())
-        .unwrap_or_else(|_| tmp.path().to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
     let daemon_thread = thread::spawn(move || {
-        serve_mock_daemon_with_enrichment(daemon, &canonical_root, "409 Conflict", DAEMON_CONFLICT)
+        serve_mock_daemon_with_enrichment(
+            daemon,
+            &canonical_root,
+            &project_id,
+            "409 Conflict",
+            DAEMON_CONFLICT,
+        )
     });
 
     let home = TempDir::new().expect("control-state tempdir creation");
@@ -532,12 +534,16 @@ fn run_hook_initial_daemon_index_not_ready_fails_open_without_retry() {
     let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
     let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
     let tmp = TempDir::new().expect("tempdir creation");
-    let canonical_root = std::fs::canonicalize(tmp.path())
-        .unwrap_or_else(|_| tmp.path().to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
+    let expected_project_id = project_id.clone();
     let daemon_thread = thread::spawn(move || {
-        serve_initially_discovered_loading_daemon(daemon, &canonical_root, DAEMON_PARTIAL)
+        serve_initially_discovered_loading_daemon(
+            daemon,
+            &canonical_root,
+            &project_id,
+            DAEMON_PARTIAL,
+        )
     });
 
     let home = TempDir::new().expect("control-state tempdir creation");
@@ -558,11 +564,12 @@ fn run_hook_initial_daemon_index_not_ready_fails_open_without_retry() {
         "the initially selected daemon's 503 must use its own session; got:\n{log}"
     );
     assert!(!log.contains("sidecar_port_stale"));
+    let project_sessions_route = format!("/v1/projects/{expected_project_id}/sessions");
     assert_request_routes(
         &daemon_requests,
         &[
             "/v1/projects",
-            "/v1/projects/mock-project/sessions",
+            project_sessions_route.as_str(),
             "/v1/sessions/mock-session/sidecar/outline",
         ],
         "initial daemon discovery",
@@ -582,12 +589,15 @@ fn run_hook_daemon_descriptor_index_not_ready_is_not_retried() {
     let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
     let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
     let tmp = TempDir::new().expect("tempdir creation");
-    let canonical_root = std::fs::canonicalize(tmp.path())
-        .unwrap_or_else(|_| tmp.path().to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
     let daemon_thread = thread::spawn(move || {
-        serve_descriptor_selected_loading_daemon(daemon, &canonical_root, DAEMON_PARTIAL)
+        serve_descriptor_selected_loading_daemon(
+            daemon,
+            &canonical_root,
+            &project_id,
+            DAEMON_PARTIAL,
+        )
     });
 
     let home = TempDir::new().expect("control-state tempdir creation");
@@ -648,11 +658,18 @@ fn assert_blank_descriptor_session_routes_locally_then_falls_back(
     let fallback_port = fallback.local_addr().expect("fallback local_addr").port();
     let tmp = TempDir::new().expect("tempdir creation");
     let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
+    let expected_project_id = project_id.clone();
+    let sessions_json = serde_json::json!([
+        {"session_id":"fresh-session","project_id":project_id.as_str(),"last_seen_at_unix_secs":1}
+    ])
+    .to_string();
     let fallback_thread = thread::spawn(move || {
         serve_recording_daemon(
             fallback,
             &canonical_root,
-            r#"[{"session_id":"fresh-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#,
+            &project_id,
+            &sessions_json,
             "fresh-session",
         )
     });
@@ -698,11 +715,12 @@ fn assert_blank_descriptor_session_routes_locally_then_falls_back(
         local_request.contains("path=") && local_request.contains("caller_root="),
         "the local request must preserve both source path and root fence; got {local_request:?}"
     );
+    let project_sessions_route = format!("/v1/projects/{expected_project_id}/sessions");
     assert_request_routes(
         &fallback_requests,
         &[
             "/v1/projects",
-            "/v1/projects/mock-project/sessions",
+            project_sessions_route.as_str(),
             "/v1/sessions/fresh-session/sidecar/outline",
         ],
         "blank-session daemon fallback",
@@ -748,11 +766,19 @@ fn assert_descriptor_daemon_failure_rediscovers_different_session(
     let fallback_port = fallback.local_addr().expect("alternate local_addr").port();
     let tmp = TempDir::new().expect("tempdir creation");
     let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
+    let expected_project_id = project_id.clone();
+    let sessions_json = serde_json::json!([
+        {"session_id":"stale-session","project_id":project_id.as_str(),"last_seen_at_unix_secs":2},
+        {"session_id":"fresh-session","project_id":project_id.as_str(),"last_seen_at_unix_secs":1}
+    ])
+    .to_string();
     let fallback_thread = thread::spawn(move || {
         serve_recording_daemon(
             fallback,
             &canonical_root,
-            r#"[{"session_id":"stale-session","project_id":"mock-project","last_seen_at_unix_secs":2},{"session_id":"fresh-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#,
+            &project_id,
+            &sessions_json,
             "fresh-session",
         )
     });
@@ -797,11 +823,12 @@ fn assert_descriptor_daemon_failure_rediscovers_different_session(
             .is_some_and(|path| path.contains("caller_root=")),
         "the failed descriptor request must be root-fenced; got {initial_requests:?}"
     );
+    let project_sessions_route = format!("/v1/projects/{expected_project_id}/sessions");
     assert_request_routes(
         &fallback_requests,
         &[
             "/v1/projects",
-            "/v1/projects/mock-project/sessions",
+            project_sessions_route.as_str(),
             "/v1/sessions/fresh-session/sidecar/outline",
         ],
         "alternate daemon discovery",
@@ -842,17 +869,16 @@ fn run_hook_stale_sidecar_with_live_daemon_routes_via_daemon_fallback() {
     // The daemon process matches projects by canonical root (same
     // canonicalization + normalization the hook applies), so advertise the
     // canonicalized tempdir.
-    let canonical_root = std::fs::canonicalize(tmp.path())
-        .unwrap_or_else(|_| tmp.path().to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical_root = canonical_root_for_mock(tmp.path());
+    let project_id = project_id_for_mock(tmp.path());
 
     // SYMFORGE_HOME hosts the daemon port file the hook's daemon fallback reads.
     let home = TempDir::new().expect("home tempdir creation");
     write_sidecar_descriptor(home.path(), tmp.path(), stale_port);
     write_daemon_port(home.path(), daemon_port);
 
-    let daemon_thread = thread::spawn(move || serve_mock_daemon(daemon, &canonical_root));
+    let daemon_thread =
+        thread::spawn(move || serve_mock_daemon(daemon, &canonical_root, &project_id));
 
     let (stdout, log) = run_hook_in_tempdir_with_env(
         tmp.path(),
@@ -975,10 +1001,39 @@ fn run_hook_stdin_held_open_exits_fail_open_within_deadline() {
 const ENRICHED_MARKER: &str = "MOCK_DAEMON_ENRICHED_OUTLINE";
 
 fn canonical_root_for_mock(root: &Path) -> String {
-    std::fs::canonicalize(root)
-        .unwrap_or_else(|_| root.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/")
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let exact = dunce::simplified(&canonical).to_string_lossy();
+    if cfg!(windows) {
+        exact.replace('\\', "/")
+    } else {
+        exact.into_owned()
+    }
+}
+
+/// Obtain the same native-safe project ID production writes into a session
+/// descriptor. Mock daemons must not invent an arbitrary ID: hook discovery
+/// now requires the advertised ID and canonical root to describe one project.
+fn project_id_for_mock(root: &Path) -> String {
+    let scratch = TempDir::new().expect("project-id scratch tempdir");
+    let control = symforge::domain::ControlStateDir::new(scratch.path().to_path_buf());
+    symforge::sidecar::port_file::write_session_descriptor(&control, 0, None, Some(root), None)
+        .expect("write project-id probe descriptor");
+    let symforge_dir = symforge::sidecar::port_file::ensure_symforge_dir(&control)
+        .expect("resolve project-id probe directory");
+    let descriptor_path = std::fs::read_dir(symforge_dir.join("sessions"))
+        .expect("read project-id probe descriptors")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .expect("project-id probe descriptor exists");
+    let descriptor: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path).expect("read project-id probe descriptor"),
+    )
+    .expect("parse project-id probe descriptor");
+    descriptor["project_id"]
+        .as_str()
+        .expect("descriptor carries project_id")
+        .to_string()
 }
 
 fn assert_request_routes(requests: &[String], expected: &[&str], label: &str) {
@@ -1049,6 +1104,7 @@ fn serve_recording_descriptor_endpoint(
 fn serve_recording_daemon(
     listener: TcpListener,
     canonical_root: &str,
+    project_id: &str,
     sessions_json: &str,
     expected_session_id: &str,
 ) -> Vec<String> {
@@ -1085,11 +1141,12 @@ fn serve_recording_daemon(
 
         if route == "/v1/projects" {
             let body = format!(
-                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":2}}]"#,
+                r#"[{{"project_id":"{}","canonical_root":"{}","session_count":2}}]"#,
+                project_id,
                 canonical_root.replace('"', "\\\"")
             );
             write_http_ok(&mut stream, &body);
-        } else if route == "/v1/projects/mock-project/sessions" {
+        } else if route == format!("/v1/projects/{project_id}/sessions") {
             write_http_ok(&mut stream, sessions_json);
         } else if route == expected_enrichment_route {
             let body = format!(r#"{{"enriched":"{ENRICHED_MARKER}"}}"#);
@@ -1113,14 +1170,15 @@ fn serve_recording_daemon(
 /// `/sessions` list, then the `/v1/sessions/{id}/sidecar/outline` enrichment —
 /// routing by request-line path. Loops until the enrichment request is served
 /// or the listener is dropped.
-fn serve_mock_daemon(listener: TcpListener, canonical_root: &str) {
+fn serve_mock_daemon(listener: TcpListener, canonical_root: &str, project_id: &str) {
     let body = format!("{{\"enriched\":\"{ENRICHED_MARKER}\"}}");
-    serve_mock_daemon_with_enrichment(listener, canonical_root, "200 OK", &body);
+    serve_mock_daemon_with_enrichment(listener, canonical_root, project_id, "200 OK", &body);
 }
 
 fn serve_mock_daemon_with_enrichment(
     listener: TcpListener,
     canonical_root: &str,
+    project_id: &str,
     enrichment_status: &str,
     enrichment_body: &str,
 ) {
@@ -1154,11 +1212,16 @@ fn serve_mock_daemon_with_enrichment(
         let body: String = if route.starts_with("/v1/projects/") && route.contains("/sessions") {
             // Include a newer session whose active project no longer matches.
             // The hook must filter it out and route through `mock-session`.
-            r#"[{"session_id":"wrong-session","project_id":"other-project","last_seen_at_unix_secs":2},{"session_id":"mock-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#.to_string()
+            serde_json::json!([
+                {"session_id":"wrong-session","project_id":"other-project","last_seen_at_unix_secs":2},
+                {"session_id":"mock-session","project_id":project_id,"last_seen_at_unix_secs":1}
+            ])
+            .to_string()
         } else if route == "/v1/projects" {
             // Projects list — advertise our canonical root.
             format!(
-                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":1}}]"#,
+                r#"[{{"project_id":"{}","canonical_root":"{}","session_count":1}}]"#,
+                project_id,
                 canonical_root.replace('"', "\\\"")
             )
         } else if route == "/v1/sessions/mock-session/sidecar/outline"
@@ -1181,6 +1244,7 @@ fn serve_mock_daemon_with_enrichment(
 fn serve_initially_discovered_loading_daemon(
     listener: TcpListener,
     canonical_root: &str,
+    project_id: &str,
     enrichment_body: &str,
 ) -> Vec<String> {
     listener
@@ -1219,13 +1283,17 @@ fn serve_initially_discovered_loading_daemon(
 
         if route == "/v1/projects" {
             let body = format!(
-                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":1}}]"#,
+                r#"[{{"project_id":"{}","canonical_root":"{}","session_count":1}}]"#,
+                project_id,
                 canonical_root.replace('"', "\\\"")
             );
             write_http_ok(&mut stream, &body);
-        } else if route == "/v1/projects/mock-project/sessions" {
-            let body = r#"[{"session_id":"mock-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#;
-            write_http_ok(&mut stream, body);
+        } else if route == format!("/v1/projects/{project_id}/sessions") {
+            let body = serde_json::json!([
+                {"session_id":"mock-session","project_id":project_id,"last_seen_at_unix_secs":1}
+            ])
+            .to_string();
+            write_http_ok(&mut stream, &body);
         } else if route == "/v1/sessions/mock-session/sidecar/outline"
             && path.contains("caller_root=")
         {
@@ -1246,6 +1314,7 @@ fn serve_initially_discovered_loading_daemon(
 fn serve_descriptor_selected_loading_daemon(
     listener: TcpListener,
     canonical_root: &str,
+    project_id: &str,
     enrichment_body: &str,
 ) -> usize {
     listener
@@ -1285,13 +1354,17 @@ fn serve_descriptor_selected_loading_daemon(
             write_http_ok(&mut stream, health);
         } else if route == "/v1/projects" {
             let body = format!(
-                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":1}}]"#,
+                r#"[{{"project_id":"{}","canonical_root":"{}","session_count":1}}]"#,
+                project_id,
                 canonical_root.replace('"', "\\\"")
             );
             write_http_ok(&mut stream, &body);
         } else if route.starts_with("/v1/projects/") && route.contains("/sessions") {
-            let body = r#"[{"session_id":"mock-session","project_id":"mock-project","last_seen_at_unix_secs":1}]"#;
-            write_http_ok(&mut stream, body);
+            let body = serde_json::json!([
+                {"session_id":"mock-session","project_id":project_id,"last_seen_at_unix_secs":1}
+            ])
+            .to_string();
+            write_http_ok(&mut stream, &body);
         } else if route == "/v1/sessions/mock-session/sidecar/outline"
             && path.contains("caller_root=")
         {

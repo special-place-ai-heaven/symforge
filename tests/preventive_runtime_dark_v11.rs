@@ -1,4 +1,4 @@
-//! Feature 020 V11, T051 — the call-edge proof for the dark Slice 3 runtime.
+//! Feature 020 V11, T051 — the reviewed darkness baseline and caller tripwires.
 //!
 //! `src/index_lifecycle/mod.rs` states the darkness property as CALL EDGES,
 //! not grep hits: no code outside that directory names an item in it; the
@@ -6,9 +6,17 @@
 //! prose mentions are not edges either. This file formalizes that paragraph
 //! into executing tests, per lane: the daemon, stdio, serve, embed,
 //! snapshot, observer, and mutation entry points are all `src/` production
-//! code, so one sweep over `src/` minus the dark directory covers every one
-//! of them — and the lane roots are asserted to EXIST so a moved file cannot
-//! make the claim vacuously true.
+//! code. The sweep reads every regular file below `src/`, not only `.rs`, and
+//! the root manifest's exact explicit lib/bin topology is pinned and confined
+//! canonically below that same root, so an extensionless or relocated Cargo
+//! target cannot escape it. The lane roots are also asserted to EXIST so a
+//! moved file cannot make the claim vacuously true. Rust name resolution is
+//! not reconstructed here. Instead, the reviewed baseline establishes that the two excluded
+//! implementation surfaces contain no pre-existing outward dispatch bridge;
+//! an exact source-set seal below makes any later trait, inherent-method,
+//! registration, or re-export bridge inside those surfaces fail, while the
+//! lexical sweeps keep direct outside callers diagnostic. This is reviewed
+//! baseline preservation, not a general compiler call-graph oracle.
 //!
 //! The rule is fail-closed and LEXER-FREE (C8 ruling, second arm; narrowed
 //! in round 6): a line mentioning a guarded surface passes only as an
@@ -37,15 +45,18 @@
 //! case-insensitively — against a verbatim allowlist a human judged
 //! doctest-free, binds each line's OCCURRENCE COUNT plus the total, the
 //! distinct set and the workflow-file count, pins the root Cargo config
-//! verbatim, and forbids any other config found by the bounded walk.
+//! verbatim, pins the production lib/bin topology, and forbids any other
+//! config found by the bounded walk.
 //! "Committable" here means visible to a normal `git add`; force-added
 //! ignored paths are outside the bound, like configs outside the repo.
 //! Round 16 corrected the walk's skip list: `.gitignore`'s `/target` is
 //! ROOT-ANCHORED, so a nested `target/` can be committable and is now
-//! WALKED; only the repo root's own `target`, `.git` (repository
-//! metadata), and `node_modules` (ignored at every depth) are skipped. The exact
-//! `/target` and `node_modules/` rules are pinned, and `git ls-files`
-//! must show no tracked path under a skipped directory. The round-15
+//! WALKED. `.git` metadata is never entered; root `target` and any
+//! `node_modules` are skipped only when `git check-ignore` confirms the
+//! directory is excluded, and a literal case-insensitive `git ls-files`
+//! pathspec must show no tracked path below it. The exact `/target` and
+//! `node_modules/` rules remain human-readable
+//! pins, while Git decides the effective normal-add boundary. The round-15
 //! claim that all three were skipped for one reason — "nothing placed
 //! there can be committed" — was false for `target`, and hid a
 //! committable config one directory from the round-14 exploit path. The
@@ -139,25 +150,164 @@
 //! directory without its token — including the COMPOUND of the two, a
 //! split invocation carrying a concat argument, which no single line of
 //! this scan can see — and any future spelling not enumerated here. The
-//! load-bearing darkness guarantee is NOT this tripwire — it is the
-//! inert-comment rule of the sweeps above, applied to every line that
-//! lives in `src/`.
+//! splice tripwire is therefore not the load-bearing mechanism by itself.
+//! Darkness is held by the reviewed whole-`src` seal. The narrower
+//! excluded-source seal and outside caller sweeps remain diagnostic tripwires:
+//! none of the three is a compiler-semantic call graph by itself.
 
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
+use std::fs::Metadata;
+use std::io;
 use std::path::{Path, PathBuf};
 
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-fn rust_files_under(root: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(root).expect("read src directory") {
-        let path = entry.expect("directory entry").path();
-        if path.is_dir() {
-            rust_files_under(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
+fn required_observation<T>(result: io::Result<T>, action: &str, path: &Path) -> T {
+    result.unwrap_or_else(|error| panic!("{action} {}: {error}", path.display()))
+}
+
+fn optional_observation<T>(result: io::Result<T>, action: &str, path: &Path) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => panic!("{action} {}: {error}", path.display()),
+    }
+}
+
+fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn reject_link_or_reparse(path: &Path, is_link_or_reparse: bool) {
+    assert!(
+        !is_link_or_reparse,
+        "refusing to follow link or reparse point {}",
+        path.display()
+    );
+}
+
+fn observed_metadata(path: &Path) -> Metadata {
+    let metadata = required_observation(
+        std::fs::symlink_metadata(path),
+        "read symlink metadata for",
+        path,
+    );
+    reject_link_or_reparse(
+        path,
+        metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata),
+    );
+    metadata
+}
+
+fn require_regular_non_link(path: &Path) -> Metadata {
+    let metadata = observed_metadata(path);
+    assert!(
+        metadata.is_file(),
+        "expected regular file at {}, found another node kind",
+        path.display()
+    );
+    metadata
+}
+
+fn read_children_sorted_from<I>(dir: &Path, observed: io::Result<I>) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = io::Result<PathBuf>>,
+{
+    let entries = required_observation(observed, "read directory", dir);
+    let mut children: Vec<PathBuf> = entries
+        .into_iter()
+        .map(|entry| required_observation(entry, "read entry below", dir))
+        .collect();
+    children.sort();
+    children
+}
+
+fn read_children_sorted(dir: &Path) -> Vec<PathBuf> {
+    let observed =
+        std::fs::read_dir(dir).map(|entries| entries.map(|entry| entry.map(|entry| entry.path())));
+    read_children_sorted_from(dir, observed)
+}
+
+fn enter_bounded_directory(dir: &Path, root_identity: &Path, visited: &mut BTreeSet<PathBuf>) {
+    let metadata = observed_metadata(dir);
+    assert!(metadata.is_dir(), "expected directory at {}", dir.display());
+    let identity = required_observation(
+        std::fs::canonicalize(dir),
+        "resolve directory identity for",
+        dir,
+    );
+    assert!(
+        identity.starts_with(root_identity),
+        "directory escaped walk root {}: {}",
+        root_identity.display(),
+        identity.display()
+    );
+    assert!(
+        visited.insert(identity.clone()),
+        "directory identity was visited twice (cycle or alias): {}",
+        identity.display()
+    );
+}
+
+fn source_files_under_bounded(
+    dir: &Path,
+    root_identity: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) {
+    enter_bounded_directory(dir, root_identity, visited);
+    for path in read_children_sorted(dir) {
+        let metadata = observed_metadata(&path);
+        if metadata.is_dir() {
+            source_files_under_bounded(&path, root_identity, visited, out);
+        } else if metadata.is_file() {
             out.push(path);
         }
     }
+}
+
+fn source_files_under(root: &Path, out: &mut Vec<PathBuf>) {
+    let root_identity = required_observation(
+        std::fs::canonicalize(root),
+        "resolve source-walk root identity for",
+        root,
+    );
+    let mut visited = BTreeSet::new();
+    source_files_under_bounded(root, &root_identity, &mut visited, out);
+    out.sort();
+}
+
+fn join_normalized_path_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    segments.into_iter().collect::<Vec<_>>().join("/")
+}
+
+fn normalized_relative_path(path: &Path) -> String {
+    join_normalized_path_segments(path.components().map(|component| {
+        match component {
+            std::path::Component::Normal(segment) => segment
+                .to_str()
+                .unwrap_or_else(|| panic!("source path is not UTF-8: {}", path.display())),
+            other => panic!(
+                "source path must be normalized and relative, found {other:?}: {}",
+                path.display()
+            ),
+        }
+    }))
 }
 
 /// The prose rule, made unarguable (C8 ruling's second arm: drop the
@@ -198,7 +348,7 @@ fn sweep(
 ) -> Sweep {
     let src = src_root();
     let mut files = Vec::new();
-    rust_files_under(&src, &mut files);
+    source_files_under(&src, &mut files);
     let mut result = Sweep {
         violations: Vec::new(),
         allowlisted_seen: Vec::new(),
@@ -213,11 +363,10 @@ fn sweep(
         }
         result.files_scanned += 1;
         let text = std::fs::read_to_string(file).expect("read source file");
-        let display = file
-            .strip_prefix(src.parent().expect("src has a parent"))
-            .expect("file under repo")
-            .to_string_lossy()
-            .replace('\\', "/");
+        let display = normalized_relative_path(
+            file.strip_prefix(src.parent().expect("src has a parent"))
+                .expect("file under repo"),
+        );
         for (number, line) in text.lines().enumerate() {
             // Bidi marks are flagged before ANY exemption. Round 12 caught
             // the file claiming they are "flagged OUTRIGHT" while the prose
@@ -623,6 +772,160 @@ fn source_splicing_is_allowlisted() {
     );
 }
 
+/// Every Rust source file excluded from one of the two caller sweeps above.
+/// The reviewed baseline at the Round-3 repair contains no impl on a type
+/// defined outside this set, no outward alias/re-export, and no registration or
+/// exported-ABI hook. This narrow seal diagnoses semantic drift inside the dark
+/// implementation set; the whole-source seal below also catches an outside
+/// alias/macro bridge that preserves the allowlisted mount spelling. Neither is
+/// a Rust name resolver or an adversary-resistant security boundary.
+const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
+    "index_lifecycle/adapters.rs",
+    "index_lifecycle/authority.rs",
+    "index_lifecycle/capacity.rs",
+    "index_lifecycle/embedded.rs",
+    "index_lifecycle/mod.rs",
+    "index_lifecycle/mutation.rs",
+    "index_lifecycle/physical_root.rs",
+    "index_lifecycle/process_runtime.rs",
+    "index_lifecycle/public_api.rs",
+    "index_lifecycle/registry.rs",
+    "index_lifecycle/runtime.rs",
+    "index_lifecycle/transition.rs",
+    "server_api.rs",
+];
+const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
+const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
+    "09b51bdbe46837b860a7144387a643b5de4fbd2428fce4bc9ff651036aa6ebca",
+    13,
+    205_026,
+);
+const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
+const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
+    "8cf143e41d269ab4e0fcf1c48e09c4323d7ebc74020f3eb24e8b4d45cdc9c2cb",
+    187,
+    8_968_263,
+);
+
+fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    normalized
+}
+
+fn normalized_source_records(src: &Path, files: Vec<PathBuf>) -> Vec<(String, Vec<u8>)> {
+    let mut records: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|path| {
+            let relative = path.strip_prefix(src).unwrap_or_else(|_| {
+                panic!(
+                    "sealed source escaped src root {}: {}",
+                    src.display(),
+                    path.display()
+                )
+            });
+            let relative = normalized_relative_path(relative);
+            let bytes = required_observation(std::fs::read(&path), "read sealed source", &path);
+            (relative, crlf_to_lf(&bytes))
+        })
+        .collect();
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    for pair in records.windows(2) {
+        assert_ne!(
+            pair[0].0, pair[1].0,
+            "two source paths collapsed to one normalized record: {}",
+            pair[0].0
+        );
+    }
+    records
+}
+
+fn source_set_fingerprint(domain: &[u8], records: &[(String, Vec<u8>)]) -> (String, usize, usize) {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update((records.len() as u64).to_le_bytes());
+    let mut normalized_bytes = 0usize;
+    for (path, content) in records {
+        hash.update((path.len() as u64).to_le_bytes());
+        hash.update(path.as_bytes());
+        hash.update((content.len() as u64).to_le_bytes());
+        hash.update(content);
+        normalized_bytes += content.len();
+    }
+    let mut digest = String::with_capacity(64);
+    for byte in hash.finalize() {
+        write!(&mut digest, "{byte:02x}").expect("write SHA-256 hex");
+    }
+    (digest, records.len(), normalized_bytes)
+}
+
+#[test]
+fn excluded_runtime_source_set_matches_reviewed_baseline() {
+    let src = src_root();
+    let mut files = Vec::new();
+    source_files_under(&src.join("index_lifecycle"), &mut files);
+    let server_api = src.join("server_api.rs");
+    require_regular_non_link(&server_api);
+    files.push(server_api);
+
+    let records = normalized_source_records(&src, files);
+
+    let observed_paths: Vec<&str> = records.iter().map(|(path, _)| path.as_str()).collect();
+    assert_eq!(
+        observed_paths, EXCLUDED_RUNTIME_SOURCE_PATHS,
+        "the excluded runtime source set changed; inspect the addition, removal, or rename \
+         before updating both the path set and its reviewed semantic baseline"
+    );
+
+    let (digest, file_count, normalized_bytes) =
+        source_set_fingerprint(EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1, &records);
+    assert_eq!(
+        (digest.as_str(), file_count, normalized_bytes),
+        EXCLUDED_RUNTIME_SOURCE_PIN_V1,
+        "an excluded runtime source changed. Direct callers may still be absent while a \
+         trait, inherent-method, registration, or re-export bridge creates a semantic edge; \
+         review the complete excluded-source diff before updating this pin"
+    );
+}
+
+/// Freeze every regular in-tree source candidate reviewed for T051. The
+/// lexical sweeps explain direct edges and the narrow seal explains dark-side
+/// semantic drift; this broader change detector also catches zero-token
+/// aliases, macro bridges, and arbitrary Cargo target files outside the dark
+/// implementation set. Updating it requires re-reviewing the complete `src/`
+/// diff. Generated `OUT_DIR`, proc-macro, dependency, and external-consumer
+/// source remain outside this in-repository claim.
+#[test]
+fn full_source_set_matches_reviewed_darkness_baseline() {
+    assert_ne!(
+        join_normalized_path_segments(["a", "b.rs"]),
+        join_normalized_path_segments([r"a\b.rs"]),
+        "a literal backslash filename must not collide with a nested path record"
+    );
+    let src = src_root();
+    let mut files = Vec::new();
+    source_files_under(&src, &mut files);
+    let records = normalized_source_records(&src, files);
+    let (digest, file_count, normalized_bytes) =
+        source_set_fingerprint(FULL_SOURCE_DOMAIN_V1, &records);
+    assert_eq!(
+        (digest.as_str(), file_count, normalized_bytes),
+        FULL_SOURCE_PIN_V1,
+        "an in-tree source candidate changed. Re-review the complete src diff for a new direct, \
+         aliased, macro-generated, trait, inherent-method, registration, or re-export bridge \
+         before updating this pin"
+    );
+}
+
 /// Each CI workflow's whole-file fingerprint, `<fnv1a-64>:<bytes>` over
 /// LF-normalized content. Round 14's backstop: the checks below read
 /// lines, CI executes YAML scalars, and that seam leaked twice — so no
@@ -753,6 +1056,513 @@ const CARGO_LINES: &[(&str, usize)] = &[
 /// a later negation or other semantic drift elsewhere in the file.
 const CARGO_CONFIG_SKIP_GITIGNORE_LINES: &[&str] = &["/target", "node_modules/"];
 const GITIGNORE_FINGERPRINT: &str = "46fa5caf712e6b65:692";
+const PRODUCTION_TARGET_TOPOLOGY: &[(&str, &str)] =
+    &[("lib", "src/lib.rs"), ("bin:symforge", "src/main.rs")];
+
+fn production_target_topology(manifest: &str) -> Vec<(String, String)> {
+    let document = manifest
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_else(|_| panic!("parse root Cargo.toml for production-target topology"));
+    let library = document
+        .get("lib")
+        .and_then(toml_edit::Item::as_table)
+        .unwrap_or_else(|| panic!("root Cargo.toml must keep an explicit [lib] table"));
+    let library_path = library
+        .get("path")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_else(|| panic!("root Cargo.toml [lib] must keep an explicit string path"));
+    let mut targets = vec![("lib".to_string(), library_path.to_string())];
+
+    let binaries = document
+        .get("bin")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .unwrap_or_else(|| panic!("root Cargo.toml must keep explicit [[bin]] tables"));
+    for binary in binaries {
+        let name = binary
+            .get("name")
+            .and_then(toml_edit::Item::as_str)
+            .unwrap_or_else(|| panic!("each root [[bin]] must keep an explicit string name"));
+        let path = binary
+            .get("path")
+            .and_then(toml_edit::Item::as_str)
+            .unwrap_or_else(|| panic!("each root [[bin]] must keep an explicit string path"));
+        targets.push((format!("bin:{name}"), path.to_string()));
+    }
+    targets
+}
+
+fn require_production_targets_beneath_src(repo: &Path, manifest: &str) {
+    let targets = production_target_topology(manifest);
+    let expected: Vec<(String, String)> = PRODUCTION_TARGET_TOPOLOGY
+        .iter()
+        .map(|(kind, path)| ((*kind).to_string(), (*path).to_string()))
+        .collect();
+    assert!(
+        targets == expected,
+        "root Cargo.toml production lib/bin target topology changed; inspect every target before \
+         updating PRODUCTION_TARGET_TOPOLOGY"
+    );
+
+    let src = repo.join("src");
+    let src_identity = required_observation(
+        std::fs::canonicalize(&src),
+        "resolve production source root identity for",
+        &src,
+    );
+    for (_, relative) in targets {
+        let target = repo.join(relative);
+        require_regular_non_link(&target);
+        let identity = required_observation(
+            std::fs::canonicalize(&target),
+            "resolve production target identity for",
+            &target,
+        );
+        assert!(
+            identity.starts_with(&src_identity),
+            "production target escaped source sweep root {}: {}",
+            src_identity.display(),
+            identity.display()
+        );
+    }
+}
+
+#[derive(Debug)]
+struct CargoConfigObservation {
+    logical_path: PathBuf,
+    identity: PathBuf,
+}
+
+fn ascii_component_candidate(path: &Path, expected: &str) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn filesystem_aliases_component(path: &Path, parent: &Path, expected: &str) -> bool {
+    if !ascii_component_candidate(path, expected) {
+        return false;
+    }
+    let observed_identity = required_observation(
+        std::fs::canonicalize(path),
+        "resolve observed directory identity for",
+        path,
+    );
+    let expected_path = parent.join(expected);
+    let Some(expected_identity) = optional_observation(
+        std::fs::canonicalize(&expected_path),
+        "resolve expected directory identity for",
+        &expected_path,
+    ) else {
+        return false;
+    };
+    observed_identity == expected_identity
+}
+
+fn git_ignore_decision(code: Option<i32>, path: &Path) -> bool {
+    match code {
+        Some(0) => true,
+        Some(1) => false,
+        other => panic!(
+            "`git check-ignore` failed for {} with status {other:?}",
+            path.display()
+        ),
+    }
+}
+
+fn git_stdin_path_record(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    let path_bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let path_bytes = {
+        let mut encoded = Vec::new();
+        for component in path.components() {
+            let std::path::Component::Normal(component) = component else {
+                panic!(
+                    "Git stdin path must be a normalized relative path: {}",
+                    path.display()
+                );
+            };
+            if !encoded.is_empty() {
+                encoded.push(b'/');
+            }
+            let component = component.to_str().unwrap_or_else(|| {
+                panic!(
+                    "Git for Windows cannot observe a non-Unicode path component below {}",
+                    path.display()
+                )
+            });
+            encoded.extend_from_slice(component.as_bytes());
+        }
+        encoded
+    };
+    #[cfg(not(any(unix, windows)))]
+    let path_bytes = path
+        .to_str()
+        .unwrap_or_else(|| panic!("Git cannot observe non-Unicode path {}", path.display()))
+        .as_bytes()
+        .to_vec();
+    assert!(!path_bytes.is_empty(), "Git stdin path cannot be empty");
+    // `check-ignore --stdin` treats records as pathnames except that a leading
+    // `:` still activates pathspec magic. A lexical `./` keeps the same
+    // repository-relative pathname while making that first byte unambiguous.
+    let mut record = b"./".to_vec();
+    record.extend_from_slice(&path_bytes);
+    record.push(b'\0');
+    record
+}
+
+fn git_check_ignore(repo: &Path, relative: &Path) -> bool {
+    let mut child = symforge::process_util::hidden_command("git")
+        .args(["check-ignore", "--no-index", "--stdin", "-z"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| {
+            panic!(
+                "run `git check-ignore --stdin` for {}: {error}",
+                relative.display()
+            )
+        });
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("piped git check-ignore stdin must exist");
+        std::io::Write::write_all(&mut stdin, &git_stdin_path_record(relative)).unwrap_or_else(
+            |error| {
+                panic!(
+                    "write `git check-ignore --stdin` path {}: {error}",
+                    relative.display()
+                )
+            },
+        );
+    }
+    let status = child.wait().unwrap_or_else(|error| {
+        panic!(
+            "wait for `git check-ignore --stdin` on {}: {error}",
+            relative.display()
+        )
+    });
+    git_ignore_decision(status.code(), relative)
+}
+
+fn require_no_tracked_output(path: &Path, stdout: &[u8]) {
+    let records = stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+        .count();
+    assert_eq!(
+        records,
+        0,
+        "{records} tracked path(s) exist below ignored directory {}; an \
+         ignored-after-tracking config could hide there",
+        path.display()
+    );
+}
+
+fn literal_icase_pathspec(path: &Path) -> OsString {
+    let mut pathspec = OsString::from(":(literal,icase)");
+    pathspec.push(path.as_os_str());
+    pathspec
+}
+
+fn should_skip_ignored_dir(repo: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(repo).unwrap_or_else(|_| {
+        panic!(
+            "skip candidate escaped repository {}: {}",
+            repo.display(),
+            path.display()
+        )
+    });
+    assert!(
+        !relative.as_os_str().is_empty(),
+        "repository root cannot be a skip candidate"
+    );
+    if !git_check_ignore(repo, relative) {
+        return false;
+    }
+
+    let tracked = symforge::process_util::hidden_command("git")
+        .args(["ls-files", "-z", "--"])
+        .arg(literal_icase_pathspec(relative))
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|error| panic!("run `git ls-files` below {}: {error}", relative.display()));
+    assert!(
+        tracked.status.success(),
+        "`git ls-files` failed below {} with status {:?}",
+        relative.display(),
+        tracked.status.code()
+    );
+    require_no_tracked_output(relative, &tracked.stdout);
+    true
+}
+
+fn optional_regular_config(path: &Path) -> Option<CargoConfigObservation> {
+    let metadata = optional_observation(
+        std::fs::symlink_metadata(path),
+        "read optional Cargo-config metadata for",
+        path,
+    )?;
+    reject_link_or_reparse(
+        path,
+        metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata),
+    );
+    assert!(
+        metadata.is_file(),
+        "Cargo config candidate is not a regular file: {}",
+        path.display()
+    );
+    let identity = required_observation(
+        std::fs::canonicalize(path),
+        "resolve Cargo-config identity for",
+        path,
+    );
+    Some(CargoConfigObservation {
+        logical_path: path.to_path_buf(),
+        identity,
+    })
+}
+
+fn cargo_configs_under(
+    dir: &Path,
+    repo: &Path,
+    repo_identity: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    found: &mut Vec<CargoConfigObservation>,
+) {
+    enter_bounded_directory(dir, repo_identity, visited);
+    for path in read_children_sorted(dir) {
+        let metadata = observed_metadata(&path);
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        if filesystem_aliases_component(&path, dir, ".git") {
+            continue;
+        }
+        let skip_candidate = ascii_component_candidate(&path, "node_modules")
+            || (dir == repo && ascii_component_candidate(&path, "target"));
+        if skip_candidate && should_skip_ignored_dir(repo, &path) {
+            continue;
+        }
+
+        if filesystem_aliases_component(&path, dir, ".cargo") {
+            let logical_cargo = dir.join(".cargo");
+            for candidate in ["config.toml", "config"] {
+                if let Some(config) = optional_regular_config(&logical_cargo.join(candidate)) {
+                    found.push(config);
+                }
+            }
+            continue;
+        }
+        cargo_configs_under(&path, repo, repo_identity, visited, found);
+    }
+}
+
+fn partition_root_config(
+    mut configs: Vec<CargoConfigObservation>,
+    root_identity: &Path,
+) -> Vec<PathBuf> {
+    configs.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
+    let root_count = configs
+        .iter()
+        .filter(|config| config.identity == root_identity)
+        .count();
+    assert_eq!(
+        root_count, 1,
+        "the pinned root Cargo config was discovered {root_count} times; exactly one \
+         physical observation is required before the stray check can be trusted"
+    );
+    configs
+        .into_iter()
+        .filter(|config| config.identity != root_identity)
+        .map(|config| config.logical_path)
+        .collect()
+}
+
+#[test]
+fn walk_observation_seams_fail_closed_and_controls_pass() {
+    let synthetic = Path::new("synthetic-walk-node");
+    let sorted = read_children_sorted_from(
+        synthetic,
+        Ok(vec![Ok(PathBuf::from("z")), Ok(PathBuf::from("a"))]),
+    );
+    assert_eq!(sorted, [PathBuf::from("a"), PathBuf::from("z")]);
+    let extensionless_root = tempfile::tempdir().expect("create extensionless source-walk control");
+    let extensionless = extensionless_root.path().join("production-target");
+    std::fs::write(&extensionless, b"fn main() {}\n")
+        .expect("write extensionless source-walk control");
+    let mut extensionless_scan = Vec::new();
+    source_files_under(extensionless_root.path(), &mut extensionless_scan);
+    assert_eq!(
+        extensionless_scan,
+        [extensionless],
+        "Cargo accepts extensionless explicit target paths, so every regular src file must be swept"
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            let read_error: io::Result<Vec<io::Result<PathBuf>>> =
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "read"));
+            read_children_sorted_from(synthetic, read_error)
+        })
+        .is_err(),
+        "a read-directory error must not become an empty successful walk"
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            let entry_error = Ok(vec![Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "entry",
+            ))]);
+            read_children_sorted_from(synthetic, entry_error)
+        })
+        .is_err(),
+        "a directory-entry error must not be flattened away"
+    );
+    assert_eq!(required_observation(Ok(7_u8), "observe", synthetic), 7);
+    assert!(
+        std::panic::catch_unwind(|| {
+            required_observation::<u8>(
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "metadata")),
+                "observe",
+                synthetic,
+            )
+        })
+        .is_err(),
+        "a required metadata or identity error must fail closed"
+    );
+    assert_eq!(
+        optional_observation(Ok(9_u8), "observe optional", synthetic),
+        Some(9)
+    );
+    assert_eq!(
+        optional_observation::<u8>(
+            Err(io::Error::new(io::ErrorKind::NotFound, "missing")),
+            "observe optional",
+            synthetic,
+        ),
+        None,
+        "NotFound is the sole accepted optional-config absence"
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            optional_observation::<u8>(
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "optional")),
+                "observe optional",
+                synthetic,
+            )
+        })
+        .is_err(),
+        "an optional-config error other than NotFound must fail closed"
+    );
+    reject_link_or_reparse(synthetic, false);
+    assert!(
+        std::panic::catch_unwind(|| reject_link_or_reparse(synthetic, true)).is_err(),
+        "a link or reparse point must never be followed"
+    );
+
+    let this_source = Path::new(file!());
+    assert!(require_regular_non_link(this_source).is_file());
+    assert!(
+        std::panic::catch_unwind(|| require_regular_non_link(Path::new("tests"))).is_err(),
+        "a directory cannot satisfy a regular-file pin"
+    );
+    let missing = Path::new("tests/__slice3_round3_missing_metadata_probe");
+    assert!(
+        !missing
+            .try_exists()
+            .expect("observe missing-path probe collision"),
+        "missing-path probe collided with the tree"
+    );
+    assert!(
+        std::panic::catch_unwind(|| observed_metadata(missing)).is_err(),
+        "a required metadata error must not become an absent node"
+    );
+
+    let tests = Path::new("tests");
+    let tests_identity = std::fs::canonicalize(tests).expect("resolve tests directory");
+    let mut visited = BTreeSet::new();
+    enter_bounded_directory(tests, &tests_identity, &mut visited);
+    assert_eq!(visited.len(), 1, "accepting directory enters once");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enter_bounded_directory(tests, &tests_identity, &mut visited)
+        }))
+        .is_err(),
+        "a repeated canonical directory identity must fail as an alias/cycle"
+    );
+    let src = Path::new("src");
+    assert!(
+        std::panic::catch_unwind(|| {
+            let mut outside_visited = BTreeSet::new();
+            enter_bounded_directory(src, &tests_identity, &mut outside_visited)
+        })
+        .is_err(),
+        "a canonical directory outside the walk root must fail confinement"
+    );
+}
+
+#[test]
+fn cargo_walk_policy_controls() {
+    let path = Path::new("execution/node_modules");
+    assert_eq!(
+        literal_icase_pathspec(Path::new("NODE_MODULES")),
+        OsString::from(":(literal,icase)NODE_MODULES")
+    );
+    let repo = src_root().parent().expect("src has a parent").to_path_buf();
+    assert!(git_check_ignore(&repo, Path::new("target")));
+    assert!(
+        !git_check_ignore(&repo, Path::new(":(top)target")),
+        "git-check-ignore stdin must treat pathspec magic bytes as a literal pathname"
+    );
+    let manifest_path = repo.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .expect("read manifest for production-target topology controls");
+    require_production_targets_beneath_src(&repo, &manifest);
+    let extra_target = format!(
+        "{manifest}\n[[bin]]\nname = \"outside-source-sweep\"\npath = \
+         \"execution/outside-source-sweep\"\n"
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            require_production_targets_beneath_src(&repo, &extra_target)
+        })
+        .is_err(),
+        "an added explicit production target must not escape topology review"
+    );
+    assert!(git_ignore_decision(Some(0), path));
+    assert!(!git_ignore_decision(Some(1), path));
+    assert!(
+        std::panic::catch_unwind(|| git_ignore_decision(Some(2), path)).is_err(),
+        "a git check-ignore execution error must fail closed"
+    );
+    assert!(
+        std::panic::catch_unwind(|| git_ignore_decision(None, path)).is_err(),
+        "a signalled git check-ignore process must fail closed"
+    );
+    require_no_tracked_output(path, b"");
+    assert!(
+        std::panic::catch_unwind(|| require_no_tracked_output(path, b"opaque-\xff\0")).is_err(),
+        "raw non-UTF-8 tracked output must be detected without decoding"
+    );
+
+    let root_identity = Path::new("root-config-identity");
+    assert!(
+        std::panic::catch_unwind(|| partition_root_config(Vec::new(), root_identity)).is_err(),
+        "zero discovered root configs must fail anti-vacuity"
+    );
+    let root = CargoConfigObservation {
+        logical_path: PathBuf::from(".cargo/config.toml"),
+        identity: root_identity.to_path_buf(),
+    };
+    assert!(partition_root_config(vec![root], root_identity).is_empty());
+}
 
 #[test]
 fn no_gate_builds_doctests() {
@@ -848,6 +1658,11 @@ fn no_gate_builds_doctests() {
         }
         format!("{hash:016x}:{}", normalized.len())
     }
+    let manifest_path = repo.join("Cargo.toml");
+    require_regular_non_link(&manifest_path);
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .expect("read root Cargo.toml for production-target topology");
+    require_production_targets_beneath_src(&repo, &manifest);
     let mut seen: Vec<String> = Vec::new();
     let mut offenders = Vec::new();
     let mut files = 0usize;
@@ -942,12 +1757,19 @@ fn no_gate_builds_doctests() {
     // `~/.cargo/config.toml`, `$CARGO_HOME`, or an ancestor directory of
     // the checkout. CI runners have none, and a `CARGO_ALIAS_*` env var
     // in a workflow would carry `cargo` in its name and be caught above.
-    let cargo_config = repo.join(".cargo").join("config.toml");
+    let cargo_dir = repo.join(".cargo");
+    let cargo_dir_metadata = observed_metadata(&cargo_dir);
+    assert!(
+        cargo_dir_metadata.is_dir(),
+        "expected Cargo config directory at {}",
+        cargo_dir.display()
+    );
+    let cargo_config = cargo_dir.join("config.toml");
+    require_regular_non_link(&cargo_config);
     let config = std::fs::read_to_string(&cargo_config)
         .expect("read .cargo/config.toml — the pin below cannot vouch for a file it did not read");
-    assert_eq!(
-        config.replace("\r\n", "\n"),
-        CARGO_CONFIG,
+    assert!(
+        config.replace("\r\n", "\n") == CARGO_CONFIG,
         "`.cargo/config.toml` differs from its pin. Any change here can \
          re-point an allowlisted gate line at a doctest-running command \
          without touching a workflow — read the diff and update this pin \
@@ -963,14 +1785,17 @@ fn no_gate_builds_doctests() {
          it exactly like config.toml, so it can carry an [alias] table this \
          pin does not cover — fold it into config.toml or pin it here"
     );
-    let gitignore = std::fs::read_to_string(repo.join(".gitignore"))
+    let gitignore_path = repo.join(".gitignore");
+    require_regular_non_link(&gitignore_path);
+    let gitignore = std::fs::read_to_string(&gitignore_path)
         .expect("read .gitignore — the directory-skip pin cannot vouch for unread rules");
     assert_eq!(
         fingerprint(&gitignore),
         GITIGNORE_FINGERPRINT,
         "`.gitignore` changed. Its `/target` and `node_modules/` rules justify \
-         directories this Cargo-config walk does not enter, so re-audit the \
-         skip boundary before updating GITIGNORE_FINGERPRINT"
+         candidate directories for omission, while `git check-ignore` decides \
+         whether each concrete directory is actually skippable. Re-audit both \
+         parts before updating GITIGNORE_FINGERPRINT"
     );
     let observed_skip_lines: Vec<&str> = gitignore
         .lines()
@@ -979,69 +1804,9 @@ fn no_gate_builds_doctests() {
     assert_eq!(
         observed_skip_lines.as_slice(),
         CARGO_CONFIG_SKIP_GITIGNORE_LINES,
-        "the exact `.gitignore` rules that justify skipping root `target` and every \
-         `node_modules` directory changed. Re-establish the normal-add visibility \
-         bound before updating CARGO_CONFIG_SKIP_GITIGNORE_LINES"
-    );
-    let tracked_output = symforge::process_util::hidden_command("git")
-        .args(["ls-files", "-z", "--"])
-        .current_dir(&repo)
-        .output()
-        .expect("run `git ls-files` for skipped-directory coverage");
-    assert!(
-        tracked_output.status.success(),
-        "`git ls-files` failed while checking skipped directories: {}",
-        String::from_utf8_lossy(&tracked_output.stderr)
-    );
-    let tracked_paths = String::from_utf8(tracked_output.stdout)
-        .expect("`git ls-files -z` returned a non-UTF-8 tracked path");
-    let ignore_case_output = symforge::process_util::hidden_command("git")
-        .args(["config", "--bool", "--default=false", "core.ignorecase"])
-        .current_dir(&repo)
-        .output()
-        .expect("read Git's case-sensitivity setting for directory-name comparisons");
-    assert!(
-        ignore_case_output.status.success(),
-        "`git config --bool --default=false core.ignorecase` failed: {}",
-        String::from_utf8_lossy(&ignore_case_output.stderr)
-    );
-    let git_ignores_case = String::from_utf8(ignore_case_output.stdout)
-        .expect("Git returned a non-UTF-8 core.ignorecase value")
-        .trim()
-        .parse::<bool>()
-        .expect("Git returned a non-boolean core.ignorecase value");
-    fn component_matches(actual: &str, expected: &str, ignore_case: bool) -> bool {
-        if ignore_case {
-            actual.eq_ignore_ascii_case(expected)
-        } else {
-            actual == expected
-        }
-    }
-    fn cargo_directory_matches(actual: &str, git_ignores_case: bool) -> bool {
-        // Cargo follows the filesystem: Windows folds even if core.ignorecase
-        // was manually misconfigured; other platforms follow the Git checkout.
-        component_matches(actual, ".cargo", cfg!(windows) || git_ignores_case)
-    }
-    let tracked_under_skips: Vec<&str> = tracked_paths
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .filter(|path| {
-            let components: Vec<&str> = path.split('/').collect();
-            components
-                .first()
-                .is_some_and(|part| component_matches(part, "target", git_ignores_case))
-                || components.iter().any(|part| {
-                    component_matches(part, ".git", git_ignores_case)
-                        || component_matches(part, "node_modules", git_ignores_case)
-                })
-        })
-        .collect();
-    assert!(
-        tracked_under_skips.is_empty(),
-        "tracked paths exist below directories the Cargo-config walk skips. An \
-         ignored-after-tracking config could hide there; move or untrack these \
-         paths before relying on the skip:\n{}",
-        tracked_under_skips.join("\n")
+        "the exact `.gitignore` rules that nominate root `target` and \
+         `node_modules` as skip candidates changed. Git still decides each \
+         concrete directory's effective normal-add visibility"
     );
     // Round 14: cargo merges `.cargo/config.toml` from the CWD and every
     // ancestor, so a config one directory DOWN is honoured the moment a
@@ -1055,85 +1820,38 @@ fn no_gate_builds_doctests() {
     // not just the root one. It intentionally does not recurse inside a
     // `.cargo` directory: `.cargo/.cargo/config.toml` matters only if the outer
     // `.cargo` itself becomes the CWD, which the pinned workflows do not do.
-    fn cargo_configs_under(
-        dir: &Path,
-        repo: &Path,
-        git_ignores_case: bool,
-        found: &mut Vec<PathBuf>,
-    ) {
-        let entries = std::fs::read_dir(dir)
-            .unwrap_or_else(|error| panic!("read directory {}: {error}", dir.display()));
-        for entry in entries {
-            let entry =
-                entry.unwrap_or_else(|error| panic!("read entry below {}: {error}", dir.display()));
-            let path = entry.path();
-            let metadata = std::fs::metadata(&path)
-                .unwrap_or_else(|error| panic!("read metadata for {}: {error}", path.display()));
-            if !metadata.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            // Round 16: the skip is NOT uniform, and the round-15 comment
-            // claiming one reason for all three was false. `.gitignore:1`
-            // is `/target` — ROOT-ANCHORED — so only `<repo>/target` is
-            // ignored; `execution/target/.cargo/config.toml` is
-            // committable, and `git check-ignore` says so. (The repo's own
-            // `.gitignore:23 spacetime/*/target/` exists precisely because
-            // line 1 does not reach nested targets.) Skipping `target` at
-            // every depth therefore hid a committable config one directory
-            // from the round-14 exploit path.
-            //
-            // So: `.git` (never source) and `node_modules` (`.gitignore:22`
-            // is unanchored, ignored at every depth) are skipped anywhere;
-            // `target` is skipped ONLY as the repo root's own child, which
-            // is exactly what the gitignore rule covers and the one that is
-            // tens of gigabytes. A nested `target/` is WALKED, because it
-            // can be committed. If a gitignored nested target ever holds a
-            // config, this over-flags — safe friction, and a human decides.
-            if component_matches(&name, ".git", git_ignores_case)
-                || component_matches(&name, "node_modules", git_ignores_case)
-                || (component_matches(&name, "target", git_ignores_case) && dir == repo)
-            {
-                continue;
-            }
-            if cargo_directory_matches(&name, git_ignores_case) {
-                for candidate in ["config.toml", "config"] {
-                    let candidate = path.join(candidate);
-                    match std::fs::metadata(&candidate) {
-                        Ok(metadata) if metadata.is_file() => found.push(candidate),
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            panic!("read metadata for {}: {error}", candidate.display())
-                        }
-                    }
-                }
-                continue;
-            }
-            cargo_configs_under(&path, repo, git_ignores_case, found);
-        }
-    }
+    // Round 17: name comparisons are only candidate filters. Cargo follows
+    // the filesystem, so an ASCII-case variant counts as `.cargo` only when
+    // it resolves to the same directory as the parent's actual `.cargo`
+    // lookup. Git, not a home-grown ignore parser, decides whether root
+    // `target` or a concrete `node_modules` can be omitted. Before any such
+    // omission, raw `git ls-files -z` output under a literal, case-insensitive
+    // pathspec must be empty; it is never decoded, so an opaque Unix path cannot
+    // turn observation into failure. `git check-ignore` receives one NUL-framed
+    // pathname on stdin with a lexical `./`, not a pathspec-capable argv token.
+    // Descendant links and Windows reparse points are refused before they can
+    // escape the root or create a cycle, and traversal is sorted.
+    let repo_identity = required_observation(
+        std::fs::canonicalize(&repo),
+        "resolve Cargo-config walk root identity for",
+        &repo,
+    );
+    let root_config_identity = required_observation(
+        std::fs::canonicalize(&cargo_config),
+        "resolve pinned root Cargo-config identity for",
+        &cargo_config,
+    );
     let mut configs = Vec::new();
-    cargo_configs_under(&repo, &repo, git_ignores_case, &mut configs);
-    let stray: Vec<String> = configs
-        .iter()
-        .filter(|p| **p != cargo_config)
-        .map(|p| {
-            p.strip_prefix(&repo)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
+    let mut visited = BTreeSet::new();
+    cargo_configs_under(&repo, &repo, &repo_identity, &mut visited, &mut configs);
+    let stray = partition_root_config(configs, &root_config_identity);
     assert!(
         stray.is_empty(),
         "a cargo config lives somewhere other than the pinned repo root. \
          Cargo merges `.cargo/config.toml` from the working directory and \
          every ancestor, so a descendant config plus a `working-directory:` \
          on any gate re-points that gate — read these and pin them \
-         deliberately:\n{}",
-        stray.join("\n")
+         deliberately:\n{stray:#?}"
     );
     // The MULTISET binds, per line. Round 12: (total, distinct) is only a
     // bijection when the two are equal — at (30, 26) a compensated edit

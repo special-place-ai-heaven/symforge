@@ -1,22 +1,72 @@
 # Feature 020 Slice 3 evidence (T041–T052)
 
-## T052 — slice closure: gates and post-slice review (PR 4)
+## T052 — slice-closure gates and post-slice review (PR 4; in progress)
 
-Run-and-review only: no production code, no frozen-corpus edit, no Slice 4.
+T052 began as run-and-review. Post-Round-3 verification required two scoped
+production-honesty repairs in the already-shipped compact facade. First, its hidden
+A-019 relay is restricted to a source-mutation-safe measurement allowlist, and the
+real MCP seam preserves raw legacy text without fabricating a semantic result status
+or inferring `isError` from valid source bytes. Second, an explicit foreign-project
+selector is now either refused before any adapter-HOME early return or carried into
+every primitive dispatched by a healthy daemon. Adapter-local path containment,
+economics, co-change/fusion enrichment, root rendering, and project evidence may not
+be substituted for the selected project. A missing or mismatched daemon receipt is
+reported as unavailable and cleared from typed metadata, never relabeled as HOME.
 
-**Every observation below states its relationship to the current candidate.**
-VOID records an observation whose compiled source is unknown; the other labels
-name the source tree they actually observed:
+The same selector audit exposed three deterministic adjacent failures that could not
+be left behind an otherwise exact matrix. Relative `index_folder` paths were resolved
+once in the adapter and again in the persistent daemon's potentially different CWD;
+overlapping default opens could reverse the daemon ACTIVE and adapter mirror order;
+and selector-less ACTIVE tools could only reject a wrong receipt after already
+executing against a concurrently retargeted project. The repaired path forwards one
+canonical root, serializes daemon activation through its mirror and reconnect lane,
+and carries an adapter-authored private canonical pin for `inspect_match`,
+`checkpoint_now`, `detect_impact`, and `conventions` without widening their public
+schemas. `ask` now performs its local no-echo guard and then proxies the whole query so
+classification happens in the selected runtime. Local `analyze_file_impact` now uses
+the exact winning reindex publication for its text, co-change footer, and typed
+evidence rather than pairing the sidecar result with an entry snapshot.
 
-- **PRE-PATCH** — T050 green, overlay as first authored. `src/` is untouched by
-  every later PR 4 change, which remains confined to `tests/` and `docs/`.
+The tool-correctness harness is part of the same repair boundary: the relay remains
+raw-result-status-free, while mandatory successful-envelope anchors are enforced for
+every oracle case rather than being downgraded to human REVIEW. This is an explicit
+PR 4 scope exception because the exact T050 audit exposed an existing
+source-write-capable route behind a read-only facade, and the containment audit then
+exposed selector-dependent HOME leakage in that same facade. Preserving either
+behavior would knowingly preserve the defect. No frozen inventory member, authority
+assignment, or normative clause is amended; the designed preactivation source-census
+pins are regenerated below for the legitimately changed release code. V10 authority
+is unchanged, and no Slice 4 activation work is included.
+
+**Evidence-kind rule.** Every binding/current execution below names the tree or
+candidate it observed. Older observations whose exact tree did not survive are
+explicitly labeled unbound historical evidence and never satisfy a current gate.
+"Observed" applies only to commands and mutations directly witnessed on the
+named candidate. Source inspection, semantic
+classification, and adjudication are inferred from cited pinned bytes unless
+explicitly paired with an execution receipt. Reconstructed or source-unknown
+outcomes are historical only and never satisfy a gate.
+
+- **PRE-PATCH — unbound historical observation only** — T050 green, overlay as first authored. Through the immutable
+  Round-3 SHA, every later PR 4 change remained in `tests/` and `docs/`. The
+  initial post-Round-3 repair first changed `src/protocol/tools.rs` for the
+  scoped facade-relay safety repair; later selector, daemon, and impact repairs
+  widened the production-source diff recorded above.
 - **VOID** — observed, but not binding as a gate because its compiled source is
   unknown; the row says why.
-- **POST-PATCH (round 1)** — after the 29-assignment-row `Refused` fix.
-- **SUPERSEDED POST-ROUND-2** — the initial depth-aware `target` repair,
+- **POST-PATCH (round 1) — unbound historical observation only** — after the 29-assignment-row `Refused` fix.
+- **SUPERSEDED POST-ROUND-2 — unbound historical observation only** — the initial depth-aware `target` repair,
   observed directly but superseded by the follow-up hardening.
-- **ROUND-2 CANDIDATE** — after the case, traversal-error, and skip-proof
-  hardening that precedes round 3.
+- **SUPERSEDED ROUND-2 REVIEW CANDIDATE** — immutable review SHA
+  `606bbeb50ac11c781f9337a7109be290f8a93b08`, after the case,
+  traversal-error, and skip-proof hardening. Round 3 returned trustworthy
+  FINDINGS; later Rust-test repairs supersede its gate rows.
+- **POST-ROUND-3 REPAIR CANDIDATE** — the current uncommitted repair tree. Its
+  production source is frozen and its final source seal is observed below; the
+  non-closure commit identity and fresh review are still PENDING. No
+  observation made while the relevant bytes were moving can substitute for the
+  LF-normalized immutable-candidate gates or a fresh trustworthy CLEAN review;
+  T052 remains in progress.
 
 Live branch/PR/SHA state is deliberately NOT quoted here — run
 `pwsh scripts/campaign-state.ps1` for that; the SHAs that do appear are
@@ -49,20 +99,24 @@ INVERTED — the docs were read and the handler was not.
   the tool handler, so `write_policy` / `apply` / `durable_replace*` keep their
   sets.
 
-**Bases were rewritten, not concatenated.** A row asserting both "Refused is not
-sprayed on" and "Refused is a BODY fact" contradicts itself. The four rows that
-remain singleton (`conventions`, `context_inventory`, `inspect_match`,
-`symforge_retrieve`) now state the reason — no `project` parameter, or no
-selector-refusal call — instead of the retired wording. Downstream citations
-were corrected rather than left lagging: the six resource wrappers and the hooks
-now say they DROP `Refused` (`project: None` at `resources.rs:160+`; hook
-fail-open), the two `symforge` co-change citations were unswapped, `FindChanges`
-now cites `route_tool_name` (`smart_query.rs:613`) plus
-`src/stel/planner.rs:1203` and
-`tools.rs:839` rather than the display string at `smart_query.rs:575`, and the
-session `/health` and `/stats` twins cite the daemon handlers (`daemon.rs:4269`,
-`:4439`) rather than a router skip list that matches only the exact sidecar
-paths.
+**At the Round-1 candidate, bases were rewritten, not concatenated.** A row
+asserting both "Refused is not sprayed on" and "Refused is a BODY fact"
+contradicted itself. At that tree, `conventions`, `context_inventory`,
+`inspect_match`, and `symforge_retrieve` remained singleton, while the six
+generation-backed resource wrappers and the hooks dropped `Refused` using the
+then-current selector/fail-open reasoning. These are historical Round-1
+classifications, not the post-Round-3 truth; the semantic supersession is mapped
+below.
+
+The other Round-1 citation repairs remain historical facts: the two `symforge`
+co-change citations were unswapped; `FindChanges` was grounded in
+`route_tool_name`, `src/stel/planner.rs`, and the actual worktree lane; and the
+session `/health` and `/stats` twins were grounded in their daemon handlers.
+Round 3 identified the stale fusion-anchor call citation; the post-Round-3
+repair corrected it from `tools.rs:11029` to the then-current `tools.rs:11028`.
+Those are historical line locations only. Later facade edits moved the call
+again; the final activation bases cite the frozen production bytes rather than
+reusing either historical line number.
 
 None of this was visible to T050's green (see M63c below).
 
@@ -96,7 +150,7 @@ diff was discarded** — T052 does not mint a receipt — and
 |---|---|
 | `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` | 4 passed, 0 failed |
 | `cargo test --test runtime_dark_v11 -- --test-threads=1` | 11 passed, 0 failed |
-| `cargo test --no-default-features --features embed --lib -- --test-threads=1` (separate run) | **exit 0**, 1332 passed / 0 failed / 4 ignored. `--lib` builds the library target only and never compiles `tests/activation_cut_v11.rs`, so a tests-only overlay patch cannot change this result and it needs no re-run. |
+| `cargo test --no-default-features --features embed --lib -- --test-threads=1` (separate run) | **exit 0**, 1332 passed / 0 failed / 4 ignored. At this historical tests-only point, `--lib` did not compile `tests/activation_cut_v11.rs`, so that overlay patch did not create an embed rerun obligation. The later production facade repair does, and its fresh row appears in the current candidate gates. |
 
 **VOID — not the slice-level gate.**
 
@@ -128,7 +182,14 @@ A later second Terminal Commander daemon restart evicted that job record. Both
 daemon restarts are operational history, not Slice 3 residuals. The walk repair
 below supersedes this result, so it is not used as the candidate gate.
 
-**ROUND-2 CANDIDATE** — after the approved walk hardening.
+**SUPERSEDED ROUND-2 REVIEW CANDIDATE — review SHA
+`606bbeb50ac11c781f9337a7109be290f8a93b08`.**
+
+The table below records the last gates observed before PR 4 post-slice Round 3.
+It remains valid only as historical evidence for exactly that reviewed tree.
+Round 3 returned trustworthy FINDINGS, and subsequent Rust-test repairs changed
+the bytes under test; therefore none of these rows validates the post-Round-3
+repair candidate.
 
 | Command | Result |
 |---|---|
@@ -154,20 +215,153 @@ across the gate runs tabulated above no `E0786` / ICE / missing-crate signal
 appeared. No `cargo clean`.
 The four ignored T058 names are NOT execution evidence.
 
-The embed `--lib` row stays PRE-PATCH for the same reason it did after round 1:
-`--lib` builds the library target only, and all later PR 4 changes are confined
-to `tests/` and `docs/`.
+The embed `--lib` row remains historical evidence through the Round-3 SHA. The
+post-Round-3 facade, routing, and evidence repairs change release source, so the
+candidate owed a fresh embed `--lib` observation before its non-closure commit;
+that current-source observation is recorded below.
 
-`cargo build --release` is explicitly deferred to PR CI; it is not claimed as
-an observed local T052 gate.
+The earlier decision to defer `cargo build --release` to PR CI is superseded.
+This candidate changes production dispatch and the executable
+tool-correctness harness, so both debug and release binaries must run both
+fixture sets locally. PR CI remains corroboration, not a substitute for those
+observations.
+
+### Post-Round-3 immutable-candidate checklist — binding current status
+
+This is the binding checklist for the LF-normalized candidate. A row changes
+from PENDING only when directly observed on the frozen bytes; earlier focused
+observations remain useful historical guard evidence but cannot fill a current
+row. Results, hashes, counts, SHAs, and review disposition are recorded only
+from direct observations on the named bytes.
+
+| Required evidence | Binding command or observation | Current status |
+|---|---|---|
+| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `8cf143e41d269ab4e0fcf1c48e09c4323d7ebc74020f3eb24e8b4d45cdc9c2cb` / 187 files / 8,968,263 LF-normalized bytes. The final refresh includes the completed selector/path/daemon/idempotency/sidecar repair and its in-module controls; no `src/` byte changed after this receipt. Any later `src/` edit invalidates this row. |
+| Selector containment controls | Run the focused `daemon_facade_` controls, including foreign primitive routing, HOME-path/economics/fusion/co-change isolation, and the matching HOME controls. | **OBSERVED ON FROZEN SOURCE** — 12/0, `outcome_trust: observed`, job `job_01a0084917b375c097a9b78dd08b3fef`; the earlier removal/inversion mutation is recorded in the next row. |
+| Missing/mismatched project evidence | Run `daemon_facade_never_reuses_home_evidence_when_foreign_receipt_is_missing` and `daemon_facade_rejects_a_mismatched_foreign_project_receipt`; verify both rendered text and typed `_meta` refuse HOME substitution. | **OBSERVED ON FROZEN SOURCE** — both named tests are in the final 12/0 selector-family receipt above and pin body plus typed `_meta`. |
+| Selector containment mutation | Disable the one adapter-local-state containment decision, observe the selector controls fail semantically, restore exact bytes, and rerun the controls. | **OBSERVED** — forcing `may_use_local_project_state=true` made all 10 then-existing foreign-project controls RED (`job_01a006ed280070e0b3f9dbeb8670f222`); exact restoration restored 10/0 (`job_01a006edc5527e01b2d8b33246db2dc5`). The guard implementation did not change afterward, and the widened final family is 12/0 on frozen bytes (`job_01a0084917b375c097a9b78dd08b3fef`). |
+| Layered T051 controls | Run the direct lexical sweeps, the 13-file excluded-runtime diagnostic seal, and the load-bearing whole-`src/` seal together. | **OBSERVED ON FROZEN SOURCE** — `preventive_runtime_dark_v11` 8/0 with `outcome_trust: observed`, job `job_01a00825786a786382c99105d9a42ebb`; the adversarial macro/alias receipt is in the next row. |
+| Whole-source macro/alias mutation | Plant the reviewed outside alias/macro bridge: the lexical and narrow diagnostics may remain green, but the whole-source seal must fail; then restore exact bytes and rerun the whole seal. | **OBSERVED** — the mutant preserved the two allowlisted mount lines while exporting a spelling-free alias: all seven non-whole-source diagnostics stayed green (`job_01a006eb300772a3b3b254e724347561`), and only the exact whole-source seal RED (`job_01a006ebd9b372d1a1144990096519b8`). Exact restoration to `src/live_index/mod.rs` SHA-256 `500824888d3cac199e941869904c6fd9af300263ef540a6a2b49a946244dc3ad` restored 8/0 (`job_01a006ec1e9b7881ba17dcd2605fa848`). |
+| A-019 relay and real MCP seam | Rerun the allowlist, mutating-relay denial, result-status-free malformed/missing controls, and real `Error:`-prefixed source-wire control. | **OBSERVED ON FROZEN SOURCE** — policy 1/0 (`job_01a0084d369f7ad2bb5d352cc82d1ccb`), serial facade family 12/0 (`job_01a0084917b375c097a9b78dd08b3fef`), and real MCP seam 1/0 (`job_01a0084996247df380e52216233f0812`). The earlier envelope-removal mutation made all four synthetic oracle cases RED at the intended terminal guard (`job_01a006ef244b7bd1a76d6376132e40ab`); the final comparator self-test is PASS and final script SHA-256 is `c99ff591d88a1b9875e0927ab5287cb60d0a0661dd072c7e292d429404744c68`. |
+| Overlay exactness | `cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact` on the final overlay and citation bytes. | **OBSERVED** — 1/0, `job_01a00848e53770119dca889c0356ddd0`. |
+| Focused dark/public suites | `preventive_runtime_dark_v11`, `runtime_dark_v11`, and `public_api_delta_v11`, each serially on the final candidate. | **OBSERVED** — preventive 8/0 (`job_01a00825786a786382c99105d9a42ebb`), runtime-dark 11/0 (`job_01a00848f5a57350a094e859222cdf90`), and public API 2/0 (`job_01a0084906447240b36abd60831a6d76`). |
+| Formatting and lint | `cargo fmt --check`, `git diff --check`, lifecycle traceability, and `cargo clippy --all-targets -- -D warnings`. | **OBSERVED** — final-source fmt clean (`job_01a008488c8e7a11b7aad780d0b5368c`), clippy clean with denied warnings (`job_01a0084807b376839da5bc616eb1cfda`), worktree and cached diff checks clean, all 34 candidate paths report `w/lf`, verify-tools syntax/self-test are clean, and lifecycle traceability is OK at 78 requirements / 24 acceptance oracles / 13 retirement categories. |
+| Embed feature | `cargo test --no-default-features --features embed --lib -- --test-threads=1`. | **OBSERVED** — 1,333 passed / 0 failed / 4 ignored, `outcome_trust: observed`, job `job_01a00849d4af7b419d77f4f40aa3e95f`. |
+| Debug binary + both harness fixtures | Build the debug `symforge` binary, then run `scripts/verify-tools.cjs` once with `verify-tools` and once with `verify-tools-real`. | **OBSERVED** — debug build exit 0 (`job_01a00826729d7f0297ac9ae2a2b3b8cd`); `target/debug/symforge.exe` synthetic fixture 7 PASS / 1 REVIEW / 0 FAIL (`job_01a008269377743084416d59f49e640b`) and real fixture 10/1/0 (`job_01a00826d2957731a00f9dfa2d55e3c1`), all with `outcome_trust: observed`. The two REVIEW dispositions are adjudicated below. |
+| Release binary + both harness fixtures | `cargo build --release --bin symforge`, then run the same two harness fixtures against that exact release binary. | **OBSERVED** — release build exit 0 in 281,920 ms (`job_01a0082702827491b9b38a8095d94f7f`); `target/release/symforge.exe` synthetic fixture 7 PASS / 1 REVIEW / 0 FAIL (`job_01a0082b8a47797396797080c413d5c1`) and real fixture 10/1/0 (`job_01a0082bb5db71a2b613e4766a9524ae`), all with `outcome_trust: observed`. This was observed locally, not deferred to CI. |
+| Full suite | `cargo test --all-targets -- --test-threads=1` with a live `outcome_trust: observed` receipt on the final candidate. | **OBSERVED** — exit 0 with `outcome_trust: observed` in 420,660 ms (`job_01a008411c3b7c92be67858bc9d3820e`); the main library target reported 3,215 passed / 0 failed / 5 ignored and every integration target completed cleanly. |
+| Non-closure commit | Commit the complete repaired candidate with a non-closure subject after all rows above are green. | **PENDING** — no SHA or subject is invented here. |
+| Fresh PR 4 review | Review one immutable committed full PR 4 range with no concurrent edits; adjudicate every substantive note. | **PENDING** — T052 needs a trustworthy CLEAN disposition. |
+| Evidence/ledger closure commit | Only after a trustworthy CLEAN review, record its archive and final receipts in a separate evidence/ledger commit. | **PENDING** |
+
+The final gate sequence retained its RED diagnostics rather than hiding them.
+The first final library run exposed five sidecar fixtures that still wrote
+identity-free legacy state after root-scoped descriptor admission became
+mandatory; binding those fixtures to the expected root restored the focused
+sidecar family to 139/0 and the library to 3,215/0/5. The next all-target run
+exposed nine hook-subprocess mocks advertising an arbitrary project id instead
+of the id derived from their canonical fixture root; the corrected mocks passed
+18/0. The following run exposed one latency fixture that omitted its descriptor
+root and therefore measured the intentional 500 ms daemon fallback deadline;
+an identity-bound descriptor restored the focused latency control to 1/0 in
+40 ms. The complete rerun above is the binding green receipt. The last two
+repairs are integration-test-only and do not alter either built binary; the
+in-module sidecar/tool fixture edits are included in the final whole-source seal.
+
+Both harness REVIEW results are expected, human-adjudicated unit differences,
+not failures. `refs-verify_token` asks a reference index to match raw grep;
+grep's three lines include the definition and prose while the tool returns the
+actual `require_bearer` call site, so 7/1/0 is the honest synthetic result.
+`text-StelRequest` compares ten raw grep lines with `search_text`'s default
+five-matches-per-file rendering cap; the required term and source file are
+present, so 10/1/0 is the honest real-fixture result. Debug and release agree
+exactly on both dispositions.
+
+Principal frozen-byte SHA-256 values at final observation are
+`tools.rs=ae4c374b29eda7d170901e8608ab1733e3133621351602e939dfb5e5562c045d`,
+`protocol/mod.rs=22ba17513dae25348f7c5f0c18f209e186f7cf1c6108c860ee6662456502e4d4`,
+`daemon.rs=eb819103ea48d98a70913d5c5544a1c28fdeebf8acd8937fa69937f35e06111a`,
+`activation_cut_v11.rs=9495ea9a6306aada36f41378268b02c870e18f0055405b283719cc26ba2833d0`,
+`preventive_runtime_dark_v11.rs=fd3e983dfb10b8525ba675e4a2689834a2ab93e2207c83a9f1d8071b4769e734`,
+and `verify-tools.cjs=c99ff591d88a1b9875e0927ab5287cb60d0a0661dd072c7e292d429404744c68`.
+Terminal Commander directly observed the final selector family at 12/0, overlay
+at 1/0, runtime-dark at 11/0, public API at 2/0, preventive suite at 8/0, and
+the real MCP seam at 1/0 in the binding rows above.
+
+These observations establish the named controls only. The final mutation and
+candidate-gate receipts are recorded in the binding checklist; none substitutes
+for the immutable non-closure commit and fresh review.
+
+#### Deliberate preactivation source-census regeneration
+
+The first frozen-candidate traceability run failed exactly four closure categories:
+`cache`, `callbacks`, `publication_roots`, and `writers`. This was not an unplanned
+inventory change. PR 4 legitimately changes release code in `daemon.rs`,
+`protocol/mod.rs`, `protocol/edit.rs`, and `protocol/tools.rs`; those paths are owned
+by exactly those four category closures. The opt-in emitter reproduced that exact
+four-category set while `ccr` stayed byte-identical. The designed regeneration
+procedure then updated:
+
+| Pin | Before | After |
+|---|---|---|
+| `cache` closure | `6fb4cace44005ceb8019730721950c55a904fb1178da83e9782ffe21614fa095` | `760c5da2d416d7e654ef1adc32a126143f1f404608d05e4a31ef84a6c7a0ebb0` |
+| `callbacks` closure | `026c548ba79c43b0e48ee1f1c4f87da9fd614d608615a41c059966f7a9fe577b` | `f0dd5624ff538db95b023a23bd02e163c3e10880fe9cd16519208a103f65eaa5` |
+| `publication_roots` closure | `b90b8d8862519ac8451ca459288157759298135b5fbb8b9ea326e48755190b54` | `555e5219eee5668808ca81adadecf42e25e8fbe4f3f245e69db2a857e53826a5` |
+| `writers` closure | `565e42273f56e3ac467fa09b13bceec9d3e6103695e49cc2f64abf47cfbf3e31` | `f2a177769a0828f3e09706d32fea4aee3dc58a84dbb8eb69e3f41556c04115a0` |
+| second-order `retirement_records` | `d86bd17b3e6ce2cddf86e2755433fe9dc0b5ed91467ad805fc634be1bbe5ce29` | `e86162d5671e18c5bc6a8673980e5908c63383dac27715ed953a831bf6b40eea` |
+| raw contract hash in the refreeze manifest | `b351235786073dc02a1684f7209c9456a84b20a9a8198cfcbf2001ab847bfef2` | `70db78519fa9fbebc35612ab9e4609397dd49c32308ea5a1983f765fe3ec3a4a` |
+
+The final all-target run then exposed the Windows health-root spelling mismatch.
+Its 94-byte `tools.rs` repair touched only the already-owned `writers` census.
+The same opt-in regeneration procedure produced this final chain; every other
+closure remained byte-identical:
+
+| Pin | Pre-health-fix value | Final value |
+|---|---|---|
+| `writers` closure | `f2a177769a0828f3e09706d32fea4aee3dc58a84dbb8eb69e3f41556c04115a0` | `22fa98fd6ef5dbb72f3088039f4a07111e1fcb8beb5ffefb787d6b71b61b7b36` |
+| second-order `retirement_records` | `e86162d5671e18c5bc6a8673980e5908c63383dac27715ed953a831bf6b40eea` | `d5b0003cd8e7150417495f89ef46a901bdd392a8287f211fae15b6fcc1758464` |
+| raw contract hash in the refreeze manifest | `70db78519fa9fbebc35612ab9e4609397dd49c32308ea5a1983f765fe3ec3a4a` | `f02ff61105f1f5ad1dce29e2a9c36e50dd4d5465ff5b48dd9440059059272d83` |
+
+At that health-fix stage the `ccr` closure remained
+`8ad77748b8fd9e6eb31853cc9615730fc632a890898321deb915546e384ad246`.
+The emitter observation was job `job_01a006c9ed6e7972aae089b26e152440`.
+
+The later selector/path/daemon/idempotency/sidecar repair widened the legitimate
+release-source census again. After production source quiesced, one final emitter
+run and manifest refresh produced this cumulative chain from the previously
+documented health-fix values:
+
+| Pin | Previous documented value | Final candidate value |
+|---|---|---|
+| `cache` closure | `760c5da2d416d7e654ef1adc32a126143f1f404608d05e4a31ef84a6c7a0ebb0` | `112eeb2b9a7712d97a311aa483ba0ca74f64e51ab277e83ebce682415622c79b` |
+| `callbacks` closure | `f0dd5624ff538db95b023a23bd02e163c3e10880fe9cd16519208a103f65eaa5` | `61161d04fa4189c6d2cf2a456655582b468a3c6d071046f956b8a7f3426928e8` |
+| `publication_roots` closure | `555e5219eee5668808ca81adadecf42e25e8fbe4f3f245e69db2a857e53826a5` | `379565fc39ae363ce880b8a9601193b56096041bc1d8241ca26c6cb95a4b1749` |
+| `writers` closure | `22fa98fd6ef5dbb72f3088039f4a07111e1fcb8beb5ffefb787d6b71b61b7b36` | `3ee16991d9c6900f8921e45fd56f604c314f1752765ef389b9f30db73581d256` |
+| `ccr` closure | `8ad77748b8fd9e6eb31853cc9615730fc632a890898321deb915546e384ad246` | `2f7cc4b3223e192fd7bb1aa4d145813100b07b438409590b63adeb6b4e6c4ebe` |
+| second-order `retirement_records` | `d5b0003cd8e7150417495f89ef46a901bdd392a8287f211fae15b6fcc1758464` | `aaf7f6a276478b3f297fa6c1eee6880ccc0e8ceeb3b805cb7f8efeb025d8ce59` |
+| raw contract hash in the refreeze manifest | `f02ff61105f1f5ad1dce29e2a9c36e50dd4d5465ff5b48dd9440059059272d83` | `4f6272565ca16c700cebee25222a4b73eba951b79bad92e1e926e6e1fdc07ae5` |
+| validator raw SHA-256, committed baseline to final | `8585caa152455dc7a22f93a5ded63095bd550c11eeae2c802a5795684f52ab76` | `3c9836dd19f3cb82fbfcc4bad4af391d95e93b51bc89adf8f88e59ddb6fcf23b` |
+| refreeze manifest raw SHA-256, committed baseline to final | `e1d083d338d4bae9dd3ff9a110acd1ed5fd83030480eaff822af04f0ae1bc9a9` | `8333b03e5829daadbcb60b0547e1ac81bed5e5d400bf8bc0b59576ab8dc2e6fe` |
+
+The final LF-normalized checker is clean at 78 requirements / 24 acceptance
+oracles / 13 retirement categories. No member/path set, authority assignment,
+or normative clause changed; only the designed source-census closures and their
+second-order pins were regenerated for the expanded PR 4 repair. The detached
+attestation's manifest pin was correspondingly rebound from
+`e1d083d338d4bae9dd3ff9a110acd1ed5fd83030480eaff822af04f0ae1bc9a9`
+to `8333b03e5829daadbcb60b0547e1ac81bed5e5d400bf8bc0b59576ab8dc2e6fe`;
+the attestation remains explicitly not an approval or signature.
 
 ### Round 2 of the post-slice review, and the hardening it triggered
 
 Round 2's persisted output contains four confirmed entries: the same `target`
 defect reported in both code and docs, plus two unique minors. Its executable
 was a stale PR 3 / round-15 prompt, so those findings are evidence, but silence
-elsewhere is not coverage. A corrected round 3 must review one committed SHA,
-with no concurrent edits and with notes adjudicated.
+elsewhere is not coverage. A corrected Round 3 subsequently reviewed the
+immutable
+`6d1c58df731910b6e8ee6c5a61a5d01f9e3be8ae..606bbeb50ac11c781f9337a7109be290f8a93b08`
+range with no concurrent edits and with every candidate and substantive note
+independently adjudicated. Its result is recorded below.
 
 **MAJOR — the `target` skip was depth-blind while its justification assumed
 otherwise.** The round-15 comment said the three skipped directories shared one
@@ -231,6 +425,262 @@ The traversal now panics on directory, entry, and metadata observation errors.
 That fail-closed behavior is covered by source inspection and the compiled
 gates above; no Windows permission mutation is claimed.
 
+### PR 4 post-slice Round 3 — trustworthy FINDINGS on
+`606bbeb50ac11c781f9337a7109be290f8a93b08`
+
+Round 3 reviewed the complete immutable range
+`6d1c58df731910b6e8ee6c5a61a5d01f9e3be8ae..606bbeb50ac11c781f9337a7109be290f8a93b08`,
+not only the final repair commit. Finders read pinned Git objects and did not
+edit, stage, commit, mutate fixtures, or run Cargo. Post-review integrity
+re-established the same clean worktree, branch, base, review SHA, merge base,
+and four-path changed set. The archive is
+`C:\AI_STUFF\PROGRAMMING\symforge-review-artifacts\feature-020\slice3-pr4\round-3\606bbeb50ac11c781f9337a7109be290f8a93b08`;
+its `SHA256SUMS` file hashes to
+`d58e286a2aa2e32e552cd3fc775738ae65bee03a850d7a82ca44d6c929a9c25e`
+and pins all nine substantive artifacts. The archived result records
+`run_integrity_valid: true`, `verdict_trustworthy: true`, and
+`review_status: FINDINGS`.
+
+| Disposition | Count | IDs |
+|---|---:|---|
+| confirmed blocker | 1 | `R3-DR-001` |
+| confirmed majors | 10 | `R3-WP-001`, `R3-WF-001`, `R3-WF-002`, `R3-WD-001`, `R3-WD-002`, `R3-OS-001`, `R3-OS-002`, `R3-OS-003`, `R3-OS-004`, `R3-ROOT-001` |
+| confirmed minors | 5 | `R3-WP-002`, `R3-WP-003`, `R3-WD-003`, `R3-EP-001`, deduplicated `R3-WD-004 / R3-OS-005` |
+| actionable substantive notes | 2 | `R3-WF-N01`, `R3-WD-N01` |
+| accepted nonblocking notes | 1 | `R3-WD-N02` |
+
+`refuted_candidates: 0`; `inconclusive_candidates: 0`;
+`dead_dimensions: []`. Every finder and adjudicator completed. Overlay
+mechanical closure and contract/ledger consistency were clean dimensions. One
+`diff_symbols` worktree-reachability subclaim was refuted while the narrower
+Git-authority candidate remained confirmed, so it does not increment the
+refuted-candidate count.
+
+The blocker demonstrated that the lexical darkness sweeps are not a compiler
+call graph: a crate-local trait/type outside the excluded module can receive an
+impl inside `index_lifecycle`, and an outside caller can dispatch through the
+trait without spelling the guarded module name. The same exclusion class
+applies to `server_api.rs`. The repair is deliberately layered. The direct
+outside caller/splice sweeps remain diagnostic; a SHA-256 seal over the 13
+excluded Rust sources diagnoses semantic drift inside the dark implementation
+set; and a second, load-bearing SHA-256 seal covers every regular source
+candidate beneath `src/`. The whole-source seal is what catches an outside
+alias, trait, registration, re-export, or macro bridge that changes no excluded
+byte. The exact explicit production lib/bin topology in root `Cargo.toml` is
+also pinned and confined beneath that same source root, so an arbitrary or
+extensionless target cannot escape the source set. Review of the narrow
+baseline found 82 explicit impls, every self type defined inside that sealed
+set, and no outward alias, registration, or exported-ABI bridge. This is
+reviewed semantic-baseline preservation, not a general Rust name-resolution
+proof. The final whole-source tuple is now frozen and observed in the binding
+checklist; the required macro/alias mutation is observed in M82 and the
+binding checklist.
+
+The walk findings require one coherent boundary rather than isolated string
+fixes: both source and Cargo-config walks fail closed and sort observations;
+descendant links and Windows reparse points are refused and canonical directory
+identities stay below a visited root; `.cargo` aliases are decided by actual
+filesystem identity, not `core.ignorecase`; root-config identity must be found
+exactly once; root `.gitignore` must be a regular non-link file; and Git decides
+whether a concrete root `target` or `node_modules` directory is ignored before
+it may be skipped. `git check-ignore --no-index --stdin -z` receives one exact
+NUL-framed pathname, prefixed with lexical `./` so pathspec-looking bytes remain
+literal. Immediately before a skip, a literal, case-insensitive
+`git ls-files -z` query must return no raw bytes; that output is never decoded.
+The source walk now observes every regular file beneath `src/`, while an exact
+root `Cargo.toml` topology pin requires every explicit production lib/bin target
+to remain beneath that source root. Fingerprint records serialize normalized
+path components with `/` rather than replacing separators in an already-joined
+path; a nested `a/b.rs` and a literal `a\b.rs` filename therefore cannot
+collapse to one record. Non-normal or non-UTF-8 components fail closed, and
+sorted records must remain unique. Together the repairs close the
+symlink/escape, fail-open, nested-unignore, pathspec-magic, case-renamed tracked
+path, arbitrary Cargo target, opaque-filename, path-record-collision,
+nondeterministic-order, root-alias, and anti-vacuity findings within the stated
+in-tree bound.
+
+#### Semantic overlay supersession and exhaustive second sweep — cardinality unchanged
+
+Round 3 **identified** twelve assignment defects and one stale citation; the
+post-Round-3 candidate maps those repairs and the exhaustive second body-level
+audit across all 102 rows. That wider audit found a materially broader class:
+dry-run edit modes, disk-degradation results, worktree diagnostics, sidecar
+aliases, hook refusals, source-free successful modes, and subordinate Git/state
+effects had not been classified consistently.
+
+The shipped schema-hidden, production-reachable facade relay also allowed
+write-capable legacy tools behind the read-only `symforge` annotation; the scoped
+production repair closes that path instead of widening the facade to all eight
+states. Its exact allowlist is nine read measurements plus `batch_rename` only
+when `dry_run=true`. Outer facade `project`/`projects` selectors are not a back
+door into this compatibility relay. "Source-mutation-safe" is the deliberate
+bound: normal read-path cache, frecency, coupling, reconciliation, and
+index-refresh effects may still occur. The relay preserves raw legacy renderer
+text and emits no `symforge/result_status`, because arbitrary returned source
+text cannot prove a semantic outcome class. The shared MCP boundary may still
+attach selected `symforge/project_evidence`, but an admitted relay is exempt
+from its rendered-text `isError` heuristic; a real `/mcp` regression test pins
+exact `Error:`-prefixed file content as successful data. The result is
+result-status-free, not metadata-free.
+
+Containment of the normal compact planner is separate from containment of the
+relay. A local or degraded topology refuses a foreign selector before preview,
+cache-hit, PFF-bypass, economics-bypass, or any other early result. A healthy
+daemon injects the selector into every planned primitive. While such a foreign
+request is routed, adapter-HOME path checks, source-byte economics, temporal
+co-change footers, fusion anchors, and root evidence are disabled; only a typed
+daemon receipt that names the selected project may be rendered or attached. A
+missing or mismatched receipt produces an explicit unavailable-root line and no
+typed project evidence. The complete selector suite and its locality-inversion
+mutation are observed in the immutable-candidate checklist and M83.
+
+The existing `verify-tools.cjs` harness is hardened along with that boundary.
+Legacy read cases continue through the exact raw A-019 relay and
+`batch_rename` remains dry-run-only. Every declared `must_contain` substring is
+now a hard FAIL for every judge. Source-bearing results must expose either the
+compact leading `Trust:` envelope or the expanded `Source authority:` envelope;
+an intentionally empty result is accepted only when the case declares its exact
+empty-result prefix. That last rule exposed and corrected the real fixture that
+mistook two `as_str` definitions for references. Both fixture sets are directly
+observed green against the debug and release binaries in the checklist above;
+no harness green is inferred from source inspection.
+
+This repair does not claim global facade-status closure. Normal STEL execution
+still uses the pre-existing `classify_compact_tool_output` rendered-text
+classifier; that classifier is byte-unchanged by this repair and has known
+truncation/caller-text ambiguity. A complete follow-up must carry typed outcome
+data before rendering. No Feature 020 authority assignment or T052 gate below
+uses those inferred outcome classes as evidence.
+
+A mechanical parser compared the post-Round-3 overlay candidate with pinned
+`606bbeb50ac11c781f9337a7109be290f8a93b08`: 102 rows remain 102, with no member
+addition/removal; 60 rows change allowed sets and 42 remain unchanged; 91
+authority cells are added and 10 removed, net +81. Total authority cells move
+from 185 to 266. The partition remains 102 `SURFACE_OVERLAY` rows + 3
+`NON_INGRESS_EXCEPTIONS` + 11 `AUTHORITY_FREE_INGRESS` members = 116. The
+eight-state vocabulary and approved eleven-slot T066 residual are unchanged.
+
+| Surface | Changed rows | Added cells | Removed cells |
+|---|---:|---:|---:|
+| compatibility aliases | 2 | 2 | 0 |
+| tools | 25 | 39 | 3 |
+| writers | 12 | 23 | 0 |
+| sidecar | 8 | 8 | 4 |
+| hooks | 6 | 8 | 3 |
+| resources | 7 | 11 | 0 |
+| **total** | **60** | **91** | **10** |
+
+| Authority | Baseline cells | Candidate cells | Added | Removed |
+|---|---:|---:|---:|---:|
+| `DiskObserved` | 8 | 34 | 27 | 1 |
+| `GenerationLeased` | 50 | 76 | 28 | 2 |
+| `GitObserved` | 11 | 5 | 1 | 7 |
+| `MutationPermitted` | 33 | 33 | 0 | 0 |
+| `Refused` | 60 | 83 | 23 | 0 |
+| `RuntimeHealthObserved` | 10 | 11 | 1 | 0 |
+| `StateWriteAuthorized` | 8 | 9 | 1 | 0 |
+| `WorktreeScopeObserved` | 5 | 15 | 10 | 0 |
+| **total** | **185** | **266** | **91** | **10** |
+
+Reproduction recipe: read the baseline with
+`git show 606bbeb50ac11c781f9337a7109be290f8a93b08:tests/activation_cut_v11.rs`
+and the candidate with `Get-Content -Raw`; isolate `const SURFACE_OVERLAY`
+through its closing `];`; parse rows with the single-line expression
+`\(\s*"(?<cat>[^"]+)"\s*,\s*"(?<member>[^"]+)"\s*,\s*&\[(?<allowed>.*?)\]\s*,`;
+extract quoted authority names from `allowed`; key on category plus member; and
+set-diff both maps. Both independent runs asserted 102 keys, no key-set delta,
+and 185 → 266 authority cells before producing the tables above.
+
+The ten removals are classified by the authority table above: seven
+`GitObserved`, two `GenerationLeased`, and one `DiskObserved`. The principal
+additions are exact-mode dry-run branches on the seven edit tools and their
+writer duplicates; disk modes on read/context/sidecar surfaces; generation
+modes on mixed impact derivations; worktree modes on applicable edit previews
+and observation surfaces; typed refusal on loading-guard, resource, and hook
+paths; the timestamp-generation mode on `what_changed`; and the
+calibration-state mode on `status`. Published Git ranking/enrichment, edit
+co-change footers, Tee/idempotency writes, and cache warming remain subordinate
+effects rather than separate selected authorities. The final source line
+citations are bound to the frozen Rust candidate and remain subject to the
+pending immutable review.
+
+The full 40-tool audit and all 62 non-tool rows were independently re-read. The
+matrix above is the measured current delta, not an extrapolation from the original
+twelve findings.
+
+### Post-Round-3 repair and mutation evidence — historical, not T052 closure
+
+Every mutant below was planted alone. Source mutants were reversed with an
+exact patch, never `git restore`; the immediately affected files were then
+SHA-256 checked against their preimages. Fixture controls were removed and the
+real Git index remained unchanged. These observations prove the repair guards,
+not a clean-review verdict. They are preserved verbatim as historical
+observations on evolving post-Round-3 repair trees; later selector, source-seal,
+overlay, and harness edits supersede them as current-candidate gates.
+
+| ID | Guard removed or adversarial fixture | Focused observation | Restore/control |
+|---|---|---|---|
+| M68a | Read-directory error returned an empty successful walk. | `walk_observation_seams_fail_closed_and_controls_pass` RED: "read-directory error must not become an empty successful walk." | Exact reverse; accepting sorted-input control remained green. |
+| M68b | Per-entry error was flattened away. | Same focused test RED: "directory-entry error must not be flattened away." | Exact reverse. |
+| M68c | Optional metadata errors other than `NotFound` became absence. | Same focused test RED on injected `PermissionDenied`; the `NotFound` control remained accepted. | Exact reverse. |
+| M68d | Link/reparse refusal became a no-op. | Same focused test RED: "link or reparse point must never be followed." | Exact reverse. |
+| M68e | Sorted-child observation was replaced by an order-preserving no-op. | Same focused test RED with observed `z,a` vs required `a,z`. | Exact reverse. |
+| M68f | Required metadata failure fell back to unrelated metadata. | Same focused test RED on the guaranteed-missing path. | Exact reverse; the real source-file metadata control remained accepted. |
+| M68g | The regular-file pin accepted a directory. | Same focused test RED on `tests/`. | Exact reverse. |
+| M68h | Canonical visited-set rejection was removed. | Same focused test RED on the second identity. | Exact reverse. |
+| M68i | Canonical root containment was removed. | Same focused test RED when `src/` was admitted beneath the `tests/` root. | Exact reverse. |
+| M69a | `git check-ignore` exit 1 was treated as skippable. | `cargo_walk_policy_controls` RED. | Exact reverse; exit 0/1 controls restore ignored/walk decisions. |
+| M69b | Non-empty raw `git ls-files -z` output was accepted. | Same focused test RED on `opaque-FF` bytes without UTF-8 decoding. | Exact reverse; empty raw output control remained accepted. |
+| M69c | The exactly-one root-config assertion was made tautological. | Same focused test RED on empty discovery. | Exact reverse; one-root control remained accepted. |
+| M70 | Existing `execution/node_modules/.cargo/config.toml` was first ignored, then made normally add-visible by a nearer `execution/.gitignore` with parent/descendant negations. | Ignored control GREEN; after `git check-ignore --quiet` changed from 0 to 1 and `git status` showed both files, `no_gate_builds_doctests` RED and named the config. | Removing the nearer `.gitignore` restored GREEN; config and empty directories then removed. |
+| M71 | The same ignored config was force-added only to an isolated temporary `GIT_INDEX_FILE`. | Focused test RED: one tracked path below `execution/node_modules`; the ordinary real-index control stayed GREEN. | Temporary index deleted, environment restored, real cached diff empty, fixture removed. |
+| M72 | Normally add-visible `execution/.CARGO/config.toml` on Windows. | `git check-ignore` exit 1; focused test RED and reported logical `execution/.cargo/config.toml`, proving filesystem alias recognition rather than lexical casing. | File and empty directory removed; focused test GREEN. |
+| M73 | Empty Windows junction beneath `src/`, targeting a separate empty directory. | Ordinary empty-directory control GREEN; junction control RED before recursion and named the exact reparse path. | Junction removed without recursion, external target verified intact then removed. |
+| M74a | Dormant inherent method on `LiveIndex` defined in `index_lifecycle/runtime.rs`, called outside without the guarded module token. | Both old lexical darkness tests GREEN; the excluded-source seal RED at 13 files / 205,144 normalized bytes. | Runtime and caller restored byte-identically; reviewed seal GREEN. |
+| M74b | Same dispatch shape with the inherent impl in `server_api.rs`. | The old `server_api` lexical test GREEN; the excluded-source seal RED at 13 files / 205,151 normalized bytes. | Server and caller restored byte-identically; reviewed seal GREEN. |
+| M75a | Restore the case-sensitive `.rs` extension filter and present an upper-case `.RS` source candidate. | `walk_observation_seams_fail_closed_and_controls_pass` RED because the candidate vanished from the bounded source observation. | Exact reverse; the final walker observes every regular file beneath `src/`, independent of suffix. |
+| M75b | Add an extensionless `execution/slice3-extensionless-probe` as an explicit `[[bin]]` target and call the public dark runtime without a guarded splice token. | `cargo check --bin slice3-extensionless-probe` GREEN, proving Cargo accepts the arbitrary target path; `no_gate_builds_doctests` RED at the exact production-target topology guard. | `Cargo.toml` restored to its exact preimage, the source removed, and no probe target remained. |
+| M76 | Track `execution/node_modules/.cargo/config.toml` in an isolated index, then case-rename the on-disk parent to `NODE_MODULES` on NTFS. | The repaired focused test RED with one tracked descendant. Temporarily restoring the exact-case literal `ls-files` query made the same fixture GREEN, proving the former false green. | Query code restored byte-identically; directory renamed back; fixture, isolated index, and empty directories removed; real cached diff empty. |
+| M77 | Ask the ignore seam about the literal pathname `:(top)target`, whose bytes resemble Git pathspec magic. | Before lexical `./` disambiguation, the check incorrectly selected the ignored root `target`; the repaired `--stdin -z` control returns visible while the real `target` control remains ignored. | Permanent paired controls remain in `cargo_walk_policy_controls`; no fixture or index mutation survives. |
+| M78 | Short-circuit the A-019 measurement allowlist before dispatch. | `symforge_facade_rejects_mutating_probe_relay` RED: the denied `index_folder {}` reached the decoder and returned raw text without the typed denial receipt. The fixture is safe under the mutant because missing `path` prevents dispatch. | Exact reverse to SHA-256 `1e38c092c2f2c526b0297071af24dc476f6baaa3cf106a19d7e2524f7a770121`; focused denial GREEN. |
+| M79 | Replace the relay's result-status-free raw result with fabricated `OutcomeClass::Found`. | `symforge_facade_preserves_malformed_probe_without_fabricated_status` RED and displayed `invalid tool parameters:` falsely paired with `outcome_class: found`. | Exact reverse to the same SHA-256 preimage; malformed and missing-batch raw-result controls GREEN. |
+| M80 | Remove `symforge_edit` from the executable replay-residual table. | `all_ingress_uses_exact_typed_authority_branch` RED at exactly 7 vs required 8 edit-tool modes. | Exact reverse to its then-current SHA-256 preimage; focused activation guard GREEN. |
+| M81 | Invert the real MCP seam's admitted-relay exemption so it runs the rendered-text error heuristic on raw relay data. | `admitted_facade_measurement_preserves_error_prefixed_source_at_wire` RED: exact file content remained intact but the wire result gained `isError:true`. | Exact reverse to SHA-256 `55cc432bc181d0e7b25d0b67e90ea2b2f25bba93e64667f6e4dc06437a2d0289`; focused real-HTTP control GREEN 1/0. |
+| M82 | Wrap the two byte-exact allowlisted lifecycle-mount lines in a macro that also exports the captured module under a spelling-free alias outside the 13-file diagnostic seal. | All seven lexical/narrow diagnostics GREEN (`job_01a006eb300772a3b3b254e724347561`); the load-bearing whole-`src/` seal alone RED (`job_01a006ebd9b372d1a1144990096519b8`). | Exact reverse to `src/live_index/mod.rs` SHA-256 `500824888d3cac199e941869904c6fd9af300263ef540a6a2b49a946244dc3ad`; full preventive suite GREEN 8/0 (`job_01a006ec1e9b7881ba17dcd2605fa848`). |
+| M83 | Force the facade's single local-state authority decision to `true` for every routed project. | Every one of the 10 `daemon_facade_` controls RED, covering receipt, path/economics, fusion, and temporal HOME contamination (`job_01a006ed280070e0b3f9dbeb8670f222`). | Exact reverse to `tools.rs` SHA-256 `ff1eb8d70990fe0910e5396ee201a8088bf5bfde8aee3dec6591815b8d560c22`; selector family GREEN 10/0 (`job_01a006edc5527e01b2d8b33246db2dc5`). |
+| M84 | Strip only `Trust:` / `Source authority:` lines from oracle responses after the MCP call, leaving every required content anchor intact. | All four synthetic oracle cases RED at `successful search terminal absent`; all four snapshot/write cases stayed GREEN (`job_01a006ef244b7bd1a76d6376132e40ab`). | Exact reverse to `scripts/verify-tools.cjs` SHA-256 `74a304feaf5f92a219f71b375f84b60e085fdd199b3a9fe3f49d852ec48417af`; synthetic harness GREEN 8/0/0 (`job_01a006ef624572d2a54ea0427d0ff6b5`). |
+
+**Historical observation on an earlier repair tree:** the restored preventive
+suite was 7 passed / 0 failed. Its narrow diagnostic seal observed the reviewed
+baseline as 13 files / 205,026 LF-normalized source bytes / SHA-256
+`09b51bdbe46837b860a7144387a643b5de4fbd2428fce4bc9ff651036aa6ebca`.
+That receipt is preserved, but it is not the load-bearing whole-`src/` seal and
+does not substitute for the separately observed final source-pin row above.
+Four production tests also corroborate the corrected overlay bases:
+`test_what_changed_returns_result`,
+`test_diff_symbols_reports_trust_envelope`,
+`daemon_proxy_reset_calibration_clears_proxy_store_and_reports_receipt`, and
+`cache_hit_and_ccr_counters_surface_in_context_inventory` each passed 1/0.
+
+The scoped facade controls below each passed 1/0 on that earlier repair tree;
+they are historical, and they were rerun with the selector and harness controls
+on the final frozen source as recorded in the binding checklist:
+
+| Command | Result |
+|---|---|
+| `cargo test --lib facade_probe_policy_allows_only_source_mutation_safe_measurements -- --test-threads=1` | 1 passed / 0 failed |
+| `cargo test --lib symforge_facade_rejects_mutating_probe_relay -- --test-threads=1` | 1 passed / 0 failed |
+| `cargo test --lib symforge_facade_preserves_malformed_probe_without_fabricated_status -- --test-threads=1` | 1 passed / 0 failed |
+| `cargo test --lib symforge_facade_preserves_missing_batch_rename_without_fabricated_status -- --test-threads=1` | 1 passed / 0 failed |
+| `cargo test --test rmcp3_protocol admitted_facade_measurement_preserves_error_prefixed_source_at_wire -- --test-threads=1` | 1 passed / 0 failed; real `/mcp` boundary; `outcome_trust: observed` |
+
+This remains a non-closure result. T052 is open, but the final selector,
+whole-source, and harness-envelope mutations are now directly observed and
+restored, and every candidate gate in the binding checklist is observed. The
+remaining obligations are a non-closure commit and a new review over that
+immutable SHA. A final evidence/ledger commit is permitted only after a
+trustworthy CLEAN review.
+
 ### Residuals carried out of Slice 3
 
 **T051's Cargo/workflow pin remains deliberately bounded.** It does not cover a
@@ -245,6 +695,43 @@ trees other than its three named skips, so configs below `/target-*/`, `/.*/`,
 `**/.symforge/`, `/mcps/`, or `spacetime/*/target/` can over-flag. The source
 splice sweep likewise remains a fail-closed tripwire over known spellings, not
 a completeness proof for every possible `include!` or `#[path]` construction.
+The fail-closed filesystem policy also conservatively rejects a checkout whose
+root itself is a symlink or Windows junction, and rejects any descendant
+link/reparse entry before an ignore skip could make it irrelevant. Those are
+safe false reds accepted for this preventive oracle; supporting such mounts
+later requires an explicit root/link policy rather than relaxing observation.
+
+**T051's semantic-darkness seal is reviewed-baseline preservation, not a
+compiler call graph.** The 13-file excluded-runtime seal is a narrow diagnostic,
+and the outside caller/splice sweeps explain direct textual edges. The
+whole-`src/` seal is load-bearing: it also changes for an outside alias, macro,
+trait, registration, or re-export bridge that leaves all 13 excluded sources
+untouched. The source walk and path-record encoding fail closed, and the exact
+manifest topology prevents an explicit production target from escaping the
+sealed root. This still does not make an incorrectly approved pin refresh
+impossible, expand macros or proc macros, inspect generated `OUT_DIR` source,
+or prove compiler/dependency/external-consumer behavior. The final tuple and its
+macro/alias mutation are both observed above. The seal therefore proves exact
+reviewed-baseline preservation for this candidate while retaining the
+compiler-semantic limitations stated here.
+
+**D16 remains a cross-process body/publication atomicity residual.** The typed
+daemon evidence header is ancillary metadata, not a transaction that pins every
+handler body, watcher refresh, and receipt to one immutable content publication
+under arbitrary concurrent publication. PR 4 removes its deterministic local
+impact mismatch and rejects missing, malformed, wrong-project, and inconsistent
+multi-step receipts; it does not claim product-wide cross-process atomicity.
+Slice 4 owns that structured activation boundary.
+
+**Daemon ACTIVE cancellation is an explicit unknown-outcome residual.** A completed
+`index_folder` call now holds one connection-scoped lane through canonical daemon
+dispatch, adapter mirror publication, and any reconnect replacement. If the caller
+cancels or times out after the daemon begins its non-abortable activation but before
+the adapter observes the response, however, the distributed outcome can remain
+unknown. Subsequent project-bound calls pin the last observed canonical adapter
+project, so this residual does not silently retarget a completed read or write. An
+activation epoch or authoritative ACTIVE re-sync is the recovery follow-up; PR 4 does
+not misreport an unobserved activation as a completed one.
 
 **What T050's green does not prove.** The three-way surface split closes over
 116 slots: 102 `SURFACE_OVERLAY` rows — 2 compatibility aliases, 6 hooks,
@@ -269,6 +756,75 @@ invariant or add a branch. Frozen prompts assertions 1 and 3 belong to the same
 approved residual — they govern how generation-backed prompt context is selected
 WHEN a prompt fetches it, and no V10 prompt fetches; V10 emits instruction text
 plus `resource_link` URIs the client may read.
+
+**Approved replay residual — eight edit-ingress modes are not represented by
+the frozen eight branches.** The seven granular edit tools and `symforge_edit`
+can return an identical stored-success replay before edit dispatch. The seven
+`edit_tools.rs` writer rows are duplicate census appearances of those same
+ingresses, not seven additional members. `ReplayRecord` v1 stores request/key
+hashes, status/timestamps, and response text, but no verified repository/source
+identity, authority branch, post-image receipt, or continuity proof. The handlers
+do prepare the current source before probing replay, but that fresh Disk/Generation
+source observation is not bound to the stored response. Worktree routing occurs
+after the replay point. The terminal replay
+therefore performs no source write, acquires no fresh `SourceMutationPermit`, and
+cannot honestly be called `MutationPermitted` or inherit the preparatory authority;
+it is not a ProjectStateDir write or refusal either. PR 4 does not invent a branch
+or inherit an authority the record does not carry.
+
+This is a mode-level residual, so it does not change the 102 + 3 + 11 member
+partition. Its executable owners are T058 (causal RED), T064 (source-bound replay
+and mutation integration), T066 (register/formally classify the replay lane), and
+T072 (full activation campaign). Slice 4 must persist and verify a typed,
+source-bound operation receipt and then either formalize replay-result authority
+or amend the model explicitly. Reacquiring a mutation permit solely to return
+stored text would falsely publish non-Current for a zero-write response and is not
+an acceptable PR 4 shortcut.
+
+**Approved source-free semantic-result residual — sixteen successful modes on
+otherwise branch-bearing members.** These are mode exceptions, not sixteen
+whole-member additions to `AUTHORITY_FREE_INGRESS`: ancillary untyped
+`ProjectEvidence` wire `_meta` remains the recorded D16 activation gap and does
+not manufacture a typed Current branch.
+
+- one hook mode: non-source `hook:Read` pass-through;
+- seven direct argument-only `estimate=true` modes: `analyze_file_impact`,
+  `search_text`, `inspect_match`, `search_files`, `what_changed`, `explore`, and
+  `diff_symbols`;
+- one static guidance mode: `ask` ToolHelp; and
+- seven compact-facade modes: relayed `search_text` estimate, relayed
+  `search_files` estimate, preview PFF plan floor, preview plan floor,
+  non-preview PFF plan floor, economics-bypass plan floor, and served `ask`
+  ToolHelp.
+
+The executable table pins exactly 16 triples, split 1 hook / 15 tool, and binds
+owners: T064/T066/T067/T072 for the hook, and T066/T067/T072 for the tools. It
+also inventories every advertised `estimate` declaration directly from the
+three protocol modules: `[8, 4, 4]`, 16 total. Their dispatch dispositions are
+exactly **7 pre-authority / 5 source-derived / 3 ignored-but-source-derived / 1
+alias-drops-estimate-then-source-derived**. The five source-derived modes are
+`get_symbol`, `get_file_content`, `get_repo_map`, `get_file_context`, and
+`get_symbol_context`; the three ignored flags are `search_symbols`,
+`find_references`, and `find_dependents`; the alias case is `trace_symbol`
+dispatching `get_symbol_context`. Sharing the parameter spelling does not make
+these semantics interchangeable. The final exact activation test is observed
+1/0 in the binding checklist, so these cardinalities now have a current green
+without turning that green into a substitute for semantic review.
+
+**Other target-vs-current activation debts remain explicit.** The overlay is a
+named frozen target owner, not proof that V10 already implements every target
+branch. `detect_changes`/`detect_impact` target pure Git/worktree observation,
+while the current delegated implementation still consumes generation symbols
+and caller graph; T064 owns that refactor. Repeat-cache results and CCR handles
+still lack the publication/source identity fence required before they may claim
+the target generation result; T064/T066/T067 own those fences. The static
+glossary and tools-catalog resources currently receive unfenced ancillary
+project evidence even though their successful bodies are source-free; T066/T067
+must remove or replace it rather than falsely add `GenerationLeased`. Standalone
+and session health target a caller-root-mismatch refusal that current V10 does
+not yet enforce; T066/T067 own that activation repair. The edit replay residual
+above is separate and remains owned by T058/T064/T066/T072. Recording each gap
+is the no-silent-gap rule; none authorizes Slice 4 work in PR 4.
 
 **D14 is still unfalsifiable, and is not coverage.**
 `read_gate_authority_v11.rs::a_failed_observation_refuses_without_disturbing_the_current_generation`
@@ -1156,6 +1712,10 @@ gaps in the splice TRIPWIRE and the register:
   DISTINCT (file, line) pairs, so a duplicate sighting cannot satisfy a
   coverage claim, and the prose-rule header no longer overstates what
   string literals do on comment lines.
+  [Corrected by PR 4 Round 3: the full-line rule is lexical too and cannot
+  prove Rust trait or inherent-method dispatch. The post-Round-3 mechanism is
+  the reviewed excluded-source seal composed with the caller tripwires; it is
+  still not a compiler-semantic call graph.]
 
 ## Gate results for the round-4 repair chunk
 
@@ -1384,7 +1944,7 @@ under the embed gate). Each stays visible in the review findings document.
 | traceability checker | OK (78 requirements, 24 oracles, 13 categories) |
 | mutations | M27 evaluator (nine negative sentinels + exit 1); M20–M26 remain as recorded |
 
-## T051 — the call-edge proof (PR 3)
+## T051 — original PR 3 call-edge proof (historical; superseded by the layered Round-3 repair)
 
 `tests/preventive_runtime_dark_v11.rs` exists now — its creation is T051's
 own act, held back from every earlier chunk on purpose — and it turns the
@@ -1394,6 +1954,11 @@ went stale — the file has held four tests since round 7: the two darkness
 sweeps this section describes, plus `source_splicing_is_allowlisted`
 (the C9 tripwire, round 1) and `no_gate_builds_doctests` (the doctest
 bound pin, round 7)].
+
+This section preserves the PR 3 chronology and receipts. It is not the current
+closure claim: Round 3 proved these lexical sweeps can miss semantic dispatch,
+so the load-bearing whole-`src/` seal, narrow diagnostic seal, and final
+mutation/gate receipts are recorded in the T052 section above.
 
 **The sweep rule is fail-closed.** A line naming the dark surface outside
 its directory passes only as prose or as one of the exactly-two
@@ -1719,9 +2284,12 @@ is now a caller-supplied parameter: the health pair passes its captured
 bundle's value, and the two capture-less callers pass the atomic EXPLICITLY,
 named at the site), `search_symbols`, `search_text` (handler + renderer share the
 caller's capture through a new parameter), `search_files` (13 loads → 1),
-`find_references` (11 → 1), `append_impact_footer`, `edit_plan`, and
-`analyze_file_impact`, whose capture is taken BEFORE the sidecar await so the
-co-change footer describes a publication the impact result actually saw.
+`find_references` (11 → 1), `append_impact_footer`, `edit_plan`, and the original
+PR-2 `analyze_file_impact` entry capture. Post-Round-3 review found that the impact
+sidecar can publish a newer winning bundle, so the current candidate deliberately
+supersedes that one site: the sidecar returns its exact receipt publication, and the
+text, co-change footer, and local typed evidence all consume that same bundle rather
+than a free before/after sample.
 `terminal_dispositions` was re-rooted from the raw `live` field onto the
 bundle, closing the store-order window where new content could pair with the
 old publication. The write-only `published_repo_outline` ArcSwap field was
@@ -1801,8 +2369,12 @@ denied warnings clean; embed 1332 passed 0 failed; fmt clean; traceability
 OK; all five closure digests byte-identical — T044 touched only uncensused
 files, per the PR 2 first-commit decision.
 
-Living document for the slice; T052 completes it. Every claim here was observed,
-not inferred. Where a command is cited, it was run on the named tree.
+This is a living slice record; T052 remains open until a trustworthy CLEAN
+terminal review. Command and mutation outcomes explicitly labeled observed were
+executed on the tree named by that entry. Source-inspection conclusions,
+authority classifications, and adjudications are reasoned from cited pinned
+bytes unless explicitly paired with an execution receipt;
+reconstructed/source-unknown outcomes are historical only.
 
 ## T041 + T042 — observed RED (durable record)
 

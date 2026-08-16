@@ -28,8 +28,9 @@
 //! non-surface categories carry `None` and are proved on owner, seams and
 //! disposition alone.
 //!
-//! ALLOWED SET, NOT A SINGLETON. Per call exactly one branch resolves; per
-//! member the matrix records the closed set of branches that call may take.
+//! ALLOWED SET, NOT A SINGLETON. Per source-derived call exactly one branch
+//! resolves; per member the matrix records the closed set of branches that
+//! source-derived call may take.
 //! `detect_changes` is the existence proof — it may resolve `GitObserved` or
 //! `WorktreeScopeObserved` and must never resolve `GenerationLeased` — so a
 //! singleton column could not describe it without lying.
@@ -49,14 +50,36 @@
 //! strings and on review, which is why every row cites a frozen assertion, an
 //! `INV-*`/`FR-*` id, or a call site rather than asserting a branch bare.
 //!
-//! STATED RESIDUAL — `INV-SURFACE` vs `AUTHORITY_FREE_INGRESS`. Eleven members
-//! are ingress that resolve no typed authority branch at all. That falsifies
-//! "every ingress resolves exactly one typed authority branch" as written, and
-//! it is recorded rather than papered over: Slice 4 (T066) must either exclude
-//! these from the invariant or add a branch for them. Frozen prompts
+//! STATED TARGET RESIDUAL — `INV-SURFACE` vs `AUTHORITY_FREE_INGRESS`. Eleven
+//! members are assigned no typed authority branch in the target model. Current
+//! V10 violations named in their row bases—most notably unfenced project
+//! evidence on static resources—are deferred implementation gaps, not reasons
+//! to bless a false branch. The target assignment falsifies "every ingress
+//! resolves exactly one typed authority branch" as written, and it is recorded
+//! rather than papered over: Slice 4 (T066) must either exclude these from the
+//! invariant or add a branch for them. Frozen prompts
 //! assertions 1 and 3 are part of the same residual — they govern how
 //! generation-backed prompt context is selected WHEN a prompt fetches it, and
 //! no V10 prompt fetches.
+//!
+//! STATED RESIDUAL — identical idempotent edit replay. Eight edit-tool
+//! ingresses can return a stored successful response after source preparation
+//! but before edit dispatch or permit acquisition. `ReplayRecord` v1 does not
+//! bind that fresh observation—or any typed authority receipt—to the stored
+//! response, so none of the eight branches honestly describes the terminal
+//! zero-write mode. The exact eight tool rows and seven
+//! duplicate writer rows are pinned below; T058 owns the causal RED, T064 the
+//! source-bound replay receipt, T066 branch registration, and T072 activation.
+//!
+//! STATED RESIDUAL — source-free successful semantic-result modes. Sixteen
+//! modes on otherwise branch-bearing members return their body from arguments,
+//! static guidance, or an ungrounded plan before source-authority selection.
+//! Tool wire responses may still carry ancillary untyped `ProjectEvidence`
+//! `_meta`, the already-recorded D16 activation gap, but that is not a typed
+//! Current branch. The exact mode triples, estimate disposition, and owners are
+//! pinned below. No ninth branch is invented here; T066/T067 must resolve the
+//! advertised tool modes, with T064 additionally owning the hook pass-through
+//! and T072 the activation boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -132,11 +155,13 @@ const NON_INGRESS_EXCEPTIONS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Ingress that carries NO source-authority branch: it runs, it succeeds, and
-/// it pins no publication and observes no source. A third kind, forced by the
-/// tree rather than chosen — overlaying any of the eight would lie about what
-/// the call did, and exempting these as non-ingress would lie about what they
-/// are.
+/// Target assignment for ingress whose semantic result carries NO
+/// source-authority branch: it runs, it succeeds, and it is specified to pin no
+/// publication and observe no source. Current V10 boundary violations named in
+/// row bases are deferred implementation gaps, not authority branches to
+/// bless. A third kind, forced by the tree rather than chosen — overlaying any
+/// of the eight would lie about the target result, and exempting these as
+/// non-ingress would lie about what they are.
 ///
 /// Named for the PROPERTY, not for catalogs: `hook:PreTool` belongs here too,
 /// and a name like `STATIC_CATALOG` would invite a fourth bucket for "hooks
@@ -207,15 +232,295 @@ const AUTHORITY_FREE_INGRESS: &[(&str, &str, &str)] = &[
         "symforge://glossary",
         "`render_glossary` is static markdown with no index access. It SUCCEEDS, so Refused would \
          misreport the outcome; it pins no publication, so GenerationLeased would be a false \
-         Current; and resources assertion 4 (static catalog resources cannot disclose raw runtime \
-         state) forbids the observed branches. None of the eight is honest.",
+         Current; and resources assertion 4 forbids static catalogs from disclosing raw runtime \
+         state. Current V10 nevertheless attaches `local_project_evidence` at resources/read and \
+         leaks publication/runtime fields without a lease (protocol/mod.rs:1748-1759; \
+         tools.rs:7546-7571; result_status.rs:53-68). T066/T067 must remove or replace that boundary \
+         metadata; adding GenerationLeased here would bless the unfenced leak.",
     ),
     (
         "resources",
         "symforge://tools/catalog",
         "`render_tool_catalog` walks `tool_catalog_groups()` — the advertised surface, not runtime \
-         state, which resources assertion 4 forbids disclosing. Same shape as glossary: a \
-         succeeding ingress with no publication to lease and no source observed.",
+         state, which resources assertion 4 forbids disclosing. Same target shape as glossary: a \
+         succeeding ingress with no publication to lease and no source observed. Current V10's \
+         resources/read wrapper still injects unfenced `local_project_evidence`; T066/T067 must \
+         remove or replace that boundary metadata rather than relabel this static catalog Current.",
+    ),
+];
+
+/// Successful identical-key edit replays prepare source first, then return the
+/// stored response before edit dispatch or permit acquisition. The fresh
+/// observation is not bound to that stored response. The optional second field
+/// pins the duplicate writer member for the seven granular handlers;
+/// `symforge_edit` has no separate writer slot in the frozen inventory.
+const EDIT_REPLAY_AUTHORITY_RESIDUAL: &[(&str, Option<&str>)] = &[
+    (
+        "batch_edit",
+        Some("src/protocol/edit_tools.rs::SymForgeServer::batch_edit"),
+    ),
+    (
+        "batch_insert",
+        Some("src/protocol/edit_tools.rs::SymForgeServer::batch_insert"),
+    ),
+    (
+        "batch_rename",
+        Some("src/protocol/edit_tools.rs::SymForgeServer::batch_rename"),
+    ),
+    (
+        "delete_symbol",
+        Some("src/protocol/edit_tools.rs::SymForgeServer::delete_symbol"),
+    ),
+    (
+        "edit_within_symbol",
+        Some("src/protocol/edit_tools.rs::SymForgeServer::edit_within_symbol"),
+    ),
+    (
+        "insert_symbol",
+        Some("src/protocol/edit_tools.rs::SymForgeServer::insert_symbol"),
+    ),
+    (
+        "replace_symbol_body",
+        Some("src/protocol/edit_tools.rs::SymForgeServer::replace_symbol_body"),
+    ),
+    ("symforge_edit", None),
+];
+const EDIT_REPLAY_AUTHORITY_RESIDUAL_OWNERS: &[&str] = &["T058", "T064", "T066", "T072"];
+
+/// Successful source-free semantic-result modes on members that also have
+/// source-derived overlay rows. Ancillary untyped wire `_meta` remains D16;
+/// these are mode residuals, not whole-member exemptions.
+const AUTHORITY_FREE_MODE_RESIDUAL: &[(&str, &str, &str, &str)] = &[
+    (
+        "hooks",
+        "hook:Read",
+        "pass_through.non_source_read",
+        "Non-source Read subcommands select PassThrough and return fail-open success before endpoint or source access (hook.rs:291-315, :811-820, :854-869).",
+    ),
+    (
+        "tools",
+        "analyze_file_impact",
+        "estimate.args_only",
+        "SymForgeServer::analyze_file_impact returns an argument-derived estimate before source selection (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "search_text",
+        "estimate.args_only",
+        "SymForgeServer::search_text returns an argument-derived estimate before source selection (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "inspect_match",
+        "estimate.args_only",
+        "SymForgeServer::inspect_match returns an argument-derived estimate before source selection (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "search_files",
+        "estimate.args_only",
+        "SymForgeServer::search_files returns an argument-derived estimate before source selection (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "what_changed",
+        "estimate.args_only",
+        "SymForgeServer::what_changed returns an argument-derived estimate before source selection (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "explore",
+        "estimate.args_only",
+        "SymForgeServer::explore returns an argument-derived estimate before source selection (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "diff_symbols",
+        "estimate.args_only",
+        "SymForgeServer::diff_symbols returns an argument-derived estimate before source selection (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "ask",
+        "tool_help.static_catalog",
+        "SymForgeServer::ask routes smart_query::QueryIntent::ToolHelp to static catalog guidance without repository source (src/protocol/tools.rs; src/protocol/smart_query.rs).",
+    ),
+    (
+        "tools",
+        "symforge",
+        "probe_relay.search_text.estimate.args_only",
+        "SymForgeServer::facade_probe_is_measurement_safe exposes SymForgeServer::search_text's pre-authority estimate mode through the source-mutation-safe A-019 relay (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "symforge",
+        "probe_relay.search_files.estimate.args_only",
+        "SymForgeServer::facade_probe_is_measurement_safe exposes SymForgeServer::search_files's pre-authority estimate mode through the source-mutation-safe A-019 relay (src/protocol/tools.rs).",
+    ),
+    (
+        "tools",
+        "symforge",
+        "preview.pff_bypass.plan_floor",
+        "Preview can return a PFF bypass estimate from an ungrounded plan whose steps carry no IndexRefs (tools.rs:10844-10982; controller.rs:108-185, :581-597).",
+    ),
+    (
+        "tools",
+        "symforge",
+        "preview.plan_floor",
+        "Preview can return the ungrounded plan-floor estimate before repository source is selected (tools.rs:10959-10982; controller.rs:319-475).",
+    ),
+    (
+        "tools",
+        "symforge",
+        "pff_bypass.plan_floor",
+        "A non-preview PFF bypass can return from an ungrounded plan before repository source is selected (tools.rs:10985-11018; controller.rs:108-185, :581-597; executor.rs:34-106).",
+    ),
+    (
+        "tools",
+        "symforge",
+        "economics_bypass.plan_floor",
+        "A non-preview economics bypass can return from an ungrounded plan before repository source is selected (tools.rs:10985-11018; controller.rs:254-267, :349-475; executor.rs:34-106).",
+    ),
+    (
+        "tools",
+        "symforge",
+        "serve.ask_tool_help.static_catalog",
+        "The facade can serve ask ToolHelp's static catalog without repository source (tools.rs:11039-11083, :12190; smart_query.rs:598-622, :780-932).",
+    ),
+];
+
+const AUTHORITY_FREE_MODE_RESIDUAL_OWNERS: &[(&str, &[&str])] = &[
+    ("hooks", &["T064", "T066", "T067", "T072"]),
+    ("tools", &["T066", "T067", "T072"]),
+];
+
+/// Stable source tokens behind the tool-mode residual. Line numbers drift as
+/// repairs land; these symbol anchors fail if the reviewed implementation seam
+/// is renamed or removed, while the basis strings above remain human-readable.
+const AUTHORITY_FREE_MODE_SOURCE_ANCHORS: &[(&str, &str)] = &[
+    (
+        "analyze_file_impact",
+        "pub(crate) async fn analyze_file_impact",
+    ),
+    ("search_text", "pub(crate) async fn search_text"),
+    ("inspect_match", "pub(crate) async fn inspect_match"),
+    ("search_files", "pub(crate) async fn search_files"),
+    ("what_changed", "pub(crate) async fn what_changed"),
+    ("explore", "pub(crate) async fn explore"),
+    ("diff_symbols", "pub(crate) async fn diff_symbols"),
+    ("ask", "smart_query::QueryIntent::ToolHelp"),
+    (
+        "symforge",
+        "fn facade_probe_is_measurement_safe(tool: &str, args: &serde_json::Value)",
+    ),
+];
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum EstimateTrueDisposition {
+    PreAuthority,
+    SourceDerived,
+    IgnoredSourceDerived,
+    AliasDropsEstimateSourceDerived,
+}
+
+/// Every advertised `estimate=true` ingress, pinned to what current release
+/// dispatch actually does rather than inferred from the common parameter name.
+const ESTIMATE_TRUE_DISPOSITION: &[(&str, &str, EstimateTrueDisposition, &str)] = &[
+    (
+        "tools",
+        "analyze_file_impact",
+        EstimateTrueDisposition::PreAuthority,
+        "args-only estimate",
+    ),
+    (
+        "tools",
+        "search_text",
+        EstimateTrueDisposition::PreAuthority,
+        "args-only estimate",
+    ),
+    (
+        "tools",
+        "inspect_match",
+        EstimateTrueDisposition::PreAuthority,
+        "args-only estimate",
+    ),
+    (
+        "tools",
+        "search_files",
+        EstimateTrueDisposition::PreAuthority,
+        "args-only estimate",
+    ),
+    (
+        "tools",
+        "what_changed",
+        EstimateTrueDisposition::PreAuthority,
+        "args-only estimate",
+    ),
+    (
+        "tools",
+        "explore",
+        EstimateTrueDisposition::PreAuthority,
+        "args-only estimate",
+    ),
+    (
+        "tools",
+        "diff_symbols",
+        EstimateTrueDisposition::PreAuthority,
+        "args-only estimate",
+    ),
+    (
+        "tools",
+        "get_symbol",
+        EstimateTrueDisposition::SourceDerived,
+        "estimate reads selected source/publication state",
+    ),
+    (
+        "tools",
+        "get_file_content",
+        EstimateTrueDisposition::SourceDerived,
+        "estimate reads selected source/publication state",
+    ),
+    (
+        "tools",
+        "get_repo_map",
+        EstimateTrueDisposition::SourceDerived,
+        "estimate reads selected source/publication state",
+    ),
+    (
+        "tools",
+        "get_file_context",
+        EstimateTrueDisposition::SourceDerived,
+        "estimate reads selected source/publication state",
+    ),
+    (
+        "tools",
+        "get_symbol_context",
+        EstimateTrueDisposition::SourceDerived,
+        "estimate reads selected source/publication state",
+    ),
+    (
+        "tools",
+        "search_symbols",
+        EstimateTrueDisposition::IgnoredSourceDerived,
+        "advertised flag is ignored; normal source-derived search runs",
+    ),
+    (
+        "tools",
+        "find_references",
+        EstimateTrueDisposition::IgnoredSourceDerived,
+        "advertised flag is ignored; normal source-derived search runs",
+    ),
+    (
+        "tools",
+        "find_dependents",
+        EstimateTrueDisposition::IgnoredSourceDerived,
+        "advertised flag is ignored; normal source-derived search runs",
+    ),
+    (
+        "compatibility_aliases",
+        "trace_symbol",
+        EstimateTrueDisposition::AliasDropsEstimateSourceDerived,
+        "release alias drops estimate and dispatches get_symbol_context (daemon.rs:5523-5542)",
     ),
 ];
 
@@ -372,17 +677,21 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "compatibility_aliases",
         "detect_changes",
-        &["GitObserved", "WorktreeScopeObserved"],
+        &["GitObserved", "Refused", "WorktreeScopeObserved"],
         "compatibility_aliases assertion: `detect_changes` returns GitObserved for committed-ref \
          diffs or WorktreeScopeObserved for worktree diffs, and never acquires a ProjectQueryLease \
-         or upgrades observation evidence to GenerationLeased",
+         or upgrades observation evidence to GenerationLeased. Current V10's delegated \
+         `detect_impact` still consumes generation symbols/graph; T064 must refactor that \
+         implementation into the frozen pure-observation target before activation. Its loading \
+         guard can terminate unavailable publication state as Refused.",
     ),
     (
         "compatibility_aliases",
         "trace_symbol",
-        &["GenerationLeased", "Refused"],
+        &["DiskObserved", "GenerationLeased", "Refused"],
         "compatibility_aliases assertion: `trace_symbol` cannot reach V10 symbol caches and uses \
-         GenerationLeased ONLY for a complete Current publication. The `only` forbids the lease \
+         GenerationLeased ONLY for a complete Current publication. Its delegated path-local \
+         symbol-context degradation can return DiskObserved. The `only` forbids the lease \
          on an incomplete publication but does not name the other outcome; ORACLE-INGRESS-CLOSED-\
          SURFACE and INV-SURFACE do — Refused is the branch that terminates selection. \
          {GenerationLeased} alone would claim this alias can never refuse.",
@@ -445,149 +754,249 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "writers",
         "src/protocol/edit.rs::execute_batch_edit",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer",
+        &["GenerationLeased", "MutationPermitted"],
+        "Dry-run renders a plan from the captured current indexed inputs without writing, so that mode is GenerationLeased; apply performs the repository-source writes under MutationPermitted",
     ),
     (
         "writers",
         "src/protocol/edit.rs::execute_batch_insert",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer",
+        &["GenerationLeased", "MutationPermitted"],
+        "Dry-run renders a plan from the captured current indexed inputs without writing, so that mode is GenerationLeased; apply performs the repository-source writes under MutationPermitted",
     ),
     (
         "writers",
         "src/protocol/edit.rs::execute_batch_rename",
-        &["MutationPermitted"],
-        "writers assertion 1: repository-source byte writer",
+        &["GenerationLeased", "MutationPermitted"],
+        "Dry-run renders a plan from the captured current indexed inputs without writing, so that mode is GenerationLeased; apply performs the repository-source writes under MutationPermitted",
     ),
+    // These seven writer members duplicate the corresponding tool ingresses.
+    // Their identical stored-success replay returns before edit dispatch and is
+    // the explicit T058/T064/T066/T072 mode-level residual: ReplayRecord v1
+    // carries no typed source/authority receipt, so PR 4 does not mislabel that
+    // zero-write response as a fresh MutationPermitted branch.
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::batch_edit",
-        &["MutationPermitted", "Refused"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+        ],
+        "Dry-run source preparation reports DiskRefreshed or CurrentIndex; apply is a repository-source mutation. Refused covers foreign-project and unavailable-publication termination. This writer member is the same tool ingress as the matching tools row.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::batch_insert",
-        &["MutationPermitted", "Refused"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+        ],
+        "Dry-run source preparation reports DiskRefreshed or CurrentIndex; apply is a repository-source mutation. Refused covers foreign-project and unavailable-publication termination. This writer member is the same tool ingress as the matching tools row.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::batch_rename",
-        &["MutationPermitted", "Refused"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+        ],
+        "Dry-run source preparation reports DiskRefreshed or CurrentIndex; apply is a repository-source mutation. Refused covers foreign-project and unavailable-publication termination. This writer member is the same tool ingress as the matching tools row.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::delete_symbol",
-        &["MutationPermitted", "Refused"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply is a repository-source mutation. Refused covers foreign-project and unavailable-publication termination. This writer member is the same tool ingress as the matching tools row.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::edit_within_symbol",
-        &["MutationPermitted", "Refused"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply is a repository-source mutation. Refused covers foreign-project and unavailable-publication termination. This writer member is the same tool ingress as the matching tools row.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::insert_symbol",
-        &["MutationPermitted", "Refused"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply is a repository-source mutation. Refused covers foreign-project and unavailable-publication termination. This writer member is the same tool ingress as the matching tools row.",
     ),
     (
         "writers",
         "src/protocol/edit_tools.rs::SymForgeServer::replace_symbol_body",
-        &["MutationPermitted", "Refused"],
-        "writers assertion 1: repository-source byte writer (tool ingress over edit.rs); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply is a repository-source mutation. Refused covers foreign-project and unavailable-publication termination. This writer member is the same tool ingress as the matching tools row.",
     ),
     // ---- tools: edit family (7), the same sets as their writers rows ----
+    // The shared stored-success replay residual above applies to each tool row.
     (
         "tools",
         "batch_edit",
-        &["MutationPermitted", "Refused"],
-        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+        ],
+        "Dry-run source preparation reports DiskRefreshed or CurrentIndex without writing; apply acquires the repository-source MutationPermitted branch. Foreign-project and unavailable-publication paths select Refused.",
     ),
     (
         "tools",
         "batch_insert",
-        &["MutationPermitted", "Refused"],
-        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+        ],
+        "Dry-run source preparation reports DiskRefreshed or CurrentIndex without writing; apply acquires the repository-source MutationPermitted branch. Foreign-project and unavailable-publication paths select Refused.",
     ),
     (
         "tools",
         "batch_rename",
-        &["MutationPermitted", "Refused"],
-        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+        ],
+        "Dry-run source preparation reports DiskRefreshed or CurrentIndex without writing; apply acquires the repository-source MutationPermitted branch. Foreign-project and unavailable-publication paths select Refused.",
     ),
     (
         "tools",
         "delete_symbol",
-        &["MutationPermitted", "Refused"],
-        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply acquires MutationPermitted. Foreign-project and unavailable-publication paths select Refused.",
     ),
     (
         "tools",
         "edit_within_symbol",
-        &["MutationPermitted", "Refused"],
-        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply acquires MutationPermitted. Foreign-project and unavailable-publication paths select Refused.",
     ),
     (
         "tools",
         "insert_symbol",
-        &["MutationPermitted", "Refused"],
-        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply acquires MutationPermitted. Foreign-project and unavailable-publication paths select Refused.",
     ),
     (
         "tools",
         "replace_symbol_body",
-        &["MutationPermitted", "Refused"],
-        "tools assertion 3: a repository-source edit, so MutationPermitted acquires the SourceMutationPermit; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "Dry-run source preparation reports DiskRefreshed, CurrentIndex, or WorktreeTarget after reroute rebasing; apply acquires MutationPermitted. Foreign-project and unavailable-publication paths select Refused.",
     ),
     (
         "tools",
         "curate_knowledge",
-        &["MutationPermitted", "Refused", "StateWriteAuthorized"],
-        "Same write set as its writers row: the source policy write at repo_root POLICY_FILE (FR-037) plus the permit-free ProjectStateDir finalization; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
+        &[
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "StateWriteAuthorized",
+        ],
+        "Preview validates the reviewed action set against one captured current knowledge publication, selecting GenerationLeased without writing. A fresh source-changing apply selects MutationPermitted; its journal/state writes are subordinate. Recovery or post-image-only finalization selects StateWriteAuthorized without rewriting source. A non-matching local project selects Refused (knowledge_curation.rs:403, :654, :740).",
     ),
     // ---- tools: the two facades, closed last as the union of what they
     // dispatch. Production compact serve is `build_plan` ->
-    // `dispatch_tool_for_tests(&step.tool)`; `probe_legacy_tool` is
-    // harness-only, so the union is over the steps the PLANNER emits, not over
-    // every tool name a probe could pass.
+    // `dispatch_tool_for_tests(&step.tool)`. The production-reachable A-019
+    // measurement relay is separately restricted to a source-mutation-safe
+    // allowlist; `batch_rename` is admitted only with `dry_run=true`. Normal
+    // read-path cache/frecency effects remain subordinate.
     (
         "tools",
         "symforge",
         &[
+            "DiskObserved",
             "GenerationLeased",
             "GitObserved",
             "Refused",
             "RuntimeHealthObserved",
             "WorktreeScopeObserved",
         ],
-        "Union of the planned steps. GenerationLeased: the planner emits \
-         get_repo_map/get_file_context/get_file_content/get_symbol/search_*/explore/\
-         find_references/find_dependents/search_knowledge/symforge_retrieve. GitObserved + \
-         WorktreeScopeObserved: `route_impact` plans `detect_impact` (planner.rs:1101-1108) and \
-         FindChanges routes via `route_tool_name` (smart_query.rs:613) to `what_changed`, whose \n         `default_args_for_tool` is `json!({})` (src/stel/planner.rs:1203) - empty args still take the \n         worktree lane through `since.is_none() && has_repo_root` (tools.rs:839), so that pair \n         holds; `smart_query.rs:575` is `route_invocation`, a DISPLAY string, not the route. \n         `inject_find_fusion_cochange_anchor` (call tools.rs:11029, def :6776) and \n         `append_impact_intent_cochanges` (call :11123, def :11171) are further GitObserved here. \n         RuntimeHealthObserved: `index health` plans `health_compact` (planner.rs:879-886). \
-         Refused: `foreign_project_refusal` and a set-valued `projects` on THIS handler — the \
-         empty-query and compact-surface gates are InvalidRequest, not INV-SURFACE Refused. \
-         ToolHelp routes to `ask` (not `render_tool_catalog`), and `ask` may reach the catalog; \
-         that arm carries no source-authority branch, which is init's host-config shape — a \
-         facade may dispatch into an authority-free arm without the member becoming \
-         authority-free, and it adds no ninth state.",
+        "Union of the planned steps plus the enforced A-019 source-mutation-safe relay. DiskObserved: the \
+         planner can emit targeted read/reference tools whose returned degradation or raw fallback \
+         is disk-authoritative. GenerationLeased: the planner emits generation-backed read, search, \
+         exploration, knowledge, and retrieval steps. GitObserved + WorktreeScopeObserved: \
+         `route_impact` plans `detect_impact` (planner.rs:1101-1108), while FindChanges routes via \
+         `route_tool_name` (smart_query.rs:613) to `what_changed`; empty default args \
+         (src/stel/planner.rs:1203) select its worktree lane. The allowlisted \
+         Fusion, co-change, and untracked-path enrichment on another selected result remain \
+         subordinate. RuntimeHealthObserved: `index \
+         health` plans `health_compact` (planner.rs:879-886). Refused: \
+         `foreign_project_refusal` and a set-valued `projects` on THIS handler; empty-query and \
+         compact-surface gates are InvalidRequest instead. `facade_probe_is_measurement_safe` constrains \
+         the relay to Disk/Generation/Refused modes already in this set and prevents \
+         MutationPermitted or an explicit StateWriteAuthorized selection. It emits no semantic \
+         result-status metadata because rendered legacy/source text cannot prove an OutcomeClass. \
+         ToolHelp routes to `ask`, whose catalog arm is \
+         authority-free; that adds no ninth state. This is the target set: current repeat-cache and \
+         CCR retrieval paths still lack publication/source identity and must gain the frozen fences \
+         before activation rather than being relabeled authority-free.",
     ),
     (
         "tools",
         "symforge_edit",
-        &["MutationPermitted", "Refused"],
-        "`build_edit_plan` emits only `replace_symbol_body`, `insert_symbol` and \
-         `edit_within_symbol` (edit_planner.rs:150-179), all MutationPermitted; preview goes \
-         through those same tools and apply is those tools committing, so preview adds no branch. \
-         Refused is `foreign_project_refusal` on this handler (tools.rs:~11255). Not \
-         GenerationLeased — the edit planner emits no generation-backed read — and not \
-         curate_knowledge, which is its own member.",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "`build_edit_plan` emits only `replace_symbol_body`, `insert_symbol`, and `edit_within_symbol` (edit_planner.rs:150-179). Their preview/source-preparation modes report DiskRefreshed, CurrentIndex, or WorktreeTarget; a dispatched source-changing apply acquires MutationPermitted. `foreign_project_refusal` on this facade selects Refused. Identical stored-success replay probes after source preparation but returns before dispatch/permit; ReplayRecord v1 does not bind the fresh observation to its stored result, so that terminal mode is the explicit T058/T064/T066/T072 residual rather than a fabricated branch. `curate_knowledge` remains its own member.",
     ),
     // ---- tools: the three that needed the whole body read ----
     // Each of these was nearly mis-assigned from a partial read, the same way
@@ -620,27 +1029,32 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "tools",
         "analyze_file_impact",
-        &["DiskObserved", "GitObserved", "Refused"],
+        &["DiskObserved", "GenerationLeased", "Refused"],
         "Refused is `foreign_project_refusal(params.0.project)` at the top of the body. \
-         `File not found on disk` is path-local DiskObserved (T042), NOT Refused. Co-changes read \
-         `git_temporal::GitTemporalState` when that lane runs, which is GitObserved. \
-         `published_generation()` is the T046 footer capture, not a ProjectQueryLease — \
-         GenerationLeased here would tell Slice 4 to lease a post-edit reindex that must run while \
-         the source is non-Current, and the index update itself is T064 candidate work, the same \
-         class as the `single_file` exceptions rather than a branch.",
+         `File not found on disk` is path-local DiskObserved (T042), NOT Refused. The successful \
+         edit/new-file modes also consume generation-owned pre/post symbols, publication snapshots, \
+         admission tier, and caller graph; under the frozen mixed-derivation rule that result selects \
+         GenerationLeased. Optional co-change data is subordinate enrichment, not an independently \
+         selected GitObserved result branch (tools.rs:5315-5329; handlers.rs:1219-1298, \
+         :1385-1433, :1500-1528, :1631-1668).",
     ),
-    // ---- tools: git/worktree observation, pinned by the detect_changes row ----
+    // ---- tools: change observation across generation/git/worktree lanes ----
     (
         "tools",
         "detect_impact",
-        &["GitObserved", "WorktreeScopeObserved"],
-        "The target detect_changes delegates to (compatibility_aliases assertion): GitObserved for committed-ref diffs, WorktreeScopeObserved for worktree diffs, and never a ProjectQueryLease",
+        &["GitObserved", "Refused", "WorktreeScopeObserved"],
+        "Frozen target of the detect_changes alias: GitObserved for committed-ref diffs, WorktreeScopeObserved for worktree diffs, and never a ProjectQueryLease. Current V10 still consumes generation symbols and caller graph (tools.rs:8463-8561); T064 must refactor that implementation to pure observation before activation. `loading_guard!` can terminate unavailable publication state as Refused.",
     ),
     (
         "tools",
         "what_changed",
-        &["GitObserved", "WorktreeScopeObserved", "Refused"],
-        "Same observation pair as detect_impact; WhatChangedInput additionally documents a project selector that refuses a non-matching value (tools.rs), which is INV-SURFACE Refused terminating selection",
+        &[
+            "GenerationLeased",
+            "GitObserved",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "`since=` selects `WhatChangedMode::Timestamp`, captures the live-index timestamp view, and derives authority with `SourceAuthority::from_freshness`, so a Current result is GenerationLeased. Git-ref mode is GitObserved and uncommitted mode is WorktreeScopeObserved. `foreign_project_refusal` and the loading guard can terminate selection as Refused (tools.rs:3283-3297, :8019-8020, :8058-8064).",
     ),
     // ---- tools: dual-lane ----
     (
@@ -649,18 +1063,23 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
         &["DiskObserved", "GenerationLeased", "Refused"],
         "Both lanes are in the body: an indexed read off the published generation and an AUTHORITATIVE disk-read lane taken when the same-project publication is refused (tools.rs:8968-8983, permits_authoritative_disk_fallback); Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
     ),
-    // ---- tools: generation-backed reads ----
+    // ---- tools: remaining read-only surfaces ----
     (
         "tools",
         "ask",
-        &["GenerationLeased", "Refused"],
-        "resources/tools assertion 3: a generation-backed read pinning one V11 publication, so it holds the ProjectQueryLease; SmartQueryInput documents a project selector that refuses a non-matching value, which is INV-SURFACE Refused",
+        &[
+            "DiskObserved",
+            "GenerationLeased",
+            "Refused",
+            "WorktreeScopeObserved",
+        ],
+        "The routed tool set includes generation-backed reads, the disk-authoritative degradation/reference modes, and worktree-backed search/change modes. SmartQueryInput's non-matching project selector and delegated unavailable-publication paths select Refused. No ask route selects a pure committed-Git result mode.",
     ),
     (
         "tools",
         "diff_symbols",
-        &["GenerationLeased", "Refused"],
-        "resources/tools assertion 3: a generation-backed read pinning one V11 publication, so it holds the ProjectQueryLease; DiffSymbolsInput documents a project selector that refuses a non-matching value, which is INV-SURFACE Refused",
+        &["GitObserved", "Refused"],
+        "`diff_symbols` routes every successful observation through `GitRepo::changed_paths_between_refs(base, target)` and parses the Git-ref bytes directly; LiveIndex supplies admission policy, not the parsed content. Missing refs default to `main`/`HEAD`; an explicit empty target fails ref resolution rather than selecting a worktree lane. `foreign_project_refusal` and the loading guard can terminate selection as Refused (tools.rs:12239-12330; format.rs:6541-6605; git.rs:121-157).",
     ),
     (
         "tools",
@@ -683,14 +1102,14 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "tools",
         "context_inventory",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: its input carries no `project` parameter.",
+        &["RuntimeHealthObserved"],
+        "`context_inventory` snapshots `session_context` and CCR compression economics and formats live session/runtime-work state; it never reads publication freshness or acquires a ProjectQueryLease, so tools assertion 4 classifies it RuntimeHealthObserved. No Refused: it has neither a project selector nor a loading guard (tools.rs:11922-11936).",
     ),
     (
         "tools",
         "conventions",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: its input carries no `project` parameter.",
+        &["GenerationLeased", "Refused"],
+        "`detect_conventions` reads the indexed publication, so the Ready path is GenerationLeased under tools assertion 3. `loading_guard!` terminates Empty, Loading, and CircuitBreaker states as Refused; having no project argument removes only selector refusal, not runtime-unavailability refusal (tools.rs:3933-3944, :10615-10623).",
     ),
     (
         "tools",
@@ -701,20 +1120,20 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "tools",
         "find_references",
-        &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "The normal reference query is generation-backed. Path-admission degradation can return early from repo-confined disk evidence, selecting DiskObserved; the later Tier-2 disk completeness disclosure is subordinate to its already selected result. Non-matching local-project and unavailable-publication paths select Refused (tools.rs:2560-2634, :9103-9118).",
     ),
     (
         "tools",
         "get_file_content",
-        &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Indexed bytes select GenerationLeased; the admitted raw-disk fallback explicitly returns a disk observation. Foreign-project and unavailable-publication paths select Refused (tools.rs:8882-8915).",
     ),
     (
         "tools",
         "get_file_context",
-        &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Normal context pins one publication. An index miss can return the repo-confined disk-derived admission-tier degradation view; foreign-project, targeted-freshen, and unavailable-publication paths select Refused (tools.rs:2560-2634, :4597-4647).",
     ),
     (
         "tools",
@@ -725,248 +1144,253 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "tools",
         "get_symbol",
-        &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Target contract: normal symbol reads pin one publication; a single-path index miss can return the repo-confined disk-derived admission-tier degradation view; foreign-project and unavailable-publication paths select Refused. Current repeat-cache hits lack publication identity (tools.rs:4284-4297; session.rs:207-235, :460-469), so T064/T066/T067 must add the frozen cache fence before activation rather than remove GenerationLeased.",
     ),
     (
         "tools",
         "get_symbol_context",
-        &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Normal symbol context pins one publication. Bundle mode can propagate path-local freshening as `disk-refreshed`, and an index miss can return a repo-confined disk admission view; foreign-project and unavailable-publication paths select Refused (tools.rs:4863-4869, :4875-4885, :4914-4968).",
     ),
     (
         "tools",
         "inspect_match",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: `InspectMatchInput` has no `project` field and the handler calls no selector refusal.",
+        &["GenerationLeased", "Refused"],
+        "`inspect_match` captures its view from the indexed publication, so the Ready path is GenerationLeased under tools assertion 3. `loading_guard!` terminates Empty, Loading, and CircuitBreaker states as Refused; the lack of a project field removes only selector refusal (tools.rs:3933-3944, :6047-6064).",
     ),
     (
         "tools",
         "review_knowledge",
         &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7656), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "search_files",
         &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `foreign_project_refusal` on a non-matching `project` selector, which is INV-SURFACE selection termination.",
+        "Every source-derived successful mode consumes generation-owned structure. Normal path search is directly generation-backed; `changed_with=` renders current-index parse state with temporal co-change signals; and the untracked-path hint compares Git/worktree paths against a generation-owned NotFound result. Under the frozen mixed-derivation rule these remain GenerationLeased rather than lease-free GitObserved or WorktreeScopeObserved branches. Foreign-project and unavailable-publication paths select Refused (tools.rs:2271-2416, :6100-6104, :6122-6380, :6684-6691).",
     ),
     (
         "tools",
         "search_knowledge",
         &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7656), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "search_symbols",
         &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
+        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7656), which is INV-SURFACE selection termination.",
     ),
     (
         "tools",
         "search_text",
         &["GenerationLeased", "Refused"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination.",
+        "Indexed search is generation-backed. Its zero-hit fallback consults that live-index result while gating untracked worktree text and appends both claims, so the frozen mixed-derivation rule keeps the returned mode GenerationLeased rather than selecting a lease-free WorktreeScopeObserved branch. Non-matching local-project and unavailable-publication paths select Refused (tools.rs:2492-2527, :3407-3491).",
     ),
     (
         "tools",
         "symforge_retrieve",
-        &["GenerationLeased"],
-        "tools assertion 3: a generation-backed read over one V11 publication, so it holds the ProjectQueryLease. No Refused: `SymforgeRetrieveInput` has no `project` field and the handler calls no selector refusal.",
+        &["GenerationLeased", "Refused"],
+        "Frozen CCR target: a live handle renders only its generation-bound projection; missing, evicted, or foreign-generation handles select Refused. Current CCR blobs carry no source/publication identity (ccr.rs:72-80, :137-166, :185-203), so T064/T066/T067 must add that fence before activation rather than bless retrieval as authority-free.",
     ),
     // ---- sidecar (24/24): 12 routes, each paired with its session twin ----
     (
         "sidecar",
         "GET /health",
-        &["RuntimeHealthObserved"],
-        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Standalone route. NO Refused: `caller_root_guard` is installed on the router but SKIPS this path by name (handlers.rs:336-340 — \"liveness probes and the hook's fail-open target must never 409\"), and the daemon twin `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4269). Assertion 3 does not reach a path the guard is written to ignore.",
+        &["Refused", "RuntimeHealthObserved"],
+        "Target contract: health success is RuntimeHealthObserved and caller-root mismatch selects Refused under the unconditional frozen sidecar guard. Current V10 skips the standalone health path and omits the daemon guard; T066/T067 must close that gap before activation (handlers.rs:330-350; daemon.rs:4249-4266, :4304).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/health",
-        &["RuntimeHealthObserved"],
-        "`health_handler`; sidecar assertion 2 (RuntimeHealthObserved endpoints separate committed-generation fields from attempt and work state). Session-scoped twin, same handler. NO Refused, and NOT via the router's skip list: that list matches the exact paths `/health` and `/stats` on the SIDECAR router, which this proxied path is not. The honest reason is the daemon handler — `sidecar_health_handler` never calls `guard_session_caller_root` (daemon.rs:4269).",
+        &["Refused", "RuntimeHealthObserved"],
+        "Session health has the same target modes: RuntimeHealthObserved success and Refused on caller-root mismatch. Current V10's daemon health handler omits the frozen guard; T066/T067 must add it (daemon.rs:4249-4266, :4304).",
     ),
     (
         "sidecar",
         "GET /impact",
-        &["DiskObserved", "GitObserved", "Refused"],
-        "`impact_handler`, the same lanes as `analyze_file_impact`: a path-local disk read and the git-temporal co-change lane. Not GenerationLeased - published_generation() there is the T046 footer capture, not a lease. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "`impact_handler` can return a path-local disk result, while successful edit/new-file analysis consumes generation-owned pre/post symbols, snapshots, admission tier, or caller graph and therefore selects GenerationLeased under the frozen mixed-derivation rule. It has no independently selected Git mode. Refused is sidecar assertion 3: caller-root mismatch terminates selection before either standalone or daemon-proxied handling (handlers.rs:1013-1046, :1219-1298, :1385-1433, :1500-1528, :1631-1668).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/impact",
-        &["DiskObserved", "GitObserved", "Refused"],
-        "`impact_handler`, the same lanes as `analyze_file_impact`: a path-local disk read and the git-temporal co-change lane. Not GenerationLeased - published_generation() there is the T046 footer capture, not a lease. session-scoped twin of the standalone route, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Session-scoped twin of `impact_handler`: the same disk/generation mixed-result modes, no independent Git mode, and the same caller-root Refused termination (handlers.rs:1013-1046; daemon.rs:3592-3629, :4315-4336).",
     ),
     (
         "sidecar",
         "GET /outline",
         &["GenerationLeased", "Refused"],
-        "`outline_handler`, the generation-backed file outline; sidecar assertion 1 (generation-backed endpoints use GenerationLeased). standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "`outline_handler` may freshen from disk, but then captures and renders `published.live`; DiskRefreshed is provenance inside a generation-derived result, not an independently selected DiskObserved branch. Caller-root or unavailable-publication termination selects Refused (handlers.rs:719-745).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/outline",
         &["GenerationLeased", "Refused"],
-        "`outline_handler`, the generation-backed file outline; sidecar assertion 1 (generation-backed endpoints use GenerationLeased). session-scoped twin of the standalone route, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped twin of `outline_handler`: refresh provenance feeds the captured publication, so success is GenerationLeased; caller-root or unavailable-publication termination is Refused (handlers.rs:719-745; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /prompt-context",
         &["GenerationLeased", "Refused"],
-        "`prompt_context_handler`, generation-backed: `require_queryable_sidecar_index` then `capture_queryable_sidecar_generation` (handlers.rs:2274+). standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "`prompt_context_handler` freshens as needed and then captures/renders `published.live`; the result is GenerationLeased, with DiskRefreshed retained only as provenance. Caller-root or unavailable-publication termination selects Refused (handlers.rs:2307-2445).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/prompt-context",
         &["GenerationLeased", "Refused"],
-        "`prompt_context_handler`, generation-backed: `require_queryable_sidecar_index` then `capture_queryable_sidecar_generation` (handlers.rs:2274+). session-scoped twin of the standalone route, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped twin of `prompt_context_handler`: refresh provenance feeds a captured generation result; caller-root or unavailable-publication termination selects Refused (handlers.rs:2307-2445; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /repo-map",
         &["GenerationLeased", "Refused"],
-        "`repo_map_handler`, the generation-backed repo map; sidecar assertion 1. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "`repo_map_handler`, the generation-backed repo map; sidecar assertion 1. Refused is sidecar assertion 3: standalone and daemon-proxied routes enforce the same caller-root termination (router.rs:52-56, handlers.rs:330-350; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/repo-map",
         &["GenerationLeased", "Refused"],
-        "`repo_map_handler`, the generation-backed repo map; sidecar assertion 1. session-scoped twin of the standalone route, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped `repo_map_handler` twin: generation-backed success under assertion 1 and the same caller-root Refused termination under assertion 3 (handlers.rs:330-350; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /stats",
-        &["RuntimeHealthObserved"],
-        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) — INV-HEALTH's runtime-WORK half: fires, estimated savings, tool-call counts. Assertion 2 exists precisely so those fields never mix into committed-generation truth, and the `health` tool already reports token savings on this branch. Live process counters, so not authority-free. Standalone route. NO Refused: the guard skips `/stats` by name (handlers.rs:336-340) and the daemon twin `sidecar_stats_handler` never calls `guard_session_caller_root` (daemon.rs:4439).",
+        &["Refused", "RuntimeHealthObserved"],
+        "Target contract: token statistics are RuntimeHealthObserved and caller-root mismatch selects Refused under the unconditional frozen sidecar guard. Current V10 skips standalone stats and omits the daemon guard; T066/T067 must close that gap (handlers.rs:330-350, :2452; daemon.rs:4249-4266, :4420).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/stats",
-        &["RuntimeHealthObserved"],
-        "`stats_handler` returns `state.token_stats.summary()` (handlers.rs:2452) - INV-HEALTH's runtime-WORK half: fires, estimated savings, tool-call counts, which assertion 2 keeps out of committed-generation truth. Live process counters, so not authority-free. Session-scoped twin. NO Refused, and NOT via the sidecar router's skip list - that list matches the exact paths `/health` and `/stats` on the SIDECAR router, which this proxied path is not. The reason is the daemon handler: `sidecar_stats_handler` never calls `guard_session_caller_root` (daemon.rs:4439).",
+        &["Refused", "RuntimeHealthObserved"],
+        "Session stats has the same target modes: RuntimeHealthObserved success and Refused on caller-root mismatch. Current V10's daemon stats handler omits the frozen guard; T066/T067 must add it (handlers.rs:2452; daemon.rs:4249-4266, :4420).",
     ),
     (
         "sidecar",
         "GET /symbol-context",
         &["GenerationLeased", "Refused"],
-        "`symbol_context_handler`, generation-backed symbol context; sidecar assertion 1. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "`symbol_context_handler` may freshen a path, but then captures and renders `published.live`; DiskRefreshed is provenance inside the generation-derived result. Caller-root or unavailable-publication termination selects Refused (handlers.rs:1752-1800).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/symbol-context",
         &["GenerationLeased", "Refused"],
-        "`symbol_context_handler`, generation-backed symbol context; sidecar assertion 1. session-scoped twin of the standalone route, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped twin of `symbol_context_handler`: refresh provenance feeds the captured publication, so success is GenerationLeased; caller-root or unavailable-publication termination is Refused (handlers.rs:1752-1800; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /workflows/post-edit-impact",
-        &["DiskObserved", "GitObserved", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_post_edit_impact_handler calls impact_handler (handlers.rs:1045), so it takes `/impact`'s set exactly. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Thin alias (sidecar assertion 4): workflow_post_edit_impact_handler delegates to impact_handler, so it takes `/impact`'s set exactly. Standalone and daemon-proxied routes enforce the same caller-root Refused termination (handlers.rs:1045, :330-350; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/workflows/post-edit-impact",
-        &["DiskObserved", "GitObserved", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_post_edit_impact_handler calls impact_handler (handlers.rs:1045), so it takes `/impact`'s set exactly. session-scoped twin, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Session-scoped post-edit alias: the delegated impact handler preserves `/impact`'s exact Disk/Generation/Refused set and caller-root termination (handlers.rs:1045, :330-350; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /workflows/prompt-context",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_prompt_narrowing_handler calls prompt_context_handler (handlers.rs:2296), so it takes `/prompt-context`'s set exactly. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Thin alias (sidecar assertion 4): workflow_prompt_narrowing_handler delegates to prompt_context_handler, whose refresh provenance feeds a captured generation result. Caller-root or unavailable-publication termination selects Refused (handlers.rs:2296, :2307-2445; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/workflows/prompt-context",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_prompt_narrowing_handler calls prompt_context_handler (handlers.rs:2296), so it takes `/prompt-context`'s set exactly. session-scoped twin, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped prompt-context alias: the delegated handler renders a captured generation after any refresh. Caller-root or unavailable-publication termination selects Refused (handlers.rs:2296, :2307-2445; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /workflows/repo-start",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_repo_start_handler calls repo_map_handler (handlers.rs:2046), so it takes `/repo-map`'s set exactly. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Thin alias (sidecar assertion 4): workflow_repo_start_handler delegates to repo_map_handler, so generation-backed success and caller-root Refused termination match `/repo-map` (handlers.rs:2046, :330-350; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/workflows/repo-start",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_repo_start_handler calls repo_map_handler (handlers.rs:2046), so it takes `/repo-map`'s set exactly. session-scoped twin, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped repo-start alias: the delegated handler preserves `/repo-map`'s Generation/Refused set and caller-root termination (handlers.rs:2046, :330-350; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /workflows/search-hit-expansion",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_search_hit_expansion_handler calls symbol_context_handler (handlers.rs:1727), so it takes `/symbol-context`'s set exactly. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Thin alias (sidecar assertion 4): workflow_search_hit_expansion_handler delegates to symbol_context_handler, whose refresh provenance feeds a captured generation result. Caller-root or unavailable-publication termination selects Refused (handlers.rs:1727, :1752-1800; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/workflows/search-hit-expansion",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_search_hit_expansion_handler calls symbol_context_handler (handlers.rs:1727), so it takes `/symbol-context`'s set exactly. session-scoped twin, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped search-hit alias: the delegated handler renders a captured generation after any refresh. Caller-root or unavailable-publication termination selects Refused (handlers.rs:1727, :1752-1800; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /workflows/source-read",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_source_read_handler calls outline_handler (handlers.rs:634), so it takes `/outline`'s set exactly. standalone route. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Thin alias (sidecar assertion 4): workflow_source_read_handler delegates to outline_handler, whose refresh provenance feeds a captured generation result. Caller-root or unavailable-publication termination selects Refused (handlers.rs:634, :719-745; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     (
         "sidecar",
         "GET /v1/sessions/{session_id}/sidecar/workflows/source-read",
         &["GenerationLeased", "Refused"],
-        "Thin alias (sidecar assertion 4): workflow_source_read_handler calls outline_handler (handlers.rs:634), so it takes `/outline`'s set exactly. session-scoped twin, same handler and same guard. Refused is sidecar assertion 3 (caller-root mismatch selects Refused and cannot fall through to V10): `caller_root_guard` is layered over every route in this router (router.rs:52-56, handlers.rs:330-350), and the daemon-proxied session twin enforces the SAME check (daemon.rs:11605)",
+        "Session-scoped source-read alias: the delegated handler renders a captured generation after any refresh. Caller-root or unavailable-publication termination selects Refused (handlers.rs:634, :719-745; daemon.rs:3592-3629, :4249-4266, :4304/:4334/:4364/:4393/:4420).",
     ),
     // ---- hooks (6 overlay; PreTool is authority-free, below) ----
     // Routing confirmed from `endpoint_for` (cli/hook.rs:944), NOT from
     // `workflow_for_subcommand`, which says it does not change routing yet.
-    // Fail-open (`fail_open_json`, empty additionalContext) adds no branch: it
-    // is not Refused and, per hooks assertion 3, carries no false Current.
+    // Fail-open (`fail_open_json`, empty additionalContext) adds no new branch
+    // and carries no false Current. It does not erase a typed sidecar 409/503
+    // Refused branch that was selected before presentation fallback.
     (
         "hooks",
         "hook:Read",
-        &["GenerationLeased"],
-        "endpoint_for routes this hook to `/outline` (cli/hook.rs:944+), the generation-backed lane of `get_file_context`. Refused is DROPPED: this process does not terminate selection - it fails open with empty additionalContext (hook.rs:8, :314) - and the caller_root guard that could refuse belongs to the sidecar.",
+        &["GenerationLeased", "Refused"],
+        "Source Read routes to `/outline`, whose refresh provenance feeds a captured generation result; typed root-conflict/index-unavailable responses select Refused before fail-open presentation. Non-source Read pass-through is the explicit mode-level authority-free residual (cli/hook.rs:291-315, :811-824, :944-1003).",
     ),
     (
         "hooks",
         "hook:SessionStart",
-        &["GenerationLeased"],
-        "endpoint_for routes this hook to `/repo-map` (cli/hook.rs:944+), the generation-backed lane of `get_repo_map`. Refused is DROPPED: this process does not terminate selection - it fails open with empty additionalContext (hook.rs:8, :314) - and the caller_root guard that could refuse belongs to the sidecar.",
+        &["GenerationLeased", "Refused"],
+        "`endpoint_for` routes SessionStart to `/repo-map`, whose success is generation-backed. Typed root-conflict/index-unavailable responses select Refused before the hook renders its empty fail-open presentation (cli/hook.rs:944-1003, :1228-1235, :1331-1337).",
     ),
     (
         "hooks",
         "hook:PromptSubmit",
-        &["GenerationLeased"],
-        "endpoint_for routes this hook to `/prompt-context` (cli/hook.rs:944+), the generation-backed lane of `prompt_context_handler`. Refused is DROPPED: this process does not terminate selection - it fails open with empty additionalContext (hook.rs:8, :314) - and the caller_root guard that could refuse belongs to the sidecar.",
+        &["GenerationLeased", "Refused"],
+        "`endpoint_for` routes PromptSubmit to `/prompt-context`, whose refresh provenance feeds a captured generation result. Typed root-conflict/index-unavailable responses select Refused before fail-open presentation (cli/hook.rs:944-1003, :1228-1235, :1331-1337).",
     ),
     (
         "hooks",
         "hook:Grep",
-        &["GenerationLeased", "RuntimeHealthObserved"],
-        "A genuine fork inside one ingress, like detect_changes: endpoint_for sends a plausible symbol name to `/symbol-context` (generation-backed) and everything else to `/health` (hook.rs ~984-990), so the set is the union of the two lanes. Refused is DROPPED for the same fail-open reason as the other hooks.",
+        &["GenerationLeased", "Refused", "RuntimeHealthObserved"],
+        "A genuine fork inside one ingress: `endpoint_for` sends a plausible symbol name to `/symbol-context` and everything else to `/health`, so success selects GenerationLeased or RuntimeHealthObserved. Grep supplies no path and cannot select symbol-context's path-triggered disk mode. A typed sidecar refusal remains Refused despite later fail-open presentation.",
     ),
     (
         "hooks",
         "hook:Edit",
-        &["DiskObserved", "GitObserved"],
+        &["GenerationLeased", "Refused"],
         "endpoint_for routes Edit to `/impact`, the `analyze_file_impact` lanes. It CANNOT be \
          MutationPermitted — hooks assertion 2: Edit and Write notifications cannot publish, mint \
-         a SourceMutationPermit, or bypass mutation authority. Refused is dropped from the tool's \
-         set because THIS process does not terminate selection: the hook fails open with empty \
-         additionalContext (hook.rs:8, :314), and the caller_root guard that could refuse belongs \
-         to the sidecar, not to this ingress.",
+         a SourceMutationPermit, or bypass mutation authority. Edit never sets `new_file`; its \
+         missing/readable results consume generation-owned pre/post state, so success is \
+         GenerationLeased. Read errors and typed root-conflict/index-unavailable termination select \
+         Refused before the hook's empty fail-open presentation (cli/hook.rs:960; \
+         handlers.rs:1385-1473).",
     ),
     (
         "hooks",
         "hook:Write",
-        &["DiskObserved", "GitObserved"],
-        "Same `/impact` route as hook:Edit with `new_file=true`, same assertion 2 prohibition, and \
-         the same fail-open reason for dropping Refused",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Write routes to `/impact` with `new_file=true`: stable PathMissing returns before \
+         published-symbol consumption and selects DiskObserved; a readable receipt consumes \
+         `receipt.published` and selects GenerationLeased; ReadError, root conflict, or unavailable \
+         publication selects Refused. Hooks assertion 2 still forbids mutation authority \
+         (cli/hook.rs:969; handlers.rs:1247-1272).",
     ),
     // ---- resources (7 overlay; glossary and tools/catalog are authority-free) ----
     // A resource wrapper starts from the set of the tool it wraps, then drops
@@ -976,53 +1400,56 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "resources",
         "symforge://file/content",
-        &["GenerationLeased"],
-        "Wraps `get_file_content`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Wraps `get_file_content` at resources.rs:210-243, including its raw-disk result lane (tools.rs:8882-8915). Passing `project: None` removes foreign-selector refusal only; unavailable publication state can still select Refused. Ready remains GenerationLeased under resources assertion 1.",
     ),
     (
         "resources",
         "symforge://file/context",
-        &["GenerationLeased"],
-        "Wraps `get_file_context`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Wraps `get_file_context` at resources.rs:199-208, including its disk-derived degradation lane (tools.rs:2560-2634, :4633-4648). Passing `project: None` removes foreign-selector refusal only; unavailable publication state can still select Refused. Ready remains GenerationLeased under resources assertion 1.",
     ),
     (
         "resources",
         "symforge://symbol/detail",
-        &["GenerationLeased"],
-        "Wraps `get_symbol`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Wraps `get_symbol` at resources.rs:245-257, including its single-path disk-derived degradation lane (tools.rs:4316-4328). Passing `project: None` removes foreign-selector refusal only; unavailable publication state can still select Refused. Ready remains GenerationLeased under resources assertion 1.",
     ),
     (
         "resources",
         "symforge://symbol/context",
-        &["GenerationLeased"],
-        "Wraps `get_symbol_context`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
+        &["DiskObserved", "GenerationLeased", "Refused"],
+        "Wraps `get_symbol_context` at resources.rs:259-273, including its path-local disk freshening/degradation result (tools.rs:4863-4886, :4958-4968). Passing `project: None` removes foreign-selector refusal only; unavailable publication state can still select Refused. Ready remains GenerationLeased under resources assertion 1.",
     ),
     (
         "resources",
         "symforge://repo/map",
-        &["GenerationLeased"],
-        "Wraps `get_repo_map`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication.",
+        &["GenerationLeased", "Refused"],
+        "Wraps `get_repo_map` at resources.rs:170-180. Passing `project: None` removes foreign-selector refusal only; the loading guard at tools.rs:4433-4442 can still refuse an unavailable runtime. Ready remains GenerationLeased under resources assertion 1.",
     ),
     (
         "resources",
         "symforge://repo/outline",
-        &["GenerationLeased"],
-        "Wraps `get_repo_map`, whose set is GenerationLeased plus Refused; the wrapper DROPS Refused because this invocation passes `project: None` (resources.rs:160+) and so can never present a non-matching selector. resources assertion 1: generation-backed resources use GenerationLeased and pin one V11 publication. repo/outline is that same invocation at detail=full, and a detail level is not a different branch.",
+        &["GenerationLeased", "Refused"],
+        "Wraps `get_repo_map` at resources.rs:158-169 with detail=full. Passing `project: None` removes foreign-selector refusal only; the loading guard at tools.rs:4433-4442 can still refuse an unavailable runtime. Ready remains GenerationLeased under resources assertion 1; detail does not select a different branch.",
     ),
     (
         "resources",
         "symforge://repo/changes/uncommitted",
-        &["WorktreeScopeObserved"],
+        &["Refused", "WorktreeScopeObserved"],
         "Wraps `what_changed` with `git_ref: None`, which is the worktree-diff lane ONLY, so the \
          wrapper drops GitObserved (that lane needs a committed ref this invocation cannot \
-         supply) and drops Refused (no caller-supplied selector to refuse). resources assertion 2: \
-         worktree-scope resources use their lease-free observed branch.",
+         supply). Passing no project removes selector refusal, but the delegated loading guard can \
+         still terminate unavailable publication state as Refused (resources.rs:182-195; \
+         tools.rs:8130-8133). resources assertion 2 keeps the successful worktree lane lease-free.",
     ),
     // ---- the health trio + its resource (4) ----
     // Runtime health is the one family that reports on the runtime itself
     // rather than on indexed content, so it takes its lease-free observed
-    // branch and never a ProjectQueryLease. Family membership is a basis, not a
-    // default: each member cites why it is in the family.
+    // branch and never a ProjectQueryLease. `status(reset_calibration=true)`
+    // additionally takes StateWriteAuthorized for its durable calibration
+    // reset. Family membership is a basis, not a default: each member cites
+    // why it is in the family and whether it has another reachable mode.
     (
         "tools",
         "health",
@@ -1041,9 +1468,8 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "tools",
         "status",
-        &["RuntimeHealthObserved"],
-        "Reports index/daemon runtime state, not indexed content, so it is a runtime-health \
-         observation under tools assertion 4 and acquires no ProjectQueryLease (tools assertion 3)",
+        &["RuntimeHealthObserved", "StateWriteAuthorized"],
+        "`status` normally reports index/daemon runtime state as RuntimeHealthObserved and takes no ProjectQueryLease. With `reset_calibration=true`, both local and proxy-owned paths call `reset_calibration`, which clears durable calibration tables in the ProjectStateDir STEL ledger, so that mode additionally takes StateWriteAuthorized (tools.rs:11503, :11552-11577, :11616-11627, :11772-11780; protocol/mod.rs:739-745; stel_core/ledger_store.rs:340-357, :964-978).",
     ),
     (
         "resources",
@@ -1072,10 +1498,12 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "writers",
         "src/protocol/knowledge_curation.rs::KnowledgeCurationCoordinator::apply",
-        &["MutationPermitted", "StateWriteAuthorized"],
+        &["MutationPermitted", "Refused", "StateWriteAuthorized"],
         "Does both: the source policy write via write_policy (FR-037, repo_root POLICY_FILE) and \
          the ProjectStateDir curation state under state_dir/CURATION_STATE_DIR \
-         (knowledge_curation.rs:351), which is the permit-free half of writers assertion 3",
+         (knowledge_curation.rs:351), which is the permit-free half of writers assertion 3. \
+         Capability and durability checks can terminate with the typed unavailable result before \
+         either write, selecting Refused (knowledge_curation.rs:422-430, :457-459, :1568-1624).",
     ),
     (
         "writers",
@@ -1095,8 +1523,13 @@ const SURFACE_OVERLAY: &[(&str, &str, &[&str], &str)] = &[
     (
         "writers",
         "src/protocol/tools.rs::SymForgeServer::curate_knowledge",
-        &["MutationPermitted", "Refused", "StateWriteAuthorized"],
-        "writers assertion 3, both halves: the source policy write at repo_root POLICY_FILE (FR-037) and the permit-free ProjectStateDir finalization; Refused because this handler calls `local_cross_project_refusal` on a non-matching `project` selector, the same selector class (tools.rs:7636), which is INV-SURFACE selection termination. The selector refusal lives on this tool handler, not on write_policy/apply/durable_replace*.",
+        &[
+            "GenerationLeased",
+            "MutationPermitted",
+            "Refused",
+            "StateWriteAuthorized",
+        ],
+        "This writer member is the same `curate_knowledge` tool ingress: preview selects GenerationLeased; a fresh source-changing apply selects MutationPermitted; recovery or post-image-only ProjectStateDir finalization selects StateWriteAuthorized; and a non-matching local project selects Refused. Journal/state writes during mutation remain subordinate. The selector refusal lives on this handler, not on write_policy/apply/durable_replace*.",
     ),
 ];
 
@@ -1296,6 +1729,239 @@ fn all_ingress_uses_exact_typed_authority_branch() {
         );
     }
 
+    // Pin the mode-level replay residual to the exact overlay rows it affects.
+    // This does not invent a ninth branch: it makes dropping or silently
+    // widening the approved residual executable until Slice 4 replaces it.
+    assert_eq!(
+        EDIT_REPLAY_AUTHORITY_RESIDUAL.len(),
+        8,
+        "identical replay affects exactly eight edit-tool ingresses"
+    );
+    assert_eq!(
+        EDIT_REPLAY_AUTHORITY_RESIDUAL_OWNERS,
+        &["T058", "T064", "T066", "T072"],
+        "replay residual ownership moved"
+    );
+    let mut replay_tools = BTreeSet::new();
+    let mut replay_writers = BTreeSet::new();
+    for (tool, writer) in EDIT_REPLAY_AUTHORITY_RESIDUAL {
+        assert!(
+            replay_tools.insert(*tool),
+            "replay residual names tool `{tool}` twice"
+        );
+        let (tool_allowed, _) = overlay
+            .get(&("tools", *tool))
+            .unwrap_or_else(|| panic!("replay residual tool `{tool}` lost its overlay row"));
+        match writer {
+            Some(writer) => {
+                assert!(
+                    replay_writers.insert(*writer),
+                    "replay residual names writer `{writer}` twice"
+                );
+                assert_eq!(
+                    writer.strip_prefix("src/protocol/edit_tools.rs::SymForgeServer::"),
+                    Some(*tool),
+                    "replay residual tool/writer pairing moved"
+                );
+                let (writer_allowed, _) = overlay.get(&("writers", *writer)).unwrap_or_else(|| {
+                    panic!("replay residual writer `{writer}` lost its overlay row")
+                });
+                assert_eq!(
+                    writer_allowed, tool_allowed,
+                    "duplicate replay tool/writer rows must carry the same non-replay modes"
+                );
+            }
+            None => assert_eq!(
+                *tool, "symforge_edit",
+                "only symforge_edit lacks a duplicate writer slot"
+            ),
+        }
+    }
+    assert_eq!(
+        replay_tools.len(),
+        8,
+        "replay residual tool names must be unique"
+    );
+    assert_eq!(
+        replay_writers.len(),
+        7,
+        "seven granular replay tools must retain duplicate writer rows"
+    );
+
+    // Source-free successful MODES on otherwise branch-bearing members. Keep
+    // this separate from whole-member authority-free ingress: deleting a mode,
+    // moving it to an exempt member, or inventing a ninth branch must fail.
+    assert_eq!(
+        AUTHORITY_FREE_MODE_RESIDUAL.len(),
+        16,
+        "the reviewed source-free mode residual has exactly sixteen entries"
+    );
+    assert_eq!(AUTHORITY_FREE_MODE_SOURCE_ANCHORS.len(), 9);
+    let tools_source = include_str!("../src/protocol/tools.rs");
+    for (member, anchor) in AUTHORITY_FREE_MODE_SOURCE_ANCHORS {
+        assert!(
+            tools_source.contains(anchor),
+            "reviewed source anchor for tools::{member} moved or disappeared: {anchor}"
+        );
+    }
+    assert_eq!(AUTHORITY_FREE_MODE_RESIDUAL_OWNERS.len(), 2);
+    assert_eq!(
+        AUTHORITY_FREE_MODE_RESIDUAL_OWNERS[0],
+        ("hooks", &["T064", "T066", "T067", "T072"][..]),
+        "hook source-free mode ownership moved"
+    );
+    assert_eq!(
+        AUTHORITY_FREE_MODE_RESIDUAL_OWNERS[1],
+        ("tools", &["T066", "T067", "T072"][..]),
+        "tool source-free mode ownership moved"
+    );
+    let whole_authority_free: BTreeSet<(&str, &str)> = AUTHORITY_FREE_INGRESS
+        .iter()
+        .map(|(category, member, _)| (*category, *member))
+        .collect();
+    let non_ingress: BTreeSet<(&str, &str)> = NON_INGRESS_EXCEPTIONS
+        .iter()
+        .map(|(category, member, _)| (*category, *member))
+        .collect();
+    let mut mode_triples = BTreeSet::new();
+    let mut mode_category_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut direct_pre_authority_estimates = BTreeSet::new();
+    let mut symforge_modes = BTreeSet::new();
+    for (category, member, mode, basis) in AUTHORITY_FREE_MODE_RESIDUAL {
+        assert!(
+            !mode.trim().is_empty(),
+            "source-free residual has an empty mode"
+        );
+        assert!(
+            !basis.trim().is_empty(),
+            "{category}::{member}::{mode} has no basis"
+        );
+        assert!(
+            mode_triples.insert((*category, *member, *mode)),
+            "source-free mode residual duplicates {category}::{member}::{mode}"
+        );
+        let key = (*category, *member);
+        assert!(
+            overlay.contains_key(&key),
+            "source-free mode {category}::{member}::{mode} lost its branch-bearing overlay row"
+        );
+        assert!(
+            !whole_authority_free.contains(&key) && !non_ingress.contains(&key),
+            "source-free mode {category}::{member}::{mode} moved onto a whole-member exemption"
+        );
+        *mode_category_counts.entry(*category).or_default() += 1;
+        if *mode == "estimate.args_only" {
+            direct_pre_authority_estimates.insert(key);
+        }
+        if *member == "symforge" {
+            symforge_modes.insert(*mode);
+        }
+    }
+    assert_eq!(
+        mode_category_counts,
+        BTreeMap::from([("hooks", 1), ("tools", 15)]),
+        "source-free mode categories moved"
+    );
+    assert_eq!(
+        direct_pre_authority_estimates,
+        BTreeSet::from([
+            ("tools", "analyze_file_impact"),
+            ("tools", "diff_symbols"),
+            ("tools", "explore"),
+            ("tools", "inspect_match"),
+            ("tools", "search_files"),
+            ("tools", "search_text"),
+            ("tools", "what_changed"),
+        ]),
+        "the exact seven direct estimate modes that return before authority moved"
+    );
+    assert_eq!(
+        symforge_modes,
+        BTreeSet::from([
+            "economics_bypass.plan_floor",
+            "pff_bypass.plan_floor",
+            "preview.pff_bypass.plan_floor",
+            "preview.plan_floor",
+            "probe_relay.search_files.estimate.args_only",
+            "probe_relay.search_text.estimate.args_only",
+            "serve.ask_tool_help.static_catalog",
+        ]),
+        "the compact facade's exact seven source-free modes moved"
+    );
+
+    // The shared `estimate` spelling does not imply shared semantics. Pin all
+    // sixteen advertised ingress dispositions and bind the seven genuinely
+    // pre-authority tools back to the mode residual above.
+    assert_eq!(ESTIMATE_TRUE_DISPOSITION.len(), 16);
+    let estimate_field_counts = [
+        include_str!("../src/protocol/read_tools.rs")
+            .matches("pub estimate: Option<bool>")
+            .count(),
+        include_str!("../src/protocol/search_tools.rs")
+            .matches("pub estimate: Option<bool>")
+            .count(),
+        include_str!("../src/protocol/tools.rs")
+            .matches("pub estimate: Option<bool>")
+            .count(),
+    ];
+    assert_eq!(
+        estimate_field_counts,
+        [8, 4, 4],
+        "advertised estimate ingress declarations moved across protocol modules"
+    );
+    assert_eq!(
+        estimate_field_counts.into_iter().sum::<usize>(),
+        ESTIMATE_TRUE_DISPOSITION.len(),
+        "every advertised estimate ingress must have one disposition"
+    );
+    let mut estimate_members = BTreeSet::new();
+    let mut estimate_counts: BTreeMap<EstimateTrueDisposition, usize> = BTreeMap::new();
+    let mut disposition_pre_authority = BTreeSet::new();
+    for (category, member, disposition, basis) in ESTIMATE_TRUE_DISPOSITION {
+        assert!(
+            !basis.trim().is_empty(),
+            "{category}::{member} estimate disposition has no basis"
+        );
+        assert!(
+            estimate_members.insert((*category, *member)),
+            "estimate disposition duplicates {category}::{member}"
+        );
+        assert!(
+            overlay.contains_key(&(*category, *member)),
+            "estimate disposition {category}::{member} lost its overlay row"
+        );
+        *estimate_counts.entry(*disposition).or_default() += 1;
+        if *disposition == EstimateTrueDisposition::PreAuthority {
+            disposition_pre_authority.insert((*category, *member));
+        }
+    }
+    assert_eq!(
+        [
+            estimate_counts
+                .get(&EstimateTrueDisposition::PreAuthority)
+                .copied()
+                .unwrap_or_default(),
+            estimate_counts
+                .get(&EstimateTrueDisposition::SourceDerived)
+                .copied()
+                .unwrap_or_default(),
+            estimate_counts
+                .get(&EstimateTrueDisposition::IgnoredSourceDerived)
+                .copied()
+                .unwrap_or_default(),
+            estimate_counts
+                .get(&EstimateTrueDisposition::AliasDropsEstimateSourceDerived)
+                .copied()
+                .unwrap_or_default(),
+        ],
+        [7, 5, 3, 1],
+        "estimate=true disposition counts moved"
+    );
+    assert_eq!(
+        disposition_pre_authority, direct_pre_authority_estimates,
+        "pre-authority estimate table and source-free mode residual diverged"
+    );
+
     // The pinned non-ingress exceptions, checked against the same frozen slots
     // and required to be disjoint from the overlay: a member may be exempt or
     // branch-bearing, never both and never neither.
@@ -1346,6 +2012,14 @@ fn all_ingress_uses_exact_typed_authority_branch() {
              exception / authority-free ingress; the three are exclusive"
         );
     }
+    assert_eq!(overlay.len(), 102, "branch-bearing surface partition moved");
+    assert_eq!(exceptions.len(), 3, "non-ingress partition moved");
+    assert_eq!(statics.len(), 11, "authority-free ingress partition moved");
+    assert_eq!(
+        overlay.len() + exceptions.len() + statics.len(),
+        116,
+        "the reviewed 102 + 3 + 11 surface partition moved"
+    );
 
     let mut missing = Vec::new();
     let mut wrongly_present = Vec::new();

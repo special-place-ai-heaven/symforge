@@ -511,7 +511,10 @@ pub fn index_folder_request_hash(
     RequestHash::for_tool_request(
         "index_folder",
         &json!({
-            "path": normalized_path_string(canonical_root),
+            // The project key hashes the canonical native path bytes. Never
+            // use a lossy UTF-8 rendering here: two distinct Unix roots must
+            // not share one replay identity.
+            "project_id": canonical_project_key(canonical_root),
             "reset": reset_requested,
             "allow_protected_root": allow_protected_root,
             // The `add` spelling changes observable side effects (per-session
@@ -521,6 +524,10 @@ pub fn index_folder_request_hash(
             "activate": activate,
         }),
     )
+}
+
+fn canonical_project_key(canonical_root: &Path) -> String {
+    crate::discovery::project_id_for_canonical_root(canonical_root).0
 }
 
 pub fn replay_response(record: &ReplayRecord) -> String {
@@ -558,15 +565,6 @@ pub fn format_live_postcondition_unavailable(
     )
 }
 
-fn normalized_path_string(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        normalized.to_lowercase()
-    } else {
-        normalized
-    }
-}
-
 fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&canonicalize_value(value))
 }
@@ -595,4 +593,43 @@ fn unix_millis() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_folder_identity_uses_native_project_identity() {
+        let literal = Path::new("/work/a\\b");
+        let nested = Path::new("/work/a/b");
+
+        if cfg!(windows) {
+            assert_eq!(
+                canonical_project_key(literal),
+                canonical_project_key(nested),
+                "Windows separator compatibility must remain intact"
+            );
+        } else {
+            assert_ne!(
+                canonical_project_key(literal),
+                canonical_project_key(nested),
+                "distinct Unix roots must produce distinct idempotency request identities"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_folder_identity_preserves_non_utf8_native_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let native = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
+        let lossy_collision = PathBuf::from("a\u{fffd}b");
+        assert_eq!(native.to_string_lossy(), lossy_collision.to_string_lossy());
+        assert_ne!(
+            canonical_project_key(&native),
+            canonical_project_key(&lossy_collision)
+        );
+    }
 }

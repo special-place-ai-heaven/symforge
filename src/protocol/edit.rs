@@ -1422,7 +1422,7 @@ pub(crate) fn try_whitespace_flexible_replace(
 pub struct ReplaceSymbolBodyInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. The whole call is single-project: cross-project
+    /// session's active project. The whole call is single-project: cross-project
     /// mixtures are rejected rather than distributed. Local/embedded servers
     /// are bound to one project and refuse a non-matching selector.
     #[serde(default)]
@@ -1482,7 +1482,7 @@ pub struct ReplaceSymbolBodyInput {
 pub struct InsertSymbolInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. The whole call is single-project: cross-project
+    /// session's active project. The whole call is single-project: cross-project
     /// mixtures are rejected rather than distributed. Local/embedded servers
     /// are bound to one project and refuse a non-matching selector.
     #[serde(default)]
@@ -1519,7 +1519,7 @@ pub struct InsertSymbolInput {
 pub struct DeleteSymbolInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. The whole call is single-project: cross-project
+    /// session's active project. The whole call is single-project: cross-project
     /// mixtures are rejected rather than distributed. Local/embedded servers
     /// are bound to one project and refuse a non-matching selector.
     #[serde(default)]
@@ -1551,7 +1551,7 @@ pub struct DeleteSymbolInput {
 pub struct EditWithinSymbolInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. The whole call is single-project: cross-project
+    /// session's active project. The whole call is single-project: cross-project
     /// mixtures are rejected rather than distributed. Local/embedded servers
     /// are bound to one project and refuse a non-matching selector.
     #[serde(default)]
@@ -1604,7 +1604,7 @@ pub struct EditWithinSymbolInput {
 pub struct BatchEditInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. The whole call is single-project: cross-project
+    /// session's active project. The whole call is single-project: cross-project
     /// mixtures are rejected rather than distributed. Local/embedded servers
     /// are bound to one project and refuse a non-matching selector.
     #[serde(default)]
@@ -2234,7 +2234,7 @@ pub(crate) fn execute_batch_edit(
 pub struct BatchRenameInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. The whole call is single-project: cross-project
+    /// session's active project. The whole call is single-project: cross-project
     /// mixtures are rejected rather than distributed. Local/embedded servers
     /// are bound to one project and refuse a non-matching selector.
     #[serde(default)]
@@ -2835,7 +2835,7 @@ pub(crate) fn execute_batch_rename(
 pub struct BatchInsertInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. The whole call is single-project: cross-project
+    /// session's active project. The whole call is single-project: cross-project
     /// mixtures are rejected rather than distributed. Local/embedded servers
     /// are bound to one project and refuse a non-matching selector.
     #[serde(default)]

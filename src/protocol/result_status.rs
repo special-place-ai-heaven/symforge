@@ -67,6 +67,31 @@ pub struct ProjectEvidence {
     pub index_symbols: usize,
 }
 
+/// Match a daemon receipt to a project selector without turning an ID/name
+/// collision into authority for the wrong project. Omission accepts the
+/// daemon session's active project; canonical IDs keep the daemon's ID-first
+/// resolution rule.
+pub fn project_evidence_matches_selector(
+    evidence: &ProjectEvidence,
+    selector: Option<&str>,
+) -> bool {
+    let Some(root) = evidence.canonical_root.as_deref() else {
+        return false;
+    };
+    let computed = crate::daemon::project_key(std::path::Path::new(root));
+    if computed != evidence.project_id {
+        return false;
+    }
+    let Some(selector) = selector.filter(|value| !value.trim().is_empty()) else {
+        return true;
+    };
+    if selector.starts_with("project-v1-") {
+        evidence.project_id == selector
+    } else {
+        evidence.project_id == selector || evidence.project_name == selector
+    }
+}
+
 tokio::task_local! {
     /// Selected-project evidence for the tool call currently being rendered.
     /// Scoped once per `tools/call` dispatch by [`with_project_evidence_scope`],
@@ -95,6 +120,15 @@ pub fn record_project_evidence(evidence: ProjectEvidence) {
     let _ = PROJECT_EVIDENCE.try_with(|cell| *cell.borrow_mut() = Some(evidence));
 }
 
+/// Clear any previously seeded or recorded evidence in the current dispatch.
+///
+/// A routed call uses this before crossing into another project so a missing,
+/// malformed, or failed daemon receipt cannot fall back to the adapter's home
+/// evidence and mislabel the response.
+pub fn clear_project_evidence() {
+    let _ = PROJECT_EVIDENCE.try_with(|cell| *cell.borrow_mut() = None);
+}
+
 /// Evidence for the response currently being built, if a dispatch scope is
 /// active and populated.
 pub fn current_project_evidence() -> Option<ProjectEvidence> {
@@ -109,9 +143,11 @@ pub fn current_project_evidence() -> Option<ProjectEvidence> {
 /// Called on every `tools/call` and `resources/read` result AFTER the router /
 /// resource renderer returns. Single-writer rule: if the statused path
 /// (`into_call_tool_result`) already wrote [`PROJECT_EVIDENCE_META_KEY`], the
-/// result stays byte-identical. Otherwise the in-scope evidence is attached —
-/// or, when no workspace is bound, the explicit unbound marker
-/// `{"bound": false}`, so absence stays distinguishable from unbound.
+/// result stays byte-identical. Otherwise the in-scope evidence is attached.
+/// When no trustworthy evidence is available, attach the explicit marker
+/// `{"bound": false, "reason": "project_evidence_unavailable"}`. This is
+/// distinct from the full `project_id: "unbound"` evidence emitted when the
+/// local adapter is observed but has no repository root.
 pub fn attach_project_evidence_meta(meta: &mut Option<MetaObject>) {
     let meta = meta.get_or_insert_with(|| MetaObject(JsonObject::new()));
     if meta.0.contains_key(PROJECT_EVIDENCE_META_KEY) {
@@ -119,9 +155,13 @@ pub fn attach_project_evidence_meta(meta: &mut Option<MetaObject>) {
     }
     let value = match current_project_evidence().map(|e| serde_json::to_value(&e)) {
         Some(Ok(value)) => value,
-        // Unbound (or unserializable — cannot happen for ProjectEvidence):
-        // disclose loudly rather than omitting the key.
-        _ => serde_json::json!({ "bound": false }),
+        // Missing/cleared (or unserializable — cannot happen for
+        // ProjectEvidence): disclose loudly rather than omitting the key or
+        // mislabeling the state as an observed local-unbound workspace.
+        _ => serde_json::json!({
+            "bound": false,
+            "reason": "project_evidence_unavailable",
+        }),
     };
     meta.0.insert(PROJECT_EVIDENCE_META_KEY.to_string(), value);
 }
@@ -162,5 +202,32 @@ impl ResultStatus {
             CallToolResult::success(content)
         };
         result.with_meta(Some(MetaObject(meta)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_evidence_selector_matching_preserves_nonblank_whitespace() {
+        let root = std::path::Path::new("/work/repo");
+        let evidence = ProjectEvidence {
+            project_id: crate::daemon::project_key(root),
+            project_name: "repo".to_string(),
+            canonical_root: Some(root.display().to_string()),
+            generation: 1,
+            index_state: "ready".to_string(),
+            load_source: "memory".to_string(),
+            index_files: 1,
+            index_symbols: 1,
+        };
+
+        assert!(project_evidence_matches_selector(&evidence, Some("repo")));
+        assert!(
+            !project_evidence_matches_selector(&evidence, Some("repo ")),
+            "a legal trailing space must not be normalized onto another project name"
+        );
+        assert!(project_evidence_matches_selector(&evidence, Some("   ")));
     }
 }

@@ -71,28 +71,41 @@ fn statused_tool_result(
     Ok(ResultStatus::new(outcome_class).into_call_tool_result(text))
 }
 
-/// Lexically normalize a path, resolving `.`/`..` segments WITHOUT touching the
-/// filesystem (so a not-yet-existing within-project filter path can still be
-/// checked for `..` escapes). Absolute prefixes and the path root are preserved.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                // Pop a normal segment if there is one; never pop past the root
-                // or a prefix (drive/UNC) component.
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                    out.pop();
-                } else {
-                    out.push("..");
+/// Canonicalize the deepest existing ancestor of `path`, then append a truly
+/// missing suffix without resolving it lexically.
+///
+/// This preserves filesystem semantics for `link/..` and catches a missing
+/// leaf beneath an escaping symlink/junction. Any error other than an ordinary
+/// missing component fails closed. A dangling link also fails closed because
+/// `symlink_metadata` can observe the link even though `canonicalize` cannot
+/// resolve its target.
+fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path.to_path_buf();
+    let mut missing_tail = Vec::<std::ffi::OsString>::new();
+
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in missing_tail.iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&ancestor) {
+                    Ok(_) => return None,
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
+                missing_tail.push(ancestor.file_name()?.to_os_string());
+                if !ancestor.pop() {
+                    return None;
                 }
             }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
+            Err(_) => return None,
         }
     }
-    out
 }
 
 /// Whether `path` (a `symforge` `path:` filter) resolves WITHIN the bound
@@ -101,13 +114,15 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// error.
 ///
 /// Resolution: a relative `path` is joined onto `root`; an absolute `path` is
-/// used as-is. Both the resolved target and the root are canonicalized when they
-/// exist on disk (resolving symlinks/`..`); when the target does not exist yet,
-/// we fall back to a lexical normalization so a `../../escape` filter is still
-/// rejected. Containment is the canonical/normalized-root being a prefix of the
-/// canonical/normalized target (equal counts as within).
+/// used as-is. The bound root must canonicalize. The target is resolved through
+/// its deepest existing ancestor so symlinks/junctions and `..` retain filesystem
+/// semantics even when the final leaf does not exist. Containment is the
+/// canonical root being a component prefix of the resolved target (equal counts
+/// as within); observation failures reject the filter.
 fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
 
     let raw = Path::new(path);
     let resolved = if raw.is_absolute() {
@@ -115,9 +130,9 @@ fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
     } else {
         canonical_root.join(raw)
     };
-    let resolved = resolved
-        .canonicalize()
-        .unwrap_or_else(|_| normalize_lexically(&resolved));
+    let Some(resolved) = canonicalize_with_missing_tail(&resolved) else {
+        return false;
+    };
 
     // Compare with the Windows verbatim (`\\?\`) prefix stripped from BOTH sides
     // so a canonicalized root (which gains `\\?\`) and a lexically-normalized
@@ -125,6 +140,26 @@ fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
     let resolved_cmp = strip_verbatim_prefix(&resolved);
     let root_cmp = strip_verbatim_prefix(&canonical_root);
     resolved_cmp.starts_with(&root_cmp)
+}
+
+/// The compact facade forwards `path` as an index key/filter, never as an OS
+/// path. Reject every rooted/prefixed spelling, including Windows drive-relative
+/// (`C:foo`) and root-relative (`\foo`) forms that `Path::is_absolute` does not
+/// classify uniformly across platforms.
+fn facade_path_is_repo_relative(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if path.starts_with('/')
+        || path.starts_with('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    {
+        return false;
+    }
+    !Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        )
+    })
 }
 
 /// Strip the Windows verbatim/UNC `\\?\` prefix from a path for comparison,
@@ -137,11 +172,13 @@ fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
 fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     use std::path::{Component, Prefix};
     let mut out = PathBuf::new();
+    let mut rebuilt_prefix_already_rooted = false;
     for component in path.components() {
         match component {
             Component::Prefix(prefix) => match prefix.kind() {
                 Prefix::VerbatimDisk(disk) => {
                     out.push(format!("{}:\\", disk as char));
+                    rebuilt_prefix_already_rooted = true;
                 }
                 Prefix::VerbatimUNC(server, share) => {
                     let mut unc = std::ffi::OsString::from(r"\\");
@@ -149,13 +186,19 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
                     unc.push(r"\");
                     unc.push(share);
                     out.push(unc);
+                    rebuilt_prefix_already_rooted = true;
                 }
-                _ => out.push(component.as_os_str()),
+                _ => {
+                    out.push(component.as_os_str());
+                    rebuilt_prefix_already_rooted = false;
+                }
             },
             Component::RootDir => {
-                // Disk prefixes above already include the root separator; only
-                // push a bare root when there is no preceding prefix.
-                if out.as_os_str().is_empty() {
+                // Rebuilt verbatim disk/UNC prefixes already include their root
+                // separator. Ordinary disk prefixes (`C:`) do not: preserve the
+                // following RootDir so an absolute path never becomes drive-
+                // relative during comparison.
+                if !rebuilt_prefix_already_rooted {
                     out.push(component.as_os_str());
                 }
             }
@@ -272,6 +315,7 @@ fn classify_get_file_content_output(text: &str) -> OutcomeClass {
         || text.starts_with("Invalid get_file_content request:")
         || text.starts_with("mode=")
         || text.contains("[error:")
+        || body.starts_with("Path is outside the repository root:")
         || (body.starts_with("Chunk ") && body.contains(" out of range for "))
     {
         // A request for a non-existent chunk index is an invalid request, not a
@@ -457,7 +501,7 @@ use super::SymForgeServer;
 /// imports a sidecar-private helper).
 fn same_root_text(a: &std::path::Path, b: &std::path::Path) -> bool {
     let canon = |path: &std::path::Path| {
-        let normalized = path.to_string_lossy().replace('\\', "/");
+        let normalized = crate::daemon::normalized_path_string(path);
         let trimmed = normalized.trim_end_matches('/').to_string();
         if cfg!(windows) {
             trimmed.to_lowercase()
@@ -492,6 +536,47 @@ pub struct IndexFolderInput {
     /// read/index-only mode. Never inherited by automatic root discovery.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub allow_protected_root: Option<bool>,
+}
+
+fn resolve_index_folder_binding(
+    input: &IndexFolderInput,
+) -> Result<crate::domain::RootBinding, String> {
+    let requested_root = PathBuf::from(&input.path);
+    let allow_protected_root = input.allow_protected_root == Some(true);
+    match crate::discovery::resolve_root_candidate(
+        &requested_root,
+        crate::domain::RootCandidateSource::ExplicitIndexFolder,
+        crate::domain::RootRequestMode::ExplicitIndexFolder {
+            allow_protected_root,
+        },
+    ) {
+        crate::domain::RootResolution::Bound(binding) => Ok(binding),
+        crate::domain::RootResolution::Unbound { reason, .. } => {
+            let crate::domain::UnboundReason::Refused(reason) = reason else {
+                return Err("index_folder refused: no candidate declared".to_string());
+            };
+            Err(match reason {
+                crate::domain::RootRefusalReason::MissingOrNotDirectory
+                    if !requested_root.exists() =>
+                {
+                    format!("Path does not exist: {}", input.path)
+                }
+                crate::domain::RootRefusalReason::MissingOrNotDirectory => {
+                    format!("Path is not a directory: {}", input.path)
+                }
+                crate::domain::RootRefusalReason::CanonicalizationFailed => {
+                    "Cannot resolve path: canonicalization_failed".to_string()
+                }
+                crate::domain::RootRefusalReason::UnsupportedPathEncoding => {
+                    "Refused to index path: canonical root is not valid UTF-8 and cannot be represented without changing its identity".to_string()
+                }
+                _ => format!(
+                    "Refused to index sensitive system path: {}. Use a project directory or retry this exact direct request with allow_protected_root=true.",
+                    reason.code()
+                ),
+            })
+        }
+    }
 }
 
 /// Input for `checkpoint_now`.
@@ -542,7 +627,7 @@ impl HealthInput {
 pub struct WhatChangedInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -649,7 +734,7 @@ pub struct DetectImpactInput {
 pub struct AnalyzeFileImpactInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -674,7 +759,7 @@ pub struct AnalyzeFileImpactInput {
 pub struct ExploreInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -712,11 +797,11 @@ pub struct ExploreInput {
     pub max_tokens: Option<u64>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct SmartQueryInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -733,7 +818,7 @@ pub struct SmartQueryInput {
 pub struct EditPlanInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -745,7 +830,7 @@ pub struct EditPlanInput {
 pub struct InvestigationInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -758,7 +843,7 @@ pub struct InvestigationInput {
 pub struct DiffSymbolsInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -4440,7 +4525,7 @@ impl SymForgeServer {
             let guard = self.index.read();
             loading_guard!(guard);
         }
-        let published = self.index.published_generation();
+        let published = self.capture_local_response_generation();
         if params.0.estimate == Some(true) {
             let file_count = published.live.file_count();
             let detail = params.0.detail.as_deref().unwrap_or("compact");
@@ -4608,7 +4693,7 @@ impl SymForgeServer {
         ) {
             return refusal.message(&params.0.path);
         }
-        let published = self.index.published_generation();
+        let published = self.capture_local_response_generation();
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             return message;
         }
@@ -4868,7 +4953,7 @@ impl SymForgeServer {
         } else {
             false
         };
-        let published = self.index.published_generation();
+        let published = self.capture_local_response_generation();
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             return message;
         }
@@ -5312,9 +5397,9 @@ impl SymForgeServer {
                 est, with_co
             );
         }
-        // T046: captured BEFORE the sidecar await — the co-change footer after
-        // the await uses THIS temporal, not a fresh load that could describe a
-        // publication the impact result never saw.
+        // Gate on one queryable baseline before the sidecar await. The impact
+        // operation may itself publish a replacement; its returned receipt,
+        // not this entry snapshot or a free post-call reload, owns the response.
         let generation = self.index.published_generation();
         {
             let guard = &generation.live;
@@ -5326,8 +5411,8 @@ impl SymForgeServer {
             path: params.0.path.clone(),
             new_file: params.0.new_file,
         };
-        let mut result = match impact_tool_text(state, &impact).await {
-            Ok(result) => result,
+        let output = match impact_tool_text(state, &impact).await {
+            Ok(output) => output,
             Err(StatusCode::NOT_FOUND) => {
                 return format!("File not found on disk: {}", params.0.path);
             }
@@ -5336,6 +5421,13 @@ impl SymForgeServer {
             }
             Err(other) => return format!("Impact analysis failed: HTTP {}", other.as_u16()),
         };
+        let generation = output.published;
+        if let Some(evidence) = self.local_project_evidence_for_generation(generation.as_ref()) {
+            super::result_status::record_project_evidence(evidence);
+        } else {
+            super::result_status::clear_project_evidence();
+        }
+        let mut result = output.text;
 
         // Append co-changes if requested
         if params.0.include_co_changes.unwrap_or(false) {
@@ -5395,10 +5487,6 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn search_symbols(&self, params: Parameters<SearchSymbolsInput>) -> String {
-        // T046: one capture of the published generation at entry; rows,
-        // trust banner, parse-state, and temporal data all read off it so a
-        // publication landing mid-render cannot mix generations in one response.
-        let generation = self.index.published_generation();
         let query_str = params.0.query.as_deref().unwrap_or("").trim();
         let is_browse = query_str.is_empty();
         if is_browse && params.0.kind.is_none() && params.0.path_prefix.is_none() {
@@ -5415,6 +5503,11 @@ impl SymForgeServer {
         {
             return refusal;
         }
+        // Capture only after daemon proxy/recovery has either returned or
+        // rebuilt the local index. Rows, trust banner, parse state, and temporal
+        // data then share the same fresh publication advertised by the local
+        // fallback ProjectEvidence.
+        let generation = self.capture_local_response_generation();
         let options = match search_symbols_options_from_input(&params.0) {
             Ok(options) => options,
             Err(message) => return message,
@@ -5756,10 +5849,6 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn search_text(&self, params: Parameters<SearchTextInput>) -> String {
-        // T046: one capture of the published generation at entry; rows,
-        // trust banner, parse-state, and temporal data all read off it so a
-        // publication landing mid-render cannot mix generations in one response.
-        let generation = self.index.published_generation();
         if let Some(result) = self.proxy_tool_call("search_text", &params.0).await {
             return result;
         }
@@ -5779,6 +5868,10 @@ impl SymForgeServer {
                 est, limit, per_file
             );
         }
+        // Capture only after daemon proxy/recovery has either returned or
+        // rebuilt the local index. The source-free estimate above deliberately
+        // remains before publication selection.
+        let generation = self.capture_local_response_generation();
         // Structural (AST-pattern) search mode.
         if params.0.structural.unwrap_or(false) {
             let pattern = match params.0.query.as_deref() {
@@ -6098,10 +6191,6 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn search_files(&self, params: Parameters<SearchFilesInput>) -> String {
-        // T046: one capture of the published generation at entry; rows,
-        // trust banner, parse-state, and temporal data all read off it so a
-        // publication landing mid-render cannot mix generations in one response.
-        let generation = self.index.published_generation();
         if let Some(result) = self.proxy_tool_call("search_files", &params.0).await {
             return result;
         }
@@ -6118,6 +6207,10 @@ impl SymForgeServer {
                 est, limit
             );
         }
+        // Capture only after daemon proxy/recovery has either returned or
+        // rebuilt the local index. The source-free estimate above deliberately
+        // remains before publication selection.
+        let generation = self.capture_local_response_generation();
 
         // Resolve mode: exact path resolution
         if params.0.resolve.unwrap_or(false) {
@@ -6777,6 +6870,7 @@ impl SymForgeServer {
         &self,
         tool: &str,
         args: &serde_json::Value,
+        may_use_local_project_state: bool,
     ) -> serde_json::Value {
         let is_fusion_path_step = tool == "search_files"
             && args.get("rank_by").and_then(serde_json::Value::as_str) == Some("path+cochange")
@@ -6792,6 +6886,14 @@ impl SymForgeServer {
         let Some(map) = args.as_object_mut() else {
             return args;
         };
+        if !may_use_local_project_state {
+            // A healthy daemon can route the primitive to a foreign project,
+            // but this adapter's index still belongs to its home project. Drop
+            // the speculative co-change mode rather than deriving target args
+            // from a home-only anchor.
+            map.remove("rank_by");
+            return args;
+        }
         match self.resolve_find_fusion_cochange_anchor(query) {
             Some(anchor) => {
                 // Retarget the path side to the anchor's basename STEM. The stem
@@ -6933,7 +7035,7 @@ impl SymForgeServer {
 
         format::RuntimeStatus {
             mode,
-            project_root: project_root.map(|root| root.to_string_lossy().replace('\\', "/")),
+            project_root: project_root.map(|root| crate::daemon::normalized_path_string(&root)),
             project_id,
             session_id,
             index_generation: published.generation,
@@ -7549,11 +7651,18 @@ impl SymForgeServer {
     pub(crate) fn local_project_evidence(
         &self,
     ) -> Option<crate::protocol::result_status::ProjectEvidence> {
-        let root = self.capture_repo_root();
         // T046: one capture; generation, load_source, counts, and index_state
         // all describe the same publication. The atomic counter is not a
         // freshness side channel.
         let generation = self.index.published_generation();
+        self.local_project_evidence_for_generation(generation.as_ref())
+    }
+
+    fn local_project_evidence_for_generation(
+        &self,
+        generation: &crate::live_index::PublishedGeneration,
+    ) -> Option<crate::protocol::result_status::ProjectEvidence> {
+        let root = self.capture_repo_root();
         let published = Arc::clone(&generation.health);
         let load_source = generation.live.load_source().label().to_string();
         Some(crate::protocol::result_status::ProjectEvidence {
@@ -7562,8 +7671,15 @@ impl SymForgeServer {
                 .map(crate::daemon::project_key)
                 .unwrap_or_else(|| "unbound".to_string()),
             project_name: self.project_name.clone(),
-            canonical_root: root.map(|r| r.display().to_string().replace('\\', "/")),
-            generation: generation.project_generation,
+            canonical_root: root.as_deref().and_then(|root| {
+                let exact = dunce::simplified(root).to_str()?;
+                Some(crate::daemon::normalized_path_text(exact, cfg!(windows)))
+            }),
+            // Publication generation identifies the exact immutable bundle
+            // from which the response body is rendered. Project generation is
+            // intentionally stable across ordinary content publications and
+            // cannot detect an N/N+1 aggregate.
+            generation: generation.publication_generation,
             index_state: published.status_label().to_string(),
             load_source,
             index_files: published.file_count,
@@ -7571,15 +7687,28 @@ impl SymForgeServer {
         })
     }
 
+    /// Capture one local publication for a response and overwrite the ambient
+    /// evidence slot from that exact immutable bundle before rendering it.
+    fn capture_local_response_generation(&self) -> Arc<crate::live_index::PublishedGeneration> {
+        let generation = self.index.published_generation();
+        if let Some(evidence) = self.local_project_evidence_for_generation(generation.as_ref()) {
+            super::result_status::record_project_evidence(evidence);
+        } else {
+            super::result_status::clear_project_evidence();
+        }
+        generation
+    }
+
     /// True when an explicit `project`/`projects` selector RESOLVES TO THE BOUND
     /// project: it equals the bound project name, the bound root's deterministic
-    /// project key, or the bound root path (either slash flavor). Shared by both
+    /// project key, or the native bound root path (plus the forward-slash spelling
+    /// on Windows). Shared by both
     /// project-refusal guards so the two agree on what "local" means; an empty or
     /// whitespace-only selector is treated as absent (returns false — the caller
-    /// decides how to handle "no selector").
+    /// decides how to handle "no selector"). Nonblank selector bytes are never
+    /// trimmed: trailing whitespace is legal in a Unix project name/path.
     fn selector_matches_bound_project(&self, selector: &str) -> bool {
-        let selector = selector.trim();
-        if selector.is_empty() {
+        if selector.trim().is_empty() {
             return false;
         }
         if selector == self.project_name {
@@ -7589,8 +7718,10 @@ impl SymForgeServer {
             if selector == crate::daemon::project_key(root) {
                 return true;
             }
-            let root_text = root.display().to_string();
-            if selector == root_text || selector == root_text.replace('\\', "/") {
+            if let Some(root_text) = dunce::simplified(root).to_str()
+                && (selector == root_text
+                    || selector == crate::daemon::normalized_path_text(root_text, cfg!(windows)))
+            {
                 return true;
             }
             let selector_path = std::path::Path::new(selector);
@@ -7613,10 +7744,11 @@ impl SymForgeServer {
     /// root path itself. Returns `None` (proceed) when the selector is absent
     /// or matches.
     pub(crate) fn foreign_project_refusal(&self, project: Option<&str>) -> Option<String> {
-        let selector = project.map(str::trim).filter(|p| !p.is_empty())?;
+        let selector = project.filter(|p| !p.trim().is_empty())?;
         if self.selector_matches_bound_project(selector) {
             return None;
         }
+        super::result_status::clear_project_evidence();
         let bound_root = self.capture_repo_root();
         // `Error:` anchor: routing refusals are semantic ERRORS, and the
         // shared `is_error_output` predicate (analytics, edit classifiers,
@@ -7660,11 +7792,15 @@ impl SymForgeServer {
     ) -> Option<String> {
         // Gather every non-empty selector from both the singular and plural params.
         let mut selectors: Vec<&str> = Vec::new();
-        if let Some(p) = project.map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some(p) = project.filter(|p| !p.trim().is_empty()) {
             selectors.push(p);
         }
         if let Some(list) = projects {
-            selectors.extend(list.iter().map(|p| p.trim()).filter(|p| !p.is_empty()));
+            selectors.extend(
+                list.iter()
+                    .map(String::as_str)
+                    .filter(|p| !p.trim().is_empty()),
+            );
         }
 
         // No selector at all -> proceed on the normal single-project path.
@@ -7681,6 +7817,8 @@ impl SymForgeServer {
         if all_local {
             return None;
         }
+
+        super::result_status::clear_project_evidence();
 
         Some(
             "Error: project_routing: cross-project queries (project/projects) require the daemon: the \
@@ -7710,7 +7848,38 @@ impl SymForgeServer {
         )
     )]
     pub async fn index_folder(&self, params: Parameters<IndexFolderInput>) -> String {
-        if let Some(result) = self.proxy_tool_call("index_folder", &params.0).await {
+        let mut input = params.0;
+        let mut daemon_root = None;
+        if self.daemon_client.is_some() {
+            // Resolve the caller's path exactly once in the adapter process.
+            // A persistent daemon can have a different launch CWD; forwarding
+            // a relative spelling would let the daemon open one project while
+            // this adapter records another project as ACTIVE.
+            let binding = match resolve_index_folder_binding(&input) {
+                Ok(binding) => binding,
+                Err(error) => return error,
+            };
+            let Some(resolved) = binding.canonical_root.to_str() else {
+                return "Cannot resolve path: canonical path is not valid UTF-8".to_string();
+            };
+            input.path = resolved.to_string();
+            daemon_root = Some(binding.canonical_root);
+        }
+
+        // The daemon changes session ACTIVE before it returns, while the
+        // adapter records its mirror only after observing the response. Keep
+        // both halves in one connection-scoped lane so overlapping default
+        // opens cannot leave daemon ACTIVE=C but adapter ACTIVE=B merely
+        // because B's response completed last. The lane also serializes
+        // every adapter `index_folder` mirror update and survives client swaps.
+        let _activation_guard = if let Some(daemon_lock) = self.daemon_client.as_ref() {
+            let lane = daemon_lock.read().await.activation_lane();
+            Some(lane.lock_owned().await)
+        } else {
+            None
+        };
+
+        if let Some(result) = self.proxy_tool_call("index_folder", &input).await {
             // Locked contract: a daemon `index_folder` opens/refreshes the
             // target in the daemon-owned working set; the default spelling
             // additionally makes it this session's ACTIVE project
@@ -7726,11 +7895,11 @@ impl SymForgeServer {
             // steal activation).
             if result.starts_with("Indexed ")
                 && let Some(daemon_lock) = self.daemon_client.as_ref()
-                && let Ok(root) = std::path::Path::new(&params.0.path).canonicalize()
+                && let Some(root) = daemon_root
             {
                 let client = daemon_lock.read().await;
                 client.record_opened_root(root.clone());
-                if params.0.add != Some(true) {
+                if input.add != Some(true) {
                     client.record_active_root(root);
                 }
             }
@@ -7748,10 +7917,9 @@ impl SymForgeServer {
                  destructively replace this connection's home index with '{}'. Unqualified \
                  reads continue to serve the local home fallback; restore the daemon \
                  connection and retry.",
-                params.0.path
+                input.path
             );
         }
-        let input = params.0;
         // Feature 012 (Phase 2), Principle VII honesty: additive multi-project
         // opens live ONLY in the daemon-owned working set. On stdio/embed (no
         // daemon) or when the daemon is unreachable, there is no working set to
@@ -7764,38 +7932,10 @@ impl SymForgeServer {
                 to open multiple projects in one session."
                 .to_string();
         }
-        let requested_root = PathBuf::from(&input.path);
         let allow_protected_root = input.allow_protected_root == Some(true);
-        let binding = match crate::discovery::resolve_root_candidate(
-            &requested_root,
-            crate::domain::RootCandidateSource::ExplicitIndexFolder,
-            crate::domain::RootRequestMode::ExplicitIndexFolder {
-                allow_protected_root,
-            },
-        ) {
-            crate::domain::RootResolution::Bound(binding) => binding,
-            crate::domain::RootResolution::Unbound { reason, .. } => {
-                let crate::domain::UnboundReason::Refused(reason) = reason else {
-                    return "index_folder refused: no candidate declared".to_string();
-                };
-                return match reason {
-                    crate::domain::RootRefusalReason::MissingOrNotDirectory
-                        if !requested_root.exists() =>
-                    {
-                        format!("Path does not exist: {}", input.path)
-                    }
-                    crate::domain::RootRefusalReason::MissingOrNotDirectory => {
-                        format!("Path is not a directory: {}", input.path)
-                    }
-                    crate::domain::RootRefusalReason::CanonicalizationFailed => {
-                        "Cannot resolve path: canonicalization_failed".to_string()
-                    }
-                    _ => format!(
-                        "Refused to index sensitive system path: {}. Use a project directory or retry this exact direct request with allow_protected_root=true.",
-                        reason.code()
-                    ),
-                };
-            }
+        let binding = match resolve_index_folder_binding(&input) {
+            Ok(binding) => binding,
+            Err(error) => return error,
         };
         let explicit_protected = matches!(
             binding.access_mode,
@@ -8799,7 +8939,7 @@ impl SymForgeServer {
         // repeat-read cache. The same request against a later watcher publication
         // must be a cache miss, and the bytes below must come from this exact
         // captured generation rather than a second live-index read.
-        let generation = self.index.published_source_set().current_generation();
+        let generation = self.capture_local_response_generation();
         if let Some(message) = loading_guard_message_from_published(&generation.health) {
             return message;
         }
@@ -8980,7 +9120,7 @@ impl SymForgeServer {
         // disposition off the SAME publication that produced the index miss, and
         // the trust decision here is taken on that same publication rather than a
         // second, possibly newer, read.
-        let published = self.index.published_generation();
+        let published = self.capture_local_response_generation();
         // No blanket loading_guard: the disk-read fallback below parses from disk
         // and does not need the index, so a not-Ready index must not block this
         // tool outright. But the indexed hit must not be TRUSTED either — the
@@ -9085,10 +9225,6 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn find_references(&self, params: Parameters<FindReferencesInput>) -> String {
-        // T046: one capture of the published generation at entry; rows,
-        // trust banner, parse-state, and temporal data all read off it so a
-        // publication landing mid-render cannot mix generations in one response.
-        let generation = self.index.published_generation();
         if let Some(result) = self.proxy_tool_call("find_references", &params.0).await {
             return result;
         }
@@ -9099,6 +9235,10 @@ impl SymForgeServer {
         {
             return refusal;
         }
+        // Capture only after daemon proxy/recovery has either returned or
+        // rebuilt the local index so the rendered body and local fallback
+        // ProjectEvidence describe one publication.
+        let generation = self.capture_local_response_generation();
         let input = &params.0;
         if let Some(path) = input.path.as_deref() {
             let repo_root = self.capture_repo_root();
@@ -10719,9 +10859,21 @@ impl SymForgeServer {
         output
     }
 
+    pub(super) fn facade_probe_is_measurement_safe(tool: &str, args: &serde_json::Value) -> bool {
+        match tool {
+            "search_files" | "search_symbols" | "search_text" | "find_dependents"
+            | "find_references" | "get_file_content" | "get_file_context" | "get_symbol"
+            | "get_symbol_context" => true,
+            "batch_rename" => {
+                args.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true)
+            }
+            _ => false,
+        }
+    }
+
     #[tool(
         name = "symforge",
-        description = "STEL read/explore facade — natural-language code intelligence with trust envelope on the compact surface. Phase 0 batteries may pass `_probe_legacy_*` harness fields.",
+        description = "STEL read/explore facade — natural-language code intelligence with trust envelope on the compact surface. Phase 0 batteries may pass `_probe_legacy_*` fields for the source-mutation-safe measurement allowlist.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn symforge_facade_tool(
@@ -10729,12 +10881,31 @@ impl SymForgeServer {
         params: Parameters<crate::stel::SymforgeCallInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         if params.0.is_probe_relay() {
+            let has_facade_project = params
+                .0
+                .request
+                .project
+                .as_deref()
+                .is_some_and(|project| !project.trim().is_empty());
+            let has_facade_projects = params
+                .0
+                .request
+                .projects
+                .as_deref()
+                .is_some_and(|projects| projects.iter().any(|project| !project.trim().is_empty()));
+            if has_facade_project || has_facade_projects {
+                super::result_status::clear_project_evidence();
+                return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                    .into_call_tool_result(
+                        "Phase 0 facade relay does not route facade-level `project`/`projects`; put the selector inside `_probe_legacy_args` for the relayed tool",
+                    ));
+            }
             let legacy_tool = match params.0.probe_legacy_tool.as_deref() {
                 Some(tool) => tool,
                 None => {
                     return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
                         .into_call_tool_result(
-                            "Phase 0 facade relay requires `_probe_legacy_tool` (A-019 battery harness only)",
+                            "Phase 0 facade relay requires `_probe_legacy_tool` (A-019 measurement relay)",
                         ));
                 }
             };
@@ -10743,19 +10914,26 @@ impl SymForgeServer {
                 None => {
                     return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
                         .into_call_tool_result(
-                            "Phase 0 facade relay requires `_probe_legacy_args` (A-019 battery harness only)",
+                            "Phase 0 A-019 measurement relay requires `_probe_legacy_args`",
                         ));
                 }
             };
+            if !Self::facade_probe_is_measurement_safe(legacy_tool, &legacy_args) {
+                return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                    .into_call_tool_result(
+                        "Phase 0 facade relay is restricted to the A-019 source-mutation-safe measurement allowlist; batch_rename additionally requires dry_run=true",
+                    ));
+            }
             let output = self.dispatch_tool_for_tests(legacy_tool, legacy_args).await;
-            let outcome_class = if is_error_output(&output) || output.starts_with("Invalid") {
-                OutcomeClass::InvalidRequest
-            } else if output.starts_with("Index not loaded.") {
-                OutcomeClass::InternalFailure
-            } else {
-                OutcomeClass::Found
-            };
-            return statused_tool_result(output, outcome_class);
+            // This compatibility relay measures byte parity with the legacy
+            // renderer. It deliberately carries no `symforge/result_status`:
+            // arbitrary returned source text can begin with the same bytes as a
+            // rendered error, so deriving a semantic OutcomeClass from the text
+            // would fabricate evidence. The allowlist above is the safety
+            // boundary; normal read-path cache/frecency effects remain possible.
+            return Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text(output),
+            ]));
         }
 
         // Surface-honesty (012 D6 / contracts §3c): with `query` now
@@ -10843,18 +11021,18 @@ impl SymForgeServer {
         // `projects` stays refused: the L1 planner plans single-project reads,
         // and silently single-project-resolving a `projects:["*"]` caller would
         // hand back partial results that LOOK cross-project (a silent drop).
-        // A blank `project` / empty `projects` is treated as "not set".
+        // A blank scalar is treated as omitted. Any present set-valued form is
+        // refused, including empty/all-blank arrays; silently converting those
+        // invalid selections into an unqualified ACTIVE-project call would
+        // change the caller's target.
         let facade_project = request
             .project
             .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.trim().is_empty())
             .map(str::to_string);
-        let has_projects = request
-            .projects
-            .as_deref()
-            .is_some_and(|ids| ids.iter().any(|id| !id.trim().is_empty()));
+        let has_projects = request.projects.is_some();
         if has_projects {
+            super::result_status::clear_project_evidence();
             return Ok(
                 ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
                     "cross-project targeting is not routed through the `symforge` facade; \
@@ -10864,25 +11042,91 @@ impl SymForgeServer {
             );
         }
 
-        // Same ordering defect as `symforge_edit_stel_handler`: the per-step
-        // `project` injection below is the ONLY thing that lets the primitives
-        // refuse a foreign selector, but the preview and economics-bypass/
-        // cache-hit paths return BEFORE the serve loop — so a foreign selector
-        // came back as a bound-project-grounded SUCCESS. Refuse up front on the
-        // no-daemon path, where cross-project routing does not exist at all.
-        //
-        // Knowingly STILL OPEN, deliberately out of scope: the daemon-
-        // CONFIGURED-but-DEGRADED topology. There `daemon_client` is `Some`, so
-        // this guard does NOT fire, while `proxy_tool_call` returns `None` and
-        // execution falls back to the local index — so `preview: true` and the
-        // economics-bypass/cache-hit early returns can still answer
-        // `outcome_class: found` with a bound-project-grounded estimate for a
-        // foreign selector. Closing it means gating on the degraded flag too,
-        // not just on client presence.
-        if self.daemon_client.is_none()
-            && let Some(refusal) = self.foreign_project_refusal(facade_project.as_deref())
-        {
+        // The serve loop below can route one selector through a healthy daemon,
+        // but local execution cannot. That includes daemon-degraded fallback:
+        // client presence alone does not make a foreign selector routable.
+        // Capture the refusal once so preview and economics-only paths can also
+        // reject it when they return before primitive dispatch.
+        let has_daemon_client = self.daemon_client.is_some();
+        // Resolve and pin the daemon target before planning. Omission pins the
+        // current ACTIVE root, including HOME, so a concurrent default
+        // `index_folder` cannot retarget an unqualified plan between local
+        // grounding and primitive dispatch. Explicit names use the daemon's
+        // ID-first/unique-name working-set semantics rather than the adapter's
+        // HOME-only name check.
+        let daemon_routed_target = match self.daemon_client.as_ref() {
+            Some(slot) => slot
+                .read()
+                .await
+                .opened_project_for_selector(facade_project.as_deref()),
+            None => None,
+        };
+        let daemon_routed_root = daemon_routed_target
+            .as_ref()
+            .map(|(_, root, _)| root.clone());
+        let daemon_target_is_home = daemon_routed_target
+            .as_ref()
+            .is_some_and(|(_, _, is_home)| *is_home);
+        let routed_project = match facade_project.as_ref() {
+            Some(selector) => daemon_routed_target
+                .as_ref()
+                .map(|(project_id, _, _)| project_id.clone())
+                .or_else(|| Some(selector.clone())),
+            None => daemon_routed_target.map(|(project_id, _, _)| project_id),
+        };
+        let unresolved_daemon_selector =
+            has_daemon_client && facade_project.is_some() && daemon_routed_root.is_none();
+        let early_project_refusal = if unresolved_daemon_selector {
+            facade_project.as_ref().map(|selector| {
+                format!(
+                    "project selector '{selector}' cannot be resolved for a local facade-only \
+                     result; execute a routed primitive so the daemon can return the \
+                     authoritative unknown-or-ambiguous selector refusal"
+                )
+            })
+        } else if has_daemon_client && daemon_routed_root.is_some() && !daemon_target_is_home {
+            Some(format!(
+                "Error: project_routing: daemon project '{}' requires routed primitive \
+                 execution; local preview/cache/bypass state belongs to the adapter HOME project",
+                routed_project.as_deref().unwrap_or("selected project")
+            ))
+        } else {
+            self.foreign_project_refusal(routed_project.as_deref())
+        };
+        let may_use_local_project_state = if has_daemon_client && daemon_routed_root.is_some() {
+            daemon_target_is_home
+        } else {
+            !unresolved_daemon_selector && early_project_refusal.is_none()
+        };
+        if !may_use_local_project_state {
+            // A foreign selector means the HOME seed cannot describe even an
+            // early refusal. A fully observed, matching daemon receipt is the
+            // only evidence allowed to repopulate this slot below.
+            super::result_status::clear_project_evidence();
+        }
+        // With no daemon transport a foreign selector cannot be served. A
+        // degraded daemon client is different: let the planned primitive enter
+        // `proxy_tool_call` for its bounded recovery probe. If that probe still
+        // fails, the primitive's local fallback guard refuses the foreign
+        // selector before HOME execution.
+        if !has_daemon_client && let Some(refusal) = early_project_refusal.clone() {
             return statused_tool_result(refusal, OutcomeClass::InvalidRequest);
+        }
+
+        // Facade path values are repository-relative filters. Accepting an
+        // absolute path inside the selected root would still pass that string
+        // to primitives whose index keys are relative, producing a dishonest
+        // empty result. Reject absolute paths uniformly before either local or
+        // routed execution.
+        if let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty())
+            && !facade_path_is_repo_relative(path)
+        {
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                    "`path:` requires a repo-relative path: it is a within-project filter, \
+                     not an absolute filesystem path or project selector.",
+                ),
+            );
         }
 
         // Surface-honesty (012 D6 / contracts §3c): `path:` is a WITHIN-project
@@ -10890,18 +11134,26 @@ impl SymForgeServer {
         // bound project would silently match nothing (or, for an absolute path,
         // mislead the caller into thinking they retargeted). Reject it up front
         // with a clear message naming the bound root, mirroring the
-        // `symbol_contract_violation` corrective pattern. Skipped when no root is
-        // bound (nothing to verify against) or when `path` is blank.
-        if let Some(root) = self.capture_repo_root()
+        // `symbol_contract_violation` corrective pattern. The daemon client
+        // records the canonical roots it opened, so a healthy routed call is
+        // checked against the selected/ACTIVE target root rather than this
+        // adapter's HOME root. Unknown or ambiguous selectors have no root here
+        // and are left for the daemon's authoritative routing refusal.
+        let containment_root = if may_use_local_project_state {
+            self.capture_repo_root()
+        } else {
+            daemon_routed_root
+        };
+        if let Some(root) = containment_root
             && let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty())
             && !path_is_within_bound_project(path, &root)
         {
-            let root_display = root.display().to_string().replace('\\', "/");
+            let root_display = crate::daemon::normalized_path_string(&root);
             return Ok(
                 ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(format!(
-                    "path is outside the bound project {root_display}: \
-                             `path:` is a within-project filter, not a project selector \
-                             (use `index_folder {{ path }}` to retarget the workspace)."
+                    "Path is outside the repository root: {path}. The selected project root is \
+                     {root_display}; `path:` is a within-project filter, not a project selector \
+                     (use `index_folder {{ path }}` to retarget the workspace)."
                 )),
             );
         }
@@ -10911,8 +11163,13 @@ impl SymForgeServer {
         // byte sizes from the index before the L2 gate runs, so `predicted_net`
         // varies with the actual work and the adaptive bypass/degrade branches
         // become reachable (a tiny target's manual baseline falls below
-        // SymForge's fixed schema+invoke overhead → economics bypass).
-        self.ground_plan_economics(&mut plan);
+        // SymForge's fixed schema+invoke overhead → economics bypass). A
+        // healthy daemon may route a foreign project, but this adapter's index
+        // still belongs to its home project; keep the documented plan floor in
+        // that case rather than grounding with the wrong repository's bytes.
+        if may_use_local_project_state {
+            self.ground_plan_economics(&mut plan);
+        }
         // T032 / FR-006: load the validated tuning in force for the current
         // estimator (None when no durable store / no accepted tuning / a stale
         // version), and thread it through BOTH the L2 decision and the envelope
@@ -10929,6 +11186,11 @@ impl SymForgeServer {
         let session_tokens_served = self.session_context.snapshot().total_tokens as i64;
 
         if request.preview == Some(true) {
+            // Preview is computed locally and never reaches per-step daemon
+            // routing, so it cannot honestly answer for another project.
+            if let Some(refusal) = early_project_refusal.clone() {
+                return statused_tool_result(refusal, OutcomeClass::InvalidRequest);
+            }
             let estimate = build_estimate(request, &plan, &decision);
             let body = handler::format_preview_estimate(&estimate);
             let metrics = metrics_for_decision_tuned(
@@ -10950,6 +11212,12 @@ impl SymForgeServer {
         }
 
         if should_skip_legacy_dispatch(&decision) {
+            // Cache-hit and economics-bypass answers likewise return before the
+            // routed primitive loop. Refuse a foreign selector instead of
+            // presenting bound-project evidence as the requested project.
+            if let Some(refusal) = early_project_refusal {
+                return statused_tool_result(refusal, OutcomeClass::InvalidRequest);
+            }
             let mut body = if decision.decision == crate::stel::AdmissionDecision::CacheHit {
                 format_cache_hit_body(&decision)
             } else {
@@ -10975,7 +11243,11 @@ impl SymForgeServer {
                 tuned.as_ref(),
             );
             // 012 D6-a: surface the bound project on every `symforge` response.
-            let output = self.with_bound_root_visibility(output);
+            let output = self.with_bound_root_visibility(
+                output,
+                may_use_local_project_state,
+                routed_project.as_deref(),
+            );
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
@@ -10996,11 +11268,13 @@ impl SymForgeServer {
         // dependent chain keeps its existing fail-fast on any non-success.
         let is_fusion_union = crate::stel::is_find_fusion_plan(&exec_plan);
 
-        // Task 4 Step 5: route the caller's single `project` selector through
+        // Task 4 Step 5: route a caller-supplied `project` selector through
         // every planned primitive. All-or-nothing: if ANY planned step's tool
         // has no `project` selector (e.g. git-scoped `detect_impact`), refuse
         // the whole call honestly instead of part-routing a plan (results that
-        // MIX projects would mislead worse than a refusal).
+        // MIX projects would mislead worse than a refusal). Omission is not an
+        // explicit selector: accepting steps receive the pinned ACTIVE id,
+        // while selectorless steps use the adapter's private/session route.
         if let Some(project) = facade_project.as_deref()
             && let Some(step) = exec_plan
                 .steps
@@ -11020,23 +11294,64 @@ impl SymForgeServer {
         let mut step_results = Vec::new();
         let mut outcome_class = OutcomeClass::Found;
         let mut chain_failed = false;
+        let mut routed_receipt: Option<super::result_status::ProjectEvidence> = None;
+        let mut all_routed_step_receipts_match = true;
         for step in &exec_plan.steps {
             // The plan-only planner emits the path step with
             // `rank_by="path+cochange"` and no anchor (it has no index). Resolve
             // and inject the co-change anchor here, where the index lives. A
             // weak/absent anchor degrades to pure path ranking with no error.
-            let mut step_args = self.inject_find_fusion_cochange_anchor(&step.tool, &step.args);
-            // Task 4 Step 5: inject the routed `project` selector (validated
-            // above to be accepted by every step tool). Never overwrite an
-            // explicit per-step selector the planner set.
-            if let Some(project) = facade_project.as_deref()
+            let mut step_args = self.inject_find_fusion_cochange_anchor(
+                &step.tool,
+                &step.args,
+                may_use_local_project_state,
+            );
+            // Inject the pinned routed project only into primitives that expose
+            // a public `project` selector. Explicit facade selectors were
+            // validated all-or-nothing above; omitted selectors may plan a
+            // private-pinned or session-scoped primitive, which must not receive
+            // an unknown public field. Never overwrite a planner-set selector.
+            if let Some(project) = routed_project.as_deref()
+                && Self::facade_step_accepts_project(&step.tool)
                 && let serde_json::Value::Object(ref mut object) = step_args
             {
                 object
                     .entry("project")
                     .or_insert_with(|| serde_json::Value::String(project.to_string()));
             }
+            // `tools/call` seeds this task-local slot with adapter evidence.
+            // Every daemon-backed step must replace it with its own typed
+            // receipt. Clearing even for HOME prevents a later valid receipt
+            // from falsely attesting an earlier missing/malformed step.
+            if has_daemon_client {
+                super::result_status::clear_project_evidence();
+            }
             let mut tool_body = self.dispatch_tool_for_tests(&step.tool, step_args).await;
+            if has_daemon_client {
+                let current = super::result_status::current_project_evidence();
+                let current_matches = current.as_ref().is_some_and(|evidence| {
+                    super::result_status::project_evidence_matches_selector(
+                        evidence,
+                        routed_project.as_deref(),
+                    )
+                });
+                if all_routed_step_receipts_match && current_matches {
+                    match (routed_receipt.as_ref(), current) {
+                        (None, Some(evidence)) => routed_receipt = Some(evidence),
+                        (Some(expected), Some(evidence)) if expected == &evidence => {}
+                        _ => all_routed_step_receipts_match = false,
+                    }
+                } else {
+                    all_routed_step_receipts_match = false;
+                }
+                if !all_routed_step_receipts_match {
+                    // A missing/mismatched receipt, or two receipts that disagree
+                    // on root/generation/counts, makes the aggregate response
+                    // unattested. A later valid step must not overwrite that fact.
+                    routed_receipt = None;
+                    super::result_status::clear_project_evidence();
+                }
+            }
             if step.tool == "search_knowledge" {
                 tool_body = crate::protocol::ccr::rewrite_footer_for_symforge_facade(tool_body);
             }
@@ -11063,6 +11378,17 @@ impl SymForgeServer {
                     chain_failed = true;
                     break;
                 }
+            }
+        }
+        if has_daemon_client {
+            if all_routed_step_receipts_match {
+                if let Some(evidence) = routed_receipt {
+                    super::result_status::record_project_evidence(evidence);
+                } else {
+                    super::result_status::clear_project_evidence();
+                }
+            } else {
+                super::result_status::clear_project_evidence();
             }
         }
 
@@ -11119,6 +11445,7 @@ impl SymForgeServer {
         if plan.intent == crate::stel::IntentBucket::Impact
             && !chain_failed
             && exec_plan.steps.len() == 1
+            && may_use_local_project_state
         {
             self.append_impact_intent_cochanges(&mut body, &exec_plan.steps[0].args);
         }
@@ -11148,7 +11475,11 @@ impl SymForgeServer {
             tuned.as_ref(),
         );
         // 012 D6-a: surface the bound project on every `symforge` response.
-        let output = self.with_bound_root_visibility(output);
+        let output = self.with_bound_root_visibility(
+            output,
+            may_use_local_project_state,
+            routed_project.as_deref(),
+        );
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
         statused_tool_result(output, outcome_class)
@@ -11265,7 +11596,7 @@ impl SymForgeServer {
         // daemon's populated index.
         if apply && self.daemon_client.is_none() {
             let abs_path =
-                match super::edit_tools::prepare_exact_path_for_edit(self, request.path.trim()) {
+                match super::edit_tools::prepare_exact_path_for_edit(self, request.path.as_str()) {
                     Ok((path, _)) => path,
                     Err(message) => {
                         return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
@@ -11500,6 +11831,13 @@ impl SymForgeServer {
             .to_string(),
         );
         if let Some(result) = self.proxy_tool_call("status", &request).await {
+            // A routed ACTIVE/foreign project may be unable to fall back to
+            // this adapter's immutable HOME after daemon failure. That proxy
+            // refusal is terminal: do not mutate proxy-owned calibration,
+            // overlay success-shaped status lines, or relabel it as Found.
+            if is_error_output(&result) {
+                return statused_tool_result(result, OutcomeClass::InvalidRequest);
+            }
             // US5c (P2 correctness/trust): `reset_calibration=true` MUST reset the
             // PROXY-owned durable store HERE. The proxy owns `stel_ledger_store`;
             // the storeless worker it proxied to resets nothing, so without this
@@ -11618,10 +11956,12 @@ impl SymForgeServer {
         // 012 D6-a bound-root visibility: surface WHICH workspace answered. This
         // is the root bound on THIS server — on the daemon side it is the warm
         // project's root (TR-01), on the front-end fallback it is the proxy's
-        // bound root. Normalized to forward slashes to match `runtime_status_for`.
+        // bound root. Uses the same platform-aware identity rendering as
+        // `runtime_status_for`: forward slashes on Windows, literal native path
+        // bytes on Unix.
         let project_root = self
             .capture_repo_root()
-            .map(|root| root.to_string_lossy().replace('\\', "/"));
+            .map(|root| crate::daemon::normalized_path_string(&root));
         // 013: `mut` — line below reassigns `ctx` with the durable calibration
         // verdict override (T033/FR-009).
         let mut ctx = crate::stel::StelStatusContext::from_server(
@@ -11772,7 +12112,31 @@ impl SymForgeServer {
     /// `project_root` derivation — a single source of truth for "which workspace
     /// answered". Returns `project_root: (unbound)` when nothing is bound so a
     /// stale or wrong binding is LOUD in every facade response, never silent.
-    fn stel_bound_root_line(&self) -> String {
+    fn stel_bound_root_line(
+        &self,
+        may_use_local_project_state: bool,
+        selected_project: Option<&str>,
+    ) -> String {
+        if !may_use_local_project_state {
+            if let Some(evidence) = super::result_status::current_project_evidence()
+                && super::result_status::project_evidence_matches_selector(
+                    &evidence,
+                    selected_project,
+                )
+            {
+                return match evidence.canonical_root {
+                    Some(root) => format!("project_root: {root}"),
+                    None => format!(
+                        "project_root: (routed project {}; root unavailable)",
+                        evidence.project_name
+                    ),
+                };
+            }
+            return format!(
+                "project_root: (routed project {}; daemon receipt unavailable)",
+                selected_project.unwrap_or("<unknown>")
+            );
+        }
         let published = self.index.published_state();
         let status = self.runtime_status_for(
             &published,
@@ -11795,8 +12159,16 @@ impl SymForgeServer {
     /// stays the FIRST block of the response — a contract relied on by consumers
     /// and by the facade tests (`output.starts_with("── stel")`). The bound-root
     /// line is still unconditionally present, so a stale/wrong binding is loud.
-    fn with_bound_root_visibility(&self, output: String) -> String {
-        format!("{output}\n{}", self.stel_bound_root_line())
+    fn with_bound_root_visibility(
+        &self,
+        output: String,
+        may_use_local_project_state: bool,
+        selected_project: Option<&str>,
+    ) -> String {
+        format!(
+            "{output}\n{}",
+            self.stel_bound_root_line(may_use_local_project_state, selected_project)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11903,9 +12275,6 @@ impl SymForgeServer {
     pub(crate) async fn ask(&self, params: Parameters<SmartQueryInput>) -> String {
         use crate::protocol::smart_query;
 
-        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
-            return refusal;
-        }
         let original_q = params.0.query.trim();
         if crate::knowledge::guard_query(original_q).is_err() {
             return "Error: sensitive query rejected by repository safety policy.".to_string();
@@ -11913,6 +12282,16 @@ impl SymForgeServer {
         let q = smart_query::strip_leading_articles(original_q);
         if q.is_empty() {
             return "query requires a non-empty question.".to_string();
+        }
+        // `ask` chooses its route from index state, so daemon-backed calls must
+        // run the whole classifier in the selected/ACTIVE project. Keep the
+        // no-echo safety checks above this transport boundary, then proxy before
+        // any adapter-HOME selector guard or index-derived route heuristic.
+        if let Some(result) = self.proxy_tool_call("ask", &params.0).await {
+            return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
 
         let (mut intent, mut matched_prefix) = smart_query::classify_intent_with_match(q);
@@ -12350,6 +12729,174 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bound_project_path_rejects_a_lexical_escape() {
+        let root = TempDir::new().expect("bound project root");
+        assert!(
+            !super::path_is_within_bound_project("../outside.rs", root.path()),
+            "a relative traversal must not escape the bound project"
+        );
+        assert!(
+            !super::path_is_within_bound_project("missing/../../outside.rs", root.path()),
+            "an unresolved prefix must not hide a later parent traversal"
+        );
+    }
+
+    #[tokio::test]
+    async fn symforge_facade_rejects_a_bound_path_escape_at_the_handler_boundary() {
+        let root = TempDir::new().expect("bound project root");
+        let server = make_server_with_root(
+            make_live_index_ready(Vec::new()),
+            Some(root.path().to_path_buf()),
+        );
+        let absolute = root.path().join("src/lib.rs").display().to_string();
+        for (path, expected) in [
+            (
+                "../outside.rs".to_string(),
+                "Path is outside the repository root",
+            ),
+            (absolute, "repo-relative path"),
+            ("C:src/lib.rs".to_string(), "repo-relative path"),
+            ("\\src\\lib.rs".to_string(), "repo-relative path"),
+        ] {
+            let request = crate::stel::StelRequest {
+                query: "who references thing".to_string(),
+                path: Some(path),
+                ..Default::default()
+            };
+
+            let result = server
+                .symforge_stel_handler(&request)
+                .await
+                .expect("facade path-boundary result");
+            let serialized = serde_json::to_value(&result).expect("serialize facade path result");
+            assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+            let text = tool_result_text(&serialized);
+            assert!(
+                text.contains(expected) && text.contains("within-project filter"),
+                "the facade handler must reject before downstream routing: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn symforge_facade_early_selector_refusals_clear_seeded_home_evidence() {
+        let root = TempDir::new().expect("bound project root");
+        let server = make_server_with_root(
+            make_live_index_ready(Vec::new()),
+            Some(root.path().to_path_buf()),
+        );
+        let home_evidence = super::super::result_status::ProjectEvidence {
+            project_id: crate::daemon::project_key(root.path()),
+            project_name: "test_project".to_string(),
+            canonical_root: Some(root.path().display().to_string()),
+            generation: 4,
+            index_state: "Ready".to_string(),
+            load_source: "home-seed".to_string(),
+            index_files: 2,
+            index_symbols: 3,
+        };
+        let requests = [
+            crate::stel::StelRequest {
+                query: "where is thing defined".to_string(),
+                projects: Some(vec!["foreign-project".to_string()]),
+                ..Default::default()
+            },
+            crate::stel::StelRequest {
+                query: "where is thing defined".to_string(),
+                projects: Some(Vec::new()),
+                ..Default::default()
+            },
+            crate::stel::StelRequest {
+                query: "where is thing defined".to_string(),
+                projects: Some(vec!["   ".to_string()]),
+                ..Default::default()
+            },
+            crate::stel::StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("foreign-project".to_string()),
+                preview: Some(true),
+                ..Default::default()
+            },
+        ];
+
+        for request in requests {
+            let result = super::super::result_status::with_project_evidence_scope(
+                Some(home_evidence.clone()),
+                async {
+                    let mut result = server.symforge_stel_handler(&request).await?;
+                    super::super::result_status::attach_project_evidence_meta(&mut result.meta);
+                    Ok::<_, rmcp::ErrorData>(result)
+                },
+            )
+            .await
+            .expect("facade selector refusal");
+            let serialized = serde_json::to_value(&result).expect("serialize selector refusal");
+            assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+            assert_eq!(
+                serialized["_meta"]["symforge/project_evidence"],
+                serde_json::json!({
+                    "bound": false,
+                    "reason": "project_evidence_unavailable",
+                }),
+                "a foreign/set-valued early refusal must never retain HOME: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_project_path_fails_closed_when_the_bound_root_is_missing() {
+        let parent = TempDir::new().expect("bound project parent");
+        let missing_root = parent.path().join("missing-root");
+        assert!(
+            !super::path_is_within_bound_project("src/lib.rs", &missing_root),
+            "an unobservable bound root must not be accepted lexically"
+        );
+    }
+
+    #[test]
+    fn bound_project_path_rejects_symlink_escape_with_a_missing_leaf() {
+        let root = TempDir::new().expect("bound project root");
+        let outside = TempDir::new().expect("outside project root");
+        let outside_child = outside.path().join("child");
+        std::fs::create_dir(&outside_child).expect("outside child directory");
+        let link = root.path().join("escape-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_child, &link).expect("create directory symlink");
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&outside_child, &link) {
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("create directory symlink: {error}");
+        }
+
+        assert!(
+            !super::path_is_within_bound_project("escape-link/missing.rs", root.path()),
+            "a missing leaf beneath an escaping link must remain outside"
+        );
+        #[cfg(unix)]
+        assert!(
+            !super::path_is_within_bound_project("escape-link/../missing.rs", root.path()),
+            "link/.. must use filesystem resolution, not lexical collapse"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_project_path_accepts_nonexistent_ascii_case_variant_on_windows() {
+        let root = TempDir::new().expect("bound project root");
+        let case_variant = root.path().display().to_string().to_ascii_uppercase();
+        let target = PathBuf::from(case_variant).join("not-yet-created.rs");
+        assert!(
+            super::path_is_within_bound_project(&target.display().to_string(), root.path()),
+            "Windows containment must use filesystem case semantics for a missing descendant; \
+             root={}, target={}",
+            root.path().display(),
+            target.display()
+        );
+    }
+
     // ── SF-001 Part 2: daemon served-binary staleness guard ──────────────────
 
     /// Build a minimal proxied-health string carrying the daemon's runtime
@@ -12684,6 +13231,59 @@ mod tests {
             !overlaid.contains("calibration: accumulating"),
             "overlay after reset must NOT show stale accumulating calibration:\n{overlaid}"
         );
+    }
+
+    #[tokio::test]
+    async fn status_routing_refusal_never_resets_proxy_calibration_or_reports_found() {
+        use crate::stel::calibration::CalibrationVerdict;
+        use crate::stel::ledger_store::StelLedgerStore;
+
+        let active = tempfile::TempDir::new().expect("active sibling root");
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "home-project-id".to_string(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        client.record_opened_root(active.path().to_path_buf());
+        client.record_active_root(active.path().to_path_buf());
+        let store = StelLedgerStore::open_in_memory("proxy-refusal-reset")
+            .expect("in-memory durable store");
+        store.record(&sample_durable_event());
+        store.record(&sample_durable_event());
+        let proxy =
+            SymForgeServer::new_daemon_proxy(client).with_stel_ledger_store(Arc::new(store));
+        {
+            let mut degraded = proxy.daemon_degraded.lock();
+            degraded.degraded = true;
+            degraded.last_reconnect_attempt = Some(std::time::Instant::now());
+        }
+        assert!(matches!(
+            proxy.durable_calibration_verdict(),
+            Some(CalibrationVerdict::Accumulating { n: 2, .. })
+        ));
+
+        let result = proxy
+            .status_stel_tool(Parameters(crate::stel::StelStatusRequest {
+                detail: Some(crate::stel::StelStatusDetail::Full),
+                reset_calibration: Some(true),
+                connection_surface: None,
+            }))
+            .await
+            .expect("status routing refusal");
+        let serialized = serde_json::to_value(result).expect("serialize status refusal");
+        assert!(
+            tool_result_text(&serialized).starts_with("Error: project_routing:"),
+            "status must surface the routing refusal unchanged: {serialized}"
+        );
+        assert_eq!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            "invalid_request"
+        );
+        assert!(matches!(
+            proxy.durable_calibration_verdict(),
+            Some(CalibrationVerdict::Accumulating { n: 2, .. })
+        ));
     }
 
     /// Honesty for the no-store proxy: `reset_calibration=true` in the proxy
@@ -13815,20 +14415,24 @@ mod tests {
         }
     }
 
-    fn write_sidecar_state(
+    fn write_sidecar_descriptor(
         control_state_dir: &crate::domain::ControlStateDir,
-        port: Option<u16>,
-        pid: Option<&str>,
-    ) {
+        project_root: &std::path::Path,
+        port: u16,
+    ) -> u32 {
         let dir = crate::sidecar::port_file::ensure_symforge_dir(control_state_dir)
             .expect("test control state should allow sidecar namespace creation");
-        if let Some(port) = port {
-            fs::write(dir.join("sidecar.port"), port.to_string())
-                .expect("sidecar port file should be writable");
-        }
-        if let Some(pid) = pid {
-            fs::write(dir.join("sidecar.pid"), pid).expect("sidecar pid file should be writable");
-        }
+        let pid = std::process::id();
+        crate::sidecar::port_file::write_descriptor_for_pid_at(
+            &dir,
+            pid,
+            port,
+            None,
+            Some(project_root),
+            None,
+        )
+        .expect("identity-bound sidecar descriptor should be writable");
+        pid
     }
 
     struct EnvVarGuard {
@@ -15051,6 +15655,12 @@ mod tests {
             !escaped.starts_with("File not found"),
             "traversal path must NOT be reported as a generic miss; got: {escaped}"
         );
+        let escaped_result = serialized_tool_result(
+            server
+                .get_file_content_tool(Parameters(get_file_content_input("../../../etc/passwd")))
+                .await,
+        );
+        assert_tool_result_status(&escaped_result, OutcomeClass::InvalidRequest);
 
         // A genuine in-repo file (not in the index) still reads from disk fine.
         let ok = server
@@ -16304,21 +16914,42 @@ mod tests {
             make_live_index_ready(vec![(key, file)]),
             Some(repo.path().to_path_buf()),
         );
+        let entry_generation = server.index.published_generation().publication_generation;
 
-        let result = server
-            .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
-                project: None,
-                path: "src/lib.rs".to_string(),
-                new_file: None,
-                include_co_changes: None,
-                co_changes_limit: None,
-                estimate: None,
-            }))
+        let (result, evidence) =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let result = server
+                    .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                        project: None,
+                        path: "src/lib.rs".to_string(),
+                        new_file: None,
+                        include_co_changes: None,
+                        co_changes_limit: None,
+                        estimate: None,
+                    }))
+                    .await;
+                (
+                    result,
+                    crate::protocol::result_status::current_project_evidence(),
+                )
+            })
             .await;
 
         assert!(
             result.contains("new_name"),
             "impact tool should re-read the file from repo_root and report new symbols; got: {result}"
+        );
+        let served = server.index.published_generation();
+        assert!(
+            served.publication_generation > entry_generation,
+            "the changed file fixture must publish a replacement generation"
+        );
+        assert_eq!(
+            evidence
+                .expect("impact result records project evidence")
+                .generation,
+            served.publication_generation,
+            "impact evidence must bind to the exact replacement publication used by the body"
         );
     }
 
@@ -16816,12 +17447,11 @@ mod tests {
         );
 
         let health = server.health_compact().await;
-        let root_text = repo
+        let canonical_root = repo
             .path()
             .canonicalize()
-            .expect("temp repo should canonicalize")
-            .to_string_lossy()
-            .replace('\\', "/");
+            .expect("temp repo should canonicalize");
+        let root_text = crate::daemon::normalized_path_string(&canonical_root);
         assert!(
             health.contains(&format!("project_root={root_text}")),
             "health should surface the project root after index_folder, got: {health}"
@@ -17107,6 +17737,166 @@ mod tests {
                 .contains("/mcp HTTP transport"),
             "multi-project refusal must name the /mcp transport"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_project_selector_does_not_alias_literal_backslash_to_separator() {
+        let parent = TempDir::new().expect("tempdir");
+        let bound_root = parent.path().join("a\\b");
+        let foreign_root = parent.path().join("a").join("b");
+        std::fs::create_dir_all(bound_root.join("src")).expect("bound src dir");
+        std::fs::create_dir_all(bound_root.join(".git")).expect("bound git dir");
+        std::fs::create_dir_all(&foreign_root).expect("foreign root");
+
+        let original = b"pub fn alpha() -> usize { 1 }\n";
+        let source_path = bound_root.join("src/lib.rs");
+        std::fs::write(&source_path, original).expect("bound source");
+        let parsed = crate::parsing::process_file("src/lib.rs", original, LanguageId::Rust);
+        let indexed = IndexedFile::from_parse_result(parsed, original.to_vec());
+        let canonical_bound = bound_root.canonicalize().expect("canonical bound root");
+        let canonical_foreign = foreign_root.canonicalize().expect("canonical foreign root");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]),
+            Some(canonical_bound.clone()),
+        );
+
+        let output = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                serde_json::json!({
+                    "project": canonical_foreign.to_string_lossy(),
+                    "path": "src/lib.rs",
+                    "name": "alpha",
+                    "new_body": "pub fn alpha() -> usize { 2 }",
+                }),
+            )))
+            .await;
+
+        assert!(
+            output.contains("not available on this connection"),
+            "the distinct slash-path selector must be refused before edit dispatch: {output}"
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("read bound source after refusal"),
+            original,
+            "a selector for a distinct Unix root must never mutate the bound root"
+        );
+
+        let evidence = server.local_project_evidence().expect("local evidence");
+        assert_eq!(
+            evidence.canonical_root.as_deref(),
+            canonical_bound.to_str(),
+            "project evidence must preserve a literal Unix backslash"
+        );
+        assert!(
+            crate::protocol::result_status::project_evidence_matches_selector(
+                &evidence,
+                Some(crate::daemon::project_key(&canonical_bound).as_str()),
+            ),
+            "the preserved evidence root must validate against its own project ID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_project_selector_does_not_alias_non_utf8_root_to_lossy_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let parent = TempDir::new().expect("tempdir");
+        let bound_root = parent
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
+        let foreign_root = parent.path().join("a\u{fffd}b");
+        std::fs::create_dir_all(bound_root.join("src")).expect("bound src dir");
+        std::fs::create_dir_all(bound_root.join(".git")).expect("bound git dir");
+        std::fs::create_dir_all(&foreign_root).expect("foreign root");
+
+        let original = b"pub fn alpha() -> usize { 1 }\n";
+        let source_path = bound_root.join("src/lib.rs");
+        std::fs::write(&source_path, original).expect("bound source");
+        let parsed = crate::parsing::process_file("src/lib.rs", original, LanguageId::Rust);
+        let indexed = IndexedFile::from_parse_result(parsed, original.to_vec());
+        let canonical_bound = bound_root.canonicalize().expect("canonical bound root");
+        let canonical_foreign = foreign_root.canonicalize().expect("canonical foreign root");
+        assert_eq!(
+            canonical_bound.to_string_lossy(),
+            canonical_foreign.to_string_lossy(),
+            "fixture must exercise a real lossy-path collision"
+        );
+        assert_ne!(
+            crate::daemon::project_key(&canonical_bound),
+            crate::daemon::project_key(&canonical_foreign)
+        );
+
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]),
+            Some(canonical_bound.clone()),
+        );
+        let output = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                serde_json::json!({
+                    "project": canonical_foreign.to_str().expect("UTF-8 foreign root"),
+                    "path": "src/lib.rs",
+                    "name": "alpha",
+                    "new_body": "pub fn alpha() -> usize { 2 }",
+                }),
+            )))
+            .await;
+
+        assert!(
+            output.contains("not available on this connection"),
+            "{output}"
+        );
+        assert_eq!(std::fs::read(&source_path).expect("bound source"), original);
+        let evidence = server.local_project_evidence().expect("local evidence");
+        assert_eq!(
+            evidence.project_id,
+            crate::daemon::project_key(&canonical_bound)
+        );
+        assert_eq!(
+            evidence.canonical_root, None,
+            "an opaque native root must never be published through a lossy string"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_project_selector_preserves_trailing_space_path_identity() {
+        let parent = TempDir::new().expect("tempdir");
+        let bound_root = parent.path().join("repo");
+        let foreign_root = parent.path().join("repo ");
+        std::fs::create_dir_all(bound_root.join("src")).expect("bound src dir");
+        std::fs::create_dir_all(bound_root.join(".git")).expect("bound git dir");
+        std::fs::create_dir_all(&foreign_root).expect("foreign root");
+
+        let original = b"pub fn alpha() -> usize { 1 }\n";
+        let source_path = bound_root.join("src/lib.rs");
+        std::fs::write(&source_path, original).expect("bound source");
+        let parsed = crate::parsing::process_file("src/lib.rs", original, LanguageId::Rust);
+        let indexed = IndexedFile::from_parse_result(parsed, original.to_vec());
+        let canonical_bound = bound_root.canonicalize().expect("canonical bound root");
+        let canonical_foreign = foreign_root.canonicalize().expect("canonical foreign root");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]),
+            Some(canonical_bound),
+        );
+
+        let output = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                serde_json::json!({
+                    "project": canonical_foreign.to_str().expect("UTF-8 foreign root"),
+                    "path": "src/lib.rs",
+                    "name": "alpha",
+                    "new_body": "pub fn alpha() -> usize { 2 }",
+                }),
+            )))
+            .await;
+
+        assert!(
+            output.contains("not available on this connection"),
+            "{output}"
+        );
+        assert_eq!(std::fs::read(&source_path).expect("bound source"), original);
     }
 
     #[tokio::test]
@@ -19711,11 +20501,10 @@ mod tests {
             result.contains("Runtime: mode=local_process"),
             "health should identify local runtime mode: {result}"
         );
-        let root_text = server
+        let root = server
             .capture_repo_root()
-            .expect("test server should retain its canonical project root")
-            .to_string_lossy()
-            .replace('\\', "/");
+            .expect("test server should retain its canonical project root");
+        let root_text = crate::daemon::normalized_path_string(&root);
         assert!(
             result.contains(&format!("project_root={root_text}")),
             "health should identify active project root: {result}"
@@ -20140,7 +20929,7 @@ mod tests {
             .local_addr()
             .expect("test listener should have a local address")
             .port();
-        write_sidecar_state(&control_state_dir, Some(port), Some("4242"));
+        let pid = write_sidecar_descriptor(&control_state_dir, temp.path(), port);
 
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let server = make_server_with_root(
@@ -20153,7 +20942,7 @@ mod tests {
             .health(Parameters(super::HealthInput::default()))
             .await;
         assert!(
-            result.contains(&format!("Sidecar: pid=4242 port={port} state=alive")),
+            result.contains(&format!("Sidecar: pid={pid} port={port} state=alive")),
             "full health should surface alive sidecar state: {result}"
         );
     }
@@ -20299,7 +21088,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir should be created");
         let control_state_dir = crate::domain::ControlStateDir::new(temp.path().join("control"));
         let port = 0;
-        write_sidecar_state(&control_state_dir, Some(port), Some("4242"));
+        let pid = write_sidecar_descriptor(&control_state_dir, temp.path(), port);
 
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let server = make_server_with_root(
@@ -20310,13 +21099,13 @@ mod tests {
 
         let result = server.health_compact().await;
         assert!(
-            result.contains(&format!("Sidecar: dead pid=4242 port={port}")),
+            result.contains(&format!("Sidecar: dead pid={pid} port={port}")),
             "compact health should surface dead sidecar state: {result}"
         );
     }
 
     #[tokio::test]
-    async fn test_health_surfaces_unknown_sidecar_state_for_malformed_port_file() {
+    async fn test_health_refuses_malformed_legacy_sidecar_state_without_project_identity() {
         let temp = TempDir::new().expect("tempdir should be created");
         let control_state_dir = crate::domain::ControlStateDir::new(temp.path().join("control"));
         let dir = crate::sidecar::port_file::ensure_symforge_dir(&control_state_dir)
@@ -20336,12 +21125,11 @@ mod tests {
             .health(Parameters(super::HealthInput::default()))
             .await;
         assert!(
-            result.contains("Sidecar: pid=4242 port=unknown state=unknown"),
-            "full health should surface unknown sidecar state: {result}"
-        );
-        assert!(
-            result.contains("sidecar.port invalid"),
-            "full health should explain malformed sidecar state: {result}"
+            result.contains(
+                "Sidecar: none usable (root-scoped sidecar lookup refused legacy fixed files \
+                 without project identity)"
+            ),
+            "root-scoped health must refuse malformed legacy state without identity: {result}"
         );
     }
 
@@ -23072,30 +23860,42 @@ mod tests {
             make_live_index_ready(vec![(key, file)]),
             Some(repo.path().to_path_buf()),
         );
-
-        let result = server
-            .get_file_content(Parameters(super::GetFileContentInput {
-                project: None,
-                path: "src/lib.rs".to_string(),
-                mode: None,
-                start_line: None,
-                end_line: None,
-                chunk_index: None,
-                max_lines: None,
-                around_line: None,
-                around_match: None,
-                match_occurrence: None,
-                around_symbol: None,
-                symbol_line: None,
-                context_lines: None,
-                show_line_numbers: None,
-                header: None,
-                estimate: None,
-                offset: None,
-                limit: None,
-                max_tokens: None,
-                force_refresh: None,
-            }))
+        let seeded = server
+            .local_project_evidence()
+            .expect("pre-refresh local evidence");
+        let seeded_generation = seeded.generation;
+        let (result, evidence) =
+            crate::protocol::result_status::with_project_evidence_scope(Some(seeded), async {
+                let result = server
+                    .get_file_content(Parameters(super::GetFileContentInput {
+                        project: None,
+                        path: "src/lib.rs".to_string(),
+                        mode: None,
+                        start_line: None,
+                        end_line: None,
+                        chunk_index: None,
+                        max_lines: None,
+                        around_line: None,
+                        around_match: None,
+                        match_occurrence: None,
+                        around_symbol: None,
+                        symbol_line: None,
+                        context_lines: None,
+                        show_line_numbers: None,
+                        header: None,
+                        estimate: None,
+                        offset: None,
+                        limit: None,
+                        max_tokens: None,
+                        force_refresh: None,
+                    }))
+                    .await;
+                (
+                    result,
+                    crate::protocol::result_status::current_project_evidence()
+                        .expect("post-refresh response evidence"),
+                )
+            })
             .await;
 
         assert!(
@@ -23105,6 +23905,15 @@ mod tests {
         assert!(
             !result.contains("fn stale() {}"),
             "stale indexed content should not be served after refresh: {result}"
+        );
+        let served_generation = server.index.published_generation().publication_generation;
+        assert_ne!(
+            evidence.generation, seeded_generation,
+            "freshening must replace the call-scope's stale evidence"
+        );
+        assert_eq!(
+            evidence.generation, served_generation,
+            "body and evidence must use the same post-freshen publication"
         );
     }
 
@@ -30891,6 +31700,172 @@ mod tests {
         );
     }
 
+    #[test]
+    fn facade_probe_policy_allows_only_source_mutation_safe_measurements() {
+        let empty = serde_json::json!({});
+        for tool in [
+            "search_files",
+            "search_symbols",
+            "search_text",
+            "find_dependents",
+            "find_references",
+            "get_file_content",
+            "get_symbol",
+            "get_file_context",
+            "get_symbol_context",
+        ] {
+            assert!(
+                SymForgeServer::facade_probe_is_measurement_safe(tool, &empty),
+                "the A-019 source-mutation-safe measurement relay must retain {tool}"
+            );
+        }
+        assert!(SymForgeServer::facade_probe_is_measurement_safe(
+            "batch_rename",
+            &serde_json::json!({ "dry_run": true })
+        ));
+        assert!(!SymForgeServer::facade_probe_is_measurement_safe(
+            "batch_rename",
+            &empty
+        ));
+        assert!(!SymForgeServer::facade_probe_is_measurement_safe(
+            "batch_rename",
+            &serde_json::json!({ "dry_run": false })
+        ));
+        for tool in [
+            "replace_symbol_body",
+            "curate_knowledge",
+            "index_folder",
+            "checkpoint_now",
+        ] {
+            assert!(
+                !SymForgeServer::facade_probe_is_measurement_safe(tool, &empty),
+                "a mutating or state-writing tool must not hide behind read-only symforge: {tool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn symforge_facade_rejects_mutating_probe_relay() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let server = make_server(make_live_index_ready(Vec::new()));
+        let call = SymforgeCallInput {
+            request: StelRequest::default(),
+            probe_legacy_tool: Some("index_folder".to_string()),
+            probe_legacy_args: Some(serde_json::json!({})),
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.contains("restricted to the A-019 source-mutation-safe measurement allowlist"),
+            "the hidden relay must reject mutating legacy dispatch before it runs: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn symforge_facade_preserves_malformed_probe_without_fabricated_status() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let server = make_server(make_live_index_ready(Vec::new()));
+        let call = SymforgeCallInput {
+            request: StelRequest::default(),
+            probe_legacy_tool: Some("get_file_content".to_string()),
+            probe_legacy_args: Some(serde_json::json!({})),
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.starts_with("invalid tool parameters:"),
+            "the allowed read relay must preserve decoder failure text: {text}"
+        );
+        assert!(
+            serialized["_meta"][RESULT_STATUS_META_KEY].is_null(),
+            "rendered legacy text is not a typed semantic status: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn symforge_facade_probe_refuses_facade_level_project_selectors() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let server = make_server(make_live_index_ready(Vec::new()));
+        let requests = [
+            StelRequest {
+                project: Some("other-project".to_string()),
+                ..Default::default()
+            },
+            StelRequest {
+                projects: Some(vec!["other-project".to_string()]),
+                ..Default::default()
+            },
+        ];
+
+        for request in requests {
+            let call = SymforgeCallInput {
+                request,
+                probe_legacy_tool: Some("get_file_content".to_string()),
+                probe_legacy_args: Some(serde_json::json!({})),
+            };
+            let result = server
+                .symforge_facade_tool(Parameters(call))
+                .await
+                .expect("facade dispatch");
+            let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+            assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+            let text = tool_result_text(&serialized);
+            assert!(
+                text.contains("does not route facade-level `project`/`projects`")
+                    && text.contains("`_probe_legacy_args`"),
+                "the relay must reject a silently dropped facade selector: {text}"
+            );
+            assert!(
+                !text.starts_with("invalid tool parameters:"),
+                "selector refusal must happen before legacy dispatch: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn symforge_facade_preserves_missing_batch_rename_without_fabricated_status() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let root = tempfile::tempdir().expect("temp repo root");
+        let server = make_server_with_root(
+            make_live_index_ready(Vec::new()),
+            Some(root.path().to_path_buf()),
+        );
+        let call = SymforgeCallInput {
+            request: StelRequest::default(),
+            probe_legacy_tool: Some("batch_rename".to_string()),
+            probe_legacy_args: Some(serde_json::json!({
+                "path": "src/missing.rs",
+                "name": "missing",
+                "new_name": "renamed",
+                "dry_run": true
+            })),
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let text = tool_result_text(&serialized);
+        assert!(text.starts_with("File not indexed:"), "output: {text}");
+        assert!(
+            serialized["_meta"][RESULT_STATUS_META_KEY].is_null(),
+            "rendered legacy text is not a typed semantic status: {serialized}"
+        );
+    }
+
     // ── Feature 012 hardening — `symforge` facade REFUSES cross-project targeting ─
     //
     // `StelRequest` carries `project`/`projects` for schema parity, but the L1
@@ -31045,44 +32020,155 @@ mod tests {
         );
     }
 
-    /// The retrieve facade's foreign-project guard must fire BEFORE the early
-    /// returns that skip the serve loop's per-step `project` injection. Before
-    /// the fix, `preview: true` with a foreign selector returned
-    /// `outcome_class=found` plus an estimate grounded in the BOUND project —
-    /// a dishonest success in exactly the shape the guard exists to prevent.
+    /// The compact facade's foreign-project guard must fire BEFORE the early
+    /// returns that skip the serve loop's per-step `project` injection. This is
+    /// true for local execution, healthy daemon configuration, and degraded
+    /// daemon fallback: none of those preview paths dispatches a primitive.
     #[tokio::test]
     async fn symforge_facade_refuses_foreign_project_before_preview_estimate() {
         use crate::stel::{StelRequest, SymforgeCallInput};
 
-        let sym = make_symbol("thing", SymbolKind::Function, 1, 1);
-        let content = medium_test_source("pub fn thing() {}");
-        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
-        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        fn ready_server() -> SymForgeServer {
+            let sym = make_symbol("thing", SymbolKind::Function, 1, 1);
+            let content = medium_test_source("pub fn thing() {}");
+            let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+            make_server(make_live_index_ready(vec![(key, file)]))
+        }
+
+        fn daemon_configured_server(degraded: bool) -> SymForgeServer {
+            let mut server = ready_server();
+            let client = crate::daemon::DaemonSessionClient::new_for_test(
+                "http://127.0.0.1:1".to_string(),
+                "project-id".to_string(),
+                "session-id".to_string(),
+                "test_project".to_string(),
+            );
+            server.daemon_client = Some(Arc::new(tokio::sync::RwLock::new(client)));
+            server.daemon_degraded.lock().degraded = degraded;
+            server
+        }
+
         let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
 
-        let preview_call = SymforgeCallInput {
+        for (topology, server) in [
+            ("local", ready_server()),
+            ("healthy-daemon", daemon_configured_server(false)),
+            ("degraded-daemon", daemon_configured_server(true)),
+        ] {
+            let preview_call = SymforgeCallInput {
+                request: StelRequest {
+                    query: "where is thing defined".to_string(),
+                    project: Some("totally-other-project".to_string()),
+                    preview: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let result = server
+                .symforge_facade_tool(Parameters(preview_call))
+                .await
+                .expect("facade dispatch");
+            let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+            assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+            let text = tool_result_text(&serialized);
+            assert!(
+                text.contains("not available on this connection")
+                    || text.contains("cannot be resolved for a local facade-only result"),
+                "a foreign selector must refuse, not preview in {topology}: {text}"
+            );
+            assert!(
+                !text.contains("predicted_net_vs_manual") && !text.contains("plan_id"),
+                "a refused call must not hand back a bound-project estimate in {topology}: {text}"
+            );
+        }
+
+        // A healthy configured daemon must NOT be refused merely because the
+        // selector differs from the session's home project. Drive an
+        // unroutable plan so the call reaches the normal all-or-nothing routing
+        // check without touching the dead test endpoint.
+        let healthy_daemon = daemon_configured_server(false);
+        let routed_call = SymforgeCallInput {
             request: StelRequest {
-                query: "where is thing defined".to_string(),
+                query: "blast radius of the recent changes".to_string(),
+                intent: Some(crate::stel::IntentBucket::Impact),
                 project: Some("totally-other-project".to_string()),
-                preview: Some(true),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let result = server
-            .symforge_facade_tool(Parameters(preview_call))
+        let result = healthy_daemon
+            .symforge_facade_tool(Parameters(routed_call))
             .await
             .expect("facade dispatch");
         let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
         assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
         let text = tool_result_text(&serialized);
         assert!(
-            text.contains("not available on this connection"),
-            "a foreign selector must refuse, not preview: {text}"
+            text.contains("cannot be routed through this plan") && text.contains("detect_impact"),
+            "healthy-daemon serve must reach normal per-plan routing: {text}"
         );
         assert!(
-            !text.contains("predicted_net_vs_manual") && !text.contains("plan_id"),
-            "a refused call must not hand back a bound-project estimate: {text}"
+            !text.contains("not available on this connection"),
+            "healthy-daemon serve must not apply the local-project refusal: {text}"
+        );
+
+        // Both non-dispatch branches share one selector guard. Pin a known
+        // P-FF bypass row and a seeded session-cache hit so neither can return
+        // home-project evidence for a foreign selector.
+        let bypass_server = daemon_configured_server(false);
+        let bypass_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "full file review service.rs".to_string(),
+                project: Some("totally-other-project".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = bypass_server
+            .symforge_facade_tool(Parameters(bypass_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            (text.contains("not available on this connection")
+                || text.contains("cannot be resolved for a local facade-only result"))
+                && !text.contains("Decision: bypass"),
+            "a foreign P-FF bypass must refuse before returning plan-floor evidence: {text}"
+        );
+
+        let cache_server = daemon_configured_server(false);
+        let mut cache_request = StelRequest {
+            query: "read src/lib.rs".to_string(),
+            intent: Some(crate::stel::IntentBucket::Read),
+            path: Some("src/lib.rs".to_string()),
+            ..Default::default()
+        };
+        let cache_plan = crate::stel::planner::build_plan(&cache_request);
+        let cache_step = cache_plan.steps.first().expect("cache plan step");
+        assert_eq!(cache_step.tool, "get_file_context");
+        let cache_hash = crate::protocol::session::hash_file_context_params_json(&cache_step.args);
+        cache_server
+            .session_context
+            .record_file_context_fetch("src/lib.rs", cache_hash, 64);
+        cache_request.project = Some("totally-other-project".to_string());
+        let cache_call = SymforgeCallInput {
+            request: cache_request,
+            ..Default::default()
+        };
+        let result = cache_server
+            .symforge_facade_tool(Parameters(cache_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            (text.contains("not available on this connection")
+                || text.contains("cannot be resolved for a local facade-only result"))
+                && !text.contains("Decision: cache_hit"),
+            "a foreign cache hit must refuse before returning stored home-project evidence: {text}"
         );
     }
 

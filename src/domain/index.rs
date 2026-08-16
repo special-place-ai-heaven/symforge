@@ -607,6 +607,7 @@ pub enum RootRefusalReason {
     SymlinkAliasToForbiddenRoot,
     MissingOrNotDirectory,
     CanonicalizationFailed,
+    UnsupportedPathEncoding,
     DeviceOrSpecialNamespace,
     ProtectedRootRequiresExplicitOverride,
 }
@@ -621,6 +622,7 @@ impl RootRefusalReason {
             Self::SymlinkAliasToForbiddenRoot => "symlink_alias_to_forbidden_root",
             Self::MissingOrNotDirectory => "missing_or_not_directory",
             Self::CanonicalizationFailed => "canonicalization_failed",
+            Self::UnsupportedPathEncoding => "unsupported_path_encoding",
             Self::DeviceOrSpecialNamespace => "device_or_special_namespace",
             Self::ProtectedRootRequiresExplicitOverride => {
                 "protected_root_requires_explicit_override"

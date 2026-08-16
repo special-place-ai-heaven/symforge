@@ -30,8 +30,8 @@ impl EditValidationError {
 
 /// Validate compact-surface edit inputs before planning.
 pub fn validate_edit_request(request: &StelEditRequest) -> Result<(), EditValidationError> {
-    let path = request.path.trim();
-    if path.is_empty() {
+    let path = request.path.as_str();
+    if path.trim().is_empty() {
         return Err(EditValidationError::new("path is required"));
     }
     if path.contains("..") {
@@ -119,7 +119,7 @@ pub fn validate_edit_request(request: &StelEditRequest) -> Result<(), EditValida
 pub fn build_edit_plan(request: &StelEditRequest) -> Result<StelPlan, EditValidationError> {
     validate_edit_request(request)?;
     let symbol = request.symbol.as_deref().unwrap_or("").trim();
-    let path = request.path.trim();
+    let path = request.path.as_str();
     let dry_run = !super::edit_apply::apply_requested(request);
     let op = effective_op(request);
 
@@ -258,7 +258,7 @@ fn edit_plan_id(request: &StelEditRequest) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path_token = request.path.trim().replace(['/', '\\'], "-");
+    let path_token = request.path.replace(['/', '\\'], "-");
     format!("stel-edit-{path_token}-{ts}")
 }
 
@@ -315,6 +315,22 @@ mod tests {
         assert_eq!(plan.steps[0].tool, "replace_symbol_body");
         assert_eq!(plan.steps[0].args["dry_run"], true);
         assert_eq!(plan.steps[0].args["name"], "helper");
+    }
+
+    #[test]
+    fn build_edit_plan_preserves_exact_path_bytes() {
+        let plan = build_edit_plan(&StelEditRequest {
+            path: "src/lib.rs ".to_string(),
+            symbol: Some("helper".to_string()),
+            body: Some("fn helper() {}".to_string()),
+            ..Default::default()
+        })
+        .expect("a nonblank repository-relative path remains valid");
+
+        assert_eq!(
+            plan.steps[0].args["path"], "src/lib.rs ",
+            "planning must not retarget a legal Unix path by trimming identity bytes"
+        );
     }
 
     #[test]

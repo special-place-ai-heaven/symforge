@@ -1255,6 +1255,12 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
 /// cold start indexes the real workspace instead of the home directory.
 pub const WORKSPACE_ROOT_ENV: &str = "SYMFORGE_WORKSPACE_ROOT";
 
+enum WorkspaceRootEnvResolution {
+    AbsentOrRecoverable,
+    Resolved(PathBuf),
+    UnsupportedEncoding,
+}
+
 /// Walk upward from the current working directory, looking for a `.git` directory.
 /// Returns `None` if no git root is found and the cwd is a forbidden directory.
 ///
@@ -1262,11 +1268,16 @@ pub const WORKSPACE_ROOT_ENV: &str = "SYMFORGE_WORKSPACE_ROOT";
 /// discovery (TR-03): it is the workspace `symforge init` resolved at install
 /// time, threaded through to a launcher whose CWD is otherwise useless. It is
 /// still validated through the SAME `is_forbidden_root` guard as CWD discovery,
-/// so the override can never widen the trust boundary — a missing, non-directory,
-/// or sensitive/broad path is ignored and discovery falls back to CWD.
+/// so the override can never widen the trust boundary. Missing, non-directory,
+/// or sensitive/broad paths remain recoverable and fall back to CWD. A present
+/// native path that cannot be represented losslessly as UTF-8 is terminal:
+/// falling back would silently replace explicit operator authority with another
+/// workspace.
 pub fn find_project_root() -> Option<PathBuf> {
-    if let Some(root) = workspace_root_env_override() {
-        return Some(root);
+    match workspace_root_env_resolution() {
+        WorkspaceRootEnvResolution::Resolved(root) => return Some(root),
+        WorkspaceRootEnvResolution::UnsupportedEncoding => return None,
+        WorkspaceRootEnvResolution::AbsentOrRecoverable => {}
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1281,8 +1292,12 @@ pub fn find_project_root() -> Option<PathBuf> {
     // project `.git` continues to be selected.
     let mut current = cwd.clone();
     loop {
-        if current.join(".git").exists() && !is_forbidden_root(&current) {
-            return Some(current);
+        if current.join(".git").exists() {
+            return validate_workspace_candidate(
+                &current,
+                "git ancestor",
+                RootCandidateSource::GitAncestor,
+            );
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
@@ -1291,15 +1306,7 @@ pub fn find_project_root() -> Option<PathBuf> {
     }
 
     // No git root found — use cwd if it's not a forbidden directory.
-    if is_forbidden_root(&cwd) {
-        tracing::warn!(
-            path = %cwd.display(),
-            "refusing to auto-index: directory is too broad (home dir, drive root, or system path)"
-        );
-        None
-    } else {
-        Some(cwd)
-    }
+    validate_workspace_candidate(&cwd, "launch CWD", RootCandidateSource::LaunchCwd)
 }
 
 /// Walk up from `start` looking for a `.git`-bearing ancestor STRICTLY ABOVE
@@ -1326,8 +1333,9 @@ pub(crate) fn git_root_above(start: &Path) -> Option<PathBuf> {
 /// Returns `Some(root)` only when the env var is set to a non-empty path that
 /// exists, is a directory, and passes the SAME `is_forbidden_root` guard used by
 /// CWD-based discovery — so the override can never index a sensitive or overly
-/// broad tree. Any failure logs and returns `None`, letting `find_project_root`
-/// fall back to its normal CWD walk (the override is a hint, never a bypass).
+/// broad tree. Recoverable failures return `None` and let `find_project_root`
+/// fall back to its normal CWD walk. Unsupported native path encoding is kept
+/// as an authoritative refusal so discovery cannot silently bind another root.
 ///
 /// Public so the per-connection retarget gate
 /// (`SymForgeServer::bind_workspace_from_client_roots`, feature 012 D4-A) can ask
@@ -1336,12 +1344,47 @@ pub(crate) fn git_root_above(start: &Path) -> Option<PathBuf> {
 /// skipped; when it did not, the bound root came from the CWD walk and declared
 /// client roots are allowed to retarget the session (`roots > CWD`).
 pub fn workspace_root_env_override() -> Option<PathBuf> {
-    let raw = std::env::var(WORKSPACE_ROOT_ENV).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
+    match workspace_root_env_resolution() {
+        WorkspaceRootEnvResolution::Resolved(root) => Some(root),
+        WorkspaceRootEnvResolution::AbsentOrRecoverable
+        | WorkspaceRootEnvResolution::UnsupportedEncoding => None,
     }
-    validate_workspace_candidate(Path::new(trimmed), WORKSPACE_ROOT_ENV)
+}
+
+/// Whether a configured environment root must prevent CWD/client-root fallback.
+///
+/// A valid override is authoritative by precedence. A present non-UTF-8 root is
+/// also authoritative, but refused: treating it as absent would select a
+/// different workspace than the operator named.
+pub fn workspace_root_env_is_authoritative() -> bool {
+    matches!(
+        workspace_root_env_resolution(),
+        WorkspaceRootEnvResolution::Resolved(_) | WorkspaceRootEnvResolution::UnsupportedEncoding
+    )
+}
+
+fn workspace_root_env_resolution() -> WorkspaceRootEnvResolution {
+    let Some(raw) = std::env::var_os(WORKSPACE_ROOT_ENV) else {
+        return WorkspaceRootEnvResolution::AbsentOrRecoverable;
+    };
+    if raw.is_empty() || raw.to_str().is_some_and(|value| value.trim().is_empty()) {
+        return WorkspaceRootEnvResolution::AbsentOrRecoverable;
+    }
+
+    match resolve_root_candidate(
+        Path::new(&raw),
+        RootCandidateSource::WorkspaceEnvironment,
+        RootRequestMode::Automatic,
+    ) {
+        RootResolution::Bound(binding) => {
+            WorkspaceRootEnvResolution::Resolved(binding.canonical_root)
+        }
+        RootResolution::Unbound {
+            reason: UnboundReason::Refused(RootRefusalReason::UnsupportedPathEncoding),
+            ..
+        } => WorkspaceRootEnvResolution::UnsupportedEncoding,
+        RootResolution::Unbound { .. } => WorkspaceRootEnvResolution::AbsentOrRecoverable,
+    }
 }
 
 #[cfg(windows)]
@@ -1460,6 +1503,12 @@ where
         Ok(root) => root,
         Err(_) => return unbound(RootRefusalReason::CanonicalizationFailed),
     };
+    // Every shipped protocol and persisted root record is UTF-8. A lossy
+    // conversion would turn a distinct native path into another project's
+    // identity, so reject it before indexing, publication, or state placement.
+    if canonical_root.to_str().is_none() {
+        return unbound(RootRefusalReason::UnsupportedPathEncoding);
+    }
     if is_device_or_special_namespace(&canonical_root)
         || is_special_filesystem_entry(&canonical_root)
     {
@@ -1656,22 +1705,30 @@ pub fn resolve_state_placement(binding: &RootBinding) -> StatePlacement {
 ///
 /// This is the single shared gate so that no workspace-resolution path — env
 /// override, MCP client roots, or CWD walk — can ever widen the trust boundary.
-fn validate_workspace_candidate(candidate: &Path, source: &str) -> Option<PathBuf> {
-    if !candidate.is_dir() {
-        tracing::warn!(
-            path = %candidate.display(),
-            "ignoring {source}: not an existing directory"
-        );
-        return None;
+fn validate_workspace_candidate(
+    candidate: &Path,
+    source: &str,
+    candidate_source: RootCandidateSource,
+) -> Option<PathBuf> {
+    match resolve_root_candidate(candidate, candidate_source, RootRequestMode::Automatic) {
+        RootResolution::Bound(binding) => Some(binding.canonical_root),
+        RootResolution::Unbound {
+            reason,
+            safe_path_id,
+            ..
+        } => {
+            let reason = match reason {
+                UnboundReason::NoCandidateDeclared => "no_candidate_declared",
+                UnboundReason::Refused(reason) => reason.code(),
+            };
+            tracing::warn!(
+                safe_path_id = safe_path_id.as_deref().unwrap_or("path-unavailable"),
+                reason,
+                "ignoring {source}: workspace root refused"
+            );
+            None
+        }
     }
-    if is_forbidden_root(candidate) {
-        tracing::warn!(
-            path = %candidate.display(),
-            "ignoring {source}: directory is too broad (home dir, drive root, or system path)"
-        );
-        return None;
-    }
-    Some(candidate.to_path_buf())
 }
 
 /// Decode `%XX` percent-escapes in a URI path segment back to raw bytes, then
@@ -1803,7 +1860,11 @@ pub fn resolve_workspace_root(
 ) -> Option<PathBuf> {
     // 1. Explicit env override wins when it passes the shared binding guard.
     if let Some(candidate) = env_root
-        && let Some(root) = validate_workspace_candidate(&candidate, "workspace environment root")
+        && let Some(root) = validate_workspace_candidate(
+            &candidate,
+            "workspace environment root",
+            RootCandidateSource::WorkspaceEnvironment,
+        )
     {
         return Some(root);
     }
@@ -1813,13 +1874,23 @@ pub fn resolve_workspace_root(
         let Some(candidate) = parse_root_uri(uri) else {
             continue;
         };
-        if let Some(root) = validate_workspace_candidate(&candidate, "MCP client root") {
+        if let Some(root) = validate_workspace_candidate(
+            &candidate,
+            "MCP client root",
+            RootCandidateSource::McpClientRoot,
+        ) {
             return Some(root);
         }
     }
 
     // 3. Launch-CWD walk, revalidated at the final binding boundary.
-    cwd_root.and_then(|candidate| validate_workspace_candidate(&candidate, "launch CWD root"))
+    cwd_root.and_then(|candidate| {
+        validate_workspace_candidate(
+            &candidate,
+            "launch CWD root",
+            RootCandidateSource::LaunchCwd,
+        )
+    })
 }
 
 /// Returns `true` if `path` is a directory that should never be auto-indexed
@@ -4471,7 +4542,7 @@ mod tests {
     /// guard) for a sensitive/broad one — it can never widen what is auto-indexed.
     mod workspace_root_override {
         use super::*;
-        use std::ffi::OsString;
+        use std::ffi::{OsStr, OsString};
         use std::sync::Mutex;
 
         // Serializes env mutation; `SYMFORGE_WORKSPACE_ROOT` is process-global.
@@ -4484,6 +4555,10 @@ mod tests {
         #[allow(unsafe_code)] // test-only env guard; mutation serialized by ENV_LOCK.
         impl RootEnvGuard {
             fn set(value: Option<&str>) -> Self {
+                Self::set_os(value.map(OsStr::new))
+            }
+
+            fn set_os(value: Option<&OsStr>) -> Self {
                 let prev = std::env::var_os(WORKSPACE_ROOT_ENV);
                 // SAFETY: serialized by ENV_LOCK held by the caller.
                 unsafe {
@@ -4519,6 +4594,51 @@ mod tests {
             let resolved = resolved.canonicalize().unwrap_or(resolved);
             let expected = workspace.path().canonicalize().unwrap();
             assert_eq!(resolved, expected);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn workspace_override_preserves_trailing_space_path_identity() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let parent = TempDir::new().unwrap();
+            let plain = parent.path().join("repo");
+            let spaced = parent.path().join("repo ");
+            std::fs::create_dir(&plain).unwrap();
+            std::fs::create_dir(&spaced).unwrap();
+            let spaced_text = spaced.to_str().expect("UTF-8 fixture");
+            let _guard = RootEnvGuard::set(Some(spaced_text));
+
+            let resolved = workspace_root_env_override().expect("spaced root must resolve");
+            assert_eq!(resolved, spaced.canonicalize().unwrap());
+            assert_ne!(resolved, plain.canonicalize().unwrap());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn non_utf8_workspace_override_never_falls_back_to_cwd() {
+            use std::os::unix::ffi::OsStringExt;
+
+            let _lock = ENV_LOCK.lock().unwrap();
+            let unset = RootEnvGuard::set(None);
+            assert!(
+                find_project_root().is_some(),
+                "anti-vacuity: the test CWD must provide a fallback workspace"
+            );
+            drop(unset);
+
+            let parent = TempDir::new().unwrap();
+            let opaque = parent
+                .path()
+                .join(OsString::from_vec(vec![b'r', b'e', b'p', b'o', 0xff]));
+            std::fs::create_dir(&opaque).unwrap();
+            let _guard = RootEnvGuard::set_os(Some(opaque.as_os_str()));
+
+            assert!(workspace_root_env_override().is_none());
+            assert!(workspace_root_env_is_authoritative());
+            assert!(
+                find_project_root().is_none(),
+                "an explicit non-UTF-8 root must refuse instead of selecting the CWD repository"
+            );
         }
 
         #[test]
@@ -4594,7 +4714,8 @@ mod tests {
 
         #[test]
         fn env_override_beats_client_roots() {
-            // Precedence rule 1: an explicit (already-validated) env root wins
+            // Precedence rule 1: an explicit env-root candidate wins after the
+            // shared resolver binds it to its canonical identity
             // over any client root, even a valid one.
             let env_ws = TempDir::new().unwrap();
             let client_ws = TempDir::new().unwrap();
@@ -4608,7 +4729,7 @@ mod tests {
             .expect("env override must resolve");
             assert_eq!(
                 resolved,
-                env_ws.path().to_path_buf(),
+                env_ws.path().canonicalize().unwrap(),
                 "SYMFORGE_WORKSPACE_ROOT must take precedence over client roots"
             );
         }
@@ -4616,11 +4737,11 @@ mod tests {
         #[test]
         fn cwd_used_only_when_env_and_roots_absent() {
             // Precedence rule 3: with no env and no usable client roots, fall
-            // back to the (already-validated) CWD walk result.
+            // back to the CWD candidate after the shared resolver binds it.
             let cwd_ws = TempDir::new().unwrap();
             let resolved = resolve_workspace_root(None, &[], Some(cwd_ws.path().to_path_buf()))
                 .expect("CWD fallback must resolve");
-            assert_eq!(resolved, cwd_ws.path().to_path_buf());
+            assert_eq!(resolved, cwd_ws.path().canonicalize().unwrap());
         }
 
         #[test]
@@ -4723,6 +4844,33 @@ mod tests {
                 ),
                 "override must not turn an unknown canonical identity into a binding: {uncanonicalizable:?}"
             );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn non_utf8_canonical_root_is_never_indexable() {
+            use std::os::unix::ffi::OsStringExt;
+
+            let canonical_root = PathBuf::from(std::ffi::OsString::from_vec(vec![
+                b'/', b'w', b'o', b'r', b'k', b'/', b'a', 0xff, b'b',
+            ]));
+            let resolution = resolve_root_candidate_with(
+                Path::new("utf8-alias"),
+                RootCandidateSource::ExplicitIndexFolder,
+                RootRequestMode::ExplicitIndexFolder {
+                    allow_protected_root: true,
+                },
+                |_| true,
+                |_| Ok(canonical_root.clone()),
+            );
+
+            assert!(matches!(
+                resolution,
+                RootResolution::Unbound {
+                    reason: UnboundReason::Refused(RootRefusalReason::UnsupportedPathEncoding),
+                    ..
+                }
+            ));
         }
 
         #[cfg(windows)]
