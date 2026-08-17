@@ -499,7 +499,7 @@ repairs.
 
 | Required evidence | Binding command or observation | Current status |
 |---|---|---|
-| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `99a06d5dc2742dffef321c7323c1e4c2a6a4f44eead77bf1c10c6acb02fdf47c` / 187 files / 8,979,963 LF-normalized bytes, held by `FULL_SOURCE_PIN_V1` and green in the preventive suite receipts below; includes the Round-2 mixed-quadrant formatter control. Any later `src/` edit invalidates this row. |
+| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `3dbd19b231c62d4bd19d81918ed357fea3156e9ed1508d62f5f444da071b8ef1` / 187 files / 8,980,190 LF-normalized bytes, held by `FULL_SOURCE_PIN_V1` after the post-closure CI repair below; includes the Round-2 mixed-quadrant formatter control. Any later `src/` edit invalidates this row. |
 | Repair regression families | `daemon_proxy_ask_` and `format_hook_adoption` library filters, serial. | **OBSERVED** — ask family 3/0 (`job_01a00fb70b4770c287ff2069bc3ecf35`, post-mutation-restore); formatter family 6/0 with the Round-2 mixed-quadrant control (`job_01a00fd6d9a27ab2b76e87ea708e01b3`, re-confirmed post-restore in the receipt below). |
 | Repair mutation sensitivity | Revert each repair's guard, observe the intended witness RED, restore byte-exactly, re-observe green. | **OBSERVED** — nested-pin revert RED 1/2/0 (`job_01a00fb5a27572309163ad9a89dc15aa`); formatter-conjunct removal RED 4/1/0 (`job_01a00fb67215788088ba6072fb4b664d`); both restorations SHA-256-verified (`tools.rs=3976dcce…`, `format.rs=beee0cf2…`) and re-green. |
 | Selector containment controls | `daemon_facade_` library filter, serial. | **OBSERVED** — 12/0, `outcome_trust: observed`, `job_01a00fafe3ed7bc3a72b1deebe9cb9bf`. |
@@ -515,6 +515,23 @@ repairs.
 | Non-closure commit | Commit the complete repaired candidate with a non-closure subject after all rows above are green. | **DONE** — two non-closure commits: immutable `9de4f69639beffc66d0a5828cdbc731ee41b7e2c` (`fix(slice3): repair C1-C3 external-review findings [non-closure]`) and immutable `9133bb36a499fafc42ad479902d67f589f167795` (`test(slice3): repair round-2 review MINORs [non-closure]`). |
 | Fresh PR 4 review | Review one immutable committed full PR 4 range with no concurrent edits; adjudicate every substantive note. | **DONE — adjudicated across Rounds 2 and 3.** Round 2 (four lenses on the full immutable range at `9de4f696`): CLEAN on both code lenses, three MINORs, all repaired in `9133bb36`. Round 3 (two lenses on the repair delta at `9133bb36`): delta-audit CLEAN with every hash, seal, and census value independently re-derived; claims-audit found exactly one MINOR — the "122 test targets" lossy-channel miscount in this checklist — whose prescribed correction is applied in this closure commit. Zero code findings across both rounds; every finding was independently challenged by two adversarial refuters. This is recorded as the honest disposition rather than an unqualified CLEAN: the final surviving finding was an evidence-count cell, corrected here as the review itself prescribed. |
 | Evidence/ledger closure commit | Only after a trustworthy CLEAN review, record its archive and final receipts in a separate evidence/ledger commit. | **THIS COMMIT** — records the Round-2/Round-3 dispositions, the census-derived target count, and the closure of the repair loop. The consolidated external-review adjudication ledger remains archived outside the repository. |
+
+**Post-closure CI repair — Linux-only test-compile defect.** The PR CI `rust`
+job failed at the clippy step on Linux with `E0277`: the `#[cfg(unix)]` test
+`daemon_session_open_refuses_non_utf8_roots_before_transport` (added with the
+PR 4 candidate) called `.expect_err(...)` on a
+`Result<DaemonSessionClient, _>`, and `DaemonSessionClient` implements no
+`Debug`. The cfg-gated body never compiles on Windows, so every local gate and
+all review passes were structurally blind to it — the same defect class as the
+documented embed-cfg trap, on the platform axis. The repair restructures the
+assertion into a `match` (test-only; no production bytes moved; no `Debug`
+impl added). A sweep of every `expect_err`/`unwrap_err`/`{:?}` site inside
+`#[cfg(unix)]` bodies across the PR 4 paths found no second instance, and the
+Linux compiler pass corroborates: it reported exactly one error for the whole
+lib-test crate. The whole-source seal was regenerated for the edit
+(independent re-derivation; the preventive suite and PR CI re-prove it) and
+`daemon.rs` is now
+`9488bb0c11759060ec6d62f3bac7a20f591e6c313c0fd664219dec794aa0454c`.
 
 Principal frozen-byte SHA-256 values of the repaired paths at final observation
 are `tools.rs=3976dcce27263acae75dff541bc59d80b0127e0a1983424ee15e28f461ee78ce`,

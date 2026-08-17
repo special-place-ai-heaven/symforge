@@ -6289,14 +6289,19 @@ mod tests {
             .join(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
         std::fs::create_dir_all(&root).expect("create non-UTF-8 project root");
         let control = TempDir::new().expect("isolated daemon control root");
-        let error = connect_or_spawn_session_at(
+        // ponytail: match instead of expect_err — DaemonSessionClient has no Debug impl,
+        // and this cfg(unix) body only ever compiles on Linux CI.
+        let error = match connect_or_spawn_session_at(
             &root,
             "non-utf8-root-test",
             Some(std::process::id()),
             &test_control_state(control.path()),
         )
         .await
-        .expect_err("lossy project identity must be refused before daemon discovery");
+        {
+            Ok(_) => panic!("lossy project identity must be refused before daemon discovery"),
+            Err(error) => error,
+        };
 
         assert!(
             error.to_string().contains("not valid UTF-8"),
