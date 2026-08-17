@@ -533,6 +533,26 @@ lib-test crate. The whole-source seal was regenerated for the edit
 `daemon.rs` is now
 `9488bb0c11759060ec6d62f3bac7a20f591e6c313c0fd664219dec794aa0454c`.
 
+The re-run then surfaced a second member of the same blind-spot class — this
+time a semantic one. The `#[cfg(unix)]` test
+`local_project_selector_does_not_alias_non_utf8_root_to_lossy_utf8` executed
+for the FIRST time anywhere on that CI run and failed: it expected a server
+bound to a non-UTF-8 root to publish the native-bytes `project_id` with only
+the lossy string suppressed, but production's fail-closed root discovery
+(`resolve_root_candidate` returning Unbound) refuses such a root at binding —
+the same stance the daemon session-open and sidecar-descriptor lanes enforce,
+both of whose refusal tests passed on the same run. The test encoded a
+superseded design intention; the shipped refusal-everywhere design makes its
+premise unreachable. The repair aligns the test with the fail-closed stance
+and strengthens it: it now asserts the binding itself is refused
+(`capture_repo_root()` returns None), that `project_id` is `unbound`, and
+that no lossy string form is published. The whole Linux lib target otherwise
+passed (3,226/1/5), so no third member of the class remains in the library;
+the two `#[cfg(unix)]` sites in the PR 4 integration targets were swept and
+are a platform helper and a both-branches-tolerant test. Seal regenerated
+again; `tools.rs` is now
+`14b9fee3bd0786620675d6bfa8fc7a85b5b3bba4f2e0a867bd33b80dd46e37f5`.
+
 Principal frozen-byte SHA-256 values of the repaired paths at final observation
 are `tools.rs=3976dcce27263acae75dff541bc59d80b0127e0a1983424ee15e28f461ee78ce`,
 `protocol/mod.rs=6f001983e346821318078dcca0bfae24ca8ee8aa97e4055f8ad46c069012367f`,

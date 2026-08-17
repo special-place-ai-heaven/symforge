@@ -17856,10 +17856,20 @@ mod tests {
             "{output}"
         );
         assert_eq!(std::fs::read(&source_path).expect("bound source"), original);
+        // Fail-closed root discovery refuses a non-reversible native root at
+        // binding (`resolve_root_candidate` returns Unbound), the same stance
+        // the daemon session open and sidecar descriptor lanes enforce. No
+        // identity may be minted from a root that binding refused, and no
+        // lossy string form may be published.
+        assert_eq!(
+            server.capture_repo_root(),
+            None,
+            "a non-reversible native root must be refused at binding, not bound lossily"
+        );
         let evidence = server.local_project_evidence().expect("local evidence");
         assert_eq!(
-            evidence.project_id,
-            crate::daemon::project_key(&canonical_bound)
+            evidence.project_id, "unbound",
+            "no project identity may be minted from a root that binding refused"
         );
         assert_eq!(
             evidence.canonical_root, None,
