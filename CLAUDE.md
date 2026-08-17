@@ -128,10 +128,11 @@ Two failure modes, both confirmed from real history on this repo:
   changelog entries and zero version bump, forever, with no error raised.
   This is what actually happened to PRs #470, #471, #472, #475.
 
-**The fix — default to squash-merge:**
+**The fix — default to squash-merge, and ALWAYS pass an explicit safe body
+(as_of 2026-08-17, measured on #582):**
 
 ```
-gh pr merge <N> --squash --delete-branch
+gh pr merge <N> --squash --delete-branch --subject "<conventional PR title> (#<N>)" --body "<one short paragraph, no parentheses, no colon-bearing prose lines>"
 ```
 
 `gh`'s default squash subject is the PR title + `(#N)`; this repo's own CI
@@ -143,6 +144,20 @@ either failure mode above to act on — deterministically, not by graph-shape
 luck. This does trade away per-commit granularity/bisectability inside a
 single PR on `main`; the full inner-commit history remains visible on the
 (closed) PR itself via the GitHub API/UI indefinitely.
+
+**Why the explicit `--body` is mandatory, not hygiene:** gh's DEFAULT squash
+BODY is the concatenated list of every inner commit message. release-please
+parses the whole squash message, and any inner-body prose line shaped like
+`word: text` starts a new conventional-parse unit — on #582 the line
+`hook:PreTool is still ingress - PreToolUse ran and the process returned
+Ok(())...` impersonated a header and its `Ok(())` broke the parser
+(`unexpected token '(' at 287:4`). ONE parse error makes the ENTIRE squash
+commit invisible: release-please reported "No user facing commits found",
+the owed 10.6.1 release PR was never created, and the workflow's "Prove
+that no release was owed" gate (correctly) went red. PR3's identical-shape
+default body survived by luck, not by design. The changelog line for a
+parsed-away commit is recoverable only by landing a new parseable `fix:`
+commit that names it.
 
 If a PR's inner-commit history must stay reachable on `main` (rare — e.g. a
 deliberately staged multi-commit landing), use `--merge` but give the merge
