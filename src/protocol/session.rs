@@ -28,6 +28,8 @@ struct FetchKey {
 pub struct SessionFetchRecord {
     pub approx_tokens: u32,
     pub fetched_at: Instant,
+    /// CCR handle for the formatted body last served for this key.
+    pub retrieve_handle: String,
 }
 
 /// Metadata for a session cache-hit response body.
@@ -38,6 +40,7 @@ pub struct SessionCacheHitMeta {
     pub name: String,
     pub prior_tokens: u32,
     pub session_age_secs: u64,
+    pub retrieve_handle: String,
 }
 
 /// Tracks what symbols and files have been served to the LLM this session.
@@ -233,6 +236,7 @@ impl SessionContext {
             name,
             prior_tokens: record.approx_tokens,
             session_age_secs: inner.started_at.elapsed().as_secs(),
+            retrieve_handle: record.retrieve_handle.clone(),
         })
     }
 
@@ -243,6 +247,7 @@ impl SessionContext {
         symbol: &str,
         params_hash: u64,
         tokens: u32,
+        retrieve_handle: &str,
     ) {
         let mut inner = self.inner.lock();
         let key = FetchKey {
@@ -256,6 +261,7 @@ impl SessionContext {
             SessionFetchRecord {
                 approx_tokens: tokens,
                 fetched_at: Instant::now(),
+                retrieve_handle: retrieve_handle.to_string(),
             },
         );
     }
@@ -308,63 +314,73 @@ impl SessionContext {
         self.try_cache_hit(FetchKind::FileContent, path, "", params_hash, force_refresh)
     }
 
-    pub fn record_symbol_fetch(&self, path: &str, name: &str, params_hash: u64, tokens: u32) {
+    pub fn record_symbol_fetch(
+        &self,
+        path: &str,
+        name: &str,
+        params_hash: u64,
+        tokens: u32,
+        retrieve_handle: &str,
+    ) {
         self.record_symbol(path, name, tokens);
-        self.record_detailed_fetch(FetchKind::Symbol, path, name, params_hash, tokens);
+        self.record_detailed_fetch(
+            FetchKind::Symbol,
+            path,
+            name,
+            params_hash,
+            tokens,
+            retrieve_handle,
+        );
     }
 
-    pub fn record_file_context_fetch(&self, path: &str, params_hash: u64, tokens: u32) {
-        self.record_detailed_fetch(FetchKind::FileContext, path, "", params_hash, tokens);
+    pub fn record_file_context_fetch(
+        &self,
+        path: &str,
+        params_hash: u64,
+        tokens: u32,
+        retrieve_handle: &str,
+    ) {
+        self.record_detailed_fetch(
+            FetchKind::FileContext,
+            path,
+            "",
+            params_hash,
+            tokens,
+            retrieve_handle,
+        );
     }
 
-    pub fn record_file_content_fetch(&self, path: &str, params_hash: u64, tokens: u32) {
+    pub fn record_file_content_fetch(
+        &self,
+        path: &str,
+        params_hash: u64,
+        tokens: u32,
+        retrieve_handle: &str,
+    ) {
         self.record_file(path, tokens);
-        self.record_detailed_fetch(FetchKind::FileContent, path, "", params_hash, tokens);
+        self.record_detailed_fetch(
+            FetchKind::FileContent,
+            path,
+            "",
+            params_hash,
+            tokens,
+            retrieve_handle,
+        );
     }
 
     /// STEL compact-step cache lookup using JSON args.
+    ///
+    /// Always `None` for the 011 US1 read surface (`get_symbol`,
+    /// `get_file_context`, `get_file_content`): the plan layer has no
+    /// generation identity. The primitive hashes publication/content generation
+    /// and redeems a CCR blob when the hit is legal.
+    #[allow(clippy::unused_self)]
     pub fn try_cache_hit_from_stel_step(
         &self,
-        tool: &str,
-        args: &serde_json::Value,
+        _tool: &str,
+        _args: &serde_json::Value,
     ) -> Option<SessionCacheHitMeta> {
-        let force_refresh = args
-            .get("force_refresh")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        match tool {
-            "get_symbol" => {
-                let name = args.get("name")?.as_str()?.trim();
-                if name.is_empty() {
-                    return None;
-                }
-                let path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                if path.is_empty() {
-                    return None;
-                }
-                let hash = hash_symbol_params_json(args);
-                self.try_symbol_cache_hit(path, name, hash, force_refresh)
-            }
-            "get_file_context" => {
-                let path = args.get("path")?.as_str()?.trim();
-                if path.is_empty() {
-                    return None;
-                }
-                let hash = hash_file_context_params_json(args);
-                self.try_file_context_cache_hit(path, hash, force_refresh)
-            }
-            // `get_file_content` owns a generation-aware cache key that is
-            // computed only after targeted freshness and publication capture.
-            // The plan-only STEL admission layer has neither identity, so it
-            // must execute the primitive instead of reusing a potentially stale
-            // pre-publication fetch.
-            "get_file_content" => None,
-            _ => None,
-        }
+        None
     }
 
     /// Take a snapshot for display.
@@ -461,11 +477,19 @@ pub fn hash_symbol_params(
     kind: Option<&str>,
     symbol_line: Option<u32>,
     max_tokens: Option<u64>,
+    project_generation: u64,
+    source_id: &str,
+    publication_generation: u64,
+    content_generation: u64,
 ) -> u64 {
     hash_value(&serde_json::json!({
         "kind": kind,
         "symbol_line": symbol_line,
         "max_tokens": max_tokens,
+        "project_generation": project_generation,
+        "source_id": source_id,
+        "publication_generation": publication_generation,
+        "content_generation": content_generation,
     }))
 }
 
@@ -659,5 +683,89 @@ mod tests {
         assert!(output.contains("src/main.rs"));
         assert!(output.contains("explore"));
         assert!(output.contains("1695"));
+    }
+
+    #[test]
+    fn hash_symbol_params_binds_generation_identity() {
+        let base = hash_symbol_params(None, None, None, 1, "src-a", 2, 3);
+        assert_ne!(
+            base,
+            hash_symbol_params(None, None, None, 1, "src-a", 2, 4),
+            "content_generation must be part of the cache key"
+        );
+        assert_ne!(
+            base,
+            hash_symbol_params(None, None, None, 1, "src-b", 2, 3),
+            "source_id must be part of the cache key"
+        );
+        assert_ne!(
+            base,
+            hash_symbol_params(None, None, None, 2, "src-a", 2, 3),
+            "project_generation must be part of the cache key"
+        );
+        assert_ne!(
+            base,
+            hash_symbol_params(None, None, None, 1, "src-a", 3, 3),
+            "publication_generation must be part of the cache key"
+        );
+    }
+
+    #[test]
+    fn generation_change_in_hash_is_a_cache_miss() {
+        let ctx = SessionContext::new();
+        let gen1 = hash_symbol_params(None, None, None, 1, "src-a", 1, 1);
+        let gen2 = hash_symbol_params(None, None, None, 1, "src-a", 1, 2);
+        ctx.record_symbol_fetch("src/lib.rs", "foo", gen1, 200, "cafe01234567");
+        assert!(
+            ctx.try_symbol_cache_hit("src/lib.rs", "foo", gen1, false)
+                .is_some()
+        );
+        assert!(
+            ctx.try_symbol_cache_hit("src/lib.rs", "foo", gen2, false)
+                .is_none(),
+            "a later generation identity must not reuse the prior fetch"
+        );
+    }
+
+    #[test]
+    fn stel_admission_does_not_cache_hit_generation_blind_reads() {
+        let ctx = SessionContext::new();
+        ctx.record_symbol_fetch(
+            "src/lib.rs",
+            "foo",
+            hash_symbol_params(None, None, None, 0, "unavailable", 0, 0),
+            200,
+            "cafe01234567",
+        );
+        ctx.record_file_context_fetch("src/lib.rs", 1, 100, "cafe01234567");
+        let symbol_args = serde_json::json!({ "path": "src/lib.rs", "name": "foo" });
+        let file_args = serde_json::json!({ "path": "src/lib.rs" });
+        assert!(
+            ctx.try_cache_hit_from_stel_step("get_symbol", &symbol_args)
+                .is_none()
+        );
+        assert!(
+            ctx.try_cache_hit_from_stel_step("get_file_context", &file_args)
+                .is_none()
+        );
+        assert!(
+            ctx.try_cache_hit_from_stel_step("get_file_content", &file_args)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_hit_meta_carries_retrieve_handle() {
+        let ctx = SessionContext::new();
+        ctx.record_symbol_fetch("src/lib.rs", "foo", 7, 200, "deadbeefcafe");
+        let meta = ctx
+            .try_symbol_cache_hit("src/lib.rs", "foo", 7, false)
+            .expect("recorded fetch");
+        assert_eq!(meta.retrieve_handle, "deadbeefcafe");
+        assert!(
+            ctx.try_symbol_cache_hit("src/lib.rs", "foo", 7, true)
+                .is_none(),
+            "force_refresh must bypass cache_hit"
+        );
     }
 }

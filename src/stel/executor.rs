@@ -126,6 +126,7 @@ fn format_cache_hit_body_from(cache: &StelCacheBody, decision_reason: &str) -> S
         name: cache.name.clone(),
         prior_tokens: cache.prior_tokens,
         session_age_secs: cache.session_age_secs,
+        retrieve_handle: String::new(),
     };
     crate::protocol::format::format_session_cache_hit_body(&meta, decision_reason)
 }
@@ -451,7 +452,33 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_skips_legacy_dispatch() {
+    fn cache_hit_decision_skips_legacy_dispatch() {
+        use crate::stel::types::{StelCacheBody, StelDecision};
+
+        let decision = StelDecision {
+            plan_id: "cache".to_string(),
+            decision: AdmissionDecision::CacheHit,
+            decision_reason: "synthetic cache hit".to_string(),
+            effective_max_tokens: None,
+            degrade_flags: vec![],
+            steps: None,
+            bypass: None,
+            cache: Some(StelCacheBody {
+                kind: "symbol".to_string(),
+                path: "src/lib.rs".to_string(),
+                name: "cfg_if".to_string(),
+                prior_tokens: 96,
+                session_age_secs: 0,
+            }),
+        };
+        assert!(should_skip_legacy_dispatch(&decision));
+        let body = format_cache_hit_body(&decision);
+        assert!(body.contains("Decision: cache_hit"));
+        assert!(body.contains("did not re-execute the read"));
+    }
+
+    #[test]
+    fn get_symbol_prefetch_does_not_stel_cache_hit() {
         use crate::protocol::session::SessionContext;
         use crate::stel::controller::evaluate_plan_with_session;
         use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
@@ -460,8 +487,9 @@ mod tests {
         session.record_symbol_fetch(
             "src/lib.rs",
             "cfg_if",
-            crate::protocol::session::hash_symbol_params(None, None, None),
+            crate::protocol::session::hash_symbol_params(None, None, None, 0, "unavailable", 0, 0),
             96,
+            "deadbeefcafe",
         );
         let plan = StelPlan {
             plan_id: "cache".to_string(),
@@ -480,11 +508,12 @@ mod tests {
         };
         let request = StelRequest::default();
         let decision = evaluate_plan_with_session(&request, &plan, Some(&session));
-        assert_eq!(decision.decision, AdmissionDecision::CacheHit);
-        assert!(should_skip_legacy_dispatch(&decision));
-        let body = format_cache_hit_body(&decision);
-        assert!(body.contains("Decision: cache_hit"));
-        assert!(body.contains("did not re-execute the read"));
+        assert_ne!(
+            decision.decision,
+            AdmissionDecision::CacheHit,
+            "plan layer has no generation identity; the primitive must run"
+        );
+        assert!(!should_skip_legacy_dispatch(&decision));
     }
 
     #[test]

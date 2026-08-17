@@ -9641,7 +9641,7 @@ mod tests {
         first_runtime
             .server
             .session_context
-            .record_file_content_fetch("src/lib.rs", 42, 100);
+            .record_file_content_fetch("src/lib.rs", 42, 100, "deadbeefcafe");
         assert!(
             first_runtime
                 .server

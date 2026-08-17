@@ -10,8 +10,8 @@ use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
 use symforge::protocol::session::SessionContext;
 use symforge::stel::{
-    self, AdmissionDecision, IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest,
-    apply_degrade_to_plan, evaluate_plan, evaluate_plan_with_session,
+    self, AdmissionDecision, IntentBucket, RouteConfidence, StelCacheBody, StelDecision, StelPlan,
+    StelPlanStep, StelRequest, apply_degrade_to_plan, evaluate_plan, evaluate_plan_with_session,
 };
 
 fn repo_root() -> PathBuf {
@@ -125,8 +125,9 @@ fn l2_controller_covers_all_four_admission_states() {
     session.record_symbol_fetch(
         "src/lib.rs",
         "cfg_if",
-        symforge::protocol::session::hash_symbol_params(None, None, None),
+        symforge::protocol::session::hash_symbol_params(None, None, None, 0, "unavailable", 0, 0),
         128,
+        "deadbeefcafe",
     );
     let cache_plan = StelPlan {
         plan_id: "cache".to_string(),
@@ -143,10 +144,13 @@ fn l2_controller_covers_all_four_admission_states() {
         }],
         suggested_followup: None,
     };
-    let cache_hit =
+    let after_prefetch =
         evaluate_plan_with_session(&StelRequest::default(), &cache_plan, Some(&session));
-    assert_eq!(cache_hit.decision, AdmissionDecision::CacheHit);
-    assert!(cache_hit.cache.is_some());
+    assert_ne!(
+        after_prefetch.decision,
+        AdmissionDecision::CacheHit,
+        "plan layer has no generation identity; get_symbol must run the primitive"
+    );
 }
 
 #[test]
@@ -197,16 +201,26 @@ async fn cache_hit_dispatch_skips_legacy_tools_after_session_prefetch() {
 
     let second = dispatch_symforge(&server, request).await;
     assert!(
-        second.contains("decision: cache_hit"),
-        "repeat should cache_hit:\n{second}"
+        second.contains("Decision: cache_hit"),
+        "repeat must hit the generation-aware primitive cache:\n{second}"
     );
-    assert!(second.contains("did not re-execute the read"));
-    assert!(!second.contains("Chosen tool: get_symbol"));
+    assert!(
+        second.contains("hash=\""),
+        "cache_hit must carry a redeemable CCR handle:\n{second}"
+    );
+    assert!(
+        !second.contains("already loaded in this session"),
+        "hit copy must not claim the caller already has the bytes:\n{second}"
+    );
+    assert!(
+        second.contains("decision: serve"),
+        "STEL L2 has no generation identity so it must dispatch the primitive:\n{second}"
+    );
+    assert!(second.contains("Chosen tool: get_symbol"));
 
     let event = server.stel_ledger().lock().last().expect("ledger event");
-    assert_eq!(event.decision, AdmissionDecision::CacheHit);
-    assert!(event.tools_called.is_empty());
-    assert_eq!(event.cache_hit, Some(true));
+    assert_eq!(event.decision, AdmissionDecision::Serve);
+    assert!(!event.tools_called.is_empty());
 }
 
 /// T035 (SC-005, US5 AC-1) end-to-end: the SAME read operation over two real
@@ -335,13 +349,6 @@ fn calibration_summary_counts_degrade_and_cache_hit() {
         surface: "symforge",
     });
 
-    let session = SessionContext::new();
-    session.record_symbol_fetch(
-        "src/lib.rs",
-        "cfg_if",
-        symforge::protocol::session::hash_symbol_params(None, None, None),
-        128,
-    );
     let cache_plan = StelPlan {
         plan_id: "cache".to_string(),
         intent: IntentBucket::Read,
@@ -357,8 +364,22 @@ fn calibration_summary_counts_degrade_and_cache_hit() {
         }],
         suggested_followup: None,
     };
-    let cache_decision =
-        evaluate_plan_with_session(&StelRequest::default(), &cache_plan, Some(&session));
+    let cache_decision = StelDecision {
+        plan_id: cache_plan.plan_id.clone(),
+        decision: AdmissionDecision::CacheHit,
+        decision_reason: "synthetic cache hit for calibration counts".to_string(),
+        effective_max_tokens: None,
+        degrade_flags: vec![],
+        steps: None,
+        bypass: None,
+        cache: Some(StelCacheBody {
+            kind: "symbol".to_string(),
+            path: "src/lib.rs".to_string(),
+            name: "cfg_if".to_string(),
+            prior_tokens: 128,
+            session_age_secs: 0,
+        }),
+    };
     let cache_economics = estimate_economics(&cache_plan);
     let (cache_event, _) = capture_ledger(&LedgerCaptureInput {
         plan: &cache_plan,
