@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.6.2](https://github.com/special-place-ai-heaven/symforge/compare/v10.6.1...v10.6.2) (2026-08-17)
+
+
+### Bug Fixes
+
+* **ccr:** route symforge_retrieve through the daemon so handles redeem ([#586](https://github.com/special-place-ai-heaven/symforge/issues/586)) ([cfa015e](https://github.com/special-place-ai-heaven/symforge/commit/cfa015eca32f342d9eb1896089e5c7e92221374d))
+
 ## [10.6.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.6.0...v10.6.1) (2026-08-17)
 
 
