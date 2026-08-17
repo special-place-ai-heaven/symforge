@@ -381,6 +381,61 @@ fn publish_before_prune_keeps_prior_snapshots_readable() {
 
 // ── supervisor: supersession, cancellation, accounting ─────────────────────
 
+/// One attempt terminal-ends exactly once (pair-1 review, MAJOR finding).
+/// Two candidates prepared under one attempt cannot both commit, and a
+/// cancel after a commit adds no row: replaying one attempt's token can
+/// never make the committed ledger and the diagnostics ledger disagree.
+#[test]
+fn an_attempt_terminal_ends_exactly_once() {
+    let pool = ProcessCapacityPool::new();
+    let owner = pool.root(1_000_000);
+    let supervisor = SourceSupervisor::new();
+    let root = ProjectArtifactRoot::empty();
+
+    let attempt = supervisor.begin_attempt();
+    let attempt_id = attempt.id();
+    let first = IsolatedCandidate::prepare_full(
+        &pool,
+        owner,
+        &attempt,
+        vec![content_source(1, "a.rs", 1)],
+        stamp_derive,
+    )
+    .expect("capacity headroom exists");
+    let second = IsolatedCandidate::prepare_full(
+        &pool,
+        owner,
+        &attempt,
+        vec![content_source(1, "a.rs", 2)],
+        stamp_derive,
+    )
+    .expect("capacity headroom exists");
+
+    let published = first.commit(&root).expect("the first commit wins");
+    let refusal = second
+        .commit(&root)
+        .expect_err("one attempt must not commit twice");
+    assert_eq!(refusal, PromotionRefusal::AttemptAlreadyTerminal);
+    assert!(
+        Arc::ptr_eq(&root.load(), &published),
+        "a replayed attempt republished the root"
+    );
+
+    attempt.cancel();
+    let records = supervisor.attempt_records();
+    let rows: Vec<_> = records
+        .iter()
+        .filter(|record| record.id == attempt_id)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one attempt produced more than one terminal row: {records:?}"
+    );
+    assert_eq!(rows[0].disposition, AttemptDisposition::Committed);
+    assert_eq!(supervisor.committed_generations(), 1);
+}
+
 /// A retry trigger supersedes the older attempt: its candidate can never
 /// commit, the failure is accounted with its cause, and the successor commits.
 #[test]
@@ -477,8 +532,12 @@ fn cancellation_is_accounted_and_never_committed() {
 // ── metadata-terminal exclusions ───────────────────────────────────────────
 
 /// Every metadata-terminal reason stays cataloged and stays EXCLUDED from
-/// content derivation — the exclusion set is complete over the closed reason
-/// list, and a content sibling in the same candidate still derives.
+/// content derivation — and a content sibling in the same candidate still
+/// derives. The reason list below is the frozen data model's ten members,
+/// hand-typed because `MetadataOnlyReason` is `#[non_exhaustive]`: an
+/// integration test cannot write an exhaustive match against it, so a variant
+/// added later is NOT caught here. The in-crate exhaustiveness pin is a
+/// recorded cut obligation (T064 metadata handling goes live there).
 #[test]
 fn metadata_terminal_exclusions_remain_complete() {
     let reasons: Vec<MetadataOnlyReason> = vec![

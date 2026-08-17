@@ -65,22 +65,32 @@ pub enum AttemptDisposition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AttemptId(pub(crate) u64);
 
-/// One bounded-diagnostics row. Deliberately carries no manifest digest,
-/// certificate, or query authority.
+/// One diagnostics row (the ledger keeps the newest [`MAX_ATTEMPT_RECORDS`]).
+/// Deliberately carries no manifest digest, certificate, or query authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttemptRecord {
     pub id: AttemptId,
     pub disposition: AttemptDisposition,
 }
 
-/// Shared interior. Locked for every transition so the two ledgers can never
-/// disagree about what happened.
+/// The diagnostics ledger keeps at most this many newest terminal rows. The
+/// frozen data model requires bounded diagnostics; the attempt-id SETS below
+/// are compact but unbounded, and bounding them is a recorded activation
+/// obligation (they guard replay of still-live candidate tokens, so they
+/// cannot be pruned before the cut defines candidate lifetime).
+const MAX_ATTEMPT_RECORDS: usize = 64;
+
+/// Shared interior. Locked for every transition, and every terminal row goes
+/// through [`SupervisorState::terminal_row`], so one attempt can terminal-end
+/// exactly once: replaying an attempt's token can never make the committed
+/// ledger and the diagnostics ledger disagree.
 #[derive(Debug, Default)]
 pub(crate) struct SupervisorState {
     next_attempt: u64,
     /// Non-terminal attempts, in mint order (last = most recent).
     live: Vec<AttemptId>,
     superseded: BTreeSet<AttemptId>,
+    terminal: BTreeSet<AttemptId>,
     records: Vec<AttemptRecord>,
     committed: u64,
 }
@@ -93,37 +103,41 @@ impl SupervisorState {
         id
     }
 
-    fn retire(&mut self, id: AttemptId) {
+    /// Terminal-end `id` with `disposition` — exactly once. Returns whether
+    /// this call was the one that ended it; a second terminal event for the
+    /// same attempt records nothing.
+    fn terminal_row(&mut self, id: AttemptId, disposition: AttemptDisposition) -> bool {
+        if !self.terminal.insert(id) {
+            return false;
+        }
         self.live.retain(|live| *live != id);
+        self.records.push(AttemptRecord { id, disposition });
+        if self.records.len() > MAX_ATTEMPT_RECORDS {
+            self.records.remove(0);
+        }
+        true
     }
 
     pub(crate) fn is_superseded(&self, id: AttemptId) -> bool {
         self.superseded.contains(&id)
     }
 
+    pub(crate) fn is_terminal(&self, id: AttemptId) -> bool {
+        self.terminal.contains(&id)
+    }
+
     pub(crate) fn record_commit(&mut self, id: AttemptId) {
-        self.retire(id);
-        self.records.push(AttemptRecord {
-            id,
-            disposition: AttemptDisposition::Committed,
-        });
-        self.committed += 1;
+        if self.terminal_row(id, AttemptDisposition::Committed) {
+            self.committed += 1;
+        }
     }
 
     pub(crate) fn record_discard(&mut self, id: AttemptId, cause: ClassifiedFailure) {
-        self.retire(id);
-        self.records.push(AttemptRecord {
-            id,
-            disposition: AttemptDisposition::Discarded(cause),
-        });
+        self.terminal_row(id, AttemptDisposition::Discarded(cause));
     }
 
     pub(crate) fn record_panic(&mut self, id: AttemptId) {
-        self.retire(id);
-        self.records.push(AttemptRecord {
-            id,
-            disposition: AttemptDisposition::Panicked,
-        });
+        self.terminal_row(id, AttemptDisposition::Panicked);
     }
 }
 
@@ -161,7 +175,8 @@ impl SourceSupervisor {
     /// Record a classified failure for the source's newest live attempt and
     /// mint its superseding successor — the retry trigger. Every OTHER live
     /// attempt is superseded too: the source is being re-observed, so every
-    /// in-flight build is stale.
+    /// in-flight build is stale. With no live attempt the cause has no row to
+    /// land on and rides the successor's future terminal row instead.
     pub fn retry_trigger(&self, cause: ClassifiedFailure) -> LoadAttempt {
         let mut state = self.state.lock().expect("supervisor lock");
         if let Some(newest) = state.live.last().copied() {
@@ -170,10 +185,7 @@ impl SourceSupervisor {
         }
         for stale in std::mem::take(&mut state.live) {
             state.superseded.insert(stale);
-            state.records.push(AttemptRecord {
-                id: stale,
-                disposition: AttemptDisposition::Superseded,
-            });
+            state.terminal_row(stale, AttemptDisposition::Superseded);
         }
         let id = state.mint();
         drop(state);
@@ -214,13 +226,12 @@ impl LoadAttempt {
             .is_superseded(self.id)
     }
 
-    /// Cancel this attempt: recorded in diagnostics, never committed.
+    /// Cancel this attempt: recorded in diagnostics, never committed. A
+    /// cancel after the attempt already terminal-ended records nothing.
     pub fn cancel(self) {
-        let mut state = self.state.lock().expect("supervisor lock");
-        state.retire(self.id);
-        state.records.push(AttemptRecord {
-            id: self.id,
-            disposition: AttemptDisposition::Cancelled,
-        });
+        self.state
+            .lock()
+            .expect("supervisor lock")
+            .terminal_row(self.id, AttemptDisposition::Cancelled);
     }
 }

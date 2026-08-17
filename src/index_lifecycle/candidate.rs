@@ -132,6 +132,11 @@ pub struct CandidateManifest {
 /// Per-source promoted artifacts (dark payloads).
 #[derive(Debug)]
 pub struct SourceArtifacts {
+    /// Content stamp. Metadata-only sources carry `SourceContentToken(0)` —
+    /// a dark payload simplification, not a contract: the real token shape
+    /// lands with the sealed artifact machinery at the cut, and a delta over
+    /// a metadata-only sibling must pass `Some(SourceContentToken(0))` until
+    /// then.
     pub token: SourceContentToken,
     pub manifest: CandidateManifest,
     pub artifacts: BTreeMap<ArtifactKind, u64>,
@@ -174,13 +179,20 @@ impl ProjectArtifactRoot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromotionRefusal {
     /// A closed-matrix cause observed during build.
+    ///
+    /// Incompleteness of the required artifact set has no variant here on
+    /// purpose: the dark build constructs all four kinds unconditionally, so
+    /// an "incomplete" refusal would be an error nothing can emit — the
+    /// reporting invariant's shape in miniature. The real refusal arrives
+    /// with the sealed `RequiredArtifactSet` compiler at the cut (T067).
     Failure(ClassifiedFailure),
-    /// The sealed required artifact set is not completely certified.
-    IncompleteRequiredArtifacts { missing: Vec<ArtifactKind> },
     /// A capability certificate was offered in place of completeness.
     CapabilityCannotAuthorize,
     /// A retry trigger superseded the owning attempt.
     Superseded,
+    /// The owning attempt already terminal-ended; one attempt commits at
+    /// most once.
+    AttemptAlreadyTerminal,
     /// The delta's changed source token no longer matches the live root.
     SameSourceDrift {
         expected: Option<SourceContentToken>,
@@ -362,6 +374,9 @@ impl IsolatedCandidate {
         let mut supervisor = self.supervisor.lock().expect("supervisor lock");
         if supervisor.is_superseded(self.attempt) {
             return Err(PromotionRefusal::Superseded);
+        }
+        if supervisor.is_terminal(self.attempt) {
+            return Err(PromotionRefusal::AttemptAlreadyTerminal);
         }
         match self.outcome {
             BuildOutcome::Classified(cause) => {
