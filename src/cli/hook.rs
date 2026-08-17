@@ -400,7 +400,20 @@ pub fn run_hook_with_input_at(
     // another agent's `index_folder` answers 409, and the daemon fallback
     // below re-resolves the caller's project BY ROOT. Keep the daemon request
     // pinned too: a session can remain open while its active project changes.
-    let query = append_caller_root(query);
+    let Some(query) = append_caller_root(query) else {
+        if verbose {
+            eprintln!(
+                "[symforge-hook] project root is not valid UTF-8 — refusing enrichment authority and failing open"
+            );
+        }
+        record_hook_outcome(
+            workflow,
+            HookOutcome::NoSidecar,
+            effective_session_id.as_deref(),
+        );
+        println!("{}", fail_open_json(event_name));
+        return Ok(());
+    };
     // Keep a copy so the stale-sidecar daemon fallback can re-issue the same
     // root-pinned enrichment request — the first HTTP call consumes `query`.
     let fallback_query = query.clone();
@@ -1012,15 +1025,19 @@ pub(crate) fn endpoint_for(
 /// Append the hook's repo root (its cwd, canonicalized) as `caller_root` so
 /// the sidecar's root guard can 409 a wrong-project answer (dogfood #6 /
 /// spec 012 FR-006b).
-fn append_caller_root(query: String) -> String {
+fn append_caller_root(query: String) -> Option<String> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    let encoded = url_encode(&root.to_string_lossy());
-    if query.is_empty() {
+    append_caller_root_for_path(query, &root)
+}
+
+fn append_caller_root_for_path(query: String, root: &Path) -> Option<String> {
+    let encoded = url_encode(root.to_str()?);
+    Some(if query.is_empty() {
         format!("caller_root={encoded}")
     } else {
         format!("{query}&caller_root={encoded}")
-    }
+    })
 }
 
 /// Returns the fail-open JSON: empty `additionalContext`.
@@ -1162,8 +1179,6 @@ fn try_daemon_fallback(
 
     // Step 3: Parse the projects list and find one matching this repo root.
     let canon_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let canon_root_str = normalize_path_for_match(&canon_root);
-
     // Minimal serde structs for daemon JSON responses.
     // The daemon returns a JSON array of objects with `canonical_root`,
     // `project_id`, and `session_count` fields.
@@ -1171,7 +1186,7 @@ fn try_daemon_fallback(
 
     let matching = projects
         .iter()
-        .find(|p| normalize_path_for_match(Path::new(&p.canonical_root)) == canon_root_str)?;
+        .find(|project| daemon_project_matches_native_root(project, &canon_root))?;
 
     if matching.session_count == 0 {
         return None;
@@ -1211,6 +1226,12 @@ struct DaemonProjectEntry {
     session_count: usize,
 }
 
+fn daemon_project_matches_native_root(project: &DaemonProjectEntry, root: &Path) -> bool {
+    let expected_project_id = crate::daemon::project_key(root);
+    project.project_id == expected_project_id
+        && crate::daemon::project_key(Path::new(&project.canonical_root)) == project.project_id
+}
+
 /// Minimal deserialization struct for daemon session list entries.
 #[derive(serde::Deserialize)]
 struct DaemonSessionEntry {
@@ -1234,16 +1255,21 @@ enum EnrichmentHttpResult {
     Unavailable,
 }
 
-/// Normalize a path for cross-platform comparison: lowercase on Windows,
-/// forward slashes everywhere, no trailing separator.
-fn normalize_path_for_match(path: &Path) -> String {
-    let s = path.to_string_lossy().replace('\\', "/");
-    let trimmed = s.trim_end_matches('/');
-    if cfg!(windows) {
-        trimmed.to_lowercase()
+fn normalize_path_text_for_match(path_text: &str, windows: bool) -> String {
+    let normalized = crate::daemon::normalized_path_text(path_text, windows);
+    let trimmed = normalized.trim_end_matches('/');
+    if windows {
+        trimmed.to_ascii_lowercase()
     } else {
         trimmed.to_string()
     }
+}
+
+/// Normalize a native path for cross-platform comparison: Windows accepts
+/// either slash spelling and compares case-insensitively; Unix preserves a
+/// literal backslash because it is a valid filename byte.
+fn normalize_path_for_match(path: &Path) -> String {
+    normalize_path_text_for_match(&path.to_string_lossy(), cfg!(windows))
 }
 
 fn sync_http_response_with_timeout(
@@ -1685,6 +1711,54 @@ mod tests {
     use tempfile::TempDir;
 
     static HOOK_VERBOSE_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[test]
+    fn daemon_fallback_path_identity_treats_backslash_as_a_separator_only_on_windows() {
+        let literal = r"/work/a\b";
+        let nested = "/work/a/b";
+        assert_ne!(
+            normalize_path_text_for_match(literal, false),
+            normalize_path_text_for_match(nested, false)
+        );
+        assert_eq!(
+            normalize_path_text_for_match(literal, true),
+            normalize_path_text_for_match(nested, true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_fallback_path_matching_preserves_literal_backslash_components_on_unix() {
+        let root = TempDir::new().expect("create hook path identity fixture");
+        let literal = root.path().join(r"a\b");
+        let nested = root.path().join("a").join("b");
+        std::fs::create_dir_all(&literal).expect("create literal-backslash root");
+        std::fs::create_dir_all(&nested).expect("create nested root");
+
+        assert_ne!(
+            normalize_path_for_match(&literal),
+            normalize_path_for_match(&nested),
+            "daemon fallback must not route a nested Unix root to a literal-backslash project"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_authority_refuses_non_utf8_lossy_root_collisions() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let native = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
+        let lossy = PathBuf::from("a\u{fffd}b");
+        assert_eq!(native.to_string_lossy(), lossy.to_string_lossy());
+
+        let foreign = DaemonProjectEntry {
+            project_id: crate::daemon::project_key(&lossy),
+            canonical_root: lossy.to_str().expect("UTF-8 root").to_string(),
+            session_count: 1,
+        };
+        assert!(!daemon_project_matches_native_root(&foreign, &native));
+        assert!(append_caller_root_for_path(String::new(), &native).is_none());
+    }
 
     // --- fail_open_json ---
 

@@ -691,6 +691,64 @@ async fn compact_gate_rejects_off_surface_calls_via_real_dispatch() {
     server.shutdown().await;
 }
 
+/// The production-reachable A-019 relay preserves legacy renderer bytes.
+/// Central plain-String error inference must not reinterpret valid file text
+/// merely because it begins with an error-shaped token.
+#[tokio::test]
+async fn admitted_facade_measurement_preserves_error_prefixed_source_at_wire() {
+    let _lock = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let full_surface = stel_surface_env::set_symforge_surface("full");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let source = "Error: ordinary repository text, not a tool failure\nstill ordinary\n";
+    std::fs::write(dir.path().join("error_prefix.rs"), source).expect("seed relay fixture");
+
+    let server = start_server(test_runtime()).await;
+    let mut client = McpHttpClient::new(server.mcp_url());
+
+    let root = dir.path().to_str().expect("utf8 tempdir").to_string();
+    client
+        .call(
+            "tools/call",
+            json!({"name": "index_folder", "arguments": {"path": root}}),
+            &[],
+        )
+        .await;
+
+    drop(full_surface);
+    let _compact_surface = stel_surface_env::set_symforge_surface("compact");
+    let result = client
+        .call(
+            "tools/call",
+            json!({
+                "name": "symforge",
+                "arguments": {
+                    "_probe_legacy_tool": "get_file_content",
+                    "_probe_legacy_args": {"path": "error_prefix.rs"}
+                }
+            }),
+            &[],
+        )
+        .await;
+
+    assert_eq!(result["content"][0]["text"], source, "{result}");
+    assert_ne!(
+        result.get("isError"),
+        Some(&Value::Bool(true)),
+        "raw source must not be inferred as an MCP error: {result}"
+    );
+    assert!(
+        result
+            .get("_meta")
+            .and_then(|meta| meta.get("symforge/result_status"))
+            .is_none(),
+        "measurement relay must remain result-status-free: {result}"
+    );
+    let evidence = evidence_of(&result);
+    assert!(evidence["project_id"].is_string(), "{evidence}");
+
+    server.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // SC-316 — FR-319 binding evidence disclosure
 // ---------------------------------------------------------------------------
@@ -798,6 +856,60 @@ async fn evidence_discloses_foreign_binding() {
         normalize(&root_b),
         "a client expecting repo B can detect the foreign binding"
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreign_selector_early_errors_never_attach_home_evidence() {
+    let repo_a = tempfile::TempDir::new().expect("repo A");
+    std::fs::write(repo_a.path().join("a.rs"), "pub fn a() {}\n").expect("seed A");
+    let server = start_server(test_runtime()).await;
+    let mut client = McpHttpClient::new(server.mcp_url());
+
+    let mut index_headers = modern_headers("tools/call");
+    index_headers.push(("Mcp-Name", "index_folder"));
+    client
+        .call(
+            "tools/call",
+            with_modern_meta(json!({
+                "name": "index_folder",
+                "arguments": {"path": repo_a.path().to_str().expect("utf8 A")},
+            })),
+            &index_headers,
+        )
+        .await;
+
+    let mut symforge_headers = modern_headers("tools/call");
+    symforge_headers.push(("Mcp-Name", "symforge"));
+    let cases = [
+        json!({
+            "name": "symforge",
+            "arguments": {"query": "", "project": "foreign-project"},
+        }),
+        json!({
+            "name": "symforge",
+            "arguments": {
+                "query": "measurement",
+                "_probe_legacy_tool": "get_file_content",
+                "_probe_legacy_args": {"path": 7, "project": "foreign-project"},
+            },
+        }),
+    ];
+
+    for params in cases {
+        let result = client
+            .call("tools/call", with_modern_meta(params), &symforge_headers)
+            .await;
+        assert_eq!(
+            evidence_of(&result),
+            &json!({
+                "bound": false,
+                "reason": "project_evidence_unavailable",
+            }),
+            "an early foreign-selector error must not inherit HOME: {result}"
+        );
+    }
 
     server.shutdown().await;
 }

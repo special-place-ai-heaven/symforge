@@ -381,7 +381,7 @@ pub struct SearchTextInput {
 pub struct SearchFilesInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,

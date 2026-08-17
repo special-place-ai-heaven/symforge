@@ -257,8 +257,8 @@ fn count_regular_files(root: &Path) -> usize {
 }
 
 fn normalized_path_string(path: &Path) -> String {
-    std::fs::canonicalize(path)
-        .expect("canonicalize project root")
+    let canonical_root = std::fs::canonicalize(path).expect("canonicalize project root");
+    dunce::simplified(&canonical_root)
         .to_string_lossy()
         .replace('\\', "/")
 }

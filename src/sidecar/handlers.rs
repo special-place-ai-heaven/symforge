@@ -39,6 +39,11 @@ pub struct ImpactParams {
     pub new_file: Option<bool>,
 }
 
+pub(crate) struct ImpactToolOutput {
+    pub(crate) text: String,
+    pub(crate) published: std::sync::Arc<crate::live_index::PublishedGeneration>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct SymbolContextParams {
     pub name: String,
@@ -366,20 +371,30 @@ pub(crate) fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -> bool {
-    fn norm(p: &std::path::Path) -> String {
-        let canon = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let s = canon.to_string_lossy().replace('\\', "/");
-        let s = s.trim_end_matches('/').to_string();
-        // Windows paths are case-insensitive; Unix roots differing only by
-        // case are distinct directories and must not be conflated.
-        if cfg!(windows) {
-            s.to_ascii_lowercase()
-        } else {
-            s
-        }
+fn normalized_root_text_for_match(path_text: &str, windows: bool) -> String {
+    let normalized = crate::daemon::normalized_path_text(path_text, windows);
+    let trimmed = normalized.trim_end_matches('/').to_string();
+    if windows {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed
     }
-    norm(caller) == norm(indexed)
+}
+
+pub(crate) fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -> bool {
+    let caller = dunce::canonicalize(caller).unwrap_or_else(|_| caller.to_path_buf());
+    let indexed = dunce::canonicalize(indexed).unwrap_or_else(|_| indexed.to_path_buf());
+    if cfg!(windows) {
+        let (Some(caller), Some(indexed)) = (caller.to_str(), indexed.to_str()) else {
+            return false;
+        };
+        normalized_root_text_for_match(caller, true)
+            == normalized_root_text_for_match(indexed, true)
+    } else {
+        // Unix paths are opaque native bytes. A lossy String comparison can
+        // authorize a different root whose UTF-8 name contains U+FFFD.
+        caller == indexed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1063,7 @@ pub async fn workflow_post_edit_impact_handler(
 pub(crate) async fn impact_tool_text(
     state: SidecarState,
     params: &ImpactParams,
-) -> Result<String, StatusCode> {
+) -> Result<ImpactToolOutput, StatusCode> {
     let impact_index = state.index.clone();
     let _impact_guard = impact_index.lock_impact_analysis().await;
     let published = state.index.published_generation();
@@ -1063,6 +1078,7 @@ pub(crate) async fn impact_tool_text(
         TOOL_RENDER_OPTIONS,
         root,
         expected_generation,
+        published,
     )
     .await;
     if state.index.current_project_generation() != expected_generation {
@@ -1077,14 +1093,17 @@ async fn impact_hook_text(
     fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
     let root = fence.indexed_root.clone();
+    let published = capture_sidecar_generation_at_fence(&state, fence)?;
     impact_text(
         state,
         params,
         HOOK_RENDER_OPTIONS,
         root,
         fence.project_generation,
+        published,
     )
     .await
+    .map(|output| output.text)
 }
 
 async fn impact_text(
@@ -1093,7 +1112,8 @@ async fn impact_text(
     options: RenderOptions,
     root: std::path::PathBuf,
     expected_generation: u64,
-) -> Result<String, StatusCode> {
+    baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
+) -> Result<ImpactToolOutput, StatusCode> {
     if state.index.current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1120,6 +1140,7 @@ async fn impact_text(
             &normalized_path,
             options,
             expected_generation,
+            baseline,
         )
         .await;
     }
@@ -1143,12 +1164,21 @@ async fn impact_text(
             &normalized_path,
             options,
             expected_generation,
+            baseline,
         )
         .await;
     }
 
     // HOOK-05: Re-index existing file and compute symbol diff.
-    handle_edit_impact(state, &root, &normalized_path, options, expected_generation).await
+    handle_edit_impact(
+        state,
+        &root,
+        &normalized_path,
+        options,
+        expected_generation,
+        baseline,
+    )
+    .await
 }
 
 fn impact_skipped_text(published: &crate::live_index::PublishedGeneration, path: &str) -> String {
@@ -1216,13 +1246,29 @@ fn impact_skipped_text(published: &crate::live_index::PublishedGeneration, path:
     )
 }
 
+fn impact_receipt_publication(
+    receipt: &crate::live_index::single_file::ReindexReceipt,
+    baseline: &std::sync::Arc<crate::live_index::PublishedGeneration>,
+) -> Result<std::sync::Arc<crate::live_index::PublishedGeneration>, StatusCode> {
+    if let Some(published) = &receipt.published {
+        return Ok(std::sync::Arc::clone(published));
+    }
+    if crate::live_index::store::PublicationFence::from_published(baseline.as_ref())
+        == receipt.observed_at
+    {
+        return Ok(std::sync::Arc::clone(baseline));
+    }
+    Err(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 async fn handle_new_file_impact(
     state: SidecarState,
     root: &std::path::Path,
     path: &str,
     options: RenderOptions,
     expected_generation: u64,
-) -> Result<String, StatusCode> {
+    baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
+) -> Result<ImpactToolOutput, StatusCode> {
     if state.index.current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1247,11 +1293,11 @@ async fn handle_new_file_impact(
     match &receipt.outcome {
         crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
         crate::watcher::ReindexResult::Skipped => {
-            let published = receipt
-                .published
-                .as_deref()
-                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-            return Ok(impact_skipped_text(published, path));
+            let published = impact_receipt_publication(&receipt, &baseline)?;
+            return Ok(ImpactToolOutput {
+                text: impact_skipped_text(published.as_ref(), path),
+                published,
+            });
         }
         crate::watcher::ReindexResult::PublicationRejected => {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -1263,9 +1309,13 @@ async fn handle_new_file_impact(
             return Err(StatusCode::NOT_FOUND);
         }
         crate::watcher::ReindexResult::ReadError(_) => {
-            return Ok(format!(
-                "Not indexed: {path} is temporarily unreadable; last-valid state was retained."
-            ));
+            let published = impact_receipt_publication(&receipt, &baseline)?;
+            return Ok(ImpactToolOutput {
+                text: format!(
+                    "Not indexed: {path} is temporarily unreadable; last-valid state was retained."
+                ),
+                published,
+            });
         }
     }
 
@@ -1331,7 +1381,10 @@ async fn handle_new_file_impact(
         language, kinds_str,
     );
 
-    Ok(text)
+    Ok(ImpactToolOutput {
+        text,
+        published: std::sync::Arc::clone(published),
+    })
 }
 
 /// Locate the SymbolRecord in an indexed file that corresponds to a
@@ -1378,7 +1431,8 @@ async fn handle_edit_impact(
     path: &str,
     options: RenderOptions,
     expected_generation: u64,
-) -> Result<String, StatusCode> {
+    baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
+) -> Result<ImpactToolOutput, StatusCode> {
     if state.index.current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1456,30 +1510,32 @@ async fn handle_edit_impact(
     match &receipt.outcome {
         crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
         crate::watcher::ReindexResult::Skipped => {
-            let published = receipt
-                .published
-                .as_deref()
-                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-            return Ok(impact_skipped_text(published, path));
+            let published = impact_receipt_publication(&receipt, &baseline)?;
+            return Ok(ImpactToolOutput {
+                text: impact_skipped_text(published.as_ref(), path),
+                published,
+            });
         }
         crate::watcher::ReindexResult::PublicationRejected => {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
         crate::watcher::ReindexResult::ReadError(_) => {
-            return Ok(format!(
-                "── Impact: {path} ──\nStatus: temporarily unreadable — last-valid state retained"
-            ));
+            let published = impact_receipt_publication(&receipt, &baseline)?;
+            return Ok(ImpactToolOutput {
+                text: format!(
+                    "── Impact: {path} ──\nStatus: temporarily unreadable — last-valid state retained"
+                ),
+                published,
+            });
         }
         crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
-            if state.index.publication_fence() != receipt.observed_at {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
+            let published = impact_receipt_publication(&receipt, &baseline)?;
             // One latency-bounded observation cannot distinguish a durable
             // deletion from delete→recreate disk ABA. Retain last-valid state;
             // the watcher retry/reconciliation path owns confirmed removal.
             let prev_symbol_count = pre_symbols.len();
             let root_display = root.display().to_string();
-            let has_index_record = state.index.read().get_file(path).is_some();
+            let has_index_record = published.live.get_file(path).is_some();
             let (status, detail) = if has_index_record {
                 (
                     "last-valid index state retained pending watcher confirmation",
@@ -1491,9 +1547,12 @@ async fn handle_edit_impact(
                     "No prior symbol count was observed.".to_string(),
                 )
             };
-            return Ok(format!(
-                "── Impact: {path} ──\nStatus: not found under {root_display} — {status}\n{detail}"
-            ));
+            return Ok(ImpactToolOutput {
+                text: format!(
+                    "── Impact: {path} ──\nStatus: not found under {root_display} — {status}\n{detail}"
+                ),
+                published,
+            });
         }
     }
 
@@ -1700,7 +1759,10 @@ async fn handle_edit_impact(
         state.token_stats.record_edit(file_bytes, output_bytes);
     }
 
-    Ok(text)
+    Ok(ImpactToolOutput {
+        text,
+        published: std::sync::Arc::clone(post_generation),
+    })
 }
 
 /// `GET /symbol-context?name=<name>[&file=<path>]` — all references to a named symbol.
@@ -2983,6 +3045,56 @@ mod tests {
 
     static GENERIC_TEST_ROOT: Lazy<TempDir> =
         Lazy::new(|| TempDir::new().expect("create generic sidecar handler test root"));
+
+    #[test]
+    fn root_identity_treats_backslash_as_a_separator_only_on_windows() {
+        let literal = r"/work/a\b";
+        let nested = "/work/a/b";
+        assert_ne!(
+            normalized_root_text_for_match(literal, false),
+            normalized_root_text_for_match(nested, false)
+        );
+        assert_eq!(
+            normalized_root_text_for_match(literal, true),
+            normalized_root_text_for_match(nested, true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn roots_match_preserves_literal_backslash_path_components_on_unix() {
+        let root = TempDir::new().expect("create sidecar root identity fixture");
+        let literal = root.path().join(r"a\b");
+        let nested = root.path().join("a").join("b");
+        std::fs::create_dir_all(&literal).expect("create literal-backslash root");
+        std::fs::create_dir_all(&nested).expect("create nested root");
+
+        assert_ne!(
+            literal.canonicalize().expect("canonicalize literal root"),
+            nested.canonicalize().expect("canonicalize nested root")
+        );
+        assert!(
+            !roots_match(&literal, &nested),
+            "distinct Unix roots must not pass the caller-root guard"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn roots_match_never_aliases_non_utf8_native_root_to_lossy_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let parent = tempfile::tempdir().expect("tempdir");
+        let native = parent
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
+        let lossy = parent.path().join("a\u{fffd}b");
+        std::fs::create_dir(&native).expect("native root");
+        std::fs::create_dir(&lossy).expect("lossy-collision root");
+        assert_eq!(native.to_string_lossy(), lossy.to_string_lossy());
+        assert!(roots_match(&native, &native));
+        assert!(!roots_match(&native, &lossy));
+    }
 
     // -----------------------------------------------------------------------
     // Test helper: minimal LiveIndex with known contents

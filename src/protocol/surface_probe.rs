@@ -221,7 +221,8 @@ fn symforge_facade_schema() -> Value {
     })
 }
 
-/// Phase 0 A-019 battery input. `_probe_*` fields are harness-only (serde accepts; not in schema).
+/// Phase 0 A-019 measurement input. `_probe_*` fields are schema-hidden but
+/// production-reachable through the source-mutation-safe facade allowlist.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StelFacadeProbeInput {
     pub query: String,
@@ -240,12 +241,10 @@ pub struct StelFacadeProbeInput {
 /// Resolve a compact/meta `symforge` facade call to a legacy L3 tool for measurement relay.
 pub fn resolve_facade_probe(input: &StelFacadeProbeInput) -> Result<(String, Value), String> {
     let legacy_tool = input.probe_legacy_tool.as_deref().ok_or_else(|| {
-        "Phase 0 facade relay requires `_probe_legacy_tool` (A-019 battery harness only)"
-            .to_string()
+        "Phase 0 facade relay requires `_probe_legacy_tool` (A-019 measurement relay)".to_string()
     })?;
     let legacy_args = input.probe_legacy_args.clone().ok_or_else(|| {
-        "Phase 0 facade relay requires `_probe_legacy_args` (A-019 battery harness only)"
-            .to_string()
+        "Phase 0 facade relay requires `_probe_legacy_args` (A-019 measurement relay)".to_string()
     })?;
     Ok((legacy_tool.to_string(), legacy_args))
 }

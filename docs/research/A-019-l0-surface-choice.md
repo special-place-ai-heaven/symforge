@@ -28,7 +28,25 @@ Source: [A-005-schema-bytes.json](./A-005-schema-bytes.json), [A-019-l0-ab-resul
 
 ### Measurement relay (Phase 0 only)
 
-Compact/meta surfaces call `symforge` with harness-only `_probe_legacy_tool` / `_probe_legacy_args` fields. Relay lives in `src/protocol/surface_probe.rs` + `symforge` tool handler — **not** STEL product code (`src/stel/**` untouched).
+Compact/meta surfaces call `symforge` with schema-hidden `_probe_legacy_tool` /
+`_probe_legacy_args` compatibility fields. The relay is production-reachable but
+restricted to a source-mutation-safe measurement allowlist; `batch_rename` is
+admitted only with `dry_run=true`. This is not a side-effect-free promise: normal
+read-path cache, frecency, coupling, and index-refresh effects may still occur.
+The relay preserves exact legacy renderer text and deliberately omits
+`symforge/result_status`, because arbitrary returned source text cannot prove a
+semantic outcome class. The shared MCP boundary still attaches
+`symforge/project_evidence`, but exempts an admitted relay from its rendered-text
+`isError` heuristic so valid source beginning with error-shaped bytes remains data.
+The input lives in `src/stel_core/types.rs`; the policy and dispatch live in the
+`symforge` tool handler; and the boundary exemption lives in
+`src/protocol/mod.rs::call_tool`. The path bypasses the normal STEL planner only for
+this Phase 0 measurement compatibility case.
+
+The numeric table above is the historical 2026-06-13 A-019 measurement and linked
+artifact. It selected compact-3 but does not itself validate the later containment
+policy; the current policy is covered by focused handler, real MCP-boundary, and
+both fixture-harness controls recorded in the Slice 3 evidence.
 
 ## Winner selection (gap plan §4.1)
 

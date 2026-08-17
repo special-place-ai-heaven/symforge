@@ -310,7 +310,7 @@ const FROZEN_DIGESTS = {
   },
   retirement_records: {
     domain: "symforge.lifecycle.v11.retirement.records",
-    hash: "d86bd17b3e6ce2cddf86e2755433fe9dc0b5ed91467ad805fc634be1bbe5ce29",
+    hash: "3b6870a3923476cbbdad962efdf1b1fb893c5ec3a3e29d5bf936d8fd4c22513d",
   },
   retirement_edges: {
     domain: "symforge.lifecycle.v11.retirement.edges",

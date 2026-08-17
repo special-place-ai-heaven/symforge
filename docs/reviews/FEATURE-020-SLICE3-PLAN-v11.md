@@ -3,23 +3,33 @@
 Slice 3 is T041–T052. Production stays on V10 authority for the whole slice. The
 deliverable is typed seams that Slice 4 can activate in one cut, plus a runtime that
 compiles, is tested, and is provably unreachable from every production entry point.
+The post-Round-3 PR 4 candidate remains an in-progress corrective change, not slice
+closure. Its bounded production scope covers defects exposed by the exact T050/T051
+audit in already-shipped paths: the schema-hidden A-019 relay; compact-facade and
+daemon project routing; `index_folder` root/ACTIVE bookkeeping; whole-call `ask`
+routing; and the local impact result's publication/evidence binding. The relay was
+production-reachable and source-write-capable behind a read-only facade, while the
+routing paths could mix HOME, ACTIVE, or an explicitly selected sibling and the
+impact path could describe a different publication from its rendered result. The
+repair narrows or binds those existing paths, hardens their existing harness, and
+does not activate V11 authority.
 
 ## PROGRESS LEDGER — durable, does not depend on session state
 
 | Task | State |
 |---|---|
-| T041 RED provenance/contract negatives | not started |
-| T042 RED cross-authority | not started |
-| T043 sealed provenance types | not started |
-| T044 read_gate authority split | not started |
-| T045 protocol lane migration | not started |
-| T046 published-source-set consolidation | not started |
-| T047 dark runtime | not started |
-| T048 dark public API + export delta | not started |
-| T049 AAP migration receipt | not started |
-| T050 activation-cut matrix | not started |
-| T051 dark unreachability | not started |
-| T052 gates + adversarial review | not started |
+| T041 RED provenance/contract negatives | landed (PR 1) |
+| T042 RED cross-authority | landed (PR 1), except approved D14 live-observer proof deferral to T056/T063 |
+| T043 sealed provenance types | landed (PR 2) |
+| T044 read_gate authority split | landed (PR 2) |
+| T045 protocol lane migration | landed (PR 2) |
+| T046 published-source-set consolidation | landed (PR 2) |
+| T047 dark runtime | landed (PR 3, squashed as 6d1c58df) |
+| T048 dark public API + export delta | landed (PR 3, squashed as 6d1c58df) |
+| T049 AAP migration receipt | landed (PR 3, squashed as 6d1c58df) |
+| T050 activation-cut matrix | closed at the reviewed candidate — the exact 116-slot overlay plus 16 source-free mode residuals have their focused controls, adversarial mutations, final gates, non-closure commits, and adjudicated fresh reviews recorded in evidence |
+| T051 dark unreachability | closed at the reviewed candidate — the layered lexical + narrow-call-surface + whole-source guard has its frozen source pin, observed macro/alias mutation, final gates, non-closure commits, and adjudicated fresh reviews recorded in evidence |
+| T052 gates + adversarial review | closed at the evidence/ledger closure commit — external Round-1 reviews adjudicated (C1 MAJOR repaired with mutation-verified regressions, C2/C3 MINORs repaired), Round-2 and Round-3 fresh reviews returned zero code findings with every documentation finding repaired as prescribed; the branch is pushed and awaits the PR 4 merge to `main` |
 
 Entry state, verified at `10e036b5` (not inherited):
 
@@ -159,6 +169,25 @@ with its own manifest hash and approval chain.
 `DerivedLimitKind`, `WorktreeObservationCut`, `WorktreeScopeCoverage`, `GitResolvedFrom`.
 T043 transcribes these names verbatim — Slice 2 lost time to four seam-name mismatches
 invented rather than copied, and that must not repeat.
+
+**7. PR 4's post-Round-3 repair has six bounded workstreams, all still candidate
+work.** First, the A-019 relay is restricted to source-mutation-safe measurements,
+keeps its raw legacy result free of fabricated semantic status, and is pinned at the
+real MCP boundary. Second, project routing must bind HOME/ACTIVE/explicit targets
+before dispatch: the compact facade cannot substitute adapter-local path, bytes,
+cache/fusion/co-change state, or evidence; selector-less ACTIVE tools carry an
+adapter-authored private pin; relative `index_folder` paths resolve once; overlapping
+activations and reconnect mirror updates share one lane; and `ask` routes as one
+selected-project operation after its local no-echo guard. Third, local
+`analyze_file_impact` renders, enriches, and records evidence from the exact winning
+reindex publication. Fourth, T050 records the exact 102-overlay + 3-non-ingress +
+11-authority-free partition and separately pins the 16 successful source-free modes
+on otherwise branch-bearing members. Fifth, T051 combines lexical outside-caller
+sweeps, the narrow approved call surface, and a fail-closed whole-`src/`
+reviewed-baseline seal. Sixth, the verify-tools harness gains non-vacuous content
+requirements in both fixture sets. None of these statements is closure evidence
+until the final mutations, gates, immutable non-closure commit, and fresh full-range
+review complete.
 
 ## T045 and T046 MUST regenerate the retirement census. This is designed, not a blocker.
 
@@ -349,8 +378,15 @@ assertion.
 only from a dark factory; T051's unreachability proof lands in the SAME PR as the code
 it constrains, so the constraint can never be merged later than the thing it guards.
 
-**PR 4 — activation matrix and slice closure (T050, T052).** The 244-member matrix,
-then the full gate set and independent adversarial review.
+**PR 4 — activation matrix and corrective closure candidate (T050, T051, T052).**
+The exact 244-member authority join and 116-slot surface partition, the separate 16
+source-free mode residuals, layered T051 darkness guards, narrow A-019 relay
+containment, selected-project/ACTIVE routing containment, exact local-impact
+publication binding, and both verify-tools fixture sets move together. After final
+mutation evidence and the full local gate set, they land in one explicitly
+non-closure commit. A fresh independent review then reads the complete PR 4 range at
+that immutable SHA. Findings restart repair, gates, commit, and review; only a
+trustworthy clean review permits a later evidence/ledger closure commit.
 
 ## Binding constraints for this slice
 
@@ -365,15 +401,99 @@ then the full gate set and independent adversarial review.
   regenerated digest chain.
 - **Every negative test pairs with its accepting case**, and each guard is
   mutation-tested — remove the guard, prove the specific test fails, restore it.
-- **No known gap crosses the Slice 3 → Slice 4 boundary.** Documenting a hazard is not
-  fixing it.
+- **No known unapproved gap crosses the Slice 3 → Slice 4 boundary.** The approved
+  residuals and their existing owners are explicit; recording them is not claiming
+  they are closed:
+
+  - Eleven whole-member authority-free ingresses do not satisfy `INV-SURFACE` as
+    written; T066 must exclude them from the invariant or add a branch. The static
+    glossary/catalog boundary-metadata part is owned by T066/T067.
+  - Sixteen successful source-free modes remain on otherwise branch-bearing rows.
+    The hook pass-through is owned by T064/T066/T067/T072; the fifteen tool modes by
+    T066/T067/T072.
+  - Eight identical-success edit replay modes lack a source-bound typed receipt.
+    T058 owns the causal RED, T064 the bound replay receipt, T066 branch
+    registration, and T072 activation.
+  - D14's stand-in does not prove live-observer invalidation. T056/T063 own the real
+    observer/query proof; it is not counted as T042 execution evidence.
+  - `detect_impact` currently consumes generation symbols/caller graph while its
+    frozen target is pure Git/worktree observation. T064 owns that refactor.
+  - Repeat-cache hits and CCR retrieval lack the frozen publication/source identity
+    fences. T064/T066/T067 own those activation prerequisites.
+  - Static resource project evidence is presently unfenced, and standalone/session
+    health/stat routes do not yet share the unconditional target guard. T066/T067 own
+    those boundary repairs.
+  - Cross-process `ProjectEvidence` is ancillary untyped metadata and is not an
+    atomic body/publication transaction under arbitrary concurrent publication.
+    That existing D16 boundary remains structured-activation work; PR 4 fixes the
+    deterministic local impact mismatch but does not claim product-wide atomicity.
+  - Cancellation or timeout after the daemon begins a non-abortable
+    `index_folder` leaves an explicitly unknown distributed outcome. Completed calls
+    are serialized through the ACTIVE mirror and every project-bound follow-up is
+    canonically pinned, so the unknown outcome cannot silently retarget a read or
+    write. An activation epoch/authoritative resync is recovery work, not a reason to
+    weaken the current pin.
+
+  PR 4 adds neither a ninth authority branch nor a frozen-corpus amendment to hide
+  any of these. The T051 guard is deliberately bounded to in-tree production source:
+  its sealed excluded implementation set composes with the outside caller/splice
+  sweep; generated `OUT_DIR`, proc-macro, and dependency behavior are outside that
+  claim. The pre-existing normal-STEL rendered-text status classifier is unchanged,
+  is not used by any Feature 020 proof, and remains an approved typed-result follow-up
+  outside this slice. Any other known gap must be repaired or separately approved
+  before Slice 3 closes.
+- **T050 exactness is review-backed, not inferred from green alone.** The executable
+  matrix proves vocabulary, closure, membership, and non-empty bases. M63c proves it
+  cannot judge the semantic correctness of one row; the exhaustive handler-body
+  audit and cited per-row bases supply that proof, and the fresh adversarial review
+  must independently accept it.
 - **Do not start Slice 4 early.** Slice 4 is the single indivisible activation cut.
 - Keep nested parentheses out of commit bodies; release-please silently drops the commit.
 
+## Current PR 4 checkpoint and binding closure sequence
+
+The previous candidate cycle completed its joint non-closure commit and received
+three independent external reviews. Their consolidated adjudication returned
+**FINDINGS — do not land unchanged**: one confirmed MAJOR (the `ask` handler's
+nested tool dispatches dropped the resolved project after an allowed HOME
+fallback), two confirmed MINOR defects (the hook-adoption formatter misdiagnosed
+all-sidecar-error runs as "no sidecar found"; one stale predicate-name comment),
+and one false positive. The repairs were made test-first with RED witnesses and
+mutation-sensitivity checks. A Round-2 fresh four-lens review of the committed
+repair candidate returned CLEAN on both code lenses and three MINOR
+documentation/test-coverage findings, all repaired and committed: a third
+formatter control pinning the mixed sidecar quadrant, and two evidence-document
+corrections. A Round-3 compact fresh review of that repair delta returned
+delta-audit CLEAN and one MINOR evidence-count correction, applied in the
+closure commit. The five new library tests raise the library target from 3,215
+to 3,220. Every candidate gate below was re-observed on the repaired frozen
+source; the non-closure commits and adjudicated fresh reviews are recorded in
+the evidence checklist. The remaining step for Slice 3 is the PR 4 merge to
+`main`. Historical green rows in the evidence document cannot satisfy these
+obligations for changed source or harness bytes.
+
+| Candidate obligation | Required result before the non-closure commit |
+|---|---|
+| Focused A-019 relay, selector-containment, activation-cut, T051 darkness, and real-MCP controls | OBSERVED — re-observed on the repaired frozen source: selector family 12/0, ask-fallback family 3/0, hook-adoption formatter family 6/0 including the Round-2 mixed-quadrant control, preventive 8/0 with the regenerated pin, runtime-dark 11/0, public API 2/0, overlay exactness 1/0; the nested-pin, formatter-honesty, and Round-2 crafted-conjunct mutations each turned their intended witnesses RED and were byte-exactly restored with hash receipts |
+| Formatting and traceability | OBSERVED — final-source `cargo fmt --check`, `git diff --check`, and the 78/24/13 lifecycle traceability census are clean; the census regeneration for the repair moved only the `writers` closure, exactly the category owning the repaired production path |
+| Clippy | OBSERVED — final-source `cargo clippy --all-targets -- -D warnings` clean with a directly observed exit-0 receipt |
+| Embed configuration | OBSERVED — `cargo test --no-default-features --features embed --lib -- --test-threads=1`: 1,333 passed, 0 failed, 4 ignored, directly observed exit 0 |
+| Debug binary + verify-tools fixtures | OBSERVED — current-source debug build clean; `target/debug/symforge.exe` produced 7 PASS / 1 REVIEW / 0 FAIL on the synthetic fixture and 10/1/0 on `verify-tools-real`, both expected unit-mismatch REVIEW cases unchanged |
+| Release binary + verify-tools fixtures | OBSERVED — current-source local release build clean; `target/release/symforge.exe` produced the same 7/1/0 synthetic and 10/1/0 real results; this was not deferred to PR CI |
+| Full target suite | OBSERVED — `cargo test --all-targets -- --test-threads=1` exited 0 with directly observed trust in 587,665 ms; the main library target reported 3,220 passed / 0 failed / 5 ignored and every integration target completed cleanly |
+
+Once those rows are observed on one stable LF-normalized tree, commit every PR 4
+candidate file together with a non-closure subject. Run the fresh adversarial review
+against that committed SHA and the complete PR 4 range with no concurrent edits. If
+the review finds anything, repair and repeat the mutation/gate/commit/review loop. If
+it is trustworthy and clean, update evidence and the progress ledger in a second
+commit. Do not push until separately authorized.
+
 ## Claims inherited, not verified
 
-- That Slice 4 can actually own all 244 inventory members. Slice 3 only proves each has
-  a named owner; whether the owner is correct is Slice 4's evidence.
+- That Slice 4 can actually implement and activate all 244 inventory owners. Slice 3's
+  exhaustive source audit determines the intended per-member owner; Slice 4 must prove
+  its implementation realizes those owners without mixed authority.
 - Grok's five smoke findings against 10.3.0 (tools catalog, path-as-project correction,
   `index_folder` parent refusal, `broken_anchor` vs `exact:symbol`, outline dropped
   under budget) are a separate product pass, not observed by me, and not Slice 3 work.

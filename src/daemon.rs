@@ -195,6 +195,11 @@ pub struct DaemonSessionClient {
     /// active. Shared across clones so a reconnect can restore the active
     /// project after re-opening the working set.
     active_root: std::sync::Arc<parking_lot::Mutex<Option<PathBuf>>>,
+    /// Serializes daemon-backed `index_folder` calls through the matching
+    /// adapter ACTIVE-mirror update. Without one shared lane, two overlapping
+    /// default opens can activate in daemon order B -> C but record their
+    /// adapter mirrors in response order C -> B.
+    activation_lane: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// The connected daemon's boot epoch (from /health at connect). Written
     /// into this adapter's session descriptor so descriptor selection can
     /// reject the record after a daemon restart instead of aliasing an
@@ -1890,7 +1895,7 @@ impl DaemonState {
             .cloned()
             .ok_or_else(|| format!("unknown session '{session_id}'"))?;
 
-        let target_id = match project.map(str::trim).filter(|p| !p.is_empty()) {
+        let target_id = match project.filter(|p| !p.trim().is_empty()) {
             None => session.active_project_id.clone(),
             Some(selector) => {
                 let open_ids: Vec<String> = session
@@ -2112,6 +2117,7 @@ impl DaemonSessionClient {
             project_root: None,
             opened_roots: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             active_root: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            activation_lane: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             daemon_started_at: None,
         }
     }
@@ -2153,10 +2159,94 @@ impl DaemonSessionClient {
         *self.active_root.lock() = Some(root);
     }
 
+    /// One connection-scoped lane for an `index_folder` daemon round trip and
+    /// the adapter mirror update that follows its successful response.
+    pub(crate) fn activation_lane(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(&self.activation_lane)
+    }
+
     /// The root currently ACTIVE for unqualified reads on this connection
     /// (set by a default `index_folder`), or `None` when home is active.
     pub(crate) fn activated_root(&self) -> Option<PathBuf> {
         self.active_root.lock().clone()
+    }
+
+    /// Resolve one session-scoped project selector to the canonical root that
+    /// this client has already opened. Resolution mirrors the daemon contract:
+    /// omission selects ACTIVE, explicit project IDs win over display names,
+    /// and a display name is accepted only when it is unique in the working
+    /// set. Unknown or ambiguous selectors return `None`; the daemon remains
+    /// the authority that renders the eventual routing refusal.
+    pub(crate) fn opened_project_for_selector(
+        &self,
+        selector: Option<&str>,
+    ) -> Option<(String, PathBuf, bool)> {
+        let active = self.active_root.lock().clone();
+        let home = self.project_root.clone();
+        let mut projects: Vec<(String, String, PathBuf)> = Vec::new();
+        if let Some(root) = home {
+            projects.push((self.project_id.clone(), self.project_name.clone(), root));
+        }
+        for root in self.opened_roots.lock().iter() {
+            let id = project_key(root);
+            if !projects.iter().any(|(existing, _, _)| existing == &id) {
+                let name = root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                projects.push((id, name, root.clone()));
+            }
+        }
+        if let Some(root) = active {
+            let id = project_key(&root);
+            if !projects.iter().any(|(existing, _, _)| existing == &id) {
+                let name = root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                projects.push((id, name, root));
+            }
+        }
+
+        let selector = selector.filter(|value| !value.trim().is_empty());
+        if selector.is_none() {
+            let active_id = self.active_project_id();
+            return projects
+                .into_iter()
+                .find(|(id, _, _)| id == &active_id)
+                .map(|(id, _, root)| {
+                    let is_home = id == self.project_id;
+                    (id, root, is_home)
+                });
+        }
+        let selector = selector.expect("non-empty selector established above");
+        if let Some((id, _, root)) = projects.iter().find(|(id, _, _)| id == selector) {
+            return Some((id.clone(), root.clone(), id == &self.project_id));
+        }
+
+        let mut name_matches = projects.into_iter().filter(|(_, name, _)| name == selector);
+        let matched = name_matches.next()?;
+        name_matches.next().is_none().then(|| {
+            let is_home = matched.0 == self.project_id;
+            (matched.0, matched.2, is_home)
+        })
+    }
+
+    /// The exact project ID targeted by an omitted selector on this session.
+    pub(crate) fn active_project_id(&self) -> String {
+        self.active_root
+            .lock()
+            .as_deref()
+            .map(project_key)
+            .unwrap_or_else(|| self.project_id.clone())
+    }
+
+    /// Local fallback is valid only while the daemon session still targets the
+    /// immutable adapter HOME project.
+    pub(crate) fn active_project_is_home(&self) -> bool {
+        self.active_project_id() == self.project_id
     }
 
     #[cfg(test)]
@@ -2252,7 +2342,8 @@ impl DaemonSessionClient {
             &self.control_state_dir,
         )
         .await?;
-        let new_client = new_client.with_project_root(project_root.to_path_buf());
+        let mut new_client = new_client.with_project_root(project_root.to_path_buf());
+        new_client.activation_lane = std::sync::Arc::clone(&self.activation_lane);
 
         // Task 8: home is immutable across reconnects — the fresh session
         // must resolve to the SAME deterministic project id, or something
@@ -2378,20 +2469,30 @@ impl DaemonSessionClient {
         // a response header; parse the typed evidence and record it in the
         // per-dispatch slot so the statused wrapper attaches it to `_meta`.
         // Never reconstructed from the text body.
-        if let Some(header) = response
+        let project_evidence = if let Some(header) = response
             .headers()
             .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
-            && let Ok(text) = header.to_str()
-            && let Ok(evidence) =
-                serde_json::from_str::<crate::protocol::result_status::ProjectEvidence>(text)
+            && let Ok(evidence) = serde_json::from_slice::<
+                crate::protocol::result_status::ProjectEvidence,
+            >(header.as_bytes())
         {
-            crate::protocol::result_status::record_project_evidence(evidence);
-        }
+            Some(evidence)
+        } else {
+            None
+        };
 
-        response
+        let body = response
             .text()
             .await
-            .with_context(|| format!("reading daemon tool response for '{tool_name}'"))
+            .with_context(|| format!("reading daemon tool response for '{tool_name}'"))?;
+        // A receipt and its semantic body are one observation. Publish the
+        // receipt only after the body has been read successfully; otherwise a
+        // truncated/failed response could leak target evidence into a local
+        // fallback or a later retry in the same dispatch scope.
+        if let Some(evidence) = project_evidence {
+            crate::protocol::result_status::record_project_evidence(evidence);
+        }
+        Ok(body)
     }
 
     pub async fn heartbeat(&self) -> anyhow::Result<HeartbeatResponse> {
@@ -2451,6 +2552,19 @@ async fn connect_or_spawn_session_at(
     pid: Option<u32>,
     control_state_dir: &ControlStateDir,
 ) -> anyhow::Result<DaemonSessionClient> {
+    // JSON carries project roots as UTF-8 strings. A lossy display string is
+    // not an identity: on Unix two real roots can differ only by invalid bytes
+    // that both render as U+FFFD. Refuse before daemon discovery/spawn rather
+    // than opening one root remotely while retaining another for fallback.
+    let canonical_project_root = project_root
+        .canonicalize()
+        .context("canonicalizing the project root before daemon session open")?;
+    let project_root_text = canonical_project_root.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the canonical project root is not valid UTF-8 and cannot be sent to the daemon without losing identity"
+        )
+    })?;
+    let expected_project_id = project_key(&canonical_project_root);
     let port = ensure_daemon_running_at(control_state_dir).await?;
     let base_url = format!("http://127.0.0.1:{port}");
     let http_client = reqwest::Client::builder()
@@ -2465,7 +2579,7 @@ async fn connect_or_spawn_session_at(
     let open_request = http_client
         .post(format!("{base_url}/v1/sessions/open"))
         .json(&OpenProjectRequest {
-            project_root: project_root.display().to_string(),
+            project_root: project_root_text.to_string(),
             client_name: client_name.to_string(),
             pid,
         });
@@ -2478,6 +2592,11 @@ async fn connect_or_spawn_session_at(
         .json::<OpenProjectResponse>()
         .await
         .context("daemon session open body")?;
+    if opened.project_id != expected_project_id {
+        anyhow::bail!(
+            "daemon opened a project identity that does not match the canonical requested root"
+        );
+    }
 
     // Capture the daemon's boot epoch for descriptor epoch validation.
     // Unauthenticated /health by design; failure is non-fatal (epoch simply
@@ -2494,7 +2613,7 @@ async fn connect_or_spawn_session_at(
         auth_token,
         control_state_dir.clone(),
     )
-    .with_project_root(project_root.to_path_buf())
+    .with_project_root(canonical_project_root)
     .with_daemon_started_at(daemon_started_at))
 }
 
@@ -3080,18 +3199,22 @@ fn daemon_executable_name_matches_current(
     health_name == identity_name
 }
 
-fn daemon_executable_file_name(path: &str) -> Option<String> {
+fn daemon_executable_file_name_for_platform(path: &str, windows: bool) -> Option<String> {
     if path == "unknown" {
         return None;
     }
 
-    let normalized = path.replace('\\', "/");
+    let normalized = normalized_path_text(path, windows);
     let name = normalized.rsplit('/').find(|part| !part.is_empty())?;
-    if cfg!(windows) {
+    if windows {
         Some(name.to_lowercase())
     } else {
         Some(name.to_string())
     }
+}
+
+fn daemon_executable_file_name(path: &str) -> Option<String> {
+    daemon_executable_file_name_for_platform(path, cfg!(windows))
 }
 
 #[cfg(target_os = "linux")]
@@ -3117,13 +3240,17 @@ fn recorded_pid_executable_matches_health(pid: u32, health: &DaemonHealth) -> Op
     )
 }
 
-fn stable_path_identity(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-    if cfg!(windows) {
+fn stable_path_identity_for_platform(path: &str, windows: bool) -> String {
+    let normalized = normalized_path_text(path, windows);
+    if windows {
         normalized.to_lowercase()
     } else {
         normalized
     }
+}
+
+fn stable_path_identity(path: &str) -> String {
+    stable_path_identity_for_platform(path, cfg!(windows))
 }
 
 impl ProjectInstance {
@@ -3886,6 +4013,105 @@ fn connection_surface_from_headers(
         .and_then(|value| value.to_str().ok())
         .and_then(crate::protocol::surface_probe::surface_profile_from_label)
 }
+
+/// Decode routing selectors without serde's permissive unknown-field/default
+/// behavior. The daemon HTTP endpoint is independently callable, so malformed
+/// selector values must be rejected before any ACTIVE/HOME runtime is chosen.
+fn strict_daemon_project_selectors(
+    params: &serde_json::Value,
+) -> Result<(Option<String>, Option<Vec<String>>), String> {
+    let Some(object) = params.as_object() else {
+        return Ok((None, None));
+    };
+    let project = match object.get("project") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(project)) => Some(project.clone()),
+        Some(_) => return Err("project must be a string project id/alias.".to_string()),
+    };
+    let projects = match object.get("projects") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(projects)) => {
+            let mut decoded = Vec::with_capacity(projects.len());
+            for project in projects {
+                let Some(project) = project.as_str() else {
+                    return Err(
+                        "projects entries must all be string project ids/aliases.".to_string()
+                    );
+                };
+                decoded.push(project.to_string());
+            }
+            Some(decoded)
+        }
+        Some(_) => return Err("projects must be an array of project ids/aliases.".to_string()),
+    };
+
+    // Reuse the public selector contract for blank/empty/path/conflict checks.
+    let _ = resolve_targets(project.as_deref(), projects.as_deref(), "<active>")?;
+    if projects
+        .as_deref()
+        .is_some_and(|projects| projects.len() > 1 && projects.iter().any(|project| project == "*"))
+    {
+        return Err(
+            "projects wildcard `*` must be the only entry; do not mix it with explicit projects."
+                .to_string(),
+        );
+    }
+    Ok((project, projects))
+}
+
+/// Adapter-only routing field for active-project tools whose public schema has
+/// no `project` selector. Direct daemon callers may not use it for other tools
+/// or combine it with public selector fields.
+pub(crate) const PRIVATE_PROJECT_ROUTE_PIN: &str = "_symforge_project_route_pin";
+
+pub(crate) fn private_project_routed_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "inspect_match"
+            | "checkpoint_now"
+            | "detect_impact"
+            | "conventions"
+            | "health"
+            | "health_compact"
+            | "status"
+            | "context_inventory"
+    )
+}
+
+fn take_private_project_route_pin(
+    tool_name: &str,
+    params: &mut serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some(object) = params.as_object_mut() else {
+        return Ok(None);
+    };
+    let has_public_selector = object.contains_key("project") || object.contains_key("projects");
+    let Some(pin) = object.remove(PRIVATE_PROJECT_ROUTE_PIN) else {
+        return Ok(None);
+    };
+    if !private_project_routed_tool(tool_name) {
+        return Err(format!(
+            "tool '{tool_name}' does not accept the daemon-private project route pin."
+        ));
+    }
+    if has_public_selector {
+        return Err(
+            "the daemon-private project route pin cannot be combined with `project` or `projects`."
+                .to_string(),
+        );
+    }
+    let serde_json::Value::String(project) = pin else {
+        return Err("the daemon-private project route pin must be a string.".to_string());
+    };
+    if project.trim().is_empty() || project.trim() != project {
+        return Err(
+            "the daemon-private project route pin must be a nonblank canonical project id."
+                .to_string(),
+        );
+    }
+    Ok(Some(project))
+}
+
 async fn call_tool_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
@@ -3894,7 +4120,23 @@ async fn call_tool_handler(
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::response::IntoResponse;
     let _activity = authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
+    let private_project_route_pin = match take_private_project_route_pin(&tool_name, &mut params) {
+        Ok(pin) => pin,
+        Err(message) => {
+            return Ok(format!("Error: project_routing: {message}").into_response());
+        }
+    };
     if tool_name == "index_folder" {
+        if params
+            .as_object()
+            .is_some_and(|object| object.contains_key("project") || object.contains_key("projects"))
+        {
+            return Ok(
+                "Error: project_routing: tool 'index_folder' does not accept `project` or \
+                 `projects`; `path` is the project selection for this operation."
+                    .into_response(),
+            );
+        }
         let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
         let state_for_index = state.clone();
         let session_id_owned = session_id.clone();
@@ -3923,7 +4165,13 @@ async fn call_tool_handler(
             return Ok(message.into_response());
         }
     }
-    if matches!(
+    let (raw_project, raw_projects) = match strict_daemon_project_selectors(&params) {
+        Ok(selectors) => selectors,
+        Err(message) => {
+            return Ok(format!("Error: project_routing: {message}").into_response());
+        }
+    };
+    let cross_project_selector_tool = matches!(
         tool_name.as_str(),
         "search_knowledge"
             | "review_knowledge"
@@ -3931,7 +4179,27 @@ async fn call_tool_handler(
             | "search_text"
             | "search_files"
             | "find_references"
-    ) {
+    );
+    if raw_project.is_some()
+        && !cross_project_selector_tool
+        && !single_project_routed_tool(&tool_name)
+    {
+        return Ok(format!(
+            "Error: project_routing: tool '{tool_name}' does not accept a public `project` \
+             selector."
+        )
+        .into_response());
+    }
+    if raw_projects.is_some() && !cross_project_selector_tool {
+        return Ok(format!(
+            "Error: project_routing: tool '{tool_name}' accepts at most one `project`; \
+             `projects` is supported only by the set-valued discovery tools."
+        )
+        .into_response());
+    }
+    let mut scalar_target_runtime: Option<SessionRuntime> = None;
+    let mut has_explicit_project_set = false;
+    if cross_project_selector_tool {
         let (project, projects) = match tool_name.as_str() {
             "search_knowledge" => {
                 let input =
@@ -3939,7 +4207,7 @@ async fn call_tool_handler(
                 if let Err(message) = crate::protocol::knowledge_search::validate_input(&input) {
                     return Ok(message.into_response());
                 }
-                (input.project, input.projects)
+                (raw_project.clone(), raw_projects.clone())
             }
             "review_knowledge" => {
                 let input =
@@ -3947,7 +4215,7 @@ async fn call_tool_handler(
                 if let Err(message) = crate::protocol::knowledge_review::validate_input(&input) {
                     return Ok(message.into_response());
                 }
-                (input.project, input.projects)
+                (raw_project.clone(), raw_projects.clone())
             }
             // The cross-project code-navigation verbs accept the SAME id/name
             // selectors but carry different input types, and they are
@@ -3961,41 +4229,35 @@ async fn call_tool_handler(
             // typed arm per verb: the write-back below already edits this same
             // object, and the knowledge validation above stays scoped to the
             // knowledge verbs that require it.
-            _ => (
-                params
-                    .get("project")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-                params.get("projects").and_then(|value| {
-                    value.as_array().map(|items| {
-                        items
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                }),
-            ),
+            _ => (raw_project.clone(), raw_projects.clone()),
         };
+
+        if project.is_some() && projects.is_some() {
+            return Ok(
+                "Error: project_routing: project and projects are mutually exclusive: pass \
+                 exactly one (a single id in `project`, or a list/`[\"*\"]` in `projects`)."
+                    .into_response(),
+            );
+        }
+        has_explicit_project_set = projects.is_some();
 
         // `search_knowledge` owns both scalar and set-valued targeting, so it
         // bypasses the single-project route below. Canonicalize every explicit
         // id/name selector through the same session-scoped resolver used by the
         // rest of the daemon before the cross-project dispatcher captures its
         // immutable source set. Wildcard expansion remains session-local.
-        let resolve_selector = |selector: &str| {
-            state
-                .runtime_for_target(&session_id, Some(selector))
-                .map(|runtime| runtime.project_id)
-        };
         if let Some(selector) = project.as_deref() {
-            let project_id = match resolve_selector(selector) {
-                Ok(project_id) => project_id,
+            let target_runtime = match state.runtime_for_target(&session_id, Some(selector)) {
+                Ok(runtime) => runtime,
                 Err(message) if message.starts_with("unknown session") => {
                     return Err((StatusCode::NOT_FOUND, message));
                 }
-                Err(message) => return Ok(message.into_response()),
+                Err(message) => {
+                    return Ok(format!("Error: project_routing: {message}").into_response());
+                }
             };
+            let project_id = target_runtime.project_id.clone();
+            scalar_target_runtime = Some(target_runtime);
             if let Some(object) = params.as_object_mut() {
                 object.insert("project".to_string(), serde_json::Value::String(project_id));
             }
@@ -4004,12 +4266,14 @@ async fn call_tool_handler(
         {
             let mut project_ids = Vec::with_capacity(selectors.len());
             for selector in selectors {
-                let project_id = match resolve_selector(selector) {
-                    Ok(project_id) => project_id,
+                let project_id = match state.runtime_for_target(&session_id, Some(selector)) {
+                    Ok(runtime) => runtime.project_id,
                     Err(message) if message.starts_with("unknown session") => {
                         return Err((StatusCode::NOT_FOUND, message));
                     }
-                    Err(message) => return Ok(message.into_response()),
+                    Err(message) => {
+                        return Ok(format!("Error: project_routing: {message}").into_response());
+                    }
                 };
                 if !project_ids.contains(&project_id) {
                     project_ids.push(project_id);
@@ -4051,10 +4315,21 @@ async fn call_tool_handler(
     // resolve the target runtime through the ONE shared resolver, canonicalize
     // or strip the routing field, and dispatch the existing per-project
     // implementation. Curation retains the canonical explicit selector because
-    // implicit-worktree mutation must fail closed. Omission selects the immutable home. The three cross-project
+    // implicit-worktree mutation must fail closed. Omission selects the session's
+    // ACTIVE project. The three cross-project
     // discovery verbs (search_symbols/search_text/find_references) keep their
     // own `project`/`projects` handling inside `execute_tool_call`.
-    let runtime = if single_project_routed_tool(&tool_name) {
+    let runtime = if let Some(project) = private_project_route_pin.as_deref() {
+        match state.runtime_for_target(&session_id, Some(project)) {
+            Ok(runtime) => runtime,
+            Err(message) if message.starts_with("unknown session") => {
+                return Err((StatusCode::NOT_FOUND, message));
+            }
+            Err(message) => {
+                return Ok(format!("Error: project_routing: {message}").into_response());
+            }
+        }
+    } else if single_project_routed_tool(&tool_name) {
         #[derive(serde::Deserialize)]
         struct ProjectPeek {
             #[serde(default)]
@@ -4073,8 +4348,8 @@ async fn call_tool_handler(
         // before `resolve_targets` could see it, so reject it here.
         if peek.project.is_some() && peek.projects.is_some() {
             return Ok(
-                "project and projects are mutually exclusive: pass exactly one (a single \
-                 id in `project`, or a list/`[\"*\"]` in `projects`)."
+                "Error: project_routing: project and projects are mutually exclusive: pass \
+                 exactly one (a single id in `project`, or a list/`[\"*\"]` in `projects`)."
                     .into_response(),
             );
         }
@@ -4100,7 +4375,9 @@ async fn call_tool_handler(
             // Deterministic routing errors surface as HTTP 200 tool text (same
             // convention as tool errors below) so the MCP client sees the
             // candidates immediately instead of a transport failure.
-            Err(message) => return Ok(message.into_response()),
+            Err(message) => {
+                return Ok(format!("Error: project_routing: {message}").into_response());
+            }
         }
     } else {
         state.session_runtime(&session_id).ok_or_else(|| {
@@ -4122,28 +4399,36 @@ async fn call_tool_handler(
     // the resolved runtime before dispatch. Returned out-of-band as a response
     // header so the human-readable body stays byte-identical; the adapter
     // parses it into the typed receipt and attaches it to `_meta`.
-    let call_evidence_json = {
+    let initial_call_evidence = if has_explicit_project_set {
+        // A set-valued result has no honest single ProjectEvidence identity.
+        // The adapter clears its HOME seed before proxying and will disclose
+        // evidence unavailable until an aggregate receipt schema exists.
+        None
+    } else {
+        let evidence_runtime = scalar_target_runtime.as_ref().unwrap_or(&runtime);
         // T046: one capture. `generation`, `load_source`, the counts, and
         // `index_state` all come off the SAME published bundle — the atomic
         // project-generation counter is not consulted, so the evidence cannot
         // pair a newer generation number with an older publication's counts.
-        let generation = runtime.index.published_generation();
-        serde_json::to_string(&crate::protocol::result_status::ProjectEvidence {
-            project_id: runtime.project_id.clone(),
-            project_name: runtime
+        let generation = evidence_runtime.index.published_generation();
+        Some(crate::protocol::result_status::ProjectEvidence {
+            project_id: evidence_runtime.project_id.clone(),
+            project_name: evidence_runtime
                 .canonical_root
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("project")
                 .to_string(),
-            canonical_root: Some(normalized_path_string(&runtime.canonical_root)),
-            generation: generation.project_generation,
+            canonical_root: Some(normalized_path_string(&evidence_runtime.canonical_root)),
+            // Receipt equality must distinguish ordinary immutable publication
+            // changes; project_generation intentionally stays stable across
+            // content-only publishes.
+            generation: generation.publication_generation,
             index_state: generation.health.status_label().to_string(),
             load_source: generation.live.load_source().label().to_string(),
             index_files: generation.health.file_count,
             index_symbols: generation.health.symbol_count,
         })
-        .ok()
     };
 
     let tool_name_owned = tool_name.clone();
@@ -4159,7 +4444,7 @@ async fn call_tool_handler(
         .governor
         .execute_non_abortable(&tool_name, async move {
             let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 // B2/D12: on the CROSS-PROJECT read path ONLY, lazily refresh each
                 // targeted working-set base if the project's published index has
                 // advanced since intern, BEFORE the search. The gate is shared with
@@ -4176,17 +4461,28 @@ async fn call_tool_handler(
                 {
                     state_for_refresh.refresh_working_set_bases(&runtime.working_set, &targets);
                 }
-                handle.block_on(crate::protocol::surface_probe::with_connection_surface(
-                    connection_surface,
-                    execute_tool_call(runtime, &tool_name_owned, params),
+                handle.block_on(crate::protocol::result_status::with_project_evidence_scope(
+                    initial_call_evidence,
+                    async move {
+                        let result = crate::protocol::surface_probe::with_connection_surface(
+                            connection_surface,
+                            execute_tool_call(runtime, &tool_name_owned, params),
+                        )
+                        .await;
+                        let evidence = crate::protocol::result_status::current_project_evidence();
+                        (result, evidence)
+                    },
                 ))
             })
             .await
-            .map_err(|join_err| anyhow::anyhow!("tool task panicked: {join_err}"))?
+            {
+                Ok(result) => result,
+                Err(join_err) => (Err(anyhow::anyhow!("tool task panicked: {join_err}")), None),
+            }
         })
         .await
     {
-        Ok(Ok(mut result)) => {
+        Ok((Ok(mut result), mut response_evidence)) => {
             // Task 7: `health`/`health_compact` gain the session's open-project
             // inventory once MORE than one project is open. Single-project
             // sessions stay byte-identical.
@@ -4210,7 +4506,11 @@ async fn call_tool_handler(
                 result.push_str(&inventory);
             }
             let mut response = result.into_response();
-            if let Some(json) = call_evidence_json
+            if has_explicit_project_set {
+                response_evidence = None;
+            }
+            if let Some(evidence) = response_evidence
+                && let Ok(json) = serde_json::to_string(&evidence)
                 && let Ok(value) = axum::http::HeaderValue::try_from(json)
             {
                 response.headers_mut().insert(
@@ -4220,7 +4520,7 @@ async fn call_tool_handler(
             }
             Ok(response)
         }
-        Ok(Err(tool_err)) => {
+        Ok((Err(tool_err), _)) => {
             // Tool returned an error — surface it as HTTP 200 so the MCP client
             // gets the message immediately instead of entering reconnect/timeout.
             Ok(format!("Error in {}: {}", tool_name_for_panic, tool_err).into_response())
@@ -4510,8 +4810,7 @@ fn resolve_targets(
                 .to_string(),
         ),
         (Some(id), None) => {
-            let id = id.trim();
-            if id.is_empty() {
+            if id.trim().is_empty() {
                 return Err("project must be a non-empty project id/alias.".to_string());
             }
             // Target keys on project id/alias, NEVER a filesystem path. A path
@@ -4534,21 +4833,21 @@ fn resolve_targets(
                         .to_string(),
                 );
             }
-            // Trim every entry before matching (symmetry with the single `project`
-            // branch, which trims): leading/trailing whitespace must not defeat
-            // the `*` check, the path-separator guard, or id equality.
-            let trimmed: Vec<&str> = list.iter().map(|id| id.trim()).collect();
-            if trimmed.iter().any(|id| id.is_empty()) {
+            // Whitespace-only entries are invalid, but nonblank selector bytes
+            // are identity-bearing. In particular, a trailing space is legal
+            // in a Unix project name and must not retarget another project.
+            let exact: Vec<&str> = list.iter().map(String::as_str).collect();
+            if exact.iter().any(|id| id.trim().is_empty()) {
                 return Err(
                     "projects entries must be non-empty project ids/aliases (blank entry found)."
                         .to_string(),
                 );
             }
-            if trimmed.contains(&"*") {
+            if exact.contains(&"*") {
                 // Any `*` in the list means "all open projects".
                 return Ok(Targets::All);
             }
-            for id in &trimmed {
+            for id in &exact {
                 if id.contains('/') || id.contains('\\') {
                     return Err(format!(
                         "projects entries must be project ids/aliases, not filesystem paths \
@@ -4562,7 +4861,7 @@ fn resolve_targets(
             // same project. `Targets::selects` is membership, so dedup is purely a
             // rendering-honesty fix, not a behavior change.
             let mut seen = std::collections::HashSet::new();
-            let deduped: Vec<String> = trimmed
+            let deduped: Vec<String> = exact
                 .into_iter()
                 .filter(|id| seen.insert(id.to_string()))
                 .map(|id| id.to_string())
@@ -5688,8 +5987,16 @@ pub(crate) fn project_key(root: &Path) -> String {
     crate::discovery::project_id_for_canonical_root(root).0
 }
 
-fn normalized_path_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+pub(crate) fn normalized_path_text(path_text: &str, windows: bool) -> String {
+    if windows {
+        path_text.replace('\\', "/")
+    } else {
+        path_text.to_string()
+    }
+}
+
+pub(crate) fn normalized_path_string(path: &Path) -> String {
+    normalized_path_text(&dunce::simplified(path).to_string_lossy(), cfg!(windows))
 }
 
 fn process_control_state_dir() -> io::Result<&'static ControlStateDir> {
@@ -5915,6 +6222,92 @@ mod tests {
     use tokio::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[test]
+    fn normalized_path_text_treats_backslash_as_separator_only_on_windows() {
+        let path_text = "/tmp/symforge-literal\\component";
+
+        assert_eq!(
+            normalized_path_text(path_text, false),
+            path_text,
+            "Unix path text must preserve a literal backslash"
+        );
+        assert_eq!(
+            normalized_path_text(path_text, true),
+            "/tmp/symforge-literal/component",
+            "Windows path text must retain forward-slash wire compatibility"
+        );
+    }
+
+    #[test]
+    fn executable_identity_preserves_literal_backslash_on_unix_policy() {
+        let literal = "/work/symforge\\helper";
+        let nested = "/work/symforge/helper";
+
+        assert_ne!(
+            stable_path_identity_for_platform(literal, false),
+            stable_path_identity_for_platform(nested, false),
+            "distinct Unix executable paths must not share one stable identity"
+        );
+        assert_ne!(
+            daemon_executable_file_name_for_platform(literal, false),
+            daemon_executable_file_name_for_platform(nested, false),
+            "a Unix backslash remains part of the executable file name"
+        );
+        assert_eq!(
+            stable_path_identity_for_platform(literal, true),
+            stable_path_identity_for_platform(nested, true),
+            "Windows separator compatibility must remain intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalized_path_string_preserves_literal_backslash_components() {
+        let path = Path::new("/tmp/symforge-literal\\component");
+
+        assert_eq!(
+            normalized_path_string(path),
+            path.to_string_lossy(),
+            "a Unix backslash is a filename byte, not a path separator"
+        );
+        assert_ne!(
+            normalized_path_string(path),
+            "/tmp/symforge-literal/component",
+            "distinct Unix roots must not collapse onto one wire identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_session_open_refuses_non_utf8_roots_before_transport() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let parent = TempDir::new().expect("non-UTF-8 project parent");
+        let root = parent
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
+        std::fs::create_dir_all(&root).expect("create non-UTF-8 project root");
+        let control = TempDir::new().expect("isolated daemon control root");
+        // ponytail: match instead of expect_err — DaemonSessionClient has no Debug impl,
+        // and this cfg(unix) body only ever compiles on Linux CI.
+        let error = match connect_or_spawn_session_at(
+            &root,
+            "non-utf8-root-test",
+            Some(std::process::id()),
+            &test_control_state(control.path()),
+        )
+        .await
+        {
+            Ok(_) => panic!("lossy project identity must be refused before daemon discovery"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "the refusal must identify the non-reversible root encoding: {error:#}"
+        );
+    }
 
     /// Every structural-edit surface must be single-project routed. The compact
     /// `symforge_edit` facade was omitted from this list while the legacy edit
@@ -6947,6 +7340,117 @@ mod tests {
 
         // Empty/whitespace project id -> error.
         assert!(resolve_targets(Some("   "), None, active).is_err());
+
+        assert_eq!(
+            resolve_targets(Some("project-other "), None, active).unwrap(),
+            Targets::One("project-other ".to_string()),
+            "nonblank selector bytes are identity-bearing"
+        );
+        assert_eq!(
+            resolve_targets(None, Some(&["project-other ".to_string()]), active).unwrap(),
+            Targets::Subset(vec!["project-other ".to_string()])
+        );
+    }
+
+    #[test]
+    fn strict_daemon_selector_decode_rejects_lossy_or_ambiguous_json() {
+        for malformed in [
+            serde_json::json!({"project": 7}),
+            serde_json::json!({"projects": "project-b"}),
+            serde_json::json!({"projects": ["project-b", 7]}),
+            serde_json::json!({"projects": []}),
+            serde_json::json!({"projects": [""]}),
+            serde_json::json!({"projects": ["*", "project-b"]}),
+            serde_json::json!({"project": "project-a", "projects": ["project-b"]}),
+        ] {
+            assert!(
+                strict_daemon_project_selectors(&malformed).is_err(),
+                "malformed selectors must fail before runtime selection: {malformed}"
+            );
+        }
+
+        assert_eq!(
+            strict_daemon_project_selectors(&serde_json::json!({
+                "project": "project-b "
+            }))
+            .expect("exact scalar selector"),
+            (Some("project-b ".to_string()), None)
+        );
+        assert_eq!(
+            strict_daemon_project_selectors(&serde_json::json!({
+                "projects": ["project-a ", "project-b"]
+            }))
+            .expect("exact set selector"),
+            (
+                None,
+                Some(vec!["project-a ".to_string(), "project-b".to_string()])
+            )
+        );
+    }
+
+    #[test]
+    fn daemon_private_route_pin_is_exact_allowlisted_and_conflict_free() {
+        fn pinned(value: serde_json::Value) -> serde_json::Value {
+            let mut params = serde_json::json!({});
+            params
+                .as_object_mut()
+                .expect("object fixture")
+                .insert(PRIVATE_PROJECT_ROUTE_PIN.to_string(), value);
+            params
+        }
+
+        for tool_name in [
+            "inspect_match",
+            "checkpoint_now",
+            "detect_impact",
+            "conventions",
+            "health",
+            "health_compact",
+            "status",
+            "context_inventory",
+        ] {
+            let mut params = pinned(serde_json::json!("project-active"));
+            assert_eq!(
+                take_private_project_route_pin(tool_name, &mut params)
+                    .expect("allowlisted private route pin"),
+                Some("project-active".to_string())
+            );
+            assert!(
+                params.get(PRIVATE_PROJECT_ROUTE_PIN).is_none(),
+                "the internal marker must be removed before typed decoding"
+            );
+        }
+
+        for (tool_name, mut params) in [
+            ("index_folder", pinned(serde_json::json!("project-active"))),
+            ("inspect_match", pinned(serde_json::json!("   "))),
+            (
+                "inspect_match",
+                pinned(serde_json::json!(" project-active")),
+            ),
+            ("checkpoint_now", pinned(serde_json::json!(7))),
+            ("detect_impact", {
+                let mut params = pinned(serde_json::json!("project-active"));
+                params
+                    .as_object_mut()
+                    .expect("object fixture")
+                    .insert("project".to_string(), serde_json::Value::Null);
+                params
+            }),
+            ("conventions", {
+                let mut params = pinned(serde_json::json!("project-active"));
+                params
+                    .as_object_mut()
+                    .expect("object fixture")
+                    .insert("projects".to_string(), serde_json::json!([]));
+                params
+            }),
+        ] {
+            assert!(
+                take_private_project_route_pin(tool_name, &mut params).is_err(),
+                "invalid private pin must fail closed for {tool_name}: {params}"
+            );
+        }
     }
 
     #[test]
@@ -7190,6 +7694,35 @@ mod tests {
             unknown.contains("not open") && unknown.contains(&opened.project_id),
             "unknown-selector error must list open projects: {unknown}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_selector_resolution_preserves_trailing_space_project_names() {
+        let parent = TempDir::new().expect("parent");
+        let home = parent.path().join("repo");
+        let sibling = parent.path().join("repo ");
+        std::fs::create_dir(&home).expect("home");
+        std::fs::create_dir(&sibling).expect("sibling");
+        let home = home.canonicalize().expect("canonical home");
+        let sibling = sibling.canonicalize().expect("canonical sibling");
+        let home_id = project_key(&home);
+        let sibling_id = project_key(&sibling);
+        let client = DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            home_id,
+            "session-id".to_string(),
+            "repo".to_string(),
+        )
+        .with_project_root(home);
+        client.record_opened_root(sibling.clone());
+
+        let selected = client
+            .opened_project_for_selector(Some("repo "))
+            .expect("exact trailing-space name must resolve");
+        assert_eq!(selected.0, sibling_id);
+        assert_eq!(selected.1, sibling);
+        assert!(!selected.2);
     }
 
     // ── Locked contract — default open ACTIVATES the target, keeps the working set ───
@@ -12449,6 +12982,30 @@ mod tests {
             .await
             .expect("spawn second daemon");
 
+        let stale_client = server
+            .daemon_client
+            .as_ref()
+            .expect("daemon proxy client")
+            .read()
+            .await
+            .clone();
+        let stale_activation_lane = stale_client.activation_lane();
+        crate::protocol::result_status::with_project_evidence_scope(None, async {
+            let reconnected = stale_client
+                .reconnect()
+                .await
+                .expect("direct reconnect probe");
+            assert!(
+                std::sync::Arc::ptr_eq(&stale_activation_lane, &reconnected.activation_lane()),
+                "a reconnect replacement must retain the connection's activation lane"
+            );
+            assert!(
+                crate::protocol::result_status::current_project_evidence().is_none(),
+                "reconnect housekeeping receipts must not escape into the next user call"
+            );
+        })
+        .await;
+
         // A routed read through the stale proxy: the first attempt fails, the
         // reconnect discovers the replacement, reopens home + B, verifies ids,
         // and the retry serves B.
@@ -12586,7 +13143,7 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
         let project_a = project_dir("symforge-receipt-home-a");
-        let project_b = project_dir("symforge-receipt-open-b");
+        let project_b = project_dir("symforge-receipt-open-é");
         std::fs::write(
             project_a.path().join("src").join("old.rs"),
             "fn old_fn() {}\n",
@@ -12663,12 +13220,11 @@ mod tests {
                 let header = response
                     .headers()
                     .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
-                    .expect("evidence header must be present")
-                    .to_str()
-                    .expect("evidence header must be ASCII")
-                    .to_string();
-                serde_json::from_str::<crate::protocol::result_status::ProjectEvidence>(&header)
-                    .expect("evidence header must parse as typed evidence")
+                    .expect("evidence header must be present");
+                serde_json::from_slice::<crate::protocol::result_status::ProjectEvidence>(
+                    header.as_bytes(),
+                )
+                .expect("evidence header must parse as typed evidence")
             }
         };
 
@@ -12687,6 +13243,79 @@ mod tests {
         assert_eq!(
             routed_evidence.project_id, project_b_id,
             "explicit project must be attested by the routed sibling"
+        );
+
+        let response = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_text",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "new_fn",
+                "project": project_b_id,
+            }))
+            .send()
+            .await
+            .expect("cross-project search request")
+            .error_for_status()
+            .expect("cross-project search status");
+        let header = response
+            .headers()
+            .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+            .expect("cross-project search evidence header");
+        let search_evidence = serde_json::from_slice::<
+            crate::protocol::result_status::ProjectEvidence,
+        >(header.as_bytes())
+        .expect("cross-project search evidence parses");
+        let body = response.text().await.expect("cross-project search body");
+        assert!(
+            body.contains("new_fn") && !body.contains("old_fn"),
+            "scalar search body must come from project B: {body}"
+        );
+        assert_eq!(
+            search_evidence.project_id, project_b_id,
+            "scalar cross-project body and receipt must identify the same project"
+        );
+
+        // Exercise the actual adapter parser, not only raw reqwest header
+        // access. The unicode project root is valid UTF-8 JSON but is not a
+        // `HeaderValue::to_str()` ASCII value.
+        let proxy = DaemonSessionClient::new_for_test_at(
+            base_url,
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        );
+        let (proxied_body, proxied_evidence) =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let body = proxy
+                    .call_tool_value(
+                        "search_text",
+                        serde_json::json!({
+                            "query": "new_fn",
+                            "project": project_b_id,
+                        }),
+                    )
+                    .await
+                    .expect("proxied unicode-project search");
+                let evidence = crate::protocol::result_status::current_project_evidence();
+                (body, evidence)
+            })
+            .await;
+        assert!(
+            proxied_body.contains("new_fn"),
+            "proxied body: {proxied_body}"
+        );
+        let proxied_evidence =
+            proxied_evidence.expect("unicode project receipt must survive adapter parsing");
+        assert_eq!(proxied_evidence.project_id, project_b_id);
+        assert!(
+            proxied_evidence
+                .canonical_root
+                .as_deref()
+                .is_some_and(|root| root.contains('é')),
+            "unicode canonical root must remain byte-exact: {proxied_evidence:?}"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -13875,7 +14504,7 @@ mod tests {
     /// Opening another project must not move connection-scoped surfaces away
     /// from the immutable home project.
     #[tokio::test]
-    async fn test_index_folder_open_preserves_home_in_status_and_symforge_surfaces() {
+    async fn test_index_folder_activation_keeps_status_home_but_routes_facade_to_active_project() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -13962,6 +14591,14 @@ mod tests {
 
         // (b) `status` (local render path) still reflects home A.
         let root_b_norm = project_b.path().display().to_string().replace('\\', "/");
+        let root_b_canonical = project_b
+            .path()
+            .canonicalize()
+            .expect("canonical project B root");
+        let root_b_receipt = dunce::simplified(&root_b_canonical)
+            .display()
+            .to_string()
+            .replace('\\', "/");
         let status_after =
             server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
         assert!(
@@ -13973,14 +14610,58 @@ mod tests {
             "opened B must not replace home A in status, got:\n{status_after}"
         );
 
-        // (c) the `symforge` facade envelope carries the same home root.
+        // The adapter-private route pin is what lets selector-less tools keep
+        // the ACTIVE snapshot they captured before dispatch. Prove the daemon
+        // consumes it as a real target selector by routing `conventions` back
+        // to home A while session ACTIVE remains B.
+        let direct_client = server
+            .daemon_client_slot()
+            .expect("daemon client slot")
+            .read()
+            .await
+            .clone();
+        let mut private_home_args = serde_json::json!({});
+        private_home_args
+            .as_object_mut()
+            .expect("private route args")
+            .insert(
+                PRIVATE_PROJECT_ROUTE_PIN.to_string(),
+                serde_json::Value::String(opened.project_id.clone()),
+            );
+        let private_home_evidence =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let body = direct_client
+                    .call_tool_value("conventions", private_home_args)
+                    .await
+                    .expect("private-pinned conventions response");
+                assert!(body.contains("Project Conventions"), "{body}");
+                crate::protocol::result_status::current_project_evidence()
+            })
+            .await
+            .expect("private-pinned call must carry project evidence");
+        assert_eq!(private_home_evidence.project_id, opened.project_id);
+        assert_eq!(
+            private_home_evidence.canonical_root.as_deref(),
+            Some(root_a_norm.as_str()),
+            "the private route pin must override mutable daemon ACTIVE"
+        );
+
+        // (c) unqualified facade calls follow the daemon session's ACTIVE
+        // project. Adapter-local status remains home-scoped, but the served
+        // body, facade root line, and typed receipt must all describe B.
         // `SymforgeCallInput` flattens the `StelRequest`, so `query` is top-level.
         let symforge_input = serde_json::from_value(serde_json::json!({
             "query": "find beta_symbol"
         }))
         .expect("symforge facade input");
-        let symforge_result = server
-            .symforge_facade_tool(Parameters(symforge_input))
+        let symforge_result =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let mut result = server
+                    .symforge_facade_tool(Parameters(symforge_input))
+                    .await?;
+                crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+                Ok::<_, rmcp::ErrorData>(result)
+            })
             .await
             .expect("symforge facade dispatch");
         let serialized = serde_json::to_value(&symforge_result).expect("serialize symforge result");
@@ -13989,8 +14670,137 @@ mod tests {
             .expect("symforge result text")
             .to_string();
         assert!(
-            symforge_body.contains(&format!("project_root: {root_a_norm}")),
-            "symforge envelope must preserve home project A, got:\n{symforge_body}"
+            symforge_body.contains("beta_symbol"),
+            "unqualified facade body must be served from active project B, got:\n{symforge_body}"
+        );
+        assert!(
+            !symforge_body.contains("alpha_symbol"),
+            "unqualified facade body must not mix home project A, got:\n{symforge_body}"
+        );
+        assert!(
+            symforge_body.contains(&format!("project_root: {root_b_receipt}")),
+            "unqualified facade root line must name active project B, got:\n{symforge_body}"
+        );
+        assert!(
+            !symforge_body.contains(&format!("project_root: {root_a_norm}")),
+            "unqualified facade root line must not name home project A, got:\n{symforge_body}"
+        );
+        assert_eq!(
+            serialized["_meta"]["symforge/project_evidence"]["canonical_root"], root_b_receipt,
+            "typed facade evidence must name the active daemon project: {serialized}"
+        );
+
+        // Pin an explicit B selector and choose a path that would resolve inside
+        // HOME A but outside selected B. This makes the adapter preflight
+        // mutation-sensitive: validating against A, skipping the guard, or
+        // relying only on the downstream primitive cannot produce the required
+        // selected-B-root refusal text.
+        let project_a_name = project_a
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("project A basename");
+        let a_inside_b_escape = format!("../{project_a_name}/src/lib.rs");
+        let escaped_input = crate::stel::SymforgeCallInput {
+            request: crate::stel::StelRequest {
+                query: "read the selected file".to_string(),
+                intent: Some(crate::stel::IntentBucket::Read),
+                path: Some(a_inside_b_escape),
+                project: Some(project_key(&root_b_canonical)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let escaped_result =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let mut result = server
+                    .symforge_facade_tool(Parameters(escaped_input))
+                    .await?;
+                crate::protocol::result_status::attach_project_evidence_meta(&mut result.meta);
+                Ok::<_, rmcp::ErrorData>(result)
+            })
+            .await
+            .expect("active-project path containment result");
+        let escaped = serde_json::to_value(&escaped_result).expect("serialize path refusal");
+        let escaped_body = escaped["content"][0]["text"]
+            .as_str()
+            .expect("path refusal text");
+        assert_eq!(
+            escaped["_meta"]["symforge/result_status"]["outcome_class"], "invalid_request",
+            "the selected primitive must type the containment refusal: {escaped}"
+        );
+        assert!(
+            escaped_body.contains("Path is outside the repository root")
+                && escaped_body.contains(&format!("The selected project root is {root_b_receipt}")),
+            "the active daemon project must reject a path escape: {escaped_body}"
+        );
+        assert!(
+            !escaped_body.contains(&root_a_norm)
+                && !escaped_body.contains("alpha_symbol")
+                && !escaped_body.contains("beta_symbol"),
+            "a rejected path must not serve source from either project: {escaped_body}"
+        );
+
+        // Real daemon routing refusals must retain a shared error prefix so a
+        // direct public wrapper cannot classify a headerless refusal as Found.
+        let unknown_input: GetFileContentInput = serde_json::from_value(serde_json::json!({
+            "path": "src/lib.rs",
+            "project": "not-an-open-project",
+        }))
+        .expect("unknown-project file input");
+        let unknown_result = server
+            .get_file_content_tool(Parameters(unknown_input))
+            .await
+            .expect("unknown-project file result");
+        let unknown = serde_json::to_value(unknown_result).expect("serialize routing refusal");
+        assert_eq!(
+            unknown["_meta"]["symforge/result_status"]["outcome_class"], "invalid_request",
+            "a daemon routing refusal must never look Found: {unknown}"
+        );
+        assert!(
+            unknown["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Error: project_routing:")),
+            "daemon routing refusal must use the shared error prefix: {unknown}"
+        );
+
+        // The daemon HTTP route is independently callable. A structural edit
+        // must not drop a malformed/set-valued selector and mutate ACTIVE B.
+        let edit_url = format!(
+            "{base_url}/v1/sessions/{}/tools/edit_within_symbol",
+            opened.session_id
+        );
+        for projects in [
+            serde_json::json!([project_key(&root_b_canonical)]),
+            serde_json::json!([project_key(&root_b_canonical), 7]),
+        ] {
+            let refused = http
+                .post(&edit_url)
+                .json(&serde_json::json!({
+                    "path": "src/lib.rs",
+                    "name": "beta_symbol",
+                    "old_text": "{ 2 }",
+                    "new_text": "{ 9 }",
+                    "projects": projects,
+                }))
+                .send()
+                .await
+                .expect("malformed edit selector request")
+                .error_for_status()
+                .expect("malformed edit selector status")
+                .text()
+                .await
+                .expect("malformed edit selector body");
+            assert!(
+                refused.starts_with("Error: project_routing:"),
+                "unsupported/malformed edit selectors must refuse before dispatch: {refused}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(project_b.path().join("src").join("lib.rs"))
+                .expect("read B after refused edits"),
+            "pub fn beta_symbol() -> u32 { 2 }\n",
+            "a rejected set-valued edit must leave ACTIVE B byte-identical"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -14413,11 +15223,36 @@ mod tests {
             .await
             .expect("open body");
 
+        let before_response = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("pre-impact health request")
+            .error_for_status()
+            .expect("pre-impact health status");
+        let before_evidence: crate::protocol::result_status::ProjectEvidence =
+            serde_json::from_slice(
+                before_response
+                    .headers()
+                    .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+                    .expect("pre-impact evidence header")
+                    .as_bytes(),
+            )
+            .expect("decode pre-impact evidence");
+        let _ = before_response
+            .text()
+            .await
+            .expect("pre-impact health body");
+
         std::fs::write(&source_path, "pub fn new_name() {}\n").expect("write updated source");
 
         let _cwd_guard = CwdGuard::set(outside.path());
 
-        let impact = client
+        let impact_response = client
             .post(format!(
                 "{base_url}/v1/sessions/{}/tools/analyze_file_impact",
                 opened.session_id
@@ -14429,14 +15264,127 @@ mod tests {
             .await
             .expect("impact request")
             .error_for_status()
-            .expect("impact status")
-            .text()
-            .await
-            .expect("impact body");
+            .expect("impact status");
+        let impact_evidence: crate::protocol::result_status::ProjectEvidence =
+            serde_json::from_slice(
+                impact_response
+                    .headers()
+                    .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+                    .expect("impact evidence header")
+                    .as_bytes(),
+            )
+            .expect("decode impact evidence");
+        let impact = impact_response.text().await.expect("impact body");
 
         assert!(
             impact.contains("new_name"),
             "impact analysis should read from the session project root, got: {impact}"
+        );
+        assert!(
+            impact_evidence.generation > before_evidence.generation,
+            "the daemon receipt must come from the publication rendered by impact: before={before_evidence:?}, impact={impact_evidence:?}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn direct_daemon_rejects_unsupported_selectors_before_project_mutation() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-daemon-selector-a");
+        let project_b = project_dir("symforge-daemon-selector-b");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "selector-guard".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let illegal_open = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "path": project_b.path().display().to_string(),
+                "project": opened.project_id.clone(),
+            }))
+            .send()
+            .await
+            .expect("selector-bearing index request")
+            .error_for_status()
+            .expect("selector-bearing index status")
+            .text()
+            .await
+            .expect("selector-bearing index body");
+        assert!(
+            illegal_open.starts_with("Error: project_routing:"),
+            "index_folder must reject selectors before opening or activating: {illegal_open}"
+        );
+
+        let inventory = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/status",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({"detail": "projects"}))
+            .send()
+            .await
+            .expect("project inventory request")
+            .error_for_status()
+            .expect("project inventory status")
+            .text()
+            .await
+            .expect("project inventory body");
+        let project_b_id = project_key(
+            &project_b
+                .path()
+                .canonicalize()
+                .expect("canonical project B root"),
+        );
+        assert!(
+            !inventory.contains(&project_b_id),
+            "rejected index_folder must leave project B unopened: {inventory}"
+        );
+
+        let illegal_checkpoint = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/checkpoint_now",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({"project": project_b_id}))
+            .send()
+            .await
+            .expect("selector-bearing checkpoint request")
+            .error_for_status()
+            .expect("selector-bearing checkpoint status")
+            .text()
+            .await
+            .expect("selector-bearing checkpoint body");
+        assert!(
+            illegal_checkpoint.starts_with("Error: project_routing:"),
+            "checkpoint_now must refuse an unsupported scalar selector: {illegal_checkpoint}"
         );
 
         let _ = handle.shutdown_tx.send(());

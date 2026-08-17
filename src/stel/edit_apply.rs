@@ -100,7 +100,7 @@ pub fn run_pre_apply_gates(
         }
     }
 
-    let path = request.path.trim();
+    let path = request.path.as_str();
     let name = request.symbol.as_deref().unwrap_or("").trim();
     let file = guard
         .capture_shared_file(path)

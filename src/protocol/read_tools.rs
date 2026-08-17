@@ -260,7 +260,7 @@ where
 pub struct GetSymbolInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -324,7 +324,7 @@ pub struct SymbolTarget {
 pub struct GetFileContentInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -402,7 +402,7 @@ pub struct SymforgeRetrieveInput {
 pub(crate) struct ValidateFileSyntaxInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -414,7 +414,7 @@ pub(crate) struct ValidateFileSyntaxInput {
 pub struct FindDependentsInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -453,7 +453,7 @@ pub struct FindDependentsInput {
 pub struct GetRepoMapInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -481,7 +481,7 @@ pub struct GetRepoMapInput {
 pub struct GetFileContextInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
@@ -539,7 +539,7 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
 pub struct GetSymbolContextInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
-    /// session's home project. Local/embedded servers are bound to one project
+    /// session's active project. Local/embedded servers are bound to one project
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,

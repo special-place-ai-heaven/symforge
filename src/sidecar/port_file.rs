@@ -161,6 +161,10 @@ pub struct SessionDescriptor {
     pub session_id: Option<String>,
     /// The project root this adapter serves, for identity validation.
     pub project_root: Option<String>,
+    /// Native-safe identity derived from the canonical root. Old descriptors
+    /// deserialize with `None` but are rejected by root-scoped selection.
+    #[serde(default)]
+    pub project_id: Option<String>,
     /// Boot epoch of the daemon this adapter's session belongs to (10.1+).
     /// Selection rejects a descriptor whose epoch differs from the live
     /// daemon's /health epoch — a stale record must not alias an unrelated
@@ -185,9 +189,21 @@ pub(crate) fn write_descriptor_for_pid_at(
 ) -> io::Result<()> {
     let sessions = dir.join(SESSIONS_DIR);
     std::fs::create_dir_all(&sessions)?;
+    let project_id = project_root.map(crate::daemon::project_key);
+    let project_root = project_root
+        .map(|root| {
+            root.to_str().map(str::to_string).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sidecar project root is not valid UTF-8",
+                )
+            })
+        })
+        .transpose()?;
     let descriptor = SessionDescriptor {
         session_id: session_id.map(str::to_string),
-        project_root: project_root.map(|root| root.display().to_string()),
+        project_root,
+        project_id,
         daemon_started_at,
         pid,
         port,
@@ -319,16 +335,39 @@ fn select_descriptor_status(
 ) -> Option<SelectedSidecar> {
     let scan_started = Instant::now();
     prune_dead_descriptor_files_at(dir);
-    let expected_root = expected_project_root.map(|root| root.display().to_string());
+    let expected_identity = match expected_project_root {
+        Some(root) => match root.to_str() {
+            Some(root_text) => Some((crate::daemon::project_key(root), root_text.to_string())),
+            None => {
+                return Some(SelectedSidecar {
+                    status: SidecarStatus {
+                        pid: None,
+                        port: None,
+                        liveness: SidecarLiveness::NoSidecar,
+                        detail: Some(
+                            "sidecar selection refused: project root is not valid UTF-8"
+                                .to_string(),
+                        ),
+                    },
+                    session_id: None,
+                });
+            }
+        },
+        None => None,
+    };
     let mut candidates = Vec::new();
     let mut rejected = 0usize;
     for descriptor in read_descriptors_at(dir) {
-        if let (Some(declared), Some(expected)) =
-            (descriptor.project_root.as_deref(), expected_root.as_deref())
-            && !same_root_identity(declared, expected)
-        {
-            rejected += 1;
-            continue;
+        if let Some((expected_id, expected_root)) = expected_identity.as_ref() {
+            let matches = descriptor.project_id.as_deref() == Some(expected_id.as_str())
+                && descriptor
+                    .project_root
+                    .as_deref()
+                    .is_some_and(|declared| same_root_identity(declared, expected_root));
+            if !matches {
+                rejected += 1;
+                continue;
+            }
         }
         if !process_may_be_alive(descriptor.pid) {
             continue;
@@ -541,8 +580,12 @@ fn same_root_identity(a: &str, b: &str) -> bool {
     canon_root_identity(a) == canon_root_identity(b)
 }
 
-fn canon_root_identity(raw: &str) -> String {
-    let normalized = raw.replace('\\', "/");
+fn canon_root_identity_for_platform(raw: &str, windows: bool) -> String {
+    if !windows {
+        return raw.trim_end_matches('/').to_string();
+    }
+
+    let normalized = crate::daemon::normalized_path_text(raw, true);
     let stripped = if let Some(rest) = strip_ascii_prefix_ci(&normalized, "//?/unc/") {
         format!("//{rest}")
     } else if let Some(rest) = strip_ascii_prefix_ci(&normalized, "//?/") {
@@ -551,11 +594,11 @@ fn canon_root_identity(raw: &str) -> String {
         normalized
     };
     let trimmed = stripped.trim_end_matches('/');
-    if cfg!(windows) {
-        trimmed.to_lowercase()
-    } else {
-        trimmed.to_string()
-    }
+    trimmed.to_lowercase()
+}
+
+fn canon_root_identity(raw: &str) -> String {
+    canon_root_identity_for_platform(raw, cfg!(windows))
 }
 
 fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -646,6 +689,17 @@ fn read_sidecar_status_for_root_at(
     {
         return selected.status;
     }
+    if expected_project_root.is_some() {
+        return SidecarStatus {
+            pid: None,
+            port: None,
+            liveness: SidecarLiveness::NoSidecar,
+            detail: Some(
+                "root-scoped sidecar lookup refused legacy fixed files without project identity"
+                    .to_string(),
+            ),
+        };
+    }
     if !sidecar_files_exist(symforge_dir) {
         return SidecarStatus::no_sidecar();
     }
@@ -733,6 +787,13 @@ pub fn read_sidecar_endpoint(
         }
     }
 
+    if expected_project_root.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "root-scoped sidecar lookup refused legacy fixed files without project identity",
+        ));
+    }
+
     let port = read_port_at(&dir)?;
     let session_id = read_runtime_file(&dir, &session_file_name(), LEGACY_SESSION_FILE)
         .ok()
@@ -802,26 +863,122 @@ mod tests {
     fn same_root_identity_strips_windows_verbatim_prefix() {
         let plain = r"C:\AI_STUFF\PROGRAMMING\symforge";
         assert!(
-            same_root_identity(r"\\?\C:\AI_STUFF\PROGRAMMING\symforge", plain),
+            canon_root_identity_for_platform(r"\\?\C:\AI_STUFF\PROGRAMMING\symforge", true,)
+                == canon_root_identity_for_platform(plain, true),
             "backslash verbatim prefix must match the plain root"
         );
         assert!(
-            same_root_identity(
-                "//?/C:/AI_STUFF/PROGRAMMING/symforge",
-                "C:/AI_STUFF/PROGRAMMING/symforge",
-            ),
+            canon_root_identity_for_platform("//?/C:/AI_STUFF/PROGRAMMING/symforge", true,)
+                == canon_root_identity_for_platform("C:/AI_STUFF/PROGRAMMING/symforge", true,),
             "slash-unified verbatim prefix (health project_root form) must match"
         );
         assert!(
-            same_root_identity(
-                r"\\?\C:\AI_STUFF\PROGRAMMING\symforge",
-                "C:/AI_STUFF/PROGRAMMING/symforge"
-            ),
+            canon_root_identity_for_platform(r"\\?\C:\AI_STUFF\PROGRAMMING\symforge", true,)
+                == canon_root_identity_for_platform("C:/AI_STUFF/PROGRAMMING/symforge", true,),
             "mixed separators after stripping the prefix must match"
         );
         assert!(
-            !same_root_identity(r"\\?\C:\other", plain),
+            canon_root_identity_for_platform(r"\\?\C:\other", true)
+                != canon_root_identity_for_platform(plain, true),
             "verbatim prefix must not collapse distinct roots"
+        );
+    }
+
+    #[test]
+    fn sidecar_root_identity_preserves_literal_backslash_on_unix_policy() {
+        let literal = "/work/a\\b";
+        let nested = "/work/a/b";
+
+        assert_ne!(
+            canon_root_identity_for_platform(literal, false),
+            canon_root_identity_for_platform(nested, false),
+            "distinct Unix roots must not admit the same sidecar descriptor"
+        );
+        assert_eq!(
+            canon_root_identity_for_platform(literal, true),
+            canon_root_identity_for_platform(nested, true),
+            "Windows separator compatibility must remain intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_authority_refuses_non_utf8_project_roots() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let control = tempfile::tempdir().expect("control dir");
+        let native_root = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
+        let error =
+            write_descriptor_for_pid_at(control.path(), 42, 31337, None, Some(&native_root), None)
+                .expect_err("an opaque native root cannot be serialized as authority");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let selected = select_descriptor_status(control.path(), "127.0.0.1", Some(&native_root))
+            .expect("non-UTF-8 selection must block legacy fallback");
+        assert_eq!(selected.status.liveness, SidecarLiveness::NoSidecar);
+        assert!(
+            selected
+                .status
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("not valid UTF-8"))
+        );
+    }
+
+    #[test]
+    fn root_scoped_lookup_rejects_legacy_descriptor_without_project_id() {
+        let control = tempfile::tempdir().expect("control dir");
+        let project = tempfile::tempdir().expect("project root");
+        let sessions = control.path().join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions).expect("sessions dir");
+        let descriptor = SessionDescriptor {
+            session_id: None,
+            project_root: Some(project.path().display().to_string()),
+            project_id: None,
+            daemon_started_at: None,
+            pid: std::process::id(),
+            port: 31337,
+            updated_at_unix_secs: now_unix_secs(),
+        };
+        std::fs::write(
+            sessions.join(descriptor_file_name(descriptor.pid)),
+            serde_json::to_vec(&descriptor).expect("serialize legacy descriptor"),
+        )
+        .expect("write legacy descriptor");
+
+        let selected = select_descriptor_status(control.path(), "127.0.0.1", Some(project.path()))
+            .expect("the rejected descriptor must block legacy fallback");
+        assert_eq!(selected.status.liveness, SidecarLiveness::NoSidecar);
+        assert!(selected.status.port.is_none());
+        assert!(
+            selected
+                .status
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("identity mismatch"))
+        );
+    }
+
+    #[test]
+    fn root_scoped_lookup_never_uses_unscoped_legacy_fixed_files() {
+        let control = tempfile::tempdir().expect("control dir");
+        let project = tempfile::tempdir().expect("project root");
+        std::fs::write(control.path().join(port_file_name()), "31337").expect("legacy port file");
+        std::fs::write(
+            control.path().join(pid_file_name()),
+            std::process::id().to_string(),
+        )
+        .expect("legacy pid file");
+
+        let status =
+            read_sidecar_status_for_root_at(control.path(), "127.0.0.1", Some(project.path()));
+        assert_eq!(status.liveness, SidecarLiveness::NoSidecar);
+        assert!(status.port.is_none());
+        assert!(
+            status
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("legacy fixed files"))
         );
     }
 
@@ -902,6 +1059,7 @@ mod tests {
     fn test_reader_selects_live_descriptor_and_rejects_foreign_root() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
+        let project_root = dir.parent().expect("temporary control dir has a parent");
         {
             // A live port: keep the listener open for the duration.
             let listener =
@@ -915,14 +1073,14 @@ mod tests {
             let live_pid = std::process::id();
             let dead_pid = u32::MAX;
 
-            write_descriptor_for_pid_at(dir, live_pid, live_port, None, None, None)
+            write_descriptor_for_pid_at(dir, live_pid, live_port, None, Some(project_root), None)
                 .expect("write live descriptor");
-            write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, None, None)
+            write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, Some(project_root), None)
                 .expect("write dead descriptor");
             // The dead one is FRESHER (rewrite bumps updated_at); force order by
             // rewriting it after the live one.
             std::thread::sleep(std::time::Duration::from_millis(1100));
-            write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, None, None)
+            write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, Some(project_root), None)
                 .expect("refresh dead descriptor");
 
             let status = read_sidecar_status_at(dir, "127.0.0.1");
@@ -966,6 +1124,7 @@ mod tests {
     fn test_daemon_backed_descriptor_requires_matching_boot_epoch() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
+        let project_root = dir.parent().expect("temporary control dir has a parent");
 
         // Minimal HTTP fake: fixed 200 + DaemonHealth JSON body.
         fn spawn_health_daemon(epoch: Option<u64>) -> u16 {
@@ -1001,16 +1160,30 @@ mod tests {
         let pid = std::process::id();
 
         // Matching epoch: selected.
-        write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), None, Some(1_700_000_000))
-            .expect("write matching descriptor");
+        write_descriptor_for_pid_at(
+            dir,
+            pid,
+            port,
+            Some("session-7"),
+            Some(project_root),
+            Some(1_700_000_000),
+        )
+        .expect("write matching descriptor");
         let status = read_sidecar_status_at(dir, "127.0.0.1");
         assert_eq!(status.liveness, SidecarLiveness::Alive);
         assert_eq!(status.port, Some(port), "matching epoch must select");
 
         // Stale epoch (descriptor written against the PREVIOUS daemon boot):
         // rejected even though the port is alive and serves 200.
-        write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), None, Some(1_600_000_000))
-            .expect("write stale-epoch descriptor");
+        write_descriptor_for_pid_at(
+            dir,
+            pid,
+            port,
+            Some("session-7"),
+            Some(project_root),
+            Some(1_600_000_000),
+        )
+        .expect("write stale-epoch descriptor");
         let status = read_sidecar_status_at(dir, "127.0.0.1");
         assert_ne!(
             status.liveness,
@@ -1028,7 +1201,7 @@ mod tests {
 
         // Legacy descriptor (no epoch) against a NEW daemon (epoch present):
         // rejected — this is the exact aliasing case from the incident.
-        write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), None, None)
+        write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), Some(project_root), None)
             .expect("write legacy descriptor");
         let status = read_sidecar_status_at(dir, "127.0.0.1");
         assert_ne!(
