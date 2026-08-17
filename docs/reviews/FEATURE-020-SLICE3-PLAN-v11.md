@@ -27,9 +27,9 @@ does not activate V11 authority.
 | T047 dark runtime | landed (PR 3, squashed as 6d1c58df) |
 | T048 dark public API + export delta | landed (PR 3, squashed as 6d1c58df) |
 | T049 AAP migration receipt | landed (PR 3, squashed as 6d1c58df) |
-| T050 activation-cut matrix | historically landed; reopened by Round 3, current exact 116-slot overlay plus 16 source-free mode residuals have their focused controls, adversarial mutations, and final gates observed and await the non-closure commit and fresh review |
-| T051 dark unreachability | historically landed (PR 3); reopened by Round 3, layered lexical + narrow-call-surface + whole-source guard has its frozen source pin, observed macro/alias mutation, and final gates observed and awaits the non-closure commit and fresh review |
-| T052 gates + adversarial review | in progress (PR 4, unpushed) — A-019 relay containment, compact-facade selector containment, T050/T051 repairs, harness hardening, required mutations, and candidate gates are implemented and observed; the non-closure commit and fresh review remain before closure |
+| T050 activation-cut matrix | closed at the reviewed candidate — the exact 116-slot overlay plus 16 source-free mode residuals have their focused controls, adversarial mutations, final gates, non-closure commits, and adjudicated fresh reviews recorded in evidence |
+| T051 dark unreachability | closed at the reviewed candidate — the layered lexical + narrow-call-surface + whole-source guard has its frozen source pin, observed macro/alias mutation, final gates, non-closure commits, and adjudicated fresh reviews recorded in evidence |
+| T052 gates + adversarial review | closed at the evidence/ledger closure commit — external Round-1 reviews adjudicated (C1 MAJOR repaired with mutation-verified regressions, C2/C3 MINORs repaired), Round-2 and Round-3 fresh reviews returned zero code findings with every documentation finding repaired as prescribed; the branch is pushed and awaits the PR 4 merge to `main` |
 
 Entry state, verified at `10e036b5` (not inherited):
 
@@ -461,14 +461,16 @@ all-sidecar-error runs as "no sidecar found"; one stale predicate-name comment),
 and one false positive. The repairs were made test-first with RED witnesses and
 mutation-sensitivity checks. A Round-2 fresh four-lens review of the committed
 repair candidate returned CLEAN on both code lenses and three MINOR
-documentation/test-coverage findings, all repaired in the current tree: a third
+documentation/test-coverage findings, all repaired and committed: a third
 formatter control pinning the mixed sidecar quadrant, and two evidence-document
-corrections. The five new library tests raise the library target from 3,215 to
-3,220. The current tree is the repaired candidate, deliberately
-**in progress / non-closure**. Every candidate gate below has been re-observed on
-the repaired frozen source. Only the new joint non-closure commit and fresh
-review remain pending. Historical green rows in the evidence document cannot
-satisfy these obligations for changed source or harness bytes.
+corrections. A Round-3 compact fresh review of that repair delta returned
+delta-audit CLEAN and one MINOR evidence-count correction, applied in the
+closure commit. The five new library tests raise the library target from 3,215
+to 3,220. Every candidate gate below was re-observed on the repaired frozen
+source; the non-closure commits and adjudicated fresh reviews are recorded in
+the evidence checklist. The remaining step for Slice 3 is the PR 4 merge to
+`main`. Historical green rows in the evidence document cannot satisfy these
+obligations for changed source or harness bytes.
 
 | Candidate obligation | Required result before the non-closure commit |
 |---|---|
