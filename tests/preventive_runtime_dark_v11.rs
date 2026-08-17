@@ -802,7 +802,7 @@ const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "1a366446a9f9b344ff9c78ebb1fd9585c71eaba95d06a8049a1a57d0b1c3bbb8",
+    "78f32c8921a1c1878fc13c29aed8775914d6beb1dfeb878048e5fb9166f67bcb",
     187,
     8_980_758,
 );

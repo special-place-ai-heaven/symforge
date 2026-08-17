@@ -499,7 +499,7 @@ repairs.
 
 | Required evidence | Binding command or observation | Current status |
 |---|---|---|
-| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `3dbd19b231c62d4bd19d81918ed357fea3156e9ed1508d62f5f444da071b8ef1` / 187 files / 8,980,190 LF-normalized bytes, held by `FULL_SOURCE_PIN_V1` after the post-closure CI repair below; includes the Round-2 mixed-quadrant formatter control. Any later `src/` edit invalidates this row. |
+| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `78f32c8921a1c1878fc13c29aed8775914d6beb1dfeb878048e5fb9166f67bcb` / 187 files / 8,980,758 LF-normalized bytes, held by `FULL_SOURCE_PIN_V1` after the two post-closure CI repairs and the recompute-script correction below. Any later `src/` edit invalidates this row. |
 | Repair regression families | `daemon_proxy_ask_` and `format_hook_adoption` library filters, serial. | **OBSERVED** — ask family 3/0 (`job_01a00fb70b4770c287ff2069bc3ecf35`, post-mutation-restore); formatter family 6/0 with the Round-2 mixed-quadrant control (`job_01a00fd6d9a27ab2b76e87ea708e01b3`, re-confirmed post-restore in the receipt below). |
 | Repair mutation sensitivity | Revert each repair's guard, observe the intended witness RED, restore byte-exactly, re-observe green. | **OBSERVED** — nested-pin revert RED 1/2/0 (`job_01a00fb5a27572309163ad9a89dc15aa`); formatter-conjunct removal RED 4/1/0 (`job_01a00fb67215788088ba6072fb4b664d`); both restorations SHA-256-verified (`tools.rs=3976dcce…`, `format.rs=beee0cf2…`) and re-green. |
 | Selector containment controls | `daemon_facade_` library filter, serial. | **OBSERVED** — 12/0, `outcome_trust: observed`, `job_01a00fafe3ed7bc3a72b1deebe9cb9bf`. |
@@ -552,6 +552,20 @@ the two `#[cfg(unix)]` sites in the PR 4 integration targets were swept and
 are a platform helper and a both-branches-tolerant test. Seal regenerated
 again; `tools.rs` is now
 `14b9fee3bd0786620675d6bfa8fc7a85b5b3bba4f2e0a867bd33b80dd46e37f5`.
+
+**Recompute-script correction — the seal values in the two repairs above were
+initially wrong, and the Rust oracle caught it.** The out-of-band Python
+recompute used for both post-closure repins kept the `src/` prefix on record
+paths, while `normalized_source_records` strips the src root before joining
+components — a hash-only divergence, which is why both wrong values carried
+the CORRECT file counts and LF byte totals. The Rust seal test itself caught
+the drift on its first execution against a recomputed pin (printing the true
+actual), the script was corrected and validated byte-exactly against that
+Rust-printed tuple on a known tree, and the binding pin now carries the
+Rust-oracle-consistent value quoted in the source-pin row above. The lesson
+is the reporting invariant again: only the Rust test is the thing that knows,
+and every out-of-band recomputation must be validated against it on a known
+input before its output is pinned.
 
 Principal frozen-byte SHA-256 values of the repaired paths at final observation
 are `tools.rs=3976dcce27263acae75dff541bc59d80b0127e0a1983424ee15e28f461ee78ce`,
