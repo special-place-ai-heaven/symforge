@@ -5954,7 +5954,11 @@ pub(crate) fn format_hook_adoption(snap: &HookAdoptionSnapshot) -> String {
     }
 
     // Show a hint when all fail-open outcomes are due to no-sidecar.
-    if snap.total_fail_open() > 0 && snap.total_routed() == 0 && total_daemon == 0 {
+    if snap.total_fail_open() > 0
+        && snap.total_routed() == 0
+        && total_daemon == 0
+        && total_sidecar_error == 0
+    {
         lines.push(String::new());
         lines.push("⚠ All hook attempts failed open (no sidecar found).".to_string());
         lines.push("  Start SymForge as an MCP server or run 'symforge daemon start'.".to_string());

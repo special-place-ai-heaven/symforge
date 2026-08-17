@@ -12293,6 +12293,14 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
+        // A daemon-backed `ask` reaches this point only when the outer call was
+        // allowed to fall back to adapter HOME. Preserve that exact authority
+        // for every nested route: ACTIVE may change after the outer snapshot,
+        // and a recovered daemon must not reinterpret omission as a sibling.
+        let nested_project = match self.daemon_client.as_ref() {
+            Some(slot) => Some(slot.read().await.project_id().to_string()),
+            None => None,
+        };
 
         let (mut intent, mut matched_prefix) = smart_query::classify_intent_with_match(q);
         if matches!(
@@ -12330,7 +12338,7 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
-                    project: None,
+                    project: nested_project.clone(),
                     projects: None,
                 };
                 self.find_references(Parameters(input)).await
@@ -12348,14 +12356,14 @@ impl SymForgeServer {
                     include_personal_tooling: None,
                     estimate: None,
                     max_tokens: None,
-                    project: None,
+                    project: nested_project.clone(),
                     projects: None,
                 };
                 self.search_symbols(Parameters(input)).await
             }
             smart_query::QueryIntent::FindFile { hint } => {
                 let input = SearchFilesInput {
-                    project: None,
+                    project: nested_project.clone(),
                     projects: None,
                     query: hint.clone(),
                     limit: None,
@@ -12375,7 +12383,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::FindChanges => {
                 let input = WhatChangedInput {
-                    project: None,
+                    project: nested_project.clone(),
                     since: None,
                     git_ref: None,
                     uncommitted: Some(true),
@@ -12390,7 +12398,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::Understand { concept } => {
                 let input = ExploreInput {
-                    project: None,
+                    project: nested_project.clone(),
                     query: concept.clone(),
                     limit: None,
                     depth: Some(2),
@@ -12406,7 +12414,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::UnderstandSymbol { symbol } => {
                 let input = GetSymbolContextInput {
-                    project: None,
+                    project: nested_project.clone(),
                     name: symbol.clone(),
                     file: None,
                     path: None,
@@ -12434,7 +12442,7 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
-                    project: None,
+                    project: nested_project.clone(),
                     projects: None,
                 };
                 self.find_references(Parameters(input)).await
@@ -12464,7 +12472,7 @@ impl SymForgeServer {
                     estimate: None,
                     max_tokens: None,
                     structural: None,
-                    project: None,
+                    project: nested_project.clone(),
                     projects: None,
                 };
                 self.search_text(Parameters(input)).await
@@ -12475,7 +12483,7 @@ impl SymForgeServer {
                     path_prefix: None,
                     source_scope: Some(super::search_tools::KnowledgeSourceScope::Current),
                     authority_scope: Some(super::search_tools::KnowledgeAuthorityScope::Default),
-                    project: None,
+                    project: nested_project.clone(),
                     projects: None,
                     limit: None,
                     max_tokens: params.0.max_tokens,
@@ -12484,7 +12492,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::RepositoryOrientation => {
                 self.get_repo_map(Parameters(GetRepoMapInput {
-                    project: None,
+                    project: nested_project.clone(),
                     detail: Some("compact".to_string()),
                     path: None,
                     depth: None,
@@ -12496,7 +12504,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::FindDependents { target } => {
                 let input = FindDependentsInput {
-                    project: None,
+                    project: nested_project.clone(),
                     path: target.clone(),
                     name: None,
                     limit: None,
@@ -12522,7 +12530,7 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
-                    project: None,
+                    project: nested_project.clone(),
                     projects: None,
                 };
                 self.find_references(Parameters(input)).await
@@ -12532,7 +12540,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::Explore { query } => {
                 let input = ExploreInput {
-                    project: None,
+                    project: nested_project.clone(),
                     query: query.clone(),
                     limit: None,
                     depth: Some(2),

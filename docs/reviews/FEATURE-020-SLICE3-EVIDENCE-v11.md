@@ -61,12 +61,19 @@ outcomes are historical only and never satisfy a gate.
   `606bbeb50ac11c781f9337a7109be290f8a93b08`, after the case,
   traversal-error, and skip-proof hardening. Round 3 returned trustworthy
   FINDINGS; later Rust-test repairs supersede its gate rows.
-- **POST-ROUND-3 REPAIR CANDIDATE** — the current uncommitted repair tree. Its
-  production source is frozen and its final source seal is observed below; the
-  non-closure commit identity and fresh review are still PENDING. No
-  observation made while the relevant bytes were moving can substitute for the
-  LF-normalized immutable-candidate gates or a fresh trustworthy CLEAN review;
-  T052 remains in progress.
+- **POST-ROUND-3 REPAIR CANDIDATE — superseded reviewed candidate** — the
+  post-Round-3 repair tree whose gates are recorded in the checklist below. It
+  was committed as the immutable candidate
+  `e8d5ae5fac9d36ec814aa302697fd6f18770161d` and received three independent
+  external reviews whose consolidated adjudication returned FINDINGS; its gate
+  rows are historical evidence for exactly that reviewed tree.
+- **EXTERNAL-REVIEW REPAIR CANDIDATE** — the current uncommitted repair tree:
+  the reviewed candidate plus the C1/C2/C3 repairs recorded in the
+  external-review section below. Its production source is frozen and its final
+  source seal is observed there; the new non-closure commit identity and fresh
+  review are still PENDING. No observation made while the relevant bytes were
+  moving can substitute for the LF-normalized immutable-candidate gates or a
+  fresh trustworthy CLEAN review; T052 remains in progress.
 
 Live branch/PR/SHA state is deliberately NOT quoted here — run
 `pwsh scripts/campaign-state.ps1` for that; the SHAs that do appear are
@@ -226,9 +233,14 @@ tool-correctness harness, so both debug and release binaries must run both
 fixture sets locally. PR CI remains corroboration, not a substitute for those
 observations.
 
-### Post-Round-3 immutable-candidate checklist — binding current status
+### Post-Round-3 immutable-candidate checklist — receipts for the reviewed candidate `e8d5ae5f` (superseded)
 
-This is the binding checklist for the LF-normalized candidate. A row changes
+These rows bound the post-Round-3 repair candidate that was committed as
+immutable `e8d5ae5fac9d36ec814aa302697fd6f18770161d` and then externally
+reviewed. The consolidated review returned FINDINGS, and the C1/C2/C3 repairs
+changed `src/` bytes, so per this checklist's own invalidation rule none of
+these rows binds the current tree. The binding checklist for the repaired
+candidate is in the external-review section below. A row changed
 from PENDING only when directly observed on the frozen bytes; earlier focused
 observations remain useful historical guard evidence but cannot fill a current
 row. Results, hashes, counts, SHAs, and review disposition are recorded only
@@ -250,9 +262,9 @@ from direct observations on the named bytes.
 | Debug binary + both harness fixtures | Build the debug `symforge` binary, then run `scripts/verify-tools.cjs` once with `verify-tools` and once with `verify-tools-real`. | **OBSERVED** — debug build exit 0 (`job_01a00826729d7f0297ac9ae2a2b3b8cd`); `target/debug/symforge.exe` synthetic fixture 7 PASS / 1 REVIEW / 0 FAIL (`job_01a008269377743084416d59f49e640b`) and real fixture 10/1/0 (`job_01a00826d2957731a00f9dfa2d55e3c1`), all with `outcome_trust: observed`. The two REVIEW dispositions are adjudicated below. |
 | Release binary + both harness fixtures | `cargo build --release --bin symforge`, then run the same two harness fixtures against that exact release binary. | **OBSERVED** — release build exit 0 in 281,920 ms (`job_01a0082702827491b9b38a8095d94f7f`); `target/release/symforge.exe` synthetic fixture 7 PASS / 1 REVIEW / 0 FAIL (`job_01a0082b8a47797396797080c413d5c1`) and real fixture 10/1/0 (`job_01a0082bb5db71a2b613e4766a9524ae`), all with `outcome_trust: observed`. This was observed locally, not deferred to CI. |
 | Full suite | `cargo test --all-targets -- --test-threads=1` with a live `outcome_trust: observed` receipt on the final candidate. | **OBSERVED** — exit 0 with `outcome_trust: observed` in 420,660 ms (`job_01a008411c3b7c92be67858bc9d3820e`); the main library target reported 3,215 passed / 0 failed / 5 ignored and every integration target completed cleanly. |
-| Non-closure commit | Commit the complete repaired candidate with a non-closure subject after all rows above are green. | **PENDING** — no SHA or subject is invented here. |
-| Fresh PR 4 review | Review one immutable committed full PR 4 range with no concurrent edits; adjudicate every substantive note. | **PENDING** — T052 needs a trustworthy CLEAN disposition. |
-| Evidence/ledger closure commit | Only after a trustworthy CLEAN review, record its archive and final receipts in a separate evidence/ledger commit. | **PENDING** |
+| Non-closure commit | Commit the complete repaired candidate with a non-closure subject after all rows above are green. | **DONE for this candidate** — committed as immutable `e8d5ae5fac9d36ec814aa302697fd6f18770161d`, subject `fix(slice3): prepare activation-cut review candidate [non-closure]`, after one attestation manifest-pin rebind amended in place. |
+| Fresh PR 4 review | Review one immutable committed full PR 4 range with no concurrent edits; adjudicate every substantive note. | **DONE for this candidate — FINDINGS** — three independent external reviews of the full immutable range were received and source-adjudicated; the consolidated verdict was FINDINGS with one confirmed MAJOR, two confirmed MINORs, and one false positive. See the external-review section below. |
+| Evidence/ledger closure commit | Only after a trustworthy CLEAN review, record its archive and final receipts in a separate evidence/ledger commit. | **NOT REACHED for this candidate** — the FINDINGS verdict restarted the repair/gate/commit/review loop. |
 
 The final gate sequence retained its RED diagnostics rather than hiding them.
 The first final library run exposed five sidecar fixtures that still wrote
@@ -351,6 +363,126 @@ attestation's manifest pin was correspondingly rebound from
 `e1d083d338d4bae9dd3ff9a110acd1ed5fd83030480eaff822af04f0ae1bc9a9`
 to `8333b03e5829daadbcb60b0547e1ac81bed5e5d400bf8bc0b59576ab8dc2e6fe`;
 the attestation remains explicitly not an approval or signature.
+
+### External review of immutable candidate `e8d5ae5f`, and the C1–C3 repair round — binding current status
+
+Three independent external reviews of the full immutable PR 4 range
+(`6d1c58df..e8d5ae5f`) were received: Composer 2.5 (CLEAN), Grok 4.6
+(FINDINGS — 1 MAJOR, 1 MINOR), and Kimi K3 (CLEAN with two reported MINORs and
+a `tools.rs` sampling-coverage caveat). Adjudication was by candidate source
+and execution path, not reviewer vote count; the full intake and
+per-finding adjudication ledger lives outside the repository at
+`C:\AI_STUFF\PROGRAMMING\LEDGER-symforge-feature-020-slice3-pr4-external-reviews.md`
+so the immutable candidate stayed clean during review. The consolidated
+verdict was **FINDINGS — do not land the candidate unchanged**:
+
+| Canonical key | Disposition | Root cause |
+|---|---|---|
+| C1-ASK-NESTED-TARGET | CONFIRMED MAJOR — landing blocker | After an allowed whole-call HOME fallback, every nested tool dispatch inside `ask` set `project: None`; a recovered or concurrently retargeted daemon could serve ACTIVE instead of the project against which `ask` classified. Neither CLEAN review exercised this path, and Kimi's own coverage caveat names the under-sampled diff region it lives in. |
+| C2-HOOK-DIAGNOSTIC | CONFIRMED MINOR | The all-fail-open branch of `format_hook_adoption` hardcoded the "no sidecar found" diagnosis even when every failure was a counted sidecar error, suppressing the later actionable sidecar-error message — a reporting-invariant violation. |
+| C3-ENV-AUTHORITY-COMMENT | CONFIRMED MINOR | The comment at the `bind_workspace_from_client_roots` env-over-roots gate named the narrower legacy predicate rather than `workspace_root_env_is_authoritative()`, which production actually gates on. Behavior correct; explanation stale. |
+| C4-FACADE-PARENTDIR-DOC | FALSE POSITIVE | The claimed doc/behavior mismatch in `facade_path_is_repo_relative` is contradicted by the caller's physical-containment check, which the reviewer themselves confirmed rejects escape. |
+
+R1's informational sidecar observation was classified an expected operational
+environment behavior, not a candidate defect, and R3's sampling caveat is
+retained as a review-scope limitation. The three approved residual families
+(D16, cancelled/timed-out `index_folder`, T051's lexical/reviewed-baseline
+seal ceiling) are unchanged.
+
+**The repairs, test-first.** RED witnesses were authored and observed failing
+before each fix. C1: `ask` now snapshots the daemon client's resolved project
+id once at handler entry (`nested_project`) and passes it in every one of the
+13 nested tool dispatches, so a recovered daemon cannot reinterpret omission
+as a sibling; two regression tests drive a failing-`ask`-then-echo daemon
+fixture through the explicit-HOME and the omitted-HOME/concurrent-ACTIVE-
+retarget races (`daemon_proxy_ask_fallback_keeps_explicit_home_for_nested_route`,
+`daemon_proxy_ask_fallback_pins_omitted_home_across_active_retarget`). C2: the
+"no sidecar found" branch gains the `total_sidecar_error == 0` conjunct, and
+two formatter controls pin both the honest no-sidecar and the honest
+all-sidecar-error renderings. C3: the comment now names the authoritative
+predicate. The four new library tests raise the library target from 3,215 to
+3,219; no production behavior outside the two fixes changed.
+
+**Repair-mutation sensitivity, re-observed on the frozen bytes.** Reverting
+the covered nested pin (the `FindSymbol` arm's `search_symbols` dispatch) to
+`project: None` turned BOTH ask-fallback regressions RED (exit 101, 1/2/0,
+`job_01a00fb5a27572309163ad9a89dc15aa`); byte-exact restoration was verified
+by SHA-256 and the family returned 3/0
+(`job_01a00fb70b4770c287ff2069bc3ecf35`). Removing the formatter's
+`total_sidecar_error == 0` conjunct turned
+`test_format_hook_adoption_names_all_sidecar_errors_honestly` RED (exit 101,
+4/1/0, `job_01a00fb67215788088ba6072fb4b664d`); byte-exact restoration was
+verified by SHA-256 and the family returned 5/0
+(`job_01a00fb75a227481bcf42b2de07acbb6`). One honest coverage note: reverting
+a nested pin on a route the regressions do not drive (the `FindReferences`
+arm) left both regressions green (3/0,
+`job_01a00fb496387542ae815c78df20a7f9`) — the regression pair witnesses the
+snapshot-and-propagate mechanism through the routes it drives, not each of
+the 13 dispatch sites individually; per-site correctness rests on the uniform
+`nested_project.clone()` pattern, confirmed complete by inspection (no
+`project: None` remains anywhere in the `ask` dispatch region).
+
+**Census regeneration for the repair.** The C1 fix changes production bytes in
+`src/protocol/tools.rs`, owned by exactly the `writers` closure; the C2 fix in
+`src/protocol/format.rs` is owned by no closure category; the C3 comment and
+all test additions are invisible to the normalized production census. The
+opt-in emitter confirmed only `writers` moved while `cache`, `callbacks`,
+`publication_roots`, and `ccr` stayed byte-identical, and the designed
+regeneration procedure updated the second-order chain:
+
+| Pin | Reviewed-candidate value | Repaired-candidate value |
+|---|---|---|
+| `writers` content closure (contract) | `8121e3478e4dc533208975575637db42ace2fa8297a22592b3ba19d0e4491273` | `780e468ecb7298c74e5f94952e821dac551f2459a983cab85d7b9d9b1b70e04a` |
+| second-order `retirement_records` (validator) | `aaf7f6a276478b3f297fa6c1eee6880ccc0e8ceeb3b805cb7f8efeb025d8ce59` | `3b6870a3923476cbbdad962efdf1b1fb893c5ec3a3e29d5bf936d8fd4c22513d` |
+| raw contract hash in the refreeze manifest | `4f6272565ca16c700cebee25222a4b73eba951b79bad92e1e926e6e1fdc07ae5` | `91642250d0400456c4cbe844c7b54d575d80ad56d9c897e5ce6c6611c8e63f74` |
+| manifest pin in the detached attestation | `8333b03e5829daadbcb60b0547e1ac81bed5e5d400bf8bc0b59576ab8dc2e6fe` | `581a91ff18651677794f1008f73e9b8f1b137ea1543a6d5a9816c7ff8a8c5f37` |
+| whole-`src/` T051 seal tuple | `8cf143e41d269ab4e0fcf1c48e09c4323d7ebc74020f3eb24e8b4d45cdc9c2cb` / 187 / 8,968,263 | `7ba5c4b3c2c82a2963df28a6d1559857b41f3db34e83019d57380e19369d9d04` / 187 / 8,979,117 |
+
+The retirement member digests did not move: no member entered or left any
+category. The 187-file count is stable — the repair edited existing files
+only. The repaired seal tuple was additionally re-derived by an independent
+re-implementation of the fingerprint (domain, LE-u64 count, per-record
+length-prefixed path and LF-normalized content over a sorted `src/` walk) and
+matched byte-exactly.
+
+**Session provenance.** The repair session that authored the fixes terminated
+mid-gates when its credit budget was exhausted: its debug build and both
+debug-fixture harness runs were directly observed green, but its release build
+was still in flight and its full-suite, clippy, and embed receipts for the
+repaired bytes were either pending or lost to context compaction. A successor
+session re-observed EVERY gate below live on the identical frozen bytes —
+identity established by the per-file SHA-256 values here and the whole-source
+seal — so no row below relies on the terminated session's unwitnessed state.
+
+#### External-review repair-candidate checklist — binding current status
+
+| Required evidence | Binding command or observation | Current status |
+|---|---|---|
+| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `7ba5c4b3c2c82a2963df28a6d1559857b41f3db34e83019d57380e19369d9d04` / 187 files / 8,979,117 LF-normalized bytes, held by `FULL_SOURCE_PIN_V1` and green in the preventive suite receipts below. Any later `src/` edit invalidates this row. |
+| Repair regression families | `daemon_proxy_ask_` and `format_hook_adoption` library filters, serial. | **OBSERVED** — 3/0 (`job_01a00fb70b4770c287ff2069bc3ecf35`) and 5/0 (`job_01a00fb75a227481bcf42b2de07acbb6`), both `outcome_trust: observed`, post-mutation-restore. |
+| Repair mutation sensitivity | Revert each repair's guard, observe the intended witness RED, restore byte-exactly, re-observe green. | **OBSERVED** — nested-pin revert RED 1/2/0 (`job_01a00fb5a27572309163ad9a89dc15aa`); formatter-conjunct removal RED 4/1/0 (`job_01a00fb67215788088ba6072fb4b664d`); both restorations SHA-256-verified (`tools.rs=3976dcce…`, `format.rs=beee0cf2…`) and re-green. |
+| Selector containment controls | `daemon_facade_` library filter, serial. | **OBSERVED** — 12/0, `outcome_trust: observed`, `job_01a00fafe3ed7bc3a72b1deebe9cb9bf`. |
+| Layered T051 controls | `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` on the final bytes. | **OBSERVED** — 8/0, `outcome_trust: observed`, `job_01a00fb77e837d22b62554a8a3ad49d2` (post-restore); the reviewed candidate's whole-source macro/alias mutation receipts remain valid guard evidence for the unchanged guard implementation. |
+| Focused dark/public suites | `runtime_dark_v11` and `public_api_delta_v11`, serially. | **OBSERVED** — 11/0 (`job_01a00fb0299274608af87ab345b6189a`) and 2/0 (`job_01a00fb0470872e0857c70a89e27d977`). |
+| Overlay exactness | `cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact`. | **OBSERVED** — 1/0 with 4 filtered, `job_01a00fb066977f0081f13a99c1837e41`. |
+| Formatting and lint | `cargo fmt --check`, `git diff --check`, lifecycle traceability, `cargo clippy --all-targets -- -D warnings`, LF audit. | **OBSERVED** — fmt and worktree diff checks clean; traceability OK at 78 requirements / 24 acceptance oracles / 13 retirement categories; clippy exit 0 (`job_01a00fa608987fa0aff00f92ae628b00`); all nine changed paths report `w/lf` with `eol=lf`. |
+| Embed feature | `cargo test --no-default-features --features embed --lib -- --test-threads=1`. | **OBSERVED** — 1,333 passed / 0 failed / 4 ignored, exit 0, `outcome_trust: observed`, `job_01a00fb11b5c7753a796c7aabf0685e4`. |
+| Debug binary + both harness fixtures | Debug build current with the frozen bytes, then both `verify-tools.cjs` fixture sets. | **OBSERVED** — build exit 0 (`job_01a00fb7fd9770e2ad48d1e81a8bd6b5`); synthetic fixture 7 PASS / 1 REVIEW / 0 FAIL and real fixture 10/1/0, the same two expected human-adjudicated REVIEW dispositions as the reviewed candidate. |
+| Release binary + both harness fixtures | Release build current with the frozen bytes, then both fixture sets against that exact binary. | **OBSERVED** — build exit 0 in 275,451 ms with `outcome_trust: observed` (`job_01a00fb81e0d75e28f40606f8dbefdaf`); synthetic fixture 7/1/0 and real fixture 10/1/0 against that exact binary, agreeing exactly with debug; observed locally, not deferred to PR CI. |
+| Full suite | `cargo test --all-targets -- --test-threads=1` with a live `outcome_trust: observed` receipt on the final candidate. | **OBSERVED** — exit 0, `outcome_trust: observed`, 541,511 ms, `job_01a00fa6477f7e82a9e908da0188ee3b`; the main library target reported 3,219 passed / 0 failed / 5 ignored and all 122 test targets completed cleanly. |
+| AAP receipt check | `python execution/aap_migration_receipt_v11.py --stage full --check`. | **OBSERVED** — exit 0; real lane 71 cases (35 resolution-failure, 33 compiles, 3 expected-failure), adapter lane 35 expected-failure rows; the regenerated receipt honestly flagged the dirty pre-commit worktree and its diff was discarded, since T052 does not mint a receipt. |
+| Non-closure commit | Commit the complete repaired candidate with a non-closure subject after all rows above are green. | **PENDING** — no SHA or subject is invented here. |
+| Fresh PR 4 review | Review one immutable committed full PR 4 range with no concurrent edits; adjudicate every substantive note. | **PENDING** — T052 needs a trustworthy CLEAN disposition. |
+| Evidence/ledger closure commit | Only after a trustworthy CLEAN review, record its archive and final receipts in a separate evidence/ledger commit. | **PENDING** |
+
+Principal frozen-byte SHA-256 values of the repaired paths at final observation
+are `tools.rs=3976dcce27263acae75dff541bc59d80b0127e0a1983424ee15e28f461ee78ce`,
+`protocol/mod.rs=6f001983e346821318078dcca0bfae24ca8ee8aa97e4055f8ad46c069012367f`,
+`format.rs=beee0cf2781b8476892c2aad1d5e0aa14dbe6661d083088796f66d2337e1e1b5`,
+`format/tests.rs=caa658bb082e664fd5ab895c9c222c19e89afe02affb798615946a1084833f0e`,
+`preventive_runtime_dark_v11.rs=bf886b930c23f216661528e116a4b444ff7da3850129810e756220b32f12ef27`,
+and
+`validate-lifecycle-oracle-traceability.cjs=90d1de9617f0c17c3a78b97a012cde4fbf206247d5740aeaef5ed9b0d1e9d83a`.
 
 ### Round 2 of the post-slice review, and the hardening it triggered
 

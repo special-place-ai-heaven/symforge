@@ -629,7 +629,7 @@ planned and unexecuted.
       ]
     },
     "writers": {
-      "digest": "8121e3478e4dc533208975575637db42ace2fa8297a22592b3ba19d0e4491273",
+      "digest": "780e468ecb7298c74e5f94952e821dac551f2459a983cab85d7b9d9b1b70e04a",
       "paths": [
         "src/cli/init.rs",
         "src/gitignore_hygiene.rs",

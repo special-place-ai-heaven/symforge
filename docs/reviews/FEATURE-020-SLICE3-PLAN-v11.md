@@ -452,21 +452,29 @@ trustworthy clean review permits a later evidence/ledger closure commit.
 
 ## Current PR 4 checkpoint and binding closure sequence
 
-The current tree is deliberately **in progress / non-closure**. The final
-whole-source pin, focused controls, required semantic mutations, and every
-candidate gate below are observed. Only the joint non-closure commit and fresh
+The previous candidate cycle completed its joint non-closure commit and received
+three independent external reviews. Their consolidated adjudication returned
+**FINDINGS — do not land unchanged**: one confirmed MAJOR (the `ask` handler's
+nested tool dispatches dropped the resolved project after an allowed HOME
+fallback), two confirmed MINOR defects (the hook-adoption formatter misdiagnosed
+all-sidecar-error runs as "no sidecar found"; one stale predicate-name comment),
+and one false positive. The repairs were made test-first with RED witnesses and
+mutation-sensitivity checks; the four new library tests raise the library target
+from 3,215 to 3,219. The current tree is the repaired candidate, deliberately
+**in progress / non-closure**. Every candidate gate below has been re-observed on
+the repaired frozen source. Only the new joint non-closure commit and fresh
 review remain pending. Historical green rows in the evidence document cannot
 satisfy these obligations for changed source or harness bytes.
 
 | Candidate obligation | Required result before the non-closure commit |
 |---|---|
-| Focused A-019 relay, selector-containment, activation-cut, T051 darkness, and real-MCP controls | OBSERVED — all accepting/refusing suites are green on the frozen source; selector-locality inversion, whole-source macro/alias, and harness-envelope adversarial mutations each turned the intended guard RED and were byte-exactly restored |
-| Formatting and traceability | OBSERVED — final-source `cargo fmt --check`, `git diff --check`, cached diff check, LF worktree checks, and the 78/24/13 lifecycle traceability census are clean with binding receipts in evidence |
-| Clippy | OBSERVED — final-source `cargo clippy --all-targets -- -D warnings` clean; the two test-only synchronous guard lifetimes it initially rejected remain lexically bounded |
-| Embed configuration | OBSERVED — `cargo test --no-default-features --features embed --lib -- --test-threads=1`: 1,333 passed, 0 failed, 4 ignored |
-| Debug binary + verify-tools fixtures | OBSERVED — current-source debug build clean; `target/debug/symforge.exe` produced 7 PASS / 1 REVIEW / 0 FAIL on the synthetic fixture and 10/1/0 on `verify-tools-real`, with both expected unit-mismatch REVIEW cases human-adjudicated and live-observed exit-0 receipts recorded in evidence |
-| Release binary + verify-tools fixtures | OBSERVED — current-source local release build clean; `target/release/symforge.exe` produced the same 7/1/0 synthetic and 10/1/0 real results, with live-observed exit-0 receipts recorded in evidence; this was not deferred to PR CI |
-| Full target suite | OBSERVED — `cargo test --all-targets -- --test-threads=1` exited 0 with directly observed trust; the main library target reported 3,215 passed / 0 failed / 5 ignored and every integration target completed cleanly |
+| Focused A-019 relay, selector-containment, activation-cut, T051 darkness, and real-MCP controls | OBSERVED — re-observed on the repaired frozen source: selector family 12/0, ask-fallback family 3/0, hook-adoption formatter family 5/0, preventive 8/0, runtime-dark 11/0, public API 2/0, overlay exactness 1/0; the nested-pin and formatter-honesty repair mutations each turned their intended witnesses RED and were byte-exactly restored with hash receipts |
+| Formatting and traceability | OBSERVED — final-source `cargo fmt --check`, `git diff --check`, and the 78/24/13 lifecycle traceability census are clean; the census regeneration for the repair moved only the `writers` closure, exactly the category owning the repaired production path |
+| Clippy | OBSERVED — final-source `cargo clippy --all-targets -- -D warnings` clean with a directly observed exit-0 receipt |
+| Embed configuration | OBSERVED — `cargo test --no-default-features --features embed --lib -- --test-threads=1`: 1,333 passed, 0 failed, 4 ignored, directly observed exit 0 |
+| Debug binary + verify-tools fixtures | OBSERVED — current-source debug build clean; `target/debug/symforge.exe` produced 7 PASS / 1 REVIEW / 0 FAIL on the synthetic fixture and 10/1/0 on `verify-tools-real`, both expected unit-mismatch REVIEW cases unchanged |
+| Release binary + verify-tools fixtures | OBSERVED — current-source local release build clean; `target/release/symforge.exe` produced the same 7/1/0 synthetic and 10/1/0 real results; this was not deferred to PR CI |
+| Full target suite | OBSERVED — `cargo test --all-targets -- --test-threads=1` exited 0 with directly observed trust in 541,511 ms; the main library target reported 3,219 passed / 0 failed / 5 ignored and every integration target completed cleanly |
 
 Once those rows are observed on one stable LF-normalized tree, commit every PR 4
 candidate file together with a non-closure subject. Run the fresh adversarial review

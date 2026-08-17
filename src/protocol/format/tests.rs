@@ -3913,6 +3913,52 @@ fn test_format_hook_adoption_marks_no_sidecar_fail_open_as_mostly_benign() {
     );
 }
 
+#[test]
+fn test_format_hook_adoption_names_all_no_sidecar_fail_open_honestly() {
+    let snap = crate::cli::hook::HookAdoptionSnapshot {
+        source_read: crate::cli::hook::WorkflowAdoptionCounts {
+            routed: 0,
+            no_sidecar: 2,
+            sidecar_error: 0,
+            daemon_fallback: 0,
+        },
+        ..Default::default()
+    };
+
+    let result = format_hook_adoption(&snap);
+    assert!(
+        result.contains("All hook attempts failed open (no sidecar found)"),
+        "pure no-sidecar outcomes should keep the missing-sidecar diagnosis: {result}"
+    );
+    assert!(
+        !result.contains("Actionable note: sidecar errors"),
+        "pure no-sidecar outcomes must not be mislabeled as routing errors: {result}"
+    );
+}
+
+#[test]
+fn test_format_hook_adoption_names_all_sidecar_errors_honestly() {
+    let snap = crate::cli::hook::HookAdoptionSnapshot {
+        source_read: crate::cli::hook::WorkflowAdoptionCounts {
+            routed: 0,
+            no_sidecar: 0,
+            sidecar_error: 2,
+            daemon_fallback: 0,
+        },
+        ..Default::default()
+    };
+
+    let result = format_hook_adoption(&snap);
+    assert!(
+        result.contains("Actionable note: sidecar errors are real routing failures"),
+        "pure sidecar errors should retain their actionable diagnosis: {result}"
+    );
+    assert!(
+        !result.contains("All hook attempts failed open (no sidecar found)"),
+        "sidecar errors must never be described as an absent sidecar: {result}"
+    );
+}
+
 // --- compact_savings_footer tests ---
 
 #[test]

@@ -1760,10 +1760,10 @@ impl SymForgeServer {
 
         let root_uris: Vec<String> = roots.into_iter().map(|root| root.uri).collect();
 
-        // env is None here: reaching this point guarantees the bound root did
-        // NOT come from the env override (the gate above returns early when
-        // `workspace_root_env_override().is_some()`), so passing None cannot let
-        // a client root jump ahead of the env override — `env > roots` holds.
+        // Reaching this point means `env_is_authoritative` was false; the gate
+        // above covers both a resolved workspace override and an unsupported-
+        // encoding refusal. Passing None therefore cannot let a client root jump
+        // ahead of an authoritative environment decision — `env > roots` holds.
         let Some(resolved) = crate::discovery::resolve_workspace_root(None, &root_uris, None)
         else {
             tracing::info!(
@@ -2208,7 +2208,7 @@ impl ServerHandler for SymForgeServer {
 mod tests {
     use super::*;
     use axum::extract::{Path as AxumPath, State};
-    use axum::http::{HeaderMap, HeaderValue};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::routing::post;
     use axum::{Json, Router};
     use rmcp::handler::server::wrapper::Parameters;
@@ -2455,6 +2455,68 @@ mod tests {
                 .await;
         });
         (base_url, shutdown_tx, requests)
+    }
+
+    #[derive(Clone)]
+    struct FailingAskThenEchoState {
+        requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        ask_entered: Arc<tokio::sync::Notify>,
+        release_ask: Arc<tokio::sync::Notify>,
+    }
+
+    async fn failing_ask_then_echo_handler(
+        AxumPath((_session_id, tool_name)): AxumPath<(String, String)>,
+        State(state): State<FailingAskThenEchoState>,
+        Json(args): Json<serde_json::Value>,
+    ) -> Result<String, StatusCode> {
+        state
+            .requests
+            .lock()
+            .push((tool_name.clone(), args.clone()));
+        if tool_name == "ask" {
+            state.ask_entered.notify_one();
+            state.release_ask.notified().await;
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        let project = args
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<daemon-active>");
+        Ok(format!("selected-project={project}; tool={tool_name}"))
+    }
+
+    async fn spawn_failing_ask_then_echo_server() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+        FailingAskThenEchoState,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing ask daemon tool server");
+        let base_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        let state = FailingAskThenEchoState {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            ask_entered: Arc::new(tokio::sync::Notify::new()),
+            release_ask: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = Router::new()
+            .route(
+                "/v1/sessions/{session_id}/tools/{tool_name}",
+                post(failing_ask_then_echo_handler),
+            )
+            .with_state(state.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let shutdown = async move {
+                let _ = shutdown_rx.await;
+            };
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        (base_url, shutdown_tx, task, state)
     }
 
     #[tokio::test]
@@ -2741,6 +2803,157 @@ mod tests {
 
         drop(captured);
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_ask_fallback_keeps_explicit_home_for_nested_route() {
+        let home = tempfile::TempDir::new().expect("HOME project root");
+        let sibling = tempfile::TempDir::new().expect("sibling project root");
+        let home = home.path().canonicalize().expect("canonical HOME root");
+        let sibling = sibling
+            .path()
+            .canonicalize()
+            .expect("canonical sibling root");
+        let home_id = crate::daemon::project_key(&home);
+        let sibling_id = crate::daemon::project_key(&sibling);
+        let (base_url, shutdown, daemon_task, fake) = spawn_failing_ask_then_echo_server().await;
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            home_id.clone(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        client.record_opened_root(home.clone());
+        client.record_opened_root(sibling.clone());
+        client.record_active_root(sibling);
+        let server = SymForgeServer::new_daemon_proxy(client);
+        *server.repo_root.write() = Some(home);
+        {
+            let mut degraded = server.daemon_degraded.lock();
+            degraded.degraded = true;
+            degraded.last_reconnect_attempt = Some(std::time::Instant::now());
+        }
+
+        let ask = tokio::spawn({
+            let server = server.clone();
+            let home_id = home_id.clone();
+            async move {
+                server
+                    .ask(Parameters(crate::protocol::tools::SmartQueryInput {
+                        project: Some(home_id),
+                        query: "find symbol ask_fallback_target".to_string(),
+                        max_tokens: None,
+                    }))
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fake.ask_entered.notified(),
+        )
+        .await
+        .expect("outer ask reached daemon");
+        fake.release_ask.notify_one();
+        let result = ask.await.expect("ask task");
+
+        assert!(
+            result.contains(&format!("selected-project={home_id}; tool=search_symbols")),
+            "the nested route must stay pinned to the HOME used for fallback: {result}"
+        );
+        assert!(
+            !result.contains(&format!("selected-project={sibling_id}")),
+            "the nested route must not inherit daemon ACTIVE: {result}"
+        );
+        {
+            let requests = fake.requests.lock();
+            assert_eq!(requests.len(), 2, "outer ask plus one nested route");
+            assert_eq!(requests[0].0, "ask");
+            assert_eq!(requests[0].1["project"], home_id);
+            assert_eq!(requests[1].0, "search_symbols");
+            assert_eq!(requests[1].1["project"], home_id);
+        }
+
+        let _ = shutdown.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), daemon_task)
+            .await
+            .expect("fake daemon shutdown")
+            .expect("fake daemon task");
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_ask_fallback_pins_omitted_home_across_active_retarget() {
+        let home = tempfile::TempDir::new().expect("HOME project root");
+        let sibling = tempfile::TempDir::new().expect("sibling project root");
+        let home = home.path().canonicalize().expect("canonical HOME root");
+        let sibling = sibling
+            .path()
+            .canonicalize()
+            .expect("canonical sibling root");
+        let home_id = crate::daemon::project_key(&home);
+        let sibling_id = crate::daemon::project_key(&sibling);
+        let (base_url, shutdown, daemon_task, fake) = spawn_failing_ask_then_echo_server().await;
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            home_id.clone(),
+            "session-id".to_string(),
+            "home-project".to_string(),
+        );
+        client.record_opened_root(home.clone());
+        client.record_opened_root(sibling.clone());
+        client.record_active_root(home.clone());
+        let client_state = client.clone();
+        let server = SymForgeServer::new_daemon_proxy(client);
+        *server.repo_root.write() = Some(home);
+        {
+            let mut degraded = server.daemon_degraded.lock();
+            degraded.degraded = true;
+            degraded.last_reconnect_attempt = Some(std::time::Instant::now());
+        }
+
+        let ask = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .ask(Parameters(crate::protocol::tools::SmartQueryInput {
+                        project: None,
+                        query: "find symbol ask_fallback_target".to_string(),
+                        max_tokens: None,
+                    }))
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fake.ask_entered.notified(),
+        )
+        .await
+        .expect("outer ask reached daemon after snapshotting HOME");
+        client_state.record_active_root(sibling);
+        fake.release_ask.notify_one();
+        let result = ask.await.expect("ask task");
+
+        assert!(
+            result.contains(&format!("selected-project={home_id}; tool=search_symbols")),
+            "the nested route must stay pinned to the snapshotted HOME: {result}"
+        );
+        assert!(
+            !result.contains(&format!("selected-project={sibling_id}")),
+            "the nested route must not inherit the concurrently activated sibling: {result}"
+        );
+        {
+            let requests = fake.requests.lock();
+            assert_eq!(requests.len(), 2, "outer ask plus one nested route");
+            assert_eq!(requests[0].0, "ask");
+            assert_eq!(requests[0].1["project"], home_id);
+            assert_eq!(requests[1].0, "search_symbols");
+            assert_eq!(requests[1].1["project"], home_id);
+        }
+
+        let _ = shutdown.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), daemon_task)
+            .await
+            .expect("fake daemon shutdown")
+            .expect("fake daemon task");
     }
 
     async fn spawn_truncated_project_evidence_server(
