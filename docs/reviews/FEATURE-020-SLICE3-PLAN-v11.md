@@ -459,8 +459,12 @@ nested tool dispatches dropped the resolved project after an allowed HOME
 fallback), two confirmed MINOR defects (the hook-adoption formatter misdiagnosed
 all-sidecar-error runs as "no sidecar found"; one stale predicate-name comment),
 and one false positive. The repairs were made test-first with RED witnesses and
-mutation-sensitivity checks; the four new library tests raise the library target
-from 3,215 to 3,219. The current tree is the repaired candidate, deliberately
+mutation-sensitivity checks. A Round-2 fresh four-lens review of the committed
+repair candidate returned CLEAN on both code lenses and three MINOR
+documentation/test-coverage findings, all repaired in the current tree: a third
+formatter control pinning the mixed sidecar quadrant, and two evidence-document
+corrections. The five new library tests raise the library target from 3,215 to
+3,220. The current tree is the repaired candidate, deliberately
 **in progress / non-closure**. Every candidate gate below has been re-observed on
 the repaired frozen source. Only the new joint non-closure commit and fresh
 review remain pending. Historical green rows in the evidence document cannot
@@ -468,13 +472,13 @@ satisfy these obligations for changed source or harness bytes.
 
 | Candidate obligation | Required result before the non-closure commit |
 |---|---|
-| Focused A-019 relay, selector-containment, activation-cut, T051 darkness, and real-MCP controls | OBSERVED — re-observed on the repaired frozen source: selector family 12/0, ask-fallback family 3/0, hook-adoption formatter family 5/0, preventive 8/0, runtime-dark 11/0, public API 2/0, overlay exactness 1/0; the nested-pin and formatter-honesty repair mutations each turned their intended witnesses RED and were byte-exactly restored with hash receipts |
+| Focused A-019 relay, selector-containment, activation-cut, T051 darkness, and real-MCP controls | OBSERVED — re-observed on the repaired frozen source: selector family 12/0, ask-fallback family 3/0, hook-adoption formatter family 6/0 including the Round-2 mixed-quadrant control, preventive 8/0 with the regenerated pin, runtime-dark 11/0, public API 2/0, overlay exactness 1/0; the nested-pin, formatter-honesty, and Round-2 crafted-conjunct mutations each turned their intended witnesses RED and were byte-exactly restored with hash receipts |
 | Formatting and traceability | OBSERVED — final-source `cargo fmt --check`, `git diff --check`, and the 78/24/13 lifecycle traceability census are clean; the census regeneration for the repair moved only the `writers` closure, exactly the category owning the repaired production path |
 | Clippy | OBSERVED — final-source `cargo clippy --all-targets -- -D warnings` clean with a directly observed exit-0 receipt |
 | Embed configuration | OBSERVED — `cargo test --no-default-features --features embed --lib -- --test-threads=1`: 1,333 passed, 0 failed, 4 ignored, directly observed exit 0 |
 | Debug binary + verify-tools fixtures | OBSERVED — current-source debug build clean; `target/debug/symforge.exe` produced 7 PASS / 1 REVIEW / 0 FAIL on the synthetic fixture and 10/1/0 on `verify-tools-real`, both expected unit-mismatch REVIEW cases unchanged |
 | Release binary + verify-tools fixtures | OBSERVED — current-source local release build clean; `target/release/symforge.exe` produced the same 7/1/0 synthetic and 10/1/0 real results; this was not deferred to PR CI |
-| Full target suite | OBSERVED — `cargo test --all-targets -- --test-threads=1` exited 0 with directly observed trust in 541,511 ms; the main library target reported 3,219 passed / 0 failed / 5 ignored and every integration target completed cleanly |
+| Full target suite | OBSERVED — `cargo test --all-targets -- --test-threads=1` exited 0 with directly observed trust in 587,665 ms; the main library target reported 3,220 passed / 0 failed / 5 ignored and every integration target completed cleanly |
 
 Once those rows are observed on one stable LF-normalized tree, commit every PR 4
 candidate file together with a non-closure subject. Run the fresh adversarial review

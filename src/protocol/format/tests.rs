@@ -3959,6 +3959,29 @@ fn test_format_hook_adoption_names_all_sidecar_errors_honestly() {
     );
 }
 
+#[test]
+fn test_format_hook_adoption_mixed_no_sidecar_and_errors_stays_honest() {
+    let snap = crate::cli::hook::HookAdoptionSnapshot {
+        source_read: crate::cli::hook::WorkflowAdoptionCounts {
+            routed: 0,
+            no_sidecar: 1,
+            sidecar_error: 1,
+            daemon_fallback: 0,
+        },
+        ..Default::default()
+    };
+
+    let result = format_hook_adoption(&snap);
+    assert!(
+        result.contains("Actionable note: sidecar errors are real routing failures"),
+        "a mixed nothing-routed run with counted sidecar errors keeps the actionable diagnosis: {result}"
+    );
+    assert!(
+        !result.contains("All hook attempts failed open (no sidecar found)"),
+        "counted sidecar errors must never be described as an absent sidecar, even mixed with no-sidecar outcomes: {result}"
+    );
+}
+
 // --- compact_savings_footer tests ---
 
 #[test]

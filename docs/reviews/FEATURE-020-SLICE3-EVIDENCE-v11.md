@@ -345,15 +345,24 @@ documented health-fix values:
 
 | Pin | Previous documented value | Final candidate value |
 |---|---|---|
-| `cache` closure | `760c5da2d416d7e654ef1adc32a126143f1f404608d05e4a31ef84a6c7a0ebb0` | `112eeb2b9a7712d97a311aa483ba0ca74f64e51ab277e83ebce682415622c79b` |
-| `callbacks` closure | `f0dd5624ff538db95b023a23bd02e163c3e10880fe9cd16519208a103f65eaa5` | `61161d04fa4189c6d2cf2a456655582b468a3c6d071046f956b8a7f3426928e8` |
-| `publication_roots` closure | `555e5219eee5668808ca81adadecf42e25e8fbe4f3f245e69db2a857e53826a5` | `379565fc39ae363ce880b8a9601193b56096041bc1d8241ca26c6cb95a4b1749` |
-| `writers` closure | `22fa98fd6ef5dbb72f3088039f4a07111e1fcb8beb5ffefb787d6b71b61b7b36` | `3ee16991d9c6900f8921e45fd56f604c314f1752765ef389b9f30db73581d256` |
-| `ccr` closure | `8ad77748b8fd9e6eb31853cc9615730fc632a890898321deb915546e384ad246` | `2f7cc4b3223e192fd7bb1aa4d145813100b07b438409590b63adeb6b4e6c4ebe` |
+| `cache` closure | `760c5da2d416d7e654ef1adc32a126143f1f404608d05e4a31ef84a6c7a0ebb0` | `90ac7e74c17485d9970a9fb8391e0a939997768bab8c08e0597e04458634d456` |
+| `callbacks` closure | `f0dd5624ff538db95b023a23bd02e163c3e10880fe9cd16519208a103f65eaa5` | `5c0f31ac8c807e6cd81520e1e9af70056a6948bf18f36a9784c84471209d29a5` |
+| `publication_roots` closure | `555e5219eee5668808ca81adadecf42e25e8fbe4f3f245e69db2a857e53826a5` | `9f8bcc30509c88f150828c26e868f740a1eba4690081ebfaf00091e9f36fbb7b` |
+| `writers` closure | `22fa98fd6ef5dbb72f3088039f4a07111e1fcb8beb5ffefb787d6b71b61b7b36` | `8121e3478e4dc533208975575637db42ace2fa8297a22592b3ba19d0e4491273` |
+| `ccr` closure | `8ad77748b8fd9e6eb31853cc9615730fc632a890898321deb915546e384ad246` | unchanged at `8ad77748b8fd9e6eb31853cc9615730fc632a890898321deb915546e384ad246` |
 | second-order `retirement_records` | `d5b0003cd8e7150417495f89ef46a901bdd392a8287f211fae15b6fcc1758464` | `aaf7f6a276478b3f297fa6c1eee6880ccc0e8ceeb3b805cb7f8efeb025d8ce59` |
 | raw contract hash in the refreeze manifest | `f02ff61105f1f5ad1dce29e2a9c36e50dd4d5465ff5b48dd9440059059272d83` | `4f6272565ca16c700cebee25222a4b73eba951b79bad92e1e926e6e1fdc07ae5` |
 | validator raw SHA-256, committed baseline to final | `8585caa152455dc7a22f93a5ded63095bd550c11eeae2c802a5795684f52ab76` | `3c9836dd19f3cb82fbfcc4bad4af391d95e93b51bc89adf8f88e59ddb6fcf23b` |
 | refreeze manifest raw SHA-256, committed baseline to final | `e1d083d338d4bae9dd3ff9a110acd1ed5fd83030480eaff822af04f0ae1bc9a9` | `8333b03e5829daadbcb60b0547e1ac81bed5e5d400bf8bc0b59576ab8dc2e6fe` |
+
+Correction, recorded by the Round-2 fresh review: the five closure cells in the
+final-value column above originally quoted the validator's never-moved
+RETIREMENT_MEMBER_DIGESTS instead of the contract's content-closure digests at
+the reviewed candidate — a documentation error that pre-existed at `e8d5ae5f`
+and was missed by all three Round-1 reviewers. The cells now carry the actual
+`e8d5ae5f` contract values, recomputed from `git show` of that commit; the
+`ccr` closure never moved in PR 4. The second-order rows below them were
+correct as originally recorded and are unchanged.
 
 The final LF-normalized checker is clean at 78 requirements / 24 acceptance
 oracles / 13 retirement categories. No member/path set, authority assignment,
@@ -454,22 +463,54 @@ session re-observed EVERY gate below live on the identical frozen bytes —
 identity established by the per-file SHA-256 values here and the whole-source
 seal — so no row below relies on the terminated session's unwitnessed state.
 
+**Round-2 fresh review of immutable candidate `9de4f696`, and the three MINOR
+repairs it forced.** The repaired candidate was committed as immutable
+`9de4f69639beffc66d0a5828cdbc731ee41b7e2c`, the branch was pushed, and a fresh
+four-lens adversarial review (repair-diff end-to-end, C1-adversarial,
+evidence audit, full-range integrity) ran against the complete immutable range
+with no concurrent edits; every finding was then independently challenged by
+two adversarial refuters. The C1-adversarial and full-range-integrity lenses
+returned CLEAN — every constructed attack on the nested-pin repair failed with
+grounded reasons (the snapshot is the immutable per-connection HOME project
+id; daemon recovery serves HOME via explicit-id resolution; an explicit
+foreign outer selector is routed daemon-side or refused before the snapshot;
+embedded `None` cannot reach daemon routing; no idempotency interaction), and
+the census/seal chain was independently recomputed, including a second
+independent re-derivation of the whole-source seal. Three findings survived
+refutation, ALL MINOR, none behavioral: (1) the C2 fix's mixed
+nothing-routed quadrant had no pinned oracle, so a crafted conjunct mutation
+would have survived every existing test; (2) the superseded census table above
+quoted never-moved member-list digests as `e8d5ae5f` closure values (corrected
+in place above, with the correction noted); (3) the LF-audit row said "nine
+changed paths" where the committed range changed eleven (reworded above). The
+repairs: a third formatter control now pins the mixed quadrant
+(`test_format_hook_adoption_mixed_no_sidecar_and_errors_stays_honest`), and
+its oracle power was proven by observing the reviewer's exact crafted
+mutation (`total_sidecar_error <= total_no_sidecar`) survive the five prior
+oracles but die on the new one (5/1/0, exit 101,
+`job_01a00fd78ba97840bfa3bf7c754c8998`), with `format.rs` then restored
+byte-exactly (`beee0cf2…`) and the family green at 6/0. The test addition
+moved the whole-source seal; the pin was regenerated RED-first (observed RED
+printing the new tuple, `job_01a00fd8219c7db2b537098614504822`, then green
+8/0). The checklist below carries the receipts re-observed after these
+repairs.
+
 #### External-review repair-candidate checklist — binding current status
 
 | Required evidence | Binding command or observation | Current status |
 |---|---|---|
-| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `7ba5c4b3c2c82a2963df28a6d1559857b41f3db34e83019d57380e19369d9d04` / 187 files / 8,979,117 LF-normalized bytes, held by `FULL_SOURCE_PIN_V1` and green in the preventive suite receipts below. Any later `src/` edit invalidates this row. |
-| Repair regression families | `daemon_proxy_ask_` and `format_hook_adoption` library filters, serial. | **OBSERVED** — 3/0 (`job_01a00fb70b4770c287ff2069bc3ecf35`) and 5/0 (`job_01a00fb75a227481bcf42b2de07acbb6`), both `outcome_trust: observed`, post-mutation-restore. |
+| Final T051 source pin | Record the whole-`src/` SHA-256 tuple, file count, and LF-normalized byte count after every production source edit is complete. | **OBSERVED ON FROZEN SOURCE** — `99a06d5dc2742dffef321c7323c1e4c2a6a4f44eead77bf1c10c6acb02fdf47c` / 187 files / 8,979,963 LF-normalized bytes, held by `FULL_SOURCE_PIN_V1` and green in the preventive suite receipts below; includes the Round-2 mixed-quadrant formatter control. Any later `src/` edit invalidates this row. |
+| Repair regression families | `daemon_proxy_ask_` and `format_hook_adoption` library filters, serial. | **OBSERVED** — ask family 3/0 (`job_01a00fb70b4770c287ff2069bc3ecf35`, post-mutation-restore); formatter family 6/0 with the Round-2 mixed-quadrant control (`job_01a00fd6d9a27ab2b76e87ea708e01b3`, re-confirmed post-restore in the receipt below). |
 | Repair mutation sensitivity | Revert each repair's guard, observe the intended witness RED, restore byte-exactly, re-observe green. | **OBSERVED** — nested-pin revert RED 1/2/0 (`job_01a00fb5a27572309163ad9a89dc15aa`); formatter-conjunct removal RED 4/1/0 (`job_01a00fb67215788088ba6072fb4b664d`); both restorations SHA-256-verified (`tools.rs=3976dcce…`, `format.rs=beee0cf2…`) and re-green. |
 | Selector containment controls | `daemon_facade_` library filter, serial. | **OBSERVED** — 12/0, `outcome_trust: observed`, `job_01a00fafe3ed7bc3a72b1deebe9cb9bf`. |
-| Layered T051 controls | `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` on the final bytes. | **OBSERVED** — 8/0, `outcome_trust: observed`, `job_01a00fb77e837d22b62554a8a3ad49d2` (post-restore); the reviewed candidate's whole-source macro/alias mutation receipts remain valid guard evidence for the unchanged guard implementation. |
+| Layered T051 controls | `cargo test --test preventive_runtime_dark_v11 -- --test-threads=1` on the final bytes. | **OBSERVED** — 8/0 with the regenerated pin, `outcome_trust: observed`, `job_01a00fd898217901ac877a4628262555`; the pin regeneration itself was observed RED-first (`job_01a00fd8219c7db2b537098614504822`); the reviewed candidate's whole-source macro/alias mutation receipts remain valid guard evidence for the unchanged guard implementation. |
 | Focused dark/public suites | `runtime_dark_v11` and `public_api_delta_v11`, serially. | **OBSERVED** — 11/0 (`job_01a00fb0299274608af87ab345b6189a`) and 2/0 (`job_01a00fb0470872e0857c70a89e27d977`). |
 | Overlay exactness | `cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact`. | **OBSERVED** — 1/0 with 4 filtered, `job_01a00fb066977f0081f13a99c1837e41`. |
-| Formatting and lint | `cargo fmt --check`, `git diff --check`, lifecycle traceability, `cargo clippy --all-targets -- -D warnings`, LF audit. | **OBSERVED** — fmt and worktree diff checks clean; traceability OK at 78 requirements / 24 acceptance oracles / 13 retirement categories; clippy exit 0 (`job_01a00fa608987fa0aff00f92ae628b00`); all nine changed paths report `w/lf` with `eol=lf`. |
-| Embed feature | `cargo test --no-default-features --features embed --lib -- --test-threads=1`. | **OBSERVED** — 1,333 passed / 0 failed / 4 ignored, exit 0, `outcome_trust: observed`, `job_01a00fb11b5c7753a796c7aabf0685e4`. |
-| Debug binary + both harness fixtures | Debug build current with the frozen bytes, then both `verify-tools.cjs` fixture sets. | **OBSERVED** — build exit 0 (`job_01a00fb7fd9770e2ad48d1e81a8bd6b5`); synthetic fixture 7 PASS / 1 REVIEW / 0 FAIL and real fixture 10/1/0, the same two expected human-adjudicated REVIEW dispositions as the reviewed candidate. |
-| Release binary + both harness fixtures | Release build current with the frozen bytes, then both fixture sets against that exact binary. | **OBSERVED** — build exit 0 in 275,451 ms with `outcome_trust: observed` (`job_01a00fb81e0d75e28f40606f8dbefdaf`); synthetic fixture 7/1/0 and real fixture 10/1/0 against that exact binary, agreeing exactly with debug; observed locally, not deferred to PR CI. |
-| Full suite | `cargo test --all-targets -- --test-threads=1` with a live `outcome_trust: observed` receipt on the final candidate. | **OBSERVED** — exit 0, `outcome_trust: observed`, 541,511 ms, `job_01a00fa6477f7e82a9e908da0188ee3b`; the main library target reported 3,219 passed / 0 failed / 5 ignored and all 122 test targets completed cleanly. |
+| Formatting and lint | `cargo fmt --check`, `git diff --check`, lifecycle traceability, `cargo clippy --all-targets -- -D warnings`, LF audit. | **OBSERVED** — re-observed after the Round-2 repairs: fmt and worktree diff checks clean; traceability OK at 78 requirements / 24 acceptance oracles / 13 retirement categories; clippy exit 0 (`job_01a00fdae4da7ca28bb41573bb56c966`); all changed paths, including the two review documents finalized after the nine-path source audit, report `w/lf` with `eol=lf`. |
+| Embed feature | `cargo test --no-default-features --features embed --lib -- --test-threads=1`. | **OBSERVED** — re-observed after the Round-2 repairs: 1,333 passed / 0 failed / 4 ignored, exit 0, `outcome_trust: observed`, `job_01a00fe493ea71a1b0223b40b50335b7` (the new formatter control is server-gated and correctly absent under embed). |
+| Debug binary + both harness fixtures | Debug build current with the frozen bytes, then both `verify-tools.cjs` fixture sets. | **OBSERVED** — re-observed after the Round-2 repairs: build exit 0 (`job_01a00fe526477ac1a230f9e77d72f8ac`); synthetic fixture 7 PASS / 1 REVIEW / 0 FAIL and real fixture 10/1/0, the same two expected human-adjudicated REVIEW dispositions as the reviewed candidate. |
+| Release binary + both harness fixtures | Release build current with the frozen bytes, then both fixture sets against that exact binary. | **OBSERVED** — re-observed after the Round-2 repairs: build exit 0 in 346,950 ms with `outcome_trust: observed` (`job_01a00fe5456472f1aa079d16c022d156`); synthetic fixture 7/1/0 and real fixture 10/1/0 against that exact binary, agreeing exactly with debug; observed locally, not deferred to PR CI. |
+| Full suite | `cargo test --all-targets -- --test-threads=1` with a live `outcome_trust: observed` receipt on the final candidate. | **OBSERVED** — re-observed after the Round-2 repairs: exit 0, `outcome_trust: observed`, 587,665 ms, `job_01a00fdb584f7533ba7fb026d1e1961e`; the main library target reported 3,220 passed / 0 failed / 5 ignored and all 122 test targets completed cleanly. |
 | AAP receipt check | `python execution/aap_migration_receipt_v11.py --stage full --check`. | **OBSERVED** — exit 0; real lane 71 cases (35 resolution-failure, 33 compiles, 3 expected-failure), adapter lane 35 expected-failure rows; the regenerated receipt honestly flagged the dirty pre-commit worktree and its diff was discarded, since T052 does not mint a receipt. |
 | Non-closure commit | Commit the complete repaired candidate with a non-closure subject after all rows above are green. | **PENDING** — no SHA or subject is invented here. |
 | Fresh PR 4 review | Review one immutable committed full PR 4 range with no concurrent edits; adjudicate every substantive note. | **PENDING** — T052 needs a trustworthy CLEAN disposition. |
@@ -479,8 +520,10 @@ Principal frozen-byte SHA-256 values of the repaired paths at final observation
 are `tools.rs=3976dcce27263acae75dff541bc59d80b0127e0a1983424ee15e28f461ee78ce`,
 `protocol/mod.rs=6f001983e346821318078dcca0bfae24ca8ee8aa97e4055f8ad46c069012367f`,
 `format.rs=beee0cf2781b8476892c2aad1d5e0aa14dbe6661d083088796f66d2337e1e1b5`,
-`format/tests.rs=caa658bb082e664fd5ab895c9c222c19e89afe02affb798615946a1084833f0e`,
-`preventive_runtime_dark_v11.rs=bf886b930c23f216661528e116a4b444ff7da3850129810e756220b32f12ef27`,
+`format/tests.rs=69c6092aa1d51fc8156cfbc16c4f9282fbcce7784d842885a97819fd78f0cb3a`
+(after the Round-2 mixed-quadrant control),
+`preventive_runtime_dark_v11.rs=01a44f13796d3a999a659ab16d81788cf47aacc2bad5a1c344527c0e2d9b81ef`
+(after the Round-2 pin regeneration),
 and
 `validate-lifecycle-oracle-traceability.cjs=90d1de9617f0c17c3a78b97a012cde4fbf206247d5740aeaef5ed9b0d1e9d83a`.
 
