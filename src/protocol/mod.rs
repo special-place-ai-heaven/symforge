@@ -3234,6 +3234,7 @@ mod tests {
             "health_compact",
             "status",
             "context_inventory",
+            "symforge_retrieve",
         ] {
             let body = server
                 .proxy_tool_call(tool_name, &serde_json::json!({}))
@@ -3242,7 +3243,7 @@ mod tests {
             assert!(body.contains(&format!("tool={tool_name}")), "{body}");
         }
         let requests = requests.lock();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 10);
         for (tool_name, args) in requests.iter().skip(1) {
             assert_eq!(
                 args[crate::daemon::PRIVATE_PROJECT_ROUTE_PIN],
