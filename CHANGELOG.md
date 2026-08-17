@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.6.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.6.0...v10.6.1) (2026-08-17)
+
+
+### Bug Fixes
+
+* **feature-020:** carry the Slice 3 PR 4 landing into the release notes ([#582](https://github.com/special-place-ai-heaven/symforge/issues/582)) ([04537c8](https://github.com/special-place-ai-heaven/symforge/commit/04537c8b39a8b48be09a543e93381d487ef957aa))
+* **session-cache:** redeem read-path cache hits through CCR ([#583](https://github.com/special-place-ai-heaven/symforge/issues/583)) ([f48f37a](https://github.com/special-place-ai-heaven/symforge/commit/f48f37a4250fb087a2e709e551348864cd6bbad7))
+
 ## [10.6.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.5.0...v10.6.0) (2026-08-14)
 
 
