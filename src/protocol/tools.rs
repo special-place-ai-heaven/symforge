@@ -12270,6 +12270,13 @@ impl SymForgeServer {
         &self,
         params: Parameters<SymforgeRetrieveInput>,
     ) -> String {
+        // On a daemon connection every producing tool stores its CCR blob in
+        // the daemon-side session server, so redemption must reach that same
+        // store. Serving this from the adapter's own (empty) store made every
+        // advertised handle irredeemable (issue #585).
+        if let Some(result) = self.proxy_tool_call("symforge_retrieve", &params.0).await {
+            return result;
+        }
         let hash = params.0.hash.trim().to_lowercase();
         if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();

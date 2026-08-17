@@ -4075,6 +4075,7 @@ pub(crate) fn private_project_routed_tool(tool_name: &str) -> bool {
             | "health_compact"
             | "status"
             | "context_inventory"
+            | "symforge_retrieve"
     )
 }
 
@@ -9675,6 +9676,79 @@ mod tests {
             &first_runtime.token_stats,
             &second_runtime.token_stats,
         ));
+    }
+
+    /// Issue #585: on a daemon connection every producing tool stores its CCR
+    /// blob in the daemon-side session server, so `symforge_retrieve` must be
+    /// daemon-routed and redeem from THAT store. The adapter-side handler used
+    /// to answer from its own empty store, making every advertised handle
+    /// irredeemable.
+    #[tokio::test]
+    async fn symforge_retrieve_redeems_from_the_session_runtime_store() {
+        let project = project_dir("symforge-retrieve-session-store");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn redeemable() {}\n",
+        )
+        .expect("write source");
+        let state = Arc::new(DaemonState::new());
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "retriever".to_string(),
+                pid: None,
+            })
+            .expect("session");
+
+        let stored_body = "── symforge get_symbol ──\npub fn redeemable() {}\n";
+        let handle = {
+            let runtime = state
+                .runtime_for_target(&opened.session_id, None)
+                .expect("session runtime");
+            runtime
+                .server
+                .ccr_store
+                .lock()
+                .insert("get_symbol", stored_body.to_string())
+        };
+
+        // The daemon-private route pin must be accepted for this tool; the
+        // adapter synthesizes it for every selector-less daemon call.
+        let mut pinned = serde_json::json!({
+            "hash": handle,
+            crate::daemon::PRIVATE_PROJECT_ROUTE_PIN: opened.project_id.clone(),
+        });
+        assert_eq!(
+            take_private_project_route_pin("symforge_retrieve", &mut pinned)
+                .expect("the pin is legal for symforge_retrieve"),
+            Some(opened.project_id.clone()),
+        );
+
+        let runtime = state
+            .runtime_for_target(&opened.session_id, None)
+            .expect("session runtime");
+        let body = execute_tool_call(runtime, "symforge_retrieve", pinned)
+            .await
+            .expect("daemon-side retrieve dispatch");
+        assert_eq!(
+            body, stored_body,
+            "the daemon dispatch must round-trip the session store's exact bytes"
+        );
+
+        let runtime = state
+            .runtime_for_target(&opened.session_id, None)
+            .expect("session runtime");
+        let miss = execute_tool_call(
+            runtime,
+            "symforge_retrieve",
+            serde_json::json!({ "hash": "0123456789ab" }),
+        )
+        .await
+        .expect("a miss is a message, not a dispatch error");
+        assert!(
+            miss.contains("stale or expired"),
+            "an unknown handle must keep the honest miss message: {miss}"
+        );
     }
 
     #[test]
