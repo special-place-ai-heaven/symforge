@@ -32205,9 +32205,18 @@ mod tests {
         let cache_step = cache_plan.steps.first().expect("cache plan step");
         assert_eq!(cache_step.tool, "get_file_context");
         let cache_hash = crate::protocol::session::hash_file_context_params_json(&cache_step.args);
-        cache_server
-            .session_context
-            .record_file_context_fetch("src/lib.rs", cache_hash, 64);
+        // Seed a GENUINELY redeemable hit: the CCR blob exists on this
+        // connection, so only the selector guard can stop it being served.
+        let cache_handle = cache_server.ccr_store.lock().insert(
+            "get_file_context",
+            "seeded home-project evidence".to_string(),
+        );
+        cache_server.session_context.record_file_context_fetch(
+            "src/lib.rs",
+            cache_hash,
+            64,
+            &cache_handle,
+        );
         cache_request.project = Some("totally-other-project".to_string());
         let cache_call = SymforgeCallInput {
             request: cache_request,
@@ -32222,8 +32231,10 @@ mod tests {
         let text = tool_result_text(&serialized);
         assert!(
             (text.contains("not available on this connection")
-                || text.contains("cannot be resolved for a local facade-only result"))
-                && !text.contains("Decision: cache_hit"),
+                || text.contains("cannot be resolved for a local facade-only result")
+                || text.contains("cannot be resolved for safe HOME fallback"))
+                && !text.contains("Decision: cache_hit")
+                && !text.contains("seeded home-project evidence"),
             "a foreign cache hit must refuse before returning stored home-project evidence: {text}"
         );
     }
