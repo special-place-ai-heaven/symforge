@@ -31,7 +31,7 @@ current `main` after the previous pair merges (seal/census files serialize).
 
 **Purpose**: land the execution-spec docs so every pair PR can reference them
 
-- [ ] T001 Commit `specs/028-preventive-activation-cut/*` + the CLAUDE.md plan-pointer update on `feature-020-slice-4-candidates`, open a docs-only PR to `main`, and on green CI squash-merge with explicit `--subject "docs(feature-020): Slice 4 execution spec (speckit 028) (#N)" --body "..."` per the repo squash rules
+- [x] T001 Commit `specs/028-preventive-activation-cut/*` + the CLAUDE.md plan-pointer update on `feature-020-slice-4-candidates`, open a docs-only PR to `main`, and on green CI squash-merge with explicit `--subject "docs(feature-020): Slice 4 execution spec (speckit 028) (#N)" --body "..."` per the repo squash rules
 
 ---
 
@@ -52,11 +52,11 @@ as dark machinery (020:T053 + T059 + T060)
 **Independent Test**: `cargo test --test index_candidate_lifecycle_v11 -- --test-threads=1`
 GREEN; darkness seal proves the new modules unreachable from production.
 
-- [ ] T002 [US1] Branch `feature-020-s4-p1-candidate` from `main`; author RED `tests/index_candidate_lifecycle_v11.rs` with frozen names `closed_candidate_promotion_matrix` and `opaque_non_utf8_path_identity_is_lossless` plus the full 020:T053 case list (isolated build, publish-before-prune, retry supersession, all seven matrix outcomes, metadata-terminal exclusions, certificate-cannot-authorize-partial, failed/panicked discard); run only this file and record the observed RED output in the PR description (020:T053)
-- [ ] T003 [US1] Implement `src/index_lifecycle/supervisor.rs` — loader ownership, cancellation, attempt accounting, classified failure, retry triggers moved from the existing loader seams (020:T059)
-- [ ] T004 [US1] Implement `src/index_lifecycle/candidate.rs` — capacity-reserved isolated full/delta candidates, complete artifact certificates, one runtime-store commit point, `CatalogPath` native/opaque identity end-to-end, delta exact-validation of only the changed source token, no-allocation whole-root patch, same-source drift retry/abort, epochs-never-authorize; register both modules in `src/index_lifecycle/mod.rs` (020:T060)
-- [ ] T005 [US1] Extend `tests/preventive_runtime_dark_v11.rs` (constructor unreachability + census) to cover supervisor+candidate; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle only; reconcile the contract chain if census categories shift (quickstart step 3)
-- [ ] T006 [US1] Run the full gate battery serially via Terminal Commander (fmt, clippy -D warnings, all-targets serial suite, `--no-default-features --features embed --lib`, release build, verify-tools, npm) plus `node scripts/validate-lifecycle-oracle-traceability.cjs`; `cargo clean` if `target/` grew heavy
+- [x] T002 [US1] Branch `feature-020-s4-p1-candidate` from `main`; author RED `tests/index_candidate_lifecycle_v11.rs` with frozen names `closed_candidate_promotion_matrix` and `opaque_non_utf8_path_identity_is_lossless` plus the full 020:T053 case list (isolated build, publish-before-prune, retry supersession, all seven matrix outcomes, metadata-terminal exclusions, certificate-cannot-authorize-partial, failed/panicked discard); run only this file and record the observed RED output in the PR description (020:T053)
+- [x] T003 [US1] Implement `src/index_lifecycle/supervisor.rs` — loader ownership, cancellation, attempt accounting, classified failure, retry triggers moved from the existing loader seams (020:T059)
+- [x] T004 [US1] Implement `src/index_lifecycle/candidate.rs` — capacity-reserved isolated full/delta candidates, complete artifact certificates, one runtime-store commit point, `CatalogPath` native/opaque identity end-to-end, delta exact-validation of only the changed source token, no-allocation whole-root patch, same-source drift retry/abort, epochs-never-authorize; register both modules in `src/index_lifecycle/mod.rs` (020:T060)
+- [x] T005 [US1] Extend `tests/preventive_runtime_dark_v11.rs` (constructor unreachability + census) to cover supervisor+candidate; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle only; reconcile the contract chain if census categories shift (quickstart step 3)
+- [x] T006 [US1] Run the full gate battery serially via Terminal Commander (fmt, clippy -D warnings, all-targets serial suite, `--no-default-features --features embed --lib`, release build, verify-tools, npm) plus `node scripts/validate-lifecycle-oracle-traceability.cjs`; `cargo clean` if `target/` grew heavy
 - [ ] T007 [US1] One independent code review including the mandatory cfg-lens sweep; open PR; on green CI auto-squash-merge with explicit subject/body (spec FR-015/FR-016)
 
 **Checkpoint**: candidate pipeline GREEN dark on `main`; the Wave 1 workflow

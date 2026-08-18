@@ -782,6 +782,7 @@ fn source_splicing_is_allowlisted() {
 const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/adapters.rs",
     "index_lifecycle/authority.rs",
+    "index_lifecycle/candidate.rs",
     "index_lifecycle/capacity.rs",
     "index_lifecycle/embedded.rs",
     "index_lifecycle/mod.rs",
@@ -791,20 +792,21 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/public_api.rs",
     "index_lifecycle/registry.rs",
     "index_lifecycle/runtime.rs",
+    "index_lifecycle/supervisor.rs",
     "index_lifecycle/transition.rs",
     "server_api.rs",
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "09b51bdbe46837b860a7144387a643b5de4fbd2428fce4bc9ff651036aa6ebca",
-    13,
-    205_026,
+    "33f3885974de102a02ef57995e7262fa9914ea9f202c32beda4f74447c636d24",
+    15,
+    230_046,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "f1921916e8f5e98c1f3320305deae6498bf9c080a17e202cd1588212b1b2b189",
-    187,
-    8_991_024,
+    "1318b2b6efde06506d503205cfa126f02e7376b47639a3eec7c2473476d17a8d",
+    189,
+    9_016_044,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

@@ -27,12 +27,17 @@
 
 pub mod adapters;
 pub mod authority;
+// T059/T060: the dark per-source supervisor and isolated candidate pipeline.
+// In-directory and oracle-suite consumption only; T064/T066 activation is the
+// only planned production caller.
+pub mod candidate;
 pub mod capacity;
 pub mod embedded;
 pub mod mutation;
 pub mod physical_root;
 pub mod process_runtime;
 pub mod registry;
+pub mod supervisor;
 // T047: the dark V11 runtime. In-directory consumption only; the dark factory
 // is the single door and Slice 4's activation cut is the only planned caller.
 pub mod runtime;
