@@ -385,6 +385,28 @@ impl ProjectSourceAuthority {
         })
     }
 
+    /// [`Self::acquire_write`] with bounded patience for a sibling writer:
+    /// retries `PhaseNotCurrent` (~2s at 25ms steps) before surfacing the
+    /// refusal honestly. C4 replaces cross-lane patience with structural
+    /// serialization at bootstrap; until then every writer lane shares this
+    /// policy (protocol/edit.rs carries its own identical C2 loop).
+    pub fn acquire_write_serialized(self: &Arc<Self>) -> Result<WriteAuthority, AuthorityRefusal> {
+        let mut attempts = 0u32;
+        loop {
+            match self.acquire_write() {
+                Ok(write) => return Ok(write),
+                Err(refusal @ AuthorityRefusal::PhaseNotCurrent { .. }) => {
+                    attempts += 1;
+                    if attempts >= 80 {
+                        return Err(refusal);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(refusal) => return Err(refusal),
+            }
+        }
+    }
+
     /// Return the source to `Current` through a fresh publication after its
     /// permit reached a terminal path: retire the permit, then the sealed
     /// Freeze -> Drain -> Install transition under a fresh lease and binding.
@@ -472,10 +494,17 @@ static PROJECT_AUTHORITIES: OnceLock<Mutex<HashMap<PathBuf, Arc<ProjectSourceAut
 /// The process registry of per-root write authorities. C2's self-provisioning
 /// seam for the writer lanes; C4 moves ownership into runtime bootstrap.
 pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
+    // One authority per PHYSICAL root: spelling variants (canonical, \\?\
+    // extended, relative) must converge on one lease and one serialization
+    // point, or two writer lanes on the same repository would not contend.
+    // Canonicalization failure (root vanished mid-call) falls back to the
+    // literal key rather than refusing here: the acquire path surfaces the
+    // real I/O failure with its own evidence.
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = registry.lock().expect("project authority registry lock");
-    map.entry(root.to_path_buf())
-        .or_insert_with(|| ProjectSourceAuthority::for_root(root))
+    map.entry(key.clone())
+        .or_insert_with(|| ProjectSourceAuthority::for_root(&key))
         .clone()
 }
 

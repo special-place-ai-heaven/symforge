@@ -131,6 +131,22 @@ is the only thing allowed to touch it:
   paths, knowledge curation apply; gitignore/init/.gitattributes classified
   per contract (source-authorized hygiene vs permit-free ProjectStateDir and
   post-image team-artifact state writes → StateWriteAuthorized).
+- C2b (T029 writers census closed — executed 2026-08-19): gitignore hygiene
+  (`reconcile_root_gitignore` append) and the `.gitattributes` merge hint
+  (`persist.rs`) acquire the permit via the shared
+  `acquire_write_serialized`; the retired `atomic_replace` is deleted
+  (inventory-mismatch onset, §4b). The registry key canonicalizes so every
+  spelling of one physical root converges on one authority. Classification
+  adjudications recorded in-file: `cli/init.rs::run_init_with_paths` writes
+  only user-scope client configs (permit-free; repo-source writing delegated
+  to the hygiene lane); `edit_tools.rs` census members delegate all disk I/O
+  to the `edit.rs::atomic_write_file` chokepoint; curation ledger writes
+  (state dir) are permit-free `StateWriteAuthorized`, while the POLICY file
+  `.symforge-knowledge.toml` at the repository root is repository-source —
+  its two writers (`write_policy` apply path, `recover_on_project_load`
+  recovery) are source-authorized and take the permit lane at C3 with the
+  callback registration (recorded residual, alongside C2's worktree-reroute
+  residual in `edit.rs`).
 - C3 (T029 observation lane): watcher process_events + single_file admission
   route through the isolated candidate pipeline permit-free; background
   verify / git_temporal / local-ref / periodic checkpoint callbacks register
@@ -184,9 +200,25 @@ census against the frozen atom sets (`resolvePublicApiLifecycle`):
   rerouted writers are fine after the flip.
 
 **Planned mid-cut state**: from C2 until C5 the validator is expected RED
-with exactly `RETIREMENT_CLOSURE_MISMATCH` (edited censused files) and,
-once D1 removes `index: SharedIndex` fields, `RETIREMENT_SOURCE_INVENTORY_
-MISMATCH`. Any other failure code in that window is a real defect. The
+with exactly these codes, verified against the live run at each commit:
+
+- `RETIREMENT_CLOSURE_MISMATCH` for every category whose censused FILES a
+  landed commit edited — `writers` from C2; `callbacks` joins at C2b
+  because `persist.rs` and `knowledge_curation.rs` sit in both categories'
+  path closures; further categories join as C3/C4 touch their files.
+- `RETIREMENT_SOURCE_INVENTORY_MISMATCH` for each retired name-anchored
+  member (`extra_in_contract`), plus its mechanical shadow
+  `PREACTIVATION_SOURCE_ANCHOR_UNRESOLVED` for the same member: one
+  deletion produces both, since the frozen contract still names an anchor
+  the live tree no longer holds. First member:
+  `src/gitignore_hygiene.rs::atomic_replace` at C2b (earlier than first
+  planned — the original note expected the inventory mismatch only at D1's
+  `index: SharedIndex` field removals, which will add their own rows).
+
+Any failure code outside this enumeration in that window is a real defect.
+Observed at C2b (2026-08-19): exactly the four lines the enumeration
+predicts — closure mismatch (writers, callbacks), inventory mismatch +
+anchor shadow (atomic_replace). The
 validator returns green via the postactivation path at C5; that is a hard
 PR exit criterion. Tool profiles (full=39 / compact=3) must hold in BOTH
 lifecycles.

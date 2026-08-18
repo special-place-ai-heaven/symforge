@@ -1075,8 +1075,27 @@ fn ensure_gitattributes_merge_hint(project_root: &Path) -> anyhow::Result<()> {
     }
     updated.push_str(HINT_LINE);
     updated.push('\n');
-    std::fs::write(&path, updated)
-        .map_err(|e| anyhow::anyhow!("writing .gitattributes at {}: {}", path.display(), e))?;
+    // V11 writer lane (Feature 020 Slice 4, T064): `.gitattributes` is a
+    // repository-source byte write and routes through a SourceMutationPermit.
+    // The sibling artifact writes in this export lane (`index.bin.zst`,
+    // `artifact.json`) are post-image team-artifact STATE writes and stay
+    // permit-free per the frozen retirement contract.
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(project_root);
+    let mut write = authority.acquire_write_serialized().map_err(|refusal| {
+        anyhow::anyhow!("acquiring write authority for .gitattributes: {refusal:?}")
+    })?;
+    let receipt = write
+        .write(Path::new(".gitattributes"), updated.as_bytes())
+        .map_err(|refusal| {
+            anyhow::anyhow!("writing .gitattributes at {}: {refusal:?}", path.display())
+        })?;
+    write.finish_committed(receipt).map_err(|refusal| {
+        anyhow::anyhow!(
+            "committing .gitattributes at {}: {refusal:?}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -2561,6 +2580,38 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/git/test_helpers.rs"
         ));
+    }
+
+    /// Feature 020 Slice 4, T064 (writers lane): the `.gitattributes` merge
+    /// hint is a repository-source byte write and must route through the
+    /// source mutation permit. The sibling artifact writes in the same export
+    /// lane are post-image team-artifact STATE writes and stay permit-free
+    /// per the frozen retirement contract.
+    #[test]
+    fn gitattributes_merge_hint_routes_through_the_source_mutation_permit() {
+        let dir = tempfile::TempDir::new().expect("fixture root");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let before = authority.grants_issued();
+
+        super::ensure_gitattributes_merge_hint(dir.path()).expect("hint write");
+
+        let written = std::fs::read_to_string(dir.path().join(".gitattributes")).expect("read");
+        assert!(
+            written
+                .lines()
+                .any(|line| line.trim() == "*.zst merge=ours")
+        );
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "the hint append must obtain a SourceMutationPermit"
+        );
+        assert!(authority.is_current());
+
+        // Idempotent second call: hint already present, no write, no grant.
+        super::ensure_gitattributes_merge_hint(dir.path()).expect("idempotent");
+        assert_eq!(authority.grants_issued(), before + 1);
     }
 
     /// Task #22 (embed snapshot export): the one-argument embedder entry

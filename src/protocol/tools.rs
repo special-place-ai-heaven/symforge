@@ -5839,6 +5839,10 @@ impl SymForgeServer {
         statused_tool_result(output, outcome_class)
     }
 
+    // V11 write classification (Feature 020 Slice 4, T064): this censused
+    // writer performs no disk I/O itself — every byte lands through
+    // `knowledge_curation.rs`, whose writers carry the classification split
+    // (state-dir ledger permit-free; repo-root policy file source-authorized).
     pub(crate) async fn curate_knowledge(
         &self,
         params: Parameters<CurateKnowledgeInput>,

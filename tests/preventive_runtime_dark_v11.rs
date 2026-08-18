@@ -429,7 +429,11 @@ const INGRESS_LANES: &[(&str, &str)] = &[
 /// edge. This is the inversion the frozen retirement contract prescribes:
 /// "After activation, the executed Slice 4 reachability cases replace the
 /// preactivation census."
-const WIRED_PRODUCTION_FILES: &[&str] = &["src/protocol/edit.rs"];
+const WIRED_PRODUCTION_FILES: &[&str] = &[
+    "src/gitignore_hygiene.rs",
+    "src/live_index/persist.rs",
+    "src/protocol/edit.rs",
+];
 
 #[test]
 fn dark_call_edges_appear_only_in_the_wired_roster() {
@@ -836,15 +840,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "325442368dfbba1dda26f7cbab0a1589811be6b06a0340ef5c35ee9ad2b0642d",
+    "f0932995dd3662b5590a9cad310550faa3ff21019d83ffde7aa29258a7167321",
     20,
-    344_501,
+    345_999,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ebd3fe3d5f1407a0ae36d095d06dc2583d0dc1ad0718c20ed6f697e95dcc5ecb",
+    "c3c2ff51a10c8ee80b5184d3b7e82af00771e2658afbcaca568267f1e2bb7702",
     194,
-    9_135_497,
+    9_143_623,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

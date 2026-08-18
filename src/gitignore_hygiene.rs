@@ -1,7 +1,6 @@
 use crate::domain::{AccessErrorKind, GitignoreHygiene};
 use ignore::gitignore::GitignoreBuilder;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -145,9 +144,29 @@ where
         Ok(_) => return unverifiable(AccessErrorKind::Other),
         Err(error) => return unverifiable(error_kind(&error)),
     }
-    match atomic_replace(&path, &updated, &metadata) {
-        Ok(()) => GitignoreHygieneReport::new(GitignoreHygiene::Effective, true),
-        Err(error) => unverifiable(error_kind(&error)),
+    // V11 writer lane (Feature 020 Slice 4, T064): the hygiene append is
+    // source-authorized per the frozen retirement contract, so the bytes go
+    // through a SourceMutationPermit and land beneath the root lease. Every
+    // refusal collapses to the bounded `Other` reason: no gate distinguishes
+    // write-path causes, and the report deliberately carries no path or
+    // message. Mid-cut residual (execution map, C2b): the leased write does
+    // not re-apply the original file's permission bits the way the retired
+    // `atomic_replace` did; nothing pins that behavior.
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(repository_root);
+    let mut write = match authority.acquire_write_serialized() {
+        Ok(write) => write,
+        Err(_) => return unverifiable(AccessErrorKind::Other),
+    };
+    let receipt = match write.write(Path::new(".gitignore"), &updated) {
+        Ok(receipt) => receipt,
+        // Dropping `write` here strands the source non-`Current` — the
+        // honest outcome until the C3 re-scout recovery lane lands.
+        Err(_) => return unverifiable(AccessErrorKind::Other),
+    };
+    match write.finish_committed(receipt) {
+        Ok(_) => GitignoreHygieneReport::new(GitignoreHygiene::Effective, true),
+        Err(_) => unverifiable(AccessErrorKind::Other),
     }
 }
 
@@ -203,21 +222,6 @@ fn first_newline(bytes: &[u8]) -> &'static [u8] {
         }
     }
     b"\n"
-}
-
-fn atomic_replace(path: &Path, content: &[u8], metadata: &fs::Metadata) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "gitignore has no parent")
-    })?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary
-        .as_file()
-        .set_permissions(metadata.permissions())?;
-    temporary.write_all(content)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
 }
 
 fn is_unsafe_gitignore_entry(metadata: &fs::Metadata) -> bool {
@@ -462,5 +466,45 @@ mod tests {
         assert!(!report.changed);
         assert_eq!(fs::read(target).unwrap(), b"outside/\n");
         assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    /// Feature 020 Slice 4, T064 (writers lane): the hygiene append is
+    /// source-authorized — it must route through the source mutation permit,
+    /// not write the repository byte-for-byte itself. Pinned on the grant
+    /// counter: a write that bypassed the permit lane leaves it unmoved.
+    #[test]
+    fn reconcile_routes_through_the_source_mutation_permit() {
+        let repository = repository();
+        let gitignore = repository.path().join(".gitignore");
+        fs::write(&gitignore, b"target/\n").unwrap();
+        let authority = crate::live_index::index_lifecycle::activation::project_source_authority(
+            repository.path(),
+        );
+        let before = authority.grants_issued();
+
+        let report = reconcile_root_gitignore(
+            repository.path(),
+            GitignoreHygieneAuthority::ExplicitNormalBinding,
+        );
+
+        assert_eq!(report.status, GitignoreHygiene::Effective);
+        assert!(report.changed);
+        assert_eq!(fs::read(&gitignore).unwrap(), b"target/\n/.symforge/\n");
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "the hygiene append must obtain a SourceMutationPermit"
+        );
+        assert!(authority.is_current());
+
+        // The read-only outcomes never touch the permit lane: an already
+        // effective rule issues no grant.
+        let second = reconcile_root_gitignore(
+            repository.path(),
+            GitignoreHygieneAuthority::ExplicitNormalBinding,
+        );
+        assert_eq!(second.status, GitignoreHygiene::Effective);
+        assert!(!second.changed);
+        assert_eq!(authority.grants_issued(), before + 1);
     }
 }

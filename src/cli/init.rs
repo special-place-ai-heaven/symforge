@@ -246,6 +246,13 @@ pub fn run_init_with_context(
     run_init_with_paths(client, paths, home_dir, working_dir, binary_path)
 }
 
+// V11 write classification (Feature 020 Slice 4, T064): this censused
+// writer's own disk writes are USER-SCOPE client registrations (Claude/
+// Codex/Gemini/... settings, config, and guidance files under the home
+// directory) — outside any repository root, so permit-free by
+// classification. Its only repository-source writing is delegated to the
+// gitignore hygiene lane below, which is source-authorized and acquires
+// the SourceMutationPermit inside `gitignore_hygiene.rs`.
 fn run_init_with_paths(
     client: InitClient,
     paths: InitPaths,

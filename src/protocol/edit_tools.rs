@@ -1,3 +1,11 @@
+// V11 write classification (Feature 020 Slice 4, T064): every censused
+// writer tool in this file (`replace_symbol_body`, `insert_symbol`,
+// `delete_symbol`, `edit_within_symbol`, `batch_edit`, `batch_rename`,
+// `batch_insert`) performs no disk I/O of its own — all repository-source
+// bytes land through `edit.rs::atomic_write_file`, the permit-gated
+// chokepoint, so the SourceMutationPermit is acquired there exactly once
+// per write cycle.
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

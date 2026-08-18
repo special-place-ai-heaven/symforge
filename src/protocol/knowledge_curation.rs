@@ -1,4 +1,16 @@
 //! Preview-first, ledger-only repository knowledge curation.
+//!
+//! V11 write classification (Feature 020 Slice 4, T064): the censused
+//! writers in this file split two ways. The curation LEDGER writes —
+//! replay records, catalog lineage, quarantine, all via `durable_replace`/
+//! `durable_replace_io` into the resolved curation STATE directory — are
+//! permit-free `StateWriteAuthorized` writes per the frozen retirement
+//! contract. The POLICY file (`.symforge-knowledge.toml` at the repository
+//! root) is repository-source bytes: its two writers (`write_policy` on
+//! the apply path, the `durable_replace` recovery in
+//! `recover_on_project_load`) are source-authorized and take the
+//! `SourceMutationPermit` lane at C3 together with the callback
+//! registration this file owes (execution map, C2b residual).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
