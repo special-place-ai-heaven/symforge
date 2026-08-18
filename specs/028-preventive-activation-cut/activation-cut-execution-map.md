@@ -147,6 +147,23 @@ is the only thing allowed to touch it:
   recovery) are source-authorized and take the permit lane at C3 with the
   callback registration (recorded residual, alongside C2's worktree-reroute
   residual in `edit.rs`).
+- C3a (T029 observation lane core — executed 2026-08-19): the
+  ProjectSourceAuthority gains the observation lane — per-source
+  supervisors, the isolated delta-candidate pipeline to its single commit
+  point, the bounded coalescing accumulator, and the ObserverSlot with the
+  ObserverId/ObserverToken unification (publications carry the ACTIVE
+  incarnation's token; the two accumulator latches the observer module
+  recorded as T064 obligations are threaded: handoff barrier at
+  registration, scope-dirty for recovery). Every permit return consumes the
+  accumulated cut. WriteAuthority drop now RECOVERS through the re-scout
+  lane (scope-dirty full baseline) — the C2 stranding oracle inverted
+  RED-first. Wired: watcher run-loop registers one incarnation per
+  instance; process_events observes admissions/removals under it (stale
+  incarnations refused — late callbacks unreachable); overflow latches the
+  gap; the embed facade update/remove observe as the current incarnation.
+  Recorded residuals: periodic/fresh reconciliation sweeps observe only
+  through the barrier/gap latches (their per-file re-admissions join at
+  C4); data-plane admissions keep the V10 generation fence until C4.
 - C3 (T029 observation lane): watcher process_events + single_file admission
   route through the isolated candidate pipeline permit-free; background
   verify / git_temporal / local-ref / periodic checkpoint callbacks register

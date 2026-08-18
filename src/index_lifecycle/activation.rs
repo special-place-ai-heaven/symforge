@@ -23,7 +23,7 @@
 //! serves only in `PreventiveV1Open`, and the window between them is
 //! drain-only.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -32,9 +32,17 @@ use super::authority::{
     AuthorityRefusal, BindingAuthority, CurrentPublication, MutationGrantInput, ObserverToken,
     SourceRuntime,
 };
+use super::candidate::{
+    CandidateSource, IsolatedCandidate, ProjectArtifactRoot, SourceContentToken, SourceId,
+    SourceObservation,
+};
+use super::capacity::{OwnerIdentity, ProcessCapacityPool};
 use super::mutation::{PermitDrainSignal, RefreshTicket, SourceMutationPermit};
+use super::observer::{CoalescingAccumulator, ObservationCut, ObserverId, ObserverSlot};
 use super::physical_root::{PhysicalRootLease, WriteReceipt};
+use super::supervisor::SourceSupervisor;
 use super::transition::{self, TransitionKind};
+use crate::domain::index::CatalogPath;
 use crate::lifecycle_identity::PublicationIdentity;
 
 /// The closed three-mode machine (frozen T066). Monotonic: the enum has no
@@ -270,16 +278,19 @@ impl ActivationCut {
     }
 }
 
-// ── The write-lane bridge (T064, C2) ───────────────────────────────────────
+// ── The write-lane bridge (T064, C2) and observation lane (T029, C3) ───────
 
 /// One project root's live source authority: the bridge the cut's writer
-/// lanes acquire mutation permits from.
+/// lanes acquire mutation permits from, and the observation lane the
+/// watcher/facade admissions and background callbacks report through.
 ///
 /// MID-CUT BRIDGING CLAIM, recorded: construction seeds the runtime
 /// `Current` on a fresh publication because the V10 data plane it stands
 /// beside serves queries today; C4 ties construction to observed bootstrap
-/// state and C3 replaces the fresh [`ObserverToken`] minted at each
-/// reconcile with the real accumulated observer cut. Neither simplification
+/// state. Since C3 every publication carries the ACTIVE observer
+/// incarnation's token (the `ObserverId`/`ObserverToken` unification the
+/// observer module recorded as T064 work), and every permit return consumes
+/// the accumulated observation cut. Neither remaining simplification
 /// weakens the write path itself: every write still requires a granted
 /// permit, publishes non-`Current` first, and returns to `Current` only
 /// through a fresh publication (FR-043).
@@ -287,6 +298,10 @@ impl ActivationCut {
 pub struct ProjectSourceAuthority {
     root: PathBuf,
     inner: Mutex<AuthorityInner>,
+    // Separate mutex, strict ordering: lane state is always taken and
+    // RELEASED before `inner` is locked (see `reconcile_returned`), so the
+    // watcher thread's observations never deadlock against a writer.
+    lane: Mutex<ObservationLane>,
 }
 
 #[derive(Debug)]
@@ -296,14 +311,58 @@ struct AuthorityInner {
     outstanding: Arc<PermitDrainSignal>,
 }
 
+/// The C3 observation lane: one active observer incarnation (watcher or
+/// embed facade), the bounded coalescing accumulator, and the per-source
+/// supervisor + isolated-candidate pipeline every admission drives —
+/// PERMIT-FREE, per the frozen contract (observation never mutates source
+/// bytes; it has no business in the mutation lane).
+///
+/// D1 applies: this is the AUTHORITY plane. The LiveIndex data plane keeps
+/// serving admissions itself mid-cut; the lane runs the frozen lifecycle
+/// semantics beside it (dark stamp payloads) until C4/C5 make it the root.
+#[derive(Debug)]
+struct ObservationLane {
+    slot: ObserverSlot,
+    /// The authority-side token paired with the active `ObserverId`.
+    active_token: ObserverToken,
+    accumulator: CoalescingAccumulator,
+    supervisors: BTreeMap<u64, SourceSupervisor>,
+    artifact_root: ProjectArtifactRoot,
+    pool: Arc<ProcessCapacityPool>,
+    owner: OwnerIdentity,
+    next_observer: u64,
+    next_stamp: u64,
+    /// Probe for the wiring oracles: the cut the most recent permit return
+    /// consumed.
+    last_reconcile_cut: Option<ObservationCut>,
+}
+
+/// Bounded distinct pending sources before the accumulator latches the
+/// capacity-exhausted full baseline.
+const OBSERVATION_ACCUMULATOR_BOUND: usize = 4096;
+
+/// Dark capacity budget for the observation lane's candidate builds. Real
+/// derivation payloads (and the C8 conservation oracle) replace this.
+const OBSERVATION_CAPACITY_BYTES: u64 = 1 << 30;
+
+fn observation_source_id(relative: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    relative.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// A granted, in-progress write on one project source. Non-Clone; ends by
 /// [`WriteAuthority::finish_committed`], [`WriteAuthority::finish_no_side_effect`],
-/// or drop (which drains the permit and leaves the source non-`Current` —
-/// honest stranding until the C3 re-scout lane lands).
+/// or drop — since C3 a drop RECOVERS: the permit drains, the scope latches
+/// dirty (the write's outcome is unobserved), and the source returns to
+/// `Current` under a full-baseline observation instead of stranding.
 #[derive(Debug)]
 pub struct WriteAuthority {
     authority: Arc<ProjectSourceAuthority>,
-    permit: SourceMutationPermit,
+    /// `None` only after a finish path has taken it; `Drop` treats that as
+    /// "already terminal, nothing to recover".
+    permit: Option<SourceMutationPermit>,
     frozen_publication: PublicationIdentity,
 }
 
@@ -313,7 +372,14 @@ impl ProjectSourceAuthority {
     pub fn for_root(root: &Path) -> Arc<Self> {
         let lease = Arc::new(PhysicalRootLease::take(root));
         let binding = BindingAuthority::bind(lease.identity());
-        let publication = CurrentPublication::promote(binding, ObserverToken::fresh());
+        // The seed publication carries the SEED observer incarnation's
+        // token — the same identity `active_token` starts on — so even the
+        // first publication names a real registration, not an anonymous
+        // mint.
+        let seed_token = ObserverToken::fresh();
+        let publication = CurrentPublication::promote(binding, seed_token);
+        let pool = ProcessCapacityPool::new();
+        let owner = pool.root(OBSERVATION_CAPACITY_BYTES);
         Arc::new(Self {
             root: root.to_path_buf(),
             inner: Mutex::new(AuthorityInner {
@@ -324,7 +390,139 @@ impl ProjectSourceAuthority {
                 // drained rather than as an optional check.
                 outstanding: Arc::new(PermitDrainSignal::new()),
             }),
+            lane: Mutex::new(ObservationLane {
+                slot: ObserverSlot::new(ObserverId(1)),
+                active_token: seed_token,
+                accumulator: CoalescingAccumulator::new(OBSERVATION_ACCUMULATOR_BOUND),
+                supervisors: BTreeMap::new(),
+                artifact_root: ProjectArtifactRoot::empty(),
+                pool,
+                owner,
+                next_observer: 1,
+                next_stamp: 0,
+                last_reconcile_cut: None,
+            }),
         })
+    }
+
+    /// Register a fresh observer incarnation (watcher (re)start, facade
+    /// attach): a drain-before-successor handoff on the slot, a fresh
+    /// authority-side token, and the successor's post-barrier full-baseline
+    /// obligation latched into the cut stream. Late callbacks holding the
+    /// predecessor's id are refused by every observation entry point below.
+    pub fn register_observer(&self) -> ObserverId {
+        let mut lane = self.lane.lock().expect("observation lane lock");
+        lane.next_observer += 1;
+        let successor = ObserverId(lane.next_observer);
+        lane.slot
+            .begin_handoff(successor)
+            .expect("registration completes each handoff before returning");
+        // The lane consumes cuts at reconcile, so the predecessor never
+        // holds undelivered cuts here; deliver anyway so the refusal path
+        // stays unreachable by construction, not by luck.
+        let _ = lane.slot.deliver_pending();
+        let kind = lane
+            .slot
+            .complete_handoff()
+            .expect("predecessor delivered above");
+        debug_assert_eq!(
+            kind,
+            super::observer::CutKind::FullBaseline {
+                cause: super::observer::LatchCause::HandoffBarrier
+            }
+        );
+        // Thread the returned obligation into the cut stream (T064).
+        lane.accumulator.latch_handoff_barrier();
+        lane.active_token = ObserverToken::fresh();
+        successor
+    }
+
+    /// The observer incarnation currently holding the slot.
+    pub fn active_observer(&self) -> ObserverId {
+        self.lane
+            .lock()
+            .expect("observation lane lock")
+            .slot
+            .active()
+    }
+
+    /// Observe one admitted source through the isolated candidate pipeline,
+    /// permit-free: supervisor attempt -> delta candidate -> the single
+    /// commit point -> accumulator. A stale incarnation is refused — the
+    /// late-callback unreachability the frozen contract demands.
+    pub fn observe_admission(
+        &self,
+        observer: ObserverId,
+        relative: &str,
+    ) -> Result<(), ObserverId> {
+        let mut lane = self.lane.lock().expect("observation lane lock");
+        if lane.slot.active() != observer {
+            return Err(lane.slot.active());
+        }
+        lane.observe_admission_locked(relative);
+        Ok(())
+    }
+
+    /// Observe one removal. The dark candidate pipeline carries no removal
+    /// payload (recorded bridging simplification): the removal lands as an
+    /// accumulator invalidation only.
+    pub fn observe_removal(&self, observer: ObserverId, relative: &str) -> Result<(), ObserverId> {
+        let mut lane = self.lane.lock().expect("observation lane lock");
+        if lane.slot.active() != observer {
+            return Err(lane.slot.active());
+        }
+        lane.next_stamp += 1;
+        let stamp = lane.next_stamp;
+        lane.accumulator
+            .observe(observation_source_id(relative), || stamp);
+        Ok(())
+    }
+
+    /// Report a lost/overflowed observation stream (watcher overflow):
+    /// latches the gap so the next cut is a full baseline.
+    pub fn report_gap(&self, observer: ObserverId) -> Result<(), ObserverId> {
+        let mut lane = self.lane.lock().expect("observation lane lock");
+        if lane.slot.active() != observer {
+            return Err(lane.slot.active());
+        }
+        lane.accumulator.report_gap();
+        Ok(())
+    }
+
+    /// [`Self::observe_admission`] attributed to the CURRENT incarnation —
+    /// the synchronous facade entry (embed `update_file_from_disk`), which
+    /// holds no id across time and so cannot be a late callback.
+    pub fn observe_admission_active(&self, relative: &str) {
+        let mut lane = self.lane.lock().expect("observation lane lock");
+        lane.observe_admission_locked(relative);
+    }
+
+    /// [`Self::observe_removal`] attributed to the current incarnation.
+    pub fn observe_removal_active(&self, relative: &str) {
+        let mut lane = self.lane.lock().expect("observation lane lock");
+        lane.next_stamp += 1;
+        let stamp = lane.next_stamp;
+        lane.accumulator
+            .observe(observation_source_id(relative), || stamp);
+    }
+
+    /// Wiring-oracle probe: how many observation candidates for `relative`
+    /// have reached the single commit point.
+    pub fn committed_observations(&self, relative: &str) -> u64 {
+        let lane = self.lane.lock().expect("observation lane lock");
+        lane.supervisors
+            .get(&observation_source_id(relative))
+            .map(|supervisor| supervisor.committed_generations())
+            .unwrap_or(0)
+    }
+
+    /// Wiring-oracle probe: the cut the most recent permit return consumed.
+    pub fn last_reconcile_cut(&self) -> Option<ObservationCut> {
+        self.lane
+            .lock()
+            .expect("observation lane lock")
+            .last_reconcile_cut
+            .clone()
     }
 
     /// Whether the source is live `Current` (queryable, grantable).
@@ -380,7 +578,7 @@ impl ProjectSourceAuthority {
         inner.outstanding = drain;
         Ok(WriteAuthority {
             authority: self.clone(),
-            permit,
+            permit: Some(permit),
             frozen_publication,
         })
     }
@@ -415,6 +613,25 @@ impl ProjectSourceAuthority {
         frozen_publication: PublicationIdentity,
         ticket: RefreshTicket,
     ) -> Result<RefreshTicket, AuthorityRefusal> {
+        self.return_to_current(frozen_publication)?;
+        Ok(ticket)
+    }
+
+    /// The shared return path: consume the accumulated observation cut
+    /// (lane lock, released before `inner` is taken — the documented lock
+    /// order), then retire the permit and apply the sealed transition. The
+    /// returning publication carries the ACTIVE observer incarnation's
+    /// token.
+    fn return_to_current(
+        &self,
+        frozen_publication: PublicationIdentity,
+    ) -> Result<(), AuthorityRefusal> {
+        let observer_cut = {
+            let mut lane = self.lane.lock().expect("observation lane lock");
+            let cut = lane.accumulator.cut();
+            lane.last_reconcile_cut = Some(cut);
+            lane.active_token
+        };
         let mut guard = self.inner.lock().expect("project source authority lock");
         let inner = &mut *guard;
         inner.runtime.retire_permit(frozen_publication);
@@ -427,14 +644,78 @@ impl ProjectSourceAuthority {
             TransitionKind::Reload,
             &old_lease,
             incoming,
-            // MID-CUT: a fresh token stands in for the accumulated observer
-            // cut until C3 wires the real accumulator (execution map, seal
-            // section).
-            ObserverToken::fresh(),
+            observer_cut,
             &outstanding,
         )?;
         inner.lease = new_lease;
-        Ok(ticket)
+        Ok(())
+    }
+
+    /// The C3 re-scout recovery lane: a write authority dropped without a
+    /// finish path leaves a write of UNOBSERVED outcome behind. Latch the
+    /// scope dirty (the next cut is a full baseline over the possibly
+    /// half-written scope), then return the source to `Current` exactly
+    /// like a terminal return. Failure here leaves the source non-`Current`
+    /// and observable as such — recovery is attempted, never asserted.
+    fn recover_stranded(
+        &self,
+        frozen_publication: PublicationIdentity,
+    ) -> Result<(), AuthorityRefusal> {
+        self.lane
+            .lock()
+            .expect("observation lane lock")
+            .accumulator
+            .latch_scope_dirty();
+        self.return_to_current(frozen_publication)
+    }
+}
+
+impl ObservationLane {
+    /// One admitted source through the pipeline: supervisor attempt ->
+    /// isolated delta candidate (dark stamp payload) -> the single commit
+    /// point -> accumulator. A refused candidate (capacity, drift,
+    /// supersession) latches a gap: the CHANGE is retained as a
+    /// full-baseline obligation, never dropped.
+    fn observe_admission_locked(&mut self, relative: &str) {
+        let source_raw = observation_source_id(relative);
+        self.next_stamp += 1;
+        let stamp = self.next_stamp;
+        let supervisor = self.supervisors.entry(source_raw).or_default();
+        let attempt = supervisor.begin_attempt();
+        let source = SourceId(source_raw);
+        let expected = self
+            .artifact_root
+            .load()
+            .sources
+            .get(&source)
+            .map(|artifacts| artifacts.token);
+        let candidate = IsolatedCandidate::prepare_delta(
+            &self.pool,
+            self.owner,
+            &attempt,
+            CandidateSource {
+                id: source,
+                observation: SourceObservation::Content {
+                    path: CatalogPath {
+                        public_id: relative.to_string(),
+                        normalized_utf8: Some(relative.to_string()),
+                    },
+                    token: SourceContentToken(stamp),
+                    bytes: 1,
+                },
+            },
+            expected,
+            |_| stamp,
+        );
+        let committed = match candidate {
+            Ok(candidate) => candidate.commit(&self.artifact_root).is_ok(),
+            Err(_) => false,
+        };
+        if committed {
+            self.accumulator.observe(source_raw, || stamp);
+        } else {
+            self.accumulator.report_gap();
+        }
     }
 }
 
@@ -447,44 +728,67 @@ impl WriteAuthority {
         relative: &Path,
         contents: &[u8],
     ) -> Result<WriteReceipt, AuthorityRefusal> {
-        match self.permit.start_side_effect() {
+        let permit = self
+            .permit
+            .as_mut()
+            .expect("permit lives until a finish path");
+        match permit.start_side_effect() {
             Ok(()) => {}
             // Continuing the batch: the side effect is already in flight.
             Err(AuthorityRefusal::SideEffectAlreadyInFlight) => {}
             Err(refusal) => return Err(refusal),
         }
-        self.permit.replace_beneath(relative, contents)
+        permit.replace_beneath(relative, contents)
     }
 
     /// Commit the observed side effect and return the source to `Current`
     /// through a fresh publication: retire the permit, then apply the sealed
     /// Freeze -> Drain -> Install transition under a fresh root lease and
-    /// binding.
+    /// binding. A commit REFUSAL leaves the permit in place, so the drop
+    /// recovery below still returns the source to `Current`.
     pub fn finish_committed(
-        self,
+        mut self,
         receipt: WriteReceipt,
     ) -> Result<RefreshTicket, AuthorityRefusal> {
-        let WriteAuthority {
-            authority,
-            mut permit,
-            frozen_publication,
-        } = self;
-        let ticket = permit.commit(receipt)?;
-        authority.reconcile_returned(frozen_publication, ticket)
+        let ticket = self
+            .permit
+            .as_mut()
+            .expect("permit lives until a finish path")
+            .commit(receipt)?;
+        drop(self.permit.take());
+        self.authority
+            .clone()
+            .reconcile_returned(self.frozen_publication, ticket)
     }
 
     /// Terminate with the permit's own observation that nothing was written
     /// through its lease (the permit never began a side effect), and return
     /// the source to `Current` through a fresh publication — FR-043 applies
-    /// to no-ops too. Refuses once a side effect has begun.
-    pub fn finish_no_side_effect(self) -> Result<RefreshTicket, AuthorityRefusal> {
-        let WriteAuthority {
-            authority,
-            mut permit,
-            frozen_publication,
-        } = self;
-        let ticket = permit.no_side_effect()?;
-        authority.reconcile_returned(frozen_publication, ticket)
+    /// to no-ops too. Refuses once a side effect has begun (the drop
+    /// recovery then owns the return).
+    pub fn finish_no_side_effect(mut self) -> Result<RefreshTicket, AuthorityRefusal> {
+        let ticket = self
+            .permit
+            .as_mut()
+            .expect("permit lives until a finish path")
+            .no_side_effect()?;
+        drop(self.permit.take());
+        self.authority
+            .clone()
+            .reconcile_returned(self.frozen_publication, ticket)
+    }
+}
+
+impl Drop for WriteAuthority {
+    /// The re-scout recovery lane (C3): a write authority dropped while its
+    /// permit is still live drains the permit and returns the source to
+    /// `Current` under a scope-dirty full-baseline observation. A finish
+    /// path already took the permit, so its drop is a no-op here.
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+            let _ = self.authority.recover_stranded(self.frozen_publication);
+        }
     }
 }
 
@@ -698,6 +1002,7 @@ mod activation_oracles {
 mod write_authority_oracles {
     use super::ProjectSourceAuthority;
     use crate::live_index::index_lifecycle::authority::AuthorityRefusal;
+    use crate::live_index::index_lifecycle::observer::{CutKind, LatchCause};
 
     fn a_temp_root(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -806,24 +1111,146 @@ mod write_authority_oracles {
     }
 
     #[test]
-    fn dropped_write_authority_strands_non_current_until_re_scout() {
+    fn dropped_write_authority_recovers_current_through_a_scope_dirty_baseline() {
         let root = a_temp_root("dropped");
         let authority = ProjectSourceAuthority::for_root(&root);
+        let before = authority.current_publication().expect("publication");
 
         let write = authority.acquire_write().expect("grant");
         drop(write);
 
-        // The drained permit's write state is unobserved, so the bridge must
-        // NOT claim Current. Recovery is the C3 re-scout lane's obligation,
-        // recorded in the execution map; until then this is honest stranding.
+        // The C3 re-scout recovery lane: the drained permit's write state is
+        // unobserved, so the return is through a FRESH publication whose
+        // consumed observation cut is a FULL baseline latched ScopeDirty —
+        // never a silent restore, and no longer a strand.
         assert!(
-            !authority.is_current(),
-            "a dropped permit must not restore Current without evidence"
+            authority.is_current(),
+            "recovery returns the source to Current"
         );
-        let refusal = authority
+        let after = authority.current_publication().expect("publication");
+        assert_ne!(
+            before, after,
+            "recovery is a fresh publication, never a restore"
+        );
+        match authority
+            .last_reconcile_cut()
+            .expect("recovery consumed a cut")
+            .kind
+        {
+            CutKind::FullBaseline {
+                cause: LatchCause::ScopeDirty,
+            } => {}
+            other => panic!("recovery must consume a scope-dirty full baseline, got {other:?}"),
+        }
+        authority
             .acquire_write()
-            .expect_err("a stranded source refuses new grants");
-        assert!(matches!(refusal, AuthorityRefusal::PhaseNotCurrent { .. }));
+            .expect("a recovered source grants again");
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// Feature 020 V11, T029 — observation-lane oracles (C3). The drop-recovery
+/// inversion above is this commit's observed RED (the C2 stranding oracle
+/// failed against the new expectation before the recovery lane existed);
+/// these pin the lane's admission, incarnation, and gap semantics.
+#[cfg(all(test, feature = "server"))]
+mod observation_lane_oracles {
+    use super::ProjectSourceAuthority;
+    use crate::live_index::index_lifecycle::observer::{CutKind, LatchCause};
+
+    fn a_temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "symforge-observation-lane-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create oracle root");
+        root
+    }
+
+    fn consume_cut(authority: &std::sync::Arc<ProjectSourceAuthority>) -> CutKind {
+        let write = authority.acquire_write().expect("grant");
+        write.finish_no_side_effect().expect("no-op return");
+        authority
+            .last_reconcile_cut()
+            .expect("the return consumed a cut")
+            .kind
+    }
+
+    #[test]
+    fn admissions_drive_the_candidate_pipeline_and_coalesce_into_one_cut() {
+        let root = a_temp_root("admission");
+        let authority = ProjectSourceAuthority::for_root(&root);
+        assert_eq!(authority.committed_observations("src/a.rs"), 0);
+
+        authority.observe_admission_active("src/a.rs");
+        authority.observe_admission_active("src/a.rs");
+
+        assert_eq!(
+            authority.committed_observations("src/a.rs"),
+            2,
+            "each admission reaches the single commit point (new membership, \
+             then an exact-validated delta over it)"
+        );
+        match consume_cut(&authority) {
+            CutKind::Incremental { invalidations } => {
+                assert_eq!(
+                    invalidations.len(),
+                    1,
+                    "repeated observations of one source coalesce"
+                );
+            }
+            other => panic!("clean admissions produce an incremental cut, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_new_incarnation_refuses_late_callbacks_and_forces_the_barrier_baseline() {
+        let root = a_temp_root("incarnation");
+        let authority = ProjectSourceAuthority::for_root(&root);
+        let stale = authority.active_observer();
+
+        let fresh = authority.register_observer();
+        assert_ne!(stale, fresh);
+
+        // The predecessor's late callback is unreachable: every observation
+        // entry refuses the stale id and names the active incarnation.
+        assert_eq!(authority.observe_admission(stale, "src/a.rs"), Err(fresh));
+        assert_eq!(authority.observe_removal(stale, "src/a.rs"), Err(fresh));
+        assert_eq!(authority.report_gap(stale), Err(fresh));
+        assert_eq!(
+            authority.committed_observations("src/a.rs"),
+            0,
+            "a refused observation commits nothing"
+        );
+
+        // The successor's first consumed cut is the post-barrier baseline.
+        match consume_cut(&authority) {
+            CutKind::FullBaseline {
+                cause: LatchCause::HandoffBarrier,
+            } => {}
+            other => panic!("the handoff obligation is a full baseline, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_reported_gap_forces_the_full_baseline_over_later_admissions() {
+        let root = a_temp_root("gap");
+        let authority = ProjectSourceAuthority::for_root(&root);
+        let observer = authority.active_observer();
+
+        authority.report_gap(observer).expect("active incarnation");
+        authority
+            .observe_admission(observer, "src/a.rs")
+            .expect("active incarnation");
+
+        match consume_cut(&authority) {
+            CutKind::FullBaseline {
+                cause: LatchCause::Gap,
+            } => {}
+            other => panic!("the first latch cause wins the baseline, got {other:?}"),
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 }

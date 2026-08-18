@@ -666,7 +666,19 @@ pub fn update_file_from_disk(
     let relative = relative_path.replace('\\', "/");
     let abs_path = repo_root.join(&relative);
     let expected_gen = shared.current_project_generation();
-    admit_and_index_single_path(&relative, &abs_path, shared, expected_gen).into_public_compat()
+    let outcome = admit_and_index_single_path(&relative, &abs_path, shared, expected_gen)
+        .into_public_compat();
+    // V11 observation lane (Feature 020 Slice 4, T029): an admission that
+    // MUTATED the index is observed through the isolated candidate pipeline,
+    // permit-free, attributed to the current incarnation (this synchronous
+    // facade holds no id across time). D1 applies: the LiveIndex mutation
+    // above IS the data plane mid-cut; the lane runs the frozen lifecycle
+    // semantics beside it. A hash-skip observed no change.
+    if matches!(outcome, ReindexResult::Reindexed) {
+        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root)
+            .observe_admission_active(&relative);
+    }
+    outcome
 }
 
 /// Remove one file from the live index (embed facade; task #24 / AAP ask 3).
@@ -677,7 +689,16 @@ pub fn update_file_from_disk(
 /// retarget invalidated the generation fence.
 pub fn remove_file(shared: &SharedIndex, relative_path: &str) -> bool {
     let relative = relative_path.replace('\\', "/");
-    shared.remove_file_at_generation(&relative, shared.current_project_generation())
+    let applied = shared.remove_file_at_generation(&relative, shared.current_project_generation());
+    // V11 observation lane (T029): an applied removal lands as an
+    // accumulator invalidation (the dark candidate pipeline carries no
+    // removal payload — recorded bridging simplification). Fixture indexes
+    // with no bound root have no source authority to observe through.
+    if applied && let Some(root) = shared.read().indexed_root.clone() {
+        crate::live_index::index_lifecycle::activation::project_source_authority(&root)
+            .observe_removal_active(&relative);
+    }
+    applied
 }
 
 #[cfg(test)]
@@ -749,6 +770,56 @@ mod tests {
         assert!(
             matches!(outcome, ReindexResult::NotFound),
             "missing file must be NotFound, got {outcome:?}"
+        );
+    }
+
+    /// Feature 020 Slice 4, T029 (observation lane): every facade admission
+    /// that MUTATED the index also drives the isolated candidate pipeline to
+    /// its commit point, permit-free; a hash-skip observes no change and
+    /// commits nothing.
+    #[test]
+    fn facade_admission_feeds_the_observation_lane() {
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn first() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        assert_eq!(authority.committed_observations("extra.rs"), 0);
+
+        std::fs::write(dir.path().join("extra.rs"), "pub fn second() {}\n").expect("new file");
+        assert!(matches!(
+            update_file_from_disk(&shared, dir.path(), "extra.rs"),
+            ReindexResult::Reindexed
+        ));
+        assert_eq!(
+            authority.committed_observations("extra.rs"),
+            1,
+            "an admitted mutation must reach the candidate commit point"
+        );
+
+        assert!(matches!(
+            update_file_from_disk(&shared, dir.path(), "extra.rs"),
+            ReindexResult::HashSkip
+        ));
+        assert_eq!(
+            authority.committed_observations("extra.rs"),
+            1,
+            "a hash-skip observed no change and commits nothing"
+        );
+
+        std::fs::write(dir.path().join("extra.rs"), "pub fn renamed() {}\n").expect("edit");
+        assert!(matches!(
+            update_file_from_disk(&shared, dir.path(), "extra.rs"),
+            ReindexResult::Reindexed
+        ));
+        assert_eq!(authority.committed_observations("extra.rs"), 2);
+
+        assert!(remove_file(&shared, "extra.rs"));
+        assert_eq!(
+            authority.committed_observations("extra.rs"),
+            2,
+            "a removal rides the accumulator, not the candidate pipeline \
+             (dark bridging: no removal payload exists yet)"
         );
     }
 

@@ -691,6 +691,10 @@ pub(crate) fn start_watcher(
     })
 }
 
+// The observer incarnation pushed this over clippy's argument bound; C4's
+// typed-authority rework of this seam owns the restructuring, so a bundle
+// struct now would be churned twice.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_events(
     events: Vec<DebouncedEvent>,
     repo_root: &Path,
@@ -699,7 +703,15 @@ pub(crate) fn process_events(
     watcher_info: &Arc<Mutex<WatcherInfo>>,
     should_stop: &dyn Fn() -> bool,
     expected_gen: u64,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
 ) {
+    // V11 observation lane (Feature 020 Slice 4, T029): every batch reports
+    // under the incarnation the surrounding watcher instance registered. A
+    // stale incarnation's observations are REFUSED by the lane (late V10
+    // callbacks unreachable); the data-plane admissions below keep their own
+    // V10 generation fence until C4 gates them too (recorded residual).
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
     let content_generation_before = shared.published_generation().content_generation;
 
     struct PendingPath {
@@ -795,6 +807,12 @@ pub(crate) fn process_events(
                     &pending.absolute_path,
                     fence,
                 );
+                if authority
+                    .observe_removal(observer, &pending.relative_path)
+                    .is_err()
+                {
+                    debug!("watcher: stale incarnation's removal observation refused");
+                }
             }
         } else {
             if pending.saw_write_hint {
@@ -808,16 +826,21 @@ pub(crate) fn process_events(
             // Language inference is a target hint, never a scope filter. Unknown
             // extensions still reach metadata-first admission/cataloging.
             let language = supported_language(&pending.absolute_path);
-            if matches!(
-                read_and_index(
-                    &pending.relative_path,
-                    &pending.absolute_path,
-                    shared,
-                    language,
-                    expected_gen,
-                ),
-                ReindexResult::NotFound
-            ) {
+            let outcome = read_and_index(
+                &pending.relative_path,
+                &pending.absolute_path,
+                shared,
+                language,
+                expected_gen,
+            );
+            if matches!(outcome, ReindexResult::Reindexed)
+                && authority
+                    .observe_admission(observer, &pending.relative_path)
+                    .is_err()
+            {
+                debug!("watcher: stale incarnation's admission observation refused");
+            }
+            if matches!(outcome, ReindexResult::NotFound) {
                 // The path disappeared after the batch observation. Converge to
                 // current disk truth without serially sleeping in the event lane;
                 // any later create hint or periodic reconciliation can re-admit it.
@@ -828,6 +851,12 @@ pub(crate) fn process_events(
                         &pending.absolute_path,
                         fence,
                     );
+                    if authority
+                        .observe_removal(observer, &pending.relative_path)
+                        .is_err()
+                    {
+                        debug!("watcher: stale incarnation's removal observation refused");
+                    }
                 }
             }
         }
@@ -943,6 +972,18 @@ pub async fn run_watcher_with_stop(
             }
             Ok(handle) => {
                 consecutive_failures = 0;
+
+                // V11 observation lane (T029): each watcher instance is one
+                // observer incarnation. Registration is a drain-before-
+                // successor handoff whose post-barrier full-baseline
+                // obligation mirrors the fresh-instance reconciliation just
+                // below; a predecessor instance's late observations are
+                // refused by the lane from here on.
+                let observer =
+                    crate::live_index::index_lifecycle::activation::project_source_authority(
+                        &repo_root,
+                    )
+                    .register_observer();
 
                 // Registration starts a fresh watcher instance. Events lost
                 // before this point cannot be recovered from the new channel,
@@ -1079,6 +1120,7 @@ pub async fn run_watcher_with_stop(
                                     &watcher_info_clone,
                                     &|| stop_for_events.load(Ordering::Acquire),
                                     expected_gen_for_events,
+                                    observer,
                                 );
                                 trackers
                             })
@@ -1093,6 +1135,19 @@ pub async fn run_watcher_with_stop(
                         }
                         Ok(Err(errors)) => {
                             let observed_errors = handle_notify_errors(&errors, || {
+                                // V11 observation lane (T029): an overflow is
+                                // a lost observation stream — latch the gap so
+                                // the next cut is a full baseline, mirroring
+                                // the data plane's overflow reconciliation.
+                                if crate::live_index::index_lifecycle::activation::
+                                    project_source_authority(&repo_root)
+                                .report_gap(observer)
+                                .is_err()
+                                {
+                                    debug!(
+                                        "watcher: stale incarnation's gap report refused"
+                                    );
+                                }
                                 let shared_clone = shared.clone();
                                 let root_clone = repo_root.clone();
                                 let watcher_info_clone = watcher_info.clone();
@@ -3140,6 +3195,73 @@ mod tests {
         // Absolute paths are rejected defensively (the `ignore` crate requires
         // relative paths).
         assert!(!index.is_path_gitignored("/abs/path.rs"));
+    }
+
+    /// Feature 020 Slice 4, T029 (observation lane): an event batch's
+    /// admissions flow through the observation lane under the registered
+    /// watcher incarnation, and a stale incarnation's batch observes
+    /// nothing — the late-callback unreachability the frozen contract
+    /// demands.
+    #[test]
+    fn process_events_feeds_the_observation_lane_under_the_registered_incarnation() {
+        use crate::live_index::store::LiveIndex;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seed() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let observer = authority.register_observer();
+        let expected_gen = shared.current_project_generation();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let mut trackers = HashMap::new();
+
+        std::fs::write(dir.path().join("extra.rs"), "pub fn second() {}\n").expect("new file");
+        let event = DebouncedEvent {
+            event: notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(dir.path().join("extra.rs")),
+            time: Instant::now(),
+        };
+        process_events(
+            vec![event],
+            dir.path(),
+            &shared,
+            &mut trackers,
+            &watcher_info,
+            &|| false,
+            expected_gen,
+            observer,
+        );
+        assert_eq!(
+            authority.committed_observations("extra.rs"),
+            1,
+            "an admitted batch entry reaches the candidate commit point"
+        );
+
+        // A successor registration makes the old incarnation's batches inert.
+        let successor = authority.register_observer();
+        assert_ne!(observer, successor);
+        std::fs::write(dir.path().join("late.rs"), "pub fn late() {}\n").expect("late file");
+        let late = DebouncedEvent {
+            event: notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(dir.path().join("late.rs")),
+            time: Instant::now(),
+        };
+        process_events(
+            vec![late],
+            dir.path(),
+            &shared,
+            &mut trackers,
+            &watcher_info,
+            &|| false,
+            expected_gen,
+            observer,
+        );
+        assert_eq!(
+            authority.committed_observations("late.rs"),
+            0,
+            "a stale incarnation's observations are unreachable"
+        );
     }
 
     /// Confirms that maybe_reindex returns HashSkip when content has not changed.
