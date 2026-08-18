@@ -132,7 +132,7 @@ GREEN dark.
 - [x] T025 [US5] Implement dark V11 snapshot migration in `src/index_lifecycle/snapshot.rs` (NOT `src/live_index/persist.rs` — the darkness sweep forbids the module token in live files, same ruling as T015/T016; the persist.rs wiring and version bump are cut work) — bounded untrusted-seed restore, complete re-observation, quarantine, atomic V11 replacement, preserved rollback, rebuild fallback, `ProjectStateDir`-only team-artifact persistence, the exact frozen-FR-051 four-state receipt/refusal matrix; the `CURRENT_VERSION` bump and V11 write path stay production-unreachable until T030 activation (020:T065)
 - [x] T026 [US5] Extend darkness seal + census for snapshot.rs (the dark module the T025 correction landed in; persist.rs stays untouched until the cut); refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
 - [x] T027 [US5] Full gate battery via Terminal Commander + traceability validator
-- [ ] T028 [US5] Review (cfg-lens) → PR → green CI → auto-squash-merge
+- [x] T028 [US5] Review (cfg-lens) → PR → green CI → auto-squash-merge
 
 **Checkpoint**: all five pairs GREEN dark on `main`; the only ignored
 lifecycle tests left are T058's four stand-ins. Wave 2 may open.
