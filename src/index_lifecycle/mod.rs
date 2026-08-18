@@ -38,6 +38,10 @@ pub mod physical_root;
 pub mod process_runtime;
 pub mod registry;
 pub mod supervisor;
+// T062: dark rolling verification — sealed scope receipts, the fixed
+// 15-minute deadline with its latch-before-acquisition ordering, work
+// bounds, and feasibility. Oracle-suite consumption only until activation.
+pub mod verification;
 // T047: the dark V11 runtime. In-directory consumption only; the dark factory
 // is the single door and Slice 4's activation cut is the only planned caller.
 pub mod runtime;

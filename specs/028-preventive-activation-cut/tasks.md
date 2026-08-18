@@ -57,7 +57,7 @@ GREEN; darkness seal proves the new modules unreachable from production.
 - [x] T004 [US1] Implement `src/index_lifecycle/candidate.rs` — capacity-reserved isolated full/delta candidates, complete artifact certificates, one runtime-store commit point, `CatalogPath` native/opaque identity end-to-end, delta exact-validation of only the changed source token, no-allocation whole-root patch, same-source drift retry/abort, epochs-never-authorize; register both modules in `src/index_lifecycle/mod.rs` (020:T060)
 - [x] T005 [US1] Extend `tests/preventive_runtime_dark_v11.rs` (constructor unreachability + census) to cover supervisor+candidate; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle only; reconcile the contract chain if census categories shift (quickstart step 3)
 - [x] T006 [US1] Run the full gate battery serially via Terminal Commander (fmt, clippy -D warnings, all-targets serial suite, `--no-default-features --features embed --lib`, release build, verify-tools, npm) plus `node scripts/validate-lifecycle-oracle-traceability.cjs`; `cargo clean` if `target/` grew heavy
-- [ ] T007 [US1] One independent code review including the mandatory cfg-lens sweep; open PR; on green CI auto-squash-merge with explicit subject/body (spec FR-015/FR-016)
+- [x] T007 [US1] One independent code review including the mandatory cfg-lens sweep; open PR; on green CI auto-squash-merge with explicit subject/body (spec FR-015/FR-016)
 
 **Checkpoint**: candidate pipeline GREEN dark on `main`; the Wave 1 workflow
 (RED → GREEN → seal → gates → review → merge) is proven end to end.
@@ -72,10 +72,10 @@ deadline machine and sealed receipts exist dark (020:T055 + T062)
 **Independent Test**: `cargo test --test rolling_verification_v11 -- --test-threads=1`
 GREEN dark.
 
-- [ ] T008 [P] [US2] Branch `feature-020-s4-p2-verification` from updated `main`; author RED `tests/rolling_verification_v11.rs` with frozen name `rolling_passes_are_fair_resumable_and_fenced` plus the full 020:T055 case list (scope discovery, entry obligations, same-stamp rewrites, exact deadline boundary with `VerificationOverdueLatched`, no-extension-by-partial-work, overdue acquisition refusal, fenced proof refresh, sealed `VerificationScopeReceipt`, `VerificationWorkBound` ≤ 712 s, `VerificationFeasibilityReceipt` lost-reservation → non-Current, policy-mismatch re-scout); record observed RED (020:T055)
-- [ ] T009 [US2] Implement `src/index_lifecycle/verification.rs` from nothing — racy-clean entry obligations, scope-discovery deadlines, resumable rolling passes, immutable proof refresh, the exact frozen-FR-049 monotonic overdue predicate; register in `mod.rs` (020:T062)
-- [ ] T010 [US2] Extend darkness seal + census for verification.rs; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
-- [ ] T011 [US2] Full gate battery via Terminal Commander + traceability validator
+- [x] T008 [P] [US2] Branch `feature-020-s4-p2-verification` from updated `main`; author RED `tests/rolling_verification_v11.rs` with frozen name `rolling_passes_are_fair_resumable_and_fenced` plus the full 020:T055 case list (scope discovery, entry obligations, same-stamp rewrites, exact deadline boundary with `VerificationOverdueLatched`, no-extension-by-partial-work, overdue acquisition refusal, fenced proof refresh, sealed `VerificationScopeReceipt`, `VerificationWorkBound` ≤ 712 s, `VerificationFeasibilityReceipt` lost-reservation → non-Current, policy-mismatch re-scout); record observed RED (020:T055)
+- [x] T009 [US2] Implement `src/index_lifecycle/verification.rs` from nothing — racy-clean entry obligations, scope-discovery deadlines, resumable rolling passes, immutable proof refresh, the exact frozen-FR-049 monotonic overdue predicate; register in `mod.rs` (020:T062)
+- [x] T010 [US2] Extend darkness seal + census for verification.rs; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
+- [x] T011 [US2] Full gate battery via Terminal Commander + traceability validator
 - [ ] T012 [US2] Review (cfg-lens) → PR → green CI → auto-squash-merge
 
 **Checkpoint**: verification machine GREEN dark on `main`.
