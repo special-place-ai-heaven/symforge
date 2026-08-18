@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.11.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.11.0...v10.11.1) (2026-08-18)
+
+
+### Bug Fixes
+
+* track .specify and .claude/skills so worktrees inherit spec-kit ([#598](https://github.com/special-place-ai-heaven/symforge/issues/598)) ([4a57aa2](https://github.com/special-place-ai-heaven/symforge/commit/4a57aa22f51f7487f551b639b8005b6a37cab009))
+
 ## [10.11.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.10.0...v10.11.0) (2026-08-18)
 
 
