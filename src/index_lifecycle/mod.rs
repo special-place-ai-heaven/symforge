@@ -45,6 +45,10 @@ pub mod observer;
 // projection seam. Oracle-suite consumption only until activation.
 pub mod query;
 pub mod registry;
+// T065: dark snapshot migration — untrusted seeds, pre-decode capacity,
+// quarantine with preserved rollback, namespace isolation, and the FR-051
+// team-artifact matrix. Oracle-suite consumption only until activation.
+pub mod snapshot;
 pub mod supervisor;
 // T062: dark rolling verification — sealed scope receipts, the fixed
 // 15-minute deadline with its latch-before-acquisition ordering, work

@@ -794,6 +794,7 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/query.rs",
     "index_lifecycle/registry.rs",
     "index_lifecycle/runtime.rs",
+    "index_lifecycle/snapshot.rs",
     "index_lifecycle/supervisor.rs",
     "index_lifecycle/transition.rs",
     "index_lifecycle/verification.rs",
@@ -801,15 +802,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "b38398b02c47df9a051e47ac935ec73ed178fff475dac1805d4eac7482e6cf84",
-    18,
-    275_376,
+    "b849ddcc81d99161f1a33cbce4ef5f5d71915ef03154933528e15e56639db54d",
+    19,
+    287_114,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "67199d04cb44e0c2bee042735c24bd96204fb2a1c6ff5d7b7ab6a7317c24363a",
-    192,
-    9_061_374,
+    "35f0521a2c62d561d5376cda4d833ac031e0ba1a9fd5536f80d34b628b153bef",
+    193,
+    9_073_112,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
