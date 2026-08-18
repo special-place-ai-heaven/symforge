@@ -780,6 +780,7 @@ fn source_splicing_is_allowlisted() {
 /// alias/macro bridge that preserves the allowlisted mount spelling. Neither is
 /// a Rust name resolver or an adversary-resistant security boundary.
 const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
+    "index_lifecycle/activation.rs",
     "index_lifecycle/adapters.rs",
     "index_lifecycle/authority.rs",
     "index_lifecycle/candidate.rs",
@@ -802,15 +803,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "dcd25c70aec04f7177fc21d0fa65d0c5c502887a9d4ba528cb7ec948faf149bf",
-    19,
-    313_588,
+    "5c8c2ebe109863ef787253af83310798636d9eb3c76ee37c62467d1958dc7f0a",
+    20,
+    330_956,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "2c574f98cefb16194245008f8b57fdfc597bddf625b788f6cf394c07affca934",
-    193,
-    9_099_586,
+    "95e43af9f213e2f05cf8addfc7f664994cdfb6c82dd0b6c2aa2864081d0042dc",
+    194,
+    9_116_954,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
