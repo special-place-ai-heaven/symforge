@@ -95,7 +95,7 @@ GREEN dark.
 - [x] T015 [US3] Implement `src/index_lifecycle/query.rs` — project/single-source strict leases, exact multi-project selections, separate ranking snapshots, sealed completed-lease render authority, `SourceRefusal` transport mapping, and the committed-vs-attempt health projection seam (all four surfaces modeled INSIDE the dark module — the call-edge sweep forbids the index_lifecycle token in live files, so the `src/live_index/health_view.rs` and `src/protocol/` wiring named by frozen T063 is cut work under T064/T066); register in `mod.rs` (020:T063)
 - [x] T016 [US3] Extend darkness seal + census for query.rs (no health_view/protocol seams — see the T015 scope correction); refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
 - [x] T017 [US3] Full gate battery via Terminal Commander + traceability validator
-- [ ] T018 [US3] Review (cfg-lens) → PR → green CI → auto-squash-merge
+- [x] T018 [US3] Review (cfg-lens) → PR → green CI → auto-squash-merge
 
 **Checkpoint**: query-lease machinery GREEN dark on `main`; US2's oracle exists.
 
@@ -109,10 +109,10 @@ exist dark (020:T054 + T061); the performance gate itself runs at the cut
 **Independent Test**: `cargo test --test observer_handoff_v11 -- --test-threads=1`
 GREEN dark.
 
-- [ ] T019 [P] [US4] Branch `feature-020-s4-p4-observer` from updated `main`; author RED `tests/observer_handoff_v11.rs` with frozen name `stable_token_cut_latches_every_gap` plus the 020:T054 case list (stable-token cuts, gap latching, predecessor drain, post-barrier baseline, ingress unwind retention, exhausted-capacity safety transitions); record observed RED (020:T054)
-- [ ] T020 [US4] Implement `src/index_lifecycle/observer.rs` — bounded coalescing accumulator, monotonic invalidation cuts, scope-dirty/gap latches, stable observer handoff, full successor baseline, adapting the live `src/watcher/` event vocabulary without touching its live routing; register in `mod.rs` (020:T061)
-- [ ] T021 [US4] Extend darkness seal + census for observer.rs; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
-- [ ] T022 [US4] Full gate battery via Terminal Commander + traceability validator
+- [x] T019 [P] [US4] Branch `feature-020-s4-p4-observer` from updated `main`; author RED `tests/observer_handoff_v11.rs` with frozen name `stable_token_cut_latches_every_gap` plus the 020:T054 case list (stable-token cuts, gap latching, predecessor drain, post-barrier baseline, ingress unwind retention, exhausted-capacity safety transitions); record observed RED (020:T054)
+- [x] T020 [US4] Implement `src/index_lifecycle/observer.rs` — bounded coalescing accumulator, monotonic invalidation cuts, scope-dirty/gap latches, stable observer handoff, full successor baseline, adapting the live `src/watcher/` event vocabulary without touching its live routing; register in `mod.rs` (020:T061)
+- [x] T021 [US4] Extend darkness seal + census for observer.rs; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
+- [x] T022 [US4] Full gate battery via Terminal Commander + traceability validator
 - [ ] T023 [US4] Review (cfg-lens) → PR → green CI → auto-squash-merge
 
 **Checkpoint**: observer GREEN dark on `main`.

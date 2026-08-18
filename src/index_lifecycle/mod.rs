@@ -36,6 +36,10 @@ pub mod embedded;
 pub mod mutation;
 pub mod physical_root;
 pub mod process_runtime;
+// T061: dark observer accumulator — bounded coalescing, monotonic cuts,
+// latch-forces-baseline, drain-before-successor handoff. Oracle-suite
+// consumption only until activation.
+pub mod observer;
 // T063: dark strict query leases — atomic exact-bijection selections,
 // sealed render authority, refusal-not-no-match, and the two-ledger health
 // projection seam. Oracle-suite consumption only until activation.
