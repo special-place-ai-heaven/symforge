@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.8.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.7.0...v10.8.0) (2026-08-18)
+
+
+### Features
+
+* **feature-020:** Slice 4 pair 2 - dark rolling verification ([#591](https://github.com/special-place-ai-heaven/symforge/issues/591)) ([81aff80](https://github.com/special-place-ai-heaven/symforge/commit/81aff80ad02c7456aab81e8bbb195d9196c2278d))
+
 ## [10.7.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.6.2...v10.7.0) (2026-08-18)
 
 
