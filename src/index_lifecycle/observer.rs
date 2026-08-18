@@ -11,9 +11,19 @@
 //! oracles can drive unwinds; the live `src/watcher/` event vocabulary is
 //! adapted at the cut (T064), not here — the darkness sweep forbids this
 //! module's name in live files. The authority SEMANTICS — strictly
-//! monotonic cut tokens, latch-clears-only-through-baseline, coalescing
-//! with a hard bound, predecessor-drain-before-successor, post-barrier full
-//! baseline, and unwind retention — are exact.
+//! monotonic cut tokens, coalescing with a hard bound,
+//! predecessor-drain-before-successor with a bound successor and
+//! producer-fenced queueing, and unwind retention — are exact. Two deltas
+//! are NOT and are recorded cut obligations (T064): the latch clears on cut
+//! EMISSION, not on rescan PROOF (the acceptance oracle's
+//! "remains latched until a complete rescan proof" needs the consumer
+//! acknowledgment seam the live wiring owns — a consumer aborting a rescan
+//! must re-latch via `report_gap`), and the successor's post-barrier
+//! baseline obligation is returned as a value, not yet threaded into any
+//! accumulator's cut stream. The `ObserverSlot`/`ObserverId` pair here is
+//! the accumulator-side MECHANICS complement of
+//! `authority.rs::ObserverPhase`/`ObserverToken` (the per-source
+//! authority-side projection); unifying the two identities is T064 work.
 //!
 //! **Nothing in production calls this module.** Only the Slice 4 oracle
 //! suites and this directory do; activation (T064/T066) is the only planned
@@ -39,12 +49,17 @@ pub enum LatchCause {
     HandoffBarrier,
 }
 
-/// What one cut demands of its consumer.
+/// What one cut demands of its consumer. The invalidations map lives
+/// INSIDE `Incremental`: a baseline cut carrying a partial map is
+/// unrepresentable, so no consumer can mistake an exhausted cut's residue
+/// for a complete invalidation set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CutKind {
     /// Apply exactly these invalidations.
-    Incremental,
-    /// Rebuild the whole scope; the latch cause says why.
+    Incremental { invalidations: BTreeMap<u64, u64> },
+    /// Rebuild the whole scope; the cause is DIAGNOSTIC only — every cause
+    /// forces the same full baseline, and no consumer may branch on it for
+    /// correctness (the first cause wins until the baseline clears it).
     FullBaseline { cause: LatchCause },
 }
 
@@ -53,7 +68,6 @@ pub enum CutKind {
 pub struct ObservationCut {
     pub token: CutToken,
     pub kind: CutKind,
-    pub invalidations: BTreeMap<u64, u64>,
 }
 
 /// The bounded coalescing accumulator (T061). Repeated observations of one
@@ -135,25 +149,30 @@ impl CoalescingAccumulator {
     pub fn cut(&mut self) -> ObservationCut {
         let token = CutToken(self.next_token);
         self.next_token += 1;
+        let pending = std::mem::take(&mut self.pending);
         let kind = match self.latch.take() {
+            // The baseline SUBSUMES the drained pending set: carrying a
+            // partial map here is unrepresentable by construction.
             Some(cause) => CutKind::FullBaseline { cause },
-            None => CutKind::Incremental,
+            None => CutKind::Incremental {
+                invalidations: pending,
+            },
         };
-        ObservationCut {
-            token,
-            kind,
-            invalidations: std::mem::take(&mut self.pending),
-        }
+        ObservationCut { token, kind }
     }
 }
 
-/// Why a handoff refused to complete.
+/// Why a handoff or queue operation refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HandoffRefusal {
     /// The predecessor still holds undelivered cuts.
     PredecessorStillDraining { undelivered: usize },
     /// No handoff has begun.
     NoHandoffInProgress,
+    /// A handoff is already in progress toward a bound successor.
+    HandoffAlreadyInProgress { bound_successor: ObserverId },
+    /// The producing observer is not the active one.
+    NotTheActiveObserver { producer: ObserverId },
 }
 
 /// Identity of one observer occupying the slot.
@@ -165,8 +184,8 @@ pub struct ObserverId(pub u64);
 #[derive(Debug)]
 pub struct ObserverSlot {
     active: ObserverId,
-    undelivered: Vec<ObservationCut>,
-    handoff_in_progress: bool,
+    undelivered: Vec<(ObserverId, ObservationCut)>,
+    pending_successor: Option<ObserverId>,
 }
 
 impl ObserverSlot {
@@ -174,7 +193,7 @@ impl ObserverSlot {
         Self {
             active: first,
             undelivered: Vec::new(),
-            handoff_in_progress: false,
+            pending_successor: None,
         }
     }
 
@@ -183,35 +202,57 @@ impl ObserverSlot {
         self.active
     }
 
-    /// Queue a cut the active observer has produced but not yet delivered.
-    pub fn queue_undelivered(&mut self, cut: ObservationCut) {
-        self.undelivered.push(cut);
+    /// Queue a cut `producer` has produced but not yet delivered. Only the
+    /// ACTIVE observer may queue: an old observer's late callback can never
+    /// affect the successor's incarnation.
+    pub fn queue_undelivered(
+        &mut self,
+        producer: ObserverId,
+        cut: ObservationCut,
+    ) -> Result<(), HandoffRefusal> {
+        if producer != self.active {
+            return Err(HandoffRefusal::NotTheActiveObserver { producer });
+        }
+        self.undelivered.push((producer, cut));
+        Ok(())
     }
 
-    /// Begin handing the slot to a successor: the predecessor drains first.
-    pub fn begin_handoff(&mut self) {
-        self.handoff_in_progress = true;
+    /// Begin handing the slot to `successor`: the successor is BOUND here
+    /// (completion cannot be redirected), the predecessor drains first, and
+    /// a second begin refuses rather than silently rebinding. A self-handoff
+    /// (successor == active) is a legitimate re-registration that still
+    /// forces the post-barrier baseline.
+    pub fn begin_handoff(&mut self, successor: ObserverId) -> Result<(), HandoffRefusal> {
+        if let Some(bound_successor) = self.pending_successor {
+            return Err(HandoffRefusal::HandoffAlreadyInProgress { bound_successor });
+        }
+        self.pending_successor = Some(successor);
+        Ok(())
     }
 
     /// Deliver every undelivered predecessor cut, in order.
     pub fn deliver_pending(&mut self) -> Vec<ObservationCut> {
         std::mem::take(&mut self.undelivered)
+            .into_iter()
+            .map(|(_, cut)| cut)
+            .collect()
     }
 
-    /// Complete the handoff. Refuses while the predecessor still holds
-    /// undelivered cuts; on success the successor is active and its FIRST
-    /// obligation is a full post-barrier baseline.
-    pub fn complete_handoff(&mut self, successor: ObserverId) -> Result<CutKind, HandoffRefusal> {
-        if !self.handoff_in_progress {
+    /// Complete the handoff toward the successor BOUND at begin. Refuses
+    /// while the predecessor still holds undelivered cuts; on success the
+    /// successor is active and its FIRST obligation is a full post-barrier
+    /// baseline.
+    pub fn complete_handoff(&mut self) -> Result<CutKind, HandoffRefusal> {
+        let Some(successor) = self.pending_successor else {
             return Err(HandoffRefusal::NoHandoffInProgress);
-        }
+        };
         if !self.undelivered.is_empty() {
             return Err(HandoffRefusal::PredecessorStillDraining {
                 undelivered: self.undelivered.len(),
             });
         }
         self.active = successor;
-        self.handoff_in_progress = false;
+        self.pending_successor = None;
         Ok(CutKind::FullBaseline {
             cause: LatchCause::HandoffBarrier,
         })
