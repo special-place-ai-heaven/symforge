@@ -502,7 +502,7 @@ impl ProcessRuntimeApi {
     }
 
     /// Fixture probe: the wrapper's honest dark refusal, for shape oracles.
-    #[cfg(any(test, feature = "server"))]
+    #[cfg(all(test, feature = "server"))]
     pub fn refusal_probe_for_test(&self) -> Result<(), EmbedSourceRefusal> {
         Err(dark_unbound_refusal(OperationKind::SearchSymbols))
     }
@@ -738,4 +738,122 @@ fn parse_pub_mod(line: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// Feature 020 V11, T048 — the dark wrapper contract-shape oracle.
+///
+/// Moved in-crate verbatim from `tests/public_api_delta_v11.rs` at the start
+/// of the Slice 4 activation cut so `refusal_probe_for_test` could tighten to
+/// `all(test, feature = "server")` and stop shipping in the release binary
+/// (the same precondition discharge as `runtime.rs::dark_runtime_oracles`).
+/// The export-delta oracle stays external — it consumes no fixture door.
+#[cfg(all(test, feature = "server"))]
+mod dark_wrapper_oracles {
+    use super::super::embedded::EmbeddedSourceFactory;
+    use super::super::registry::ProjectKey;
+    use super::{
+        EVIDENCE_ABSENT, EmbedOperationReceipt, EmbedSourceRefusal,
+        PROVISIONAL_ACQUIRE_PROCESS_BYTES, ProcessRuntimeApi, SymbolSearchRequest,
+        TextSearchRequest,
+    };
+
+    #[test]
+    fn dark_wrappers_match_contract_shapes() {
+        // acquire takes NO arguments per the atom and delegates to incarnate
+        // with the NAMED provisional constant — never live V10 env policy.
+        let runtime = ProcessRuntimeApi::acquire().expect("the dark acquisition admits");
+        // The provisional budget is a named constant; clippy rightly refuses
+        // a constant assertion, so the pin is that acquire() DELEGATED with
+        // it — the runtime exists — and the constant's value lives in the
+        // D-ledger.
+        let _ = PROVISIONAL_ACQUIRE_PROCESS_BYTES;
+
+        // The refusal wrapper: kind-prefixed identity strings, stored at wrap
+        // time; Display and Error implemented; the sentinel reserved for
+        // refusals that examined nothing.
+        let refusal: EmbedSourceRefusal = runtime
+            .refusal_probe_for_test()
+            .expect_err("the probe yields the wrapper's honest dark refusal");
+        let evidence = refusal.evidence_identity();
+        assert_eq!(
+            evidence, EVIDENCE_ABSENT,
+            "a refusal that examined no authority renders the closed sentinel"
+        );
+        assert!(
+            !evidence.starts_with("auth-"),
+            "the sentinel is a token the identity renderer cannot emit"
+        );
+        let operation: &EmbedOperationReceipt = refusal.operation();
+        assert!(
+            operation.identity().starts_with("op-"),
+            "operation identities are kind-prefixed, got {}",
+            operation.identity()
+        );
+        assert!(
+            operation
+                .identity()
+                .trim_start_matches("op-")
+                .parse::<u64>()
+                .is_ok(),
+            "the prefix is followed by the counter digits"
+        );
+        let first = operation.identity().to_string();
+        assert_eq!(
+            operation.identity(),
+            first,
+            "the rendered string is STORED at wrap time — stable across calls"
+        );
+        // Display + Error are contract trait impls, exercised not just
+        // derived.
+        let rendered = format!("{refusal}");
+        assert!(
+            rendered.contains("SourceUnavailable"),
+            "Display names the refusal kind: {rendered}"
+        );
+        let _as_error: &dyn std::error::Error = &refusal;
+
+        // The four V11 handle methods, under their contract shapes, refusing
+        // honestly in the dark rather than fabricating empty results.
+        let factory = EmbeddedSourceFactory::new();
+        let handle = factory
+            .open(ProjectKey::new("src-a"))
+            .expect("open admits a fresh key");
+
+        let view = handle.runtime_view();
+        assert!(
+            view.binding_identity.starts_with("source-"),
+            "the view's binding identity is kind-prefixed: {}",
+            view.binding_identity
+        );
+        assert!(
+            view.current_publication_identity.is_none(),
+            "a dark handle has NO publication; inventing one would be \
+             fabricated completion"
+        );
+        assert_eq!(view.observer_epoch, 0, "no observer has been registered");
+
+        let refusal = handle
+            .search_symbols(&SymbolSearchRequest {
+                query: Some("anchor".to_string()),
+                path_prefix: None,
+                limit: 10,
+            })
+            .expect_err("no generation is bound, so a symbol search refuses");
+        assert_eq!(refusal.kind_name(), "SourceUnavailable");
+
+        let refusal = handle
+            .search_text(&TextSearchRequest {
+                query: "anchor".to_string(),
+                path_prefix: None,
+                limit: 10,
+                case_sensitive: false,
+            })
+            .expect_err("no generation is bound, so a text search refuses");
+        assert_eq!(refusal.kind_name(), "SourceUnavailable");
+
+        let refusal = handle
+            .request_refresh()
+            .expect_err("a dark refresh cannot run, so the ticket is refused honestly");
+        assert_eq!(refusal.kind_name(), "SourceUnavailable");
+    }
 }

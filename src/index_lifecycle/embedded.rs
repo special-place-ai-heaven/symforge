@@ -315,7 +315,7 @@ impl EmbeddedSourceHandle {
     /// source and attempts to wait on its own close receipt from inside it —
     /// which must refuse with [`ReceiptWaitError::WouldSelfWait`] rather than
     /// deadlock.
-    #[cfg(any(test, feature = "server"))]
+    #[cfg(all(test, feature = "server"))]
     pub fn self_wait_probe_for_test(&self) -> Result<SourceCloseReport, ReceiptWaitError> {
         let receipt = self.begin_close();
         self.finalize(|| receipt.wait_for_test())
@@ -410,7 +410,7 @@ impl SourceCloseReceipt {
     /// record (T047's oracle shape). Refuses a self-wait; completes
     /// immediately otherwise, because the close performed synchronously and
     /// only observed completions may be reported.
-    #[cfg(any(test, feature = "server"))]
+    #[cfg(all(test, feature = "server"))]
     pub fn wait_for_test(&self) -> Result<SourceCloseReport, ReceiptWaitError> {
         if FINALIZING.with(std::cell::Cell::get) == Some(self.identity) {
             return Err(ReceiptWaitError::WouldSelfWait);
