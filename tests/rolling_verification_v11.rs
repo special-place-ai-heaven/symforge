@@ -11,7 +11,8 @@ use std::time::Duration;
 use symforge::live_index::index_lifecycle::verification::{
     DEFAULT_MAX_COMPLETE_VERIFICATION_PASS, DEFAULT_MAX_VERIFICATION_BYTES,
     DEFAULT_MAX_VERIFICATION_ENTRIES, MAX_CURRENT_UNVERIFIED_AGE, MonotonicInstant,
-    NonCurrentCause, PassScheduler, PolicyVersion, RollingVerifier, VerificationFeasibilityReceipt,
+    NonCurrentCause, PassScheduler, PolicyVersion, RESERVED_VERIFICATION_BYTES_PER_SECOND,
+    RESERVED_VERIFICATION_ENTRIES_PER_SECOND, RollingVerifier, VerificationFeasibilityReceipt,
     VerificationRefusal, VerificationScopeReceipt, VerificationWorkBound,
 };
 
@@ -28,14 +29,16 @@ fn sealed(count: u64) -> VerificationScopeReceipt {
     VerificationScopeReceipt::seal(POLICY, scope_entries(count))
 }
 
-fn feasibility() -> VerificationFeasibilityReceipt {
+fn feasibility_for(receipt: &VerificationScopeReceipt) -> VerificationFeasibilityReceipt {
     VerificationFeasibilityReceipt::reserve(
-        VerificationWorkBound::for_scope(1_024, 4).expect("tiny scope is affordable"),
+        VerificationWorkBound::for_scope(receipt, 1_024, 4).expect("tiny scope is affordable"),
     )
 }
 
 fn promoted(count: u64) -> RollingVerifier {
-    RollingVerifier::promote(sealed(count), feasibility(), T0)
+    let receipt = sealed(count);
+    let feasibility = feasibility_for(&receipt);
+    RollingVerifier::promote(receipt, feasibility, T0).expect("feasibility is bound to this scope")
 }
 
 fn just_before_deadline() -> MonotonicInstant {
@@ -102,7 +105,9 @@ fn rolling_passes_are_fair_resumable_and_fenced() {
         pass.verify_chunk(scope_entries(2)).expect("chunk verifies");
         pass
     };
-    fenced.refresh_scope(VerificationScopeReceipt::seal(POLICY, scope_entries(2)));
+    fenced
+        .refresh_scope(VerificationScopeReceipt::seal(POLICY, scope_entries(2)))
+        .expect("a same-policy refresh is legitimate");
     let stale_record = stale_pass
         .complete()
         .expect("the stale pass still completes locally");
@@ -260,6 +265,63 @@ fn the_deadline_boundary_is_exact_and_latches_before_acquisition() {
     assert!(verifier.acquire_strict(just_before_deadline()).is_err());
 }
 
+/// Frozen FR-049's latch-clear clause, exactly: "Only a fresh complete
+/// exact-bound verification and publication may clear the latch." A latched
+/// OVERDUE verifier can still verify — begin a pass, complete the whole
+/// scope, and advance — and that fresh complete record clears the latch;
+/// strict leases resume. The other non-Current causes stay re-scout-only:
+/// a lost reservation has no capacity to verify with, and a policy mismatch
+/// invalidates the scope itself (pair-2 review, MAJOR finding).
+#[test]
+fn a_fresh_complete_verification_clears_the_overdue_latch() {
+    let mut verifier = promoted(2);
+    assert_eq!(
+        verifier.acquire_strict(at_deadline()).unwrap_err(),
+        VerificationRefusal::OverdueLatched
+    );
+    assert_eq!(
+        verifier.non_current_cause(),
+        Some(NonCurrentCause::OverdueLatched)
+    );
+
+    // A mismatched-policy probe against the latched verifier refuses WITHOUT
+    // relabeling the latch: the recorded cause stays honest.
+    assert_eq!(
+        verifier.begin_pass(PolicyVersion(9)).unwrap_err(),
+        VerificationRefusal::PolicyMismatch
+    );
+    assert_eq!(
+        verifier.non_current_cause(),
+        Some(NonCurrentCause::OverdueLatched),
+        "an unrelated later probe must not relabel the latch"
+    );
+
+    // The latched verifier may still VERIFY (never lease): the FR's named
+    // clear-path must be representable.
+    let mut pass = verifier
+        .begin_pass(POLICY)
+        .expect("an overdue-latched verifier must still be verifiable");
+    pass.verify_chunk(scope_entries(2)).expect("chunks verify");
+    let record = pass.complete().expect("whole scope");
+    let cleared_at = at_deadline().plus(Duration::from_secs(60));
+    verifier
+        .advance(record, cleared_at)
+        .expect("a fresh complete verification clears the overdue latch");
+    assert_eq!(verifier.non_current_cause(), None);
+    verifier
+        .acquire_strict(MonotonicInstant(cleared_at.0 + 1))
+        .expect("strict leases resume after the latch clears");
+
+    // Negative control: a lost reservation is NOT clearable by verification.
+    let mut lost = promoted(2);
+    lost.reservation_lost();
+    assert_eq!(
+        lost.begin_pass(POLICY).unwrap_err(),
+        VerificationRefusal::NonCurrent(NonCurrentCause::ReservationLost),
+        "only the overdue latch is verification-clearable"
+    );
+}
+
 /// Partial, cancelled, and resumed work never extends the deadline: only a
 /// complete exact-identity whole-scope record does.
 #[test]
@@ -304,12 +366,31 @@ fn partial_cancelled_or_resumed_work_never_extends_the_deadline() {
 
 // ── work bounds and feasibility ────────────────────────────────────────────
 
+/// The frozen constants are pinned by VALUE, not only by the source seal: a
+/// changed deadline or cap must fail an oracle, not just a hash refresh
+/// (pair-2 review). Values verbatim from the frozen data model.
+#[test]
+fn the_frozen_constants_are_pinned_by_value() {
+    assert_eq!(MAX_CURRENT_UNVERIFIED_AGE, Duration::from_secs(900));
+    assert_eq!(
+        DEFAULT_MAX_COMPLETE_VERIFICATION_PASS,
+        Duration::from_secs(720)
+    );
+    assert_eq!(DEFAULT_MAX_VERIFICATION_BYTES, 17_179_869_184);
+    assert_eq!(DEFAULT_MAX_VERIFICATION_ENTRIES, 200_000);
+    assert_eq!(RESERVED_VERIFICATION_BYTES_PER_SECOND, 33_554_432);
+    assert_eq!(RESERVED_VERIFICATION_ENTRIES_PER_SECOND, 1_000);
+}
+
 /// The computed bound is the ceiling arithmetic at the reserved floors, the
-/// caps make 712 s the reachable maximum (strictly under the 720 s default),
-/// and work beyond the caps refuses at admission.
+/// caps make 712 s the reachable maximum (STRICTLY under the 720 s default —
+/// "a ceiling the defaults never reach"), work beyond the caps refuses at
+/// admission, and feasibility is bound to its scope — a reservation for one
+/// receipt cannot promote another.
 #[test]
 fn the_work_bound_never_exceeds_the_reachable_default() {
-    let tiny = VerificationWorkBound::for_scope(1, 1).expect("affordable");
+    let receipt = sealed(1);
+    let tiny = VerificationWorkBound::for_scope(&receipt, 1, 1).expect("affordable");
     assert_eq!(
         tiny.bound(),
         Duration::from_secs(2),
@@ -317,20 +398,31 @@ fn the_work_bound_never_exceeds_the_reachable_default() {
     );
 
     let max = VerificationWorkBound::for_scope(
+        &receipt,
         DEFAULT_MAX_VERIFICATION_BYTES,
         DEFAULT_MAX_VERIFICATION_ENTRIES,
     )
     .expect("the caps themselves are affordable");
     assert_eq!(max.bound(), Duration::from_secs(712));
-    assert!(max.bound() <= DEFAULT_MAX_COMPLETE_VERIFICATION_PASS);
+    assert!(max.bound() < DEFAULT_MAX_COMPLETE_VERIFICATION_PASS);
 
     assert_eq!(
-        VerificationWorkBound::for_scope(DEFAULT_MAX_VERIFICATION_BYTES + 1, 1).unwrap_err(),
+        VerificationWorkBound::for_scope(&receipt, DEFAULT_MAX_VERIFICATION_BYTES + 1, 1)
+            .unwrap_err(),
         VerificationRefusal::WorkBeyondCaps
     );
     assert_eq!(
-        VerificationWorkBound::for_scope(1, DEFAULT_MAX_VERIFICATION_ENTRIES + 1).unwrap_err(),
+        VerificationWorkBound::for_scope(&receipt, 1, DEFAULT_MAX_VERIFICATION_ENTRIES + 1)
+            .unwrap_err(),
         VerificationRefusal::WorkBeyondCaps
+    );
+
+    // Feasibility is bound, never bearer: a foreign reservation refuses.
+    let this_scope = sealed(2);
+    let other_scope = sealed(2);
+    assert_eq!(
+        RollingVerifier::promote(this_scope, feasibility_for(&other_scope), T0).unwrap_err(),
+        VerificationRefusal::FeasibilityNotForThisScope
     );
 }
 
@@ -357,9 +449,14 @@ fn a_lost_reservation_forces_non_current_not_an_extension() {
         VerificationRefusal::NonCurrent(NonCurrentCause::ReservationLost)
     );
 
-    // The only way back: an authoritative re-scout with fresh feasibility.
+    // The only way back: an authoritative re-scout with fresh feasibility
+    // bound to the fresh receipt.
     let rescouted_at = MonotonicInstant(T0.0 + 10_000);
-    verifier.re_scout(sealed(2), feasibility(), rescouted_at);
+    let fresh = sealed(2);
+    let fresh_feasibility = feasibility_for(&fresh);
+    verifier
+        .re_scout(fresh, fresh_feasibility, rescouted_at)
+        .expect("re-scout accepts its own scope's feasibility");
     assert_eq!(verifier.non_current_cause(), None);
     verifier
         .acquire_strict(MonotonicInstant(rescouted_at.0 + 1))
@@ -386,13 +483,29 @@ fn policy_mismatch_forces_rescout_before_new_current() {
         VerificationRefusal::NonCurrent(NonCurrentCause::PolicyMismatch)
     );
 
+    // A cross-policy refresh may not smuggle past the mandated re-scout:
+    // it refuses without relabeling the latched cause.
+    assert_eq!(
+        verifier
+            .refresh_scope(VerificationScopeReceipt::seal(
+                PolicyVersion(8),
+                scope_entries(2)
+            ))
+            .unwrap_err(),
+        VerificationRefusal::PolicyMismatch
+    );
+    assert_eq!(
+        verifier.non_current_cause(),
+        Some(NonCurrentCause::PolicyMismatch)
+    );
+
     // Re-scout under the new policy is the only path to a new Current.
     let rescouted_at = MonotonicInstant(T0.0 + 5_000);
-    verifier.re_scout(
-        VerificationScopeReceipt::seal(PolicyVersion(8), scope_entries(2)),
-        feasibility(),
-        rescouted_at,
-    );
+    let repolicied = VerificationScopeReceipt::seal(PolicyVersion(8), scope_entries(2));
+    let repolicied_feasibility = feasibility_for(&repolicied);
+    verifier
+        .re_scout(repolicied, repolicied_feasibility, rescouted_at)
+        .expect("re-scout accepts its own scope's feasibility");
     let mut pass = verifier
         .begin_pass(PolicyVersion(8))
         .expect("the re-scouted policy matches");

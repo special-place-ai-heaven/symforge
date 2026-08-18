@@ -14,7 +14,10 @@
 //! `MonotonicInstant` parameter so oracles drive the deadline exactly. The
 //! authority SEMANTICS — sealed scope, exact-identity advancement, the
 //! at/after latch ordering, feasibility-loss → non-Current, policy-mismatch →
-//! re-scout — are exact; payloads are recorded cut obligations.
+//! re-scout — are exact; payloads are recorded cut obligations. Deliberately
+//! deferred with them: `MAX_SUCCESSOR_VERIFICATION_START` (180 s) and the
+//! `successor_start_deadline` scheduling arithmetic, which sit outside
+//! T055's case list and land with the live scheduler at the cut.
 //!
 //! **Nothing in production calls this module.** Only the Slice 4 oracle
 //! suites and this directory do; activation (T064/T066) is the only planned
@@ -83,6 +86,10 @@ pub enum VerificationRefusal {
     WorkBeyondCaps,
     /// The pass's policy version does not match the sealed receipt's.
     PolicyMismatch,
+    /// The feasibility receipt was reserved for a DIFFERENT scope receipt —
+    /// feasibility is bound, never bearer (frozen data model:
+    /// `VerificationWorkBound.scope_receipt`).
+    FeasibilityNotForThisScope,
     /// The verifier is non-Current; only an authoritative re-scout returns.
     NonCurrent(NonCurrentCause),
     /// An entry drifted to a DIFFERENT stamp during the pass (a same-stamp
@@ -138,13 +145,16 @@ impl VerificationScopeReceipt {
 /// disagree with the operands it was derived from.
 #[derive(Debug)]
 pub struct VerificationWorkBound {
+    scope_receipt: VerificationScopeReceiptId,
     bound: Duration,
 }
 
 impl VerificationWorkBound {
-    /// Compute the bound for a scope's declared work, refusing work beyond
-    /// the frozen admission caps.
+    /// Compute the bound for ONE sealed scope's declared work, refusing work
+    /// beyond the frozen admission caps. The bound carries the receipt it
+    /// was computed for: feasibility is bound to a scope, never bearer.
     pub fn for_scope(
+        receipt: &VerificationScopeReceipt,
         verification_bytes: u64,
         verification_entries: u64,
     ) -> Result<Self, VerificationRefusal> {
@@ -156,6 +166,7 @@ impl VerificationWorkBound {
         let seconds = verification_bytes.div_ceil(RESERVED_VERIFICATION_BYTES_PER_SECOND)
             + verification_entries.div_ceil(RESERVED_VERIFICATION_ENTRIES_PER_SECOND);
         Ok(Self {
+            scope_receipt: receipt.id,
             bound: Duration::from_secs(seconds),
         })
     }
@@ -170,12 +181,16 @@ impl VerificationWorkBound {
 /// extending the deadline.
 #[derive(Debug)]
 pub struct VerificationFeasibilityReceipt {
-    _work: VerificationWorkBound,
+    work: VerificationWorkBound,
 }
 
 impl VerificationFeasibilityReceipt {
     pub fn reserve(work: VerificationWorkBound) -> Self {
-        Self { _work: work }
+        Self { work }
+    }
+
+    fn scope_receipt(&self) -> VerificationScopeReceiptId {
+        self.work.scope_receipt
     }
 }
 
@@ -287,42 +302,51 @@ pub struct RollingVerifier {
 }
 
 impl RollingVerifier {
-    /// Promote to Current at `now`. Requires a feasibility reservation —
-    /// affordability is admission, not advice, and the type makes a
-    /// reservation-free promotion unrepresentable.
+    /// Promote to Current at `now`. Requires a feasibility reservation whose
+    /// work bound was computed for THIS receipt — affordability is admission,
+    /// not advice, and a foreign reservation refuses.
     pub fn promote(
         receipt: VerificationScopeReceipt,
         feasibility: VerificationFeasibilityReceipt,
         now: MonotonicInstant,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, VerificationRefusal> {
+        if feasibility.scope_receipt() != receipt.id {
+            return Err(VerificationRefusal::FeasibilityNotForThisScope);
+        }
+        Ok(Self {
             receipt,
             _feasibility: feasibility,
             verified_at: now,
             non_current: None,
             scope_dirty: false,
-        }
+        })
     }
 
     /// Begin a rolling pass over the sealed scope under `policy`. A policy
-    /// mismatch refuses AND forces non-Current: only an authoritative
-    /// re-scout may mint a new Current after that.
+    /// mismatch refuses AND forces non-Current (without relabeling an
+    /// already-latched cause): only an authoritative re-scout may mint a new
+    /// Current after that. An OVERDUE-latched verifier may still begin a
+    /// pass — frozen FR-049's latch is cleared by exactly a fresh complete
+    /// verification, so the path to one must stay open; the other
+    /// non-Current causes refuse (no capacity, or an invalidated scope).
     pub fn begin_pass(
         &mut self,
         policy: PolicyVersion,
     ) -> Result<RollingPass, VerificationRefusal> {
         if policy != self.receipt.policy {
-            self.non_current = Some(NonCurrentCause::PolicyMismatch);
+            if self.non_current.is_none() {
+                self.non_current = Some(NonCurrentCause::PolicyMismatch);
+            }
             return Err(VerificationRefusal::PolicyMismatch);
         }
-        if let Some(cause) = self.non_current {
-            return Err(VerificationRefusal::NonCurrent(cause));
+        match self.non_current {
+            None | Some(NonCurrentCause::OverdueLatched) => Ok(RollingPass {
+                receipt: self.receipt.id,
+                scope: self.receipt.entries.clone(),
+                verified: BTreeMap::new(),
+            }),
+            Some(cause) => Err(VerificationRefusal::NonCurrent(cause)),
         }
-        Ok(RollingPass {
-            receipt: self.receipt.id,
-            scope: self.receipt.entries.clone(),
-            verified: BTreeMap::new(),
-        })
     }
 
     /// Whether the source is Current at `now`: never while a non-Current
@@ -351,8 +375,9 @@ impl RollingVerifier {
 
     /// Advance the deadline with a complete record at `now`. Anything less
     /// than the exact sealed whole scope was already refused at `complete`;
-    /// here a stale receipt binding fences, a dirty scope refuses, and a
-    /// latched verifier stays latched.
+    /// here a stale receipt binding fences and a dirty scope refuses. A
+    /// fresh complete record CLEARS an overdue latch — frozen FR-049's
+    /// exact clear clause — while the other non-Current causes refuse.
     pub fn advance(
         &mut self,
         record: VerificationRecord,
@@ -364,19 +389,34 @@ impl RollingVerifier {
         if self.scope_dirty {
             return Err(VerificationRefusal::ScopeDirty);
         }
-        if let Some(cause) = self.non_current {
-            return Err(VerificationRefusal::NonCurrent(cause));
+        match self.non_current {
+            None | Some(NonCurrentCause::OverdueLatched) => {
+                self.non_current = None;
+                self.verified_at = now;
+                Ok(())
+            }
+            Some(cause) => Err(VerificationRefusal::NonCurrent(cause)),
         }
-        self.verified_at = now;
-        Ok(())
     }
 
     /// Refresh the proof scope: seals a NEW receipt (new identity) and
     /// fences every pass still bound to the old one. The old receipt is
-    /// never mutated; the fresh receipt starts racy-clean.
-    pub fn refresh_scope(&mut self, receipt: VerificationScopeReceipt) {
+    /// never mutated; the fresh receipt starts racy-clean. A receipt sealed
+    /// under a DIFFERENT policy refuses — a policy change may not smuggle
+    /// past the mandated re-scout.
+    pub fn refresh_scope(
+        &mut self,
+        receipt: VerificationScopeReceipt,
+    ) -> Result<(), VerificationRefusal> {
+        if receipt.policy != self.receipt.policy {
+            if self.non_current.is_none() {
+                self.non_current = Some(NonCurrentCause::PolicyMismatch);
+            }
+            return Err(VerificationRefusal::PolicyMismatch);
+        }
         self.receipt = receipt;
         self.scope_dirty = false;
+        Ok(())
     }
 
     /// Record that an entry was rewritten during verification with `stamp`.
@@ -400,18 +440,24 @@ impl RollingVerifier {
         self.non_current
     }
 
-    /// The only path back to Current from non-Current: an authoritative
-    /// re-scout sealing a fresh receipt with fresh feasibility.
+    /// The authoritative re-scout: a fresh receipt with fresh feasibility
+    /// bound to it. The only path back to Current from a lost reservation or
+    /// a policy mismatch (the overdue latch alternatively clears through a
+    /// fresh complete verification, per frozen FR-049).
     pub fn re_scout(
         &mut self,
         receipt: VerificationScopeReceipt,
         feasibility: VerificationFeasibilityReceipt,
         now: MonotonicInstant,
-    ) {
+    ) -> Result<(), VerificationRefusal> {
+        if feasibility.scope_receipt() != receipt.id {
+            return Err(VerificationRefusal::FeasibilityNotForThisScope);
+        }
         self.receipt = receipt;
         self._feasibility = feasibility;
         self.verified_at = now;
         self.non_current = None;
         self.scope_dirty = false;
+        Ok(())
     }
 }
