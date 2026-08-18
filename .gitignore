@@ -9,6 +9,16 @@
 !/.cargo/config.toml
 !/.github/
 
+# Spec Kit: tracked so `git worktree add` carries the templates, scripts and
+# constitution into every worktree. .specify/.gitignore (shipped by the CLI)
+# excludes the per-checkout bits like feature.json.
+!/.specify/
+
+# Claude Code: share the skills (incl. speckit-*), keep local state out.
+!/.claude/
+/.claude/*
+!/.claude/skills/
+
 # Nested SymForge local cache (e.g. npm/.symforge/) — local state, never tracked.
 **/.symforge/
 
