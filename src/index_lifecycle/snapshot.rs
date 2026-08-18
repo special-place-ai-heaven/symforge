@@ -34,6 +34,8 @@ use std::collections::BTreeMap;
 /// secret-bearing — the canary oracle plants one here).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotSeed {
+    /// Deliberately unread by the store: a seed is untrusted regardless of
+    /// the version it claims.
     pub version: u32,
     pub declared_len: u64,
     pub root_digest: u64,
@@ -60,6 +62,9 @@ pub enum SnapshotRefusal {
     /// The seed declares more payload than the pre-decode capacity allows;
     /// nothing was decoded.
     SeedBeyondCapacity { declared: u64, limit: u64 },
+    /// The seed LIED: its declaration passed, but actual decode consumption
+    /// crossed the limit — aborted mid-decode, nothing promoted.
+    CapacityExceededMidDecode { consumed: u64, limit: u64 },
     /// The binding class refuses team-artifact export BEFORE any mutation.
     BindingRefusesExport(BindingClass),
     /// A companion `.gitattributes` repository-content write requires the
@@ -80,7 +85,9 @@ pub enum RestoreOutcome {
     Quarantined { id: u64 },
 }
 
-/// Quarantine metadata — digests and lengths ONLY, never seed bytes.
+/// Quarantine metadata — digests, counts, and lengths only, never seed
+/// byte CONTENT (`declared_digest` echoes the seed's numeric claim, which
+/// the mismatch explanation requires).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuarantineMetadata {
     pub id: u64,
@@ -129,7 +136,10 @@ pub struct ExportReceipt {
 
 impl ExportReceipt {
     /// `None` exactly when git visibility is unavailable — shareability is
-    /// never inferred without it.
+    /// never inferred without it. The Some(..) booleans for the other three
+    /// states are a DARK MODELING CHOICE, not frozen semantics: FR-051
+    /// constrains only the None-when-unavailable case, and the oracle
+    /// deliberately pins only that.
     pub fn shareability(&self) -> Option<bool> {
         match self.visibility {
             GitVisibility::AlreadyTracked | GitVisibility::UntrackedVisible => Some(true),
@@ -139,13 +149,28 @@ impl ExportReceipt {
     }
 }
 
-#[derive(Debug)]
 struct QuarantineEntry {
     metadata: QuarantineMetadata,
     /// The untrusted ORIGINAL, preserved byte-intact for one rollback.
     /// Retention is not disclosure: this payload never reaches metadata,
-    /// receipts, diagnostics, or the V11 state.
+    /// receipts, diagnostics, or the V11 state — and the manual Debug below
+    /// redacts it, so no future diagnostics line can leak it by accident.
     rollback_payload: Option<SnapshotSeed>,
+}
+
+impl std::fmt::Debug for QuarantineEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuarantineEntry")
+            .field("metadata", &self.metadata)
+            .field(
+                "rollback_payload",
+                &self
+                    .rollback_payload
+                    .as_ref()
+                    .map(|seed| format!("<retained, {} opaque bytes>", seed.opaque_note.len())),
+            )
+            .finish()
+    }
 }
 
 /// The dark `.symforge/v11/` store model: V10 namespace, V11 current state,
@@ -194,7 +219,18 @@ impl SnapshotStore {
                 limit,
             });
         }
-        let decoded: Vec<(u64, u64)> = seed.entries.iter().map(&mut decode).collect();
+        // The declaration is a fast-path check, never the enforcement: the
+        // bound binds ACTUAL decode consumption (model stride: 16 bytes per
+        // entry), so a seed that lies small aborts mid-decode.
+        let mut decoded: Vec<(u64, u64)> = Vec::new();
+        let mut consumed: u64 = 0;
+        for entry in &seed.entries {
+            consumed += 16;
+            if consumed > limit {
+                return Err(SnapshotRefusal::CapacityExceededMidDecode { consumed, limit });
+            }
+            decoded.push(decode(entry));
+        }
         let computed = seed_digest(&decoded);
         if computed != seed.root_digest {
             let id = self.next_quarantine;

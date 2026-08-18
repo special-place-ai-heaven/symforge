@@ -130,7 +130,7 @@ GREEN dark.
 
 - [x] T024 [P] [US5] Branch `feature-020-s4-p5-snapshot` from updated `main`; author RED `tests/snapshot_v11_migration.rs` with frozen name `snapshot_seed_requires_complete_current_proof` plus the 020:T057 case list (untrusted V10 seeds, pre-decode capacity, root/digest mismatch, quarantine, rollback, concurrent V10 writers, `.symforge/v11/` namespace isolation, secret-canary bytes never persisted); record observed RED (020:T057)
 - [x] T025 [US5] Implement dark V11 snapshot migration in `src/index_lifecycle/snapshot.rs` (NOT `src/live_index/persist.rs` — the darkness sweep forbids the module token in live files, same ruling as T015/T016; the persist.rs wiring and version bump are cut work) — bounded untrusted-seed restore, complete re-observation, quarantine, atomic V11 replacement, preserved rollback, rebuild fallback, `ProjectStateDir`-only team-artifact persistence, the exact frozen-FR-051 four-state receipt/refusal matrix; the `CURRENT_VERSION` bump and V11 write path stay production-unreachable until T030 activation (020:T065)
-- [x] T026 [US5] Extend darkness seal + census for the persist.rs dark seams; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
+- [x] T026 [US5] Extend darkness seal + census for snapshot.rs (the dark module the T025 correction landed in; persist.rs stays untouched until the cut); refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
 - [x] T027 [US5] Full gate battery via Terminal Commander + traceability validator
 - [ ] T028 [US5] Review (cfg-lens) → PR → green CI → auto-squash-merge
 

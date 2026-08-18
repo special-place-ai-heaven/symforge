@@ -9,8 +9,8 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use symforge::live_index::index_lifecycle::snapshot::{
-    BindingClass, GitVisibility, RestoreOutcome, SnapshotRefusal, SnapshotSeed, SnapshotStore,
-    seed_digest,
+    BindingClass, ExportReceipt, GitVisibility, QuarantineMetadata, RestoreOutcome,
+    SnapshotRefusal, SnapshotSeed, SnapshotStore, seed_digest,
 };
 
 // ── fixtures ───────────────────────────────────────────────────────────────
@@ -202,15 +202,20 @@ fn the_v11_namespace_is_isolated_and_v10_writers_cannot_reach_current() {
 // ── the secret canary ──────────────────────────────────────────────────────
 
 /// Runtime secret-canary bytes never enter V11 snapshots, quarantine
-/// metadata, receipts, or diagnostics — while the quarantined ORIGINAL is
-/// still preserved intact for rollback, which is exactly the difference
-/// between retention and disclosure.
+/// metadata, receipts, or diagnostics - on the QUARANTINE path and the
+/// PROMOTED path both - while the quarantined ORIGINAL is still preserved
+/// intact for rollback, which is exactly the difference between retention
+/// and disclosure. The typed surfaces are pinned by EXHAUSTIVE
+/// destructuring (pair-5 review): a new byte-carrying field on any of them
+/// breaks this test at compile time instead of slipping past a string scan,
+/// and diagnostics are scanned as string CONTENT, not as a Debug rendering
+/// that would show leaked byte vectors as decimals.
 #[test]
 fn secret_canary_bytes_never_persist_in_v11_surfaces() {
     let mut store = SnapshotStore::new();
     let mut secret_bearing = healthy_seed(2);
     secret_bearing.opaque_note = SECRET_CANARY.to_vec();
-    secret_bearing.root_digest ^= 7; // force the quarantine path too
+    secret_bearing.root_digest ^= 7; // force the quarantine path
     let original = secret_bearing.clone();
 
     let RestoreOutcome::Quarantined { id } = store
@@ -220,26 +225,32 @@ fn secret_canary_bytes_never_persist_in_v11_surfaces() {
         panic!("expected quarantine");
     };
 
-    let metadata_view = format!("{:?}", store.quarantine_metadata());
-    assert!(
-        !contains_canary(&metadata_view),
-        "the canary reached quarantine metadata"
-    );
-    assert!(
-        metadata_view.contains("opaque_len"),
-        "metadata must still describe the opaque payload by size"
-    );
-    let diagnostics_view = store.diagnostics().join("\n");
-    assert!(
-        !contains_canary(&diagnostics_view),
-        "the canary reached diagnostics"
-    );
-    let current_view = format!("{:?}", store.current());
-    assert!(
-        !contains_canary(&current_view),
-        "the canary reached the V11 state"
-    );
+    // Quarantine metadata: every field typed, none byte-carrying — pinned
+    // exhaustively, no `..` allowed.
+    for row in store.quarantine_metadata() {
+        let QuarantineMetadata {
+            id: _,
+            declared_digest: _,
+            computed_digest: _,
+            entry_count,
+            opaque_len,
+        } = row;
+        assert_eq!(entry_count, 2);
+        assert_eq!(
+            opaque_len,
+            SECRET_CANARY.len(),
+            "metadata describes the payload by SIZE"
+        );
+    }
+    // Diagnostics: scanned as string content.
+    for line in store.diagnostics() {
+        assert!(
+            !contains_canary(&line),
+            "the canary reached diagnostics: {line}"
+        );
+    }
 
+    // The receipt: one typed field, pinned exhaustively.
     let receipt = store
         .export_team_artifact(
             BindingClass::NormalWritable,
@@ -247,13 +258,80 @@ fn secret_canary_bytes_never_persist_in_v11_surfaces() {
             b"artifact".to_vec(),
         )
         .expect("a normal writable binding exports");
-    assert!(
-        !contains_canary(&format!("{receipt:?}")),
-        "the canary reached a receipt"
-    );
+    let ExportReceipt { visibility } = receipt;
+    assert_eq!(visibility, GitVisibility::AlreadyTracked);
 
     // Retention is not disclosure: rollback still returns the original.
     assert_eq!(store.rollback(id), Some(original));
+
+    // The PROMOTED path - the first surface the frozen wording names: a
+    // fully proven secret-bearing seed promotes, and the promoted state
+    // (u64 stamps only, pinned by type) plus its diagnostics stay clean.
+    let mut promoted = SnapshotStore::new();
+    let mut proven_secret = healthy_seed(2);
+    proven_secret.opaque_note = SECRET_CANARY.to_vec();
+    promoted
+        .restore(proven_secret, 1_024, identity_decode, |_, _| true)
+        .expect("a proven secret-bearing seed still promotes");
+    let current: std::collections::BTreeMap<u64, u64> = promoted.current();
+    assert_eq!(
+        current.len(),
+        2,
+        "the promoted snapshot carries stamps, never seed bytes"
+    );
+    for line in promoted.diagnostics() {
+        assert!(
+            !contains_canary(&line),
+            "the canary reached promoted-path diagnostics"
+        );
+    }
+}
+
+/// The capacity bound binds the UNTRUSTED input, not its self-declaration
+/// (pair-5 review): a seed that lies small but carries a huge payload
+/// aborts MID-decode with bounded decode invocations - the declared header
+/// is a fast-path check, never the enforcement.
+#[test]
+fn a_lying_declaration_cannot_defeat_the_capacity_bound() {
+    let mut store = SnapshotStore::new();
+    let decodes = Cell::new(0_u32);
+
+    // 200 entries at the model stride of 16 bytes = 3200 actual, declared 16.
+    let entries: Vec<(u64, u64)> = (1..=200).map(|id| (id, id)).collect();
+    let liar = SnapshotSeed {
+        version: 10,
+        declared_len: 16,
+        root_digest: seed_digest(&entries),
+        entries,
+        opaque_note: Vec::new(),
+    };
+    let refusal = store
+        .restore(
+            liar,
+            1_024,
+            |entry| {
+                decodes.set(decodes.get() + 1);
+                *entry
+            },
+            |_, _| true,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            SnapshotRefusal::CapacityExceededMidDecode { limit: 1_024, .. }
+        ),
+        "a lying seed must abort mid-decode, got {refusal:?}"
+    );
+    assert!(
+        decodes.get() <= 65,
+        "decode must stop within the bound, ran {} times",
+        decodes.get()
+    );
+    assert!(
+        store.current().is_empty(),
+        "an aborted decode promoted something"
+    );
 }
 
 // ── FR-051: the team-artifact matrix ───────────────────────────────────────
