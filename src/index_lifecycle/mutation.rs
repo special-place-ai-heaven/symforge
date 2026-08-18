@@ -86,33 +86,6 @@ impl PermitDrainSignal {
     }
 }
 
-/// The holder's declaration that its permit performed no source-disk side
-/// effect.
-///
-/// **This is a declaration, not a proof.** An earlier doc comment here claimed
-/// it was "constructible only by the lane that actually observed the absence",
-/// which was false: the constructor is public and any caller can produce one. It
-/// therefore cannot distinguish an observed absence from an asserted one, and
-/// naming it a proof made it read like the sibling
-/// [`NonCurrentPublicationProof`], which really does derive its force from
-/// private fields and a single construction site.
-///
-/// It is kept as a distinct type so the declaration is explicit at the call
-/// site rather than implied by calling a bare method. When Slice 4 introduces
-/// the write lane that can actually observe the absence, construction should
-/// move behind it and this type can become a real proof.
-#[derive(Debug)]
-pub struct NoSideEffectProof {
-    _seal: (),
-}
-
-impl NoSideEffectProof {
-    /// Declare that nothing was written.
-    pub fn observed() -> Self {
-        Self { _seal: () }
-    }
-}
-
 /// A ticket requiring the source to return through a fresh candidate at the
 /// latest observer cut. A permit never restores its predecessor to `Current`.
 #[derive(Debug, PartialEq, Eq)]
@@ -273,15 +246,19 @@ impl SourceMutationPermit {
         self.finish(Termination::Committed)
     }
 
-    /// Terminate with proof that nothing was written.
-    pub fn no_side_effect(
-        &mut self,
-        proof: NoSideEffectProof,
-    ) -> Result<RefreshTicket, AuthorityRefusal> {
-        if matches!(self.state, PermitState::Terminal(_)) {
-            return Err(AuthorityRefusal::PermitAlreadyTerminal);
+    /// Terminate with the permit's OWN observation that nothing was written
+    /// through its lease: a permit still `Granted` never began a side effect,
+    /// so its lease wrote nothing. This discharges the recorded obligation on
+    /// the former `NoSideEffectProof` type -- the caller declaration is gone,
+    /// and the write lane that observed the absence is the permit itself. A
+    /// permit whose side effect has begun cannot attest the absence and must
+    /// commit or drain instead.
+    pub fn no_side_effect(&mut self) -> Result<RefreshTicket, AuthorityRefusal> {
+        match self.state {
+            PermitState::Terminal(_) => return Err(AuthorityRefusal::PermitAlreadyTerminal),
+            PermitState::InFlight => return Err(AuthorityRefusal::SideEffectAlreadyInFlight),
+            PermitState::Granted => {}
         }
-        let _ = proof;
         self.finish(Termination::NoSideEffect)
     }
 

@@ -23,9 +23,19 @@
 //! serves only in `PreventiveV1Open`, and the window between them is
 //! drain-only.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use super::authority::{
+    AuthorityRefusal, BindingAuthority, CurrentPublication, MutationGrantInput, ObserverToken,
+    SourceRuntime,
+};
+use super::mutation::{PermitDrainSignal, RefreshTicket, SourceMutationPermit};
+use super::physical_root::{PhysicalRootLease, WriteReceipt};
+use super::transition::{self, TransitionKind};
+use crate::lifecycle_identity::PublicationIdentity;
 
 /// The closed three-mode machine (frozen T066). Monotonic: the enum has no
 /// reverse edge and the type exposes no API that revisits an earlier mode.
@@ -260,6 +270,215 @@ impl ActivationCut {
     }
 }
 
+// ── The write-lane bridge (T064, C2) ───────────────────────────────────────
+
+/// One project root's live source authority: the bridge the cut's writer
+/// lanes acquire mutation permits from.
+///
+/// MID-CUT BRIDGING CLAIM, recorded: construction seeds the runtime
+/// `Current` on a fresh publication because the V10 data plane it stands
+/// beside serves queries today; C4 ties construction to observed bootstrap
+/// state and C3 replaces the fresh [`ObserverToken`] minted at each
+/// reconcile with the real accumulated observer cut. Neither simplification
+/// weakens the write path itself: every write still requires a granted
+/// permit, publishes non-`Current` first, and returns to `Current` only
+/// through a fresh publication (FR-043).
+#[derive(Debug)]
+pub struct ProjectSourceAuthority {
+    root: PathBuf,
+    inner: Mutex<AuthorityInner>,
+}
+
+#[derive(Debug)]
+struct AuthorityInner {
+    runtime: SourceRuntime,
+    lease: Arc<PhysicalRootLease>,
+    outstanding: Arc<PermitDrainSignal>,
+}
+
+/// A granted, in-progress write on one project source. Non-Clone; ends by
+/// [`WriteAuthority::finish_committed`], [`WriteAuthority::finish_no_side_effect`],
+/// or drop (which drains the permit and leaves the source non-`Current` —
+/// honest stranding until the C3 re-scout lane lands).
+#[derive(Debug)]
+pub struct WriteAuthority {
+    authority: Arc<ProjectSourceAuthority>,
+    permit: SourceMutationPermit,
+    frozen_publication: PublicationIdentity,
+}
+
+impl ProjectSourceAuthority {
+    /// The bridge for one project root. See the type doc for the recorded
+    /// mid-cut construction claim.
+    pub fn for_root(root: &Path) -> Arc<Self> {
+        let lease = Arc::new(PhysicalRootLease::take(root));
+        let binding = BindingAuthority::bind(lease.identity());
+        let publication = CurrentPublication::promote(binding, ObserverToken::fresh());
+        Arc::new(Self {
+            root: root.to_path_buf(),
+            inner: Mutex::new(AuthorityInner {
+                runtime: SourceRuntime::current(publication),
+                lease,
+                // Unarmed: reports ended until a permit arms it, which is
+                // what lets the first transition treat "no permit ever" as
+                // drained rather than as an optional check.
+                outstanding: Arc::new(PermitDrainSignal::new()),
+            }),
+        })
+    }
+
+    /// Whether the source is live `Current` (queryable, grantable).
+    pub fn is_current(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("project source authority lock")
+            .runtime
+            .live_publication()
+            .is_some()
+    }
+
+    /// The live publication identity, when `Current`.
+    pub fn current_publication(&self) -> Option<PublicationIdentity> {
+        self.inner
+            .lock()
+            .expect("project source authority lock")
+            .runtime
+            .live_publication()
+            .map(|publication| publication.publication())
+    }
+
+    /// How many mutation grants this source has ever issued. The wiring
+    /// oracles pin routing on this: a write that went through the permit
+    /// lane moved the counter; one that bypassed it did not.
+    pub fn grants_issued(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("project source authority lock")
+            .runtime
+            .grants_issued()
+    }
+
+    /// Acquire the single write authority for this source: grant against the
+    /// live `Current` publication (which publishes non-`Current` before the
+    /// permit exists), then mint the permit pinned to this root's lease.
+    pub fn acquire_write(self: &Arc<Self>) -> Result<WriteAuthority, AuthorityRefusal> {
+        let mut inner = self.inner.lock().expect("project source authority lock");
+        let presented = match inner.runtime.live_publication() {
+            Some(publication) => publication.publication(),
+            None => {
+                return Err(AuthorityRefusal::PhaseNotCurrent {
+                    phase: inner.runtime.phase(),
+                });
+            }
+        };
+        let grant = inner
+            .runtime
+            .request_mutation_grant(MutationGrantInput::LiveCurrent(presented))?;
+        let frozen_publication = grant.published_non_current().publication();
+        let drain = Arc::new(PermitDrainSignal::new());
+        let permit = SourceMutationPermit::grant(grant, inner.lease.clone(), drain.clone())?;
+        inner.outstanding = drain;
+        Ok(WriteAuthority {
+            authority: self.clone(),
+            permit,
+            frozen_publication,
+        })
+    }
+
+    /// Return the source to `Current` through a fresh publication after its
+    /// permit reached a terminal path: retire the permit, then the sealed
+    /// Freeze -> Drain -> Install transition under a fresh lease and binding.
+    fn reconcile_returned(
+        &self,
+        frozen_publication: PublicationIdentity,
+        ticket: RefreshTicket,
+    ) -> Result<RefreshTicket, AuthorityRefusal> {
+        let mut guard = self.inner.lock().expect("project source authority lock");
+        let inner = &mut *guard;
+        inner.runtime.retire_permit(frozen_publication);
+        let outstanding = inner.outstanding.clone();
+        let new_lease = Arc::new(PhysicalRootLease::take(self.root.as_path()));
+        let incoming = BindingAuthority::bind(new_lease.identity());
+        let old_lease = inner.lease.clone();
+        transition::apply(
+            &mut inner.runtime,
+            TransitionKind::Reload,
+            &old_lease,
+            incoming,
+            // MID-CUT: a fresh token stands in for the accumulated observer
+            // cut until C3 wires the real accumulator (execution map, seal
+            // section).
+            ObserverToken::fresh(),
+            &outstanding,
+        )?;
+        inner.lease = new_lease;
+        Ok(ticket)
+    }
+}
+
+impl WriteAuthority {
+    /// Write one path beneath the authorized root. The first write begins the
+    /// permit's side effect; later writes continue it (a batch is one
+    /// authority, many receipts).
+    pub fn write(
+        &mut self,
+        relative: &Path,
+        contents: &[u8],
+    ) -> Result<WriteReceipt, AuthorityRefusal> {
+        match self.permit.start_side_effect() {
+            Ok(()) => {}
+            // Continuing the batch: the side effect is already in flight.
+            Err(AuthorityRefusal::SideEffectAlreadyInFlight) => {}
+            Err(refusal) => return Err(refusal),
+        }
+        self.permit.replace_beneath(relative, contents)
+    }
+
+    /// Commit the observed side effect and return the source to `Current`
+    /// through a fresh publication: retire the permit, then apply the sealed
+    /// Freeze -> Drain -> Install transition under a fresh root lease and
+    /// binding.
+    pub fn finish_committed(
+        self,
+        receipt: WriteReceipt,
+    ) -> Result<RefreshTicket, AuthorityRefusal> {
+        let WriteAuthority {
+            authority,
+            mut permit,
+            frozen_publication,
+        } = self;
+        let ticket = permit.commit(receipt)?;
+        authority.reconcile_returned(frozen_publication, ticket)
+    }
+
+    /// Terminate with the permit's own observation that nothing was written
+    /// through its lease (the permit never began a side effect), and return
+    /// the source to `Current` through a fresh publication — FR-043 applies
+    /// to no-ops too. Refuses once a side effect has begun.
+    pub fn finish_no_side_effect(self) -> Result<RefreshTicket, AuthorityRefusal> {
+        let WriteAuthority {
+            authority,
+            mut permit,
+            frozen_publication,
+        } = self;
+        let ticket = permit.no_side_effect()?;
+        authority.reconcile_returned(frozen_publication, ticket)
+    }
+}
+
+static PROJECT_AUTHORITIES: OnceLock<Mutex<HashMap<PathBuf, Arc<ProjectSourceAuthority>>>> =
+    OnceLock::new();
+
+/// The process registry of per-root write authorities. C2's self-provisioning
+/// seam for the writer lanes; C4 moves ownership into runtime bootstrap.
+pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
+    let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().expect("project authority registry lock");
+    map.entry(root.to_path_buf())
+        .or_insert_with(|| ProjectSourceAuthority::for_root(root))
+        .clone()
+}
+
 /// Feature 020 V11, T066 — activation machine oracles (in-crate per the
 /// discharged fixture-door precondition; see `runtime.rs`).
 #[cfg(all(test, feature = "server"))]
@@ -442,5 +661,140 @@ mod activation_oracles {
         // No oracle in this module advances the process machine; the fresh
         // machines above keep scenario state out of the singleton.
         assert_eq!(first.mode(), ActivationMode::LegacyOpen);
+    }
+}
+
+/// Feature 020 V11, T064 — write-lane bridge oracles.
+#[cfg(all(test, feature = "server"))]
+mod write_authority_oracles {
+    use super::ProjectSourceAuthority;
+    use crate::live_index::index_lifecycle::authority::AuthorityRefusal;
+
+    fn a_temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "symforge-write-authority-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create oracle root");
+        root
+    }
+
+    #[test]
+    fn write_cycle_publishes_non_current_then_returns_current_fresh() {
+        let root = a_temp_root("cycle");
+        let authority = ProjectSourceAuthority::for_root(&root);
+        assert!(authority.is_current(), "the bridge seeds Current");
+        let before = authority
+            .current_publication()
+            .expect("Current has a publication");
+
+        let mut write = authority.acquire_write().expect("grant on Current");
+        assert!(
+            !authority.is_current(),
+            "the grant itself published non-Current before any byte moved"
+        );
+
+        let receipt = write
+            .write(std::path::Path::new("oracle.txt"), b"written under permit")
+            .expect("confined write beneath the leased root");
+        write.finish_committed(receipt).expect("commit and return");
+
+        assert!(authority.is_current(), "the source returned to Current");
+        let after = authority
+            .current_publication()
+            .expect("Current has a publication");
+        assert_ne!(
+            before, after,
+            "return is through a FRESH publication, never a restore"
+        );
+        assert_eq!(
+            std::fs::read(root.join("oracle.txt")).expect("the write landed"),
+            b"written under permit",
+            "the permit's lease wrote the actual bytes"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn one_outstanding_write_authority_at_a_time() {
+        let root = a_temp_root("single");
+        let authority = ProjectSourceAuthority::for_root(&root);
+
+        let write = authority.acquire_write().expect("first grant");
+        let refusal = authority
+            .acquire_write()
+            .expect_err("a second grant while one is outstanding refuses");
+        assert!(
+            matches!(refusal, AuthorityRefusal::PhaseNotCurrent { .. }),
+            "the refusal names the non-Current phase, got {refusal:?}"
+        );
+
+        // Positive control: finishing the first restores grantability.
+        write
+            .finish_no_side_effect()
+            .expect("an unstarted permit attests no side effect");
+        authority
+            .acquire_write()
+            .expect("after the return to Current a fresh grant succeeds");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn no_side_effect_refuses_once_a_side_effect_began() {
+        let root = a_temp_root("nse");
+        let authority = ProjectSourceAuthority::for_root(&root);
+
+        let mut write = authority.acquire_write().expect("grant");
+        write
+            .write(std::path::Path::new("touched.txt"), b"bytes")
+            .expect("write");
+        let refusal = write
+            .finish_no_side_effect()
+            .expect_err("a begun side effect cannot be attested away");
+        assert!(
+            matches!(refusal, AuthorityRefusal::SideEffectAlreadyInFlight),
+            "the refusal names the in-flight side effect, got {refusal:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn no_side_effect_return_is_also_a_fresh_publication() {
+        let root = a_temp_root("nse-fresh");
+        let authority = ProjectSourceAuthority::for_root(&root);
+        let before = authority.current_publication().expect("publication");
+
+        let write = authority.acquire_write().expect("grant");
+        write
+            .finish_no_side_effect()
+            .expect("unstarted permit attests");
+        let after = authority.current_publication().expect("publication");
+        assert_ne!(
+            before, after,
+            "FR-043: even a proven no-op returns through a fresh publication"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dropped_write_authority_strands_non_current_until_re_scout() {
+        let root = a_temp_root("dropped");
+        let authority = ProjectSourceAuthority::for_root(&root);
+
+        let write = authority.acquire_write().expect("grant");
+        drop(write);
+
+        // The drained permit's write state is unobserved, so the bridge must
+        // NOT claim Current. Recovery is the C3 re-scout lane's obligation,
+        // recorded in the execution map; until then this is honest stranding.
+        assert!(
+            !authority.is_current(),
+            "a dropped permit must not restore Current without evidence"
+        );
+        let refusal = authority
+            .acquire_write()
+            .expect_err("a stranded source refuses new grants");
+        assert!(matches!(refusal, AuthorityRefusal::PhaseNotCurrent { .. }));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

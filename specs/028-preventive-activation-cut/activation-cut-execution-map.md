@@ -160,6 +160,44 @@ is the only thing allowed to touch it:
 Gate battery after every commit-group, serial via TC; fmt BEFORE pin
 refresh; embed feature gate before every push.
 
+## 4b. Traceability validator lifecycle (verified against the .cjs, C2 planning)
+
+The validator classifies the live tree by comparing lib.rs's public-mod
+census against the frozen atom sets (`resolvePublicApiLifecycle`):
+
+- **Preactivation** (until C5's keyword flip): enforces (1) the frozen
+  byte-census digests over the five closure categories
+  (`RETIREMENT_CLOSURE_MISMATCH`), (2) exact equality of the
+  pattern-DERIVED semantic inventory with the frozen member lists
+  (`RETIREMENT_SOURCE_INVENTORY_MISMATCH`) — fields typed
+  `SharedIndex(Handle)` named index/project_indexes, writer/callback items
+  by file+name, `pub struct SharedIndexHandle`, pub reload methods — and
+  (3) source-anchor resolution of every member.
+- **Postactivation** (lib.rs matches kept+introduced atoms): switches to
+  (1) no retired atom reachable in the public graph
+  (`POSTACTIVATION_RETIRED_API_REACHABLE`) and (2) every frozen seam
+  anchor resolves in live source (`POSTACTIVATION_V11_SEAM_UNRESOLVED`) —
+  which REQUIRES a resolvable `V11PublicApi` construct in
+  `public_api.rs` (does not exist yet; C5 creates it) alongside
+  `activation.rs::ActivationCut` (exists). The semantic-inventory
+  equality is NOT enforced postactivation, so retained function names in
+  rerouted writers are fine after the flip.
+
+**Planned mid-cut state**: from C2 until C5 the validator is expected RED
+with exactly `RETIREMENT_CLOSURE_MISMATCH` (edited censused files) and,
+once D1 removes `index: SharedIndex` fields, `RETIREMENT_SOURCE_INVENTORY_
+MISMATCH`. Any other failure code in that window is a real defect. The
+validator returns green via the postactivation path at C5; that is a hard
+PR exit criterion. Tool profiles (full=39 / compact=3) must hold in BOTH
+lifecycles.
+
+**Seal transformation at C2**: the call-edge sweep inverts from "no live
+file names index_lifecycle" to a pinned reachability roster — the set of
+live files holding call edges is exactly the planned wiring set, extended
+per commit. This preserves the no-unplanned-edges property through the
+mid-cut window and becomes the executed-reachability record the frozen
+retirement contract says replaces the preactivation census.
+
 ## 5. Doc-recorded cut obligations index (verified file:line)
 
 mod.rs:26 (writer lanes consume permits = Slice 4); mod.rs:30-55 (per-module

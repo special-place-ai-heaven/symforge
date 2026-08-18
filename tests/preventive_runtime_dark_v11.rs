@@ -422,8 +422,17 @@ const INGRESS_LANES: &[(&str, &str)] = &[
     ("mutation", "src/protocol/edit_tools.rs"),
 ];
 
+/// The activation cut's executed-reachability roster: live files where call
+/// edges into the lifecycle directory are INTENDED, extended deliberately
+/// with each wiring commit. Every row must actually hold at least one edge
+/// (anti-vacuity below), so a stale row fails as loudly as an unplanned
+/// edge. This is the inversion the frozen retirement contract prescribes:
+/// "After activation, the executed Slice 4 reachability cases replace the
+/// preactivation census."
+const WIRED_PRODUCTION_FILES: &[&str] = &["src/protocol/edit.rs"];
+
 #[test]
-fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
+fn dark_call_edges_appear_only_in_the_wired_roster() {
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     for (lane, path) in INGRESS_LANES {
         assert!(
@@ -459,11 +468,35 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
         ],
     );
 
+    // Partition every matched line: a roster file's edges are the wiring the
+    // cut intends; anything else is an unplanned edge and fails exactly as
+    // it did before the cut began.
+    let mut wired_counts: std::collections::BTreeMap<&str, usize> = WIRED_PRODUCTION_FILES
+        .iter()
+        .map(|file| (*file, 0usize))
+        .collect();
+    let mut unplanned = Vec::new();
+    for violation in &result.violations {
+        match WIRED_PRODUCTION_FILES
+            .iter()
+            .find(|file| violation.starts_with(&format!("{file}:")))
+        {
+            Some(file) => *wired_counts.get_mut(*file).expect("roster key") += 1,
+            None => unplanned.push(violation.clone()),
+        }
+    }
     assert!(
-        result.violations.is_empty(),
-        "call edges into the dark directory from production code:\n{}",
-        result.violations.join("\n")
+        unplanned.is_empty(),
+        "call edges into the lifecycle directory OUTSIDE the wired roster:\n{}",
+        unplanned.join("\n")
     );
+    for (file, count) in &wired_counts {
+        assert!(
+            *count > 0,
+            "roster row `{file}` holds no call edge — a stale row claims \
+             wiring that does not exist; remove it deliberately"
+        );
+    }
     // Anti-vacuity: the sweep must have SEEN what the tree is known to hold —
     // both halves of the one permitted mount, the prose mentions that prove
     // comments are tolerated rather than never encountered, and a file count
@@ -803,15 +836,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "5c8c2ebe109863ef787253af83310798636d9eb3c76ee37c62467d1958dc7f0a",
+    "325442368dfbba1dda26f7cbab0a1589811be6b06a0340ef5c35ee9ad2b0642d",
     20,
-    330_956,
+    344_501,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "95e43af9f213e2f05cf8addfc7f664994cdfb6c82dd0b6c2aa2864081d0042dc",
+    "ebd3fe3d5f1407a0ae36d095d06dc2583d0dc1ad0718c20ed6f697e95dcc5ecb",
     194,
-    9_116_954,
+    9_135_497,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

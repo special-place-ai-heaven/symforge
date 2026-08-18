@@ -150,19 +150,22 @@ pub(crate) struct AtomicWriteReport {
     pub tee_snapshot: crate::edit_safety::tee::TeeSnapshot,
 }
 
+/// Wrap an authority refusal for this module's `io::Result` writers.
+fn authority_refused(
+    refusal: crate::live_index::index_lifecycle::authority::AuthorityRefusal,
+) -> std::io::Error {
+    std::io::Error::other(format!("source mutation authority refused: {refusal:?}"))
+}
+
 pub(crate) fn atomic_write_file(
     repo_root: &Path,
     project_state_dir: Option<&crate::domain::ProjectStateDir>,
     path: &Path,
     content: &[u8],
 ) -> std::io::Result<AtomicWriteReport> {
-    use std::io::Write;
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path has no parent directory",
-        )
-    })?;
+    // The tee snapshot is a ProjectStateDir state write and stays permit-free
+    // per the frozen writers-category assertion; only the repository-source
+    // byte write below carries mutation authority.
     let tee_snapshot = match project_state_dir {
         Some(state_dir) => crate::edit_safety::tee::Tee::for_repo(repo_root, state_dir)
             .snapshot(path)
@@ -175,13 +178,83 @@ pub(crate) fn atomic_write_file(
             message: "project state unavailable; tee snapshot disabled".to_string(),
         },
     };
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(content)?;
-    tmp.flush()?;
-    tmp.as_file().sync_all()?;
-    // persist() uses rename(2) on Unix and MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows,
-    // atomically replacing any existing target file.
-    tmp.persist(path).map_err(|e| e.error)?;
+    match path.strip_prefix(repo_root) {
+        Ok(relative) => {
+            // The lease's staged replacement deliberately creates missing
+            // parents beneath the confined root (physical_root.rs); this
+            // seam preserves the V10 refusal instead — pinned by
+            // test_atomic_write_error_path_no_orphan — so an edit-tool
+            // write into a nonexistent directory stays an error, checked
+            // before any grant is spent.
+            match path.parent() {
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "path has no parent directory",
+                    ));
+                }
+                Some(parent) if !parent.exists() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "target parent directory does not exist",
+                    ));
+                }
+                Some(_) => {}
+            }
+            // T064: the repository-source byte write obtains a current
+            // SourceMutationPermit BEFORE I/O, writes beneath the permit's
+            // own confined lease, and returns to Current only through a
+            // fresh publication. A sibling writer holds the source
+            // non-Current for the length of one write cycle, so a brief
+            // bounded wait stands in for the daemon-level serialization the
+            // C4 root commit makes structural.
+            let authority =
+                crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
+            let mut write = {
+                let mut attempts = 0u32;
+                loop {
+                    match authority.acquire_write() {
+                        Ok(write) => break write,
+                        Err(
+                            refusal @ crate::live_index::index_lifecycle::authority::AuthorityRefusal::PhaseNotCurrent { .. },
+                        ) => {
+                            attempts += 1;
+                            if attempts >= 80 {
+                                // ~2s of sibling-writer patience, then the
+                                // refusal surfaces honestly.
+                                return Err(authority_refused(refusal));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        Err(refusal) => return Err(authority_refused(refusal)),
+                    }
+                }
+            };
+            let receipt = write.write(relative, content).map_err(authority_refused)?;
+            write.finish_committed(receipt).map_err(authority_refused)?;
+        }
+        Err(_) => {
+            // Resolve-hook reroute outside the project root (worktree lane).
+            // Recorded C2 residual: this lane keeps the legacy tempfile
+            // write until the per-root authorities of C3/C4 attach to
+            // resolved targets (execution map, seal section).
+            use std::io::Write;
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path has no parent directory",
+                )
+            })?;
+            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+            tmp.write_all(content)?;
+            tmp.flush()?;
+            tmp.as_file().sync_all()?;
+            // persist() uses rename(2) on Unix and
+            // MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows, atomically
+            // replacing any existing target file.
+            tmp.persist(path).map_err(|e| e.error)?;
+        }
+    }
     Ok(AtomicWriteReport { tee_snapshot })
 }
 
@@ -3389,6 +3462,40 @@ pub(crate) fn detect_stale_references(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Feature 020 V11, T064 — writer-lane wiring oracles: the repository-source
+/// byte write in this module routes through a current `SourceMutationPermit`.
+#[cfg(test)]
+mod write_authority_wiring {
+    use super::atomic_write_file;
+    use crate::live_index::index_lifecycle::activation::project_source_authority;
+
+    #[test]
+    fn atomic_write_file_routes_through_the_source_mutation_permit() {
+        let root = tempfile::tempdir().expect("oracle root");
+        let authority = project_source_authority(root.path());
+        let before = authority.grants_issued();
+
+        let target = root.path().join("wired.rs");
+        atomic_write_file(root.path(), None, &target, b"fn wired() {}")
+            .expect("the permit-authorized write succeeds");
+
+        assert_eq!(
+            std::fs::read(&target).expect("the write landed"),
+            b"fn wired() {}"
+        );
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "the write acquired exactly one mutation grant — zero means the \
+             legacy lane wrote without authority"
+        );
+        assert!(
+            authority.is_current(),
+            "the source returned to Current through the permit's terminal path"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
