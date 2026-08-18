@@ -57,7 +57,7 @@ GREEN; darkness seal proves the new modules unreachable from production.
 - [x] T004 [US1] Implement `src/index_lifecycle/candidate.rs` — capacity-reserved isolated full/delta candidates, complete artifact certificates, one runtime-store commit point, `CatalogPath` native/opaque identity end-to-end, delta exact-validation of only the changed source token, no-allocation whole-root patch, same-source drift retry/abort, epochs-never-authorize; register both modules in `src/index_lifecycle/mod.rs` (020:T060)
 - [x] T005 [US1] Extend `tests/preventive_runtime_dark_v11.rs` (constructor unreachability + census) to cover supervisor+candidate; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle only; reconcile the contract chain if census categories shift (quickstart step 3)
 - [x] T006 [US1] Run the full gate battery serially via Terminal Commander (fmt, clippy -D warnings, all-targets serial suite, `--no-default-features --features embed --lib`, release build, verify-tools, npm) plus `node scripts/validate-lifecycle-oracle-traceability.cjs`; `cargo clean` if `target/` grew heavy
-- [ ] T007 [US1] One independent code review including the mandatory cfg-lens sweep; open PR; on green CI auto-squash-merge with explicit subject/body (spec FR-015/FR-016)
+- [x] T007 [US1] One independent code review including the mandatory cfg-lens sweep; open PR; on green CI auto-squash-merge with explicit subject/body (spec FR-015/FR-016)
 
 **Checkpoint**: candidate pipeline GREEN dark on `main`; the Wave 1 workflow
 (RED → GREEN → seal → gates → review → merge) is proven end to end.
