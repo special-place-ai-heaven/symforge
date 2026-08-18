@@ -72,10 +72,10 @@ deadline machine and sealed receipts exist dark (020:T055 + T062)
 **Independent Test**: `cargo test --test rolling_verification_v11 -- --test-threads=1`
 GREEN dark.
 
-- [ ] T008 [P] [US2] Branch `feature-020-s4-p2-verification` from updated `main`; author RED `tests/rolling_verification_v11.rs` with frozen name `rolling_passes_are_fair_resumable_and_fenced` plus the full 020:T055 case list (scope discovery, entry obligations, same-stamp rewrites, exact deadline boundary with `VerificationOverdueLatched`, no-extension-by-partial-work, overdue acquisition refusal, fenced proof refresh, sealed `VerificationScopeReceipt`, `VerificationWorkBound` ≤ 712 s, `VerificationFeasibilityReceipt` lost-reservation → non-Current, policy-mismatch re-scout); record observed RED (020:T055)
-- [ ] T009 [US2] Implement `src/index_lifecycle/verification.rs` from nothing — racy-clean entry obligations, scope-discovery deadlines, resumable rolling passes, immutable proof refresh, the exact frozen-FR-049 monotonic overdue predicate; register in `mod.rs` (020:T062)
-- [ ] T010 [US2] Extend darkness seal + census for verification.rs; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
-- [ ] T011 [US2] Full gate battery via Terminal Commander + traceability validator
+- [x] T008 [P] [US2] Branch `feature-020-s4-p2-verification` from updated `main`; author RED `tests/rolling_verification_v11.rs` with frozen name `rolling_passes_are_fair_resumable_and_fenced` plus the full 020:T055 case list (scope discovery, entry obligations, same-stamp rewrites, exact deadline boundary with `VerificationOverdueLatched`, no-extension-by-partial-work, overdue acquisition refusal, fenced proof refresh, sealed `VerificationScopeReceipt`, `VerificationWorkBound` ≤ 712 s, `VerificationFeasibilityReceipt` lost-reservation → non-Current, policy-mismatch re-scout); record observed RED (020:T055)
+- [x] T009 [US2] Implement `src/index_lifecycle/verification.rs` from nothing — racy-clean entry obligations, scope-discovery deadlines, resumable rolling passes, immutable proof refresh, the exact frozen-FR-049 monotonic overdue predicate; register in `mod.rs` (020:T062)
+- [x] T010 [US2] Extend darkness seal + census for verification.rs; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
+- [x] T011 [US2] Full gate battery via Terminal Commander + traceability validator
 - [ ] T012 [US2] Review (cfg-lens) → PR → green CI → auto-squash-merge
 
 **Checkpoint**: verification machine GREEN dark on `main`.
