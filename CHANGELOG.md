@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.10.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.9.0...v10.10.0) (2026-08-18)
+
+
+### Features
+
+* **feature-020:** Slice 4 pair 4 - dark observer accumulator and handoff ([#595](https://github.com/special-place-ai-heaven/symforge/issues/595)) ([f541e6e](https://github.com/special-place-ai-heaven/symforge/commit/f541e6ecba4d07f454c5fcd001bf88fe3e3e58d0))
+
 ## [10.9.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.8.0...v10.9.0) (2026-08-18)
 
 
