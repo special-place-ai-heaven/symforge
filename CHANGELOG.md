@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.9.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.8.0...v10.9.0) (2026-08-18)
+
+
+### Features
+
+* **feature-020:** Slice 4 pair 3 - dark strict query leases ([#593](https://github.com/special-place-ai-heaven/symforge/issues/593)) ([d9cbc44](https://github.com/special-place-ai-heaven/symforge/commit/d9cbc44697998b94718cb6c38880045fe5f21c05))
+
 ## [10.8.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.7.0...v10.8.0) (2026-08-18)
 
 
