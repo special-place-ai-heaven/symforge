@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.11.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.10.0...v10.11.0) (2026-08-18)
+
+
+### Features
+
+* **feature-020:** Slice 4 pair 5 - dark snapshot migration ([#597](https://github.com/special-place-ai-heaven/symforge/issues/597)) ([53b7193](https://github.com/special-place-ai-heaven/symforge/commit/53b71939544e8c29d3749c42a96c787714a18c57))
+
 ## [10.10.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.9.0...v10.10.0) (2026-08-18)
 
 
