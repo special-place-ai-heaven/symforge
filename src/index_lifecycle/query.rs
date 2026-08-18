@@ -18,7 +18,10 @@
 //! exact-bijection capture, refusal-not-no-match, stale/retarget
 //! finalization fences, sealed render authority whose truncation cannot
 //! change identity, protected roots reaching Current only through full
-//! candidate promotion, and the two-ledger health split — are exact.
+//! candidate promotion, and the two-ledger health split — are exact. The
+//! promotion-evidence PAYLOAD is not: any committed candidate root counts
+//! as evidence today, and binding it to the specific source is a recorded
+//! cut obligation.
 //!
 //! **Nothing in production calls this module.** Only the Slice 4 oracle
 //! suites and this directory do; activation (T064/T066) is the only planned
@@ -56,6 +59,8 @@ pub enum SelectionRefusal {
     StaleAtFinalization(SourceId),
     /// The project was retargeted while the lease was open.
     RetargetedDuringLease,
+    /// The lease was finalized against a table that did not issue it.
+    ForeignTable,
     /// A protected root may reach `Current` only through full candidate
     /// promotion.
     ProtectedRootRequiresPromotion(SourceId),
@@ -72,6 +77,7 @@ impl SelectionRefusal {
             SelectionRefusal::NotCurrent(_) => "source_not_current",
             SelectionRefusal::StaleAtFinalization(_) => "lease_stale_at_finalization",
             SelectionRefusal::RetargetedDuringLease => "lease_retargeted",
+            SelectionRefusal::ForeignTable => "lease_foreign_table",
             SelectionRefusal::ProtectedRootRequiresPromotion(_) => {
                 "protected_root_requires_promotion"
             }
@@ -111,8 +117,11 @@ pub enum QueryOutcome {
     NoMatch,
 }
 
-/// One health surface. All four project the SAME two ledgers; none may sum,
-/// swap, or substitute them.
+/// One health surface. All four project the SAME two ledgers as two
+/// separate numbers; none may sum, swap, or substitute them. (Committed
+/// rows also appear in the bounded diagnostics ledger, so the ledgers are
+/// separate, not disjoint — and committed may exceed the bounded row
+/// count.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HealthSurface {
     Health,
@@ -159,23 +168,38 @@ impl SelectedAggregate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceState {
     Current { generation: u64 },
-    NonCurrent,
+    NonCurrent { last_generation: u64 },
 }
 
 static NEXT_RANKING_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
+static NEXT_TABLE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 /// The dark per-project query table: source states, protection roster,
-/// target epoch.
-#[derive(Debug, Default)]
+/// target epoch, and its own never-reused identity — a lease binds to the
+/// table that issued it, so a lookalike world cannot finalize it.
+#[derive(Debug)]
 pub struct ProjectQueryTable {
+    identity: u64,
     sources: BTreeMap<SourceId, SourceState>,
     protected: BTreeSet<SourceId>,
     target_epoch: u64,
 }
 
+impl Default for ProjectQueryTable {
+    fn default() -> Self {
+        Self {
+            identity: NEXT_TABLE_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            sources: BTreeMap::new(),
+            protected: BTreeSet::new(),
+            target_epoch: 0,
+        }
+    }
+}
+
 /// An open (not yet finalized) strict lease: the atomic capture.
 #[derive(Debug)]
 pub struct StrictSelectionLease {
+    table_identity: u64,
     captured: BTreeMap<SourceId, u64>,
     ranking_snapshot: u64,
     target_epoch: u64,
@@ -205,26 +229,46 @@ impl ProjectQueryTable {
             .insert(source, SourceState::Current { generation });
     }
 
-    /// Mark `source` non-Current.
+    /// Mark `source` non-Current, preserving the last generation so the
+    /// machinery-owned allocator can never reuse a stamp across the
+    /// invalidation.
     pub fn mark_non_current(&mut self, source: SourceId) {
-        self.sources.insert(source, SourceState::NonCurrent);
+        let last_generation = match self.sources.get(&source) {
+            Some(SourceState::Current { generation }) => *generation,
+            Some(SourceState::NonCurrent { last_generation }) => *last_generation,
+            None => 0,
+        };
+        self.sources
+            .insert(source, SourceState::NonCurrent { last_generation });
     }
 
     /// Declare `source` a PROTECTED root: `Current` only through full
-    /// candidate promotion.
+    /// candidate promotion. Any existing bare `Current` state is DEMOTED —
+    /// a newly protected root re-earns `Current` through promotion, so the
+    /// publish-first-declare-later ordering hole does not exist.
     pub fn declare_protected(&mut self, source: SourceId) {
         self.protected.insert(source);
+        if let Some(SourceState::Current { generation }) = self.sources.get(&source) {
+            let last_generation = *generation;
+            self.sources
+                .insert(source, SourceState::NonCurrent { last_generation });
+        }
     }
 
-    /// Sealed negative: publishing a protected root without promotion
-    /// evidence refuses, unconditionally. Nothing changes.
-    pub fn publish_protected_without_promotion(
+    /// The bare-publication door: legitimate for non-protected sources
+    /// (caller-supplied generation, like `publish_current`), refused for
+    /// protected roots — and the refusal changes nothing.
+    pub fn publish_without_promotion(
         &mut self,
         source: SourceId,
         generation: u64,
-    ) -> SelectionRefusal {
-        let _ = generation;
-        SelectionRefusal::ProtectedRootRequiresPromotion(source)
+    ) -> Result<(), SelectionRefusal> {
+        if self.protected.contains(&source) {
+            return Err(SelectionRefusal::ProtectedRootRequiresPromotion(source));
+        }
+        self.sources
+            .insert(source, SourceState::Current { generation });
+        Ok(())
     }
 
     /// Publish a protected root from a full candidate promotion. `probe` is
@@ -243,7 +287,8 @@ impl ProjectQueryTable {
         let _ = probe;
         let next = match self.sources.get(&source) {
             Some(SourceState::Current { generation }) => generation + 1,
-            _ => 1,
+            Some(SourceState::NonCurrent { last_generation }) => last_generation + 1,
+            None => 1,
         };
         self.sources
             .insert(source, SourceState::Current { generation: next });
@@ -272,7 +317,7 @@ impl ProjectQueryTable {
             }
             match self.sources.get(source) {
                 None => return Err(SelectionRefusal::MissingSource(*source)),
-                Some(SourceState::NonCurrent) => {
+                Some(SourceState::NonCurrent { .. }) => {
                     return Err(SelectionRefusal::NotCurrent(*source));
                 }
                 Some(SourceState::Current { generation }) => {
@@ -288,6 +333,7 @@ impl ProjectQueryTable {
             }
         }
         Ok(StrictSelectionLease {
+            table_identity: self.identity,
             captured,
             ranking_snapshot: NEXT_RANKING_SNAPSHOT.fetch_add(1, Ordering::Relaxed),
             target_epoch: self.target_epoch,
@@ -348,6 +394,9 @@ impl StrictSelectionLease {
     /// Finalize against the table: refuses if the project retargeted or any
     /// captured generation went stale while the lease was open.
     pub fn finalize(self, table: &ProjectQueryTable) -> Result<CompletedLease, SelectionRefusal> {
+        if table.identity != self.table_identity {
+            return Err(SelectionRefusal::ForeignTable);
+        }
         if table.target_epoch != self.target_epoch {
             return Err(SelectionRefusal::RetargetedDuringLease);
         }

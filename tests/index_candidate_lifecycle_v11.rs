@@ -493,6 +493,44 @@ fn retry_supersession_blocks_the_older_attempt() {
     assert_eq!(supervisor.committed_generations(), 1);
 }
 
+/// The diagnostics ledger is BOUNDED (newest 64 rows) and the committed
+/// ledger is not: eviction really happens, and committed can exceed the
+/// bounded row count without either ledger corrupting the other (pair-3
+/// review — "bounded" must be exercised, not just asserted by name).
+#[test]
+fn the_diagnostics_ledger_is_bounded_and_the_committed_ledger_is_not() {
+    let pool = ProcessCapacityPool::new();
+    let owner = pool.root(1_000_000);
+    let supervisor = SourceSupervisor::new();
+    let root = ProjectArtifactRoot::empty();
+
+    for _ in 0..70 {
+        let attempt = supervisor.begin_attempt();
+        IsolatedCandidate::prepare_full(&pool, owner, &attempt, Vec::new(), |_| 0)
+            .expect("capacity headroom exists")
+            .commit(&root)
+            .expect("an empty full candidate publishes");
+    }
+
+    assert_eq!(
+        supervisor.committed_generations(),
+        70,
+        "the committed ledger never evicts"
+    );
+    assert_eq!(
+        supervisor.attempt_records().len(),
+        64,
+        "the diagnostics ledger keeps exactly the newest bound"
+    );
+    assert!(
+        supervisor
+            .attempt_records()
+            .iter()
+            .all(|record| record.disposition == AttemptDisposition::Committed),
+        "eviction drops oldest rows, never corrupts surviving ones"
+    );
+}
+
 /// Cancellation lands in the diagnostics ledger and never in the committed
 /// ledger — the two are separate by construction.
 #[test]

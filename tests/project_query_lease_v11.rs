@@ -82,10 +82,11 @@ fn strict_selection_is_atomic_and_complete() {
 /// `contracts/lifecycle-oracle-traceability-v11.md` as a `planned_exact`
 /// target; do not rename it without amending that contract.
 ///
-/// Committed generations and bounded attempts are DISJOINT ledgers, and all
+/// Committed generations and bounded attempts are SEPARATE ledgers, and all
 /// four health surfaces report them as two separate numbers: attempt
 /// diagnostics can never masquerade as committed dispositions, on any
-/// surface.
+/// surface. (Committed rows also appear in the bounded diagnostics ledger —
+/// separate, not disjoint.)
 #[test]
 fn committed_generation_and_attempt_health_are_separate() {
     let table = current_table(1);
@@ -250,6 +251,20 @@ fn post_lease_truncation_never_changes_identity() {
 
 // ── protected roots (frozen SC-019) ────────────────────────────────────────
 
+/// A real committed candidate root — the promotion evidence fixture.
+fn promotion_evidence()
+-> std::sync::Arc<symforge::live_index::index_lifecycle::candidate::ProjectArtifacts> {
+    let pool = ProcessCapacityPool::new();
+    let owner = pool.root(1_000);
+    let supervisor = SourceSupervisor::new();
+    let attempt = supervisor.begin_attempt();
+    let root = ProjectArtifactRoot::empty();
+    IsolatedCandidate::prepare_full(&pool, owner, &attempt, Vec::new(), |_| 0)
+        .expect("capacity headroom exists")
+        .commit(&root)
+        .expect("the candidate publishes")
+}
+
 /// A protected root reaches `Current` only through full candidate
 /// promotion, with ZERO state/durability-probe I/O below the source root —
 /// and a bare publication refuses.
@@ -259,22 +274,12 @@ fn protected_roots_reach_current_only_via_full_promotion() {
     table.declare_protected(SourceId(7));
 
     assert_eq!(
-        table.publish_protected_without_promotion(SourceId(7), 1),
+        table.publish_without_promotion(SourceId(7), 1).unwrap_err(),
         SelectionRefusal::ProtectedRootRequiresPromotion(SourceId(7)),
         "a protected root must refuse bare publication"
     );
 
-    // Promotion evidence: a real committed candidate root.
-    let pool = ProcessCapacityPool::new();
-    let owner = pool.root(1_000);
-    let supervisor = SourceSupervisor::new();
-    let attempt = supervisor.begin_attempt();
-    let root = ProjectArtifactRoot::empty();
-    let promoted = IsolatedCandidate::prepare_full(&pool, owner, &attempt, Vec::new(), |_| 0)
-        .expect("capacity headroom exists")
-        .commit(&root)
-        .expect("the candidate publishes");
-
+    let promoted = promotion_evidence();
     let mut probes = 0_u32;
     table
         .publish_protected_from_promotion(SourceId(7), &promoted, || probes += 1)
@@ -285,6 +290,125 @@ fn protected_roots_reach_current_only_via_full_promotion() {
     table
         .acquire_strict(&SelectedAggregate::of([(7, 1)]))
         .expect("the promoted protected root is Current");
+}
+
+/// The bare-publication door CONSULTS the roster (pair-3 review W3): a
+/// non-protected source publishes bare and is leasable; a protected one
+/// refuses and nothing changes. A refusal that fires regardless of state
+/// would prove nothing about the state.
+#[test]
+fn the_bare_publication_door_consults_the_protection_roster() {
+    let mut table = ProjectQueryTable::new();
+
+    table
+        .publish_without_promotion(SourceId(1), 5)
+        .expect("non-protected sources may publish bare");
+    table
+        .acquire_strict(&SelectedAggregate::of([(1, 5)]))
+        .expect("the bare publication is Current");
+
+    table.declare_protected(SourceId(7));
+    assert_eq!(
+        table.publish_without_promotion(SourceId(7), 1).unwrap_err(),
+        SelectionRefusal::ProtectedRootRequiresPromotion(SourceId(7))
+    );
+    assert_eq!(
+        table
+            .acquire_strict(&SelectedAggregate::of([(7, 1)]))
+            .unwrap_err(),
+        SelectionRefusal::MissingSource(SourceId(7)),
+        "the refused publication must have changed nothing"
+    );
+}
+
+/// Declaring protection DEMOTES any existing bare Current state: a newly
+/// protected root re-earns `Current` through promotion, and the ordering
+/// hole (publish first, declare later) is closed (pair-3 review W3).
+#[test]
+fn declaring_protection_demotes_any_bare_current_state() {
+    let mut table = ProjectQueryTable::new();
+    table.publish_current(SourceId(3), 5);
+    table.declare_protected(SourceId(3));
+    assert_eq!(
+        table
+            .acquire_strict(&SelectedAggregate::of([(3, 5)]))
+            .unwrap_err(),
+        SelectionRefusal::NotCurrent(SourceId(3)),
+        "declaration must demote bare Current state"
+    );
+
+    // Promotion re-earns Current — at a generation ABOVE the demoted one.
+    let promoted = promotion_evidence();
+    table
+        .publish_protected_from_promotion(SourceId(3), &promoted, || ())
+        .expect("promotion is the path back");
+    table
+        .acquire_strict(&SelectedAggregate::of([(3, 6)]))
+        .expect("the promoted generation continues the sequence, never reuses it");
+}
+
+/// The caller-bug door is pinned: bare `publish_current` on a protected
+/// root is unrepresentable, loudly.
+#[test]
+#[should_panic(expected = "protected roots publish only through full candidate promotion")]
+fn bare_publish_current_on_a_protected_root_is_unrepresentable() {
+    let mut table = ProjectQueryTable::new();
+    table.declare_protected(SourceId(9));
+    table.publish_current(SourceId(9), 1);
+}
+
+/// Machinery-owned promotion generations NEVER reuse a stamp across an
+/// invalidation (pair-3 review W1): the ABA that would let a lease spanning
+/// an invalidation finalize clean is unrepresentable.
+#[test]
+fn promotion_generations_never_reuse_across_invalidation() {
+    let mut table = ProjectQueryTable::new();
+    table.declare_protected(SourceId(7));
+    let promoted = promotion_evidence();
+    table
+        .publish_protected_from_promotion(SourceId(7), &promoted, || ())
+        .expect("first promotion");
+
+    let lease = table
+        .acquire_strict(&SelectedAggregate::of([(7, 1)]))
+        .expect("generation 1 is Current");
+
+    table.mark_non_current(SourceId(7));
+    table
+        .publish_protected_from_promotion(SourceId(7), &promoted, || ())
+        .expect("re-promotion after invalidation");
+
+    assert_eq!(
+        lease.finalize(&table).unwrap_err(),
+        SelectionRefusal::StaleAtFinalization(SourceId(7)),
+        "a lease that spanned an invalidation must never finalize clean"
+    );
+    table
+        .acquire_strict(&SelectedAggregate::of([(7, 2)]))
+        .expect("the re-promotion continues the generation sequence");
+}
+
+/// A lease binds to the table that issued it (pair-3 review W2): a
+/// same-shaped foreign table cannot finalize it — the stale/retarget fences
+/// cannot be driven around by handing back a lookalike world.
+#[test]
+fn a_lease_binds_to_its_issuing_table() {
+    let issuing = current_table(2);
+    let lookalike = current_table(2);
+
+    let lease = issuing.acquire_strict(&select_all(2)).expect("all Current");
+    assert_eq!(
+        lease.finalize(&lookalike).unwrap_err(),
+        SelectionRefusal::ForeignTable,
+        "a lookalike table must not finalize another table's lease"
+    );
+
+    // Positive control: the issuing table still finalizes its own lease.
+    issuing
+        .acquire_strict(&select_all(2))
+        .expect("all Current")
+        .finalize(&issuing)
+        .expect("the issuing table finalizes its own lease");
 }
 
 // ── multi-project selections ───────────────────────────────────────────────
@@ -355,6 +479,7 @@ fn source_refusals_map_totally_onto_transport_codes() {
         SelectionRefusal::NotCurrent(SourceId(1)),
         SelectionRefusal::StaleAtFinalization(SourceId(1)),
         SelectionRefusal::RetargetedDuringLease,
+        SelectionRefusal::ForeignTable,
         SelectionRefusal::ProtectedRootRequiresPromotion(SourceId(1)),
     ];
     let codes: Vec<&'static str> = refusals
