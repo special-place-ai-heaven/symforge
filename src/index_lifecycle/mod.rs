@@ -36,6 +36,10 @@ pub mod embedded;
 pub mod mutation;
 pub mod physical_root;
 pub mod process_runtime;
+// T063: dark strict query leases — atomic exact-bijection selections,
+// sealed render authority, refusal-not-no-match, and the two-ledger health
+// projection seam. Oracle-suite consumption only until activation.
+pub mod query;
 pub mod registry;
 pub mod supervisor;
 // T062: dark rolling verification — sealed scope receipts, the fixed

@@ -76,7 +76,7 @@ GREEN dark.
 - [x] T009 [US2] Implement `src/index_lifecycle/verification.rs` from nothing — racy-clean entry obligations, scope-discovery deadlines, resumable rolling passes, immutable proof refresh, the exact frozen-FR-049 monotonic overdue predicate; register in `mod.rs` (020:T062)
 - [x] T010 [US2] Extend darkness seal + census for verification.rs; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
 - [x] T011 [US2] Full gate battery via Terminal Commander + traceability validator
-- [ ] T012 [US2] Review (cfg-lens) → PR → green CI → auto-squash-merge
+- [x] T012 [US2] Review (cfg-lens) → PR → green CI → auto-squash-merge
 
 **Checkpoint**: verification machine GREEN dark on `main`.
 
@@ -90,11 +90,11 @@ split, exist dark behind the factory (020:T056 + T063)
 **Independent Test**: `cargo test --test project_query_lease_v11 -- --test-threads=1`
 GREEN dark.
 
-- [ ] T013 [P] [US3] Branch `feature-020-s4-p3-query` from updated `main`; author RED `tests/project_query_lease_v11.rs` with frozen name `strict_selection_is_atomic_and_complete` plus the 020:T056 lease cases (atomic multi-source capture, empty/missing/extra/mismatched `SelectedAggregate` rejection, exact bijection, no-match-only-all-Current, stale finalization, retarget races, post-lease `OutputCoverage::Truncated` identity preservation, SC-019 protected-root promotion with zero below-root probe I/O); record observed RED (020:T056)
-- [ ] T014 [US2] In the same RED file (after T013), author the frozen-named `committed_generation_and_attempt_health_are_separate` cases across health, health_compact, status, and health resources (the US2 acceptance oracle) (020:T056)
-- [ ] T015 [US3] Implement `src/index_lifecycle/query.rs` — project/single-source strict leases, exact multi-project selections, separate ranking snapshots, sealed completed-lease render authority, `SourceRefusal` transport mapping — plus dark committed-vs-attempt projections in `src/live_index/health_view.rs` and dark wiring stubs in `src/protocol/` kept unreachable behind the factory; register in `mod.rs` (020:T063)
-- [ ] T016 [US3] Extend darkness seal + census for query.rs and the health_view/protocol dark seams; refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
-- [ ] T017 [US3] Full gate battery via Terminal Commander + traceability validator
+- [x] T013 [P] [US3] Branch `feature-020-s4-p3-query` from updated `main`; author RED `tests/project_query_lease_v11.rs` with frozen name `strict_selection_is_atomic_and_complete` plus the 020:T056 lease cases (atomic multi-source capture, empty/missing/extra/mismatched `SelectedAggregate` rejection, exact bijection, no-match-only-all-Current, stale finalization, retarget races, post-lease `OutputCoverage::Truncated` identity preservation, SC-019 protected-root promotion with zero below-root probe I/O); record observed RED (020:T056)
+- [x] T014 [US2] In the same RED file (after T013), author the frozen-named `committed_generation_and_attempt_health_are_separate` cases across health, health_compact, status, and health resources (the US2 acceptance oracle) (020:T056)
+- [x] T015 [US3] Implement `src/index_lifecycle/query.rs` — project/single-source strict leases, exact multi-project selections, separate ranking snapshots, sealed completed-lease render authority, `SourceRefusal` transport mapping, and the committed-vs-attempt health projection seam (all four surfaces modeled INSIDE the dark module — the call-edge sweep forbids the index_lifecycle token in live files, so the `src/live_index/health_view.rs` and `src/protocol/` wiring named by frozen T063 is cut work under T064/T066); register in `mod.rs` (020:T063)
+- [x] T016 [US3] Extend darkness seal + census for query.rs (no health_view/protocol seams — see the T015 scope correction); refresh `FULL_SOURCE_PIN_V1` via the Rust oracle
+- [x] T017 [US3] Full gate battery via Terminal Commander + traceability validator
 - [ ] T018 [US3] Review (cfg-lens) → PR → green CI → auto-squash-merge
 
 **Checkpoint**: query-lease machinery GREEN dark on `main`; US2's oracle exists.
