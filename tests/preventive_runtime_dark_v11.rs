@@ -430,10 +430,14 @@ const INGRESS_LANES: &[(&str, &str)] = &[
 /// "After activation, the executed Slice 4 reachability cases replace the
 /// preactivation census."
 const WIRED_PRODUCTION_FILES: &[&str] = &[
+    "src/daemon.rs",
     "src/gitignore_hygiene.rs",
     "src/live_index/persist.rs",
     "src/live_index/single_file.rs",
+    "src/main.rs",
     "src/protocol/edit.rs",
+    "src/protocol/knowledge_curation.rs",
+    "src/server/serve.rs",
     "src/watcher/mod.rs",
 ];
 
@@ -842,15 +846,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "b952b14f3ebc3c6ef4229d383731eb69fdf05e9872748688c58964976028df9d",
+    "a15015984825dbbe9f7ac868653b6b89a11b9d58e6d7cd33f98560d6e097eda8",
     20,
-    364_274,
+    370_784,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3db17522fc735dbb3731d9e4db06362d8b27aa70304f86996221291ee1b5d07a",
+    "20ea88323ec723ee169358a1023ac15958168d0eff7aeef327719437f00c6829",
     194,
-    9_170_920,
+    9_194_283,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

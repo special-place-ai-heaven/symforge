@@ -173,6 +173,27 @@ impl SourceMutationPermit {
             .map_err(AuthorityRefusal::from)
     }
 
+    /// Attest a DELEGATED durable replacement beneath this permit's lease.
+    ///
+    /// The caller ran its own contract-pinned durability protocol against
+    /// `relative` while this permit was in flight; the pinned lease re-reads
+    /// the target and mints a receipt only if the bytes it observes are
+    /// exactly the authorized post-image. `Ok(None)` is a mismatch: the lease
+    /// cannot attest a write it did not observe landing, the permit stays in
+    /// flight, and the caller's only honest terminal is the drop-recovery
+    /// lane.
+    pub fn attest_delegated_beneath(
+        &mut self,
+        relative: &std::path::Path,
+        expected: &[u8],
+    ) -> Result<Option<WriteReceipt>, AuthorityRefusal> {
+        if self.state != PermitState::InFlight {
+            return Err(AuthorityRefusal::PermitAlreadyTerminal);
+        }
+        super::physical_root::verify_replacement_beneath(&self.lease, relative, expected)
+            .map_err(AuthorityRefusal::from)
+    }
+
     /// The whole authority this permit carries.
     pub fn authority(&self) -> &MutationAuthority {
         &self.authority

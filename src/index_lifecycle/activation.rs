@@ -370,7 +370,10 @@ impl ProjectSourceAuthority {
     /// The bridge for one project root. See the type doc for the recorded
     /// mid-cut construction claim.
     pub fn for_root(root: &Path) -> Arc<Self> {
-        let lease = Arc::new(PhysicalRootLease::take(root));
+        // Dormant while idle: the OS directory handle exists only during a
+        // permit cycle (see `PhysicalRootLease::parked`), so an idle root
+        // stays user-movable.
+        let lease = Arc::new(PhysicalRootLease::take(root).parked());
         let binding = BindingAuthority::bind(lease.identity());
         // The seed publication carries the SEED observer incarnation's
         // token — the same identity `active_token` starts on — so even the
@@ -574,7 +577,12 @@ impl ProjectSourceAuthority {
             .request_mutation_grant(MutationGrantInput::LiveCurrent(presented))?;
         let frozen_publication = grant.published_non_current().publication();
         let drain = Arc::new(PermitDrainSignal::new());
-        let permit = SourceMutationPermit::grant(grant, inner.lease.clone(), drain.clone())?;
+        // Unpark the dormant lease for exactly this permit cycle. Stored only
+        // on a successful grant: a refused grant drops the reopened handle
+        // and the authority stays dormant.
+        let live_lease = Arc::new(inner.lease.reopened());
+        let permit = SourceMutationPermit::grant(grant, live_lease.clone(), drain.clone())?;
+        inner.lease = live_lease;
         inner.outstanding = drain;
         Ok(WriteAuthority {
             authority: self.clone(),
@@ -636,7 +644,10 @@ impl ProjectSourceAuthority {
         let inner = &mut *guard;
         inner.runtime.retire_permit(frozen_publication);
         let outstanding = inner.outstanding.clone();
-        let new_lease = Arc::new(PhysicalRootLease::take(self.root.as_path()));
+        // The incoming lease is stored DORMANT: its capability opens at the
+        // next permit cycle's acquire, so the returned-to-`Current` root is
+        // immediately user-movable again.
+        let new_lease = Arc::new(PhysicalRootLease::take(self.root.as_path()).parked());
         let incoming = BindingAuthority::bind(new_lease.identity());
         let old_lease = inner.lease.clone();
         transition::apply(
@@ -739,6 +750,38 @@ impl WriteAuthority {
             Err(refusal) => return Err(refusal),
         }
         permit.replace_beneath(relative, contents)
+    }
+
+    /// Begin a DELEGATED side effect: the caller is about to run its own
+    /// contract-pinned durability protocol (curation policy lane) beneath
+    /// this authority's root. The permit goes in flight FIRST, so a protocol
+    /// failure drops through the re-scout recovery lane as a write of
+    /// unobserved outcome, never as a claimed no-op.
+    pub fn begin_delegated(&mut self) -> Result<(), AuthorityRefusal> {
+        let permit = self
+            .permit
+            .as_mut()
+            .expect("permit lives until a finish path");
+        match permit.start_side_effect() {
+            Ok(()) | Err(AuthorityRefusal::SideEffectAlreadyInFlight) => Ok(()),
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    /// Attest the delegated protocol's outcome: the pinned lease re-reads
+    /// `relative` and mints a receipt only if it observes exactly the
+    /// authorized post-image. `Ok(None)` is a mismatch — no receipt exists,
+    /// and dropping this authority is the caller's honest terminal (the
+    /// recovery lane returns the source to `Current` scope-dirty).
+    pub fn attest_delegated(
+        &mut self,
+        relative: &Path,
+        expected: &[u8],
+    ) -> Result<Option<WriteReceipt>, AuthorityRefusal> {
+        self.permit
+            .as_mut()
+            .expect("permit lives until a finish path")
+            .attest_delegated_beneath(relative, expected)
     }
 
     /// Commit the observed side effect and return the source to `Current`

@@ -3519,6 +3519,10 @@ impl ProjectSlot {
 // yet, so L-R03 holds across a reopen but not live. Upgrade path: a refs watcher
 // (like the filesystem watcher) that calls `reconcile_local_ref_topology` on ref
 // change.
+// V11 callbacks census (Feature 020 Slice 4, C3b): publication-fence-gated
+// DATA-PLANE enrichment — it publishes local-ref topology into the index and
+// admits no repository-source bytes, so it holds no source-observation or
+// publication authority of its own. C4's typed roots gate its publication.
 fn spawn_local_ref_reconcile(
     index: SharedIndex,
     canonical_root: PathBuf,
@@ -3618,8 +3622,21 @@ fn bootstrap_project_index(
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let bg_index = shared.clone();
             let bg_root = canonical_root.to_path_buf();
+            // V11 callbacks census (C3b): the verify callback carries the
+            // observer incarnation current at its spawn; the watcher's later
+            // registration in `activate()` makes it stale, and the lane then
+            // refuses its observations (late V10 callbacks unreachable).
+            let observer =
+                live_index::index_lifecycle::activation::project_source_authority(canonical_root)
+                    .active_observer();
             handle.spawn(async move {
-                live_index::persist::background_verify(bg_index, bg_root, snapshot_mtimes).await;
+                live_index::persist::background_verify(
+                    bg_index,
+                    bg_root,
+                    snapshot_mtimes,
+                    observer,
+                )
+                .await;
             });
         }
 
@@ -3668,6 +3685,9 @@ fn bootstrap_project_index(
     }
 }
 
+// V11 callbacks census (C3b): the observer-incarnation registration for this
+// census row lives inside `run_watcher_with_stop` (C3a) — one incarnation per
+// watcher instance, registered on the same authority every observation names.
 fn start_project_watcher(
     repo_root: PathBuf,
     index: SharedIndex,

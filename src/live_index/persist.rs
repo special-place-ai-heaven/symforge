@@ -2377,8 +2377,9 @@ pub async fn background_verify(
     index: crate::live_index::store::SharedIndex,
     root: std::path::PathBuf,
     snapshot_mtimes: HashMap<String, u64>,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
 ) {
-    background_verify_with_hook(index, root, snapshot_mtimes, || {}).await;
+    background_verify_with_hook(index, root, snapshot_mtimes, observer, || {}).await;
 }
 
 fn remove_snapshot_deleted_file_if_still_absent(
@@ -2397,10 +2398,19 @@ async fn background_verify_with_hook<F>(
     index: crate::live_index::store::SharedIndex,
     root: std::path::PathBuf,
     snapshot_mtimes: HashMap<String, u64>,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
     after_fence: F,
 ) where
     F: FnOnce(),
 {
+    // V11 observation lane (Feature 020 Slice 4, T064/T065, C3b): this
+    // callback carries the observer incarnation current at its SPAWN. Every
+    // re-admission and removal below is observed under that incarnation; a
+    // successor registration (watcher (re)start) makes the carried id stale
+    // and the lane refuses it — late V10 callbacks are unreachable in the
+    // authority lane — while the V10 data-plane reconciliation continues
+    // under its own publication fences (recorded residual until C4 gates it).
+    let authority = crate::live_index::index_lifecycle::activation::project_source_authority(&root);
     let captured_base = index.publication_fence();
     after_fence();
     let Some(mut commit_fence) = index.mark_snapshot_verify_running_at_fence(captured_base) else {
@@ -2425,6 +2435,14 @@ async fn background_verify_with_hook<F>(
         for path in &stat_result.deleted {
             if !remove_snapshot_deleted_file_if_still_absent(&index, &root, path, commit_fence) {
                 return;
+            }
+            if let Err(active) = authority.observe_removal(observer, path) {
+                tracing::debug!(
+                    ?observer,
+                    ?active,
+                    %path,
+                    "stale verify incarnation: removal observation refused"
+                );
             }
             commit_fence = index.publication_fence();
         }
@@ -2468,8 +2486,17 @@ async fn background_verify_with_hook<F>(
                 &index,
                 expected_gen,
             ) {
-                crate::watcher::ReindexResult::Reindexed
-                | crate::watcher::ReindexResult::HashSkip => {}
+                crate::watcher::ReindexResult::Reindexed => {
+                    if let Err(active) = authority.observe_admission(observer, rel_path) {
+                        tracing::debug!(
+                            ?observer,
+                            ?active,
+                            %rel_path,
+                            "stale verify incarnation: admission observation refused"
+                        );
+                    }
+                }
+                crate::watcher::ReindexResult::HashSkip => {}
                 _ => unreconciled.push(rel_path.clone()),
             }
             if index.current_project_generation() != expected_gen {
@@ -2503,8 +2530,17 @@ async fn background_verify_with_hook<F>(
                 &index,
                 expected_gen,
             ) {
-                crate::watcher::ReindexResult::Reindexed
-                | crate::watcher::ReindexResult::HashSkip => {}
+                crate::watcher::ReindexResult::Reindexed => {
+                    if let Err(active) = authority.observe_admission(observer, rel_path) {
+                        tracing::debug!(
+                            ?observer,
+                            ?active,
+                            %rel_path,
+                            "stale verify incarnation: admission observation refused"
+                        );
+                    }
+                }
+                crate::watcher::ReindexResult::HashSkip => {}
                 // Same reasoning as the changed/new loop above: a spot-check
                 // mismatch whose re-parse did not land is still a mismatch.
                 _ => unreconciled.push(rel_path.clone()),
@@ -2561,6 +2597,13 @@ async fn background_verify_with_hook<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The incarnation a production spawn site would carry: whatever observer
+    /// is active on this root's authority at spawn time.
+    fn verify_observer(root: &Path) -> crate::live_index::index_lifecycle::observer::ObserverId {
+        crate::live_index::index_lifecycle::activation::project_source_authority(root)
+            .active_observer()
+    }
     use crate::domain::{
         AccessErrorKind, CapabilityStatus, CapabilityUnavailableReason, CatalogEntry, CatalogPath,
         FileDisposition, HardSkipReason, IndexTargets, LanguageId, MetadataOnlyReason,
@@ -3110,7 +3153,13 @@ mod tests {
         assert_eq!(before.partial_parse_count, 0);
         assert_eq!(before.failed_count, 0);
 
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let guard = shared.read();
         assert_eq!(guard.load_source(), IndexLoadSource::SnapshotRestore);
@@ -3167,12 +3216,81 @@ mod tests {
         );
         assert!(!before_ready.authority.records.is_empty());
 
-        background_verify(restored.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            restored.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         assert!(restored.read().is_ready());
         let ready = restored.published_generation();
         assert_eq!(ready.authority.versions, before_ready.authority.versions);
         assert_eq!(ready.authority.records, before_ready.authority.records);
+    }
+
+    /// Feature 020 Slice 4, T064/T065 (callbacks, C3b): the background verify
+    /// callback carries the observer incarnation current at its spawn. Its
+    /// per-file re-admissions are observed under that incarnation, and a
+    /// SUCCESSOR incarnation makes the carried id stale — the late callback's
+    /// observations are refused (unreachable in the authority lane) while the
+    /// V10 data plane still reconciles (recorded residual until C4 gates it).
+    /// Server-only: the re-parse loops are the watcher admission path.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn background_verify_observes_admissions_under_the_carried_incarnation() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("src").join("fresh.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"pub fn fresh() {}\n").unwrap();
+
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(tmp.path());
+        let observer = authority.register_observer();
+        let before = authority.committed_observations("src/fresh.rs");
+
+        let shared =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            observer,
+        )
+        .await;
+        assert!(
+            shared.read().files.contains_key("src/fresh.rs"),
+            "the new file must be re-indexed by the verify sweep"
+        );
+        assert_eq!(
+            authority.committed_observations("src/fresh.rs"),
+            before + 1,
+            "a verify re-admission must be observed under the carried incarnation"
+        );
+
+        std::fs::write(&file_path, b"pub fn fresh() { let _ = 1; }\n").unwrap();
+        let _successor = authority.register_observer();
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            observer,
+        )
+        .await;
+        assert!(
+            shared
+                .read()
+                .files
+                .get("src/fresh.rs")
+                .is_some_and(|file| file.content == b"pub fn fresh() { let _ = 1; }\n"),
+            "the stale-incarnation sweep still reconciles the data plane (C4 residual)"
+        );
+        assert_eq!(
+            authority.committed_observations("src/fresh.rs"),
+            before + 1,
+            "a stale incarnation must not land observations"
+        );
     }
 
     // Server-only: exercises the watcher admission reparse path, which the embed
@@ -3191,7 +3309,13 @@ mod tests {
 
         let shared =
             crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
-        background_verify(shared.clone(), tmp.path().to_path_buf(), HashMap::new()).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let guard = shared.read();
         assert!(
@@ -3336,7 +3460,13 @@ mod tests {
         crate::watcher::reconcile_stale_files(tmp.path(), &reconcile);
 
         let background = make_empty_shared();
-        background_verify(background.clone(), tmp.path().to_path_buf(), HashMap::new()).await;
+        background_verify(
+            background.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let expected = capture(&cold);
         assert_eq!(capture(&watch), expected);
@@ -3357,17 +3487,23 @@ mod tests {
         let initial_project_generation = shared.current_project_generation();
         let reset_publication_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        background_verify_with_hook(shared.clone(), tmp.path().to_path_buf(), HashMap::new(), {
-            let shared = shared.clone();
-            let reset_publication_generation = reset_publication_generation.clone();
-            move || {
-                shared.reset_to_empty();
-                reset_publication_generation.store(
-                    shared.published_state().generation,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }
-        })
+        background_verify_with_hook(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+            {
+                let shared = shared.clone();
+                let reset_publication_generation = reset_publication_generation.clone();
+                move || {
+                    shared.reset_to_empty();
+                    reset_publication_generation.store(
+                        shared.published_state().generation,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -3399,35 +3535,43 @@ mod tests {
         let watcher_publication = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watcher_content = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        background_verify_with_hook(shared.clone(), tmp.path().to_path_buf(), HashMap::new(), {
-            let shared = shared.clone();
-            let watcher_publication = watcher_publication.clone();
-            let watcher_content = watcher_content.clone();
-            move || {
-                let watcher_index =
-                    make_live_index_with_files(vec![("src/watcher.rs", b"fn watcher_won() {}\n")]);
-                let indexed = watcher_index
-                    .files
-                    .get("src/watcher.rs")
-                    .expect("watcher fixture")
-                    .as_ref()
-                    .clone();
-                assert!(shared.update_file_at_generation(
-                    "src/watcher.rs",
-                    indexed,
-                    base_project_generation,
-                ));
-                let watcher = shared.published_generation();
-                watcher_publication.store(
-                    watcher.publication_generation,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-                watcher_content.store(
-                    watcher.content_generation,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }
-        })
+        background_verify_with_hook(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+            {
+                let shared = shared.clone();
+                let watcher_publication = watcher_publication.clone();
+                let watcher_content = watcher_content.clone();
+                move || {
+                    let watcher_index = make_live_index_with_files(vec![(
+                        "src/watcher.rs",
+                        b"fn watcher_won() {}\n",
+                    )]);
+                    let indexed = watcher_index
+                        .files
+                        .get("src/watcher.rs")
+                        .expect("watcher fixture")
+                        .as_ref()
+                        .clone();
+                    assert!(shared.update_file_at_generation(
+                        "src/watcher.rs",
+                        indexed,
+                        base_project_generation,
+                    ));
+                    let watcher = shared.published_generation();
+                    watcher_publication.store(
+                        watcher.publication_generation,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    watcher_content.store(
+                        watcher.content_generation,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            },
+        )
         .await;
 
         let current = shared.published_generation();
@@ -3473,7 +3617,13 @@ mod tests {
         assert_eq!(before.failed_count, 0);
 
         std::fs::remove_file(&file_path).expect("remove indexed file");
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let published = shared.published_state();
         assert!(
@@ -3552,7 +3702,13 @@ mod tests {
         let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let shared = crate::live_index::SharedIndexHandle::shared(loaded);
 
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let published = shared.published_state();
         match &published.snapshot_verify_state {
@@ -3606,7 +3762,13 @@ mod tests {
         let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let shared = crate::live_index::SharedIndexHandle::shared(loaded);
 
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let published = shared.published_state();
         match &published.snapshot_verify_state {

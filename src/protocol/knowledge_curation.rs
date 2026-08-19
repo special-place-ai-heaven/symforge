@@ -301,6 +301,13 @@ impl KnowledgeCurationCoordinator {
     /// startup. Nothing consumed that plan on this path, and the same error
     /// resurfaces on the first `review_knowledge` call, so this trades a
     /// startup warning nothing acted on for ~3.8s of cold-start latency.
+    ///
+    /// V11 callbacks census (Feature 020 Slice 4, C3b): this load-time
+    /// callback holds no publication authority of its own. Its one
+    /// repository-source mutation — replaying a `PendingWrite` policy image —
+    /// reaches disk only through `handle_existing_record`'s delegated source
+    /// mutation permit lane; everything else it writes is replay-record state
+    /// under the curation state dir (permit-free `StateWriteAuthorized`).
     pub(crate) fn recover_on_project_load(
         &self,
         index: &SharedIndex,
@@ -564,7 +571,44 @@ impl KnowledgeCurationCoordinator {
                 write_replay_record(&record_path, &record)?;
                 return Ok(output);
             }
+            // V11 writer lane (Feature 020 Slice 4, T064, C3b): the policy
+            // file at the repository root IS repository source, so this write
+            // runs as a DELEGATED side effect under the source mutation
+            // permit — the staged durability protocol in `write_policy` stays
+            // exactly as the crash-recovery contract pins it, and the pinned
+            // lease re-reads the post-image to attest what actually landed. A
+            // protocol failure drops the authority through the re-scout
+            // recovery lane (scope-dirty full baseline); the replay record
+            // stays `PendingWrite` for the durable recovery to replay.
+            let authority =
+                crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
+            let mut write = authority.acquire_write_serialized().map_err(|refusal| {
+                format!(
+                    "Error: source_authority_refused; the policy write could not acquire the source mutation permit ({refusal:?})."
+                )
+            })?;
+            write.begin_delegated().map_err(|refusal| {
+                format!(
+                    "Error: source_authority_refused; the policy write could not begin its delegated side effect ({refusal:?})."
+                )
+            })?;
             self.write_policy(&policy_path, &prepared.post_image)?;
+            let attested = write
+                .attest_delegated(Path::new(POLICY_FILE), &prepared.post_image)
+                .map_err(|refusal| {
+                    format!(
+                        "Error: source_authority_refused; the delegated policy write could not be attested ({refusal:?})."
+                    )
+                })?
+                .ok_or_else(|| {
+                    "Error: delegated_policy_image_unverified; the leased read did not observe the authorized post-image."
+                        .to_string()
+                })?;
+            write.finish_committed(attested).map_err(|refusal| {
+                format!(
+                    "Error: source_authority_refused; the policy write could not return the source to Current ({refusal:?})."
+                )
+            })?;
             record.state = ReplayState::Succeeded {
                 receipt: receipt.clone(),
             };
@@ -637,10 +681,50 @@ impl KnowledgeCurationCoordinator {
                         }
                         return error;
                     }
+                    // V11 writer lane (C3b): the recovery write mutates the
+                    // same repository-source policy bytes as the apply path,
+                    // so it takes the same delegated permit lane; a failed
+                    // protocol drops the authority through the re-scout
+                    // recovery lane and leaves the record `PendingWrite`.
+                    let authority =
+                        crate::live_index::index_lifecycle::activation::project_source_authority(
+                            repo_root,
+                        );
+                    let mut write = match authority.acquire_write_serialized() {
+                        Ok(write) => write,
+                        Err(refusal) => {
+                            return format!(
+                                "Error: source_authority_refused; the policy recovery write could not acquire the source mutation permit ({refusal:?})."
+                            );
+                        }
+                    };
+                    if let Err(refusal) = write.begin_delegated() {
+                        return format!(
+                            "Error: source_authority_refused; the policy recovery write could not begin its delegated side effect ({refusal:?})."
+                        );
+                    }
                     if let Err(error) =
                         durable_replace(&policy_path, post_image, ".symforge-curation-recovery-")
                     {
                         return error;
+                    }
+                    let attested = match write.attest_delegated(Path::new(POLICY_FILE), post_image)
+                    {
+                        Ok(Some(attested)) => attested,
+                        Ok(None) => {
+                            return "Error: delegated_policy_image_unverified; the leased read did not observe the authorized post-image."
+                                .to_string();
+                        }
+                        Err(refusal) => {
+                            return format!(
+                                "Error: source_authority_refused; the delegated policy recovery write could not be attested ({refusal:?})."
+                            );
+                        }
+                    };
+                    if let Err(refusal) = write.finish_committed(attested) {
+                        return format!(
+                            "Error: source_authority_refused; the policy recovery write could not return the source to Current ({refusal:?})."
+                        );
                     }
                 } else {
                     let output = "Error: indeterminate_conflict; policy bytes match neither the recorded pre-image nor post-image."
@@ -2566,6 +2650,70 @@ mod tests {
             "stale pending replay must not write the stored policy post-image"
         );
         assert_eq!(fixture.execute(&coordinator), recovered);
+    }
+
+    /// Feature 020 Slice 4, T064 (writers lane, C3b): the policy file
+    /// `.symforge-knowledge.toml` lives at the repository root — it IS
+    /// repository source, so its apply-path write must take the source
+    /// mutation permit lane. Pinned on the grant counter: a write that
+    /// bypassed the lane leaves it unmoved. The replay of the same terminal
+    /// is the permit-free positive control — it serves the recorded receipt
+    /// and must not re-acquire.
+    #[test]
+    fn policy_apply_routes_through_the_source_mutation_permit() {
+        let fixture = CrashFixture::new("policy-permit-lane");
+        let coordinator = KnowledgeCurationCoordinator::default();
+        let authority = crate::live_index::index_lifecycle::activation::project_source_authority(
+            fixture.dir.path(),
+        );
+        let before = authority.grants_issued();
+
+        let applied = fixture.execute(&coordinator);
+        assert!(applied.contains("status=applied"), "{applied}");
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "the policy apply write must take the source mutation permit lane"
+        );
+
+        let replay = fixture.execute(&coordinator);
+        assert_eq!(replay, applied);
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "a replayed terminal serves the recorded receipt and must not re-acquire"
+        );
+    }
+
+    /// Feature 020 Slice 4, T064/T065 (C3b): the pending-write RECOVERY
+    /// writer (the `durable_replace` arm reachable from
+    /// `recover_on_project_load`) mutates the same repository-source policy
+    /// bytes, so it takes the same permit lane. AfterPendingIntentSync
+    /// leaves the record `PendingWrite` with the pre-image on disk — the
+    /// exact state the recovery writer owns.
+    #[test]
+    fn pending_write_recovery_routes_through_the_source_mutation_permit() {
+        let fixture = CrashFixture::new("policy-permit-recovery");
+        let coordinator = KnowledgeCurationCoordinator::default();
+        coordinator.set_failpoint_for_tests(CurationWriteStage::AfterPendingIntentSync);
+        let interrupted = fixture.execute(&coordinator);
+        assert!(
+            interrupted.contains("injected_curation_crash"),
+            "{interrupted}"
+        );
+
+        let authority = crate::live_index::index_lifecycle::activation::project_source_authority(
+            fixture.dir.path(),
+        );
+        let before = authority.grants_issued();
+
+        let recovered = fixture.execute(&coordinator);
+        assert!(recovered.contains("status=applied"), "{recovered}");
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "the pending-write recovery must take the source mutation permit lane"
+        );
     }
 
     #[test]

@@ -75,6 +75,12 @@ impl GitTemporalJobQueue {
 /// it into the shared handle. Non-blocking — returns immediately.
 ///
 /// Call after `LiveIndex::load()` or `SharedIndexHandle::reload()` completes.
+///
+/// V11 callbacks census (Feature 020 Slice 4, C3b): publication-fence-gated
+/// DATA-PLANE enrichment — it computes git metadata and publishes it behind
+/// the generation fence below; it admits no repository-source bytes and holds
+/// no source-observation or publication authority of its own. C4's typed
+/// roots gate its publication.
 pub fn spawn_git_temporal_computation(index: SharedIndex, repo_root: PathBuf, expected_gen: u64) {
     // Guard: only spawn if a tokio runtime is available (not the case in some sync tests).
     if tokio::runtime::Handle::try_current().is_err() {

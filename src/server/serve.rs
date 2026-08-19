@@ -566,8 +566,14 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // serve immediately with the honest SnapshotRestore/Pending trust labels.
     if let (Some(mtimes), Some(root)) = (snapshot_mtimes, repo_root.clone()) {
         let bg_index = index.clone();
+        // V11 callbacks census (C3b): carry the observer incarnation current
+        // at spawn; a later watcher registration makes it stale and the lane
+        // refuses its observations.
+        let observer =
+            crate::live_index::index_lifecycle::activation::project_source_authority(&root)
+                .active_observer();
         tokio::spawn(async move {
-            crate::live_index::persist::background_verify(bg_index, root, mtimes).await;
+            crate::live_index::persist::background_verify(bg_index, root, mtimes, observer).await;
         });
     }
     let control_state_dir: Option<ControlStateDir> =

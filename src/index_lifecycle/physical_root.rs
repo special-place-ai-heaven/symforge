@@ -120,6 +120,43 @@ impl PhysicalRootLease {
         }
     }
 
+    /// A DORMANT copy of this lease: same identity, same shared revocation, no
+    /// OS handle.
+    ///
+    /// A root with no outstanding permit must stay user-movable — on Windows
+    /// an open directory handle blocks renaming (and, pre-POSIX-semantics,
+    /// deleting) the root, so an authority that idled with the capability open
+    /// held every repository it ever wrote hostage (found by the C3b curation
+    /// foreign-root oracles). The confinement claim in the module doc protects
+    /// a WRITE's resolution, and a dormant lease can resolve nothing; the
+    /// handle therefore exists only for the duration of a permit cycle
+    /// ([`Self::reopened`] to begin one). Between cycles, root-swap detection
+    /// belongs to the observation lane's baseline latches, not to a handle
+    /// nothing is resolving through.
+    pub fn parked(&self) -> Self {
+        Self {
+            identity: self.identity,
+            root: self.root.clone(),
+            dir: None,
+            revoked: Arc::clone(&self.revoked),
+        }
+    }
+
+    /// Reopen a dormant lease's capability for one permit cycle, preserving
+    /// identity and revocation. From this open until the cycle's terminal
+    /// transition, every resolution is handle-relative exactly as the module
+    /// doc claims. A root that vanished while dormant yields a capability-less
+    /// lease that refuses every resolution rather than falling back to
+    /// path-based I/O.
+    pub fn reopened(&self) -> Self {
+        Self {
+            identity: self.identity,
+            root: self.root.clone(),
+            dir: Dir::open_ambient_dir(&self.root, ambient_authority()).ok(),
+            revoked: Arc::clone(&self.revoked),
+        }
+    }
+
     /// The directory capability, if the lease is live and the root opened.
     fn capability(&self) -> Result<&Dir, RootRefusal> {
         if !self.is_live() {
@@ -276,6 +313,11 @@ pub enum ReplacementStep {
     TempCreated,
     /// The temporary replaced the target.
     Replaced,
+    /// A DELEGATED replacement's post-image was read back through the lease's
+    /// capability and matched the authorized bytes exactly. The lease did not
+    /// perform the write, so no temp/replace pair is claimed — this step
+    /// records the one thing the lease actually observed.
+    DelegatedVerified,
 }
 
 /// What a replacement actually did, recorded as it happened rather than asserted
@@ -319,6 +361,40 @@ pub fn replace_beneath(
     contents: &[u8],
 ) -> Result<WriteReceipt, RootRefusal> {
     stage_replacement(lease, relative, contents)?.commit()
+}
+
+/// Verify a DELEGATED replacement beneath `lease`: the caller ran its own
+/// durability protocol against `relative` (a lane whose staged fsync/failpoint
+/// protocol is contract-pinned and cannot be replaced by [`replace_beneath`]);
+/// the lease re-reads the target through its capability and mints a receipt
+/// only when the bytes it observes are exactly the authorized post-image.
+///
+/// `Ok(None)` is a mismatch: the lease observed bytes it did not authorize, so
+/// nothing attests the write and the caller's only honest terminal is the
+/// drop-recovery lane. The traversal/link guards refuse exactly as they do for
+/// a lease-performed write.
+pub fn verify_replacement_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    expected: &[u8],
+) -> Result<Option<WriteReceipt>, RootRefusal> {
+    let target = lease.resolve_beneath(relative)?;
+    lease.refuse_link_relative(target.relative())?;
+    let dir = lease.capability()?;
+    let observed = dir
+        .read(target.relative())
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.path(),
+            message: error.to_string(),
+        })?;
+    if observed != expected {
+        return Ok(None);
+    }
+    Ok(Some(WriteReceipt {
+        steps: vec![ReplacementStep::DelegatedVerified],
+        target: target.path(),
+        lease: lease.identity(),
+    }))
 }
 
 /// Stage a replacement without committing it.

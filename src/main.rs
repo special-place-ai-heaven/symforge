@@ -76,6 +76,10 @@ fn startup_plan(
     }
 }
 
+// V11 callbacks census (Feature 020 Slice 4, C3b): ProjectStateDir checkpoint
+// writes only (permit-free StateWriteAuthorized per the frozen contract) — it
+// snapshots the published index and mutates no repository-source bytes, so it
+// holds no source-observation or publication authority.
 fn spawn_periodic_checkpoint(
     index: live_index::SharedIndex,
     root: std::path::PathBuf,
@@ -429,8 +433,13 @@ async fn run_local_mcp_server_async(
             // Spawn background verification to reconcile against current disk state.
             let bg_index = shared.clone();
             let bg_root = root.clone();
+            // V11 callbacks census (C3b): carry the observer incarnation
+            // current at spawn; a later watcher registration makes it stale
+            // and the lane refuses its observations.
+            let observer = live_index::index_lifecycle::activation::project_source_authority(&root)
+                .active_observer();
             tokio::spawn(async move {
-                persist::background_verify(bg_index, bg_root, snapshot_mtimes).await;
+                persist::background_verify(bg_index, bg_root, snapshot_mtimes, observer).await;
             });
 
             shared

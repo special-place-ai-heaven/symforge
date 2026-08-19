@@ -164,6 +164,33 @@ is the only thing allowed to touch it:
   Recorded residuals: periodic/fresh reconciliation sweeps observe only
   through the barrier/gap latches (their per-file re-admissions join at
   C4); data-plane admissions keep the V10 generation fence until C4.
+- C3b (T029/T064/T065 policy lane + callbacks census closed — executed
+  2026-08-19): the curation POLICY file's two writers take the permit lane
+  as a DELEGATED side effect — `begin_delegated` puts the permit in flight,
+  the contract-pinned staged durability protocol runs untouched
+  (failpoints, digest verification, fsyncs), and `attest_delegated` has the
+  pinned lease re-read the target and mint a receipt only for the exact
+  authorized post-image (`Ok(None)` = mismatch = drop-recovery is the only
+  honest terminal). Wired at the apply path and the `PendingWrite`
+  recovery arm shared by replay and `recover_on_project_load` (which
+  discharges that census row). `background_verify` carries the observer
+  incarnation current at its spawn (threaded from all three spawn sites:
+  daemon bootstrap, stdio main, serve); its re-admissions/removals observe
+  under that id and a successor registration refuses them — pinned RED-first
+  together with the data-plane-continues residual. Enrichment callbacks
+  adjudicated in-file: local-ref reconcile and git_temporal are
+  publication-fence-gated data-plane enrichment (no source admission;
+  typed-root gating at C4); periodic checkpoint is permit-free
+  ProjectStateDir state; edit_hooks resolve/after_commit are routing/fan-out
+  with their writes landing through already-wired lanes; the three watcher
+  census rows are discharged by C3a's registration inside
+  `run_watcher_with_stop`. DESIGN FIX exposed by the C3b foreign-root
+  oracles: since C2 the authority idled with its cap-std directory handle
+  OPEN, which on Windows blocked renaming (and hostage-held) every
+  repository root ever written — `PhysicalRootLease` is now DORMANT between
+  permit cycles (`parked`/`reopened`, identity- and revocation-preserving);
+  the confinement handle exists only while a permit is in flight, which is
+  the window the confinement claim protects.
 - C3 (T029 observation lane): watcher process_events + single_file admission
   route through the isolated candidate pipeline permit-free; background
   verify / git_temporal / local-ref / periodic checkpoint callbacks register
@@ -235,7 +262,12 @@ with exactly these codes, verified against the live run at each commit:
 Any failure code outside this enumeration in that window is a real defect.
 Observed at C2b (2026-08-19): exactly the four lines the enumeration
 predicts — closure mismatch (writers, callbacks), inventory mismatch +
-anchor shadow (atomic_replace). The
+anchor shadow (atomic_replace). Observed at C3b (2026-08-19): exactly SIX
+lines — `cache` and `publication_roots` closures joined because C3b edits
+`daemon.rs` (five cache rows + three publication_roots rows) and
+`knowledge_curation.rs` (`probe_cache` sits in the cache closure); no new
+name-anchored member was deleted, so the inventory/anchor pair is still
+only `atomic_replace`. The
 validator returns green via the postactivation path at C5; that is a hard
 PR exit criterion. Tool profiles (full=39 / compact=3) must hold in BOTH
 lifecycles.

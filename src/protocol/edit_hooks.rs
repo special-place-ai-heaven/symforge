@@ -115,6 +115,11 @@ pub fn register(hook: Box<dyn EditHook>) {
 ///
 /// Because [`DefaultEditHook`] is pre-registered and always returns `Ok`, this
 /// function only returns `Err` when a feature hook explicitly fails resolution.
+///
+/// V11 callbacks census (Feature 020 Slice 4, C3b): a pure ROUTING decision —
+/// it returns where an edit should land and performs no I/O itself, so it
+/// holds no source-observation or publication authority. The write it routes
+/// lands through `edit.rs::atomic_write_file`'s permit lane (C2).
 pub fn resolve(ctx: &EditContext) -> Result<ResolvedTarget, String> {
     let reg = registry().read();
     let mut passthrough: Option<ResolvedTarget> = None;
@@ -136,6 +141,11 @@ pub fn resolve(ctx: &EditContext) -> Result<ResolvedTarget, String> {
 }
 
 /// Invoke [`EditHook::after_edit_committed`] on every registered hook.
+///
+/// V11 callbacks census (Feature 020 Slice 4, C3b): post-commit notification
+/// fan-out. The registered hooks mutate usage state (frecency), not
+/// repository source; the edit's own index re-admission is observed by the
+/// facade lane (C3a), so this fan-out holds no publication authority.
 pub fn after_commit(ctx: &EditContext, resolved_path: &Path) {
     let reg = registry().read();
     for hook in reg.iter() {
