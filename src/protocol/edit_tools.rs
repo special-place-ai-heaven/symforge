@@ -417,38 +417,39 @@ pub(crate) fn prepare_exact_path_for_edit(
     server: &SymForgeServer,
     relative_path: &str,
 ) -> Result<(PathBuf, edit_format::EditSourceAuthority), String> {
-    let expected_gen = server.index.current_project_generation();
+    let expected_gen = server.index.data_plane().current_project_generation();
     let repo_root = server
         .capture_repo_root()
         .ok_or_else(|| "Error: no repository root configured.".to_string())?;
     let abs_path =
         safe_repo_path_for_freshen(&repo_root, relative_path).map_err(|e| format!("Error: {e}"))?;
-    let source_authority =
-        match watcher::freshen_file_if_stale(relative_path, &abs_path, &server.index, expected_gen)
-        {
-            watcher::FreshenResult::Fresh => edit_format::EditSourceAuthority::CurrentIndex,
-            watcher::FreshenResult::StaleReindexed => {
-                edit_format::EditSourceAuthority::DiskRefreshed
-            }
-            watcher::FreshenResult::StaleRemoved => {
-                return Err(format!("{}", EditError::PathNotFound { path: abs_path }));
-            }
-            watcher::FreshenResult::GenerationMismatch => {
-                return Err(format!(
-                    "{}",
-                    EditError::SessionStale {
-                        path: abs_path,
-                        recovery: session_stale_recovery(),
-                    }
-                ));
-            }
-            watcher::FreshenResult::PublicationRejected => {
-                return Err(format!(
-                    "Error: index refresh for '{}' did not publish; retry the edit.",
-                    relative_path
-                ));
-            }
-        };
+    let source_authority = match watcher::freshen_file_if_stale(
+        relative_path,
+        &abs_path,
+        server.index.data_plane(),
+        expected_gen,
+    ) {
+        watcher::FreshenResult::Fresh => edit_format::EditSourceAuthority::CurrentIndex,
+        watcher::FreshenResult::StaleReindexed => edit_format::EditSourceAuthority::DiskRefreshed,
+        watcher::FreshenResult::StaleRemoved => {
+            return Err(format!("{}", EditError::PathNotFound { path: abs_path }));
+        }
+        watcher::FreshenResult::GenerationMismatch => {
+            return Err(format!(
+                "{}",
+                EditError::SessionStale {
+                    path: abs_path,
+                    recovery: session_stale_recovery(),
+                }
+            ));
+        }
+        watcher::FreshenResult::PublicationRejected => {
+            return Err(format!(
+                "Error: index refresh for '{}' did not publish; retry the edit.",
+                relative_path
+            ));
+        }
+    };
     Ok((abs_path, source_authority))
 }
 
@@ -456,7 +457,7 @@ pub(super) fn prepare_batch_paths_for_edit(
     server: &SymForgeServer,
     relative_paths: &[String],
 ) -> Result<(PathBuf, edit_format::EditSourceAuthority), String> {
-    let expected_gen = server.index.current_project_generation();
+    let expected_gen = server.index.data_plane().current_project_generation();
     let repo_root = server
         .capture_repo_root()
         .ok_or_else(|| "Error: no repository root configured.".to_string())?;
@@ -468,8 +469,12 @@ pub(super) fn prepare_batch_paths_for_edit(
     for relative_path in unique_paths {
         let abs_path = safe_repo_path_for_freshen(&repo_root, &relative_path)
             .map_err(|e| format!("Error: {e}"))?;
-        match watcher::freshen_file_if_stale(&relative_path, &abs_path, &server.index, expected_gen)
-        {
+        match watcher::freshen_file_if_stale(
+            &relative_path,
+            &abs_path,
+            server.index.data_plane(),
+            expected_gen,
+        ) {
             watcher::FreshenResult::Fresh => {}
             watcher::FreshenResult::StaleReindexed => {
                 refreshed = true;
@@ -510,7 +515,7 @@ fn prepare_project_wide_rename(
     server: &SymForgeServer,
     repo_root: &std::path::Path,
 ) -> edit_format::EditSourceAuthority {
-    if watcher::reconcile_stale_files(repo_root, &server.index) > 0 {
+    if watcher::reconcile_stale_files(repo_root, server.index.data_plane()) > 0 {
         edit_format::EditSourceAuthority::DiskRefreshed
     } else {
         edit_format::EditSourceAuthority::CurrentIndex
@@ -726,14 +731,14 @@ impl SymForgeServer {
     /// the footer text. Computes the distinct dependent file count and (when git
     /// temporal data is `Ready`) the top co-change partners via
     /// `format::edit_impact_summary`. The dependents come from the read snapshot
-    /// (`self.index.read()` → `&LiveIndex`) and the co-changes from the lock-free
-    /// temporal snapshot on the shared handle (`self.index.git_temporal()`). If the
+    /// (`self.index.data_plane().read()` → `&LiveIndex`) and the co-changes from the lock-free
+    /// temporal snapshot on the shared handle (`self.index.data_plane().git_temporal()`). If the
     /// index is not `Ready` (loading/empty), nothing is appended — the footer is
     /// best-effort and never blocks a successful edit response.
     fn append_impact_footer(&self, output: &mut String, path: &str) {
         // T046: one capture — the dependency counts and the co-change rows in
         // one footer describe the same publication.
-        let generation = self.index.published_generation();
+        let generation = self.index.data_plane().published_generation();
         let guard = &generation.live;
         if !matches!(guard.index_state(), IndexState::Ready) {
             return;
@@ -788,7 +793,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -835,7 +840,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -998,7 +1003,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -1007,7 +1012,7 @@ impl SymForgeServer {
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let warnings = edit::detect_stale_references(
-            &self.index,
+            self.index.data_plane(),
             &params.0.path,
             &params.0.name,
             &old_sig,
@@ -1075,7 +1080,7 @@ impl SymForgeServer {
             return format!("Error: position must be 'before' or 'after', got '{position}'");
         }
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -1122,7 +1127,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -1214,7 +1219,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -1271,7 +1276,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -1318,7 +1323,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -1405,7 +1410,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -1464,7 +1469,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -1511,7 +1516,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -1780,7 +1785,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -1880,7 +1885,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
         let batch_paths: Vec<String> = params.0.edits.iter().map(|e| e.path.clone()).collect();
@@ -1905,7 +1910,7 @@ impl SymForgeServer {
             Err(output) => return output,
         };
         match edit::execute_batch_edit(
-            &self.index,
+            self.index.data_plane(),
             &repo_root,
             project_state.as_ref(),
             &params.0.edits,
@@ -1994,7 +1999,7 @@ impl SymForgeServer {
             Err(message) => return message,
         };
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
         let source_authority = prepare_project_wide_rename(self, &repo_root);
@@ -2009,8 +2014,12 @@ impl SymForgeServer {
             Ok(idempotency) => idempotency,
             Err(output) => return output,
         };
-        match edit::execute_batch_rename(&self.index, &repo_root, project_state.as_ref(), &params.0)
-        {
+        match edit::execute_batch_rename(
+            self.index.data_plane(),
+            &repo_root,
+            project_state.as_ref(),
+            &params.0,
+        ) {
             Ok(summary) => {
                 let write_semantics = if dry_run {
                     edit_format::EditWriteSemantics::DryRunNoWrites
@@ -2094,7 +2103,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
         let batch_paths: Vec<String> = params.0.targets.iter().map(|t| t.path.clone()).collect();
@@ -2118,8 +2127,12 @@ impl SymForgeServer {
             Ok(idempotency) => idempotency,
             Err(output) => return output,
         };
-        match edit::execute_batch_insert(&self.index, &repo_root, project_state.as_ref(), &params.0)
-        {
+        match edit::execute_batch_insert(
+            self.index.data_plane(),
+            &repo_root,
+            project_state.as_ref(),
+            &params.0,
+        ) {
             Ok(summaries) => {
                 let file_count = params
                     .0

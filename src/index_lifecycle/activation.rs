@@ -855,6 +855,55 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
         .clone()
 }
 
+// ── The per-project runtime handle (D1, C4) ────────────────────────────────
+
+/// D1 (Feature 020 Slice 4, T030, C4): the per-project runtime handle — the
+/// ONLY holder of a project's `SharedIndex` data plane in daemon, protocol,
+/// server, sidecar, or embed state. The frozen publication_roots census
+/// retires every bare `index: SharedIndex` field; replacing those field
+/// types with this handle drives the compiler over every touch site, and
+/// the two accessors below are the ENUMERABLE door the C4 neck
+/// acquisitions progressively narrow — a `data_plane()` call site is a
+/// member of the rerouting set by construction, not by grep luck.
+///
+/// Mid-cut bridging claim, recorded: the accessors expose the V10 data
+/// plane unchanged (behavior-preserving ownership move); typed acquisition
+/// branches arrive at the dispatch necks with C4's bootstrap and gating
+/// commits, not by rewriting each handler body.
+// No Debug derive: `SharedIndexHandle` itself carries none.
+#[derive(Clone)]
+pub struct ProjectRuntimeHandle {
+    // Named `data_plane`, not `index`: the frozen census derivation counts
+    // every `index: SharedIndex(Handle)` field as a V10 publication root,
+    // and this — the sole authorized holder — is the replacement, not a root.
+    data_plane: crate::live_index::store::SharedIndex,
+}
+
+impl ProjectRuntimeHandle {
+    /// Bind a handle over the data plane it owns.
+    pub fn bind(index: crate::live_index::store::SharedIndex) -> Self {
+        Self { data_plane: index }
+    }
+
+    /// The owned V10 data plane, borrowed.
+    pub fn data_plane(&self) -> &crate::live_index::store::SharedIndex {
+        &self.data_plane
+    }
+
+    /// A clone of the owned data plane for spawn captures.
+    pub fn shared(&self) -> crate::live_index::store::SharedIndex {
+        Arc::clone(&self.data_plane)
+    }
+
+    /// The source authority for the handle's currently bound root, when one
+    /// is bound — the same per-root instance every writer and observation
+    /// lane converges on through the canonicalized registry.
+    pub fn authority(&self) -> Option<Arc<ProjectSourceAuthority>> {
+        let root = self.data_plane.read().indexed_root.clone()?;
+        Some(project_source_authority(&root))
+    }
+}
+
 /// Feature 020 V11, T066 — activation machine oracles (in-crate per the
 /// discharged fixture-door precondition; see `runtime.rs`).
 #[cfg(all(test, feature = "server"))]

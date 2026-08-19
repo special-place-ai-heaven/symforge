@@ -196,10 +196,29 @@ is the only thing allowed to touch it:
   verify / git_temporal / local-ref / periodic checkpoint callbacks register
   with supervisor+observer incarnations (no callback holds publication
   authority; late V10 callbacks unreachable).
-- C4 (T030/T031 roots): bare SharedIndex holders replaced by the authority
-  facade; bootstrap flows through activation machine + registry/adapters
-  admission; serve/stdio/daemon/sidecar surfaces attach via
-  ProcessIndexRuntime.
+- C4a (T030 roots, structural — executed 2026-08-19): the D1 ownership
+  move. `activation.rs::ProjectRuntimeHandle` (inner field deliberately
+  named `data_plane`, NOT `index` — the census derivation counts every
+  `index: SharedIndex(Handle)` field as a V10 root, and the sole authorized
+  holder is the replacement, not a root) now owns the data plane at all six
+  retired publication_roots fields: `ProjectInstance::index`,
+  `SessionRuntime::index`, `SessionRuntime::project_indexes`,
+  `SymForgeServer::index`, `ServerRuntime::index`, `SidecarState::index`.
+  Field-type replacement drove the compiler over every touch site
+  (~200 sites across daemon/protocol/server/sidecar + tests); every read
+  routes through the enumerable `data_plane()`/`shared()` door, pinned
+  RED-first by the structural oracle
+  `root_holders_store_no_bare_shared_index` (struct-scoped, so params and
+  locals cannot satisfy the claim). Behavior-preserving by design: typed
+  acquisition branches arrive at the dispatch necks with C4b/C4c, not by
+  rewriting handler bodies. `IndexBase::index` (Arc<LiveIndex>, cache
+  census) deliberately untouched — cache disposition is C4c/C5 work.
+- C4b/C4c (T030/T031 roots, remaining): bootstrap flows through activation
+  machine + registry/adapters admission; serve/stdio/daemon/sidecar
+  surfaces attach via ProcessIndexRuntime; registry ownership moves from
+  the `project_source_authority` static to bootstrap; reconciliation
+  sweeps' per-file re-admissions join the lane; data-plane admissions
+  gated at the necks.
 - C5 (T031 exposure): embed.rs raw re-exports removed per the 79-member
   raw_embed dispositions → V11 replacement API + EmbeddedSourceHandle
   re-exports; `server_api` `pub(crate)`→`pub`; mount flip; exact-graph
@@ -268,6 +287,11 @@ lines — `cache` and `publication_roots` closures joined because C3b edits
 `knowledge_curation.rs` (`probe_cache` sits in the cache closure); no new
 name-anchored member was deleted, so the inventory/anchor pair is still
 only `atomic_replace`. The
+Observed at C4a (2026-08-19): exactly SEVEN lines — the C3b six plus the
+publication_roots inventory mismatch whose `extra_in_contract` names all
+six retired `index`/`project_indexes` field members (the D1 rows the C2b
+note predicted); anchors still resolve (the field names survive with the
+handle type), so no new anchor shadows. The
 validator returns green via the postactivation path at C5; that is a hard
 PR exit criterion. Tool profiles (full=39 / compact=3) must hold in BOTH
 lifecycles.

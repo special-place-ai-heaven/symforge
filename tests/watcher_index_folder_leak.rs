@@ -110,14 +110,14 @@ async fn repeated_index_folder_preserves_file_count() {
 
     tokio::time::sleep(Duration::from_millis(3_200)).await;
 
-    let published = server.index().published_state();
+    let published = server.index().data_plane().published_state();
     assert_eq!(
         published.file_count, 25,
         "second root's file count must remain intact after the old watcher \
          has had time to reconcile"
     );
 
-    let index = server.index().read();
+    let index = server.index().data_plane().read();
     for idx in 0..25 {
         let path = format!("src/b_file_{idx:03}.rs");
         assert!(

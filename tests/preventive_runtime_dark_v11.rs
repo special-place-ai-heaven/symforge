@@ -437,9 +437,75 @@ const WIRED_PRODUCTION_FILES: &[&str] = &[
     "src/main.rs",
     "src/protocol/edit.rs",
     "src/protocol/knowledge_curation.rs",
+    "src/protocol/mod.rs",
+    "src/server/mod.rs",
     "src/server/serve.rs",
+    "src/sidecar/handlers.rs",
+    "src/sidecar/mod.rs",
+    "src/sidecar/server.rs",
     "src/watcher/mod.rs",
 ];
+
+/// The frozen publication_roots census (C4): the state structs that retired
+/// their bare `index: SharedIndex` / `project_indexes: ..SharedIndex..`
+/// fields for the D1 `ProjectRuntimeHandle`. Scoped per struct so function
+/// parameters and locals spelled `index: SharedIndex` — which are values in
+/// flight, not stored roots — cannot satisfy or violate the claim.
+const ROOT_HOLDER_STRUCTS: &[(&str, &str)] = &[
+    ("src/daemon.rs", "ProjectInstance"),
+    ("src/daemon.rs", "SessionRuntime"),
+    ("src/protocol/mod.rs", "SymForgeServer"),
+    ("src/server/mod.rs", "ServerRuntime"),
+    ("src/sidecar/mod.rs", "SidecarState"),
+];
+
+#[test]
+fn root_holders_store_no_bare_shared_index() {
+    let repo = src_root().parent().expect("src has a parent").to_path_buf();
+    let mut hits = Vec::new();
+    for (file, name) in ROOT_HOLDER_STRUCTS {
+        let text =
+            std::fs::read_to_string(repo.join(file)).unwrap_or_else(|_| panic!("read {file}"));
+        let header = format!("struct {name} {{");
+        let mut in_struct = false;
+        let mut found = false;
+        for (number, line) in text.lines().enumerate() {
+            if !in_struct {
+                if line.trim_start().ends_with(&header)
+                    && (line.trim_start().starts_with("struct")
+                        || line.trim_start().starts_with("pub struct"))
+                {
+                    in_struct = true;
+                    found = true;
+                }
+                continue;
+            }
+            // rustfmt closes a top-level struct at column 0.
+            if line == "}" {
+                in_struct = false;
+                continue;
+            }
+            let field = line.trim_start();
+            if field.starts_with("//") {
+                continue;
+            }
+            let stores_bare = field
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ")
+                .starts_with("index: SharedIndex")
+                || field.contains("HashMap<String, SharedIndex>");
+            if stores_bare {
+                hits.push(format!("{file}:{}: {name}::{field}", number + 1));
+            }
+        }
+        assert!(found, "root-holder struct {name} not found in {file}");
+    }
+    assert!(
+        hits.is_empty(),
+        "bare SharedIndex stored in root-holder state (frozen publication_roots census):\n{}",
+        hits.join("\n")
+    );
+}
 
 #[test]
 fn dark_call_edges_appear_only_in_the_wired_roster() {
@@ -846,15 +912,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "a15015984825dbbe9f7ac868653b6b89a11b9d58e6d7cd33f98560d6e097eda8",
+    "5f263356a9b83e897d370612e732933ed815673e17cfe74ede9395a0c17f02b6",
     20,
-    370_784,
+    373_110,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "20ea88323ec723ee169358a1023ac15958168d0eff7aeef327719437f00c6829",
+    "87ffe241a78555cfba37a1b05fad834ed33fd87e049670403c00fc2a440b8d1d",
     194,
-    9_194_283,
+    9_205_434,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

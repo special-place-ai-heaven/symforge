@@ -159,6 +159,7 @@ async fn impact_prefix_comment_survives_watcher_pre_update_snapshot() {
     let indexed = IndexedFile::from_parse_result(parsed, bytes);
     fx.server
         .index()
+        .data_plane()
         .update_file("src/watcher_race.rs".to_string(), indexed);
 
     let result = fx.impact("src/watcher_race.rs").await;

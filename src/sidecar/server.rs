@@ -91,7 +91,7 @@ pub async fn spawn_sidecar(
     // can read token savings directly without an HTTP round-trip.
     let token_stats = TokenStats::new();
     let state = SidecarState {
-        index,
+        index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(index),
         token_stats: Arc::clone(&token_stats),
         repo_root,
         symbol_cache: Arc::new(RwLock::new(HashMap::new())),
