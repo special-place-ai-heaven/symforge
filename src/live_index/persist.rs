@@ -2389,9 +2389,18 @@ fn remove_snapshot_deleted_file_if_still_absent(
     expected: crate::live_index::store::PublicationFence,
 ) -> bool {
     let absolute_path = root.join(path);
-    index
-        .remove_file_if_absent_at_publication_fence_with_receipt(path, &absolute_path, expected)
-        .is_some()
+    match index.remove_file_if_absent_at_publication_fence_with_receipt(
+        path,
+        &absolute_path,
+        expected,
+    ) {
+        // `NothingHeld` means the deletion is already reconciled (nothing
+        // holds the path, so nothing publishes); the verify continues. Only a
+        // fence rejection aborts the pass.
+        crate::live_index::store::FencedRemoval::Removed(_)
+        | crate::live_index::store::FencedRemoval::NothingHeld => true,
+        crate::live_index::store::FencedRemoval::Rejected => false,
+    }
 }
 
 async fn background_verify_with_hook<F>(

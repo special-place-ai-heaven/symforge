@@ -1006,6 +1006,21 @@ pub(crate) struct IndexedFilePublicationReceipt {
     pub snapshot_created: bool,
 }
 
+/// Outcome of a fenced single-file removal. Only `Removed` published.
+pub(crate) enum FencedRemoval {
+    /// The path was held (parsed file, manifest row, or scout entry) and its
+    /// removal published; the receipt is the winning publication.
+    Removed(Arc<PublishedGeneration>),
+    /// Confirmed under the write lock: nothing holds this path — no parsed
+    /// file, no manifest row, no scout entry. There is no removal to publish;
+    /// publishing anyway would mint a new publication out of a failed
+    /// observation (the D14 defect).
+    NothingHeld,
+    /// A fence rejected the removal (stale generation/publication, changed
+    /// scout base, recreated path, or a poisoned mutation). Nothing published.
+    Rejected,
+}
+
 pub struct PreparedKnowledgeBridge {
     fence: PublicationFence,
     bridge: Arc<KnowledgeBridge>,
@@ -2864,20 +2879,36 @@ impl SharedIndexHandle {
     }
 
     pub fn remove_file_at_generation(&self, path: &str, expected_gen: u64) -> bool {
+        matches!(
+            self.remove_file_outcome_at_generation(path, expected_gen),
+            FencedRemoval::Removed(_)
+        )
+    }
+
+    /// Typed variant of [`Self::remove_file_at_generation`] for callers that
+    /// must distinguish a published removal from a fence-held no-op
+    /// (`NothingHeld`) — e.g. the embed facade, whose contract reports both as
+    /// applied but may only OBSERVE the removal that actually happened.
+    pub(crate) fn remove_file_outcome_at_generation(
+        &self,
+        path: &str,
+        expected_gen: u64,
+    ) -> FencedRemoval {
         self.remove_file_with_fences(path, expected_gen, None, None, None)
-            .is_some()
     }
 
     pub fn remove_file_at_publication_fence(&self, path: &str, expected: PublicationFence) -> bool {
-        self.remove_file_at_publication_fence_with_receipt(path, expected)
-            .is_some()
+        matches!(
+            self.remove_file_at_publication_fence_with_receipt(path, expected),
+            FencedRemoval::Removed(_)
+        )
     }
 
     pub(crate) fn remove_file_at_publication_fence_with_receipt(
         &self,
         path: &str,
         expected: PublicationFence,
-    ) -> Option<Arc<PublishedGeneration>> {
+    ) -> FencedRemoval {
         self.remove_file_with_fences(
             path,
             expected.project_generation,
@@ -2892,7 +2923,7 @@ impl SharedIndexHandle {
         path: &str,
         absolute_path: &Path,
         expected: PublicationFence,
-    ) -> Option<Arc<PublishedGeneration>> {
+    ) -> FencedRemoval {
         // The observation fence contributes project identity, but an unrelated
         // same-project publication must not pin a confirmed deletion forever.
         // Re-checking filesystem absence under `write_mutex` is the path-local
@@ -2913,14 +2944,16 @@ impl SharedIndexHandle {
         expected_entry: &crate::domain::ScoutedEntry,
         expected_gen: u64,
     ) -> bool {
-        self.remove_file_with_fences(
-            path,
-            expected_gen,
-            Some(expected_entry),
-            None,
-            expected_entry.absolute_path.as_deref(),
+        matches!(
+            self.remove_file_with_fences(
+                path,
+                expected_gen,
+                Some(expected_entry),
+                None,
+                expected_entry.absolute_path.as_deref(),
+            ),
+            FencedRemoval::Removed(_)
         )
-        .is_some()
     }
 
     fn remove_file_with_fences(
@@ -2930,7 +2963,7 @@ impl SharedIndexHandle {
         expected_scout_entry: Option<&crate::domain::ScoutedEntry>,
         expected_publication: Option<PublicationFence>,
         expected_absent_path: Option<&Path>,
-    ) -> Option<Arc<PublishedGeneration>> {
+    ) -> FencedRemoval {
         let _wg = self.write_mutex.lock();
         let current_gen = self.project_generation.load(Ordering::Acquire);
         if current_gen != expected_gen {
@@ -2942,7 +2975,7 @@ impl SharedIndexHandle {
                 current_gen,
                 "rejecting stale file removal"
             );
-            return None;
+            return FencedRemoval::Rejected;
         }
         if let Some(expected_publication) = expected_publication {
             let current_publication = self.publication_fence();
@@ -2953,7 +2986,7 @@ impl SharedIndexHandle {
                     ?current_publication,
                     "rejecting stale file removal publication"
                 );
-                return None;
+                return FencedRemoval::Rejected;
             }
         }
         if let Some(expected_scout_entry) = expected_scout_entry {
@@ -2968,7 +3001,7 @@ impl SharedIndexHandle {
                     path,
                     "rejecting file removal because its scouted base changed"
                 );
-                return None;
+                return FencedRemoval::Rejected;
             }
         }
         if let Some(absolute_path) = expected_absent_path {
@@ -2979,7 +3012,7 @@ impl SharedIndexHandle {
                         path,
                         "rejecting file removal because the path was recreated"
                     );
-                    return None;
+                    return FencedRemoval::Rejected;
                 }
                 Err(error) => {
                     tracing::trace!(
@@ -2987,16 +3020,16 @@ impl SharedIndexHandle {
                         %error,
                         "rejecting file removal because absence could not be confirmed"
                     );
-                    return None;
+                    return FencedRemoval::Rejected;
                 }
             }
         }
 
         let mut live = (*self.live.load_full()).clone();
         let path_owned = path.to_string();
+        let mut removed_from_live = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            live.remove_file(path);
-            live.remove_manifest_entry(path);
+            removed_from_live = live.remove_file(path);
         }));
         if let Err(panic_info) = result {
             let msg = panic_info
@@ -3009,16 +3042,25 @@ impl SharedIndexHandle {
                 path_owned,
                 msg
             );
-            return None;
+            return FencedRemoval::Rejected;
         }
 
         let updated_scout_plan = match self.scout_plan_without_path_locked(path) {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::error!(path, %error, "failed to refresh scout plan after removal");
-                return None;
+                return FencedRemoval::Rejected;
             }
         };
+
+        // D14 fence: `remove_file` and the scout reconciliation are the two
+        // components that KNOW whether this path was held anywhere (parsed
+        // file, manifest row, scout entry). When neither removed anything,
+        // there is no removal to publish — publishing anyway would mint a new
+        // publication out of a failed observation.
+        if !removed_from_live && updated_scout_plan.is_none() {
+            return FencedRemoval::NothingHeld;
+        }
 
         if let Some(plan) = updated_scout_plan {
             self.scout_plan.store(Some(plan));
@@ -3027,7 +3069,7 @@ impl SharedIndexHandle {
         self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish(live);
         self.pre_update_snapshots.lock().remove(path);
-        Some(self.published_generation())
+        FencedRemoval::Removed(self.published_generation())
     }
 
     /// Publish one metadata-terminal observation under the same generation
@@ -5188,7 +5230,10 @@ impl LiveIndex {
     ///
     /// Indexed bytes and the canonical manifest entry are cleared together. If
     /// neither lane contains the path, this is a no-op (no timestamp update).
-    pub fn remove_file(&mut self, path: &str) {
+    /// Remove a file's parsed entry and manifest row. Returns whether the
+    /// index actually HELD anything for this path — the caller that reports a
+    /// removal (or publishes one) must know, not assume.
+    pub fn remove_file(&mut self, path: &str) -> bool {
         self.remove_reverse_index_for_path(path);
         let removed_file = self.files.remove(path).is_some();
         let removed_manifest = self.remove_manifest_entry(path);
@@ -5199,6 +5244,7 @@ impl LiveIndex {
         if removed_file || removed_manifest {
             self.loaded_at_system = SystemTime::now();
         }
+        removed_file || removed_manifest
     }
 
     /// Remove reverse index entries for a single file path.

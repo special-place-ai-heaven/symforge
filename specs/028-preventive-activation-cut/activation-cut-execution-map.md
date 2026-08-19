@@ -546,10 +546,66 @@ is the only thing allowed to touch it:
   - The C9 mtime lesson recurred in the CCR fixture (same-second rewrite
     defeating the freshen) and was fixed with deterministic backdates
     before any fence conclusion was drawn.
-- C11 (T037 remainder): D14 falsifiable live-observer invalidation,
-  cancelled non-abortable `index_folder` resolution, D16 structured
-  boundary adjudication, the campaign run through
-  `all_ingress_uses_exact_typed_authority_branch`, the evidence doc, and
+- C11b (T037 observation-side residuals — executed 2026-08-19): the three
+  carried observation families, one genuine RED.
+  - D14 made falsifiable
+    (`a_failed_read_observation_preserves_the_fence_the_observer_moves`,
+    `tests/activation_residuals_v11.rs`): on ONE live runtime, the same
+    `publication_fence()` that provably moves under the observer lane
+    (request-path refresh, confirmed-absent removal) stays byte-identical
+    across failed read observations — before AND after the fence has
+    moved, so the preservation is not a frozen-counter artifact (the
+    exact unfalsifiability the Slice 3 evidence recorded against the
+    model-level test, which stays). **RED observed and real**: a read of
+    a never-indexed missing path PUBLISHED — `remove_file_with_fences`
+    swapped-and-published unconditionally, minting a new publication out
+    of a failed observation; the same defect wore a second face at the
+    source-scope eviction lane (a never-held gitignored path "evicted"
+    and published) and a third at the embed facade (`remove_file` no-op
+    OBSERVED a removal that never happened). Minimal machinery: typed
+    `FencedRemoval { Removed(receipt) | NothingHeld | Rejected }` from
+    the one fenced-removal seam; `LiveIndex::remove_file` (the component
+    that knows) now reports whether anything was held; `NothingHeld`
+    publishes nothing and observes nothing. Mappings, each per its own
+    contract: `finalize_missing_file` → `NotFound` (absence confirmed,
+    nothing published); source-scope eviction → `Skipped` without a
+    publication (exclusion already reconciled); snapshot verify →
+    continue (already reconciled), abort only on fence rejection; the
+    embed facade keeps its frozen "no-op is applied" bool while only an
+    actual removal drives `observe_removal_active`.
+  - Cancelled non-abortable `index_folder` (frozen 028 edge case):
+    `a_cancelled_activation_never_governs_until_an_observed_resync`
+    (`src/daemon.rs` — needs the live-daemon spawn helpers). A raw
+    daemon-side default activation stands in for the caller-cancelled
+    adapter future; the control proves the daemon session's ACTIVE
+    really moved. The fence: the adapter's unqualified read stays on the
+    last OBSERVED project with body and receipt agreeing (the unobserved
+    activation never governs; no half-published root), and the caller's
+    observed retry IS the authoritative ACTIVE re-sync after which both
+    sides converge, again body+receipt agreeing. Observed green on first
+    run — the C4-era pin (`expected_daemon_project_id` written into the
+    selector) plus the activation lane already carry the fence; the
+    oracle pins the resolution the residual demanded.
+  - D16 structured boundary adjudicated
+    (`the_evidence_receipt_names_the_publication_that_rendered_the_body`):
+    the typed evidence receipt equals the publication that rendered the
+    body — not the pre-dispatch seed, and not a publication landing
+    between body render and receipt attach (deterministic interleave via
+    a direct observed-refresh publish inside the dispatch scope); the
+    wire `_meta` value round-trips as the typed `ProjectEvidence`.
+    Cross-process atomicity under arbitrary concurrent publication is
+    deliberately NOT claimed — the adjudicated boundary is per-response:
+    no response pairs one publication's body with another's receipt.
+    Observed green on first run (T046's one-capture rule holds).
+  - Battery: fmt clean; residual oracles 4/4 + daemon oracle 1/1; clippy
+    `-D warnings` on final bytes; dark suite 9/9 (FULL pin refreshed
+    from oracle actuals after fmt, twice — once more after the facade
+    repair; EXCLUDED pin unchanged, as predicted for edits outside the
+    13 sealed sources); embed cell exactly 1336; full serial suite +
+    bench smoke + validator recorded at commit.
+- C11c (T037 remainder): the campaign run through
+  `all_ingress_uses_exact_typed_authority_branch`, the evidence doc
+  (`docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md`), and
   the full gate battery via Terminal Commander.
 
 Gate battery after every commit-group, serial via TC; fmt BEFORE pin

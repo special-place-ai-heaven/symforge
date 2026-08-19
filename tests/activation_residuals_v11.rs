@@ -11,10 +11,21 @@
 //!   `ReplayRecord` v1 binds no source identity, so an identical stored
 //!   success could replay after the source moved past the recorded state —
 //!   Slice 4 must persist and VERIFY a typed, source-bound operation
-//!   receipt).
+//!   receipt);
+//! * the falsifiable D14 live-observer contrast (the Slice 3 model-level
+//!   oracle preserves a generation nothing could move; here the SAME live
+//!   publication fence provably moves under the observer lane and stays
+//!   byte-identical across failed read observations);
+//! * the D16 structured activation boundary (the typed evidence receipt
+//!   names the exact immutable publication that rendered the body, held as
+//!   captured data across later publications; cross-process atomicity under
+//!   arbitrary concurrent publication is NOT claimed).
 //!
 //! The read-tools half of the publication-identity fence is proven by
 //! `session_cache_hit.rs::stale_publication_never_satisfies_the_repeat_read_cache`.
+//! The cancelled non-abortable `index_folder` residual needs a live daemon and
+//! its `#[cfg(test)]` spawn helpers, so its oracle lives in `src/daemon.rs`
+//! (`a_cancelled_activation_never_governs_until_an_observed_resync`).
 
 // Server-only integration test: drives protocol tool dispatch. File-level
 // gate, same as `activation_cut_v11.rs`.
@@ -45,8 +56,16 @@ fn write_fixture(root: &Path, files: &[(&str, &str)]) {
 
 /// A plain single-project server over `root` (no durable state).
 fn server_over(root: &Path) -> SymForgeServer {
+    server_with_shared(root).1
+}
+
+/// Same fixture, but keeps a clone of the `SharedIndex` handle so the test can
+/// observe the server's own publications (the fence and the receipt) from
+/// outside the dispatch.
+fn server_with_shared(root: &Path) -> (symforge::live_index::store::SharedIndex, SymForgeServer) {
     let shared = LiveIndex::load(root).expect("fixture load");
-    SymForgeServer::new(
+    let observer = std::sync::Arc::clone(&shared);
+    let server = SymForgeServer::new(
         shared,
         "activation_residuals".to_string(),
         std::sync::Arc::new(parking_lot::Mutex::new(
@@ -54,7 +73,23 @@ fn server_over(root: &Path) -> SymForgeServer {
         )),
         Some(root.to_path_buf()),
         None,
-    )
+    );
+    (observer, server)
+}
+
+/// Deterministic absolute mtime: a same-second rewrite would defeat the
+/// freshen's mtime guard (the C9 fixture lesson).
+fn backdate(path: &Path, secs: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for backdate")
+        .set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ),
+        )
+        .expect("set mtime");
 }
 
 /// A server with durable project state (required by the mutation replay
@@ -275,5 +310,239 @@ async fn replay_never_serves_a_stored_success_the_current_source_does_not_hold()
         !final_disk.contains("99") || after_external.starts_with("Error"),
         "the response and the disk disagree: the dispatch neither re-applied \
          the edit nor reported a typed non-success.\nresponse:\n{after_external}\ndisk:\n{final_disk}"
+    );
+}
+
+// ── D14: live-observer invalidation, made falsifiable ──────────────────────
+
+/// The model-level D14 oracle
+/// (`read_gate_authority_v11.rs::a_failed_observation_refuses_without_disturbing_the_current_generation`)
+/// is unfalsifiable on its own: its model generation has no lane that could
+/// move it, so the preservation assertion cannot fail. This is the live
+/// contrast that makes the claim falsifiable: on one real runtime, the SAME
+/// publication fence that provably MOVES under the observer lane (refresh and
+/// confirmed-absent removal) stays byte-identical across failed read
+/// observations. Only the observer seam may invalidate the Current
+/// generation, and only on its own independent evidence.
+#[tokio::test]
+async fn a_failed_read_observation_preserves_the_fence_the_observer_moves() {
+    let dir = tempfile::tempdir().expect("root");
+    let root = dir.path();
+    write_fixture(
+        root,
+        &[
+            ("src/kept.rs", "pub fn kept_anchor() -> u64 {\n    1\n}\n"),
+            ("src/doomed.rs", "pub fn doomed_anchor() {}\n"),
+        ],
+    );
+    backdate(&root.join("src/kept.rs"), 1_000_000_001);
+    let (fence_handle, server) = server_with_shared(root);
+
+    // Failed pure observation #1: a path the generation never held and the
+    // disk does not hold. The read refuses with a typed miss; the fence must
+    // not move — a failure yields no evidence to publish.
+    let before = fence_handle.publication_fence();
+    let missing = server
+        .dispatch_tool_for_tests("get_file_content", json!({ "path": "src/gone.rs" }))
+        .await;
+    assert!(
+        missing.contains("File not found"),
+        "a never-indexed missing path must refuse with a typed miss:\n{missing}"
+    );
+    assert_eq!(
+        fence_handle.publication_fence(),
+        before,
+        "a failed read observation must not disturb the publication fence"
+    );
+
+    // Failed pure observation #2: an admission refusal (path traversal) is
+    // equally evidence-free.
+    let outside = server
+        .dispatch_tool_for_tests("get_file_content", json!({ "path": "../outside.rs" }))
+        .await;
+    assert!(
+        outside.contains("outside the repository"),
+        "a traversal path must refuse as a containment violation:\n{outside}"
+    );
+    assert_eq!(
+        fence_handle.publication_fence(),
+        before,
+        "an admission refusal must not disturb the publication fence"
+    );
+
+    // THE CONTRAST that makes the preservation falsifiable: the observer lane
+    // on the SAME runtime moves the same fence. A request-path freshen that
+    // observes changed bytes republishes.
+    std::fs::write(
+        root.join("src/kept.rs"),
+        "pub fn kept_anchor() -> u64 {\n    2\n}\n",
+    )
+    .expect("mutate kept file");
+    backdate(&root.join("src/kept.rs"), 1_000_000_002);
+    let refreshed = server
+        .dispatch_tool_for_tests(
+            "get_file_content",
+            json!({ "path": "src/kept.rs", "force_refresh": true }),
+        )
+        .await;
+    assert!(
+        refreshed.contains("    2"),
+        "the observer refresh must serve the republished bytes:\n{refreshed}"
+    );
+    let after_refresh = fence_handle.publication_fence();
+    assert!(
+        after_refresh.content_generation > before.content_generation,
+        "control: the observer lane must move the fence the failed reads preserved \
+         (before {before:?}, after {after_refresh:?})"
+    );
+
+    // The preservation holds against the MOVED fence too — it is not an
+    // artifact of a counter nothing touches (the exact D14 unfalsifiability
+    // being repaired).
+    let missing_again = server
+        .dispatch_tool_for_tests("get_file_content", json!({ "path": "src/gone.rs" }))
+        .await;
+    assert!(missing_again.contains("File not found"), "{missing_again}");
+    assert_eq!(
+        fence_handle.publication_fence(),
+        after_refresh,
+        "a failed read observation must also preserve a fence that has already moved"
+    );
+
+    // Observer removal on independent evidence: an indexed file deleted on
+    // disk. The targeted freshen CONFIRMS the absence under a publication
+    // fence and removes it — the response is a miss, but unlike the pure
+    // failures above, this miss carries observer evidence and the fence moves.
+    std::fs::remove_file(root.join("src/doomed.rs")).expect("delete indexed file");
+    let removed = server
+        .dispatch_tool_for_tests("get_file_content", json!({ "path": "src/doomed.rs" }))
+        .await;
+    assert!(
+        !removed.contains("doomed_anchor"),
+        "a deleted file's bytes must not be served from a stale generation:\n{removed}"
+    );
+    let after_removal = fence_handle.publication_fence();
+    assert!(
+        after_removal.content_generation > after_refresh.content_generation,
+        "the observer's confirmed-absent removal must publish \
+         (after refresh {after_refresh:?}, after removal {after_removal:?})"
+    );
+
+    // And with the removal already published, the identical read is again a
+    // pure failed observation: no new evidence, no movement.
+    let settled = server
+        .dispatch_tool_for_tests("get_file_content", json!({ "path": "src/doomed.rs" }))
+        .await;
+    assert!(!settled.contains("doomed_anchor"), "{settled}");
+    assert_eq!(
+        fence_handle.publication_fence(),
+        after_removal,
+        "re-reading an already-removed path yields no evidence and must not republish"
+    );
+}
+
+// ── D16: the structured activation boundary, adjudicated ───────────────────
+
+/// Carried Slice 3 residual: the daemon evidence header was "ancillary
+/// metadata, not a transaction". The adjudicated Slice 4 boundary is
+/// per-response and structured: the typed evidence receipt names the exact
+/// immutable publication that rendered the body — captured once at the
+/// handler's boundary, held as DATA in the dispatch scope, and therefore
+/// immune to publications that land between the body render and the receipt
+/// attach. Cross-process atomicity under arbitrary concurrent publication is
+/// deliberately NOT claimed; what is claimed is that no response can pair one
+/// publication's body with another publication's receipt.
+#[tokio::test]
+async fn the_evidence_receipt_names_the_publication_that_rendered_the_body() {
+    let dir = tempfile::tempdir().expect("root");
+    let root = dir.path();
+    write_fixture(
+        root,
+        &[(
+            "src/lib.rs",
+            "pub fn boundary_anchor() -> u64 {\n    1\n}\n",
+        )],
+    );
+    backdate(&root.join("src/lib.rs"), 1_000_000_001);
+    let (observer, server) = server_with_shared(root);
+    let seeded = observer.published_generation().publication_generation;
+
+    // The source moves before the call; the handler's own freshen republishes
+    // and renders the NEW bytes, so the rendering publication is NOT the one
+    // current at dispatch entry.
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn boundary_anchor() -> u64 {\n    2\n}\n",
+    )
+    .expect("mutate source");
+    backdate(&root.join("src/lib.rs"), 1_000_000_002);
+
+    let (body, rendered_publication, receipt) =
+        symforge::protocol::result_status::with_project_evidence_scope(None, async {
+            let body = server
+                .dispatch_tool_for_tests(
+                    "get_file_content",
+                    json!({ "path": "src/lib.rs", "force_refresh": true }),
+                )
+                .await;
+            let rendered_publication = observer.published_generation().publication_generation;
+            // A publication lands AFTER the body render but BEFORE the receipt
+            // would be attached — the deterministic form of "arbitrary
+            // concurrent publication" at this boundary.
+            std::fs::write(
+                root.join("src/lib.rs"),
+                "pub fn boundary_anchor() -> u64 {\n    3\n}\n",
+            )
+            .expect("late mutate");
+            backdate(&root.join("src/lib.rs"), 1_000_000_003);
+            let late = symforge::live_index::single_file::update_file_from_disk(
+                &observer,
+                root,
+                "src/lib.rs",
+            );
+            let late = format!("{late:?}");
+            assert!(
+                late.contains("Reindexed"),
+                "control: the late publication must actually land: {late}"
+            );
+            let receipt = symforge::protocol::result_status::current_project_evidence();
+            (body, rendered_publication, receipt)
+        })
+        .await;
+
+    assert!(
+        body.contains("    2"),
+        "the body must render the in-call republished bytes:\n{body}"
+    );
+    assert!(
+        rendered_publication > seeded,
+        "control: the in-call freshen really moved the publication \
+         (seeded {seeded}, rendered {rendered_publication})"
+    );
+    let receipt = receipt.expect("a rendered read must record a typed evidence receipt");
+
+    // THE BOUNDARY, both directions: the receipt is the rendering publication
+    // — not the pre-dispatch seed (stale receipt on fresh body), and not the
+    // later publication that raced in before attach (fresh receipt on a body
+    // it never rendered). Either pairing would be the half-published response.
+    assert_eq!(
+        receipt.generation, rendered_publication,
+        "the receipt must name the publication that rendered the body"
+    );
+    let moved = observer.published_generation().publication_generation;
+    assert!(
+        moved > rendered_publication,
+        "control: the post-render publication really superseded the rendering one"
+    );
+
+    // The wire form is TYPED: the receipt round-trips through its serialized
+    // JSON as the same typed value. The recorded D16 gap named an UNTYPED
+    // wire `_meta`; the boundary is a typed struct on both sides of the wire.
+    let wire = serde_json::to_value(&receipt).expect("receipt serializes");
+    let parsed: symforge::protocol::result_status::ProjectEvidence =
+        serde_json::from_value(wire).expect("the wire value parses back as the typed receipt");
+    assert_eq!(
+        parsed, receipt,
+        "the evidence receipt must survive the wire as the same typed value"
     );
 }

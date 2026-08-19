@@ -13416,6 +13416,184 @@ mod tests {
         .await;
     }
 
+    /// Carried Slice 3 residual (T037 / 020:T072, frozen 028 edge case): a
+    /// caller that cancels a non-abortable `index_folder` after the daemon
+    /// began activation leaves the distributed outcome unknown — the daemon
+    /// session's ACTIVE moved while the adapter mirror kept the last OBSERVED
+    /// activation. The required resolution: an authoritative ACTIVE re-sync,
+    /// never a half-published root. Concretely: (1) the unobserved activation
+    /// never governs the adapter's unqualified reads — every read stays
+    /// pinned to the last observed project, body and receipt agreeing on it —
+    /// and (2) the caller's OBSERVED retry of the cancelled call is the
+    /// authoritative re-sync after which both sides agree on the new ACTIVE.
+    #[tokio::test]
+    async fn a_cancelled_activation_never_governs_until_an_observed_resync() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-cancelled-activation-home-a");
+        let project_b = project_dir("symforge-cancelled-activation-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "cancelled-activation".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // The cancellation: the daemon runs its non-abortable DEFAULT
+        // activation of B to completion, but the ADAPTER never observes the
+        // response. The raw HTTP hop below stands in for the caller-cancelled
+        // adapter future — the daemon-side outcome is identical: the
+        // session's ACTIVE moved to B and nobody on the adapter side knows.
+        let activated_b = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            })
+            .send()
+            .await
+            .expect("activate B request")
+            .error_for_status()
+            .expect("activate B status")
+            .text()
+            .await
+            .expect("activate B body");
+        assert!(
+            activated_b.starts_with("Indexed "),
+            "daemon-side activation must complete: {activated_b}"
+        );
+
+        // Control proving the divergence is real: the DAEMON's own unqualified
+        // view now serves B. Without the adapter's pin, the fence below would
+        // have nothing to defend against.
+        let daemon_view = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/get_repo_map",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({ "detail": "full" }))
+            .send()
+            .await
+            .expect("daemon view request")
+            .error_for_status()
+            .expect("daemon view status")
+            .text()
+            .await
+            .expect("daemon view body");
+        assert!(
+            daemon_view.contains("new.rs"),
+            "control: the daemon session ACTIVE must have moved to B: {daemon_view}"
+        );
+
+        // THE FENCE, half 1 — the unobserved activation must not govern: an
+        // unqualified read through the adapter serves the last OBSERVED
+        // project (home A), body and receipt agreeing on A. Serving B here
+        // would report an activation nobody observed; pairing A's body with
+        // B's receipt (or vice versa) would be the half-published root.
+        let (map_home, home_receipt) =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let input = serde_json::from_value(serde_json::json!({"detail": "full"}))
+                    .expect("map input");
+                let map = server.get_repo_map(Parameters(input)).await;
+                let receipt = crate::protocol::result_status::current_project_evidence();
+                (map, receipt)
+            })
+            .await;
+        assert!(
+            map_home.contains("old.rs") && !map_home.contains("new.rs"),
+            "an unqualified read must stay on the last OBSERVED activation: {map_home}"
+        );
+        let home_receipt = home_receipt.expect("a proxied read must carry a daemon receipt");
+        assert_eq!(
+            home_receipt.project_id, opened.project_id,
+            "the receipt must name the same project that served the body"
+        );
+
+        // THE FENCE, half 2 — the authoritative re-sync: the caller's natural
+        // retry of the cancelled call, OBSERVED through the adapter this
+        // time, resolves the unknown outcome. Both sides converge on B.
+        let retried = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        assert!(
+            retried.starts_with("Indexed "),
+            "the observed retry must complete: {retried}"
+        );
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+        let (map_b, receipt_b) =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let input = serde_json::from_value(serde_json::json!({"detail": "full"}))
+                    .expect("map input");
+                let map = server.get_repo_map(Parameters(input)).await;
+                let receipt = crate::protocol::result_status::current_project_evidence();
+                (map, receipt)
+            })
+            .await;
+        assert!(
+            map_b.contains("new.rs") && !map_b.contains("old.rs"),
+            "after the observed re-sync the activation governs unqualified reads: {map_b}"
+        );
+        let receipt_b = receipt_b.expect("the re-synced read must carry a daemon receipt");
+        assert_eq!(
+            receipt_b.project_id, project_b_id,
+            "body and receipt must agree on the re-synced ACTIVE"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
     #[tokio::test]
     async fn test_tool_receipt_carries_project_evidence() {
         let _env_lock = env_lock().await;
