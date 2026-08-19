@@ -349,6 +349,14 @@ with exactly these codes, verified against the live run at each commit:
   planned — the original note expected the inventory mismatch only at D1's
   `index: SharedIndex` field removals, which will add their own rows).
 
+C5-prep amendment (2026-08-19): hoisting the binary's dispatcher into
+`src/cli/entry.rs` moved two callbacks-census constructs out of their
+frozen `src/main.rs` anchors, adding their mechanical shadow pairs
+(`spawn_periodic_checkpoint`, `run_local_mcp_server_async::
+background_verify spawn`) — ten enumerated lines during the C5 window,
+all retired when the flip switches the validator to its postactivation
+branch.
+
 Any failure code outside this enumeration in that window is a real defect.
 Observed at C2b (2026-08-19): exactly the four lines the enumeration
 predicts — closure mismatch (writers, callbacks), inventory mismatch +

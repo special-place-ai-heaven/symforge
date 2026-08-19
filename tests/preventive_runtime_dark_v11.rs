@@ -430,11 +430,13 @@ const INGRESS_LANES: &[(&str, &str)] = &[
 /// "After activation, the executed Slice 4 reachability cases replace the
 /// preactivation census."
 const WIRED_PRODUCTION_FILES: &[&str] = &[
+    // C5 prep: the stdio bootstrap edges moved from `src/main.rs` into the
+    // hoisted dispatcher `src/cli/entry.rs`; the shim main.rs holds none.
+    "src/cli/entry.rs",
     "src/daemon.rs",
     "src/gitignore_hygiene.rs",
     "src/live_index/persist.rs",
     "src/live_index/single_file.rs",
-    "src/main.rs",
     "src/protocol/edit.rs",
     "src/protocol/edit_tools.rs",
     "src/protocol/knowledge_curation.rs",
@@ -920,9 +922,9 @@ const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "4f9222e6c2fceed81a34af8e1037a559bb638fc9364d5d00026a54bd6c497c8d",
-    194,
-    9_240_108,
+    "0a29130785f04cd5630a9b7c046e1d9369cd27b31352ce41bf7c4092d300d8d3",
+    195,
+    9_241_006,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

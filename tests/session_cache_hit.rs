@@ -29,7 +29,7 @@ fn ccr_hash(body: &str) -> Option<&str> {
 #[tokio::test]
 async fn get_symbol_repeat_returns_cache_hit() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
@@ -54,7 +54,7 @@ async fn get_symbol_repeat_returns_cache_hit() {
     let forced = server
         .dispatch_tool_for_tests(
             "get_symbol",
-            json!({ "path": "src/main.rs", "name": "main", "force_refresh": true }),
+            json!({ "path": "src/cli/entry.rs", "name": "run_main", "force_refresh": true }),
         )
         .await;
     assert!(
@@ -67,7 +67,7 @@ async fn get_symbol_repeat_returns_cache_hit() {
 #[tokio::test]
 async fn get_symbol_cache_hit_is_redeemable_via_retrieve() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
@@ -107,7 +107,7 @@ async fn get_symbol_cache_hit_is_redeemable_via_retrieve() {
 #[tokio::test]
 async fn shared_session_cache_hit_is_redeemable_issue_574() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
@@ -129,7 +129,7 @@ async fn shared_session_cache_hit_is_redeemable_issue_574() {
 #[tokio::test]
 async fn evicted_ccr_blob_turns_cache_hit_into_miss() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
