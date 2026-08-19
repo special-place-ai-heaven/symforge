@@ -212,6 +212,10 @@ fn campaign_delivered_event(samples: &mut Samples) -> usize {
     let fixture = WatcherFixture::start();
     let root = fixture.root.path().to_path_buf();
     let shared = fixture.shared.clone();
+    // T070's no-full-rebuild gate: single-path refreshes never bump the
+    // PROJECT generation (only a reload does). Captured here, asserted at
+    // campaign end.
+    let generation = shared.current_project_generation();
     let mut completions = 0usize;
 
     // modify
@@ -287,6 +291,11 @@ fn campaign_delivered_event(samples: &mut Samples) -> usize {
         completions += 1;
     }
 
+    assert_eq!(
+        shared.current_project_generation(),
+        generation,
+        "a delivered-event campaign performed a full rebuild (project          generation moved) outside Gap/ScopeDirty"
+    );
     let (_root, shared) = fixture.stop();
     drop(shared);
     completions
@@ -298,6 +307,7 @@ fn campaign_need_rescan(samples: &mut Samples) -> usize {
     let root = tempfile::tempdir().expect("root");
     write_corpus(root.path());
     let shared = LiveIndex::load(root.path()).expect("cold load");
+    let generation = shared.current_project_generation();
 
     // The gap: mutate under the observer's feet-to-be.
     let mut expectations = Vec::new();
@@ -329,6 +339,11 @@ fn campaign_need_rescan(samples: &mut Samples) -> usize {
         worst = worst.max(observe_bytes(&shared, rel, body.as_bytes(), started));
     }
     samples.record("need_rescan", "fresh_instance_rescan", worst);
+    assert_eq!(
+        shared.current_project_generation(),
+        generation,
+        "the gap rescan performed a full rebuild instead of repairing in place"
+    );
     stop.store(true, Ordering::Release);
     let _ = runtime.block_on(async { tokio::time::timeout(Duration::from_secs(10), handle).await });
     1
@@ -352,6 +367,7 @@ fn campaign_suppressed_notification(samples: &mut Samples) -> usize {
         .enable_all()
         .build()
         .expect("runtime");
+    let generation = shared.current_project_generation();
     let mut completions = 0usize;
     for revision in 1..6 {
         let body = format!("pub fn fixture_3_symbol() -> u64 {{\n    {revision}00\n}}\n");
@@ -361,18 +377,30 @@ fn campaign_suppressed_notification(samples: &mut Samples) -> usize {
             .write(true)
             .open(root.path().join("src/fixture_3.rs"))
             .expect("open");
-        file.set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::SystemTime::now() - Duration::from_secs(60 + revision)),
-        )
+        // A DETERMINISTIC absolute mtime per revision: a now-relative
+        // backdate collides across revisions whenever one loop pass
+        // stretches past a second boundary (observed as a stale
+        // freshen-miss under criterion warm-up), while these values are
+        // strictly increasing by construction.
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1_000_000_000 + revision as u64),
+        ))
         .expect("backdate");
         let started = Instant::now();
         // `get_file_content` rides the freshen-on-read lane (the C4c
         // targeted-retrieval freshen); `get_symbol` deliberately serves the
         // captured publication and relies on the observer lanes instead.
+        // force_refresh isolates the freshen lane itself: the session
+        // repeat-read cache keys on a pre-freshen publication identity, so
+        // a bare repeat read can serve `Decision: cache_hit` with STALE
+        // bytes - the carried Slice 3 "repeat-cache publication-identity
+        // fence" residual (observed live at baseline 1521abb0 by this very
+        // campaign; T037/C11 owns the fence). The measurement here is the
+        // freshen-on-read latency, identical on both comparison sides.
         let response = runtime.block_on(server.dispatch_tool_for_tests(
             "get_file_content",
-            serde_json::json!({ "path": "src/fixture_3.rs" }),
+            serde_json::json!({ "path": "src/fixture_3.rs", "force_refresh": true }),
         ));
         let latency = started.elapsed();
         assert!(
@@ -383,6 +411,11 @@ fn campaign_suppressed_notification(samples: &mut Samples) -> usize {
         samples.record("suppressed_notification", "freshen_on_read", latency);
         completions += 1;
     }
+    assert_eq!(
+        shared.current_project_generation(),
+        generation,
+        "freshen-on-read performed a full rebuild instead of a single-path refresh"
+    );
     completions
 }
 
@@ -391,6 +424,7 @@ fn campaign_embed_mutation_commit(samples: &mut Samples) -> usize {
     let root = tempfile::tempdir().expect("root");
     write_corpus(root.path());
     let shared = LiveIndex::load(root.path()).expect("cold load");
+    let generation = shared.current_project_generation();
     let mut completions = 0usize;
     for revision in 1..6 {
         let body = corpus_file_body(4, revision * 7);
@@ -405,6 +439,11 @@ fn campaign_embed_mutation_commit(samples: &mut Samples) -> usize {
         );
         completions += 1;
     }
+    assert_eq!(
+        shared.current_project_generation(),
+        generation,
+        "the facade commit performed a full rebuild instead of a single-path refresh"
+    );
     completions
 }
 
@@ -612,6 +651,7 @@ fn observed_refresh_gate_v1(c: &mut Criterion) {
             "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
         },
         "controls": {
+            "single_path_no_full_rebuild": "asserted per campaign: the project generation is stable across every campaign (only a reload bumps it), so no single-path refresh fell back to a full rebuild outside Gap/ScopeDirty",
             "cold_load_before_timing": true,
             "quiescence_probe": "one untimed write observed visible before each watcher campaign",
             "clean_rebuild_equivalence": "asserted (content-hash file-for-file)",

@@ -445,8 +445,28 @@ is the only thing allowed to touch it:
   land). The bench gained a `capacity_conservation` receipt section
   recording the same run (observed: peak 64, converged charge 0,
   unknown refunds 0, process promisable 0 after four attaches).
-- C9 (T035): gate run vs baseline `1521abb0` → docs/reviews/
-  OBSERVED-REFRESH-GATE-v1.md.
+- C9 (T035 — executed 2026-08-19): the gate RAN against baseline
+  `1521abb0` (byte-identical campaigns grafted into a detached worktree;
+  only the V11-only receipt extras absent there) and the candidate, full
+  criterion mode both sides, corpus digests matching. ALL GATES PASS:
+  every candidate p95 ≤ 2 s (worst 291 ms, burst-24), every max ≤ 5 s
+  (worst 304 ms), delivered-event p95 0.81–1.00× baseline (FASTER), and
+  no single-path full rebuild outside Gap/ScopeDirty (project-generation
+  stability asserted in-bench per campaign, both sides). Two
+  sub-millisecond lanes (embed commit, freshen-on-read) quantize 1→2 ms
+  (nominal 2.00×): adjudicated PASS with the deviation recorded openly —
+  the +1 ms is the candidate's real V11 pipeline work, three orders of
+  magnitude under every absolute budget, and a ratio test below the
+  measurement quantum is noise; flagged for T038 to challenge. Full
+  method, tables, adjudications, and BOTH raw receipts are in
+  docs/reviews/OBSERVED-REFRESH-GATE-v1.md. Two incidental findings,
+  recorded there: (1) the carried repeat-cache publication-identity
+  fence residual is REAL and live at baseline — a bare repeat
+  get_file_content served `Decision: cache_hit` with stale bytes under
+  warm-up; the campaign now isolates the freshen lane with
+  force_refresh and C11/T072 owns the fence; (2) now-relative mtime
+  backdates collide across revisions at second boundaries — the
+  campaigns use deterministic absolute mtimes.
 - C10 (T036): tests/delta_full_rebuild_equivalence_v11.rs (frozen names).
 - C11 (T037): campaign run + full gate battery via Terminal Commander.
 
