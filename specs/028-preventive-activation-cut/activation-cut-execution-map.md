@@ -603,10 +603,20 @@ is the only thing allowed to touch it:
     repair; EXCLUDED pin unchanged, as predicted for edits outside the
     13 sealed sources); embed cell exactly 1336; full serial suite +
     bench smoke + validator recorded at commit.
-- C11c (T037 remainder): the campaign run through
-  `all_ingress_uses_exact_typed_authority_branch`, the evidence doc
-  (`docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md`), and
-  the full gate battery via Terminal Commander.
+- C11c (T037 campaign close — executed 2026-08-20): the campaign oracle
+  `all_ingress_uses_exact_typed_authority_branch` run `--exact` at
+  `dce1cddc` (1 passed, exit 0 — TEST-SURFACE partition closure over the
+  116 slots), and the evidence document opened at
+  `docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md`: commit
+  lineage C1–C11b, the battery observed at `dce1cddc`, the five carried
+  residual-family dispositions, the adjudications on T038's roster
+  (sub-ms 2.00× bench lanes, retarget-in-place admission identity, serve
+  path without RootBinding, `project_source_authority` static, replay
+  control-state scope boundary, D16 non-claim, embed-facade no-op
+  contract), and the what-green-does-not-prove carryover. The full gate
+  battery for these code bytes is the C11b battery — C11c changes docs
+  and the task checkbox only; fmt/validator re-observed at commit. T037
+  checked; T038's review rounds append to (and close) the evidence doc.
 
 Gate battery after every commit-group, serial via TC; fmt BEFORE pin
 refresh; embed feature gate before every push.
