@@ -469,7 +469,41 @@ is the only thing allowed to touch it:
   (fresh-change miss + unchanged-repeat hit + re-arm, get_file_content
   and get_file_context); the broader residual sweep stays on C11/T072;
   (2) the campaigns use deterministic absolute mtimes.
-- C10 (T036): tests/delta_full_rebuild_equivalence_v11.rs (frozen names).
+- C10 (T036 — executed 2026-08-19): `tests/delta_full_rebuild_equivalence_v11.rs`
+  landed with the two frozen names, arming TEST-DELTA
+  (ORACLE-MIGRATION-DELTA-EQUIVALENCE) and TEST-KNOWLEDGE
+  (ORACLE-KNOWLEDGE-CURRENT-PROJECTION); validator OK. After every
+  advertised edit class (add, modify, rename, terminal 4 MiB demotion,
+  delete) applied through observed refresh, a clean `LiveIndex::load`
+  from the same on-disk bytes agrees on all five canonical projections —
+  code, manifest (digest included), knowledge bridge, authority, and
+  representative query results — with instance-bound counters
+  (generations, per-anchor SourceIdentity, document timelines, usage
+  telemetry) projected out by declared exclusion listed in the file
+  header. The nine frozen file classes
+  (code/prose/policy/manifest/orientation/curation/encoding/sparse/path)
+  are the versioned in-file corpus; the policy class is the real
+  `.symforge-knowledge.toml` ledger. The delta oracle passed on its
+  FIRST run — no divergence exists between the two build paths, and the
+  manifest digest plus digest-keyed finding index proved deterministic
+  across instances. One authored-assertion RED observed and fixed in the
+  TEST, not production: the malformed-policy typed finding was asserted
+  by literal rule name, but `stable_finding_id` digests anchor+rule, so
+  the honest observables are the policy-ledger review signal on the
+  records plus a non-empty finding index (both now asserted alongside
+  `PolicyLedgerStatus::Malformed`/`Absent`). Negative controls in-test:
+  omitted projection rows fail equivalence (both oracles); renamed and
+  deleted identities are unreachable through files, search, and
+  knowledge anchors (no raw cache, no second authority); discovery
+  tools create no frecency while a commitment read does (driven through
+  real tool dispatch on a dedicated root); a stale prepared bridge is
+  refused by the publication fence with a fresh-prepare positive
+  control; a bounded rebuild reports typed truncation and fails
+  equivalence; a foreign root's cards carry a distinct source identity;
+  and knowledge-scope queries (all four source scopes + review summary)
+  answer deterministically. Battery: fmt clean, validator OK, dark
+  suite 9/9, clippy `-D warnings` observed checking the new target
+  (forced re-check after a cache-instant first pass), embed cell 1336.
 - C11 (T037): campaign run + full gate battery via Terminal Commander.
 
 Gate battery after every commit-group, serial via TC; fmt BEFORE pin
