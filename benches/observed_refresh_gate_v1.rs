@@ -536,6 +536,49 @@ fn observed_refresh_gate_v1(c: &mut Criterion) {
 
     clean_rebuild_equivalence();
 
+    // ── Capacity conservation measurements (T069/C8) ─────────────────────
+    // The same identity the frozen oracle asserts, recorded as receipt data:
+    // all four surfaces attach (exhausting the process vector exactly), and
+    // a 64-source observation burst is sampled for its retained+candidate
+    // peak, convergence, and unknown-refund count.
+    let capacity_conservation = {
+        use symforge::live_index::index_lifecycle::activation::{
+            activate_surface, process_index_runtime, project_source_authority,
+        };
+        use symforge::live_index::index_lifecycle::process_runtime::SurfaceKind;
+
+        for surface in SurfaceKind::ALL {
+            activate_surface(surface);
+        }
+        let runtime = process_index_runtime();
+        let root = tempfile::tempdir().expect("capacity root");
+        let lane = project_source_authority(root.path());
+        let observer = lane.register_observer();
+        let (_, pregranted, _, _) = lane.observation_capacity_ledger();
+        let mut peak = 0u64;
+        for index in 0..64 {
+            lane.observe_admission(observer, &format!("src/burst_{index}.rs"))
+                .expect("current incarnation");
+            let (candidate, _, _, _) = lane.observation_capacity_ledger();
+            let (_, retained) = lane.retained_observation_artifacts();
+            peak = peak.max(candidate + retained);
+        }
+        let (converged_charge, _, outstanding, unknown) = lane.observation_capacity_ledger();
+        let (retained_sources, retained_bytes) = lane.retained_observation_artifacts();
+        serde_json::json!({
+            "surfaces_attached": runtime.attached().len(),
+            "process_promisable_after_attach": runtime.available(),
+            "lane_pregranted_bytes": pregranted,
+            "burst_sources": 64,
+            "retained_plus_candidate_peak": peak,
+            "converged_candidate_charge": converged_charge,
+            "outstanding_charges": outstanding,
+            "unknown_refunds": unknown,
+            "retained_sources": retained_sources,
+            "retained_dark_bytes": retained_bytes,
+        })
+    };
+
     // ── The code-owned receipt ────────────────────────────────────────────
     let samples = samples.into_inner().expect("samples");
     let quantiles: Vec<serde_json::Value> = samples
@@ -577,6 +620,7 @@ fn observed_refresh_gate_v1(c: &mut Criterion) {
             "pre_granted_per_surface_bytes": symforge::live_index::index_lifecycle::activation::OBSERVATION_CAPACITY_BYTES,
             "note": "dark budgets until C7/C8 measurements replace them",
         },
+        "capacity_conservation": capacity_conservation,
         "latencies": quantiles,
         "campaign_completions": completions,
     });

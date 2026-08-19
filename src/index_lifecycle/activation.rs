@@ -527,6 +527,32 @@ impl ProjectSourceAuthority {
             .observe(observation_source_id(relative), || stamp);
     }
 
+    /// Measurement probe (C8, T069): the observation lane's capacity ledger
+    /// as `(charged now, pre-granted, outstanding charges, unknown refunds)`.
+    /// Reads the pool's own counters — the probe reports the ledger, never a
+    /// cached belief.
+    pub fn observation_capacity_ledger(&self) -> (u64, u64, usize, u64) {
+        let lane = self.lane.lock().expect("observation lane lock");
+        (
+            lane.pool.charged(lane.owner),
+            OBSERVATION_CAPACITY_BYTES,
+            lane.pool.outstanding_charges(lane.owner),
+            lane.pool.unknown_refunds(),
+        )
+    }
+
+    /// Measurement probe (C8, T069): retained observation artifacts as
+    /// `(sources, dark retained bytes)`. The dark payload weight is the same
+    /// one the candidate pipeline reserves with (one byte per observed
+    /// source), so `retained + candidate <= pregranted` is measured in the
+    /// pipeline's own units; the sealed artifact machinery replaces the
+    /// weight with real bytes when it lands.
+    pub fn retained_observation_artifacts(&self) -> (usize, u64) {
+        let lane = self.lane.lock().expect("observation lane lock");
+        let publication = lane.artifact_root.load();
+        (publication.sources.len(), publication.sources.len() as u64)
+    }
+
     /// Wiring-oracle probe: how many observation candidates for `relative`
     /// have reached the single commit point.
     pub fn committed_observations(&self, relative: &str) -> u64 {

@@ -425,8 +425,26 @@ is the only thing allowed to touch it:
   doctest-lane guard re-judged all four new workflow lines
   (target-selection flags suppress the doctest lane; cargo bench never
   builds doctests) with fingerprints and line counts refreshed.
-- C8 (T034): capacity conservation oracle
-  `whole_runtime_capacity_is_conserved_under_activation` + bench additions.
+- C8 (T034 — executed 2026-08-19): the frozen
+  `whole_runtime_capacity_is_conserved_under_activation` stand-in (armed
+  RED since Slice 2) has its observing body, measuring
+  `retained + candidate <= pregranted (+ zero dark scratch/headroom)` in
+  the pipeline's own units: (1) the pre-granted vector exhausts the
+  process root EXACTLY — four surfaces attach, `available() == 0`,
+  every surface uncharged; (2) retained-plus-candidate peak sampled
+  after every admission of a 64-source burst on a live lane; burst
+  convergence (candidates all refunded, zero outstanding, zero unknown
+  refunds, retention exactly the burst's sources); no-unaccounted-
+  residency (the identical burst repeated grows nothing and leaves no
+  residue); (3) fairness — two lanes burst concurrently from separate
+  pre-grants, both make full committed progress and converge
+  charge-free. Two measurement probes added on the authority
+  (`observation_capacity_ledger`, `retained_observation_artifacts` —
+  the dark retained weight is the same one byte/source the candidate
+  pipeline reserves with; sealed artifact bytes replace it when they
+  land). The bench gained a `capacity_conservation` receipt section
+  recording the same run (observed: peak 64, converged charge 0,
+  unknown refunds 0, process promisable 0 after four attaches).
 - C9 (T035): gate run vs baseline `1521abb0` → docs/reviews/
   OBSERVED-REFRESH-GATE-v1.md.
 - C10 (T036): tests/delta_full_rebuild_equivalence_v11.rs (frozen names).
