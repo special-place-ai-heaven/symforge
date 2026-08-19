@@ -1,65 +1,33 @@
-//! `symforge::embed` — the engine-only facade for library embedders (e.g. AAP).
+//! `symforge::embed` — the V11 embedded-source facade (Feature 020 Slice 4,
+//! C5: the exposure flip).
 //!
-//! This namespace re-exports the parsing + live-index + query + git engine
-//! WITHOUT the daemon / sidecar / protocol-server / CLI surface. Depend on it
-//! with:
+//! Depend on it with:
 //!
 //! ```toml
 //! symforge = { version = "*", default-features = false, features = ["embed"] }
 //! ```
 //!
-//! Because the `server` feature is off, none of the server modules (and none of
-//! their heavy/unsafe deps: axum, rmcp, clap, reqwest, process signaling) are
-//! compiled, so server-side breakage cannot reach an embedding consumer.
+//! This namespace exposes EXACTLY the frozen contract's V11 embed atoms
+//! (`specs/020-repository-knowledge-index/contracts/public-api-v11.json`,
+//! `migration_v10.introduced_v11_atoms`) plus the kept engine identity
+//! (`EngineInfo`/`engine_info`). The V10 raw surface this file used to
+//! re-export — live-index state, authorityless search, raw per-file
+//! mutation, snapshot loaders, parser/domain types, `GitRepo`, the STEL
+//! ledger, and the deep module re-exports — is RETIRED per the frozen
+//! category dispositions: an embedder now opens ONE
+//! [`EmbeddedSourceHandle`] through [`ProcessIndexRuntime`] and works with
+//! typed claims, receipts, and refusals instead of raw engine internals.
 //!
-//! SEMVER-PUBLIC: the flat re-exports below are an interface contract between
-//! the SymForge engine and its embedders. A breaking change to any name or
-//! signature here is a MAJOR bump. The `#[cfg(test)]` `contract` module at the
-//! bottom of this file names every contracted item (types via `use`, functions
-//! via full-signature fn-pointer bindings) so a rename, removal, or
-//! signature-drift becomes a COMPILE FAILURE in SymForge's own embed test
-//! suite rather than a downstream AAP surprise.
-//!
-//! UNSTABLE OPT-IN: the base+overlay multi-project primitive in
-//! `live_index::view::*` (reachable via the deep-path re-export below, e.g.
-//! `symforge::embed::live_index::view::WorkingSet`) is **opt-in and unstable**
-//! and is intentionally **NOT** part of the frozen contract above. Its
-//! overlay-invalidation internals may churn at MINOR; it is deliberately absent
-//! from the `contract` test (research D3 / SC-011). Do not add `view::*` types
-//! to the flat facade or the contract test.
+//! SEMVER-PUBLIC: this facade is the interface contract between the
+//! SymForge engine and its embedders. This activation cut is the
+//! contract's one planned MAJOR break (the V10→V11 migration the Feature
+//! 020 campaign froze); from here, any breaking change to a name or
+//! signature below is a MAJOR bump. The `#[cfg(test)]` `contract` module
+//! at the bottom names every contracted item so a rename, removal, or
+//! signature drift becomes a COMPILE FAILURE in SymForge's own embed test
+//! suite rather than a downstream surprise.
 
-// ---------------------------------------------------------------------------
-// Flat, semver-public facade. Re-exports ITEMS (types + free functions).
-// ---------------------------------------------------------------------------
-pub use crate::domain::{
-    FileClassification, FileProcessingResult, LanguageId, ReferenceKind, SymbolKind, SymbolRecord,
-};
-pub use crate::git::GitRepo;
-pub use crate::live_index::LiveIndex;
-pub use crate::live_index::query::{SearchFilesTier, SearchFilesView};
-pub use crate::live_index::search::{
-    SymbolSearchResult, TextSearchError, TextSearchResult, search_symbols, search_text,
-};
-pub use crate::live_index::single_file::{ReindexResult, remove_file, update_file_from_disk};
-
-// ---------------------------------------------------------------------------
-// Engine identity + runtime guarantees (task #25 / AAP asks 4-6).
-//
-// NO IMPLICIT BACKGROUND MACHINERY: constructing or loading an index under
-// the embed feature spawns no watchers, timers, or async runtimes — the file
-// watcher is server-only and caller-started, never by `LiveIndex::load`. The
-// one lazily created resource is the rayon indexing pool (persistent COMPUTE
-// workers, first parse), cappable via `SYMFORGE_INDEXING_THREADS` for
-// tight-RAM PID-1 embedders.
-//
-// SEARCH BOUNDS: `search_symbols`/`search_text` results are bounded by their
-// limit parameters; the scan itself is bounded by the in-memory candidate set
-// (trigram-prefiltered for literal text queries) with a worst case linear in
-// indexed files — measured p95 well under 1 ms on a ~900-file repo. There is
-// no in-engine cancellation token today; an embedder enforcing `timeout_ms`
-// should wrap the call (a budget parameter is a compatible future addition
-// and will land here if a real workload needs it).
-// ---------------------------------------------------------------------------
+// ── The kept engine identity (migration category v10-03, decision: keep) ──
 
 /// Engine identity for embedder readiness evidence: one call, no I/O.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,271 +61,95 @@ pub fn engine_info() -> EngineInfo {
         grammars: &GRAMMAR_NAMES,
     }
 }
-pub use crate::live_index::store::{
-    IndexLoadSource, IndexedFile, ParseStatus, PublishedIndexState, PublishedIndexStatus,
-    SharedIndex, SnapshotVerifyState,
-};
-pub use crate::parsing::process_file;
 
-// ---------------------------------------------------------------------------
-// Per-file incremental update (task #24 / AAP ask 3): `update_file_from_disk`
-// re-indexes ONE file through the SAME admission seam the watcher and bulk
-// load use (scope exclusions, metadata-first scout, secret-content demotion,
-// hash-gated parse, generation-fenced publication); `remove_file` is the
-// fenced removal. An embedder's per-file reindex needs no parsing or store
-// internals — and cannot accidentally bypass admission.
-// ---------------------------------------------------------------------------
+// ── The introduced V11 atoms (migration_v10.introduced_v11_atoms) ──
+//
+// Contract shapes live in the boundary module
+// (`index_lifecycle/public_api.rs`) and on the seam-pinned handle
+// (`index_lifecycle/embedded.rs`); the wrap table
+// (`public_api::V11PublicApi::wrap_table`) records how each atom is
+// satisfied — a contract-shaped wrapper (`wrapped-here`) or a
+// contract-verbatim enum made nameable by re-export
+// (`verbatim-reexport`). Nothing pre-existing leaks: the internal names
+// are aliased to the contract names HERE, and this facade is their only
+// public door.
 
-// ---------------------------------------------------------------------------
-// In-memory construction (F7): `LiveIndex::from_indexed_files(root, files)` is
-// the route for an embedder whose `IndexedFile`s came from `process_file` +
-// `IndexedFile::from_parse_result` rather than from this process's filesystem
-// walk. It yields a Ready, source-BOUND index.
-//
-// `LiveIndex::empty()` + `add_file` is NOT that route and never was: the
-// resulting index has no `indexed_root`, so it never reports Ready and it
-// publishes knowledge unbound (`source=unknown`). Use `empty()` only as a
-// placeholder you will later `reload(root)`.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Snapshot restore (task #22 / AAP ask 2a): the warm-start fast path.
-//
-// `load_snapshot_for_root` (or the explicit-placement `load_snapshot`)
-// rehydrates a persisted `.symforge/index.bin` WITHOUT re-parsing; the loader
-// fails soft — `None` on a missing/corrupt/version-mismatched/foreign
-// snapshot, never a panic — so the embedder's fallback is always a cold
-// `LiveIndex::load`. `snapshot_compatible` is the readiness probe.
-//
-// Cross-root restore (task #23): a raw snapshot stays bound to the canonical
-// absolute root it was written from (anti-foreign-state identity check), but
-// `import_portable_snapshot` is the sanctioned EXPLICIT opt-in for a
-// host-baked `index.bin.zst` artifact restored at a different root - every
-// content-derived check (integrity digests, git tip/history fingerprint
-// against the restoring workspace) stays enforced; only the path-derived
-// identities are rebound, and a second in-process attempt is refused
-// (restore-once). Bake the artifact host-side with
-// `live_index::persist::export_artifact` (deep path).
-// ---------------------------------------------------------------------------
-pub use crate::domain::StatePlacement;
-pub use crate::live_index::persist::{
-    IndexSnapshot, PortableSnapshotProvenance, import_portable_snapshot, load_snapshot,
-    load_snapshot_for_root, project_local_state_placement, snapshot_compatible,
-    snapshot_to_live_index,
+pub use crate::index_lifecycle::embedded::SourceCloseReceipt;
+pub use crate::index_lifecycle::embedded::{EmbeddedSourceHandle, ReceiptWaitError};
+pub use crate::index_lifecycle::public_api::{
+    EmbedAtomicAuthority as AtomicAuthority, EmbedClaim as Claim,
+    EmbedClaimProvenance as ClaimProvenance, EmbedEvaluationProvenance as EvaluationProvenance,
+    EmbedOperationReceipt as OperationReceipt, EmbedRefreshTicket as RefreshTicket,
+    EmbedShutdownReceipt as ShutdownReceipt, EmbedSourceRefusal as SourceRefusal,
+    EmbeddedSourceSpec, OperationKind, ProcessRuntimeApi as ProcessIndexRuntime, RetryAdvice,
+    ShutdownReport, SourceCloseReport, SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView,
+    SymbolMatch, SymbolSearchRequest, SymbolSearchResult, TextMatch, TextSearchRequest,
+    TextSearchResult,
 };
-
-// ---------------------------------------------------------------------------
-// STEL durable economics ledger + calibration (FR-001 embed durability).
-//
-// D3-ROOT extract-up: the durable per-project ledger store and the calibration
-// math are protocol-free (`crate::stel_core`, gated `any(server, embed)`), so an
-// embedder can now OPEN the durable store, RECORD economics events, READ them
-// back, and summarize calibration — WITHOUT the server/transport stack. These
-// re-exports are SEMVER-PUBLIC (see the file header) and are pinned by the
-// `contract` module below.
-//
-// Open + use:  `StelLedgerStore::open(project_root, session_id)` →
-// `.record(&event)` (degrade-silently, never panics) → `.recent(limit)` /
-// `.summary()`. Build an event from the POD enums (`IntentBucket` /
-// `AdmissionDecision` / `RouteConfidence`).
-// ---------------------------------------------------------------------------
-pub use crate::stel_core::calibration::{
-    CalibrationVerdict, StelCalibrationSummary, format_calibration_section, summarize_calibration,
-};
-pub use crate::stel_core::ledger_store::{
-    LedgerStoreStatus, LedgerSubsystemState, LedgerSummary, StelLedgerStore, StoredLedgerRecord,
-};
-pub use crate::stel_core::types::{
-    AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent,
-};
-
-// ---------------------------------------------------------------------------
-// Back-compat MODULE re-exports. AAP currently imports via deep module paths
-// (e.g. `symforge::embed::parsing::process_file`). These re-export the MODULES
-// `domain / git / live_index / parsing` — distinct names from every flat item
-// above, so there is NO E0252 "defined multiple times" collision: the flat
-// block exports `process_file` / `GitRepo` / `LiveIndex` (item names) while
-// this line exports `parsing` / `git` / `live_index` / `domain` (module names).
-// ---------------------------------------------------------------------------
-pub use crate::{domain, git, live_index, parsing};
 
 #[cfg(test)]
 mod contract {
-    //! Compile-time tripwire for the semver-public embedder facade.
+    //! Compile-time tripwire for the semver-public V11 embedder facade.
     //!
-    //! WHY THIS EXISTS: `symforge::embed` is a public, semver-stable interface
-    //! contract between the SymForge engine and its embedders (AAP). This test
-    //! module NAMES every contracted item so that:
-    //!   * a removed or renamed item -> the `use` / path fails to compile,
-    //!   * a changed function/method signature -> the `fn`-pointer binding
-    //!     fails to compile (type mismatch).
-    //!
-    //! A breaking change to the contract therefore trips SymForge's own embed
-    //! test suite at compile time, not a downstream consumer at integration
-    //! time. The bindings are checked by the compiler; the body need not run.
-    //!
-    //! `#[allow(unused_imports)]` is intentional: these imports exist ONLY to
-    //! name the contracted types, not to be used. Under `warnings = "deny"`
-    //! an unused-import warning would otherwise fail the build.
+    //! Names every contracted atom so a removed or renamed item fails the
+    //! `use`, and pins the runtime/handle entry points with bindings so a
+    //! signature drift fails to type-check. The deep behavioral pins live
+    //! in the activation-cut oracles (`tests/activation_cut_v11.rs`).
     #[allow(unused_imports)]
     use crate::embed::{
-        FileClassification, FileProcessingResult, GitRepo, IndexLoadSource, IndexedFile,
-        LanguageId, LiveIndex, ParseStatus, PublishedIndexState, PublishedIndexStatus,
-        ReferenceKind, SearchFilesTier, SearchFilesView, SharedIndex, SnapshotVerifyState,
-        SymbolKind, SymbolRecord, SymbolSearchResult, TextSearchError, TextSearchResult,
+        AtomicAuthority, Claim, ClaimProvenance, EmbeddedSourceHandle, EmbeddedSourceSpec,
+        EngineInfo, EvaluationProvenance, OperationKind, OperationReceipt, ProcessIndexRuntime,
+        ReceiptWaitError, RefreshTicket, RetryAdvice, ShutdownReceipt, ShutdownReport,
+        SourceCloseReceipt, SourceCloseReport, SourceRefusal, SourceRefusalKind,
+        SourceRuntimePhase, SourceRuntimeView, SymbolMatch, SymbolSearchRequest,
+        SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult, engine_info,
     };
 
-    // D3-ROOT extract-up: the STEL durable-ledger + calibration embed surface is
-    // a NEW semver-public contract (the embed public surface WIDENS). Name every
-    // contracted item so a rename/removal/signature-drift trips compilation here.
-    #[allow(unused_imports)]
-    use crate::embed::{
-        AdmissionDecision, CalibrationVerdict, IntentBucket, LedgerStoreStatus,
-        LedgerSubsystemState, LedgerSummary, RouteConfidence, StelCalibrationSummary,
-        StelLedgerEvent, StelLedgerStore, StoredLedgerRecord,
-    };
-
-    // Task #22: the snapshot-restore fast path is semver-public. Name every
-    // contracted item so rename/removal/signature-drift trips compilation.
-    #[allow(unused_imports)]
-    use crate::embed::{
-        IndexSnapshot, PortableSnapshotProvenance, StatePlacement, import_portable_snapshot,
-        load_snapshot, load_snapshot_for_root, project_local_state_placement, snapshot_compatible,
-        snapshot_to_live_index,
-    };
-
-    // Task #24: the per-file incremental update seam is semver-public.
-    #[allow(unused_imports)]
-    use crate::embed::{ReindexResult, remove_file, update_file_from_disk};
-
-    // Task #25: engine identity is semver-public.
-    #[allow(unused_imports)]
-    use crate::embed::{EngineInfo, engine_info};
-
-    // Also name the back-compat MODULE re-exports so their removal trips too.
-    #[allow(unused_imports)]
-    use crate::embed::{domain, git, live_index, parsing};
-
-    use std::path::Path;
-
-    /// Naming every contracted item forces removal/rename/signature drift to be
-    /// a compile error. Functions use FULL-signature `fn`-pointer bindings, so a
-    /// changed parameter or return type ALSO breaks compilation (not just a
-    /// rename). No runtime logic — the bindings are the assertion.
     #[test]
     fn facade_contract_is_stable() {
-        // --- Type contract: name each contracted type in type position. ---
-        // (The `use` block above already fails to compile if any is removed or
-        // renamed; these turbofish references additionally pin the names here.)
         fn _assert_named<T>() {}
-        _assert_named::<FileClassification>();
-        _assert_named::<FileProcessingResult>();
-        _assert_named::<LanguageId>();
-        _assert_named::<ReferenceKind>();
-        _assert_named::<SymbolKind>();
-        _assert_named::<SymbolRecord>();
-        _assert_named::<SearchFilesTier>();
-        _assert_named::<SearchFilesView>();
+        _assert_named::<AtomicAuthority>();
+        _assert_named::<Claim<u64>>();
+        _assert_named::<ClaimProvenance>();
+        _assert_named::<EmbeddedSourceHandle>();
+        _assert_named::<EmbeddedSourceSpec>();
+        _assert_named::<EvaluationProvenance>();
+        _assert_named::<OperationKind>();
+        _assert_named::<OperationReceipt>();
+        _assert_named::<ProcessIndexRuntime>();
+        _assert_named::<ReceiptWaitError>();
+        _assert_named::<RefreshTicket>();
+        _assert_named::<RetryAdvice>();
+        _assert_named::<ShutdownReceipt>();
+        _assert_named::<ShutdownReport>();
+        _assert_named::<SourceCloseReceipt>();
+        _assert_named::<SourceCloseReport>();
+        _assert_named::<SourceRefusal>();
+        _assert_named::<SourceRefusalKind>();
+        _assert_named::<SourceRuntimePhase>();
+        _assert_named::<SourceRuntimeView>();
+        _assert_named::<SymbolMatch>();
+        _assert_named::<SymbolSearchRequest>();
         _assert_named::<SymbolSearchResult>();
+        _assert_named::<TextMatch>();
+        _assert_named::<TextSearchRequest>();
         _assert_named::<TextSearchResult>();
-        _assert_named::<TextSearchError>();
-        _assert_named::<IndexLoadSource>();
-        _assert_named::<IndexedFile>();
-        _assert_named::<ParseStatus>();
-        _assert_named::<PublishedIndexState>();
-        _assert_named::<PublishedIndexStatus>();
-        _assert_named::<SharedIndex>();
-        _assert_named::<SnapshotVerifyState>();
-        _assert_named::<LiveIndex>();
-        _assert_named::<GitRepo>();
-        _assert_named::<IndexSnapshot>();
-        _assert_named::<StatePlacement>();
 
-        // --- Function / method contract: FULL-signature fn-pointer bindings. ---
-        // A signature change (param type, arity, or return type) makes these
-        // bindings fail to type-check.
+        // The contract entry points, pinned as bindings so arity or type
+        // drift fails compilation.
+        let _acquire: fn() -> Result<ProcessIndexRuntime, SourceRefusal> =
+            ProcessIndexRuntime::acquire;
+        let _open: fn(
+            &ProcessIndexRuntime,
+            EmbeddedSourceSpec,
+        ) -> Result<EmbeddedSourceHandle, SourceRefusal> =
+            ProcessIndexRuntime::open_embedded_source;
+        let _spec: fn(std::path::PathBuf) -> EmbeddedSourceSpec =
+            EmbeddedSourceSpec::current_worktree;
+        let _engine_info: fn() -> EngineInfo = engine_info;
+        let _ = (_acquire, _open, _spec, _engine_info);
 
-        // Free functions. Referenced via the fully-qualified `crate::embed::`
-        // re-export path so the binding pins the FACADE name (not the engine's
-        // internal path) — removal/rename of the re-export breaks compilation.
-        let _search_symbols: fn(&LiveIndex, &str, Option<&str>, usize) -> SymbolSearchResult =
-            crate::embed::search_symbols;
-        #[allow(clippy::type_complexity)]
-        let _search_text: fn(
-            &LiveIndex,
-            Option<&str>,
-            Option<&[String]>,
-            bool,
-        ) -> Result<TextSearchResult, TextSearchError> = crate::embed::search_text;
-        let _process_file: fn(&str, &[u8], LanguageId) -> FileProcessingResult =
-            crate::embed::process_file;
-
-        // Snapshot restore (task #22) — full-signature bindings.
-        let _load_snapshot: fn(&Path, &StatePlacement) -> Option<IndexSnapshot> =
-            crate::embed::load_snapshot;
-        let _load_snapshot_for_root: fn(&Path) -> Option<IndexSnapshot> =
-            crate::embed::load_snapshot_for_root;
-        let _project_local_state_placement: fn(&Path) -> anyhow::Result<StatePlacement> =
-            crate::embed::project_local_state_placement;
-        let _snapshot_compatible: fn(&Path) -> bool = crate::embed::snapshot_compatible;
-        let _snapshot_to_live_index: fn(IndexSnapshot, &Path) -> LiveIndex =
-            crate::embed::snapshot_to_live_index;
-        let _import_portable_snapshot: fn(
-            &Path,
-            &StatePlacement,
-            PortableSnapshotProvenance,
-        ) -> Option<IndexSnapshot> = crate::embed::import_portable_snapshot;
-        let _update_file_from_disk: fn(&SharedIndex, &Path, &str) -> ReindexResult =
-            crate::embed::update_file_from_disk;
-        let _remove_file: fn(&SharedIndex, &str) -> bool = crate::embed::remove_file;
-        let _engine_info: fn() -> EngineInfo = crate::embed::engine_info;
-
-        // Associated functions (no `&self`).
-        let _load: fn(&Path) -> anyhow::Result<SharedIndex> = LiveIndex::load;
-        let _from_indexed_files: fn(
-            &Path,
-            Vec<(String, IndexedFile)>,
-        ) -> anyhow::Result<SharedIndex> = LiveIndex::from_indexed_files;
-        let _from_parse_result: fn(FileProcessingResult, Vec<u8>) -> IndexedFile =
-            IndexedFile::from_parse_result;
-        let _from_extension: fn(&str) -> Option<LanguageId> = LanguageId::from_extension;
-        let _for_code_path: fn(&str) -> FileClassification = FileClassification::for_code_path;
-
-        // `GitRepo` — the exactly-three methods AAP calls. `open` is an assoc
-        // fn; `file_at_ref` / `changed_paths_between_refs` are `&self` methods
-        // bound as fn-item paths with `&GitRepo` as the explicit receiver type.
-        let _git_open: fn(&Path) -> Result<GitRepo, String> = GitRepo::open;
-        let _git_file_at_ref: fn(&GitRepo, &str, &str) -> Result<Option<String>, String> =
-            GitRepo::file_at_ref;
-        let _git_changed_paths: fn(&GitRepo, &str, &str) -> Result<Vec<String>, String> =
-            GitRepo::changed_paths_between_refs;
-
-        // Silence unused-binding lints without weakening the contract: each
-        // binding's TYPE is the assertion; touching them keeps them live.
-        let _ = (
-            _search_symbols,
-            _search_text,
-            _process_file,
-            _load,
-            _from_indexed_files,
-            _from_parse_result,
-            _from_extension,
-            _for_code_path,
-            _git_open,
-            _git_file_at_ref,
-            _git_changed_paths,
-            _load_snapshot,
-            _load_snapshot_for_root,
-            _project_local_state_placement,
-            _snapshot_compatible,
-            _snapshot_to_live_index,
-            _import_portable_snapshot,
-            _update_file_from_disk,
-            _remove_file,
-            _engine_info,
-        );
-
-        // Task #25: engine identity is real data, not just a signature.
+        // Engine identity is real data, not just a signature.
         let info = crate::embed::engine_info();
         assert!(!info.version.is_empty());
         assert_eq!(
@@ -367,24 +159,5 @@ mod contract {
         );
         assert!(info.grammars.contains(&"rust"));
         assert!(info.snapshot_format_version >= 7);
-
-        // Back-compat module paths still resolve (deep-path imports AAP uses).
-        let _deep_process_file: fn(&str, &[u8], LanguageId) -> FileProcessingResult =
-            parsing::process_file;
-        let _deep_search_symbols: fn(
-            &live_index::LiveIndex,
-            &str,
-            Option<&str>,
-            usize,
-        ) -> live_index::search::SymbolSearchResult = live_index::search::search_symbols;
-        let _deep_git_open: fn(&Path) -> Result<git::GitRepo, String> = git::GitRepo::open;
-        let _deep_for_code_path: fn(&str) -> domain::FileClassification =
-            domain::FileClassification::for_code_path;
-        let _ = (
-            _deep_process_file,
-            _deep_search_symbols,
-            _deep_git_open,
-            _deep_for_code_path,
-        );
     }
 }

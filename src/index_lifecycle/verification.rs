@@ -461,3 +461,9 @@ impl RollingVerifier {
         Ok(())
     }
 }
+
+// ── Frozen seam anchor (C5) ────────────────────────────────────────────────
+
+/// The rolling verification machinery under its frozen seam name: fair,
+/// resumable, deadline-fenced passes over the admitted scope.
+pub type RollingVerification = RollingVerifier;

@@ -1,24 +1,13 @@
-//! Feature 020 V11, T048/D4 (amended by the C2 ruling) — the flip-ready
-//! server API module.
+//! Feature 020 V11, `symforge::server_api` — the public server entry
+//! (C5: the keyword flip executed, the entry wired).
 //!
-//! REAL, not fictional: the contract's four `symforge::server_api` atoms name
-//! this module, and activation is ONE KEYWORD — the `pub(crate)` on the
-//! `lib.rs` declaration becomes `pub` BEHIND THE ALREADY-PRESENT
-//! `cfg(feature = "server")` gate, at which point the census gains exactly
-//! these atoms in server graphs and never in an embed cell: the frozen
-//! contract pins this module's availability as `feature=server` and the
-//! embed-v11 projection EXCLUDES it. D4's earlier "std-only so the embed
-//! build compiles it unused" sentence is amended — std-only stays true, but
-//! the module no longer compiles under embed at all. No `pub use` re-exports
-//! it anywhere, and it holds NO call edge into `index_lifecycle`: wiring
-//! `run` to the dark factory is Slice 4 activation work, not a stand-in's
-//! business.
-
-// Unreachable BY DESIGN until the keyword flip: no consumer may exist before
-// the activation cut, and the crate denies warnings, so the module carries its
-// own allow — scoped here, never crate-wide — with this sentence as the
-// receipt. Slice 4 deletes it when `run` gains its real caller.
-#![allow(dead_code)]
+//! The contract's four atoms name this module: [`run`], [`ServerExit`],
+//! [`ServerBootstrapError`], and the module itself, public behind the
+//! frozen `feature=server` availability gate (the embed-v11 projection
+//! excludes it). `run` dispatches the whole symforge CLI through
+//! `cli::entry::run_main` — the binary is a shim over this door, and the
+//! retired raw module surface is no longer reachable from outside the
+//! crate.
 
 use std::ffi::OsString;
 
@@ -26,28 +15,27 @@ use std::ffi::OsString;
 /// frozen record pins `kind: "struct"` with no public fields and
 /// `has_nonpublic_fields: true`, so external code can neither construct one
 /// nor match it exhaustively — every future refusal cause is non-breaking.
-/// An earlier draft shipped a public enum with an `ActivationPending`
-/// variant, the third T043-class invention caught in this file; corrected
-/// against `public-api-v11.json`.
+///
+/// The cause chain is CAPTURED AS TEXT at construction: the frozen
+/// trait_impls pin all five auto traits on this type, and holding the
+/// dispatch error itself (`anyhow::Error`) would lose `RefUnwindSafe`.
 #[derive(Debug)]
 pub struct ServerBootstrapError {
-    reason: &'static str,
+    reason: String,
 }
 
 impl ServerBootstrapError {
-    /// The stand-in's only cause until the activation cut: the V11 server
-    /// entry is not wired, and this refuses rather than pretending a server
-    /// ran.
-    fn activation_pending() -> Self {
+    /// Wrap a dispatch failure, rendering its full cause chain.
+    fn from_dispatch(error: &anyhow::Error) -> Self {
         Self {
-            reason: "server_api::run is not wired until the V11 activation cut",
+            reason: format!("{error:#}"),
         }
     }
 }
 
 impl std::fmt::Display for ServerBootstrapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.reason)
+        f.write_str(&self.reason)
     }
 }
 
@@ -59,40 +47,42 @@ impl std::error::Error for ServerBootstrapError {}
 /// corrected against `public-api-v11.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerExit {
-    /// The server declined to come up and reported that as its exit.
+    /// The server declined to come up and reported that as its exit (the
+    /// cli-serve contract maps this to process exit code 2).
     RefusedToStart,
     /// Clean successful shutdown.
     Success,
 }
 
-/// The contract entry point, `run(args) -> Result<ServerExit,
-/// ServerBootstrapError>`. A STAND-IN: it refuses with the opaque
-/// activation-pending bootstrap error and consumes nothing — reporting a
-/// server run nothing performed would be the invariant violation this
-/// feature exists to prevent. Slice 4 wires it.
-pub fn run(_args: Vec<OsString>) -> Result<ServerExit, ServerBootstrapError> {
-    Err(ServerBootstrapError::activation_pending())
+/// The contract entry point: run the symforge CLI with `args` (argv[0]
+/// included). Dispatches every subcommand exactly as the binary always
+/// has — daemon, serve, stdio MCP, init/setup/admin/hook/trust/update —
+/// and maps the typed outcome onto the contract shapes. Argument-parse
+/// failures follow CLI convention (clap prints usage and exits).
+pub fn run(args: Vec<OsString>) -> Result<ServerExit, ServerBootstrapError> {
+    match crate::cli::entry::run_main(args) {
+        Ok(crate::cli::entry::MainExit::Success) => Ok(ServerExit::Success),
+        Ok(crate::cli::entry::MainExit::ServeRefusedToStart) => Ok(ServerExit::RefusedToStart),
+        Err(error) => Err(ServerBootstrapError::from_dispatch(&error)),
+    }
 }
 
-// T049: `server_api` is `pub(crate)` until the keyword flip, so NO external
-// crate — the dependent-positive fixture and the integration tests included —
-// can name it. That unreachability is the point, and it means the contract
-// shapes can only be pinned from inside the crate: this test is the
-// server-consumer leg of the AAP migration receipt.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// C5: the wired entry preserves the contract shapes the dark stand-in
+    /// pinned — the two exit variants stay a closed set, the bootstrap
+    /// error keeps all five auto traits, and `run` actually dispatches
+    /// (the `--version` fast path completes and reports success).
     #[test]
-    fn dark_run_refuses_and_the_contract_shapes_hold() {
-        let refusal = run(Vec::new())
-            .expect_err("the stand-in refuses; a server run nothing performed is not reported");
-        let rendered = format!("{refusal}");
-        assert!(
-            rendered.contains("activation cut"),
-            "Display names the cut: {rendered}"
-        );
-        let _as_error: &dyn std::error::Error = &refusal;
+    fn wired_run_dispatches_and_the_contract_shapes_hold() {
+        let exit = run(vec![
+            OsString::from("symforge"),
+            OsString::from("--version"),
+        ])
+        .expect("the --version fast path succeeds");
+        assert_eq!(exit, ServerExit::Success);
 
         // The contract's two exit variants, verbatim from the frozen record;
         // the match keeps the set CLOSED — a third variant fails compilation
@@ -110,6 +100,11 @@ mod tests {
         }
         all_five_auto::<ServerBootstrapError>();
         all_five_auto::<ServerExit>();
+
+        // The error renders its captured cause chain.
+        let refusal = ServerBootstrapError::from_dispatch(&anyhow::anyhow!("boom"));
+        assert!(format!("{refusal}").contains("boom"));
+        let _as_error: &dyn std::error::Error = &refusal;
     }
 
     /// C1 ruling: pin the ITEM KIND, not just the trait surface. The frozen

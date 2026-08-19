@@ -1,8 +1,7 @@
 //! The binary's whole dispatcher, hoisted from `src/main.rs` (Feature 020
-//! Slice 4, C5 prep): the exposure flip retires the raw `symforge::*` module
-//! surface the binary consumed, so the dispatch logic lives in the crate and
-//! the binary shrinks to a shim. `server_api::run` wires to this entry at the
-//! flip; until then the shim calls it through the public `cli` module.
+//! Slice 4, C5 prep): the exposure flip retired the raw `symforge::*`
+//! module surface the binary consumed, so the dispatch logic lives in the
+//! crate and the binary is a shim over `server_api::run`, which wires here.
 
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -16,11 +15,21 @@ use clap::Parser;
 use rmcp::{serve_server, transport};
 use std::ffi::OsString;
 
+/// How a completed dispatch ended, for the `server_api::run` mapping. The
+/// serve refusal is a DISTINCT success-shaped exit (the cli-serve contract
+/// maps it to process exit code 2), not an error: the server declined to
+/// come up and reported that as its outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainExit {
+    /// The dispatched command completed successfully.
+    Success,
+    /// `symforge serve` refused to start (secure-default startup checks).
+    ServeRefusedToStart,
+}
+
 /// Run the symforge CLI with `args` (argv[0] included), exactly as the
-/// binary's `main` always has. Returns the dispatched command's result;
-/// `serve` refuse-to-start still exits the process with code 2 (the
-/// cli-serve contract) inside its own arm.
-pub fn run_main(args: Vec<OsString>) -> anyhow::Result<()> {
+/// binary's `main` always has.
+pub fn run_main(args: Vec<OsString>) -> anyhow::Result<MainExit> {
     // Record this binary's path+version so a stale durable binary can be
     // detected later (see `version_registry`). Best-effort and read-mostly;
     // runs before the `--version` fast path so the npm-installed binary
@@ -28,11 +37,11 @@ pub fn run_main(args: Vec<OsString>) -> anyhow::Result<()> {
     version_registry::record_self_default();
 
     if cli::version::is_version_request(&args) {
-        return cli::version::run_version();
+        return cli::version::run_version().map(|()| MainExit::Success);
     }
 
     let cli = cli::Cli::parse_from(args);
-    match cli.command {
+    let completed = match cli.command {
         Some(cli::Commands::Analytics { command }) => cli::analytics::run_analytics(&command),
         Some(cli::Commands::Init {
             client,
@@ -48,14 +57,15 @@ pub fn run_main(args: Vec<OsString>) -> anyhow::Result<()> {
             }
         }
         Some(cli::Commands::Daemon) => run_daemon(),
-        Some(cli::Commands::Serve(args)) => run_serve(args),
+        Some(cli::Commands::Serve(args)) => return run_serve(args),
         Some(cli::Commands::Setup(args)) => cli::setup::run(args),
         Some(cli::Commands::Admin(args)) => cli::admin::run(args),
         Some(cli::Commands::Hook { subcommand }) => cli::hook::run_hook(subcommand.as_ref()),
         Some(cli::Commands::Trust { subcommand }) => cli::trust::run_trust(&subcommand),
         Some(cli::Commands::Update) => cli::update::run_update(),
         None => run_mcp_server(),
-    }
+    };
+    completed.map(|()| MainExit::Success)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +192,7 @@ fn run_daemon() -> anyhow::Result<()> {
         })
 }
 
-fn run_serve(args: cli::serve::ServeCliArgs) -> anyhow::Result<()> {
+fn run_serve(args: cli::serve::ServeCliArgs) -> anyhow::Result<MainExit> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -192,20 +202,22 @@ fn run_serve(args: cli::serve::ServeCliArgs) -> anyhow::Result<()> {
         // inside `server::serve::run` before any bind; on a permitted config it
         // mounts `/mcp` and runs until shutdown. Map only the tracing-init error
         // to anyhow here; the serve result stays a typed `ServeError` so
-        // refuse-to-start can map to exit code 2 below.
+        // refuse-to-start can map to exit code 2 in the shim.
         Ok::<Result<(), server::serve::ServeError>, anyhow::Error>(
             server::serve::run(args.into_serve_args()).await,
         )
     })?;
 
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(MainExit::Success),
         // Secure-default refuse-to-start is exit code 2 (cli-serve contract):
         // distinct from a generic failure so operators/CI can detect a refused
-        // bind specifically. Print the cause, then exit 2 directly.
+        // bind specifically. Print the cause; the typed exit carries the code
+        // through server_api::run to the binary shim (C5: the lib no longer
+        // exits the process itself).
         Err(server::serve::ServeError::Startup(err)) => {
             eprintln!("error: {err}");
-            std::process::exit(2);
+            Ok(MainExit::ServeRefusedToStart)
         }
         Err(other) => Err(anyhow::Error::from(other)),
     }

@@ -56,8 +56,7 @@ pub use crate::protocol::read_gate::{
 // under embed). Re-exported here so every existing oracle path keeps
 // resolving; `pub use` outside `embed.rs` adds no census atom.
 pub use crate::lifecycle_identity::{
-    CanonicalArgumentHash, OperationKind, OperationReceipt, RetryAdvice, SourceRefusal,
-    SourceRefusalKind,
+    CanonicalArgumentHash, OperationKind, RetryAdvice, SourceRefusal, SourceRefusalKind,
 };
 
 // ── Physical root and observation leases ───────────────────────────────────
@@ -1226,3 +1225,10 @@ impl KnowledgeVoiceFilter {
         ]
     }
 }
+
+// ── Frozen SEAM-PROVENANCE anchor (C5) ─────────────────────────────────────
+
+/// The lifecycle operation receipt under its provenance seam name: every
+/// claim this module renders carries one, minted by the process-wide
+/// identity counter.
+pub type OperationReceipt = crate::lifecycle_identity::OperationReceipt;

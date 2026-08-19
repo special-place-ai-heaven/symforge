@@ -275,3 +275,15 @@ impl ObserverSlot {
         })
     }
 }
+
+// ── Frozen seam anchors (C5) ───────────────────────────────────────────────
+
+/// SEAM-OBSERVER anchor: the handoff protocol's carrier — the slot whose
+/// begin/deliver/complete sequence (and typed [`HandoffRefusal`]) IS the
+/// stable observer handoff the contract names.
+pub type ObserverHandoff = ObserverSlot;
+
+/// SEAM-OBSERVER anchor: the observation lane's observable health — the
+/// coalescing accumulator whose gap, scope-dirty, and handoff latches are
+/// exactly what a health reader can know about the lane.
+pub type ObserverHealth = CoalescingAccumulator;

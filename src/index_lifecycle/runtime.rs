@@ -1009,3 +1009,20 @@ mod dark_runtime_oracles {
         drop(held);
     }
 }
+
+// ── Frozen seam anchors (C5) ───────────────────────────────────────────────
+
+/// SEAM-STATE anchor: the project's derived-state directory placement.
+/// Every V11 checkpoint and team artifact persists beneath it — never
+/// beneath a protected source root (the frozen FR-051 placement rule).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectStateDir(pub std::path::PathBuf);
+
+/// SEAM-STATE anchor: the opt-in team artifact's observed state at the
+/// runtime seam (`None` until an export completed; the byte count is the
+/// export receipt's own measurement, frozen FR-051).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TeamArtifactState {
+    /// Bytes of the last completed export, when one has completed.
+    pub exported_bytes: Option<usize>,
+}

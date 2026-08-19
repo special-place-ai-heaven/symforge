@@ -329,3 +329,22 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
     // Permit. These are the only bytes any gated lane may render or parse.
     None
 }
+
+// ── Frozen seam anchor (C5) ────────────────────────────────────────────────
+
+/// The single admission gate for raw-disk content reads, under its frozen
+/// seam name. Every lane that reopens a file from disk routes through the
+/// gate; this carrier's one associated operation IS that door.
+pub struct ReadGate;
+
+impl ReadGate {
+    /// Admit one raw-disk read: policy refusals run before the file is
+    /// opened, and the returned bytes are the gate's own read.
+    pub fn admit_disk_read(
+        live: &LiveIndex,
+        relative_path: &str,
+        canon_path: &Path,
+    ) -> Result<Vec<u8>, String> {
+        admit_disk_read(live, relative_path, canon_path)
+    }
+}

@@ -64,13 +64,24 @@ fn export_delta_matches_frozen_contract_atoms() {
         })
         .collect();
     assert!(
-        !live_mods.contains("symforge::server_api"),
-        "server_api stays pub-crate until activation flips one keyword"
+        live_mods.contains("symforge::server_api"),
+        "C5 flipped the keyword: server_api is public in the census"
+    );
+    assert!(
+        live_mods.contains("symforge::embed"),
+        "the kept embed facade stays in the census"
+    );
+    assert_eq!(
+        live_mods.len(),
+        2,
+        "the postactivation census is exactly the kept + introduced modules, got {live_mods:?}"
     );
 
-    // Recompute leg 3: the wrap table. Obligations come from HERE — the
-    // module's own judgment of shape-vs-contract — never from path identity.
-    let table = public_api::wrap_table();
+    // Recompute leg 3: the wrap table, read through the frozen V11 seam
+    // anchor so the anchor stays load-bearing. Obligations come from HERE —
+    // the module's own judgment of shape-vs-contract — never from path
+    // identity.
+    let table = public_api::V11PublicApi::wrap_table();
     let table_atoms: BTreeSet<String> = table.iter().map(|e| e.atom.to_string()).collect();
     assert_eq!(
         table_atoms,

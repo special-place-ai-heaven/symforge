@@ -13,7 +13,9 @@ pub(crate) mod knowledge_model;
 pub(crate) mod knowledge_review;
 pub(crate) mod knowledge_search;
 pub mod prompts;
-pub(crate) mod read_gate;
+// Public within the crate tree for the C5 seam anchor `ReadGate` (reachable
+// externally only through the repo-internal test door).
+pub mod read_gate;
 pub(crate) mod read_tools;
 pub mod resources;
 pub mod result_status;

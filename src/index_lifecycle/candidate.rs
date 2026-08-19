@@ -428,3 +428,18 @@ impl IsolatedCandidate {
         PromotionRefusal::CapabilityCannotAuthorize
     }
 }
+
+// ── Frozen seam anchors (C5) ───────────────────────────────────────────────
+// The traceability contract names this file's constructs by their seam
+// names; each binding below ties the frozen name to the construct that
+// carries it, so the anchor resolves against what actually runs.
+
+/// SEAM-CANDIDATE / SEAM-PERFORMANCE anchor: the isolated candidate a
+/// supervisor attempt holds — capacity-reserved, built beside the store,
+/// promoted only through the single commit point.
+pub type CandidateHandle = IsolatedCandidate;
+
+/// SEAM-PUBLICATION anchor: the single commit point's outcome — a promoted
+/// artifact root or the typed promotion refusal
+/// ([`IsolatedCandidate::commit`] is the one place that produces it).
+pub type CandidateCommit = Result<Arc<ProjectArtifacts>, PromotionRefusal>;

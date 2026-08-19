@@ -885,3 +885,38 @@ mod tests {
         );
     }
 }
+
+// ── Frozen SEAM-HEALTH anchors (C5) ────────────────────────────────────────
+// The V11 health projection keeps committed generations and bounded
+// attempts as DISJOINT ledgers (`index_lifecycle::query::HealthProjection`);
+// these are the two halves at their live surface, split by
+// [`split_health_projection`] so a renderer cannot conflate them back into
+// one number.
+
+/// The committed-generation half of the committed-versus-attempt split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedGenerationHealth {
+    /// Generations that reached the single commit point.
+    pub committed_generations: u64,
+}
+
+/// The bounded-attempt half of the committed-versus-attempt split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptHealth {
+    /// Attempts admitted under the verification work bound.
+    pub bounded_attempts: u64,
+}
+
+/// Split the V11 projection into its two live-surface halves.
+pub fn split_health_projection(
+    projection: crate::live_index::index_lifecycle::query::HealthProjection,
+) -> (CommittedGenerationHealth, AttemptHealth) {
+    (
+        CommittedGenerationHealth {
+            committed_generations: projection.committed_generations,
+        },
+        AttemptHealth {
+            bounded_attempts: projection.bounded_attempts,
+        },
+    )
+}

@@ -35,13 +35,6 @@ pub use crate::lifecycle_identity::{OperationKind, RetryAdvice, SourceRefusalKin
 use super::embedded::ReceiptWaitError;
 use super::process_runtime::ProcessIndexRuntime;
 
-/// The provisional process-byte budget behind the contract's zero-argument
-/// `acquire`. A NAMED constant, recorded in the D-ledger as provisional and
-/// not policy: the real budget source is an activation decision, and this is
-/// deliberately NOT `configured_inflight_byte_budget`, which is live V10 env
-/// policy that must not leak into a dark constructor.
-pub const PROVISIONAL_ACQUIRE_PROCESS_BYTES: u64 = 256 * 1024 * 1024;
-
 /// The closed sentinel for a refusal that examined no authority. Kind-prefixed
 /// identities always render as `<kind>-<digits>`, so this token is outside the
 /// renderer's image by construction.
@@ -450,13 +443,18 @@ impl Drop for ProcessRuntimeApi {
 }
 
 impl ProcessRuntimeApi {
-    /// The atom's shape: no receiver, no arguments. The budget question is an
-    /// activation decision; the dark form admits with the provisional
-    /// constant and cannot fail, so the `Result` shape is carried for the
-    /// contract while the refusing evidence arrives with Slice 4.
+    /// The atom's shape: no receiver, no arguments. Since C5 the embed
+    /// surface ATTACHES: acquisition runs the process activation ceremony
+    /// (idempotent) and joins the ONE process capacity runtime every other
+    /// surface attaches to — the C4b daemon/stdio/serve pattern — instead
+    /// of minting a private incarnation with a provisional budget. The
+    /// `Result` shape is the contract's; the current admission cannot
+    /// refuse, and the refusing evidence arrives with the measured budgets
+    /// (C7/C8).
     pub fn acquire() -> Result<Self, EmbedSourceRefusal> {
+        super::activation::activate_surface(super::process_runtime::SurfaceKind::Embed);
         Ok(Self {
-            _inner: ProcessIndexRuntime::incarnate(PROVISIONAL_ACQUIRE_PROCESS_BYTES),
+            _inner: super::activation::process_index_runtime(),
             factory: super::embedded::EmbeddedSourceFactory::new(),
             _not_unwind_safe: std::marker::PhantomData,
         })
@@ -524,12 +522,27 @@ impl ProcessRuntimeApi {
 /// * `"wrap-planned-t049"` — RETIRED vocabulary: T048 recorded the nine
 ///   shape-diverging types (the D13 list) under it so they could not be
 ///   forgotten; T049 discharged all nine into `"wrapped-here"` wrappers.
-/// * `"keyword-flip"` — `server_api`: a real `pub(crate)` module whose
-///   activation is one keyword.
+/// * `"keyword-flip"` — `server_api`: the `pub(crate)` module whose
+///   activation was one keyword — executed at C5; the module is public and
+///   wired to the crate dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WrapEntry {
     pub atom: &'static str,
     pub obligation: &'static str,
+}
+
+/// The V11 public-API seam (the frozen postactivation anchor
+/// `src/index_lifecycle/public_api.rs::V11PublicApi`): the boundary's own
+/// record of how each introduced atom is satisfied. `embed.rs` re-exports
+/// the wrappers; the export-delta oracle reads the table through this
+/// seam, so the anchor is load-bearing, not a marker.
+pub struct V11PublicApi;
+
+impl V11PublicApi {
+    /// The closed wrap table over exactly the top-level introduced atoms.
+    pub fn wrap_table() -> &'static [WrapEntry] {
+        wrap_table()
+    }
 }
 
 /// The closed table over exactly the top-level introduced atoms.
@@ -719,8 +732,8 @@ pub fn render_export_delta(contract_text: &str, lib_text: &str) -> String {
             }
         ],
         "server_api": {
-            "form": "cfg feature=server gated pub(crate) mod server_api in src/lib.rs, std-only stub",
-            "activation": "one keyword behind the already-present server cfg gate: pub(crate) becomes pub, and the census gains the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them"
+            "form": "cfg feature=server gated pub mod server_api in src/lib.rs, wired to the crate dispatcher",
+            "activation": "executed at C5: the pub(crate) keyword flipped behind the already-present server cfg gate, and the census carries the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them"
         }
     });
     serde_json::to_string_pretty(&delta).expect("delta serializes")
@@ -752,21 +765,16 @@ mod dark_wrapper_oracles {
     use super::super::embedded::EmbeddedSourceFactory;
     use super::super::registry::ProjectKey;
     use super::{
-        EVIDENCE_ABSENT, EmbedOperationReceipt, EmbedSourceRefusal,
-        PROVISIONAL_ACQUIRE_PROCESS_BYTES, ProcessRuntimeApi, SymbolSearchRequest,
-        TextSearchRequest,
+        EVIDENCE_ABSENT, EmbedOperationReceipt, EmbedSourceRefusal, ProcessRuntimeApi,
+        SymbolSearchRequest, TextSearchRequest,
     };
 
     #[test]
     fn dark_wrappers_match_contract_shapes() {
-        // acquire takes NO arguments per the atom and delegates to incarnate
-        // with the NAMED provisional constant — never live V10 env policy.
-        let runtime = ProcessRuntimeApi::acquire().expect("the dark acquisition admits");
-        // The provisional budget is a named constant; clippy rightly refuses
-        // a constant assertion, so the pin is that acquire() DELEGATED with
-        // it — the runtime exists — and the constant's value lives in the
-        // D-ledger.
-        let _ = PROVISIONAL_ACQUIRE_PROCESS_BYTES;
+        // acquire takes NO arguments per the atom. Since C5 it attaches to
+        // the ONE process capacity runtime through the activation ceremony
+        // (the provisional private-incarnation constant retired with it).
+        let runtime = ProcessRuntimeApi::acquire().expect("the acquisition admits");
 
         // The refusal wrapper: kind-prefixed identity strings, stored at wrap
         // time; Display and Error implemented; the sentinel reserved for

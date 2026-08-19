@@ -138,41 +138,14 @@
     "symforge::embed::TextMatch",
     "symforge::embed::TextSearchRequest",
     "symforge::embed::TextSearchResult",
-    "symforge::server_api",
     "symforge::server_api::ServerBootstrapError",
     "symforge::server_api::ServerExit",
     "symforge::server_api::run"
   ],
   "kind": "symforge-feature-020-export-delta",
   "live_census_pub_mods": [
-    "symforge::analytics",
-    "symforge::capability",
-    "symforge::cli",
-    "symforge::daemon",
-    "symforge::discovery",
-    "symforge::domain",
-    "symforge::edit_safety",
     "symforge::embed",
-    "symforge::git",
-    "symforge::gitignore_hygiene",
-    "symforge::hash",
-    "symforge::idempotency",
-    "symforge::knowledge",
-    "symforge::live_index",
-    "symforge::observability",
-    "symforge::parsing",
-    "symforge::path_shadow",
-    "symforge::paths",
-    "symforge::process_util",
-    "symforge::protocol",
-    "symforge::server",
-    "symforge::sidecar",
-    "symforge::stel",
-    "symforge::stel_core",
-    "symforge::version_registry",
-    "symforge::watcher",
-    "symforge::watcher_state",
-    "symforge::worktree"
+    "symforge::server_api"
   ],
   "obligations": [
     {
@@ -298,7 +271,7 @@
   ],
   "schema_version": 1,
   "server_api": {
-    "activation": "one keyword behind the already-present server cfg gate: pub(crate) becomes pub, and the census gains the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them",
-    "form": "cfg feature=server gated pub(crate) mod server_api in src/lib.rs, std-only stub"
+    "activation": "executed at C5: the pub(crate) keyword flipped behind the already-present server cfg gate, and the census carries the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them",
+    "form": "cfg feature=server gated pub mod server_api in src/lib.rs, wired to the crate dispatcher"
   }
 }

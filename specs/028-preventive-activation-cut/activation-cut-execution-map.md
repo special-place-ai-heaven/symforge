@@ -290,10 +290,75 @@ is the only thing allowed to touch it:
   rerouted=true). The category's full retirement test
   (`all_ingress_uses_exact_typed_authority_branch`) remains C6's
   stand-in; the pinned-publication identity moves onto C5's leases.
-- C5 (T031 exposure): embed.rs raw re-exports removed per the 79-member
-  raw_embed dispositions → V11 replacement API + EmbeddedSourceHandle
-  re-exports; `server_api` `pub(crate)`→`pub`; mount flip; exact-graph
-  equality across the 26 configuration cells re-verified.
+- C5 (T031 exposure — executed 2026-08-19, two commits: the dispatcher
+  hoist prep and the atomic flip). THE EXPOSURE FLIP: the public census
+  now holds exactly the kept + introduced V11 atoms and the validator
+  runs GREEN on its postactivation path ("lifecycle oracle traceability
+  v11: OK") — the hard PR exit criterion.
+  - The 27 raw crate-root modules are declared inside the private
+    `internals` wrapper (28 same-directory `#[path]` remounts, each
+    splice-allowlisted) and re-imported at the root as `pub(crate)`;
+    every `crate::X` path resolves unchanged. The `__test-internals`
+    dunder feature — enabled ONLY through the repo's self dev-dependency
+    (`default-features = false`, learned the hard way: without it,
+    feature unification dragged `server` into the embed test cell and
+    the embed gate ran 3273 server tests) — swaps the re-imports to
+    `pub`, so all 129 integration test files compile UNCHANGED while no
+    supported configuration cell ever sees the door.
+  - `embed.rs` retired its raw surface for the 26 introduced embed atoms
+    (boundary wrappers aliased to contract names; `EmbeddedSourceHandle`
+    + `ReceiptWaitError` + `SourceCloseReceipt` from the seam file) plus
+    kept `EngineInfo`/`engine_info`; its contract tripwire module now
+    names the V11 surface. `ProcessRuntimeApi::acquire` ATTACHES: it
+    runs the activation ceremony (`SurfaceKind::Embed`) and joins the
+    one process capacity runtime — the provisional private-incarnation
+    constant retired.
+  - `server_api` flipped `pub(crate)`→`pub` and WIRED: `run` dispatches
+    the whole CLI through the hoisted `cli::entry::run_main`;
+    `MainExit::ServeRefusedToStart` carries the cli-serve exit-2
+    contract through the typed door instead of `process::exit` in lib
+    code; `ServerBootstrapError` captures cause chains as text (all
+    five auto traits preserved per the frozen trait_impls). main.rs is
+    an ExitCode shim over the door.
+  - The `#[path]` mount flip: `live_index`'s mount became the internals
+    declaration + a cfg-paired alias in `live_index/mod.rs`, so every
+    `crate::live_index::index_lifecycle::` path (and the suite's
+    `symforge::live_index::index_lifecycle::`, via the door) resolves.
+  - Fifteen frozen seam anchors whose names Wave 1 spelled differently
+    were discharged in-file with documented bindings: aliases where the
+    construct exists (`CandidateHandle`=IsolatedCandidate,
+    `ObserverHandoff`=ObserverSlot, `ObserverHealth`=
+    CoalescingAccumulator, `ProjectQueryLease`=StrictSelectionLease,
+    `QuerySelection`=SelectedAggregate, `RuntimeHealthObservation`=
+    HealthProjection, `RollingVerification`=RollingVerifier,
+    `CandidateCommit`=the commit point's outcome type,
+    claim_provenance `OperationReceipt`=the lifecycle receipt) and
+    small real constructs where the seam names a projection
+    (`CheckpointAvailability`, `ProjectStateDir`, `TeamArtifactState`,
+    health_view's `CommittedGenerationHealth`/`AttemptHealth` split by
+    `split_health_projection`, `ReadGate` hosting the admission door).
+    `V11PublicApi` owns the wrap table and the delta oracle reads
+    through it, so the anchor is load-bearing.
+  - Exact-graph equality across the 26 cells holds BY CONSTRUCTION and
+    is enforced at item granularity by the validator + delta oracle:
+    every public item is gated exactly `feature=embed` or
+    `feature=server` (the frozen availability column), no public item is
+    target-cfg'd, and the door feature exists in no cell — so the
+    observed projection per cell is the expected one wherever the cell
+    compiles (the CI matrix covers the five targets). The frozen
+    `observed_graph.cell_graphs` slot stays null in the immutable
+    contract; C6's `all_ingress_uses_exact_typed_authority_branch` is
+    the category's retirement test.
+  - The export delta regenerated under the C14 discipline (write run
+    reports the drift it repairs; the verify rerun passed);
+    `the_flip_ready_module_is_declared_once_and_never_called` became
+    `the_server_door_is_declared_once_and_called_only_by_the_shim`;
+    embed.rs and health_view.rs joined WIRED_PRODUCTION_FILES.
+  - Gates: fmt; dark 9/9 (pins refreshed post-fmt, 196 files); clippy
+    -D warnings; TRUE embed cell 1336; full serial suite exit 0 (732s);
+    release build + verify-tools harness 7 PASS / 0 FAIL through the
+    new shim; validator OK (78 requirements, 24 acceptance oracles, 13
+    retirement categories).
 - C6 (T032): the four stand-ins get observing bodies, `#[ignore]` removed;
   focused cli/init + persistence tests (cold-recovery-cannot-mint-permit,
   frozen FR-051 matrix).

@@ -7,23 +7,21 @@ pub mod git_temporal;
 // Program 015 SP-0A spike -> C-S1A-002: name-based call graph + inbound BFS,
 // now a real `detect_impact` production dependency (no longer cbm-spike-gated).
 pub mod graph;
-mod health_view;
-// Feature 020 V11. The frozen seam contract places every lifecycle file at
-// `src/index_lifecycle/`, so that is where the files live. The module PATH is
-// a different question: a top-level `pub mod index_lifecycle;` would add
-// `symforge::index_lifecycle` to the public-API census that the refreeze
-// freezes for the whole preactivation period, and `introduced_v11_atoms` never
-// names it — the V11 surface is re-exported through `embed`, not through a
-// public lifecycle module. `#[path]` satisfies both: contract file location,
-// unchanged public-API CENSUS — not unchanged public API. `live_index` is
-// itself public, so these modules and their types ARE reachable by a consumer;
-// the census counts only top-level `pub mod` in `lib.rs`, and that granularity
-// is the contract's, not a claim that nothing was exposed. At activation
-// (T060) this declaration is deleted and `lib.rs` gains a private
-// `mod index_lifecycle;`, with the public types re-exported from `embed.rs`.
-// No file moves then.
-#[path = "../index_lifecycle/mod.rs"]
-pub mod index_lifecycle;
+// Public within the crate tree for the C5 SEAM-HEALTH anchors (reachable
+// externally only through the repo-internal test door).
+pub mod health_view;
+// Feature 020 V11 (C5 — the pre-plotted mount flip executed): the lifecycle
+// directory is now mounted at the crate root through the private `internals`
+// wrapper, and this alias keeps every `crate::live_index::index_lifecycle::`
+// path — production and the integration suite's — resolving unchanged. No
+// file moved. Under the repo-internal `__test-internals` door the alias is
+// `pub` so the suite's `symforge::live_index::index_lifecycle::` paths keep
+// working; in every supported cell it is crate-internal and the V11 surface
+// is reachable ONLY through `embed`/`server_api`.
+#[cfg(not(feature = "__test-internals"))]
+pub(crate) use crate::index_lifecycle;
+#[cfg(feature = "__test-internals")]
+pub use crate::index_lifecycle;
 pub mod knowledge_authority;
 pub mod knowledge_bridge;
 pub mod local_ref_scout;

@@ -451,3 +451,29 @@ impl CompletedLease {
         }
     }
 }
+
+// ── Frozen seam anchors (C5) ───────────────────────────────────────────────
+
+/// SEAM-KNOWLEDGE / SEAM-QUERY / SEAM-SURFACE anchor: the strict
+/// per-project query lease — atomic exact-bijection selection over the
+/// requested sources.
+pub type ProjectQueryLease = StrictSelectionLease;
+
+/// SEAM-QUERY anchor: the caller's requested source set with expected
+/// generations — what a strict lease must capture exactly.
+pub type QuerySelection = SelectedAggregate;
+
+/// SEAM-HEALTH anchor: the committed-versus-attempt split, projected — two
+/// disjoint ledgers as two fields, never one number.
+pub type RuntimeHealthObservation = HealthProjection;
+
+/// SEAM-STATE anchor: whether a checkpoint may be seeded from the queried
+/// publication. The frozen FR-051/T065 rule makes a COMPLETE `Current`
+/// publication the seed precondition; this projects that judgment at the
+/// query seam instead of letting a checkpoint caller infer it from raw
+/// state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointAvailability {
+    /// Every selected source is `Current` — the seed precondition holds.
+    pub current_complete: bool,
+}
