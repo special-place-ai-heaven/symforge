@@ -391,13 +391,17 @@ fn campaign_suppressed_notification(samples: &mut Samples) -> usize {
         // `get_file_content` rides the freshen-on-read lane (the C4c
         // targeted-retrieval freshen); `get_symbol` deliberately serves the
         // captured publication and relies on the observer lanes instead.
-        // force_refresh isolates the freshen lane itself: the session
-        // repeat-read cache keys on a pre-freshen publication identity, so
-        // a bare repeat read can serve `Decision: cache_hit` with STALE
-        // bytes - the carried Slice 3 "repeat-cache publication-identity
-        // fence" residual (observed live at baseline 1521abb0 by this very
-        // campaign; T037/C11 owns the fence). The measurement here is the
-        // freshen-on-read latency, identical on both comparison sides.
+        // force_refresh keeps the MEASUREMENT pure: it excludes the
+        // repeat-read cache's hit fast-path from the freshen-latency
+        // samples, so every sample is a real freshen+serve. (The fence
+        // itself HOLDS - freshen runs before the cache key, pinned by
+        // tests/session_cache_hit.rs::
+        // stale_publication_never_satisfies_the_repeat_read_cache. The
+        // stale cache_hit this campaign once flushed out of baseline
+        // 1521abb0 was fixture-induced: the original now-relative mtime
+        // backdate collided across revisions, the freshen legitimately saw
+        // an unchanged mtime, and the cache consistently served the
+        // unchanged publication.)
         let response = runtime.block_on(server.dispatch_tool_for_tests(
             "get_file_content",
             serde_json::json!({ "path": "src/fixture_3.rs", "force_refresh": true }),

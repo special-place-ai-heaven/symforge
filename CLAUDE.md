@@ -39,6 +39,14 @@ process, so the job's lifetime is independent of the tool call. Interleaving fea
 sets in one target dir (`--all-targets` then `--no-default-features --features embed`)
 causes the same `E0786` without any kill; run them one at a time.
 
+**Windows commit-limit corruption (as_of 2026-08-19).** Two suite builds died
+mid-compile to `0xc000012d` (STATUS_COMMITMENT_LIMIT — virtual-memory commit
+exhaustion) under default 16-way parallel rustc + linkers, corrupting emitted
+artifacts (the E0786 cascade below, plus one rustc ICE and `only metadata stub
+found for rlib dependency core/std` on the NEXT cold build). Cap build
+parallelism with `-j 8` on this machine for heavy `cargo test`/`bench`/`build`
+runs; the capped builds completed where the default died twice.
+
 Recovery, cheapest first: delete `target/debug/incremental`; then
 `cargo clean -p symforge`; then a full `cargo clean`. Do not diagnose a rustc ICE or a
 missing-crate error as a code defect until the build directory is known clean.

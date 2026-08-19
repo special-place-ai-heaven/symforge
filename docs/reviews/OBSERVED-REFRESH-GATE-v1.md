@@ -72,13 +72,27 @@ Samples per case (baseline/candidate):
 
 ## Incidental findings (observed while measuring)
 
-1. **The carried repeat-cache residual is real and live at baseline.** A
-   bare repeat `get_file_content` after an on-disk change can serve
-   `Decision: cache_hit` with STALE bytes — the session cache keys on a
-   pre-freshen publication identity. Observed at `1521abb0` under criterion
-   warm-up before the campaign switched to `force_refresh`. This is the
-   Slice 3 "repeat-cache/CCR publication-identity fence" residual already
-   on C11's roster (T072); the benchmark measures the freshen lane itself.
+1. **A stale `Decision: cache_hit` observed at baseline — root-caused to
+   the FIXTURE, and the fence subsequently PROVEN.** Under criterion
+   warm-up at `1521abb0`, a bare repeat `get_file_content` served a cache
+   hit with stale bytes. This report initially attributed that to the
+   session cache keying on a pre-freshen publication identity; that
+   explanation was WRONG. The verified cause: the campaign's original
+   now-relative mtime backdate (`now - (60+revision)`) collided across
+   revisions whenever a loop pass crossed a second boundary, the
+   freshen-on-read lane legitimately observed an unchanged mtime and did
+   not reindex, and the cache then consistently served the unchanged
+   publication — the same stale bytes a direct read would have served.
+   The fence itself HOLDS: the freshen runs before the cache key is
+   computed in every freshen-bearing read tool, so a real on-disk change
+   bumps the content generation and a stale record structurally cannot
+   match. This is now pinned by
+   `tests/session_cache_hit.rs::stale_publication_never_satisfies_the_repeat_read_cache`
+   (fresh-change miss + unchanged-repeat hit + re-arm, for
+   `get_file_content` and `get_file_context`). `force_refresh` stays in
+   the campaign to keep the latency samples pure freshen+serve. The
+   broader Slice 3 "repeat-cache/CCR publication-identity fence" residual
+   sweep remains on C11's roster (T072).
 2. **A now-relative backdate is a flaky fixture.** Backdating mtimes by
    `now - (60+revision)` collides across revisions whenever one loop pass
    crosses a second boundary; the campaigns now use deterministic absolute

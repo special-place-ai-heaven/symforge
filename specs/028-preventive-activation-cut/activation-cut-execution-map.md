@@ -460,13 +460,15 @@ is the only thing allowed to touch it:
   measurement quantum is noise; flagged for T038 to challenge. Full
   method, tables, adjudications, and BOTH raw receipts are in
   docs/reviews/OBSERVED-REFRESH-GATE-v1.md. Two incidental findings,
-  recorded there: (1) the carried repeat-cache publication-identity
-  fence residual is REAL and live at baseline — a bare repeat
-  get_file_content served `Decision: cache_hit` with stale bytes under
-  warm-up; the campaign now isolates the freshen lane with
-  force_refresh and C11/T072 owns the fence; (2) now-relative mtime
-  backdates collide across revisions at second boundaries — the
-  campaigns use deterministic absolute mtimes.
+  recorded there and closed after C9: (1) a stale `Decision: cache_hit`
+  observed at baseline was ROOT-CAUSED TO THE FIXTURE (colliding
+  now-relative mtime backdates defeating the freshen), NOT to the cache
+  — the report's first explanation was wrong and was corrected; the
+  publication-identity fence itself is now PROVEN by
+  `stale_publication_never_satisfies_the_repeat_read_cache`
+  (fresh-change miss + unchanged-repeat hit + re-arm, get_file_content
+  and get_file_context); the broader residual sweep stays on C11/T072;
+  (2) the campaigns use deterministic absolute mtimes.
 - C10 (T036): tests/delta_full_rebuild_equivalence_v11.rs (frozen names).
 - C11 (T037): campaign run + full gate battery via Terminal Commander.
 
