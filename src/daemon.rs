@@ -9911,7 +9911,7 @@ mod tests {
                 .server
                 .ccr_store
                 .lock()
-                .insert("get_symbol", stored_body.to_string())
+                .insert("get_symbol", stored_body.to_string(), None)
         };
 
         // The daemon-private route pin must be accepted for this tool; the

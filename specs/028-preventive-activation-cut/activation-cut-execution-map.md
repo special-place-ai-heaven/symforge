@@ -504,7 +504,53 @@ is the only thing allowed to touch it:
   answer deterministically. Battery: fmt clean, validator OK, dark
   suite 9/9, clippy `-D warnings` observed checking the new target
   (forced re-check after a cache-instant first pass), embed cell 1336.
-- C11 (T037): campaign run + full gate battery via Terminal Commander.
+- C11a (T037 residual fences — executed 2026-08-19): the two
+  implementation-bearing carried families landed RED-first in
+  `tests/activation_residuals_v11.rs`.
+  - CCR half of the publication-identity fence (frozen `ccr` category,
+    all three assertions): `CcrPublicationIdentity` (source digest +
+    content generation of the rendering publication) is now an INPUT to
+    handle minting — identical rendered bytes under a moved publication
+    mint different handles (RED observed: the handle did not move when
+    only the publication did) — and is stored on the blob.
+    `retrieve_checked` refuses a foreign-source blob with typed
+    `ForeignPublication`; a same-source superseded rendering is served
+    WITH a "CCR replay: rendering bound to content generation N" label
+    (a bound rendering cache, not fresh authority); evicted/unknown
+    handles keep their typed unavailability. All four read-tool voucher
+    blobs and both budget/overflow funnels thread the identity
+    (`SymForgeServer::ccr_publication_identity`). Oracle:
+    `ccr_handles_bind_the_rendering_publication_identity` + a
+    store-level unit for the foreign/superseded split.
+  - Replay-authority forbidden shortcut (the Slice 3 approved residual):
+    `ReplayRecord` gained `post_image: Option<PostImageReceipt>` — the
+    ABSOLUTE written paths plus content digests, read back from disk at
+    the single completion funnel (`complete_with_post_image`); the three
+    batch executors now RETURN their written paths (the writer is the
+    component that knows — per-file reroutes happen inside them). New
+    verified lanes `begin_tool_replay_verified` /
+    `probe_tool_replay_verified`: a stored result replays ONLY while
+    every receipt target still holds its bytes; an unverified completed/
+    failed record is SUPERSEDED at begin (reservation retaken, fresh
+    execution records the current truth) and ignored at probe; in-flight
+    reservations keep their replay-unavailable answer. Fail-closed
+    consequences, deliberate: v1 records (no receipt) and FAILED records
+    (no receipt captured on fail) never replay through the verified
+    lanes — a stored failure retried re-executes and reports the current
+    truth. The `index_folder`/daemon control-state replay lanes are
+    deliberately untouched (state-dir idempotency contracts, not
+    source-byte claims). RED observed: the stored success replayed
+    byte-identical (same tee-snapshot line) after an external overwrite;
+    oracle `replay_never_serves_a_stored_success_the_current_source_
+    does_not_hold` with the identical-retry positive control.
+  - The C9 mtime lesson recurred in the CCR fixture (same-second rewrite
+    defeating the freshen) and was fixed with deterministic backdates
+    before any fence conclusion was drawn.
+- C11 (T037 remainder): D14 falsifiable live-observer invalidation,
+  cancelled non-abortable `index_folder` resolution, D16 structured
+  boundary adjudication, the campaign run through
+  `all_ingress_uses_exact_typed_authority_branch`, the evidence doc, and
+  the full gate battery via Terminal Commander.
 
 Gate battery after every commit-group, serial via TC; fmt BEFORE pin
 refresh; embed feature gate before every push.

@@ -4502,10 +4502,11 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self
-                    .ccr_store
-                    .lock()
-                    .insert("get_symbol", final_output.clone());
+                let handle = self.ccr_store.lock().insert(
+                    "get_symbol",
+                    final_output.clone(),
+                    self.ccr_publication_identity(),
+                );
                 self.session_context.record_symbol_fetch(
                     &params.0.path,
                     &params.0.name,
@@ -4847,10 +4848,11 @@ impl SymForgeServer {
                 context_max_tokens,
             );
             let tokens = (output.len() / 4) as u32;
-            let handle = self
-                .ccr_store
-                .lock()
-                .insert("get_file_context", output.clone());
+            let handle = self.ccr_store.lock().insert(
+                "get_file_context",
+                output.clone(),
+                self.ccr_publication_identity(),
+            );
             self.session_context.record_file_context_fetch(
                 &params.0.path,
                 params_hash,
@@ -4921,10 +4923,11 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self
-                    .ccr_store
-                    .lock()
-                    .insert("get_file_context", output.clone());
+                let handle = self.ccr_store.lock().insert(
+                    "get_file_context",
+                    output.clone(),
+                    self.ccr_publication_identity(),
+                );
                 self.session_context.record_file_context_fetch(
                     &params.0.path,
                     params_hash,
@@ -9059,10 +9062,11 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self
-                    .ccr_store
-                    .lock()
-                    .insert("get_file_content", final_output.clone());
+                let handle = self.ccr_store.lock().insert(
+                    "get_file_content",
+                    final_output.clone(),
+                    self.ccr_publication_identity(),
+                );
                 self.session_context.record_file_content_fetch(
                     &input.path,
                     params_hash,
@@ -12296,17 +12300,36 @@ impl SymForgeServer {
         if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();
         }
-        match self
-            .ccr_store
-            .lock()
-            .retrieve_checked(&hash, crate::knowledge::SECRET_POLICY_VERSION)
-        {
-            Ok(Some(body)) => body,
+        let current = self.ccr_publication_identity();
+        match self.ccr_store.lock().retrieve_checked(
+            &hash,
+            crate::knowledge::SECRET_POLICY_VERSION,
+            current.as_ref(),
+        ) {
+            Ok(Some(retrieved)) => {
+                // A rendering bound to a superseded publication is still
+                // redeemable — it is exactly the output the footer promised —
+                // but it must say so instead of passing as current (frozen:
+                // "CCR cannot originate truth or extend a lease").
+                match (&retrieved.publication, &current) {
+                    (Some(stored), Some(now)) if stored != now => format!(
+                        "CCR replay: rendering bound to content generation {} (current is {}). \
+                         A CCR blob is a bound rendering cache, not fresh authority; rerun the \
+                         originating search for current results.\n\n{}",
+                        stored.content_generation, now.content_generation, retrieved.body
+                    ),
+                    _ => retrieved.body,
+                }
+            }
             Ok(None) => {
                 "CCR retrieve: stale or expired handle; retry the originating search.".to_string()
             }
             Err(crate::protocol::ccr::CcrRetrieveError::SecretPolicyMismatch) => {
                 "CCR retrieve: secret-policy version mismatch; retry the originating search."
+                    .to_string()
+            }
+            Err(crate::protocol::ccr::CcrRetrieveError::ForeignPublication) => {
+                "CCR retrieve: handle was rendered from a different source publication; retry                  the originating search in this project."
                     .to_string()
             }
         }
@@ -32290,6 +32313,7 @@ mod tests {
         let cache_handle = cache_server.ccr_store.lock().insert(
             "get_file_context",
             "seeded home-project evidence".to_string(),
+            None,
         );
         cache_server.session_context.record_file_context_fetch(
             "src/lib.rs",

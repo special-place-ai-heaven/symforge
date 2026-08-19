@@ -560,7 +560,12 @@ fn begin_mutation_replay<T: Serialize>(
     let project_state = server.capture_project_state_dir().ok_or_else(|| {
         "Error: durable project-state replay is unavailable for this binding.".to_string()
     })?;
-    match crate::idempotency::begin_tool_replay(&project_state, tool_name, raw_key, &request) {
+    match crate::idempotency::begin_tool_replay_verified(
+        &project_state,
+        tool_name,
+        raw_key,
+        &request,
+    ) {
         Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Ok(Some(active)),
         Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
         Err(error) => Err(crate::idempotency::format_tool_error(&error)),
@@ -606,7 +611,7 @@ fn probe_mutation_replay<T: Serialize>(
     let project_state = server.capture_project_state_dir().ok_or_else(|| {
         "Error: durable project-state replay is unavailable for this binding.".to_string()
     })?;
-    crate::idempotency::probe_tool_replay(&project_state, tool_name, raw_key, &request)
+    crate::idempotency::probe_tool_replay_verified(&project_state, tool_name, raw_key, &request)
         .map_err(|error| crate::idempotency::format_tool_error(&error))
 }
 
@@ -665,13 +670,25 @@ pub(crate) fn probe_symforge_edit_apply_replay(
 fn complete_mutation_replay(
     idempotency: &Option<crate::idempotency::ActiveReplay>,
     output: &mut String,
+    written: &[std::path::PathBuf],
 ) {
-    if let Some(idempotency) = idempotency
-        && let Err(error) = idempotency.complete(output.clone())
-    {
-        output.push_str(&format!(
-            "\nIdempotency warning: failed to store replay result: {error}"
-        ));
+    if let Some(idempotency) = idempotency {
+        // The replay-authority fence (Feature 020 Slice 4): bind the bytes
+        // this success left on disk into the record. Edit tools never delete
+        // files, so a receipt with any absent or unreadable target means the
+        // read-back failed and the record must never replay (None receipt).
+        let post_image = crate::idempotency::capture_post_image(written).filter(|receipt| {
+            !receipt.targets.is_empty()
+                && receipt
+                    .targets
+                    .iter()
+                    .all(|target| target.content_digest.is_some())
+        });
+        if let Err(error) = idempotency.complete_with_post_image(output.clone(), post_image) {
+            output.push_str(&format!(
+                "\nIdempotency warning: failed to store replay result: {error}"
+            ));
+        }
     }
 }
 
@@ -1063,7 +1080,11 @@ impl SymForgeServer {
         ));
         append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut result, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut result);
+        complete_mutation_replay(
+            &idempotency,
+            &mut result,
+            std::slice::from_ref(&resolved_target.target_path),
+        );
         result
     }
 
@@ -1264,7 +1285,11 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut out);
+        complete_mutation_replay(
+            &idempotency,
+            &mut out,
+            std::slice::from_ref(&resolved_target.target_path),
+        );
         out
     }
 
@@ -1455,7 +1480,11 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut out);
+        complete_mutation_replay(
+            &idempotency,
+            &mut out,
+            std::slice::from_ref(&resolved_target.target_path),
+        );
         out
     }
 
@@ -1840,7 +1869,11 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut out);
+        complete_mutation_replay(
+            &idempotency,
+            &mut out,
+            std::slice::from_ref(&resolved_target.target_path),
+        );
         out
     }
 
@@ -1936,7 +1969,7 @@ impl SymForgeServer {
                 .as_deref()
                 .map(std::path::Path::new),
         ) {
-            Ok(summaries) => {
+            Ok((summaries, written_paths)) => {
                 let file_count = params
                     .0
                     .edits
@@ -1972,7 +2005,7 @@ impl SymForgeServer {
                 if let Some(primary) = params.0.edits.first() {
                     self.append_impact_footer(&mut result, &primary.path);
                 }
-                complete_mutation_replay(&idempotency, &mut result);
+                complete_mutation_replay(&idempotency, &mut result, &written_paths);
                 result
             }
             Err(e) => {
@@ -2035,7 +2068,7 @@ impl SymForgeServer {
             project_state.as_ref(),
             &params.0,
         ) {
-            Ok(summary) => {
+            Ok((summary, written_paths)) => {
                 let write_semantics = if dry_run {
                     edit_format::EditWriteSemantics::DryRunNoWrites
                 } else {
@@ -2061,7 +2094,7 @@ impl SymForgeServer {
                     project_config_trust_suffix.as_deref(),
                 );
                 self.append_impact_footer(&mut result, &params.0.path);
-                complete_mutation_replay(&idempotency, &mut result);
+                complete_mutation_replay(&idempotency, &mut result, &written_paths);
                 result
             }
             Err(e) => {
@@ -2148,7 +2181,7 @@ impl SymForgeServer {
             project_state.as_ref(),
             &params.0,
         ) {
-            Ok(summaries) => {
+            Ok((summaries, written_paths)) => {
                 let file_count = params
                     .0
                     .targets
@@ -2184,7 +2217,7 @@ impl SymForgeServer {
                 if let Some(primary) = params.0.targets.first() {
                     self.append_impact_footer(&mut result, &primary.path);
                 }
-                complete_mutation_replay(&idempotency, &mut result);
+                complete_mutation_replay(&idempotency, &mut result, &written_paths);
                 result
             }
             Err(e) => {

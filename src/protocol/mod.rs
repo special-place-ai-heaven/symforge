@@ -947,6 +947,19 @@ impl SymForgeServer {
         }
     }
 
+    /// The current publication identity for CCR handle minting: the source
+    /// digest plus content generation of the bound index's published
+    /// generation. `None` for an unbound session (nothing to encode).
+    pub(crate) fn ccr_publication_identity(&self) -> Option<ccr::CcrPublicationIdentity> {
+        let published = self.index.data_plane().published_generation();
+        let source = published.source.as_deref()?;
+        let bytes = serde_json::to_vec(source).ok()?;
+        Some(ccr::CcrPublicationIdentity {
+            source_digest: crate::hash::digest_hex(&bytes),
+            content_generation: published.content_generation,
+        })
+    }
+
     /// Apply token budget with CCR offload for eligible discovery tools (011).
     pub(crate) fn apply_ccr_budget(
         &self,
@@ -956,8 +969,15 @@ impl SymForgeServer {
     ) -> String {
         let budget = ccr::resolve_tool_max_tokens(tool_name, max_tokens);
         if ccr::profile_for_tool(tool_name).is_some_and(|p| p.ccr_eligible) {
+            let publication = self.ccr_publication_identity();
             let mut store = self.ccr_store.lock();
-            return ccr::enforce_token_budget_with_ccr(&mut store, tool_name, result, budget);
+            return ccr::enforce_token_budget_with_ccr(
+                &mut store,
+                tool_name,
+                result,
+                budget,
+                publication,
+            );
         }
         format::enforce_token_budget(result, budget)
     }
@@ -978,8 +998,16 @@ impl SymForgeServer {
         };
         if ccr::profile_for_tool(tool_name).is_some_and(|profile| profile.ccr_eligible) {
             let summary = format::enforce_token_budget(summary, Some(tokens));
+            let publication = self.ccr_publication_identity();
             let mut store = self.ccr_store.lock();
-            return ccr::apply_ccr_overflow(&mut store, tool_name, summary, result, tokens);
+            return ccr::apply_ccr_overflow(
+                &mut store,
+                tool_name,
+                summary,
+                result,
+                tokens,
+                publication,
+            );
         }
         format::enforce_token_budget(result, Some(tokens))
     }

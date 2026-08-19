@@ -1928,7 +1928,7 @@ pub(crate) fn execute_batch_edit(
     edits: &[SingleEdit],
     dry_run: bool,
     top_level_working_directory: Option<&Path>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<std::path::PathBuf>), String> {
     struct ResolvedEdit {
         path: String,
         sym: SymbolRecord,
@@ -2188,7 +2188,7 @@ pub(crate) fn execute_batch_edit(
                 summaries.push(format!("[DRY RUN] Would {summary}"));
             }
         }
-        return Ok(summaries);
+        return Ok((summaries, Vec::new()));
     }
 
     // Phase 4: Apply all writes, rolling back any already-written files on failure.
@@ -2296,7 +2296,8 @@ pub(crate) fn execute_batch_edit(
         summaries.extend(file_summaries);
     }
 
-    Ok(summaries)
+    let written_paths = staged.iter().map(|sf| sf.abs_path.clone()).collect();
+    Ok((summaries, written_paths))
 }
 
 // ---------------------------------------------------------------------------
@@ -2386,7 +2387,7 @@ pub(crate) fn execute_batch_rename(
     repo_root: &Path,
     project_state_dir: Option<&crate::domain::ProjectStateDir>,
     input: &BatchRenameInput,
-) -> Result<String, String> {
+) -> Result<(String, Vec<std::path::PathBuf>), String> {
     // Phase 1: Resolve the definition and find the name within its body.
     // `target_owner` is the resolved target's enclosing-`impl` owner type (019
     // recall-recovery): for `Target::new`, `Some("Target")`. `None` when the
@@ -2727,7 +2728,7 @@ pub(crate) fn execute_batch_rename(
             ));
             lines.extend(uncertain_lines);
         }
-        return Ok(lines.join("\n"));
+        return Ok((lines.join("\n"), Vec::new()));
     }
 
     // Phase 4: Atomic rename — stage all new content in memory first, then write all.
@@ -2897,7 +2898,8 @@ pub(crate) fn execute_batch_rename(
             &sf.resolved_target,
         ));
     }
-    Ok(output)
+    let written_paths = staged.iter().map(|sf| sf.abs_path.clone()).collect();
+    Ok((output, written_paths))
 }
 
 // ---------------------------------------------------------------------------
@@ -3037,7 +3039,7 @@ pub(crate) fn execute_batch_insert(
     repo_root: &Path,
     project_state_dir: Option<&crate::domain::ProjectStateDir>,
     input: &BatchInsertInput,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<PathBuf>), String> {
     struct ResolvedTarget {
         path: String,
         sym: SymbolRecord,
@@ -3210,7 +3212,7 @@ pub(crate) fn execute_batch_insert(
                 summaries.push(format!("[DRY RUN] Would {summary}"));
             }
         }
-        return Ok(summaries);
+        return Ok((summaries, Vec::new()));
     }
 
     let mut written: Vec<usize> = Vec::new();
@@ -3305,7 +3307,8 @@ pub(crate) fn execute_batch_insert(
         summaries.extend(file_summaries);
     }
 
-    Ok(summaries)
+    let written_paths = staged.iter().map(|sf| sf.abs_path.clone()).collect();
+    Ok((summaries, written_paths))
 }
 
 // ---------------------------------------------------------------------------
@@ -4458,7 +4461,8 @@ mod tests {
             },
         ];
 
-        let summaries = execute_batch_edit(&handle, dir.path(), None, &edits, false, None).unwrap();
+        let (summaries, _written) =
+            execute_batch_edit(&handle, dir.path(), None, &edits, false, None).unwrap();
         assert_eq!(summaries.len(), 2);
 
         let a_content = std::fs::read_to_string(src.join("a.rs")).unwrap();
@@ -4624,7 +4628,8 @@ mod tests {
             working_directory: None,
         }];
 
-        let summaries = execute_batch_edit(&handle, dir.path(), None, &edits, true, None).unwrap();
+        let (summaries, _written) =
+            execute_batch_edit(&handle, dir.path(), None, &edits, true, None).unwrap();
         assert_eq!(summaries.len(), 1, "expected one preview line");
         assert!(
             summaries[0].contains("[DRY RUN]"),
@@ -4722,7 +4727,8 @@ mod tests {
             working_directory: None,
         };
 
-        let summaries = execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
+        let (summaries, _written) =
+            execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
         assert_eq!(summaries.len(), 2);
 
         let a = std::fs::read_to_string(src.join("a.rs")).unwrap();
@@ -4774,7 +4780,8 @@ mod tests {
             working_directory: None,
         };
 
-        let summaries = execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
+        let (summaries, _written) =
+            execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
         assert_eq!(summaries.len(), 2, "expected two preview lines");
         for s in &summaries {
             assert!(s.contains("[DRY RUN]"), "expected [DRY RUN] prefix in: {s}");
@@ -5042,7 +5049,7 @@ mod tests {
             working_directory: None,
         };
 
-        let out = execute_batch_rename(&handle, dir.path(), None, &input).unwrap();
+        let (out, _written) = execute_batch_rename(&handle, dir.path(), None, &input).unwrap();
 
         assert!(
             out.contains("Confident matches (will be applied)"),

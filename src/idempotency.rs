@@ -85,6 +85,73 @@ pub struct ReplayRecord {
     pub updated_unix_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_text: Option<String>,
+    /// Source-bound operation receipt (Feature 020 Slice 4, the
+    /// replay-authority fence): the disk bytes the completed operation left
+    /// behind, read back at completion time. A stored response may be
+    /// replayed ONLY while every target still holds these bytes; a record
+    /// without a receipt never replays through the verified lanes. Absent on
+    /// v1 records (serde default), which is exactly the fail-closed case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_image: Option<PostImageReceipt>,
+}
+
+/// One target the completed operation left on disk. `path` is the ABSOLUTE
+/// path as actually written (edits can be rerouted into a worktree, so the
+/// request-relative path is not always where the bytes landed). Absolute
+/// paths make the record machine-local; the record's whole job is a
+/// retry-window guard on this machine's project state, so that is the
+/// correct scope. `content_digest: None` records the path as ABSENT (a
+/// delete or rename-away), which is verified as absence, not skipped.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PostImageTarget {
+    pub path: String,
+    pub content_digest: Option<String>,
+}
+
+/// The post-image the operation's completion observed: (path → digest) for
+/// every file the operation wrote or removed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PostImageReceipt {
+    pub targets: Vec<PostImageTarget>,
+}
+
+/// Read back the current bytes of the written paths and digest them into a
+/// receipt. A missing file records absence; any OTHER read error returns
+/// `None` — capture failure means NO receipt, and a record without a receipt
+/// never replays (fail closed rather than binding bytes nobody read).
+pub fn capture_post_image(written: &[PathBuf]) -> Option<PostImageReceipt> {
+    let mut targets = Vec::with_capacity(written.len());
+    for path in written {
+        let content_digest = match fs::read(path) {
+            Ok(bytes) => Some(crate::hash::digest_hex(&bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        };
+        targets.push(PostImageTarget {
+            path: path.display().to_string(),
+            content_digest,
+        });
+    }
+    Some(PostImageReceipt { targets })
+}
+
+/// True only when every receipt target matches the CURRENT disk state:
+/// present targets byte-hash-equal, absent targets still absent. An empty
+/// receipt verifies trivially — callers must capture every written path.
+pub fn verify_post_image(receipt: &PostImageReceipt) -> bool {
+    receipt
+        .targets
+        .iter()
+        .all(|target| match fs::read(Path::new(&target.path)) {
+            Ok(bytes) => target
+                .content_digest
+                .as_deref()
+                .is_some_and(|digest| digest == crate::hash::digest_hex(&bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                target.content_digest.is_none()
+            }
+            Err(_) => false,
+        })
 }
 
 impl ReplayRecord {
@@ -98,6 +165,7 @@ impl ReplayRecord {
             created_unix_millis: now,
             updated_unix_millis: now,
             response_text: None,
+            post_image: None,
         }
     }
 
@@ -137,6 +205,26 @@ impl ActiveReplay {
             ReplayStatus::Completed,
             Some(response_text.into()),
         )
+    }
+
+    /// Complete with the source-bound receipt the verified replay lanes
+    /// require. A `None` receipt stores a record that will never replay
+    /// through those lanes (capture failed — fail closed).
+    pub fn complete_with_post_image(
+        &self,
+        response_text: impl Into<String>,
+        post_image: Option<PostImageReceipt>,
+    ) -> Result<ReplayRecord, IdempotencyError> {
+        let record = self.store.update_status_with_response(
+            &self.key,
+            &self.request_hash,
+            ReplayStatus::Completed,
+            Some(response_text.into()),
+        )?;
+        let mut record = record;
+        record.post_image = post_image;
+        self.store.write_record_atomic(&record)?;
+        Ok(record)
     }
 
     pub fn fail(&self, response_text: impl Into<String>) -> Result<ReplayRecord, IdempotencyError> {
@@ -498,6 +586,69 @@ pub fn probe_tool_replay(
 
     match store.replay_if_present(&key, &request_hash)? {
         Some(record) => Ok(Some(replay_response(&record))),
+        None => Ok(None),
+    }
+}
+
+/// [`begin_tool_replay`] with the replay-authority fence (Feature 020
+/// Slice 4): a stored result is replayed ONLY when its source-bound
+/// post-image receipt verifies against the CURRENT bytes at the recorded
+/// written paths. A completed/failed record whose receipt is missing or no
+/// longer true is SUPERSEDED — the reservation is retaken and the caller
+/// executes fresh, so the record ends up holding the current truth instead
+/// of a claim the disk no longer supports. In-flight reservations keep their
+/// existing replay-unavailable answer; superseding a live reservation would
+/// race the owner.
+pub fn begin_tool_replay_verified(
+    project_state: &ProjectStateDir,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+) -> Result<ReplayStart, IdempotencyError> {
+    let key = IdempotencyKey::new(raw_key)?;
+    let request_hash = RequestHash::for_tool_request(tool_name, request)?;
+    let store = FileReplayStore::open(project_state)?;
+
+    match store.check_or_reserve(&key, &request_hash)? {
+        ReplayDecision::FirstExecution(_) => Ok(ReplayStart::FirstExecution(ActiveReplay {
+            store,
+            key,
+            request_hash,
+        })),
+        ReplayDecision::Replay(record) => {
+            let verified = record.post_image.as_ref().is_some_and(verify_post_image);
+            if verified || record.status == ReplayStatus::Reserved {
+                return Ok(ReplayStart::Replay(replay_response(&record)));
+            }
+            let superseding = ReplayRecord::reserved(key.key_hash(), request_hash.clone());
+            store.write_record_atomic(&superseding)?;
+            Ok(ReplayStart::FirstExecution(ActiveReplay {
+                store,
+                key,
+                request_hash,
+            }))
+        }
+    }
+}
+
+/// [`probe_tool_replay`] with the replay-authority fence: non-reserving, so
+/// an unverified record simply answers `None` and the caller falls through
+/// to its normal (reserving) execution path, which supersedes it there.
+pub fn probe_tool_replay_verified(
+    project_state: &ProjectStateDir,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+) -> Result<Option<String>, IdempotencyError> {
+    let key = IdempotencyKey::new(raw_key)?;
+    let request_hash = RequestHash::for_tool_request(tool_name, request)?;
+    let store = FileReplayStore::open(project_state)?;
+
+    match store.replay_if_present(&key, &request_hash)? {
+        Some(record) => {
+            let verified = record.post_image.as_ref().is_some_and(verify_post_image);
+            Ok(verified.then(|| replay_response(&record)))
+        }
         None => Ok(None),
     }
 }
