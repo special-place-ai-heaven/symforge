@@ -213,12 +213,34 @@ is the only thing allowed to touch it:
   acquisition branches arrive at the dispatch necks with C4b/C4c, not by
   rewriting handler bodies. `IndexBase::index` (Arc<LiveIndex>, cache
   census) deliberately untouched — cache disposition is C4c/C5 work.
-- C4b/C4c (T030/T031 roots, remaining): bootstrap flows through activation
-  machine + registry/adapters admission; serve/stdio/daemon/sidecar
-  surfaces attach via ProcessIndexRuntime; registry ownership moves from
-  the `project_source_authority` static to bootstrap; reconciliation
-  sweeps' per-file re-admissions join the lane; data-plane admissions
-  gated at the necks.
+- C4b (T030 bootstrap — executed 2026-08-19): bootstrap flows through the
+  activation machine and the process registry. `activate_surface(surface)`
+  runs the startup CEREMONY on the process machine — register all nine
+  frozen lanes, `begin_closing`, confirm every drain, `open_preventive` —
+  BEFORE the surface serves, which is what makes each drain confirmation
+  truthful: at that moment the bootstrapper IS every lane's owner and can
+  observe that nothing has entered the legacy gate. It also attaches the
+  surface to the one `ProcessIndexRuntime` (dark budgets: 1 GiB per
+  surface, 4 GiB process; C7/C8 measure real ones). Wired at daemon state
+  construction, stdio `run_mcp_server_async`, and `serve::run`; embed
+  attaches at C5. `admit_project` is the single admission door: plan
+  (`plan_admission`) → single-flight admit (`execute_plan`, live
+  occupancies join on matching root+placement) → install charged to the
+  surface's capacity owner; wired at `ProjectInstance::load_bound`, the
+  stdio local bind, and the serve load — refusals fail the open honestly.
+  `ProjectSlot::stop` retires the admission slot, so daemon eviction and
+  retarget re-admit fresh. The authority presents a STABLE admission-root
+  identity (its first lease's), so every open of one canonicalized root
+  joins one occupancy; recorded residuals: a root physically replaced at
+  the same path keeps its admission identity until C5's transitions own
+  rebinding; the serve path surfaces no RootBinding and presents
+  NormalProject (its loader resolves protected roots upstream); the
+  registry-ownership move is the admission door — the
+  `project_source_authority` static remains the per-root convergence
+  lookup until C5 narrows it.
+- C4c (T030/T031 roots, remaining): typed acquisition branches at the
+  dispatch necks; reconciliation sweeps' per-file re-admissions join the
+  lane; data-plane admissions gated; cache-census dispositions.
 - C5 (T031 exposure): embed.rs raw re-exports removed per the 79-member
   raw_embed dispositions → V11 replacement API + EmbeddedSourceHandle
   re-exports; `server_api` `pub(crate)`→`pub`; mount flip; exact-graph

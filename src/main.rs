@@ -213,6 +213,13 @@ fn run_mcp_server() -> anyhow::Result<()> {
 async fn run_mcp_server_async() -> anyhow::Result<()> {
     observability::init_tracing()?;
 
+    // V11 bootstrap (Feature 020 Slice 4, T030, C4b): the stdio surface runs
+    // the process activation ceremony before the transport comes up — both
+    // the daemon-proxied and local paths below serve only afterwards.
+    live_index::index_lifecycle::activation::activate_surface(
+        live_index::index_lifecycle::process_runtime::SurfaceKind::Stdio,
+    );
+
     // INFR-02: Auto-index on startup (configurable via SYMFORGE_AUTO_INDEX)
     let should_auto_index = std::env::var("SYMFORGE_AUTO_INDEX")
         .map(|v| v != "false")
@@ -403,6 +410,23 @@ async fn run_local_mcp_server_async(
             ),
         };
         let state_placement = discovery::resolve_state_placement(&binding);
+
+        // V11 bootstrap (C4b): the local stdio project admits through the
+        // process registry before its index is built; a refusal fails the
+        // startup honestly.
+        live_index::index_lifecycle::activation::admit_project(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Stdio,
+            &binding.canonical_root,
+            &binding.root_id.0,
+            binding.access_mode,
+            &state_placement,
+        )
+        .map_err(|refusal| {
+            anyhow::anyhow!(
+                "project admission refused for '{}': {refusal:?}",
+                binding.root_id.0
+            )
+        })?;
 
         // Try loading from persisted snapshot first (fast path: no re-parsing).
         let index = if let Some(snapshot) = persist::load_snapshot(&root, &state_placement) {

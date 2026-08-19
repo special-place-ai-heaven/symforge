@@ -532,6 +532,11 @@ fn build_serve_runtime(
 /// graceful drain: SIGINT (Ctrl+C) on all platforms, plus SIGTERM on Unix so the
 /// server drains under Docker/K8s/systemd (P2-B).
 pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
+    // V11 bootstrap (Feature 020 Slice 4, T030, C4b): the serve surface runs
+    // the process activation ceremony before any socket opens.
+    crate::live_index::index_lifecycle::activation::activate_surface(
+        crate::live_index::index_lifecycle::process_runtime::SurfaceKind::Serve,
+    );
     let api_key = resolve_api_key(args.api_key.as_deref(), args.api_key_env.as_deref());
     let auth = AuthConfig::new(api_key);
 
@@ -561,6 +566,28 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     let (index, repo_root, state_placement, snapshot_mtimes) =
         load_serve_index(args.workspace_root.as_deref())?;
     tracing::info!("serve: index ready in {:?}", phase.elapsed());
+    // V11 bootstrap (C4b): the serve project admits through the process
+    // registry. Recorded residual: this path surfaces no RootBinding, so the
+    // admission presents NormalProject — the serve loader resolves protected
+    // roots to user-local placement upstream, and C5's typed bootstrap
+    // threads the real binding through.
+    if let (Some(root), Some(placement)) = (repo_root.as_ref(), state_placement.as_ref()) {
+        let project_id = crate::discovery::project_id_for_canonical_root(root);
+        if let Err(refusal) = crate::live_index::index_lifecycle::activation::admit_project(
+            crate::live_index::index_lifecycle::process_runtime::SurfaceKind::Serve,
+            root,
+            &project_id.0,
+            crate::domain::index::SourceAccessMode::NormalProject,
+            placement,
+        ) {
+            return Err(ServeError::IndexLoad {
+                source: anyhow::anyhow!(
+                    "project admission refused for '{}': {refusal:?}",
+                    project_id.0
+                ),
+            });
+        }
+    }
     // Spec 026: a snapshot-restored index reconciles against current disk
     // state in the background (same verify pass the stdio path spawns); tools
     // serve immediately with the honest SnapshotRestore/Pending trust labels.

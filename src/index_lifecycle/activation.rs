@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use super::adapters::{AdapterRefusal, execute_plan, plan_admission};
 use super::authority::{
     AuthorityRefusal, BindingAuthority, CurrentPublication, MutationGrantInput, ObserverToken,
     SourceRuntime,
@@ -39,7 +40,12 @@ use super::candidate::{
 use super::capacity::{OwnerIdentity, ProcessCapacityPool};
 use super::mutation::{PermitDrainSignal, RefreshTicket, SourceMutationPermit};
 use super::observer::{CoalescingAccumulator, ObservationCut, ObserverId, ObserverSlot};
-use super::physical_root::{PhysicalRootLease, WriteReceipt};
+use super::physical_root::{PhysicalRootIdentity, PhysicalRootLease, WriteReceipt};
+use super::process_runtime::{ProcessIndexRuntime, SurfaceKind};
+use super::registry::{
+    LiveProjectSlot, ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection,
+    StatePlacement as AdmissionStatePlacement,
+};
 use super::supervisor::SourceSupervisor;
 use super::transition::{self, TransitionKind};
 use crate::domain::index::CatalogPath;
@@ -297,6 +303,13 @@ impl ActivationCut {
 #[derive(Debug)]
 pub struct ProjectSourceAuthority {
     root: PathBuf,
+    /// The identity of this root's FIRST lease, presented for project
+    /// admission (C4b). Every open of one canonicalized root converges on
+    /// this authority and therefore presents the same physical identity —
+    /// which is what lets concurrent opens join one admission. Mid-cut
+    /// residual: a root physically replaced at the same path keeps its
+    /// admission identity until C5's transitions own rebinding.
+    admission_root: PhysicalRootIdentity,
     inner: Mutex<AuthorityInner>,
     // Separate mutex, strict ordering: lane state is always taken and
     // RELEASED before `inner` is locked (see `reconcile_returned`), so the
@@ -374,6 +387,7 @@ impl ProjectSourceAuthority {
         // permit cycle (see `PhysicalRootLease::parked`), so an idle root
         // stays user-movable.
         let lease = Arc::new(PhysicalRootLease::take(root).parked());
+        let admission_root = lease.identity();
         let binding = BindingAuthority::bind(lease.identity());
         // The seed publication carries the SEED observer incarnation's
         // token — the same identity `active_token` starts on — so even the
@@ -385,6 +399,7 @@ impl ProjectSourceAuthority {
         let owner = pool.root(OBSERVATION_CAPACITY_BYTES);
         Arc::new(Self {
             root: root.to_path_buf(),
+            admission_root,
             inner: Mutex::new(AuthorityInner {
                 runtime: SourceRuntime::current(publication),
                 lease,
@@ -546,6 +561,14 @@ impl ProjectSourceAuthority {
             .runtime
             .live_publication()
             .map(|publication| publication.publication())
+    }
+
+    /// The binding this authority presents for project admission: a fresh
+    /// binding identity over the STABLE admission-root identity (see the
+    /// field doc), so every open of one canonicalized root can join one
+    /// registry occupancy.
+    pub fn admission_binding(&self) -> BindingAuthority {
+        BindingAuthority::bind(self.admission_root)
     }
 
     /// How many mutation grants this source has ever issued. The wiring
@@ -904,6 +927,131 @@ impl ProjectRuntimeHandle {
     }
 }
 
+// ── Process bootstrap: ceremony, surfaces, admission (T030, C4b) ───────────
+
+/// Dark process capacity budget: every surface can attach at the observation
+/// lane's dark budget. C7/C8 replace the dark constants with measured ones.
+const PROCESS_CAPACITY_BYTES: u64 = (SurfaceKind::ALL.len() as u64) * OBSERVATION_CAPACITY_BYTES;
+
+static PROCESS_INDEX_RUNTIME: OnceLock<Arc<ProcessIndexRuntime>> = OnceLock::new();
+static PROCESS_PROJECT_REGISTRY: OnceLock<Arc<ProjectRegistry>> = OnceLock::new();
+/// Serializes the one-time ceremony and surface attaches so concurrent
+/// surface starts cannot race either.
+static PROCESS_BOOTSTRAP: Mutex<()> = Mutex::new(());
+
+/// The one process capacity runtime every surface attaches to.
+pub fn process_index_runtime() -> Arc<ProcessIndexRuntime> {
+    PROCESS_INDEX_RUNTIME
+        .get_or_init(|| ProcessIndexRuntime::incarnate(PROCESS_CAPACITY_BYTES))
+        .clone()
+}
+
+/// The process project registry — the admission table bootstrap owns. The
+/// C4b registry-ownership move: projects enter through [`admit_project`],
+/// never by a lane minting its own slot.
+pub fn process_project_registry() -> Arc<ProjectRegistry> {
+    PROCESS_PROJECT_REGISTRY
+        .get_or_init(ProjectRegistry::new)
+        .clone()
+}
+
+/// Drive the process activation machine through its startup ceremony and
+/// attach `surface` to the capacity runtime. Idempotent per process and per
+/// surface.
+///
+/// The ceremony runs BEFORE the surface serves its first request, which is
+/// what makes each drain confirmation truthful: at that moment the
+/// bootstrapper IS every lane's owner, and it can observe that nothing has
+/// entered the legacy gate because serving has not begun. After this PR's
+/// compile-time flip there is no legacy traffic left to drain at runtime;
+/// the machine records that observation as typed evidence instead of
+/// assuming it.
+pub fn activate_surface(surface: SurfaceKind) {
+    let _bootstrap = PROCESS_BOOTSTRAP.lock().expect("process bootstrap lock");
+    let machine = ActivationCut::process();
+    if machine.mode() == ActivationMode::LegacyOpen {
+        let registrations: Vec<LaneRegistration> = RegisteredLane::ALL
+            .iter()
+            .map(|lane| {
+                machine
+                    .register_lane(*lane)
+                    .expect("the bootstrap lock is held and the machine is LegacyOpen")
+            })
+            .collect();
+        machine
+            .begin_closing()
+            .expect("every lane registered above");
+        for registration in registrations {
+            machine
+                .confirm_drained(registration)
+                .expect("the drain window opened above");
+        }
+        machine
+            .open_preventive()
+            .expect("every registered lane confirmed above");
+    }
+    let runtime = process_index_runtime();
+    if runtime.owner_for(surface).is_none() {
+        runtime
+            .attach(surface, OBSERVATION_CAPACITY_BYTES)
+            .expect("all surfaces fit the process budget by construction");
+    }
+}
+
+/// One admitted project bootstrap (C4b): plan against the process runtime
+/// and admit through the process registry — single-flight per key, and a
+/// live occupancy joins when root and placement agree — then install as
+/// live. Self-activating: the surface's ceremony and capacity attach run
+/// first, so a bare test constructing a project without a daemon still
+/// admits honestly. The per-root authority is created (or joined) through
+/// the same canonicalized registry every writer lane converges on, and the
+/// admission presents its stable admission-root identity so every open of
+/// one root names the same physical root.
+pub fn admit_project(
+    surface: SurfaceKind,
+    canonical_root: &Path,
+    project_id: &str,
+    access_mode: crate::domain::index::SourceAccessMode,
+    placement: &crate::domain::StatePlacement,
+) -> Result<Arc<LiveProjectSlot>, AdapterRefusal> {
+    use crate::domain::index::SourceAccessMode as Mode;
+
+    activate_surface(surface);
+    let runtime = process_index_runtime();
+    let registry = process_project_registry();
+    let key = ProjectKey::new(project_id);
+    let protection = match access_mode {
+        Mode::NormalProject => RootProtection::Normal,
+        // A protected root binds only when the operator asked for it
+        // explicitly; the explicitness IS the authorization.
+        Mode::ExplicitProtected => RootProtection::Protected,
+    };
+    let authorized = matches!(access_mode, Mode::ExplicitProtected);
+    let requested = match placement {
+        crate::domain::StatePlacement::ProjectLocal { .. } => AdmissionStatePlacement::ProjectLocal,
+        crate::domain::StatePlacement::UserLocal { .. } => AdmissionStatePlacement::UserLocal,
+        crate::domain::StatePlacement::MemoryOnly { .. } => AdmissionStatePlacement::MemoryOnly,
+    };
+    let plan = plan_admission(
+        &runtime,
+        surface,
+        key.clone(),
+        protection,
+        authorized,
+        requested,
+    )?;
+    let binding = project_source_authority(canonical_root).admission_binding();
+    let (_slot, owner) = execute_plan(&registry, &plan, binding)?;
+    match registry.install(&key, Some(owner)) {
+        Ok(live) => Ok(live),
+        // Not pending any more: either a concurrent opener installed between
+        // our admit and install, or the admit above JOINED an occupancy that
+        // is already live. Both resolve to the same live slot.
+        Err(RegistryRefusal::NotAdmitted) => registry.live(&key).map_err(AdapterRefusal::Registry),
+        Err(refusal) => Err(AdapterRefusal::Registry(refusal)),
+    }
+}
+
 /// Feature 020 V11, T066 — activation machine oracles (in-crate per the
 /// discharged fixture-door precondition; see `runtime.rs`).
 #[cfg(all(test, feature = "server"))]
@@ -1076,16 +1224,28 @@ mod activation_oracles {
     }
 
     #[test]
-    fn process_machine_is_one_per_process_and_starts_legacy_open() {
+    fn process_machine_is_one_per_process_and_never_precedes_legacy_open() {
         let first = ActivationCut::process();
         let second = ActivationCut::process();
         assert!(
             std::ptr::eq(first, second),
             "process() returns the one process-wide machine"
         );
-        // No oracle in this module advances the process machine; the fresh
-        // machines above keep scenario state out of the singleton.
-        assert_eq!(first.mode(), ActivationMode::LegacyOpen);
+        // Since C4b the production bootstrap (`activate_surface`) drives the
+        // process machine to `PreventiveV1Open`, and any daemon/serve test
+        // that ran earlier in this serial binary has legitimately done so.
+        // The START mode is pinned on a fresh machine by
+        // `starts_legacy_open_and_advances_only_forward`; the singleton claim
+        // left to pin here is monotonicity's floor: the machine is never in a
+        // state outside the closed three-mode set, and if the ceremony ran it
+        // is exactly `PreventiveV1Open`, never half-open.
+        assert!(
+            matches!(
+                first.mode(),
+                ActivationMode::LegacyOpen | ActivationMode::PreventiveV1Open
+            ),
+            "the process machine is never observed mid-drain outside the ceremony"
+        );
     }
 }
 

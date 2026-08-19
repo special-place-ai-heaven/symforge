@@ -822,6 +822,12 @@ impl DaemonState {
         auth_token: String,
         control_state_dir: Option<ControlStateDir>,
     ) -> Self {
+        // V11 bootstrap (Feature 020 Slice 4, T030, C4b): the daemon surface
+        // runs the process activation ceremony and attaches its capacity
+        // owner BEFORE any request can be served through this state.
+        live_index::index_lifecycle::activation::activate_surface(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+        );
         Self {
             next_session_id: AtomicU64::new(1),
             bases: RwLock::new(HashMap::new()),
@@ -3276,6 +3282,24 @@ impl ProjectInstance {
             .unwrap_or("project")
             .to_string();
 
+        // V11 bootstrap (C4b): every daemon project flows through the
+        // process registry's single-flight admission BEFORE its index is
+        // built. A refusal fails the open honestly — admission is
+        // authoritative, not advisory.
+        live_index::index_lifecycle::activation::admit_project(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+            canonical_root,
+            &binding.root_id.0,
+            binding.access_mode,
+            &state_placement,
+        )
+        .map_err(|refusal| {
+            anyhow::anyhow!(
+                "project admission refused for '{}': {refusal:?}",
+                binding.root_id.0
+            )
+        })?;
+
         let index = bootstrap_project_index(canonical_root, &state_placement)?;
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
@@ -3375,11 +3399,26 @@ impl ProjectSlot {
 
     fn stop(&self) {
         let _mutation = self.mutation.lock();
-        let (mut watcher_task, stop_token) = {
+        let (mut watcher_task, stop_token, project_id) = {
             let mut project = self.metadata.write();
-            (project.watcher_task.take(), Arc::clone(&project.stop_token))
+            (
+                project.watcher_task.take(),
+                Arc::clone(&project.stop_token),
+                project.project_id.clone(),
+            )
         };
         abort_watcher_task(&mut watcher_task, &stop_token);
+        // V11 bootstrap (C4b): retire the project's admission slot. A
+        // refusal here means the registry never held this project live
+        // (possible only for instances minted outside `load_bound`);
+        // surfaced at debug so an orphaned slot is observable, not silent.
+        if let Err(refusal) = live_index::index_lifecycle::activation::process_project_registry()
+            .stop(&live_index::index_lifecycle::registry::ProjectKey::new(
+                &project_id,
+            ))
+        {
+            tracing::debug!(?refusal, project_id, "admission slot stop refused");
+        }
     }
 
     fn base(&self) -> Arc<IndexBase> {
@@ -7053,6 +7092,44 @@ mod tests {
         let projects = state.list_projects();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].session_count, 2);
+    }
+
+    /// Feature 020 Slice 4, T030 (C4b): daemon bootstrap flows through the
+    /// activation machine and the process project registry — a project open
+    /// ADMITS through `plan_admission`/`execute_plan` and installs a live
+    /// slot charged to the daemon surface's capacity owner, and the process
+    /// machine has been driven to `PreventiveV1Open` before serving. (The C1
+    /// machine oracle pins that a fresh machine starts `LegacyOpen`, so the
+    /// mode observed here is bootstrap's doing, not a default.)
+    #[test]
+    fn project_open_admits_through_the_process_activation_registry() {
+        use crate::live_index::index_lifecycle::activation::{
+            ActivationCut, ActivationMode, process_project_registry,
+        };
+        use crate::live_index::index_lifecycle::registry::ProjectKey;
+
+        let project = project_dir("symforge-daemon-admission");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(400),
+            })
+            .expect("open session");
+
+        let live = process_project_registry()
+            .live(&ProjectKey::new(&opened.project_id))
+            .expect("the opened project holds a live admission slot");
+        assert!(
+            live.capacity_owner().expect("live slot").is_some(),
+            "the admission is charged to the daemon surface's capacity owner"
+        );
+        assert_eq!(
+            ActivationCut::process().mode(),
+            ActivationMode::PreventiveV1Open,
+            "bootstrap drives the startup ceremony before serving"
+        );
     }
 
     #[test]
