@@ -1,0 +1,8 @@
+{
+  "kind": "symforge-observed-refresh-v1-corpus",
+  "schema_version": 1,
+  "generator": "benches/observed_refresh_gate_v1.rs::write_corpus (deterministic, revision 0)",
+  "corpus_files": 40,
+  "corpus_digest": "51ce7613e55e2c1715c533a13a28ea9441f89e4ea9adb2c9993f805a7d689a11",
+  "note": "clean-rebuild equivalence and cross-run comparability both key on this digest; regenerating it is a deliberate workload change"
+}

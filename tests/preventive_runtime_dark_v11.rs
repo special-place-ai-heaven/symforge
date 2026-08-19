@@ -979,15 +979,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "72307d1c50166a2bc92beaa9233c01ba43b6add643c8e4cd82527e6f6b86ea0a",
+    "16fb134fef6d1648770db97e59add805412514a7deec92cd8eeb1a8aeb46ba6e",
     20,
-    386_351,
+    386_541,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "55c10206eac420496cb8d0e5fa4e11223c8dcd4c4e28b0274f6a845e2f8a7dcf",
+    "79164228c608f9a3d988f20b8bc285227a517ee6f087109e1721c6f28b717183",
     196,
-    9_240_164,
+    9_240_347,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1118,8 +1118,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "a45c1a8754a91cac:13452"),
-    ("release.yml", "6e996401bbb76142:110465"),
+    ("ci.yml", "d7fc46fe50bf2df8:13897"),
+    ("release.yml", "8ee888c1cf1be6a0:110910"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1218,7 +1218,20 @@ const CARGO_LINES: &[(&str, usize)] = &[
     // `--`, which is why the doctest lane stays shut; drop one and the
     // line no longer matches this pin, and drop one COPY and its count
     // no longer matches either.
-    ("run: cargo test --all-targets -- --test-threads=1", 2),
+    // C7: the suite selects `--lib --bins --tests` — explicit target
+    // selection SUPPRESSES the doctest lane (doctests build only under
+    // `--doc` or a bare no-selection `cargo test`), and the criterion
+    // bench target rejects libtest's `--test-threads`.
+    (
+        "run: cargo test --lib --bins --tests -- --test-threads=1",
+        2,
+    ),
+    // C7: `cargo bench` never builds doctests; criterion's `--test` mode
+    // runs one pass per campaign as the bench smoke gate.
+    (
+        "run: cargo bench --bench observed_refresh_gate_v1 -- --test",
+        2,
+    ),
     (
         "run: cargo test --no-default-features --features embed --lib -- --test-threads=1",
         2,
@@ -2086,9 +2099,9 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (30, 26, 2),
-        "the CI workflows hold thirty cargo-mentioning lines, twenty-six of \
-         them distinct, across two workflow files; this walk saw {:?}. A gate \
+        (32, 27, 2),
+        "the CI workflows hold thirty-two cargo-mentioning lines, twenty-seven \
+         of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \
          pin",

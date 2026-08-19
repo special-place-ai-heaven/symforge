@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-pub(crate) fn digest_hex(bytes: &[u8]) -> String {
+pub fn digest_hex(bytes: &[u8]) -> String {
     let hash = digest(bytes);
     let mut result = String::with_capacity(64);
     for byte in hash {

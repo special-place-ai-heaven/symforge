@@ -356,7 +356,10 @@ const OBSERVATION_ACCUMULATOR_BOUND: usize = 4096;
 
 /// Dark capacity budget for the observation lane's candidate builds. Real
 /// derivation payloads (and the C8 conservation oracle) replace this.
-const OBSERVATION_CAPACITY_BYTES: u64 = 1 << 30;
+/// The dark per-surface observation budget (C7/C8 replace it with a
+/// measured value); public so the benchmark receipt records the exact
+/// pre-granted capacity vector it ran under.
+pub const OBSERVATION_CAPACITY_BYTES: u64 = 1 << 30;
 
 fn observation_source_id(relative: &str) -> u64 {
     use std::hash::{Hash, Hasher};

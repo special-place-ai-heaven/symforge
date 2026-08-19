@@ -388,9 +388,43 @@ is the only thing allowed to touch it:
   is a server build. Gates: fmt; validator OK; dark 9/9 (src pins
   untouched — tests-only change); clippy -D warnings; embed cell 1336;
   full serial suite exit 0 (594s).
-- C7 (T033): criterion dev-dep + `[[bench]] observed_refresh_gate_v1`
-  (frozen registration `criterion_group:observed_refresh_gate_v1_group->
-  observed_refresh_gate_v1`) + fixtures.
+- C7 (T033 — executed 2026-08-19): criterion 0.8 dev-dep + the frozen
+  `[[bench]] observed_refresh_gate_v1` (registration
+  `criterion_group:observed_refresh_gate_v1_group->
+  observed_refresh_gate_v1`, harness=false, server-gated). The measured
+  phenomenon: exact completed write (or mutation commit) → the FIRST
+  in-process observation of the published index carrying that byte
+  identity (`IndexedFile::content` equality) — a phenomenon that exists
+  at baseline `1521abb0` too, which is what makes C9's comparison
+  meaningful. Campaigns = the real ingress lanes: `delivered_event`
+  (the actual watcher: notify + debounce + batches; the
+  daemon/stdio/serve managed-observer lane) with
+  add/modify/delete/rename/terminal-classification/burst-24 workloads;
+  `need_rescan` (changes land with NO observer; a fresh watcher's
+  mandatory fresh-instance reconciliation repairs them);
+  `suppressed_notification` (no delivery; `get_file_content` rides the
+  C4c freshen-on-read — `get_symbol` deliberately does NOT freshen, a
+  fact the first smoke run taught); `embed_mutation_commit` (the
+  synchronous facade). Controls: corpus digest pinned by
+  `tests/fixtures/observed-refresh-v1/corpus.json`, host identity,
+  quiescence probe (one untimed write observed visible before timing),
+  per-campaign completion counts, the pre-granted capacity vector
+  (`OBSERVATION_CAPACITY_BYTES`, now pub for the receipt), and
+  clean-rebuild equivalence (incremental == from-disk rebuild,
+  content-hash file-for-file). Emits the code-owned receipt
+  `target/observed-refresh-gate-v1/receipt.json`; first observed run:
+  delivered_event p95 ≈ 250-308 ms (the debounce window), burst-24
+  282 ms, need_rescan 15 ms, freshen-on-read 1-2 ms, embed commit 1 ms
+  — all far inside the p95 ≤ 2 s / max ≤ 5 s gates C9 will enforce.
+  SUITE INVOCATION CHANGE (binding): `cargo test --all-targets`
+  forwards `--test-threads=1` to every selected binary and criterion
+  rejects it, so the canonical suite is now
+  `cargo test --lib --bins --tests -- --test-threads=1` plus a separate
+  `cargo bench --bench observed_refresh_gate_v1 -- --test` smoke —
+  ci.yml, release.yml, and CLAUDE.md updated together, and the
+  doctest-lane guard re-judged all four new workflow lines
+  (target-selection flags suppress the doctest lane; cargo bench never
+  builds doctests) with fingerprints and line counts refreshed.
 - C8 (T034): capacity conservation oracle
   `whole_runtime_capacity_is_conserved_under_activation` + bench additions.
 - C9 (T035): gate run vs baseline `1521abb0` → docs/reviews/

@@ -1,7 +1,8 @@
 # CLAUDE.md — SymForge
 
 ## Verification (symforge)
-- Backend: `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`
+- Backend: `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib --bins --tests -- --test-threads=1`, `cargo bench --bench observed_refresh_gate_v1 -- --test`, `cargo build --release`
+- (as_of 2026-08-19, C7) the suite selects `--lib --bins --tests`, NOT `--all-targets`: the trailing libtest flag is forwarded to every selected binary and the criterion bench target (`observed_refresh_gate_v1`, harness = false) rejects `--test-threads`. The bench is smoked separately in criterion's `--test` mode (one pass per campaign).
 - `npm/` only: `cd npm && npm test`
 - Mixed: run both before reporting success
 
