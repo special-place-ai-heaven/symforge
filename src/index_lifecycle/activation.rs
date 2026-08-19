@@ -900,12 +900,51 @@ pub struct ProjectRuntimeHandle {
     // every `index: SharedIndex(Handle)` field as a V10 publication root,
     // and this — the sole authorized holder — is the replacement, not a root.
     data_plane: crate::live_index::store::SharedIndex,
+    // The admission slot this runtime serves under (C4c). Carried ONLY where
+    // a surface can retire slots — the daemon, whose eviction/retarget stop
+    // path revokes them. Stdio/serve admissions are process-lifetime with no
+    // stop path, so a carried slot there would feed a refusal branch nothing
+    // can emit; those handles stay `None` until C5's typed bootstrap.
+    admission: Option<Arc<super::registry::LiveProjectSlot>>,
 }
 
 impl ProjectRuntimeHandle {
-    /// Bind a handle over the data plane it owns.
+    /// Bind a handle over the data plane it owns, outside any admission
+    /// (stdio/serve/standalone-sidecar surfaces, transient test indexes).
     pub fn bind(index: crate::live_index::store::SharedIndex) -> Self {
-        Self { data_plane: index }
+        Self {
+            data_plane: index,
+            admission: None,
+        }
+    }
+
+    /// Bind a handle over the data plane it owns, under the admission slot
+    /// the surface's [`admit_project`] call installed for it.
+    pub fn bind_admitted(
+        index: crate::live_index::store::SharedIndex,
+        admission: Arc<super::registry::LiveProjectSlot>,
+    ) -> Self {
+        Self {
+            data_plane: index,
+            admission: Some(admission),
+        }
+    }
+
+    /// The typed acquisition branch for a dispatch neck (C4c): the data
+    /// plane is handed out only while the carried admission slot is still
+    /// the live occupancy of its key. The evidence is the registry's own
+    /// shared revocation flag — the slot the stop path revokes IS the slot
+    /// this handle asks — so a project retired between map lookup and
+    /// dispatch refuses instead of serving a retired index.
+    pub fn acquire(
+        &self,
+    ) -> Result<&crate::live_index::store::SharedIndex, super::registry::RegistryRefusal> {
+        if let Some(slot) = &self.admission
+            && !slot.is_live()
+        {
+            return Err(super::registry::RegistryRefusal::Tombstoned { slot: slot.slot() });
+        }
+        Ok(&self.data_plane)
     }
 
     /// The owned V10 data plane, borrowed.

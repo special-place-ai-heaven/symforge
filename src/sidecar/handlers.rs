@@ -260,11 +260,19 @@ fn freshen_sidecar_path_if_stale_at_generation(
     let Ok(abs_path) = safe_sidecar_path_for_freshen(repo_root, relative_path) else {
         return Ok(ContextSourceAuthority::CurrentIndex);
     };
+    // V11 observation lane (C4c): a request-path freshen re-admission
+    // observes under the incarnation current at call time — the handler
+    // holds no id across time, so it cannot be a late callback.
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
+    let observer = authority.active_observer();
     match watcher::freshen_file_if_stale(
         relative_path,
         &abs_path,
         state.index.data_plane(),
         expected_gen,
+        &authority,
+        observer,
     ) {
         watcher::FreshenResult::Fresh => Ok(ContextSourceAuthority::CurrentIndex),
         watcher::FreshenResult::StaleReindexed => Ok(ContextSourceAuthority::DiskRefreshed),

@@ -436,8 +436,10 @@ const WIRED_PRODUCTION_FILES: &[&str] = &[
     "src/live_index/single_file.rs",
     "src/main.rs",
     "src/protocol/edit.rs",
+    "src/protocol/edit_tools.rs",
     "src/protocol/knowledge_curation.rs",
     "src/protocol/mod.rs",
+    "src/protocol/tools.rs",
     "src/server/mod.rs",
     "src/server/serve.rs",
     "src/sidecar/handlers.rs",
@@ -912,15 +914,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "6812a0450f665ea52ccab5d981a7426a354462539f67390fc0162dc8c2a6f4bf",
+    "e854993e5232998b483ea2cab68c31001638a0e080c8f9af061ed0bd6ac8a380",
     20,
-    380_659,
+    382_432,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8f046f8c5b322a6dada574e4af03d3f6bc1c93a57605b09e50b08005e0d2a272",
+    "5ba86dc52e52b7b005c5e468e10b1ef70948f6139acf15b031ed7d6ee54d8d74",
     194,
-    9_218_949,
+    9_234_217,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

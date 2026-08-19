@@ -238,9 +238,39 @@ is the only thing allowed to touch it:
   registry-ownership move is the admission door — the
   `project_source_authority` static remains the per-root convergence
   lookup until C5 narrows it.
-- C4c (T030/T031 roots, remaining): typed acquisition branches at the
-  dispatch necks; reconciliation sweeps' per-file re-admissions join the
-  lane; data-plane admissions gated; cache-census dispositions.
+- C4c part 1 (T030 roots — executed 2026-08-19): the sweeps join the lane
+  and the daemon neck gets its typed acquisition branch. Reconciliation
+  (`reconcile_stale_files_with_stop_and_hook` and every caller) and
+  freshen-on-read (`freshen_file_if_stale` at the watcher fallback, the
+  sidecar handler, and the three edit/retrieval request paths) carry an
+  `ObserverId`: long-running sweeps carry the watcher's spawn-registered
+  incarnation, synchronous request paths the incarnation current at call
+  time (the C3b synchronous-facade ruling). Re-admissions observe on the
+  mutation EVIDENCE (`Reindexed`), removals on the completed removal —
+  before any generation re-check, since a spurious observation only
+  dirties the next cut while a missed one loses the change. Data-plane
+  admissions are thereby GATED: every sweep re-admission now flows
+  through the candidate pipeline's capacity/supersession gate (a refused
+  candidate latches a gap, never drops the change). The daemon's
+  `ProjectRuntimeHandle` carries its admission slot
+  (`bind_admitted`/`acquire`); `runtime_for_target` refuses a retired
+  slot via the registry's own shared revocation flag. Deliberately NOT
+  carried on stdio/serve handles: those admissions are process-lifetime
+  with no stop path, so a refusal branch there could never fire
+  (reporting-invariant ruling); C5's typed bootstrap revisits. RED
+  observed on all three oracles before wiring
+  (`reconciliation_sweep_feeds_the_observation_lane_under_the_carried_incarnation`,
+  `freshen_on_read_feeds_the_observation_lane`,
+  `retired_admission_slot_refuses_dispatch_at_the_runtime_neck`);
+  `src/protocol/tools.rs` and `src/protocol/edit_tools.rs` joined
+  WIRED_PRODUCTION_FILES.
+- C4c part 2 (T030/T031 roots, remaining): cache-census dispositions —
+  adjudicate the nine frozen cache members against the category's three
+  assertions; survey found the members generation-fenced or
+  non-authoritative by construction EXCEPT `WorktreeCache`, whose
+  `lookup` hit ignores which indexed root populated the entries (a
+  cross-project reroute a fresh `git worktree list` would refuse) — fix
+  RED-first, classify the rest in-file.
 - C5 (T031 exposure): embed.rs raw re-exports removed per the 79-member
   raw_embed dispositions → V11 replacement API + EmbeddedSourceHandle
   re-exports; `server_api` `pub(crate)`→`pub`; mount flip; exact-graph

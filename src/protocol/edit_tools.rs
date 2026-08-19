@@ -423,11 +423,19 @@ pub(crate) fn prepare_exact_path_for_edit(
         .ok_or_else(|| "Error: no repository root configured.".to_string())?;
     let abs_path =
         safe_repo_path_for_freshen(&repo_root, relative_path).map_err(|e| format!("Error: {e}"))?;
+    // V11 observation lane (C4c): a request-path freshen re-admission
+    // observes under the incarnation current at call time — the edit path
+    // holds no id across time, so it cannot be a late callback.
+    let lane_authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
+    let lane_observer = lane_authority.active_observer();
     let source_authority = match watcher::freshen_file_if_stale(
         relative_path,
         &abs_path,
         server.index.data_plane(),
         expected_gen,
+        &lane_authority,
+        lane_observer,
     ) {
         watcher::FreshenResult::Fresh => edit_format::EditSourceAuthority::CurrentIndex,
         watcher::FreshenResult::StaleReindexed => edit_format::EditSourceAuthority::DiskRefreshed,
@@ -465,6 +473,11 @@ pub(super) fn prepare_batch_paths_for_edit(
     unique_paths.sort();
     unique_paths.dedup();
 
+    // V11 observation lane (C4c): request-path freshens observe under the
+    // incarnation current at call time (the C3b synchronous-facade ruling).
+    let lane_authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
+    let lane_observer = lane_authority.active_observer();
     let mut refreshed = false;
     for relative_path in unique_paths {
         let abs_path = safe_repo_path_for_freshen(&repo_root, &relative_path)
@@ -474,6 +487,8 @@ pub(super) fn prepare_batch_paths_for_edit(
             &abs_path,
             server.index.data_plane(),
             expected_gen,
+            &lane_authority,
+            lane_observer,
         ) {
             watcher::FreshenResult::Fresh => {}
             watcher::FreshenResult::StaleReindexed => {

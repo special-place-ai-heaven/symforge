@@ -1198,11 +1198,18 @@ fn freshen_exact_path_for_targeted_retrieval(
     let Ok(abs_path) = safe_repo_path_for_freshen(&repo_root, relative_path) else {
         return Ok(false);
     };
+    // V11 observation lane (C4c): a request-path freshen observes under the
+    // incarnation current at call time (the C3b synchronous-facade ruling).
+    let lane_authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
+    let lane_observer = lane_authority.active_observer();
     classify_targeted_freshen_result(watcher::freshen_file_if_stale(
         relative_path,
         &abs_path,
         server.index.data_plane(),
         expected_gen,
+        &lane_authority,
+        lane_observer,
     ))
 }
 
@@ -28762,11 +28769,16 @@ mod tests {
         let stale_gen = index.current_project_generation();
         index.reload(project_b.path()).unwrap();
 
+        let lane = crate::live_index::index_lifecycle::activation::project_source_authority(
+            project_a.path(),
+        );
         let result = crate::watcher::freshen_file_if_stale(
             "src/b.rs",
             &project_a.path().join("src/b.rs"),
             &index,
             stale_gen,
+            &lane,
+            lane.active_observer(),
         );
 
         assert!(matches!(

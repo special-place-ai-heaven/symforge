@@ -1965,6 +1965,17 @@ impl DaemonState {
             )
         })?;
         let project_meta = slot.metadata.read();
+        // C4c typed acquisition: dispatch requires the project's admission
+        // slot to still be the live occupancy of its key. A project the
+        // eviction/retarget stop path retired refuses here — between the stop
+        // and the map sweep, the maps can still resolve it, and without this
+        // branch the neck would serve a retired index.
+        if let Err(refusal) = project_meta.index.acquire() {
+            return Err(format!(
+                "project '{target_id}' has been retired from the process registry \
+                 ({refusal:?}); reopen it with index_folder(path=...)"
+            ));
+        }
         let project_indexes = session
             .servers
             .iter()
@@ -3285,8 +3296,9 @@ impl ProjectInstance {
         // V11 bootstrap (C4b): every daemon project flows through the
         // process registry's single-flight admission BEFORE its index is
         // built. A refusal fails the open honestly — admission is
-        // authoritative, not advisory.
-        live_index::index_lifecycle::activation::admit_project(
+        // authoritative, not advisory. The live slot rides on the runtime
+        // handle (C4c) so the dispatch neck can refuse a retired admission.
+        let admission = live_index::index_lifecycle::activation::admit_project(
             live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
             canonical_root,
             &binding.root_id.0,
@@ -3333,9 +3345,10 @@ impl ProjectInstance {
             state_placement,
             persistence_health,
             curation_coordinator,
-            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
-                index,
-            ),
+            index:
+                crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind_admitted(
+                    index, admission,
+                ),
             watcher_info,
             watcher_task: None,
             stop_token: Arc::new(AtomicBool::new(false)),
@@ -7129,6 +7142,46 @@ mod tests {
             ActivationCut::process().mode(),
             ActivationMode::PreventiveV1Open,
             "bootstrap drives the startup ceremony before serving"
+        );
+    }
+
+    /// Feature 020 Slice 4, T030 (C4c): the dispatch neck refuses a retired
+    /// admission. Stopping a project's registry slot (what the eviction and
+    /// retarget stop path does) makes `runtime_for_target` refuse instead of
+    /// serving the retired index; the live slot resolving first is the
+    /// accepting control in the same test.
+    #[test]
+    fn retired_admission_slot_refuses_dispatch_at_the_runtime_neck() {
+        use crate::live_index::index_lifecycle::activation::process_project_registry;
+        use crate::live_index::index_lifecycle::registry::ProjectKey;
+
+        let project = project_dir("symforge-daemon-retired-neck");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(401),
+            })
+            .expect("open session");
+
+        assert!(
+            state.runtime_for_target(&opened.session_id, None).is_ok(),
+            "a live admission slot resolves at the neck"
+        );
+
+        // Retire the admission out from under the daemon maps — the race the
+        // typed branch closes (the stop path ran; the maps have not yet been
+        // swept, or a stale runtime is dispatching between the two).
+        process_project_registry()
+            .stop(&ProjectKey::new(&opened.project_id))
+            .expect("stop the live slot");
+        let Err(refused) = state.runtime_for_target(&opened.session_id, None) else {
+            panic!("a retired admission slot must refuse dispatch at the neck");
+        };
+        assert!(
+            refused.contains("retired"),
+            "the refusal names the retirement: {refused}"
         );
     }
 
