@@ -106,11 +106,25 @@ fn canonicalize_or_identity(path: &Path) -> PathBuf {
     canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Cache of known worktrees for one indexed root. Populated on demand
-/// by `refresh()`; `lookup()` refreshes once on cache miss before
-/// concluding the directory is unknown.
+/// Cache of known worktrees, FENCED per indexed root (Feature 020 Slice 4,
+/// C4c cache census). Populated on demand by `refresh()`; `lookup()`
+/// refreshes once on cache miss before concluding the directory is unknown.
+///
+/// The fence is the point: the hook holding this cache is process-wide,
+/// and a hit may only be served from entries the REQUESTING root's own
+/// `git worktree list` produced. Before the fence, entries cached for
+/// project A satisfied lookups for project B and authorized rerouting B's
+/// edit into A's worktree — a routing decision a fresh listing against B
+/// would refuse. A cache must never be more permissive than the
+/// observation it stands in for.
 #[derive(Debug, Default)]
 pub struct WorktreeCache {
+    roots: HashMap<PathBuf, RootWorktrees>,
+}
+
+/// One indexed root's slice of the cache.
+#[derive(Debug, Default)]
+struct RootWorktrees {
     entries: HashMap<PathBuf, WorktreeEntry>,
     last_refreshed: Option<Instant>,
 }
@@ -121,64 +135,93 @@ impl WorktreeCache {
         Self::default()
     }
 
-    /// Inject a worktree entry directly. Primarily used by tests that
-    /// want to exercise the resolution algorithm without shelling out
-    /// to `git`.
-    pub fn insert(&mut self, path: PathBuf) {
-        self.entries.insert(path.clone(), WorktreeEntry { path });
+    /// The canonical key one indexed root's entries live under. Callers
+    /// pass roots in whatever spelling they hold; convergence here keeps
+    /// insert/lookup/refresh on one slice per physical root.
+    fn root_key(indexed_root: &Path) -> PathBuf {
+        canonicalize_or_identity(indexed_root)
     }
 
-    /// Number of cached worktree entries.
+    /// Inject a worktree entry directly under `indexed_root`'s slice.
+    /// Primarily used by tests that want to exercise the resolution
+    /// algorithm without shelling out to `git`.
+    pub fn insert(&mut self, indexed_root: &Path, path: PathBuf) {
+        self.roots
+            .entry(Self::root_key(indexed_root))
+            .or_default()
+            .entries
+            .insert(path.clone(), WorktreeEntry { path });
+    }
+
+    /// Number of cached worktree entries across all roots.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.roots.values().map(|slice| slice.entries.len()).sum()
     }
 
     /// Whether the cache holds no entries.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
-    /// Timestamp of the most recent successful refresh, if any.
+    /// Timestamp of the most recent successful refresh across all roots,
+    /// if any.
     pub fn last_refreshed(&self) -> Option<Instant> {
-        self.last_refreshed
+        self.roots
+            .values()
+            .filter_map(|slice| slice.last_refreshed)
+            .max()
     }
 
-    /// Canonicalize `dir` and look it up. On a miss, force one refresh
-    /// (cheap — single `git` invocation) and try again.
+    /// Canonicalize `dir` and look it up WITHIN `indexed_root`'s slice.
+    /// On a miss, force one refresh of that slice (cheap — single `git`
+    /// invocation) and try again.
     ///
     /// Returns `Ok(Some(entry))` when the directory resolves to a
-    /// known worktree, `Ok(None)` when the refresh completed cleanly
-    /// but the directory is still unknown.
+    /// worktree of `indexed_root`, `Ok(None)` when the refresh completed
+    /// cleanly but the directory is still unknown to that root.
     pub fn lookup(
         &mut self,
         dir: &Path,
         indexed_root: &Path,
     ) -> Result<Option<WorktreeEntry>, WorktreeError> {
         let canon = canonicalize(dir)?;
-        if let Some(entry) = self.entries.get(&canon) {
+        let key = Self::root_key(indexed_root);
+        if let Some(entry) = self
+            .roots
+            .get(&key)
+            .and_then(|slice| slice.entries.get(&canon))
+        {
             return Ok(Some(entry.clone()));
         }
         self.refresh(indexed_root)?;
-        Ok(self.entries.get(&canon).cloned())
+        Ok(self
+            .roots
+            .get(&key)
+            .and_then(|slice| slice.entries.get(&canon).cloned()))
     }
 
-    /// Wipe the cache and repopulate from `git -C <indexed_root>
-    /// worktree list --porcelain`. Callers rarely need this directly;
-    /// `lookup` calls it on cache miss.
+    /// Wipe `indexed_root`'s slice and repopulate it from `git -C
+    /// <indexed_root> worktree list --porcelain`. Other roots' slices are
+    /// untouched. Callers rarely need this directly; `lookup` calls it on
+    /// cache miss.
     pub fn refresh(&mut self, indexed_root: &Path) -> Result<(), WorktreeError> {
         let paths = list_worktrees(indexed_root)?;
-        self.entries.clear();
+        let slice = self.roots.entry(Self::root_key(indexed_root)).or_default();
+        slice.entries.clear();
         for path in paths {
-            self.entries.insert(path.clone(), WorktreeEntry { path });
+            slice.entries.insert(path.clone(), WorktreeEntry { path });
         }
-        self.last_refreshed = Some(Instant::now());
+        slice.last_refreshed = Some(Instant::now());
         Ok(())
     }
 
-    /// Read-only view of the cached paths in no particular order.
-    /// Useful for diagnostics (e.g. building `health` output).
+    /// Read-only view of the cached paths across all roots in no
+    /// particular order. Useful for diagnostics (e.g. building `health`
+    /// output).
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
-        self.entries.keys().map(|p| p.as_path())
+        self.roots
+            .values()
+            .flat_map(|slice| slice.entries.keys().map(|p| p.as_path()))
     }
 }
 
@@ -557,8 +600,9 @@ mod tests {
     fn insert_adds_entry_without_refresh() {
         let mut cache = WorktreeCache::new();
         let tmp = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
         let canon = canonicalize(tmp.path()).unwrap();
-        cache.insert(canon.clone());
+        cache.insert(root.path(), canon.clone());
         assert_eq!(cache.len(), 1);
         let paths: Vec<&Path> = cache.paths().collect();
         assert!(paths.contains(&canon.as_path()));
@@ -669,6 +713,41 @@ mod tests {
         let mut cache = WorktreeCache::new();
         let err = resolve_target_path(&indexed_abs, &main_root, Some(stray.path()), &mut cache)
             .expect_err("should reject unknown dir");
+        assert!(
+            matches!(
+                err,
+                WorktreeError::WorkingDirectoryNotARecognizedWorktree { .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Feature 020 Slice 4, T030/T031 (C4c cache census): a cache hit is
+    /// fenced to the REQUESTING indexed root. Entries cached from project
+    /// A's `git worktree list` must not authorize rerouting project B's
+    /// edit into A's worktree — a fresh listing against B would refuse,
+    /// and the cache may not be more permissive than the observation it
+    /// stands in for. The accepting control (A's own reroute through the
+    /// same cache) is in the same test.
+    #[test]
+    fn worktree_hits_are_fenced_to_the_requesting_indexed_root() {
+        let (_tmp_a, main_a, wt_a) = make_repo_with_worktree();
+        let (_tmp_b, main_b, _wt_b) = make_repo_with_worktree();
+        let mut cache = WorktreeCache::new();
+
+        // Accepting control: A reroutes into its own worktree.
+        let indexed_abs_a = main_a.join("src/file.rs");
+        let resolved = resolve_target_path(&indexed_abs_a, &main_a, Some(&wt_a), &mut cache)
+            .expect("A's own worktree reroutes");
+        assert!(resolved.rerouted);
+
+        // B, dispatched through the SAME (process-shared) cache, presents
+        // A's worktree as its working directory. The target file exists
+        // there (both repos share the fixture layout), so only the root
+        // fence can refuse.
+        let indexed_abs_b = main_b.join("src/file.rs");
+        let err = resolve_target_path(&indexed_abs_b, &main_b, Some(&wt_a), &mut cache)
+            .expect_err("a foreign root's cached worktree must not authorize B's reroute");
         assert!(
             matches!(
                 err,

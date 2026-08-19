@@ -227,6 +227,11 @@ pub struct DaemonState {
     /// read route reads those bases and `intern_base_refresh` FORCE-REPLACES the
     /// value for a key when a watched change has advanced the project's published
     /// index (B2/D12) — still one Arc per `BaseKey` (SC-002).
+    /// Cache census (C4c): each value is a projection PINNED to one
+    /// publication — keyed by `(canonical_root, commit)`, fenced by its
+    /// minted `base_generation`, force-replaced when the published index
+    /// advances, and GC'd by the strong-count orphan sweep. C5's leases
+    /// take over the pinned-publication identity.
     bases: RwLock<HashMap<BaseKey, Arc<IndexBase>>>,
     /// Monotonic source of `base_generation` fence tokens, minted only when
     /// `intern_base` publishes a NEW base. Starts at 1; a shared (interned) base
@@ -303,6 +308,11 @@ struct ProjectInstance {
     watcher_task: Option<tokio::task::JoinHandle<()>>,
     stop_token: Arc<AtomicBool>,
     token_stats: Arc<TokenStats>,
+    /// Cache census (C4c): the project's symbol-snapshot cache. Never read
+    /// here — flows to `SessionRuntime`/`SidecarState`, whose sole reader
+    /// (the sidecar handlers) fences every hit to the current project
+    /// generation via `ensure_symbol_cache_generation`. Dropped whole with
+    /// the instance on eviction/retarget.
     symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
     session_ids: HashSet<String>,
     opened_at: SystemTime,
@@ -340,6 +350,10 @@ struct SessionRecord {
     /// keeps Principle I airtight). `Arc<RwLock>` is mandatory: `SessionRecord` is
     /// cloned on every `session_runtime` call and `WorkingSet: Clone` deep-clones
     /// overlays, so the `Arc` keeps the clone O(1) and the overlay state singular.
+    /// Cache census (C4c): entries hold interned bases pinned per
+    /// publication; every cross-project read lazily re-fences its targeted
+    /// entry against the CURRENT published index (B2/D12) before serving,
+    /// and no path writes into the overlay.
     working_set: Arc<RwLock<WorkingSet>>,
     /// Session-private protocol state, partitioned by project while shared index
     /// and project metrics remain owned by the project instance.
@@ -763,6 +777,10 @@ struct SessionRuntime {
     session_id: String,
     index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
     token_stats: Arc<TokenStats>,
+    /// Cache census (C4c): a clone of the project's symbol-snapshot Arc.
+    /// Sole reader is the sidecar handler family behind
+    /// `ensure_symbol_cache_generation` — generation-keyed, deterministic
+    /// clear on mismatch, unavailability when the generation moved.
     symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
     /// Session-private, project-keyed `SymForgeServer` clone.
     server: SymForgeServer,
@@ -776,6 +794,8 @@ struct SessionRuntime {
     /// single-project behavior is byte-identical and frecency-neutral. No overlay
     /// is written. The active project's id for the targeting contract is
     /// `project_id` above (the default target when neither param is supplied).
+    /// Cache census (C4c): same adjudication as `SessionRecord::working_set`
+    /// — this is the same `Arc`, re-fenced per read via B2/D12.
     working_set: Arc<RwLock<WorkingSet>>,
     /// Session-scoped project publications used by `search_knowledge`.
     /// Capturing from this map, rather than the daemon-global project table,

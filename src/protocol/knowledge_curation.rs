@@ -57,6 +57,12 @@ const MAX_RECOVERY_RECORDS: usize = 1_024;
 #[derive(Debug, Default)]
 pub(crate) struct KnowledgeCurationCoordinator {
     mutation_lock: Mutex<()>,
+    /// Cache census (C4c): durability-probe VERDICTS per canonical
+    /// directory, not index data. A stale `Ok` cannot mint success — the
+    /// durable write protocol reports its own failure; a stale `Err` keeps
+    /// the capability fail-closed for this coordinator's lifetime, and the
+    /// coordinator drops whole with its project instance on
+    /// eviction/retarget.
     probe_cache: Mutex<BTreeMap<PathBuf, Result<(), CapabilityUnavailableReason>>>,
     #[cfg(test)]
     probe_operations: Mutex<Vec<PathBuf>>,

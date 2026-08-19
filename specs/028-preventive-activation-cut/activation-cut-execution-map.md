@@ -264,13 +264,32 @@ is the only thing allowed to touch it:
   `retired_admission_slot_refuses_dispatch_at_the_runtime_neck`);
   `src/protocol/tools.rs` and `src/protocol/edit_tools.rs` joined
   WIRED_PRODUCTION_FILES.
-- C4c part 2 (T030/T031 roots, remaining): cache-census dispositions —
-  adjudicate the nine frozen cache members against the category's three
-  assertions; survey found the members generation-fenced or
-  non-authoritative by construction EXCEPT `WorktreeCache`, whose
-  `lookup` hit ignores which indexed root populated the entries (a
-  cross-project reroute a fresh `git worktree list` would refuse) — fix
-  RED-first, classify the rest in-file.
+- C4c part 2 (T030/T031 cache census — executed 2026-08-19): the nine
+  frozen cache members adjudicated in-file against the category's three
+  assertions. Eight were already generation-fenced or non-authoritative
+  by construction and got classification comments naming the mechanism:
+  `DaemonState::bases` (BaseKey-pinned projections, base_generation
+  fence, B2/D12 force-replace, strong-count GC), the three
+  `symbol_cache`s (sole reader is the sidecar handlers behind
+  `ensure_symbol_cache_generation`), both `working_set`s (interned bases
+  re-fenced per read via B2/D12, no overlay writes),
+  `probe_cache` (capability VERDICTS, not index data; a stale Ok cannot
+  mint success because the durable write reports its own failure;
+  dropped with the instance), `detailed_fetches` (params_hash binds
+  project/publication/content generation — pinned by
+  `hash_symbol_params_binds_generation_identity` — and a hit yields
+  dedup metadata only). ONE real defect found and fixed RED-first:
+  `WorktreeCache` was process-shared through the edit hook but its
+  `lookup` hit ignored which indexed root populated the entries, so
+  project A's cached `git worktree list` authorized rerouting project
+  B's edit into A's worktree — a routing decision a fresh listing
+  against B refuses. The cache is now fenced per canonical indexed root
+  (per-root slices; refresh touches only the requesting root's slice),
+  pinned by `worktree_hits_are_fenced_to_the_requesting_indexed_root`
+  (observed RED: B's file rerouted into A's worktree with
+  rerouted=true). The category's full retirement test
+  (`all_ingress_uses_exact_typed_authority_branch`) remains C6's
+  stand-in; the pinned-publication identity moves onto C5's leases.
 - C5 (T031 exposure): embed.rs raw re-exports removed per the 79-member
   raw_embed dispositions → V11 replacement API + EmbeddedSourceHandle
   re-exports; `server_api` `pub(crate)`→`pub`; mount flip; exact-graph

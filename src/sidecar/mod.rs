@@ -228,6 +228,10 @@ pub struct SidecarState {
     pub repo_root: Option<PathBuf>,
     /// Per-file symbol snapshot cache for impact diff.
     /// Key: relative file path. Value: symbol list captured after the last impact.
+    /// Cache census (C4c): every handler read is fenced by
+    /// `ensure_symbol_cache_generation` — a hit is served only at the
+    /// generation the cache was associated with, and a generation move
+    /// clears it deterministically.
     pub symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
 }
 
