@@ -359,9 +359,35 @@ is the only thing allowed to touch it:
     release build + verify-tools harness 7 PASS / 0 FAIL through the
     new shim; validator OK (78 requirements, 24 acceptance oracles, 13
     retirement categories).
-- C6 (T032): the four stand-ins get observing bodies, `#[ignore]` removed;
-  focused cli/init + persistence tests (cold-recovery-cannot-mint-permit,
-  frozen FR-051 matrix).
+- C6 (T032 — executed 2026-08-19): the four frozen T058 stand-ins have
+  OBSERVING bodies, `#[ignore]` removed — the stand-ins were the armed
+  RED (ignore + panic since Slice 3); the bodies observe what the cut
+  made real. TEST-ACTIVATION: every surface's ceremony lands and stays
+  in `PreventiveV1Open` (closed 3-variant mode set pinned by exhaustive
+  match; repeat ceremonies cannot regress; the fresh-machine LegacyOpen
+  start remains the C1 lib oracle's claim). TEST-EMBED: acquisition
+  drives the embed attach; one source = one handle; a second open —
+  the only bypass shape the surface can spell — refuses typed
+  (`SelectionUnavailable`); the view invents no publication;
+  close-then-reopen releases. TEST-MUTATION: on the authority's own
+  grant ledger, a read ingress mints nothing, each of two live edit
+  writes mints exactly one. TEST-STATE: admission records placement
+  exactly with a charged capacity owner; protected + project-local
+  refuses pre-install; each team-artifact export discloses its precise
+  visibility and persists exactly one; refused bindings persist
+  nothing. Plus the two focused C6 oracles:
+  `cold_recovery_mints_no_mutation_permit` (cold load + checkpoint +
+  snapshot restore = zero grants, with a real acquire as the accepting
+  control) and `init_gitignore_reconcile_acquires_exactly_one_permit`
+  (the init writer lane grants once; explicit-protected writes nothing
+  and mints nothing — and a rootless fixture honestly reported
+  NoRootGitignore/no-grant twice before the fixture earned its write).
+  The file gained a FILE-level `#![cfg(feature = "server")]`: the
+  traceability validator rightly refuses a planned oracle behind a
+  per-case feature cfg, and every CI job that builds integration tests
+  is a server build. Gates: fmt; validator OK; dark 9/9 (src pins
+  untouched — tests-only change); clippy -D warnings; embed cell 1336;
+  full serial suite exit 0 (594s).
 - C7 (T033): criterion dev-dep + `[[bench]] observed_refresh_gate_v1`
   (frozen registration `criterion_group:observed_refresh_gate_v1_group->
   observed_refresh_gate_v1`) + fixtures.
