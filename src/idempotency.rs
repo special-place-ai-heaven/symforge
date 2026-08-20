@@ -412,37 +412,48 @@ impl FileReplayStore {
         self.record_path_for_hash(&key.key_hash())
     }
 
-    /// One-winner supersede claim (T038 round-1): `create_new` is the same
-    /// atomic first-claim primitive `check_or_reserve` uses, so exactly one
-    /// of N concurrent contenders superseding the same unverified record may
-    /// retake its reservation — the losers answer as reserved instead of
-    /// double-executing the mutation. A marker orphaned by a crash between
-    /// claim and release (two adjacent fs writes) heals by age.
+    /// One-winner supersede claim (T038 round-1; heal narrowed in round-2):
+    /// `create_new` is the same atomic first-claim primitive
+    /// `check_or_reserve` uses, so of N concurrent contenders superseding
+    /// the same unverified record, one retakes its reservation and the
+    /// losers answer as reserved instead of double-executing the mutation.
+    ///
+    /// A marker orphaned by a crash between claim and release (two adjacent
+    /// fs writes) heals by age — but healing NEVER claims in the same call:
+    /// round-2 review showed delete-then-claim lets a second healer delete
+    /// the first healer's FRESH marker by name and mint two winners. The
+    /// healer removes the orphan, answers "not claimed" (one extra reserved
+    /// response after a crash), and the NEXT retry claims the clean slot
+    /// through the ordinary `create_new` path.
+    ///
+    /// Recorded residual, stated exactly: a contender whose staleness
+    /// judgment predates another healer's removal can still delete a fresh
+    /// marker created in between. That interleave needs a crash-orphan plus
+    /// three parties racing inside the winner's two-fs-write claim window
+    /// (microseconds); its degradation equals the pre-claim behavior, and
+    /// no name-based marker scheme can close it without an
+    /// identity-compare-and-delete primitive the filesystem does not offer.
     pub fn try_claim_supersede(&self, key_hash: &str) -> Result<bool, IdempotencyError> {
         let marker = self.supersede_marker_path(key_hash);
-        for attempt in 0..2 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)
-            {
-                Ok(_) => return Ok(true),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&marker)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > SUPERSEDE_MARKER_STALE);
-                    if attempt == 0 && stale {
-                        let _ = fs::remove_file(&marker);
-                        continue;
-                    }
-                    return Ok(false);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&marker)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > SUPERSEDE_MARKER_STALE);
+                if stale {
+                    let _ = fs::remove_file(&marker);
                 }
-                Err(error) => return Err(IdempotencyError::Io(error)),
+                Ok(false)
             }
+            Err(error) => Err(IdempotencyError::Io(error)),
         }
-        Ok(false)
     }
 
     /// Release a claim taken by [`Self::try_claim_supersede`]. Best-effort:
@@ -662,6 +673,30 @@ pub fn probe_tool_replay(
     }
 }
 
+/// Test-only interleave hook: fires between the supersede claim and the
+/// double-checked re-read in [`begin_tool_replay_verified`], so an oracle can
+/// deterministically stand in for a concurrent contender that already
+/// superseded (the round-2 Critical's exact window). Same pattern as
+/// `edit.rs`'s `write_interleave`.
+#[cfg(test)]
+pub(crate) mod supersede_interleave {
+    use std::cell::Cell;
+    thread_local! {
+        static HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+    pub fn install(hook: fn()) {
+        HOOK.with(|cell| cell.set(Some(hook)));
+    }
+    pub fn clear() {
+        HOOK.with(|cell| cell.set(None));
+    }
+    pub(super) fn fire() {
+        if let Some(hook) = HOOK.with(|cell| cell.get()) {
+            hook();
+        }
+    }
+}
+
 /// [`begin_tool_replay`] with the replay-authority fence (Feature 020
 /// Slice 4): a stored result is replayed ONLY when its source-bound
 /// post-image receipt verifies against the CURRENT bytes at the recorded
@@ -694,14 +729,52 @@ pub fn begin_tool_replay_verified(
             }
             // T038 round-1 repair: superseding must have ONE winner. Without
             // the claim, two concurrent identical-key retries could both
-            // retake the reservation and both execute the mutation. Losers
-            // answer as reserved — transient by construction (the winner's
-            // record write and marker release are adjacent, and an orphaned
-            // marker heals by age).
+            // retake the reservation and both execute the mutation.
             if !store.try_claim_supersede(&key.key_hash())? {
                 return Ok(ReplayStart::Replay(replay_response(
                     &ReplayRecord::reserved(key.key_hash(), request_hash.clone()),
                 )));
+            }
+            #[cfg(test)]
+            supersede_interleave::fire();
+            // T038 round-2 repair (Critical): the read and verify above ran
+            // UNFENCED — a contender may have claimed, superseded, and
+            // released between our read and our claim, making the pre-claim
+            // decision stale. Re-read and RE-DECIDE under the marker
+            // (double-checked locking): only a record that is STILL the
+            // unverified completed/failed one may be superseded. A record
+            // now Reserved answers as reserved; a record whose fresh receipt
+            // now verifies replays the fresh truth. Recorded residual: the
+            // crash-orphan heal path can, in a multi-party interleave, strip
+            // a live marker — the double check bounds even that to two
+            // re-reads landing inside one contender's re-read-to-write
+            // window (microseconds), versus the pre-fix exposure of the
+            // whole verify window.
+            let decision = match store.replay_if_present(&key, &request_hash) {
+                Ok(Some(current)) => {
+                    let current_verified =
+                        current.post_image.as_ref().is_some_and(verify_post_image);
+                    if current_verified || current.status == ReplayStatus::Reserved {
+                        Some(replay_response(&current))
+                    } else {
+                        None
+                    }
+                }
+                // Record gone under the claim (external tampering): the
+                // conservative answer is the transient reserved response —
+                // never a blind re-execution off a vanished decision base.
+                Ok(None) => Some(replay_response(&ReplayRecord::reserved(
+                    key.key_hash(),
+                    request_hash.clone(),
+                ))),
+                Err(error) => {
+                    store.release_supersede(&key.key_hash());
+                    return Err(error);
+                }
+            };
+            if let Some(response) = decision {
+                store.release_supersede(&key.key_hash());
+                return Ok(ReplayStart::Replay(response));
             }
             let superseding = ReplayRecord::reserved(key.key_hash(), request_hash.clone());
             let written = store.write_record_atomic(&superseding);
@@ -855,8 +928,10 @@ mod tests {
             "a released claim is reclaimable"
         );
 
-        // Crash-orphan healing: backdate the marker past the staleness bound;
-        // the next claim reclaims it instead of wedging the key forever.
+        // Crash-orphan healing: backdate the marker past the staleness bound.
+        // Healing must NOT claim in the same call (round-2: delete-then-claim
+        // re-opens the two-winner race) — it removes the orphan and answers
+        // "not claimed"; the NEXT claim owns the clean slot.
         let marker = store.supersede_marker_path("k1");
         std::fs::File::options()
             .write(true)
@@ -868,9 +943,81 @@ mod tests {
             )
             .expect("backdate marker");
         assert!(
-            store.try_claim_supersede("k1").expect("stale reclaim"),
-            "an orphaned marker past the staleness bound must be reclaimable"
+            !store.try_claim_supersede("k1").expect("stale heal"),
+            "healing an orphaned marker must not claim in the same call"
         );
+        assert!(
+            !marker.exists(),
+            "the orphaned marker must be removed by the heal"
+        );
+        assert!(
+            store.try_claim_supersede("k1").expect("post-heal claim"),
+            "the claim after the heal owns the clean slot"
+        );
+    }
+
+    /// T038 round-2 (Critical repair, deterministic interleave): the
+    /// pre-claim read and verify run UNFENCED, so a contender can claim,
+    /// supersede, and release between our read and our claim. The hook
+    /// stands in for that contender by rewriting the record to Reserved
+    /// right after we win the claim; `begin_tool_replay_verified` must
+    /// RE-DECIDE under the marker and answer as reserved — never
+    /// double-execute off the stale pre-claim decision.
+    #[test]
+    fn a_record_superseded_between_read_and_claim_is_not_double_executed() {
+        use std::sync::OnceLock;
+        static STATE: OnceLock<(ProjectStateDir, String)> = OnceLock::new();
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let project_state = ProjectStateDir::new(
+            dunce::canonicalize(dir.path())
+                .expect("canonical tempdir")
+                .join("state"),
+        );
+        std::fs::create_dir_all(project_state.as_path()).expect("state dir");
+        let request = json!({ "path": "src/x.rs" });
+
+        // Seed an UNVERIFIED completed record (v1 shape: no post-image).
+        let ReplayStart::FirstExecution(active) =
+            begin_tool_replay_verified(&project_state, "t", "race-key", &request)
+                .expect("first begin")
+        else {
+            panic!("fresh key must be a first execution");
+        };
+        active
+            .complete_with_post_image("first result".to_string(), None)
+            .expect("complete without receipt");
+
+        let key = IdempotencyKey::new("race-key").expect("key");
+        STATE
+            .set((project_state.clone(), key.key_hash()))
+            .expect("state slot");
+
+        // The stand-in contender: after our claim, the record becomes
+        // Reserved (as a real winner's superseding write would make it).
+        fn contender() {
+            let (project_state, key_hash) = STATE.get().expect("state");
+            let store = FileReplayStore::open(project_state).expect("store");
+            let request_hash =
+                RequestHash::for_tool_request("t", &json!({ "path": "src/x.rs" })).expect("hash");
+            store
+                .write_record_atomic(&ReplayRecord::reserved(key_hash.clone(), request_hash))
+                .expect("contender write");
+        }
+        supersede_interleave::install(contender);
+        let outcome = begin_tool_replay_verified(&project_state, "t", "race-key", &request);
+        supersede_interleave::clear();
+
+        match outcome.expect("begin under interleave") {
+            ReplayStart::Replay(response) => assert!(
+                response.contains("still reserved"),
+                "the re-decision under the claim must answer as reserved: {response}"
+            ),
+            ReplayStart::FirstExecution(_) => panic!(
+                "double execution: the stale pre-claim decision was acted on \
+                 although the record was superseded before the claim"
+            ),
+        }
     }
 
     #[test]

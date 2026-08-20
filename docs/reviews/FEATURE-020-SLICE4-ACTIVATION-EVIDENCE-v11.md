@@ -311,6 +311,78 @@ quarantine landed in this round; wiring the richer `SnapshotStore`
 per-entry proof machinery into the live restore path remains open. See
 that document for the exact scope.
 
+## 7b. T038 Round 2 (executed 2026-08-20)
+
+Three fresh reviewers over round 1's own output: a refuter verifying each
+claimed fix against the resulting code, a mandatory cfg-lens re-sweep, and
+an adversarial hunt on the new machinery round 1 introduced (the
+least-reviewed code on the branch).
+
+**Verdicts on round 1's repairs**: six of seven confirmed genuinely closed
+with independent evidence — the watcher observation gates, the eviction-seam
+publish gate, the in-memory post-image digests (verified byte-verbatim
+end-to-end through both write lanes, including reroute), the CCR fail-closed
+arm, all three D16 capture sites (each traced to render exclusively from the
+captured bundle), and the CI lanes/pins (the workflow fingerprints
+independently recomputed to byte-exact matches).
+
+**One Critical, confirmed and fixed RED-first**: the round-1 supersede
+marker guarded only the final two fs writes — the pre-claim read and
+post-image verify ran unfenced, so the dominant interleave (contender B's
+claim landing after contender A's release) still double-executed. Fixed
+with real double-checked locking: `begin_tool_replay_verified` now
+re-reads and RE-DECIDES the record under the claim — a record now
+Reserved answers as reserved; a record whose fresh receipt verifies
+replays the fresh truth; only a record still unverified may be
+superseded. The RED was observed deterministically via a new test-only
+interleave hook (`supersede_interleave`, the `write_interleave` pattern):
+with the re-decision bypassed, the oracle
+`a_record_superseded_between_read_and_claim_is_not_double_executed`
+reported the double execution; with it in place, the reserved answer.
+
+**The stale-marker heal TOCTOU** (found independently by all three
+reviewers): delete-then-claim let a second healer delete the first's fresh
+marker and mint two winners. Fixed by healing WITHOUT claiming — the
+healer removes the orphan, answers "not claimed", and the next retry
+claims the clean slot through the ordinary `create_new` path. Recorded
+residual, stated exactly in the code: a multi-party interleave following
+a crash-orphan can still strip a live marker; the double-checked re-read
+bounds even that to two re-reads landing inside one contender's
+re-read-to-write window (microseconds), versus the pre-fix exposure of
+the whole verify window. No name-based marker scheme closes it fully
+without an identity-compare-and-delete primitive the filesystem lacks.
+
+**cfg-lens round 2**: one structurally dead `#[cfg(not(feature =
+"server"))]` arm inside server-mounted `protocol/tools.rs`
+(`proxy_reset_calibration_receipt`'s embed twin compiled in NO cell while
+claiming embed behavior) — both the dead arm and its now-redundant
+sibling gate removed. The new CCR `(Some, None)` arm was untested and its
+message misreported an unobserved "different source publication" — split
+into a distinct typed `PublicationUnverifiable` refusal with an honest
+message, pinned by a new unit case (bound blob + unavailable current →
+typed unverifiable; identity-free blob control keeps generic behavior).
+A wire-protection comment added to `ArtifactGitVisibility` (its long
+variant identifier derives the frozen FR-051 snake_case label and must
+not be "fixed" by a future rename sweep); one review-provenance label
+corrected in snapshot.rs.
+
+**Adjudicated-declined** (recorded, not silently dropped): flattening
+`remove_snapshot_deleted_file_if_still_absent`'s `Option<bool>` into
+`FencedRemoval` (cosmetic; the tri-state is local to one caller and two
+tests); `detect_impact`'s marginally staler-but-receipt-consistent render
+under a mid-diff publish (that is D16's point — the deliberate trade is
+hereby recorded).
+
+**Battery for round 2**: fmt clean; all three clippy lanes exit 0; dark
+seal 9/9 (both pins refreshed — EXCLUDED moved for the reviewed
+comment-only snapshot.rs diff); embed cell exactly **1340** (the
+interleave oracle added one; new frozen count); full serial suite exit 0;
+bench smoke exit 0; validator OK; campaign oracle 1/1 exact. Operational
+note: the documented target-dir feature-interleaving corruption struck
+twice this round (rustc ICE + E0786); recovered per the recovery ladder,
+terminally via full `cargo clean` (which also reclaimed a 120 GiB debug
+tree) — no code defect involved, exactly as `CLAUDE.md` records.
+
 ## 7. Open obligations before merge
 
 - **T038**: multi-round adversarial review (cfg-lens sweep included),

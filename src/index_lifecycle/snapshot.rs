@@ -103,11 +103,12 @@ pub enum GitVisibility {
     AlreadyTracked,
     UntrackedVisible,
     IgnoredForceAddRequired,
-    // T038 round-2 (cfg-lens): renamed from `GitVisibilityUnavailable` — the
+    // T038 round-1 repair: renamed from `GitVisibilityUnavailable` — the
     // stutter tripped `clippy::enum_variant_names` in the doorless embed
-    // cell, a lane this campaign had never actually run door-open until now.
-    // No frozen contract names this Rust identifier (the frozen wire label
-    // is the separate snake_case string "git_visibility_unavailable").
+    // clippy lane the same round un-masked. No frozen contract names this
+    // Rust identifier (the frozen wire label is persist.rs's separate
+    // snake_case string "git_visibility_unavailable", whose identifier is
+    // deliberately NOT renamed — see `ArtifactGitVisibility`).
     Unavailable,
 }
 

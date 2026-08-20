@@ -12137,7 +12137,12 @@ impl SymForgeServer {
     /// language whether the reset ran locally or through the proxy: a real
     /// cleared-sample count with a store, or the "no durable store" no-op note
     /// without one.
-    #[cfg(feature = "server")]
+    ///
+    /// No feature gate: `protocol/tools.rs` is mounted only under
+    /// `feature = "server"` (internals.rs), so a per-item `server` gate here
+    /// is redundant and its former `not(server)` sibling compiled in NO cell
+    /// while claiming embed behavior (T038 round-2 cfg-lens finding; both
+    /// removed).
     pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
         match self.reset_calibration() {
             Some(cleared) => format!(
@@ -12148,14 +12153,6 @@ impl SymForgeServer {
                     .to_string()
             }
         }
-    }
-
-    /// Embed/no-`server` builds have no durable calibration store wired, so the
-    /// reset is an honest no-op — mirrors the `reset_calibration() == None` arm
-    /// of the local path.
-    #[cfg(not(feature = "server"))]
-    pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
-        "calibration_reset: no durable store; in-memory calibration is already deferred".to_string()
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -12342,6 +12339,12 @@ impl SymForgeServer {
             Err(crate::protocol::ccr::CcrRetrieveError::ForeignPublication) => {
                 "CCR retrieve: handle was rendered from a different source publication; retry \
                  the originating search in this project."
+                    .to_string()
+            }
+            Err(crate::protocol::ccr::CcrRetrieveError::PublicationUnverifiable) => {
+                "CCR retrieve: the current publication identity is unavailable (project still \
+                 binding or mid-retarget), so the handle's currency cannot be verified; retry \
+                 after the project finishes binding, or rerun the originating search."
                     .to_string()
             }
         }

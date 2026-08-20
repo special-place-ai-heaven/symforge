@@ -868,6 +868,12 @@ pub enum ArtifactGitVisibility {
     AlreadyTracked,
     UntrackedVisible,
     IgnoredForceAddRequired,
+    // Deliberately KEEPS the long identifier the dark-model enum in
+    // snapshot.rs renamed away: here `rename_all = "snake_case"` derives the
+    // frozen FR-051 wire label "git_visibility_unavailable" FROM the
+    // identifier, so renaming it would break the artifact-metadata format.
+    // (`enum_variant_names` does not fire — no stutter against
+    // `ArtifactGitVisibility`.)
     GitVisibilityUnavailable,
 }
 

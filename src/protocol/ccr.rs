@@ -102,6 +102,12 @@ pub enum CcrRetrieveError {
     /// current binding (frozen: "Evicted or foreign generations return typed
     /// unavailability").
     ForeignPublication,
+    /// The handle carries a publication identity but the CURRENT identity is
+    /// unavailable (unbound session, mid-bind, mid-retarget). Nothing
+    /// observed a foreign source — what was observed is that currency cannot
+    /// be verified, and "cannot verify" is not "verified current" (T038
+    /// round-2: refuse with the honest cause, never fail open).
+    PublicationUnverifiable,
 }
 
 /// A redeemed blob: the stored bytes plus the publication that rendered them,
@@ -237,18 +243,19 @@ impl CcrStore {
         {
             return Err(CcrRetrieveError::SecretPolicyMismatch);
         }
-        // T038 round-1 repair: a blob minted under a KNOWN publication must
-        // not fail open when the current identity is unavailable (mid-bind,
-        // mid-retarget, or mid-reset). "Cannot verify" is not "verified
-        // current" — refuse the same as an explicit mismatch. A blob minted
-        // with NO identity (`stored: None`) keeps its prior generic
-        // behavior, matching the secret-policy check's precedent above.
+        // T038 round-1 repair (variant split in round-2): a blob minted
+        // under a KNOWN publication must not fail open when the current
+        // identity is unavailable (mid-bind, mid-retarget, or mid-reset).
+        // "Cannot verify" is not "verified current" — but it is also not an
+        // OBSERVED foreign source, so the two refusals carry distinct typed
+        // causes. A blob minted with NO identity (`stored: None`) keeps its
+        // prior generic behavior, matching the secret-policy precedent above.
         match (&blob.publication, current_publication) {
             (Some(stored), Some(current)) if stored.source_digest != current.source_digest => {
                 return Err(CcrRetrieveError::ForeignPublication);
             }
             (Some(_), None) => {
-                return Err(CcrRetrieveError::ForeignPublication);
+                return Err(CcrRetrieveError::PublicationUnverifiable);
             }
             _ => {}
         }
@@ -672,6 +679,23 @@ mod tests {
                 Some(&publication_b)
             ),
             Err(CcrRetrieveError::ForeignPublication)
+        ));
+
+        // T038 round-2 pin: an identity-bearing blob must not fail OPEN when
+        // the CURRENT identity is unavailable (unbound/mid-retarget) — and
+        // the refusal names unverifiability, not an unobserved foreign
+        // source.
+        assert!(matches!(
+            store.retrieve_checked(&h1, crate::knowledge::SECRET_POLICY_VERSION, None),
+            Err(CcrRetrieveError::PublicationUnverifiable)
+        ));
+
+        // Control: an identity-FREE blob keeps its generic behavior under an
+        // unavailable current identity.
+        let generic = store.insert("search_text", "generic bytes".to_string(), None);
+        assert!(matches!(
+            store.retrieve_checked(&generic, crate::knowledge::SECRET_POLICY_VERSION, None),
+            Ok(Some(_))
         ));
     }
 
