@@ -9,6 +9,10 @@
 !/.cargo/config.toml
 !/.github/
 
+# Cursor plugin manifest (marketplace / Grok Bot). Root `/.*/` would
+# otherwise ignore this directory and the logo would never reach GitHub.
+!/.cursor-plugin/
+
 # Spec Kit: tracked so `git worktree add` carries the templates, scripts and
 # constitution into every worktree. .specify/.gitignore (shipped by the CLI)
 # excludes the per-checkout bits like feature.json.

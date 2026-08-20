@@ -1,0 +1,25 @@
+{
+  "name": "symforge",
+  "version": "11.0.0",
+  "description": "Local-first MCP code intelligence: symbol index, targeted search, and structural edits. Spawns npx -y symforge on the agent host so npm picks that OS's binary. Index any path with index_folder.",
+  "author": {
+    "name": "special-place-ai-heaven"
+  },
+  "homepage": "https://github.com/special-place-ai-heaven/symforge",
+  "repository": "https://github.com/special-place-ai-heaven/symforge",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "logo": ".cursor-plugin/assets/logo.png",
+  "keywords": [
+    "mcp",
+    "code-indexing",
+    "code-retrieval",
+    "symbols",
+    "cursor"
+  ],
+  "mcpServers": {
+    "symforge": {
+      "command": "npx",
+      "args": ["-y", "symforge"]
+    }
+  }
+}
