@@ -26,6 +26,17 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.11.1...v11.0.0) (2026-08-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **feature-020:** activate the preventive index lifecycle (V11 cut) ([#601](https://github.com/special-place-ai-heaven/symforge/issues/601))
+
+### Features
+
+* **feature-020:** activate the preventive index lifecycle (V11 cut) ([#601](https://github.com/special-place-ai-heaven/symforge/issues/601)) ([35364b8](https://github.com/special-place-ai-heaven/symforge/commit/35364b8428c971fb3bddc13149c1cc42d51f412c))
+
 ## [10.11.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.11.0...v10.11.1) (2026-08-18)
 
 
