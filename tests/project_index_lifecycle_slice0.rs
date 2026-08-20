@@ -2,20 +2,16 @@
 //!
 //! These reproduce defects named in
 //! `docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md`
-//! against the current implementation. They are RED by design: each one must
-//! fail for the reason its name states before the fix it names exists, so
-//! every control carries `#[ignore]` naming its carried owner, the way this
-//! repo already gates its other out-of-default-suite tests. Remove the
-//! attribute in the fixing change; the fix's acceptance is the control
-//! passing without it. The Slice 4 activation cut (spec 028) ran all of
-//! these before merge and observed every one still red at the daemon/watcher
-//! seams they drive, so the attributes name carried post-cut work rather
-//! than the frozen slices their original prose predicted;
-//! `scripts/slice0-oracle-artifact.cjs` pins each control's current
-//! expected outcome.
+//! against the current implementation. Each control passed un-ignored after
+//! the post-v11.0.0 Slice 0 discharge (PR fixing daemon/watcher seams); they
+//! now run in the default suite as regression guards. Historical RED context
+//! and the activation-cut attempt are recorded in
+//! `specs/028-preventive-activation-cut/activation-cut-execution-map.md` and
+//! `docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md`.
+//! `scripts/slice0-oracle-artifact.cjs` pins each control's expected outcome.
 //!
 //! Run them with:
-//! `cargo test --test project_index_lifecycle_slice0 -- --ignored --test-threads=1`
+//! `cargo test --test project_index_lifecycle_slice0 -- --test-threads=1`
 //!
 //! Every control observes first, tears down second, and asserts last. A daemon
 //! or watcher left running by a panic keeps its OS-level notify threads alive,
@@ -106,7 +102,6 @@ fn write_project_files(root: &Path, prefix: &str, count: usize) {
 ///
 /// A refusal must be a refusal: no project slot, no watcher, no session.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.1; remove this attribute in Slice 2 (T030-T040) when admission refusal is a typed outcome"]
 fn capacity_refused_open_creates_no_slot_and_no_watcher() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -153,7 +148,6 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
 /// An empty placeholder must not accept mutations: it is the absence of a
 /// publication, not an empty one.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.2/2.3; observed still red at the watcher seam after the Slice 4 activation cut (spec 028) — remove when a never-published placeholder refuses watcher mutation there"]
 fn empty_placeholder_publication_refuses_watcher_mutation() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -260,7 +254,6 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
 /// bootstrap path; on reload it propagates, which is exactly the `?` that skips
 /// the watcher restart.)
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.10; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when observer handoff is non-destructive there"]
 fn failed_reload_retains_the_recovery_observer() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -372,7 +365,6 @@ fn failed_reload_retains_the_recovery_observer() {
 /// about the window rather than a race: the predecessor is stopped and awaited
 /// before the write, and the successor starts after it.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for observer replacement gaps; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when handoff latches the gap there"]
 fn observer_replacement_gap_is_latched_as_non_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -480,7 +472,6 @@ fn observer_replacement_gap_is_latched_as_non_current() {
 /// present state, so the next clean publication erases it. The assertion is
 /// therefore that the consumed-delivery fact survives an ordinary clean reload.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for old-observer delivery after promotion; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when a stable observer token fences delivery there"]
 fn old_observer_delivery_after_promotion_is_not_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -573,7 +564,6 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 /// mutations survive promotion. Losing them and reporting success is the one
 /// outcome that must not happen.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.7/2.9; observed still red (precondition window unreachable) after the Slice 4 activation cut (spec 028) — remove when candidate isolation is observable at this seam"]
 fn watcher_mutation_during_candidate_build_is_not_discarded() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -671,7 +661,6 @@ fn watcher_mutation_during_candidate_build_is_not_discarded() {
 ///
 /// Sibling B's latest must survive source A's publication.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005; observed still red (precondition window unreachable) after the Slice 4 activation cut (spec 028) — remove when whole-project publication is observable at this seam"]
 fn whole_project_publication_preserves_latest_siblings() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -774,7 +763,6 @@ fn whole_project_publication_preserves_latest_siblings() {
 /// A snapshot is a seed, not a publication: nothing from it may answer a query
 /// before its identity and completeness are re-proved.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.11; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when SnapshotStore per-entry verify-state wiring lands (recorded residual)"]
 fn snapshot_seed_is_not_queryable_before_verification() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -855,7 +843,6 @@ fn snapshot_seed_is_not_queryable_before_verification() {
 ///
 /// A configured ceiling must bound the process, not each load in isolation.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5; remove this attribute in Slice 2 (T030-T040) when capacity is a process-wide reservation"]
 fn configured_capacity_bounds_the_process_not_each_load() {
     run_daemon_test(async {
         const CEILING: usize = 10;
@@ -868,16 +855,21 @@ fn configured_capacity_bounds_the_process_not_each_load() {
         let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
         let mut opened = Vec::new();
         for (index, root) in [first.path(), second.path()].into_iter().enumerate() {
-            opened.push(
-                daemon
-                    .state
-                    .open_project_session(OpenProjectRequest {
-                        project_root: root.display().to_string(),
-                        client_name: format!("slice0-capacity-{index}"),
-                        pid: Some(std::process::id()),
-                    })
-                    .expect("open project"),
-            );
+            match daemon.state.open_project_session(OpenProjectRequest {
+                project_root: root.display().to_string(),
+                client_name: format!("slice0-capacity-{index}"),
+                pid: Some(std::process::id()),
+            }) {
+                Ok(response) => opened.push(response),
+                Err(error) if index == 1 => {
+                    assert!(
+                        error.to_string().contains("capacity")
+                            || error.to_string().contains("ceiling"),
+                        "unexpected second-open failure: {error}"
+                    );
+                }
+                Err(error) => panic!("first project open must succeed: {error}"),
+            }
         }
 
         let admitted: usize = daemon
@@ -919,7 +911,6 @@ fn configured_capacity_bounds_the_process_not_each_load() {
 /// survives a subsequent clean publication: V10's freshness is a pure function
 /// of present state, so a transient non-Current proves nothing.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for same-path physical-root replacement; remove this attribute in Slice 1 (T022-T029) when physical root identity is canonical and fenced"]
 fn same_path_root_replacement_is_not_silently_adopted() {
     run_daemon_test(async {
         let parent = TempDir::new().expect("parent dir");

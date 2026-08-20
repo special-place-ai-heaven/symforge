@@ -1055,6 +1055,7 @@ pub async fn run_watcher_with_stop(
                         &repo_root,
                     )
                     .register_observer();
+                shared.note_observer_registration();
 
                 // Registration starts a fresh watcher instance. Events lost
                 // before this point cannot be recovered from the new channel,
@@ -2997,6 +2998,7 @@ mod tests {
                 coupling_store: None,
                 local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
                 indexed_root: None,
+                indexed_root_fingerprint: None,
             };
             index.update_file(rel_path.to_string(), indexed);
             crate::live_index::SharedIndexHandle::shared(index)
@@ -3075,6 +3077,7 @@ mod tests {
                 coupling_store: None,
                 local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
                 indexed_root: None,
+                indexed_root_fingerprint: None,
             };
             crate::live_index::SharedIndexHandle::shared(index)
         };
@@ -3214,6 +3217,7 @@ mod tests {
                 coupling_store: None,
                 local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
                 indexed_root: None,
+                indexed_root_fingerprint: None,
             };
             crate::live_index::SharedIndexHandle::shared(index)
         };
@@ -3264,6 +3268,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
 
         // SymForge's own gitignored state dir must never be indexed, even though
@@ -3489,6 +3494,7 @@ mod tests {
                 coupling_store: None,
                 local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
                 indexed_root: None,
+                indexed_root_fingerprint: None,
             };
             index.update_file(rel_path.to_string(), indexed);
             crate::live_index::SharedIndexHandle::shared(index)
@@ -3534,6 +3540,7 @@ mod tests {
                 coupling_store: None,
                 local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
                 indexed_root: None,
+                indexed_root_fingerprint: None,
             };
             crate::live_index::SharedIndexHandle::shared(index)
         };

@@ -1218,6 +1218,9 @@ fn path_within_indexed_root(relative_path: &str, root: &std::path::Path) -> bool
 impl LiveIndex {
     /// O(1) lookup of a file by its relative path.
     pub fn get_file(&self, relative_path: &str) -> Option<&IndexedFile> {
+        if self.snapshot_verify_state.blocks_query_visibility() {
+            return None;
+        }
         self.files.get(relative_path).map(|file| file.as_ref())
     }
 
@@ -3314,6 +3317,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         // Rebuild the reverse index so xref query tests work.
         index.rebuild_reverse_index();
@@ -5666,6 +5670,7 @@ impl Actor for MyActor {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         assert!(!index.is_ready());
     }
@@ -5705,6 +5710,7 @@ impl Actor for MyActor {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
 
         match index.index_state() {

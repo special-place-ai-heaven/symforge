@@ -323,6 +323,12 @@ where
     R: FnMut(&Path, &crate::domain::FileStamp) -> crate::live_index::store::StableReadOutcome,
 {
     let language = language.into();
+    if !shared.accepts_source_observation() {
+        return ReindexReceipt::observed(
+            ReindexOutcome::Skipped,
+            PublicationFence::from_published(&shared.published_generation()),
+        );
+    }
     let mut base = shared.published_generation();
     let mut observed_at = PublicationFence::from_published(&base);
     // Keep single-file watcher/freshen paths symmetric with the bulk walk.
@@ -601,6 +607,7 @@ where
                     expected_index_state_generation,
                 ) {
                     debug!("watcher: hash-skip {relative_path}");
+                    shared.note_stale_observer_delivery_for_path(abs_path);
                     return ReindexReceipt {
                         outcome: ReindexOutcome::HashSkip,
                         observed_at,
@@ -639,6 +646,7 @@ where
             expected_index_state_generation,
         ) {
             debug!("watcher: re-indexed {relative_path}");
+            shared.note_stale_observer_delivery_for_path(abs_path);
             return ReindexReceipt {
                 outcome: ReindexOutcome::Reindexed,
                 observed_at,

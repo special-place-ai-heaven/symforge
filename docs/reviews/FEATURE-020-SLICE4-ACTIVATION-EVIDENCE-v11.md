@@ -167,7 +167,9 @@ Additionally, observed post-review on 2026-08-20 (recorded in the map's
 un-ignored against the cut and remain red at the daemon/watcher seams
 they drive. This green therefore does not prove those seven frozen-tree
 acceptance behaviors; they stay RED on the slice-0 oracle roster as
-carried post-cut work.
+carried post-cut work. **Update (Feature 020 Slice 0 discharge PR)**:
+those eleven controls now pass un-ignored; the slice-0 oracle records
+them as resolved-green with no remaining RED roster entries.
 
 ## 7a. T038 Round 1 (executed 2026-08-20)
 

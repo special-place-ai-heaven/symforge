@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -214,6 +215,8 @@ pub struct DaemonSessionClient {
     project_root: Option<PathBuf>,
 }
 
+type ColdOpenGate = Arc<OnceLock<anyhow::Result<Arc<ProjectSlot>>>>;
+
 pub struct DaemonState {
     next_session_id: AtomicU64,
     // Registry/session guards protect only map membership and short metadata
@@ -264,6 +267,8 @@ pub struct DaemonState {
     /// Notified by the reaper once the idle-shutdown window elapses;
     /// `run_daemon_until_shutdown` treats it like a shutdown signal.
     idle_shutdown: tokio::sync::Notify,
+    /// Single-flight cold opens keyed by project id.
+    cold_opens: Mutex<HashMap<String, ColdOpenGate>>,
 }
 
 struct AuthenticatedActivityGuard {
@@ -317,6 +322,8 @@ struct ProjectInstance {
     session_ids: HashSet<String>,
     opened_at: SystemTime,
     activation_state: ActivationState,
+    /// Process-wide catalog capacity charged for this project's file count.
+    charged_catalog_entries: u64,
 }
 
 struct ProjectSlot {
@@ -862,6 +869,7 @@ impl DaemonState {
             last_activity_at: AtomicU64::new(now_epoch_millis()),
             active_authenticated_requests: AtomicU64::new(0),
             idle_shutdown: tokio::sync::Notify::new(),
+            cold_opens: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1129,17 +1137,35 @@ impl DaemonState {
                         .insert(session_id.to_string());
                     return Ok(slot);
                 }
-                // The map entry changed under us (concurrent cleanup or a fresh
-                // reinsert); retry against the current authoritative entry.
                 continue;
             }
 
-            let candidate = Arc::new(ProjectSlot::new(load_project
-                .take()
-                .expect("cold project loader is consumed only on the returning branch")(
-            )?));
+            let gate = {
+                let mut gates = self.cold_opens.lock();
+                Arc::clone(
+                    gates
+                        .entry(project_id.to_string())
+                        .or_insert_with(|| Arc::new(OnceLock::new())),
+                )
+            };
+            let loaded_slot = match gate.get_or_init(|| {
+                match load_project
+                    .take()
+                    .expect("cold project loader is consumed only on the single-flight branch")(
+                ) {
+                    Ok(project) => Ok(Arc::new(ProjectSlot::new(project))),
+                    Err(error) => Err(error),
+                }
+            }) {
+                Ok(slot) => Ok(Arc::clone(slot)),
+                Err(error) => Err(anyhow::Error::msg(error.to_string())),
+            }?;
             let mut projects = self.projects.write();
-            let slot = Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
+            let slot = Arc::clone(
+                projects
+                    .entry(project_id.to_string())
+                    .or_insert(loaded_slot),
+            );
             slot.metadata
                 .write()
                 .session_ids
@@ -3333,6 +3359,15 @@ impl ProjectInstance {
         })?;
 
         let index = bootstrap_project_index(canonical_root, &state_placement)?;
+        let file_count = index.published_state().file_count as u64;
+        live_index::index_lifecycle::activation::process_index_runtime()
+            .try_charge_catalog_entries(file_count)
+            .map_err(|limit| {
+                anyhow::anyhow!(
+                    "project admission refused: {file_count} catalog entries would exceed the \
+                     configured process ceiling of {limit}"
+                )
+            })?;
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
         let persistence_status = if matches!(
@@ -3377,6 +3412,7 @@ impl ProjectInstance {
             session_ids: HashSet::new(),
             opened_at: SystemTime::now(),
             activation_state: ActivationState::Inactive,
+            charged_catalog_entries: file_count,
         })
     }
 
@@ -3432,15 +3468,20 @@ impl ProjectSlot {
 
     fn stop(&self) {
         let _mutation = self.mutation.lock();
-        let (mut watcher_task, stop_token, project_id) = {
+        let (mut watcher_task, stop_token, project_id, charged_catalog_entries) = {
             let mut project = self.metadata.write();
             (
                 project.watcher_task.take(),
                 Arc::clone(&project.stop_token),
                 project.project_id.clone(),
+                project.charged_catalog_entries,
             )
         };
         abort_watcher_task(&mut watcher_task, &stop_token);
+        if charged_catalog_entries > 0 {
+            live_index::index_lifecycle::activation::process_index_runtime()
+                .release_catalog_entries(charged_catalog_entries);
+        }
         // V11 bootstrap (C4b): retire the project's admission slot. A
         // refusal here means the registry never held this project live
         // (possible only for instances minted outside `load_bound`);
@@ -3543,9 +3584,15 @@ impl ProjectSlot {
                 Arc::clone(&project.stop_token),
             )
         };
+
+        if let Err(error) = reload_index(&index, canonical_root) {
+            let mut project = self.metadata.write();
+            project.watcher_task = watcher_task;
+            project.stop_token = old_stop_token;
+            return Err(error);
+        }
         abort_watcher_task(&mut watcher_task, &old_stop_token);
 
-        reload_index(&index, canonical_root)?;
         let published = index.published_state();
         let counts = (published.file_count, published.symbol_count);
         let stop_token = Arc::new(AtomicBool::new(false));
@@ -3720,7 +3767,7 @@ fn bootstrap_project_index(
         return Ok(shared);
     }
 
-    let cold_result = if matches!(state_placement, StatePlacement::ProjectLocal { .. }) {
+    if matches!(state_placement, StatePlacement::ProjectLocal { .. }) {
         live_index::LiveIndex::load_for_state_placement(canonical_root, state_placement)
             .with_context(|| {
                 format!(
@@ -3730,35 +3777,13 @@ fn bootstrap_project_index(
             })
     } else {
         let index = LiveIndex::empty();
-        match index.reload_for_binding_with_exclusions(
-            canonical_root,
-            state_placement.directory().cloned(),
-            source_exclusions,
-        ) {
-            Ok(()) => Ok(index),
-            Err(error) => Err(error),
-        }
-    };
-
-    match cold_result {
-        Ok(index) => Ok(index),
-        Err(error) => {
-            let Some(capacity) = error.downcast_ref::<crate::discovery::ScoutCapacityError>()
-            else {
-                return Err(error);
-            };
-            let index = LiveIndex::empty();
-            index.set_freshness_status(crate::domain::FreshnessStatus::Degraded {
-                last_valid_content_generation: 0,
-                reason_codes: vec![capacity.reason()],
-            });
-            tracing::warn!(
-                root = %canonical_root.display(),
-                reason = ?capacity.reason(),
-                "cold project observation refused by catalog capacity; keeping project non-ready"
-            );
-            Ok(index)
-        }
+        index
+            .reload_for_binding_with_exclusions(
+                canonical_root,
+                state_placement.directory().cloned(),
+                source_exclusions,
+            )
+            .map(|()| index)
     }
 }
 
@@ -10050,7 +10075,6 @@ mod tests {
     /// One first open must cost exactly one cold load, however many sessions
     /// race for it.
     #[test]
-    #[ignore = "Feature 020 Slice 0 RED control for design defect 2.4; remove this attribute in Slice 2 (T030-T040) when project admission is single-flight"]
     fn concurrent_first_open_performs_exactly_one_cold_load() {
         let project = project_dir("symforge-slot-single-flight");
         std::fs::write(

@@ -657,7 +657,12 @@ is the only thing allowed to touch it:
   continuously, on every green CI run before and during the cut), their
   attributes now name carried post-cut work instead of the falsified
   slice prediction, and resolving them is owed by the post-cut
-  continuation of Feature 020, not by this PR.
+  continuation of Feature 020, not by this PR. **Update (post-v11.0.0,
+  Feature 020 Slice 0 discharge PR)**: all eleven roster controls —
+  the ten in `tests/project_index_lifecycle_slice0.rs` plus
+  `internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load`
+  — now pass un-ignored; `scripts/slice0-oracle-artifact.cjs` reclassifies
+  them as resolved-green with zero remaining RED cases.
 
 Gate battery after every commit-group, serial via TC; fmt BEFORE pin
 refresh; embed feature gate before every push.

@@ -976,6 +976,12 @@ pub enum FreshnessReason {
     DerivedPublicationPending,
     CatalogEntryCapacityExceeded,
     CatalogMetadataCapacityExceeded,
+    /// A source change landed while no observer held the slot (handoff gap).
+    ObserverHandoffGap,
+    /// A promoted generation consumed a predecessor epoch's observation.
+    StaleObserverDelivery,
+    /// The directory at `indexed_root` is a different physical root than before.
+    PhysicalRootReplacement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

@@ -2138,6 +2138,7 @@ pub fn snapshot_to_live_index_with_code_signals(
         // A snapshot-restored index serves a real project; record its root so a
         // project switch invalidates it the same way a freshly loaded one does.
         indexed_root: Some(normalize_root(project_root)),
+        indexed_root_fingerprint: super::store::fingerprint_physical_root(project_root),
     };
     let phase = Instant::now();
     index.rebuild_reverse_index();
@@ -2964,6 +2965,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -4131,6 +4133,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -4315,6 +4318,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         before.rebuild_reverse_index();
         before.rebuild_path_indices();
@@ -5072,6 +5076,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -5137,6 +5142,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -5212,6 +5218,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -5270,6 +5277,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();

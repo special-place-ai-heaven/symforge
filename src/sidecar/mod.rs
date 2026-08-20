@@ -493,6 +493,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         });
 
         let state = SidecarState {

@@ -96,6 +96,8 @@ pub struct ProcessIndexRuntime {
     ledger: Arc<ProcessCapacityPool>,
     root: OwnerIdentity,
     surfaces: std::sync::Mutex<HashMap<SurfaceKind, OwnerIdentity>>,
+    /// Catalog entries charged across every open project in this process.
+    admitted_catalog_entries: AtomicU64,
 }
 
 impl ProcessIndexRuntime {
@@ -108,6 +110,7 @@ impl ProcessIndexRuntime {
             ledger,
             root,
             surfaces: std::sync::Mutex::new(HashMap::new()),
+            admitted_catalog_entries: AtomicU64::new(0),
         })
     }
 
@@ -191,5 +194,42 @@ impl ProcessIndexRuntime {
     /// Bytes still promisable to a new surface.
     pub fn available(&self) -> u64 {
         self.ledger.available(self.root)
+    }
+
+    /// Try to charge `count` catalog entries against the process-wide file ceiling.
+    ///
+    /// Returns `Err(limit)` when the charge would exceed
+    /// [`crate::discovery::DiscoveryLimits::from_env`]'s `max_files`.
+    pub fn try_charge_catalog_entries(&self, count: u64) -> Result<(), u64> {
+        let limit = crate::discovery::DiscoveryLimits::from_env().max_files;
+        loop {
+            let current = self.admitted_catalog_entries.load(Ordering::Acquire);
+            if current.saturating_add(count) > limit {
+                return Err(limit);
+            }
+            if self
+                .admitted_catalog_entries
+                .compare_exchange_weak(
+                    current,
+                    current + count,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Release a prior catalog-entry charge when a project leaves the process.
+    pub fn release_catalog_entries(&self, count: u64) {
+        self.admitted_catalog_entries
+            .fetch_sub(count, Ordering::AcqRel);
+    }
+
+    /// Catalog entries currently charged across open projects.
+    pub fn admitted_catalog_entries(&self) -> u64 {
+        self.admitted_catalog_entries.load(Ordering::Acquire)
     }
 }

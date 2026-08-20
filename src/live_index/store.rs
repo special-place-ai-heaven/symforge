@@ -821,6 +821,42 @@ impl SnapshotVerifyState {
     pub fn completed_with_mismatches(paths: Vec<String>) -> Self {
         Self::Completed(SnapshotVerifyReport::from_mismatched_paths(paths))
     }
+
+    /// Whether snapshot bytes must not answer queries yet.
+    pub fn blocks_query_visibility(&self) -> bool {
+        matches!(self, Self::Pending | Self::Running)
+    }
+}
+
+/// Stable `(dev, ino)` identity for an indexed root directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalRootFingerprint {
+    dev: u64,
+    ino: u64,
+}
+
+pub(crate) fn fingerprint_physical_root(root: &Path) -> Option<PhysicalRootFingerprint> {
+    let metadata = std::fs::metadata(root).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(PhysicalRootFingerprint {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        let canonical = dunce::canonicalize(root).ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        canonical.hash(&mut hasher);
+        Some(PhysicalRootFingerprint {
+            dev: 0,
+            ino: hasher.finish(),
+        })
+    }
 }
 
 /// Compact published status label for handle-level state consumers.
@@ -1267,6 +1303,8 @@ pub struct LiveIndex {
     /// across `\\?\` prefixes, trailing separators, and separator/case
     /// differences. See `SymForgeServer::ensure_local_index`.
     pub(crate) indexed_root: Option<PathBuf>,
+    /// `(dev, ino)` of [`indexed_root`] when the generation was built.
+    pub(crate) indexed_root_fingerprint: Option<PhysicalRootFingerprint>,
 }
 
 /// Lightweight snapshot of a symbol for pre-update diffing in `analyze_file_impact`.
@@ -1368,6 +1406,16 @@ pub struct SharedIndexHandle {
     /// already running, a second caller skips, because the running pass already
     /// reflects the newest refs.
     ref_reconcile_lock: Mutex<()>,
+    /// Historical freshness reasons that survive present-state recompute and reload.
+    latched_freshness_reasons: ArcSwap<Vec<FreshnessReason>>,
+    /// Number of in-flight whole-project reload builds touching this handle.
+    reload_build_depth: AtomicU64,
+    /// How many watcher instances have registered on this handle (handoff gaps).
+    observer_registrations: AtomicU64,
+    /// When the current generation was last promoted by a whole-project reload.
+    last_publication_promotion_at: Mutex<Option<SystemTime>>,
+    /// The next watcher admission after promotion may be a predecessor-epoch delivery.
+    pending_post_promotion_admission: AtomicBool,
 }
 
 /// Write guard that republishes lightweight handle state when mutated data is released.
@@ -1543,6 +1591,11 @@ impl SharedIndexHandle {
             git_temporal_jobs: Mutex::new(super::git_temporal::GitTemporalJobQueue::default()),
             pre_update_snapshots: Mutex::new(HashMap::new()),
             ref_reconcile_lock: Mutex::new(()),
+            latched_freshness_reasons: ArcSwap::new(Arc::new(Vec::new())),
+            reload_build_depth: AtomicU64::new(0),
+            observer_registrations: AtomicU64::new(0),
+            last_publication_promotion_at: Mutex::new(None),
+            pending_post_promotion_admission: AtomicBool::new(false),
         }
     }
 
@@ -1892,6 +1945,11 @@ impl SharedIndexHandle {
                 next_reasons.push(reason);
             }
         }
+        for reason in self.latched_freshness_reasons.load_full().iter().copied() {
+            if !next_reasons.contains(&reason) {
+                next_reasons.push(reason);
+            }
+        }
         if observation_failed && !next_reasons.contains(&FreshnessReason::ObservationFailed) {
             next_reasons.push(FreshnessReason::ObservationFailed);
         }
@@ -2104,6 +2162,7 @@ impl SharedIndexHandle {
         Arc::clone(&self.published_generation().freshness)
     }
 
+    #[allow(dead_code)] // sidecar queryability tests; production uses latch_freshness_reason.
     pub(crate) fn set_freshness_status(&self, status: FreshnessStatus) {
         let _wg = self.write_mutex.lock();
         self.freshness_status.store(Arc::new(status));
@@ -2118,6 +2177,99 @@ impl SharedIndexHandle {
     /// that subsequent `read()` calls will see.
     pub fn read(&self) -> Arc<LiveIndex> {
         Arc::clone(&self.published_generation().live)
+    }
+
+    /// Whether watcher or facade observations may mutate this handle's live index.
+    pub(crate) fn accepts_source_observation(&self) -> bool {
+        let live = self.live.load_full();
+        !(live.is_empty
+            && live.indexed_root.is_none()
+            && live.load_source == IndexLoadSource::EmptyBootstrap)
+    }
+
+    /// Record a historical freshness reason that survives recompute and reload.
+    pub(crate) fn latch_freshness_reason(&self, reason: FreshnessReason) {
+        let _wg = self.write_mutex.lock();
+        let mut next = self.latched_freshness_reasons.load_full().as_ref().clone();
+        if !next.contains(&reason) {
+            next.push(reason);
+            self.latched_freshness_reasons.store(Arc::new(next));
+        }
+        let live = (*self.live.load_full()).clone();
+        self.recompute_freshness_locked(&live, self.scout_plan.load_full().as_deref());
+        self.swap_and_publish_retaining_content(live);
+    }
+
+    /// Observe a completed observer handoff; latches a gap after the first.
+    pub(crate) fn note_observer_registration(&self) {
+        let prior = self.observer_registrations.fetch_add(1, Ordering::AcqRel);
+        if prior > 0 {
+            self.latch_freshness_reason(FreshnessReason::ObserverHandoffGap);
+        }
+    }
+
+    /// Observe a predecessor-epoch delivery applied after promotion.
+    pub(crate) fn note_stale_observer_delivery(&self) {
+        self.latch_freshness_reason(FreshnessReason::StaleObserverDelivery);
+    }
+
+    pub(crate) fn note_publication_promotion(&self) {
+        *self.last_publication_promotion_at.lock() = Some(SystemTime::now());
+        self.pending_post_promotion_admission
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn note_stale_observer_delivery_for_path(&self, abs_path: &Path) {
+        let _ = abs_path;
+        if self
+            .pending_post_promotion_admission
+            .swap(false, Ordering::AcqRel)
+        {
+            self.note_stale_observer_delivery();
+        }
+    }
+
+    fn merge_reload_live_observations(&self, candidate: &mut LiveIndex, baseline: &LiveIndex) {
+        let current = self.live.load_full();
+        for (path, file) in current.files.iter() {
+            let unchanged = baseline.files.get(path).is_some_and(|baseline_file| {
+                baseline_file.content_hash == file.content_hash
+                    && baseline_file.byte_len == file.byte_len
+            });
+            if !unchanged {
+                candidate.update_file(path.clone(), (**file).clone());
+            }
+        }
+    }
+
+    fn await_reload_live_catchup(&self, baseline: &LiveIndex, max_wait: Duration) {
+        // Wait for debounced watcher deliveries to land, not just the first
+        // path that diverges from the reload baseline (sibling publications
+        // during a whole-project rebuild may arrive in sequence).
+        const DEBOUNCE_QUIESCE: Duration = Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + max_wait;
+        let mut last_divergent_count = 0usize;
+        let mut last_change = std::time::Instant::now();
+        while std::time::Instant::now() < deadline {
+            let current = self.live.load_full();
+            let divergent_count = current
+                .files
+                .iter()
+                .filter(|(path, file)| {
+                    baseline.files.get(*path).is_none_or(|baseline_file| {
+                        baseline_file.content_hash != file.content_hash
+                            || baseline_file.byte_len != file.byte_len
+                    })
+                })
+                .count();
+            if divergent_count != last_divergent_count {
+                last_divergent_count = divergent_count;
+                last_change = std::time::Instant::now();
+            } else if divergent_count > 0 && last_change.elapsed() >= DEBOUNCE_QUIESCE {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Single-flight impact analyses that share this index and its sidecar
@@ -2400,39 +2552,67 @@ impl SharedIndexHandle {
         project_state_dir: Option<ProjectStateDir>,
         source_exclusions: discovery::SourceExclusions,
     ) -> anyhow::Result<()> {
+        self.reload_build_depth.fetch_add(1, Ordering::AcqRel);
+        struct ReloadBuildGuard<'a>(&'a SharedIndexHandle);
+        impl Drop for ReloadBuildGuard<'_> {
+            fn drop(&mut self) {
+                self.0.reload_build_depth.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _reload_build = ReloadBuildGuard(self);
+
+        let baseline = self.live.load_full();
+        let prior_fingerprint = baseline.indexed_root_fingerprint;
+        let next_fingerprint = fingerprint_physical_root(root);
+        if let (Some(prior), Some(next)) = (prior_fingerprint, next_fingerprint)
+            && prior != next
+        {
+            self.latch_freshness_reason(FreshnessReason::PhysicalRootReplacement);
+        }
+
         // Build new index data OUTSIDE the write lock (file I/O + parsing).
         // Only the final swap acquires the mutex, reducing block time from
         // seconds (full I/O) to milliseconds (in-memory index rebuild).
+        let build_started = std::time::Instant::now();
         let data = LiveIndex::build_reload_data_for_binding_with_exclusions(
             root,
             project_state_dir.as_ref(),
             &source_exclusions,
         )?;
+        let build_elapsed = build_started.elapsed();
         let scout_plan = Arc::clone(&data.scout_plan);
         let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
-        let live = LiveIndex::from_reload_data(data);
+        let mut live = LiveIndex::from_reload_data(data);
+        if build_elapsed >= Duration::from_millis(50) {
+            let catchup_budget = build_elapsed
+                .saturating_mul(4)
+                .max(Duration::from_millis(300))
+                .min(Duration::from_millis(800));
+            self.await_reload_live_catchup(&baseline, catchup_budget);
+        }
+        self.merge_reload_live_observations(&mut live, &baseline);
         let _wg = self.write_mutex.lock();
         self.source_exclusions.store(Arc::new(source_exclusions));
         self.scout_plan.store(Some(scout_plan));
-        self.freshness_status.store(Arc::new(if is_degraded {
-            FreshnessStatus::Degraded {
-                last_valid_content_generation: self.published_generation().content_generation,
-                reason_codes: vec![FreshnessReason::ReconciliationPending],
-            }
-        } else {
-            FreshnessStatus::Current
-        }));
+        let latched = self.latched_freshness_reasons.load_full();
+        if latched.is_empty() {
+            self.freshness_status.store(Arc::new(if is_degraded {
+                FreshnessStatus::Degraded {
+                    last_valid_content_generation: self.published_generation().content_generation,
+                    reason_codes: vec![FreshnessReason::ReconciliationPending],
+                }
+            } else {
+                FreshnessStatus::Current
+            }));
+        }
         self.project_state_dir
             .store(project_state_dir.map(Arc::new));
         self.project_generation.fetch_add(1, Ordering::AcqRel);
-        // Deterministic test observation point: the generation has advanced but
-        // the previous root is still published (no-op in release).
         #[cfg(test)]
         reload_mid_commit::fire();
-        // Path-keyed pre-update snapshots belong to the previous project
-        // generation. Clear them under the same writer lock as the retarget so
-        // a late impact request cannot consume a replacement project's state.
         self.pre_update_snapshots.lock().clear();
+        self.recompute_freshness_locked(&live, self.scout_plan.load_full().as_deref());
+        self.note_publication_promotion();
         self.swap_and_publish(live);
         self.last_reset_project_generation
             .store(0, Ordering::Release);
@@ -2497,6 +2677,13 @@ impl SharedIndexHandle {
     }
 
     pub fn update_file(&self, path: String, file: IndexedFile) {
+        if !self.accepts_source_observation() {
+            tracing::debug!(
+                path,
+                "refusing mutation into a never-published empty bootstrap placeholder"
+            );
+            return;
+        }
         let _wg = self.write_mutex.lock();
         let current = self.live.load_full();
         let path_clone = path.clone();
@@ -3790,6 +3977,7 @@ pub(crate) struct ReloadData {
     /// `apply_reload_data` can record it on the live index (root-mismatch
     /// invalidation in `ensure_local_index`).
     pub indexed_root: PathBuf,
+    pub indexed_root_fingerprint: Option<PhysicalRootFingerprint>,
 }
 
 /// Build a reverse index from a file map (standalone, no `&self` needed).
@@ -4717,6 +4905,7 @@ impl LiveIndex {
             // Record the normalized root this fresh index was built from so a
             // later project switch invalidates it (root-mismatch reload).
             indexed_root: Some(normalize_root(root)),
+            indexed_root_fingerprint: fingerprint_physical_root(root),
         };
         let phase = Instant::now();
         index.rebuild_reverse_index();
@@ -4778,6 +4967,7 @@ impl LiveIndex {
             // is therefore a mismatch, which is the desired behaviour (the next
             // local fallback reloads from the current root).
             indexed_root: None,
+            indexed_root_fingerprint: None,
         }
     }
 
@@ -4811,6 +5001,7 @@ impl LiveIndex {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -5067,6 +5258,7 @@ impl LiveIndex {
             // Record the normalized root so the reloaded index advertises which
             // project it now serves (root-mismatch invalidation).
             indexed_root: normalize_root(root),
+            indexed_root_fingerprint: fingerprint_physical_root(root),
         })
     }
 
@@ -5091,6 +5283,7 @@ impl LiveIndex {
         self.manifest_entries = data.manifest_entries;
         self.coupling_store = data.coupling_store;
         self.indexed_root = Some(data.indexed_root);
+        self.indexed_root_fingerprint = data.indexed_root_fingerprint;
     }
 
     fn from_reload_data(data: ReloadData) -> Self {
@@ -7435,6 +7628,7 @@ mod tests {
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+            indexed_root_fingerprint: None,
         }
     }
 

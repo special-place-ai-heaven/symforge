@@ -41,8 +41,8 @@ const GIT = process.env.SYMFORGE_LIFECYCLE_GIT_EXECUTABLE || "git";
 const SUITES = [
   {
     target: "tests/project_index_lifecycle_slice0.rs",
-    expected: "red",
-    args: ["test", "--test", "project_index_lifecycle_slice0", "--", "--ignored", "--test-threads=1"],
+    expected: "green",
+    args: ["test", "--test", "project_index_lifecycle_slice0", "--", "--test-threads=1"],
   },
   // Lib unit tests print their full module path, and the V11 cut mounts the
   // server modules under `src/internals.rs`, so the paths carry `internals::`.
@@ -59,14 +59,13 @@ const SUITES = [
   },
   {
     target: "src/daemon.rs::tests",
-    expected: "red",
+    expected: "green",
     args: [
       "test",
       "--lib",
       "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
       "--",
       "--exact",
-      "--ignored",
     ],
   },
 ];
@@ -82,23 +81,7 @@ const MAX_REASON_BYTES = 512;
 //
 // Still RED: the defect each names is unfixed, the test carries `#[ignore]`, and it
 // MUST fail.
-// The Slice 4 activation cut ran every one of these before merge (2026-08-20)
-// and observed each still failing at the daemon/watcher seam it drives, so the
-// cut did not reclassify them; they are carried post-cut work recorded in
-// specs/028-preventive-activation-cut/activation-cut-execution-map.md.
-const RED_CASES = [
-  "capacity_refused_open_creates_no_slot_and_no_watcher",
-  "configured_capacity_bounds_the_process_not_each_load",
-  "empty_placeholder_publication_refuses_watcher_mutation",
-  "failed_reload_retains_the_recovery_observer",
-  "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
-  "observer_replacement_gap_is_latched_as_non_current",
-  "old_observer_delivery_after_promotion_is_not_current",
-  "same_path_root_replacement_is_not_silently_adopted",
-  "snapshot_seed_is_not_queryable_before_verification",
-  "watcher_mutation_during_candidate_build_is_not_discarded",
-  "whole_project_publication_preserves_latest_siblings",
-];
+const RED_CASES = [];
 
 // RESOLVED: the named slice fixed the defect, the `#[ignore]` is gone, and the
 // control MUST now pass. It stays on the roster and stays run — dropping it would
@@ -111,10 +94,106 @@ const RESOLVED_CASES = new Map([
       slice: 1,
       tasks: ["T028"],
       defect: "2.8 root and generation authority can split",
-      // Not the commit reordering the oracle's prose predicted: the fence takes
-      // both values from one `Arc<PublishedGeneration>`, so the generation and
-      // the root that publication served cannot disagree.
       fix: "src/watcher/mod.rs::effective_fence_generation reads one published generation",
+    },
+  ],
+  [
+    "capacity_refused_open_creates_no_slot_and_no_watcher",
+    {
+      slice: "post-cut",
+      tasks: ["T030-T040"],
+      defect: "2.1 admission refusal crosses the seam as success",
+      fix: "src/daemon.rs::bootstrap_project_index propagates ScoutCapacityError",
+    },
+  ],
+  [
+    "configured_capacity_bounds_the_process_not_each_load",
+    {
+      slice: "post-cut",
+      tasks: ["T030-T040"],
+      defect: "2.5 per-load capacity instead of process-wide catalog charge",
+      fix: "src/index_lifecycle/process_runtime.rs catalog admission + daemon load",
+    },
+  ],
+  [
+    "empty_placeholder_publication_refuses_watcher_mutation",
+    {
+      slice: "post-cut",
+      tasks: ["T022-T029"],
+      defect: "2.2/2.3 never-published placeholder accepts watcher mutation",
+      fix: "SharedIndexHandle::accepts_source_observation + update_file refusal",
+    },
+  ],
+  [
+    "failed_reload_retains_the_recovery_observer",
+    {
+      slice: "post-cut",
+      tasks: ["T022-T029"],
+      defect: "2.10 failed reload aborts watcher before retry",
+      fix: "src/daemon.rs::ProjectSlot::reload_with non-destructive handoff",
+    },
+  ],
+  [
+    "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
+    {
+      slice: "post-cut",
+      tasks: ["T030-T040"],
+      defect: "2.4 concurrent cold opens race duplicate loads",
+      fix: "src/daemon.rs single-flight cold_opens via OnceLock",
+    },
+  ],
+  [
+    "observer_replacement_gap_is_latched_as_non_current",
+    {
+      slice: "post-cut",
+      tasks: ["T022-T029"],
+      defect: "observer handoff gap not latched non-Current",
+      fix: "SharedIndexHandle::note_observer_registration + latched freshness",
+    },
+  ],
+  [
+    "old_observer_delivery_after_promotion_is_not_current",
+    {
+      slice: "post-cut",
+      tasks: ["T022-T029"],
+      defect: "predecessor-epoch delivery erased by clean reload",
+      fix: "pending_post_promotion_admission + hash-skip stale delivery latch",
+    },
+  ],
+  [
+    "same_path_root_replacement_is_not_silently_adopted",
+    {
+      slice: "post-cut",
+      tasks: ["T022-T029"],
+      defect: "physical root replacement silently adopted",
+      fix: "indexed_root_fingerprint + PhysicalRootReplacement latch on reload",
+    },
+  ],
+  [
+    "snapshot_seed_is_not_queryable_before_verification",
+    {
+      slice: "post-cut",
+      tasks: ["T022-T029"],
+      defect: "2.11 pending snapshot bytes queryable before verify completes",
+      fix: "get_file returns None while SnapshotVerifyState blocks visibility",
+    },
+  ],
+  [
+    "watcher_mutation_during_candidate_build_is_not_discarded",
+    {
+      slice: "post-cut",
+      tasks: ["T017"],
+      defect: "2.7/2.9 candidate build discards live watcher mutations",
+      fix: "reload merge_reload_live_observations + debounce quiescence catchup",
+    },
+  ],
+  [
+    "whole_project_publication_preserves_latest_siblings",
+    {
+      slice: "post-cut",
+      tasks: ["T017"],
+      defect: "FR-008/FR-009 partial publication loses sibling latest",
+      fix: "merge_reload_live_observations preserves sibling watcher updates",
     },
   ],
 ]);
