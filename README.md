@@ -33,6 +33,7 @@ The same engine also compiles **without the server**, as a library other agentic
 - [Why SymForge](#why-symforge)
 - [What it gives an agent](#what-it-gives-an-agent)
 - [How it works](#how-it-works)
+- [Index lifecycle (V11)](#index-lifecycle-v11)
 - [The life of an edit](#the-life-of-an-edit)
 - [What makes it different](#what-makes-it-different)
 - [Embed the engine](#embed-the-engine)
@@ -71,7 +72,8 @@ Measured token savings, with their method and date, live on the wiki: [Benchmark
 | **Knowledge hygiene** | Read-only dossiers that separate implemented reality from declared intent; curation is preview-first and only ever writes a policy ledger, never your documents |
 | **Impact tracing** | Call sites, dependents, symbol diffs, changed files, and blast radius seeded from the symbols that actually changed |
 | **Structural editing** | Replace, insert, delete, batch-edit, and rename by indexed structure, with a pre-write snapshot and a receipt naming exactly what was written where |
-| **Snapshot warm start** | A byte-exact index snapshot restores on startup instead of re-parsing the tree, then reconciles against disk in the background |
+| **Snapshot warm start** | A current-format snapshot can skip the parse phase; a V10-format file is an untrusted seed (it never confers authority) and is copied under `.symforge/v11/` while the original bytes stay in place for rollback |
+| **Preventive index lifecycle** | One bad observation cannot publish mixed or false-current state. Candidates promote only when complete; queries run under a strict lease; answers that are not current say so |
 | **Content admission** | One gate decides what may be read, parsed, or disclosed — secret-bearing files fail closed to metadata-only under a versioned detector |
 | **Local daemon and HTTP serve** | Share one index across sessions, or run an operator server with a dashboard at `/admin` |
 | **Embeddable engine** | The indexing/search/parsing core compiles without the server behind a semver-stable facade |
@@ -81,10 +83,10 @@ Measured token savings, with their method and date, live on the wiki: [Benchmark
 ```mermaid
 flowchart TD
     accTitle: SymForge architecture
-    accDescr: MCP clients reach the server over stdio or HTTP. Startup either restores a snapshot or cold-loads through the admission scout into the live index, which backs the tool, read, and edit lanes.
+    accDescr: MCP clients reach the server over stdio or HTTP. Startup restores a current-format snapshot or treats a V10 file as an untrusted seed, then the preventive lifecycle and admission scout feed the live index.
 
     subgraph Clients["Clients"]
-        MCP["MCP clients<br/>Claude, Codex, Gemini, Cursor, Kilo"]
+        MCP["MCP clients<br/>Claude, Codex, Gemini, Cursor, Grok, Kilo"]
         LIB["Embedding platforms<br/>(no MCP)"]
     end
 
@@ -95,10 +97,11 @@ flowchart TD
     end
 
     subgraph Startup["Index startup"]
-        SNAP[".symforge/index.bin<br/>snapshot restore"]
+        SNAP["current-format snapshot<br/>or untrusted V10 seed"]
         SCOUT["metadata-first scout<br/>one disposition per file"]
         PARSE["tree-sitter<br/>25 grammars"]
         KNOW["knowledge lane<br/>docs, specs, safe configs"]
+        LIFE["preventive lifecycle<br/>candidates, leases, verify"]
     end
 
     subgraph Core["Live index"]
@@ -121,7 +124,7 @@ flowchart TD
     STDIO --> IDX
     LIB --> IDX
 
-    SNAP --> IDX
+    SNAP --> LIFE --> IDX
     SCOUT --> PARSE --> IDX
     SCOUT --> KNOW --> IDX
     SIG --> IDX
@@ -138,9 +141,22 @@ The read path is deliberately local. Symbol spans depend on the exact bytes in t
 
 **Every raw-disk read goes through one gate.** Any lane that reopens a file from disk — rather than serving bytes already in the index — routes through `admit_disk_read` in `src/protocol/read_gate.rs`. The gate owns the read: it classifies the exact buffer it just read and hands that buffer back only on a permit. No caller can classify one set of bytes and render another.
 
-**Warm start skips the parse phase.** `symforge serve`, the stdio path, and the daemon all consult the persisted snapshot through the same staleness-gated loader before falling back to a cold parse, then reconcile against disk in the background while already serving — with `SnapshotRestore` / `Pending` trust labels until verification completes. The cold pipeline this replaces was measured on this repository at roughly 9.9 s to listening (parse 4.60 s, runtime 3.59 s, publication 2.67 s, trigram 0.61 s); method and numbers are recorded in [specs/026-serve-snapshot-restore/spec.md](./specs/026-serve-snapshot-restore/spec.md).
+**Warm start skips the parse phase only for a current-format snapshot.** `symforge serve`, the stdio path, and the daemon consult the persisted snapshot through the same loader. A matching format can skip the parse and then reconcile against disk in the background while already serving — with `SnapshotRestore` / `Pending` trust labels until verification completes. A prior-format (V10) `index.bin` is an untrusted seed: it is not restored as authority, the original file is left in place so a 10.x binary can still read it, and a copy is quarantined under `.symforge/v11/quarantine/index-snapshots/`. The cold pipeline a miss falls back to was measured on this repository at roughly 9.9 s to listening (parse 4.60 s, runtime 3.59 s, publication 2.67 s, trigram 0.61 s); method and numbers are recorded in [specs/026-serve-snapshot-restore/spec.md](./specs/026-serve-snapshot-restore/spec.md).
 
 Depth: [Architecture and How It Works](https://github.com/special-place-ai-heaven/symforge/wiki/Architecture-and-How-It-Works) and [Runtime Model](https://github.com/special-place-ai-heaven/symforge/wiki/Runtime-Model).
+
+## Index lifecycle (V11)
+
+The 11.x binary runs the **preventive index lifecycle**. There is no flag to turn V10 behavior back on. MCP tools, resources, and prompts are the same 39/40 surface; what changed is the crate doors and what a snapshot is allowed to prove.
+
+Operator-visible rules, from the live restore path and the embed contract:
+
+- **V10 snapshots confer no authority.** Format 8 is current. An older `index.bin` stays on disk for rollback; 11.x copies it under `.symforge/v11/` and does not restore it as current. Install a 10.x binary to read the V10 store again; it ignores `.symforge/v11/`.
+- **Corrupt current-format snapshots** still go to `.symforge/quarantine/index-snapshots/` with metadata, same as before.
+- **Embedders lost the raw index handle.** Open one `EmbeddedSourceHandle` through `ProcessIndexRuntime`. Search returns claims with provenance; refresh returns a receipt; refusals are `SourceRefusalKind`.
+- **Incomplete observations must not publish as current.** That is the reason the lifecycle exists. The live snapshot gate today is whole-file format admission (current vs prior); richer per-entry re-proof is not on the restore path yet.
+
+Embedders and anyone reaching into the crate: the raw V10 modules (`symforge::live_index`, `::parsing`, authorityless search, `update_file_from_disk`, snapshot loaders) are gone from the public surface. The two doors are `symforge::embed` and `symforge::server_api`. Narrative plus compile-fix crib: [docs/migrations/v11-index-lifecycle.md](./docs/migrations/v11-index-lifecycle.md).
 
 ## The life of an edit
 
@@ -182,6 +198,8 @@ sequenceDiagram
 
 The decisions that separate SymForge from "grep over MCP".
 
+**A preventive lifecycle behind the MCP tools.** The agent still calls `search_symbols` and `get_file_context`. Incomplete observations cannot become current, and an answer you did not obtain through a current selection is not served as a hit. There is no configuration switch back to the V10 raw index handle.
+
 **Trust envelopes on every answer.** Responses open with a header stating match type (exact / constrained / heuristic), source authority, parse state, completeness with the real numbers, the scope searched, and `file:line` evidence anchors. As of 10.0.0 the compact-versus-loud form of that header is derived from a measured freshness status at every envelope site — it used to be decided by a string comparison that every code-navigation caller satisfied by passing a literal, which meant the loud form was unreachable on the one lane agents navigate by.
 
 **A gate that owns its read.** `admit_disk_read` is the single admission point for raw-disk content. It refuses on the current path rule, on a recorded content demotion, and on bytes it could not have scanned — and it distinguishes "withheld by policy" from "withheld unscanned", because the recovery action differs.
@@ -204,22 +222,35 @@ The decisions that separate SymForge from "grep over MCP".
 
 SymForge is also a library. Building with `--no-default-features --features embed` compiles the parsing, indexing, search, and git core **without** the daemon, sidecar, protocol server, or CLI — and without their heavy dependencies. Server-side breakage structurally cannot reach an embedding consumer, because those modules are not in the build.
 
+The V11 cut is a breaking change to this facade. Depend on 11.x and open one handle; do not import `symforge::live_index`.
+
 ```toml
-symforge = { version = "10", default-features = false, features = ["embed"] }
+symforge = { version = "11", default-features = false, features = ["embed"] }
 ```
 
-This is how another agentic platform gets SymForge's code intelligence in-process, with no MCP transport and no subprocess. `symforge::embed` gives it:
+```rust
+use symforge::embed::{EmbeddedSourceSpec, ProcessIndexRuntime};
 
-- **Index and search** — build or load an index, search symbols and text, parse one file.
-- **Warm start** — restore a persisted snapshot instead of re-parsing. The loader fails soft on a missing, corrupt, version-mismatched, or foreign snapshot, so the fallback is always a cold load rather than a wrong index.
-- **Portable snapshots** — an explicit opt-in to restore a host-baked artifact at a *different* root. Every content-derived check stays enforced (integrity digests, manifest digest, git tip and reachable-history fingerprint against the restoring workspace); only path-derived identity is rebound, and a second in-process import is refused.
-- **Per-file update and remove** — one file re-indexed through the *same* admission seam the watcher uses: exclusions, scout, secret demotion, hash-gated parse, generation-fenced publication. An embedder's incremental reindex cannot accidentally bypass admission.
+let runtime = ProcessIndexRuntime::acquire()?;
+let handle = runtime.open_embedded_source(
+    EmbeddedSourceSpec::current_worktree(root_path),
+)?;
+```
+
+`symforge::embed` is the only public coupling surface in the embed cell. Through the handle you get:
+
+- **Typed search** — `SymbolSearchRequest` / `TextSearchRequest`. Hits arrive as `Claim`s with provenance you can audit, not as a raw index dump.
+- **Refresh as a receipt** — request a refresh; completion is an `OperationReceipt`, staleness is `RetryAdvice`, never a silent stale serve. Deletions are observations, not `remove_file` commands.
 - **Engine identity** — `engine_info()` returns crate version, snapshot format version, secret-policy version, and every supported grammar as compile-time constants, in one call with no I/O.
-- **A durable economics ledger** — record, read back, and summarize per-project tool economics without the transport stack.
+- **Typed refusal** — match `SourceRefusalKind`. Do not scrape error strings.
 
-Two properties make this safe to depend on. The facade is **semver-public**: a compile-time contract test names every exported type and binds every exported function to its full signature, so a rename, removal, or signature drift fails SymForge's own build rather than a downstream integrator's. And CI compiles the engine-only feature for both glibc and musl on every PR.
+Snapshot restore is engine-internal. You do not call a loader. A pre-existing file may accelerate re-proof; it never confers authority by itself.
 
-`CHANGELOG.md` carries a hand-maintained **Embedder API** section above the release entries, tracking every change to this facade specifically.
+The facade is **semver-public**: a compile-time contract test names every exported type and binds every exported function to its full signature, so a rename, removal, or signature drift fails SymForge's own build rather than a downstream integrator's. CI compiles the engine-only feature for both glibc and musl on every PR.
+
+Server integrators use `symforge::server_api::run(argv)` (feature `server`, the default). The binary is a shim over that door. Exit is `ServerExit`; bootstrap failure is opaque `ServerBootstrapError` (full cause chain via `Display`, not exhaustively matchable).
+
+`CHANGELOG.md` carries a hand-maintained **Embedder API** section above the release entries, tracking every change to this facade specifically. Migration table and crib sheet: [docs/migrations/v11-index-lifecycle.md](./docs/migrations/v11-index-lifecycle.md).
 
 Parameter-level reference: [Embedding the Engine](https://github.com/special-place-ai-heaven/symforge/wiki/Embedding-the-Engine).
 
@@ -324,7 +355,7 @@ Full list with defaults and bounds: [Runtime Model](https://github.com/special-p
 > [!WARNING]
 > Daemon and `serve` HTTP are local coordination surfaces, not remote production APIs. The default bind is loopback-only; a non-loopback `SYMFORGE_DAEMON_BIND` is rejected unless explicitly allowed, and that opt-in warns. `/health` stays unauthenticated so local readiness checks can discover the daemon, and reports only *whether* auth is required — never the token.
 
-**When a snapshot goes wrong:** `checkpoint_now(verify_after_write=true)` forces a byte-exact write and verification; `health` reports the load source, verification state, and mismatch paths; corrupt or version-incompatible snapshots are preserved under `.symforge/quarantine/index-snapshots/` rather than silently served. Rebuilding from source is deliberately explicit — run the serving process with `SYMFORGE_INDEX_FOLDER_RESET=1`, then call `index_folder`. No durable run IDs are exposed: recovery is a sequence you drive, not a job you poll.
+**When a snapshot goes wrong:** `checkpoint_now(verify_after_write=true)` forces a byte-exact write and verification; `health` or `health_compact` report the load source, verification state, and mismatch paths; corrupt or version-incompatible snapshots are preserved under `.symforge/quarantine/index-snapshots/` with metadata rather than silently served. A V10-format `index.bin` is additionally copied under `.symforge/v11/quarantine/index-snapshots/` and never restored as current. Rebuilding from source is deliberately explicit — run the serving process with `SYMFORGE_INDEX_FOLDER_RESET=1`, then call `index_folder`. `repair_index` is intentionally retired; `get_index_run` and `cancel_index_run` remain retired. No durable run IDs are exposed: recovery is a sequence you drive, not a job you poll. Use `index_folder` reset when health, verification, or quarantine evidence shows the snapshot is not a valid recovery source.
 
 ## Develop
 
@@ -337,7 +368,8 @@ The toolchain is pinned by [`rust-toolchain.toml`](./rust-toolchain.toml) (Rust 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets -- --test-threads=1
+cargo test --lib --bins --tests -- --test-threads=1
+cargo bench --bench observed_refresh_gate_v1 -- --test
 cargo build --release
 
 cd npm && npm test
@@ -346,6 +378,8 @@ cd npm && npm test
 cargo build --no-default-features --features embed
 cargo test --no-default-features --features embed --lib -- --test-threads=1
 ```
+
+Do not pass `--all-targets` to `cargo test` with `--test-threads=1`: that flag is forwarded into the criterion bench harness (`observed_refresh_gate_v1`), which rejects it. Smoke the bench separately as above. Run the embed-feature suite in its own pass; interleaving it with the default-feature suite in one `target/` can corrupt artifacts.
 
 PR and push CI run version sync, formatting, clippy with warnings denied, the full Rust suite, the embed build including a musl cross-compile gate, a release build, and npm tests. Scheduled runs add bounded performance smoke coverage. Releases are driven by Release Please on `main`.
 
