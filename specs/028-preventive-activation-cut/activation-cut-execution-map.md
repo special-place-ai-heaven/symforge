@@ -603,6 +603,24 @@ is the only thing allowed to touch it:
     repair; EXCLUDED pin unchanged, as predicted for edits outside the
     13 sealed sources); embed cell exactly 1336; full serial suite +
     bench smoke + validator recorded at commit.
+- T038 (multi-round adversarial review — executed and CLOSED 2026-08-20):
+  three rounds. Round 1 (`32fb1477`): five parallel lenses (mandatory
+  cfg-lens, C11 fences, adjudications challenge, oracle quality,
+  authority bypass) — zero Critical; all warnings fixed or adjudicated;
+  the round also discharged 020:T065's live snapshot format bump (7→8,
+  V10 seeds preserved+quarantined) and landed T039's migration doc.
+  Round 2 (`c1502698`): three refuters over round 1's own fixes — one
+  genuine Critical (the supersede marker guarded microseconds of a
+  milliseconds race) fixed RED-first with double-checked locking via a
+  deterministic interleave hook; heal-without-claim closed the
+  stale-marker TOCTOU; a structurally dead cfg arm removed; the CCR
+  cannot-verify case split into typed `PublicationUnverifiable`. Round 3:
+  convergence refuter verified every round-2 fix line-by-line, re-swept
+  cfg, spot-checked the evidence doc's claims — "no unresolved P0/P1/P2".
+  Full battery observed at every landing; embed cell's frozen count moved
+  1336→1339→1340 with the new unconditional oracles. Six recorded
+  residuals stand adjudicated with named owners in the evidence doc §5/
+  §7a. Evidence doc CLOSED per the T038 exit criterion.
 - C11c (T037 campaign close — executed 2026-08-20): the campaign oracle
   `all_ingress_uses_exact_typed_authority_branch` run `--exact` at
   `dce1cddc` (1 passed, exit 0 — TEST-SURFACE partition closure over the

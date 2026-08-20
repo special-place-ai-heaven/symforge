@@ -383,6 +383,40 @@ twice this round (rustc ICE + E0786); recovered per the recovery ladder,
 terminally via full `cargo clean` (which also reclaimed a 120 GiB debug
 tree) — no code defect involved, exactly as `CLAUDE.md` records.
 
+## 7c. T038 Round 3 and closure (executed 2026-08-20)
+
+A convergence refuter verified every round-2 fix against the resulting
+code at `c1502698`, traced all exit paths of the double-checked supersede
+(one release per path, no leak on the write-error path, the interleave
+hook firing in exactly the oracle's window), confirmed the
+`PublicationUnverifiable` split is emitted at exactly one site with an
+exhaustive compiler-checked handler match and no missed matcher anywhere
+in the tree, confirmed the dead-arm removal structurally (the removed
+twin compiled in no cell; all callers live in the same server-gated
+file), re-swept the round-2 cfg delta across every cell, and spot-checked
+§7a's "Fixed" claims independently — no overstatement found.
+
+**Convergence call, verbatim**: "Round 3 verifies clean... I can name no
+unresolved P0/P1/P2 defect on this branch." The six recorded residuals
+(retarget-in-place admission identity, `project_source_authority` static,
+serve access-mode threading, `SnapshotStore` per-entry wiring, the
+supersede multi-party heal residual, the Kilo init classification) were
+re-examined and held as correctly adjudicated with named owners; the
+reviewer explicitly declined to challenge any adjudication and assessed
+the supersede residual as genuinely sub-P2.
+
+**Recorded verification gap, honestly**: round 3's reviewer was
+read-only and did not re-run the battery; the battery claims in §7b were
+re-observed by the campaign itself at commit time (fmt, three clippy
+lanes, dark seal 9/9, embed cell 1340, full serial suite exit 0, bench
+smoke exit 0, validator OK, campaign oracle 1/1). The T040 operator gate
+is the final independent hold on those claims.
+
+**T038 is CLOSED**: three rounds (five lenses + three refuters + one
+convergence pass), every finding fixed RED-first where machinery changed
+or explicitly adjudicated with rationale, zero unresolved P0/P1/P2. This
+document is the evidence half of 020:T072 and now awaits only T040.
+
 ## 7. Open obligations before merge
 
 - **T038**: multi-round adversarial review (cfg-lens sweep included),

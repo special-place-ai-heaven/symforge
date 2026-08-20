@@ -162,7 +162,7 @@ live acceptance for all five user stories verified via quickstart spot-checks.
 
 ## Phase 9: Polish & closure
 
-- [ ] T038 Complete the post-slice multi-round adversarial code review (fresh reviewer rounds + refuters, mandatory cfg-lens, explicit verdicts on each T037 residual family) and close `docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md` with zero unresolved P0/P1/P2 (020:T072, evidence half)
+- [x] T038 Complete the post-slice multi-round adversarial code review (fresh reviewer rounds + refuters, mandatory cfg-lens, explicit verdicts on each T037 residual family) and close `docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md` with zero unresolved P0/P1/P2 (020:T072, evidence half)
 - [x] T039 [P] Write the breaking lifecycle/embed migration boundary, removed exports, replacement APIs, and rollback constraints in `docs/migrations/v11-index-lifecycle.md` (020:T073)
 - [ ] T040 Verify `git diff --stat <merge-base> HEAD -- specs/020-repository-knowledge-index/` is empty (spec SC-008); present the cut PR to the operator and **wait for explicit approval** before merging (spec FR-015); after approval, squash-merge with explicit subject/body and watch the release-please cycle per repo rules
 - [ ] T041 [P] Save durable findings to agentmemory with the `[symforge]` prefix; run `cargo clean` in the worktree; update `docs/reviews/FEATURE-020-SLICE4-CAMPAIGN-v11.md` status line via a follow-up docs commit if the campaign deviated from plan
