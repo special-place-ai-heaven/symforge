@@ -137,6 +137,23 @@ impl CoalescingAccumulator {
         self.latch.get_or_insert(LatchCause::Gap);
     }
 
+    /// A completed observer handoff: the successor's first cut must be a
+    /// full post-barrier baseline. This threads the value
+    /// [`ObserverSlot::complete_handoff`] returns into the cut stream —
+    /// the cut obligation this module's header recorded for T064.
+    pub fn latch_handoff_barrier(&mut self) {
+        self.latch.get_or_insert(LatchCause::HandoffBarrier);
+    }
+
+    /// An observed change whose content outcome is unknown (a stranded
+    /// write authority, an aborted rescan): the scope is dirty. The same
+    /// latch [`UnwindRetention`] arms across a payload derivation, exposed
+    /// for the T064 recovery lane, which observes the dirtiness directly
+    /// rather than through an unwind.
+    pub fn latch_scope_dirty(&mut self) {
+        self.latch.get_or_insert(LatchCause::ScopeDirty);
+    }
+
     /// Pending distinct sources (coalesced).
     pub fn pending(&self) -> usize {
         self.pending.len()
@@ -258,3 +275,15 @@ impl ObserverSlot {
         })
     }
 }
+
+// ── Frozen seam anchors (C5) ───────────────────────────────────────────────
+
+/// SEAM-OBSERVER anchor: the handoff protocol's carrier — the slot whose
+/// begin/deliver/complete sequence (and typed [`HandoffRefusal`]) IS the
+/// stable observer handoff the contract names.
+pub type ObserverHandoff = ObserverSlot;
+
+/// SEAM-OBSERVER anchor: the observation lane's observable health — the
+/// coalescing accumulator whose gap, scope-dirty, and handoff latches are
+/// exactly what a health reader can know about the lane.
+pub type ObserverHealth = CoalescingAccumulator;

@@ -150,19 +150,22 @@ pub(crate) struct AtomicWriteReport {
     pub tee_snapshot: crate::edit_safety::tee::TeeSnapshot,
 }
 
+/// Wrap an authority refusal for this module's `io::Result` writers.
+fn authority_refused(
+    refusal: crate::live_index::index_lifecycle::authority::AuthorityRefusal,
+) -> std::io::Error {
+    std::io::Error::other(format!("source mutation authority refused: {refusal:?}"))
+}
+
 pub(crate) fn atomic_write_file(
     repo_root: &Path,
     project_state_dir: Option<&crate::domain::ProjectStateDir>,
     path: &Path,
     content: &[u8],
 ) -> std::io::Result<AtomicWriteReport> {
-    use std::io::Write;
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path has no parent directory",
-        )
-    })?;
+    // The tee snapshot is a ProjectStateDir state write and stays permit-free
+    // per the frozen writers-category assertion; only the repository-source
+    // byte write below carries mutation authority.
     let tee_snapshot = match project_state_dir {
         Some(state_dir) => crate::edit_safety::tee::Tee::for_repo(repo_root, state_dir)
             .snapshot(path)
@@ -175,13 +178,83 @@ pub(crate) fn atomic_write_file(
             message: "project state unavailable; tee snapshot disabled".to_string(),
         },
     };
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(content)?;
-    tmp.flush()?;
-    tmp.as_file().sync_all()?;
-    // persist() uses rename(2) on Unix and MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows,
-    // atomically replacing any existing target file.
-    tmp.persist(path).map_err(|e| e.error)?;
+    match path.strip_prefix(repo_root) {
+        Ok(relative) => {
+            // The lease's staged replacement deliberately creates missing
+            // parents beneath the confined root (physical_root.rs); this
+            // seam preserves the V10 refusal instead — pinned by
+            // test_atomic_write_error_path_no_orphan — so an edit-tool
+            // write into a nonexistent directory stays an error, checked
+            // before any grant is spent.
+            match path.parent() {
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "path has no parent directory",
+                    ));
+                }
+                Some(parent) if !parent.exists() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "target parent directory does not exist",
+                    ));
+                }
+                Some(_) => {}
+            }
+            // T064: the repository-source byte write obtains a current
+            // SourceMutationPermit BEFORE I/O, writes beneath the permit's
+            // own confined lease, and returns to Current only through a
+            // fresh publication. A sibling writer holds the source
+            // non-Current for the length of one write cycle, so a brief
+            // bounded wait stands in for the daemon-level serialization the
+            // C4 root commit makes structural.
+            let authority =
+                crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
+            let mut write = {
+                let mut attempts = 0u32;
+                loop {
+                    match authority.acquire_write() {
+                        Ok(write) => break write,
+                        Err(
+                            refusal @ crate::live_index::index_lifecycle::authority::AuthorityRefusal::PhaseNotCurrent { .. },
+                        ) => {
+                            attempts += 1;
+                            if attempts >= 80 {
+                                // ~2s of sibling-writer patience, then the
+                                // refusal surfaces honestly.
+                                return Err(authority_refused(refusal));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        Err(refusal) => return Err(authority_refused(refusal)),
+                    }
+                }
+            };
+            let receipt = write.write(relative, content).map_err(authority_refused)?;
+            write.finish_committed(receipt).map_err(authority_refused)?;
+        }
+        Err(_) => {
+            // Resolve-hook reroute outside the project root (worktree lane).
+            // Recorded C2 residual: this lane keeps the legacy tempfile
+            // write until the per-root authorities of C3/C4 attach to
+            // resolved targets (execution map, seal section).
+            use std::io::Write;
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path has no parent directory",
+                )
+            })?;
+            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+            tmp.write_all(content)?;
+            tmp.flush()?;
+            tmp.as_file().sync_all()?;
+            // persist() uses rename(2) on Unix and
+            // MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows, atomically
+            // replacing any existing target file.
+            tmp.persist(path).map_err(|e| e.error)?;
+        }
+    }
     Ok(AtomicWriteReport { tee_snapshot })
 }
 
@@ -1855,7 +1928,7 @@ pub(crate) fn execute_batch_edit(
     edits: &[SingleEdit],
     dry_run: bool,
     top_level_working_directory: Option<&Path>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<std::path::PathBuf>), String> {
     struct ResolvedEdit {
         path: String,
         sym: SymbolRecord,
@@ -2115,7 +2188,7 @@ pub(crate) fn execute_batch_edit(
                 summaries.push(format!("[DRY RUN] Would {summary}"));
             }
         }
-        return Ok(summaries);
+        return Ok((summaries, Vec::new()));
     }
 
     // Phase 4: Apply all writes, rolling back any already-written files on failure.
@@ -2223,7 +2296,8 @@ pub(crate) fn execute_batch_edit(
         summaries.extend(file_summaries);
     }
 
-    Ok(summaries)
+    let written_paths = staged.iter().map(|sf| sf.abs_path.clone()).collect();
+    Ok((summaries, written_paths))
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,7 +2387,7 @@ pub(crate) fn execute_batch_rename(
     repo_root: &Path,
     project_state_dir: Option<&crate::domain::ProjectStateDir>,
     input: &BatchRenameInput,
-) -> Result<String, String> {
+) -> Result<(String, Vec<std::path::PathBuf>), String> {
     // Phase 1: Resolve the definition and find the name within its body.
     // `target_owner` is the resolved target's enclosing-`impl` owner type (019
     // recall-recovery): for `Target::new`, `Some("Target")`. `None` when the
@@ -2654,7 +2728,7 @@ pub(crate) fn execute_batch_rename(
             ));
             lines.extend(uncertain_lines);
         }
-        return Ok(lines.join("\n"));
+        return Ok((lines.join("\n"), Vec::new()));
     }
 
     // Phase 4: Atomic rename — stage all new content in memory first, then write all.
@@ -2824,7 +2898,8 @@ pub(crate) fn execute_batch_rename(
             &sf.resolved_target,
         ));
     }
-    Ok(output)
+    let written_paths = staged.iter().map(|sf| sf.abs_path.clone()).collect();
+    Ok((output, written_paths))
 }
 
 // ---------------------------------------------------------------------------
@@ -2964,7 +3039,7 @@ pub(crate) fn execute_batch_insert(
     repo_root: &Path,
     project_state_dir: Option<&crate::domain::ProjectStateDir>,
     input: &BatchInsertInput,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<PathBuf>), String> {
     struct ResolvedTarget {
         path: String,
         sym: SymbolRecord,
@@ -3137,7 +3212,7 @@ pub(crate) fn execute_batch_insert(
                 summaries.push(format!("[DRY RUN] Would {summary}"));
             }
         }
-        return Ok(summaries);
+        return Ok((summaries, Vec::new()));
     }
 
     let mut written: Vec<usize> = Vec::new();
@@ -3232,7 +3307,8 @@ pub(crate) fn execute_batch_insert(
         summaries.extend(file_summaries);
     }
 
-    Ok(summaries)
+    let written_paths = staged.iter().map(|sf| sf.abs_path.clone()).collect();
+    Ok((summaries, written_paths))
 }
 
 // ---------------------------------------------------------------------------
@@ -3389,6 +3465,40 @@ pub(crate) fn detect_stale_references(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Feature 020 V11, T064 — writer-lane wiring oracles: the repository-source
+/// byte write in this module routes through a current `SourceMutationPermit`.
+#[cfg(test)]
+mod write_authority_wiring {
+    use super::atomic_write_file;
+    use crate::live_index::index_lifecycle::activation::project_source_authority;
+
+    #[test]
+    fn atomic_write_file_routes_through_the_source_mutation_permit() {
+        let root = tempfile::tempdir().expect("oracle root");
+        let authority = project_source_authority(root.path());
+        let before = authority.grants_issued();
+
+        let target = root.path().join("wired.rs");
+        atomic_write_file(root.path(), None, &target, b"fn wired() {}")
+            .expect("the permit-authorized write succeeds");
+
+        assert_eq!(
+            std::fs::read(&target).expect("the write landed"),
+            b"fn wired() {}"
+        );
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "the write acquired exactly one mutation grant — zero means the \
+             legacy lane wrote without authority"
+        );
+        assert!(
+            authority.is_current(),
+            "the source returned to Current through the permit's terminal path"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -4351,7 +4461,8 @@ mod tests {
             },
         ];
 
-        let summaries = execute_batch_edit(&handle, dir.path(), None, &edits, false, None).unwrap();
+        let (summaries, _written) =
+            execute_batch_edit(&handle, dir.path(), None, &edits, false, None).unwrap();
         assert_eq!(summaries.len(), 2);
 
         let a_content = std::fs::read_to_string(src.join("a.rs")).unwrap();
@@ -4517,7 +4628,8 @@ mod tests {
             working_directory: None,
         }];
 
-        let summaries = execute_batch_edit(&handle, dir.path(), None, &edits, true, None).unwrap();
+        let (summaries, _written) =
+            execute_batch_edit(&handle, dir.path(), None, &edits, true, None).unwrap();
         assert_eq!(summaries.len(), 1, "expected one preview line");
         assert!(
             summaries[0].contains("[DRY RUN]"),
@@ -4615,7 +4727,8 @@ mod tests {
             working_directory: None,
         };
 
-        let summaries = execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
+        let (summaries, _written) =
+            execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
         assert_eq!(summaries.len(), 2);
 
         let a = std::fs::read_to_string(src.join("a.rs")).unwrap();
@@ -4667,7 +4780,8 @@ mod tests {
             working_directory: None,
         };
 
-        let summaries = execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
+        let (summaries, _written) =
+            execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
         assert_eq!(summaries.len(), 2, "expected two preview lines");
         for s in &summaries {
             assert!(s.contains("[DRY RUN]"), "expected [DRY RUN] prefix in: {s}");
@@ -4935,7 +5049,7 @@ mod tests {
             working_directory: None,
         };
 
-        let out = execute_batch_rename(&handle, dir.path(), None, &input).unwrap();
+        let (out, _written) = execute_batch_rename(&handle, dir.path(), None, &input).unwrap();
 
         assert!(
             out.contains("Confident matches (will be applied)"),

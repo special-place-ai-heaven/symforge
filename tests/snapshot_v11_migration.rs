@@ -355,7 +355,7 @@ fn team_artifact_export_discloses_exactly_one_visibility_state() {
             "the receipt must disclose its exact state"
         );
         match visibility {
-            GitVisibility::GitVisibilityUnavailable => assert_eq!(
+            GitVisibility::Unavailable => assert_eq!(
                 receipt.shareability(),
                 None,
                 "shareability must never be inferred without git visibility"

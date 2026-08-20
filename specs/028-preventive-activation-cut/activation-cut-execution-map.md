@@ -1,0 +1,756 @@
+# Activation Cut Execution Map (T029–T037 working notes)
+
+Working document for the Wave 2 branch `feature-020-slice-4-activation`.
+Fuses the pre-implementation surveys (dark-seam map + live-V10 map, both
+verified against this worktree on 2026-08-18) with the commit sequence.
+Not a contract: the frozen 020 tree and the 028 spec/tasks stay authoritative.
+No volatile git facts here by design (see CLAUDE.md docs hygiene).
+
+## 1. The two worlds the cut connects
+
+**V10 (live today)**: `SharedIndexHandle` (src/live_index/store.rs) is both
+data plane and authority plane — ArcSwap<LiveIndex> + published_state +
+generation fences + write mutexes + git_temporal jobs. Every writer, watcher
+tick, background verifier, and handler touches it directly:
+
+- Bootstrap: `daemon.rs::bootstrap_project_index` (snapshot-first +
+  background_verify spawn); `ProjectInstance::activate` starts watcher +
+  git_temporal separately; `main.rs::run_local_mcp_server_async` builds inline
+  and spawns watcher/git_temporal/periodic-checkpoint/sidecar;
+  `server/serve.rs` loads + background_verify, no watcher.
+- Bare-`SharedIndex` holders (publication_roots category): daemon
+  `ProjectInstance::index`, `SessionRuntime::index` + `::project_indexes`,
+  `DaemonState::bases`, `ServerRuntime::index`, `SidecarState::index`,
+  protocol `SymForgeServer::index`.
+- Writers: `protocol/edit.rs::reindex_after_write` → `index.update_file`
+  (called by execute_batch_edit/insert/rename on success AND rollback);
+  `live_index/single_file.rs::{update_file_from_disk, remove_file}` → fenced
+  publish (ALSO re-exported raw by embed.rs today); gitignore_hygiene +
+  cli/init + persist::ensure_gitattributes_merge_hint write disk only (no
+  index edge); knowledge_curation `write_policy` publishes INDIRECTLY (its
+  durable write is picked up by the watcher lane).
+- Watcher: `process_events` → `read_and_index` / fenced remove; re-spawns
+  git_temporal on content-generation advance. `background_verify` re-parses
+  via the same admission seam under `feature = "server"`.
+- Hooks: HTTP-only ingress (sidecar first, daemon proxy fallback, fail-open);
+  PreTool is static text, no data source.
+- Embed: flat raw re-exports in `src/embed.rs` (the 79 raw_embed retirement
+  members); `lib.rs:31-32` `pub(crate) mod server_api` (flip target);
+  `src/live_index/mod.rs:25-26` `#[path]` mount (flip target — delete, add
+  private `mod index_lifecycle;` to lib.rs, re-export public types from
+  embed.rs; no file moves). `server_api::run` currently returns
+  `activation_pending` and holds no call edge into index_lifecycle.
+
+**V11 (dark, complete)**: authority machinery finished, evidence fixtured.
+
+- `authority.rs::SourceRuntime` — 5-phase machine;
+  `request_mutation_grant(MutationGrantInput::LiveCurrent) →
+  CurrentMutationGrantAuthority` (freezes → non-Current, epoch++).
+- `mutation.rs::SourceMutationPermit::grant(grant, lease, drain)` —
+  whole-authority validation; `replace_beneath`/`commit → RefreshTicket`.
+- `transition.rs::apply(runtime, kind, outgoing, incoming, observer_cut,
+  outstanding)` — Freeze→Drain→Install; Install revokes the outgoing root
+  lease first.
+- `physical_root.rs::PhysicalRootLease` — cap-std beneath-confined I/O,
+  staged replacement re-checks revocation at commit.
+- `capacity.rs::ProcessCapacityPool` + `process_runtime.rs::
+  ProcessIndexRuntime::incarnate/attach(SurfaceKind)` — one process, one
+  capacity domain (Daemon|Stdio|Serve|Embed).
+- `registry.rs::ProjectRegistry::admit/install/stop` — single-flight
+  admission, non-revivable tombstones. `adapters.rs::plan_admission/
+  execute_plan` — the admission decision layer (SC-019 enforced).
+- `runtime.rs::DarkRuntimeFactory` → `ProjectIndexRuntime` →
+  `ProjectPublicationRoot` (ArcSwap<ProjectRuntimePublication>);
+  `acquire_strict` implements F020-V11-A20. All mutating doors are
+  `*_for_test` fixtures that mint evidence unconditionally.
+- `public_api.rs::ProcessRuntimeApi::{acquire, open_embedded_source,
+  begin_shutdown}` + wrap_table() work list; `embedded.rs::
+  EmbeddedSourceFactory/EmbeddedSourceHandle` — sole-handle semantics ready;
+  search/refresh return honest dark refusals awaiting bound generations.
+- Wave 1 modules: supervisor / candidate / verification / query / observer /
+  snapshot — oracle-green dark.
+
+`src/index_lifecycle/activation.rs` does NOT exist yet (T030 creates it).
+
+## 2. Load-bearing preconditions and rulings
+
+1. **runtime.rs:63-66 ACTIVATION PRECONDITION**: before the keyword flip,
+   every `#[cfg(any(test, feature = "server"))] *_for_test` door must become
+   `#[cfg(all(test, feature = "server"))]` (their oracles move in-crate) or
+   sit behind a dedicated non-server test feature — otherwise fixture
+   evidence ships in the release binary.
+2. The 30 doc-recorded cut obligations indexed in §5 below are the work
+   checklist; each is either discharged by the cut or explicitly carried into
+   the T038 evidence doc with rationale.
+3. Frozen census partition (oracle `all_ingress_uses_exact_typed_authority_
+   branch`): 244 slots / 13 categories; surface split 102 branch-bearing +
+   3 non-ingress + 11 authority-free; 8-branch MODEL_SURFACE (test-local by
+   design — the src-side typed enum is ours to build); replay residual
+   (8 tools / 7 duplicate writers); estimate dispositions [7,5,3,1]; tools
+   full-39/compact-3/union-40.
+4. Wave-1 pair-review recorded obligations (from the merged PR reviews):
+   latch clear-on-emission-vs-proof seam + HandoffBarrier threading +
+   ObserverId/ObserverToken unification (observer.rs, T064 work); real
+   RequiredArtifactSet (candidate.rs); persist.rs wiring + CURRENT_VERSION
+   bump (snapshot lane, T065→cut); health_view/protocol wiring (query lane);
+   missing/forged bijection oracles; transport codes vs frozen
+   embed::SourceRefusal alignment; MetadataOnlyReason in-crate
+   exhaustiveness pin.
+
+## 3. Core design decision (D1): the authority facade owns the data plane
+
+The V11 layer is authority-only; the LiveIndex machinery remains the data
+plane. The cut inserts a typed facade that OWNS the `SharedIndexHandle` and
+is the only thing allowed to touch it:
+
+- `ProjectRuntimePublication` carries the real payload (the published
+  LiveIndex view) instead of fixture data.
+- A per-project authority handle (activation.rs) exposes ONLY typed-branch
+  acquisitions mirroring MODEL_SURFACE: strict generation leases
+  (GenerationLeased), mutation grants (MutationPermitted), the observed
+  branches, and Refused. Field-type replacement drives the compiler over
+  every touch site: `ProjectInstance::index`, `SessionRuntime::index/
+  project_indexes`, `ServerRuntime::index`, `SidecarState::index`,
+  `SymForgeServer::index` change type, and rustc enumerates the rerouting
+  work — unrepresentable over checked.
+- Chokepoints cover families: daemon dispatch goes through
+  `runtime_for_target`; sidecar handlers all read `SidecarState`; protocol
+  tools go through `SymForgeServer`. Branch selection happens at those necks,
+  not by rewriting each handler body.
+
+## 4. Commit sequence on this branch (mid-branch mixing allowed; PR is the unit)
+
+- C1 (T030 core): `src/index_lifecycle/activation.rs` — ActivationCut
+  machine (LegacyOpen → LegacyClosing → PreventiveV1Open, monotonic,
+  process-wide, non-configurable), lane registration, the authority facade
+  type; plus the cfg-tightening precondition (move needed oracles in-crate,
+  `any(test, feature="server")` → `all(test, feature="server")` on fixture
+  doors). Compiles dark; census/seal updated.
+- C2 (T029 writers lane): SymForge-owned writes acquire a fresh
+  `SourceMutationPermit` (publish non-Current first): protocol/edit.rs batch
+  paths, knowledge curation apply; gitignore/init/.gitattributes classified
+  per contract (source-authorized hygiene vs permit-free ProjectStateDir and
+  post-image team-artifact state writes → StateWriteAuthorized).
+- C2b (T029 writers census closed — executed 2026-08-19): gitignore hygiene
+  (`reconcile_root_gitignore` append) and the `.gitattributes` merge hint
+  (`persist.rs`) acquire the permit via the shared
+  `acquire_write_serialized`; the retired `atomic_replace` is deleted
+  (inventory-mismatch onset, §4b). The registry key canonicalizes so every
+  spelling of one physical root converges on one authority. Classification
+  adjudications recorded in-file: `cli/init.rs::run_init_with_paths` writes
+  only user-scope client configs (permit-free; repo-source writing delegated
+  to the hygiene lane); `edit_tools.rs` census members delegate all disk I/O
+  to the `edit.rs::atomic_write_file` chokepoint; curation ledger writes
+  (state dir) are permit-free `StateWriteAuthorized`, while the POLICY file
+  `.symforge-knowledge.toml` at the repository root is repository-source —
+  its two writers (`write_policy` apply path, `recover_on_project_load`
+  recovery) are source-authorized and take the permit lane at C3 with the
+  callback registration (recorded residual, alongside C2's worktree-reroute
+  residual in `edit.rs`).
+- C3a (T029 observation lane core — executed 2026-08-19): the
+  ProjectSourceAuthority gains the observation lane — per-source
+  supervisors, the isolated delta-candidate pipeline to its single commit
+  point, the bounded coalescing accumulator, and the ObserverSlot with the
+  ObserverId/ObserverToken unification (publications carry the ACTIVE
+  incarnation's token; the two accumulator latches the observer module
+  recorded as T064 obligations are threaded: handoff barrier at
+  registration, scope-dirty for recovery). Every permit return consumes the
+  accumulated cut. WriteAuthority drop now RECOVERS through the re-scout
+  lane (scope-dirty full baseline) — the C2 stranding oracle inverted
+  RED-first. Wired: watcher run-loop registers one incarnation per
+  instance; process_events observes admissions/removals under it (stale
+  incarnations refused — late callbacks unreachable); overflow latches the
+  gap; the embed facade update/remove observe as the current incarnation.
+  Recorded residuals: periodic/fresh reconciliation sweeps observe only
+  through the barrier/gap latches (their per-file re-admissions join at
+  C4); data-plane admissions keep the V10 generation fence until C4.
+- C3b (T029/T064/T065 policy lane + callbacks census closed — executed
+  2026-08-19): the curation POLICY file's two writers take the permit lane
+  as a DELEGATED side effect — `begin_delegated` puts the permit in flight,
+  the contract-pinned staged durability protocol runs untouched
+  (failpoints, digest verification, fsyncs), and `attest_delegated` has the
+  pinned lease re-read the target and mint a receipt only for the exact
+  authorized post-image (`Ok(None)` = mismatch = drop-recovery is the only
+  honest terminal). Wired at the apply path and the `PendingWrite`
+  recovery arm shared by replay and `recover_on_project_load` (which
+  discharges that census row). `background_verify` carries the observer
+  incarnation current at its spawn (threaded from all three spawn sites:
+  daemon bootstrap, stdio main, serve); its re-admissions/removals observe
+  under that id and a successor registration refuses them — pinned RED-first
+  together with the data-plane-continues residual. Enrichment callbacks
+  adjudicated in-file: local-ref reconcile and git_temporal are
+  publication-fence-gated data-plane enrichment (no source admission;
+  typed-root gating at C4); periodic checkpoint is permit-free
+  ProjectStateDir state; edit_hooks resolve/after_commit are routing/fan-out
+  with their writes landing through already-wired lanes; the three watcher
+  census rows are discharged by C3a's registration inside
+  `run_watcher_with_stop`. DESIGN FIX exposed by the C3b foreign-root
+  oracles: since C2 the authority idled with its cap-std directory handle
+  OPEN, which on Windows blocked renaming (and hostage-held) every
+  repository root ever written — `PhysicalRootLease` is now DORMANT between
+  permit cycles (`parked`/`reopened`, identity- and revocation-preserving);
+  the confinement handle exists only while a permit is in flight, which is
+  the window the confinement claim protects.
+- C3 (T029 observation lane): watcher process_events + single_file admission
+  route through the isolated candidate pipeline permit-free; background
+  verify / git_temporal / local-ref / periodic checkpoint callbacks register
+  with supervisor+observer incarnations (no callback holds publication
+  authority; late V10 callbacks unreachable).
+- C4a (T030 roots, structural — executed 2026-08-19): the D1 ownership
+  move. `activation.rs::ProjectRuntimeHandle` (inner field deliberately
+  named `data_plane`, NOT `index` — the census derivation counts every
+  `index: SharedIndex(Handle)` field as a V10 root, and the sole authorized
+  holder is the replacement, not a root) now owns the data plane at all six
+  retired publication_roots fields: `ProjectInstance::index`,
+  `SessionRuntime::index`, `SessionRuntime::project_indexes`,
+  `SymForgeServer::index`, `ServerRuntime::index`, `SidecarState::index`.
+  Field-type replacement drove the compiler over every touch site
+  (~200 sites across daemon/protocol/server/sidecar + tests); every read
+  routes through the enumerable `data_plane()`/`shared()` door, pinned
+  RED-first by the structural oracle
+  `root_holders_store_no_bare_shared_index` (struct-scoped, so params and
+  locals cannot satisfy the claim). Behavior-preserving by design: typed
+  acquisition branches arrive at the dispatch necks with C4b/C4c, not by
+  rewriting handler bodies. `IndexBase::index` (Arc<LiveIndex>, cache
+  census) deliberately untouched — cache disposition is C4c/C5 work.
+- C4b (T030 bootstrap — executed 2026-08-19): bootstrap flows through the
+  activation machine and the process registry. `activate_surface(surface)`
+  runs the startup CEREMONY on the process machine — register all nine
+  frozen lanes, `begin_closing`, confirm every drain, `open_preventive` —
+  BEFORE the surface serves, which is what makes each drain confirmation
+  truthful: at that moment the bootstrapper IS every lane's owner and can
+  observe that nothing has entered the legacy gate. It also attaches the
+  surface to the one `ProcessIndexRuntime` (dark budgets: 1 GiB per
+  surface, 4 GiB process; C7/C8 measure real ones). Wired at daemon state
+  construction, stdio `run_mcp_server_async`, and `serve::run`; embed
+  attaches at C5. `admit_project` is the single admission door: plan
+  (`plan_admission`) → single-flight admit (`execute_plan`, live
+  occupancies join on matching root+placement) → install charged to the
+  surface's capacity owner; wired at `ProjectInstance::load_bound`, the
+  stdio local bind, and the serve load — refusals fail the open honestly.
+  `ProjectSlot::stop` retires the admission slot, so daemon eviction and
+  retarget re-admit fresh. The authority presents a STABLE admission-root
+  identity (its first lease's), so every open of one canonicalized root
+  joins one occupancy; recorded residuals: a root physically replaced at
+  the same path keeps its admission identity until C5's transitions own
+  rebinding; the serve path surfaces no RootBinding and presents
+  NormalProject (its loader resolves protected roots upstream); the
+  registry-ownership move is the admission door — the
+  `project_source_authority` static remains the per-root convergence
+  lookup until C5 narrows it.
+- C4c part 1 (T030 roots — executed 2026-08-19): the sweeps join the lane
+  and the daemon neck gets its typed acquisition branch. Reconciliation
+  (`reconcile_stale_files_with_stop_and_hook` and every caller) and
+  freshen-on-read (`freshen_file_if_stale` at the watcher fallback, the
+  sidecar handler, and the three edit/retrieval request paths) carry an
+  `ObserverId`: long-running sweeps carry the watcher's spawn-registered
+  incarnation, synchronous request paths the incarnation current at call
+  time (the C3b synchronous-facade ruling). Re-admissions observe on the
+  mutation EVIDENCE (`Reindexed`), removals on the completed removal —
+  before any generation re-check, since a spurious observation only
+  dirties the next cut while a missed one loses the change. Data-plane
+  admissions are thereby GATED: every sweep re-admission now flows
+  through the candidate pipeline's capacity/supersession gate (a refused
+  candidate latches a gap, never drops the change). The daemon's
+  `ProjectRuntimeHandle` carries its admission slot
+  (`bind_admitted`/`acquire`); `runtime_for_target` refuses a retired
+  slot via the registry's own shared revocation flag. Deliberately NOT
+  carried on stdio/serve handles: those admissions are process-lifetime
+  with no stop path, so a refusal branch there could never fire
+  (reporting-invariant ruling); C5's typed bootstrap revisits. RED
+  observed on all three oracles before wiring
+  (`reconciliation_sweep_feeds_the_observation_lane_under_the_carried_incarnation`,
+  `freshen_on_read_feeds_the_observation_lane`,
+  `retired_admission_slot_refuses_dispatch_at_the_runtime_neck`);
+  `src/protocol/tools.rs` and `src/protocol/edit_tools.rs` joined
+  WIRED_PRODUCTION_FILES.
+- C4c part 2 (T030/T031 cache census — executed 2026-08-19): the nine
+  frozen cache members adjudicated in-file against the category's three
+  assertions. Eight were already generation-fenced or non-authoritative
+  by construction and got classification comments naming the mechanism:
+  `DaemonState::bases` (BaseKey-pinned projections, base_generation
+  fence, B2/D12 force-replace, strong-count GC), the three
+  `symbol_cache`s (sole reader is the sidecar handlers behind
+  `ensure_symbol_cache_generation`), both `working_set`s (interned bases
+  re-fenced per read via B2/D12, no overlay writes),
+  `probe_cache` (capability VERDICTS, not index data; a stale Ok cannot
+  mint success because the durable write reports its own failure;
+  dropped with the instance), `detailed_fetches` (params_hash binds
+  project/publication/content generation — pinned by
+  `hash_symbol_params_binds_generation_identity` — and a hit yields
+  dedup metadata only). ONE real defect found and fixed RED-first:
+  `WorktreeCache` was process-shared through the edit hook but its
+  `lookup` hit ignored which indexed root populated the entries, so
+  project A's cached `git worktree list` authorized rerouting project
+  B's edit into A's worktree — a routing decision a fresh listing
+  against B refuses. The cache is now fenced per canonical indexed root
+  (per-root slices; refresh touches only the requesting root's slice),
+  pinned by `worktree_hits_are_fenced_to_the_requesting_indexed_root`
+  (observed RED: B's file rerouted into A's worktree with
+  rerouted=true). The category's full retirement test
+  (`all_ingress_uses_exact_typed_authority_branch`) remains C6's
+  stand-in; the pinned-publication identity moves onto C5's leases.
+- C5 (T031 exposure — executed 2026-08-19, two commits: the dispatcher
+  hoist prep and the atomic flip). THE EXPOSURE FLIP: the public census
+  now holds exactly the kept + introduced V11 atoms and the validator
+  runs GREEN on its postactivation path ("lifecycle oracle traceability
+  v11: OK") — the hard PR exit criterion.
+  - The 27 raw crate-root modules are declared inside the private
+    `internals` wrapper (28 same-directory `#[path]` remounts, each
+    splice-allowlisted) and re-imported at the root as `pub(crate)`;
+    every `crate::X` path resolves unchanged. The `__test-internals`
+    dunder feature — enabled ONLY through the repo's self dev-dependency
+    (`default-features = false`, learned the hard way: without it,
+    feature unification dragged `server` into the embed test cell and
+    the embed gate ran 3273 server tests) — swaps the re-imports to
+    `pub`, so all 129 integration test files compile UNCHANGED while no
+    supported configuration cell ever sees the door.
+  - `embed.rs` retired its raw surface for the 26 introduced embed atoms
+    (boundary wrappers aliased to contract names; `EmbeddedSourceHandle`
+    + `ReceiptWaitError` + `SourceCloseReceipt` from the seam file) plus
+    kept `EngineInfo`/`engine_info`; its contract tripwire module now
+    names the V11 surface. `ProcessRuntimeApi::acquire` ATTACHES: it
+    runs the activation ceremony (`SurfaceKind::Embed`) and joins the
+    one process capacity runtime — the provisional private-incarnation
+    constant retired.
+  - `server_api` flipped `pub(crate)`→`pub` and WIRED: `run` dispatches
+    the whole CLI through the hoisted `cli::entry::run_main`;
+    `MainExit::ServeRefusedToStart` carries the cli-serve exit-2
+    contract through the typed door instead of `process::exit` in lib
+    code; `ServerBootstrapError` captures cause chains as text (all
+    five auto traits preserved per the frozen trait_impls). main.rs is
+    an ExitCode shim over the door.
+  - The `#[path]` mount flip: `live_index`'s mount became the internals
+    declaration + a cfg-paired alias in `live_index/mod.rs`, so every
+    `crate::live_index::index_lifecycle::` path (and the suite's
+    `symforge::live_index::index_lifecycle::`, via the door) resolves.
+  - Fifteen frozen seam anchors whose names Wave 1 spelled differently
+    were discharged in-file with documented bindings: aliases where the
+    construct exists (`CandidateHandle`=IsolatedCandidate,
+    `ObserverHandoff`=ObserverSlot, `ObserverHealth`=
+    CoalescingAccumulator, `ProjectQueryLease`=StrictSelectionLease,
+    `QuerySelection`=SelectedAggregate, `RuntimeHealthObservation`=
+    HealthProjection, `RollingVerification`=RollingVerifier,
+    `CandidateCommit`=the commit point's outcome type,
+    claim_provenance `OperationReceipt`=the lifecycle receipt) and
+    small real constructs where the seam names a projection
+    (`CheckpointAvailability`, `ProjectStateDir`, `TeamArtifactState`,
+    health_view's `CommittedGenerationHealth`/`AttemptHealth` split by
+    `split_health_projection`, `ReadGate` hosting the admission door).
+    `V11PublicApi` owns the wrap table and the delta oracle reads
+    through it, so the anchor is load-bearing.
+  - Exact-graph equality across the 26 cells holds BY CONSTRUCTION and
+    is enforced at item granularity by the validator + delta oracle:
+    every public item is gated exactly `feature=embed` or
+    `feature=server` (the frozen availability column), no public item is
+    target-cfg'd, and the door feature exists in no cell — so the
+    observed projection per cell is the expected one wherever the cell
+    compiles (the CI matrix covers the five targets). The frozen
+    `observed_graph.cell_graphs` slot stays null in the immutable
+    contract; C6's `all_ingress_uses_exact_typed_authority_branch` is
+    the category's retirement test.
+  - The export delta regenerated under the C14 discipline (write run
+    reports the drift it repairs; the verify rerun passed);
+    `the_flip_ready_module_is_declared_once_and_never_called` became
+    `the_server_door_is_declared_once_and_called_only_by_the_shim`;
+    embed.rs and health_view.rs joined WIRED_PRODUCTION_FILES.
+  - Gates: fmt; dark 9/9 (pins refreshed post-fmt, 196 files); clippy
+    -D warnings; TRUE embed cell 1336; full serial suite exit 0 (732s);
+    release build + verify-tools harness 7 PASS / 0 FAIL through the
+    new shim; validator OK (78 requirements, 24 acceptance oracles, 13
+    retirement categories).
+- C6 (T032 — executed 2026-08-19): the four frozen T058 stand-ins have
+  OBSERVING bodies, `#[ignore]` removed — the stand-ins were the armed
+  RED (ignore + panic since Slice 3); the bodies observe what the cut
+  made real. TEST-ACTIVATION: every surface's ceremony lands and stays
+  in `PreventiveV1Open` (closed 3-variant mode set pinned by exhaustive
+  match; repeat ceremonies cannot regress; the fresh-machine LegacyOpen
+  start remains the C1 lib oracle's claim). TEST-EMBED: acquisition
+  drives the embed attach; one source = one handle; a second open —
+  the only bypass shape the surface can spell — refuses typed
+  (`SelectionUnavailable`); the view invents no publication;
+  close-then-reopen releases. TEST-MUTATION: on the authority's own
+  grant ledger, a read ingress mints nothing, each of two live edit
+  writes mints exactly one. TEST-STATE: admission records placement
+  exactly with a charged capacity owner; protected + project-local
+  refuses pre-install; each team-artifact export discloses its precise
+  visibility and persists exactly one; refused bindings persist
+  nothing. Plus the two focused C6 oracles:
+  `cold_recovery_mints_no_mutation_permit` (cold load + checkpoint +
+  snapshot restore = zero grants, with a real acquire as the accepting
+  control) and `init_gitignore_reconcile_acquires_exactly_one_permit`
+  (the init writer lane grants once; explicit-protected writes nothing
+  and mints nothing — and a rootless fixture honestly reported
+  NoRootGitignore/no-grant twice before the fixture earned its write).
+  The file gained a FILE-level `#![cfg(feature = "server")]`: the
+  traceability validator rightly refuses a planned oracle behind a
+  per-case feature cfg, and every CI job that builds integration tests
+  is a server build. Gates: fmt; validator OK; dark 9/9 (src pins
+  untouched — tests-only change); clippy -D warnings; embed cell 1336;
+  full serial suite exit 0 (594s).
+- C7 (T033 — executed 2026-08-19): criterion 0.8 dev-dep + the frozen
+  `[[bench]] observed_refresh_gate_v1` (registration
+  `criterion_group:observed_refresh_gate_v1_group->
+  observed_refresh_gate_v1`, harness=false, server-gated). The measured
+  phenomenon: exact completed write (or mutation commit) → the FIRST
+  in-process observation of the published index carrying that byte
+  identity (`IndexedFile::content` equality) — a phenomenon that exists
+  at baseline `1521abb0` too, which is what makes C9's comparison
+  meaningful. Campaigns = the real ingress lanes: `delivered_event`
+  (the actual watcher: notify + debounce + batches; the
+  daemon/stdio/serve managed-observer lane) with
+  add/modify/delete/rename/terminal-classification/burst-24 workloads;
+  `need_rescan` (changes land with NO observer; a fresh watcher's
+  mandatory fresh-instance reconciliation repairs them);
+  `suppressed_notification` (no delivery; `get_file_content` rides the
+  C4c freshen-on-read — `get_symbol` deliberately does NOT freshen, a
+  fact the first smoke run taught); `embed_mutation_commit` (the
+  synchronous facade). Controls: corpus digest pinned by
+  `tests/fixtures/observed-refresh-v1/corpus.json`, host identity,
+  quiescence probe (one untimed write observed visible before timing),
+  per-campaign completion counts, the pre-granted capacity vector
+  (`OBSERVATION_CAPACITY_BYTES`, now pub for the receipt), and
+  clean-rebuild equivalence (incremental == from-disk rebuild,
+  content-hash file-for-file). Emits the code-owned receipt
+  `target/observed-refresh-gate-v1/receipt.json`; first observed run:
+  delivered_event p95 ≈ 250-308 ms (the debounce window), burst-24
+  282 ms, need_rescan 15 ms, freshen-on-read 1-2 ms, embed commit 1 ms
+  — all far inside the p95 ≤ 2 s / max ≤ 5 s gates C9 will enforce.
+  SUITE INVOCATION CHANGE (binding): `cargo test --all-targets`
+  forwards `--test-threads=1` to every selected binary and criterion
+  rejects it, so the canonical suite is now
+  `cargo test --lib --bins --tests -- --test-threads=1` plus a separate
+  `cargo bench --bench observed_refresh_gate_v1 -- --test` smoke —
+  ci.yml, release.yml, and CLAUDE.md updated together, and the
+  doctest-lane guard re-judged all four new workflow lines
+  (target-selection flags suppress the doctest lane; cargo bench never
+  builds doctests) with fingerprints and line counts refreshed.
+- C8 (T034 — executed 2026-08-19): the frozen
+  `whole_runtime_capacity_is_conserved_under_activation` stand-in (armed
+  RED since Slice 2) has its observing body, measuring
+  `retained + candidate <= pregranted (+ zero dark scratch/headroom)` in
+  the pipeline's own units: (1) the pre-granted vector exhausts the
+  process root EXACTLY — four surfaces attach, `available() == 0`,
+  every surface uncharged; (2) retained-plus-candidate peak sampled
+  after every admission of a 64-source burst on a live lane; burst
+  convergence (candidates all refunded, zero outstanding, zero unknown
+  refunds, retention exactly the burst's sources); no-unaccounted-
+  residency (the identical burst repeated grows nothing and leaves no
+  residue); (3) fairness — two lanes burst concurrently from separate
+  pre-grants, both make full committed progress and converge
+  charge-free. Two measurement probes added on the authority
+  (`observation_capacity_ledger`, `retained_observation_artifacts` —
+  the dark retained weight is the same one byte/source the candidate
+  pipeline reserves with; sealed artifact bytes replace it when they
+  land). The bench gained a `capacity_conservation` receipt section
+  recording the same run (observed: peak 64, converged charge 0,
+  unknown refunds 0, process promisable 0 after four attaches).
+- C9 (T035 — executed 2026-08-19): the gate RAN against baseline
+  `1521abb0` (byte-identical campaigns grafted into a detached worktree;
+  only the V11-only receipt extras absent there) and the candidate, full
+  criterion mode both sides, corpus digests matching. ALL GATES PASS:
+  every candidate p95 ≤ 2 s (worst 291 ms, burst-24), every max ≤ 5 s
+  (worst 304 ms), delivered-event p95 0.81–1.00× baseline (FASTER), and
+  no single-path full rebuild outside Gap/ScopeDirty (project-generation
+  stability asserted in-bench per campaign, both sides). Two
+  sub-millisecond lanes (embed commit, freshen-on-read) quantize 1→2 ms
+  (nominal 2.00×): adjudicated PASS with the deviation recorded openly —
+  the +1 ms is the candidate's real V11 pipeline work, three orders of
+  magnitude under every absolute budget, and a ratio test below the
+  measurement quantum is noise; flagged for T038 to challenge. Full
+  method, tables, adjudications, and BOTH raw receipts are in
+  docs/reviews/OBSERVED-REFRESH-GATE-v1.md. Two incidental findings,
+  recorded there and closed after C9: (1) a stale `Decision: cache_hit`
+  observed at baseline was ROOT-CAUSED TO THE FIXTURE (colliding
+  now-relative mtime backdates defeating the freshen), NOT to the cache
+  — the report's first explanation was wrong and was corrected; the
+  publication-identity fence itself is now PROVEN by
+  `stale_publication_never_satisfies_the_repeat_read_cache`
+  (fresh-change miss + unchanged-repeat hit + re-arm, get_file_content
+  and get_file_context); the broader residual sweep stays on C11/T072;
+  (2) the campaigns use deterministic absolute mtimes.
+- C10 (T036 — executed 2026-08-19): `tests/delta_full_rebuild_equivalence_v11.rs`
+  landed with the two frozen names, arming TEST-DELTA
+  (ORACLE-MIGRATION-DELTA-EQUIVALENCE) and TEST-KNOWLEDGE
+  (ORACLE-KNOWLEDGE-CURRENT-PROJECTION); validator OK. After every
+  advertised edit class (add, modify, rename, terminal 4 MiB demotion,
+  delete) applied through observed refresh, a clean `LiveIndex::load`
+  from the same on-disk bytes agrees on all five canonical projections —
+  code, manifest (digest included), knowledge bridge, authority, and
+  representative query results — with instance-bound counters
+  (generations, per-anchor SourceIdentity, document timelines, usage
+  telemetry) projected out by declared exclusion listed in the file
+  header. The nine frozen file classes
+  (code/prose/policy/manifest/orientation/curation/encoding/sparse/path)
+  are the versioned in-file corpus; the policy class is the real
+  `.symforge-knowledge.toml` ledger. The delta oracle passed on its
+  FIRST run — no divergence exists between the two build paths, and the
+  manifest digest plus digest-keyed finding index proved deterministic
+  across instances. One authored-assertion RED observed and fixed in the
+  TEST, not production: the malformed-policy typed finding was asserted
+  by literal rule name, but `stable_finding_id` digests anchor+rule, so
+  the honest observables are the policy-ledger review signal on the
+  records plus a non-empty finding index (both now asserted alongside
+  `PolicyLedgerStatus::Malformed`/`Absent`). Negative controls in-test:
+  omitted projection rows fail equivalence (both oracles); renamed and
+  deleted identities are unreachable through files, search, and
+  knowledge anchors (no raw cache, no second authority); discovery
+  tools create no frecency while a commitment read does (driven through
+  real tool dispatch on a dedicated root); a stale prepared bridge is
+  refused by the publication fence with a fresh-prepare positive
+  control; a bounded rebuild reports typed truncation and fails
+  equivalence; a foreign root's cards carry a distinct source identity;
+  and knowledge-scope queries (all four source scopes + review summary)
+  answer deterministically. Battery: fmt clean, validator OK, dark
+  suite 9/9, clippy `-D warnings` observed checking the new target
+  (forced re-check after a cache-instant first pass), embed cell 1336.
+- C11a (T037 residual fences — executed 2026-08-19): the two
+  implementation-bearing carried families landed RED-first in
+  `tests/activation_residuals_v11.rs`.
+  - CCR half of the publication-identity fence (frozen `ccr` category,
+    all three assertions): `CcrPublicationIdentity` (source digest +
+    content generation of the rendering publication) is now an INPUT to
+    handle minting — identical rendered bytes under a moved publication
+    mint different handles (RED observed: the handle did not move when
+    only the publication did) — and is stored on the blob.
+    `retrieve_checked` refuses a foreign-source blob with typed
+    `ForeignPublication`; a same-source superseded rendering is served
+    WITH a "CCR replay: rendering bound to content generation N" label
+    (a bound rendering cache, not fresh authority); evicted/unknown
+    handles keep their typed unavailability. All four read-tool voucher
+    blobs and both budget/overflow funnels thread the identity
+    (`SymForgeServer::ccr_publication_identity`). Oracle:
+    `ccr_handles_bind_the_rendering_publication_identity` + a
+    store-level unit for the foreign/superseded split.
+  - Replay-authority forbidden shortcut (the Slice 3 approved residual):
+    `ReplayRecord` gained `post_image: Option<PostImageReceipt>` — the
+    ABSOLUTE written paths plus content digests, read back from disk at
+    the single completion funnel (`complete_with_post_image`); the three
+    batch executors now RETURN their written paths (the writer is the
+    component that knows — per-file reroutes happen inside them). New
+    verified lanes `begin_tool_replay_verified` /
+    `probe_tool_replay_verified`: a stored result replays ONLY while
+    every receipt target still holds its bytes; an unverified completed/
+    failed record is SUPERSEDED at begin (reservation retaken, fresh
+    execution records the current truth) and ignored at probe; in-flight
+    reservations keep their replay-unavailable answer. Fail-closed
+    consequences, deliberate: v1 records (no receipt) and FAILED records
+    (no receipt captured on fail) never replay through the verified
+    lanes — a stored failure retried re-executes and reports the current
+    truth. The `index_folder`/daemon control-state replay lanes are
+    deliberately untouched (state-dir idempotency contracts, not
+    source-byte claims). RED observed: the stored success replayed
+    byte-identical (same tee-snapshot line) after an external overwrite;
+    oracle `replay_never_serves_a_stored_success_the_current_source_
+    does_not_hold` with the identical-retry positive control.
+  - The C9 mtime lesson recurred in the CCR fixture (same-second rewrite
+    defeating the freshen) and was fixed with deterministic backdates
+    before any fence conclusion was drawn.
+- C11b (T037 observation-side residuals — executed 2026-08-19): the three
+  carried observation families, one genuine RED.
+  - D14 made falsifiable
+    (`a_failed_read_observation_preserves_the_fence_the_observer_moves`,
+    `tests/activation_residuals_v11.rs`): on ONE live runtime, the same
+    `publication_fence()` that provably moves under the observer lane
+    (request-path refresh, confirmed-absent removal) stays byte-identical
+    across failed read observations — before AND after the fence has
+    moved, so the preservation is not a frozen-counter artifact (the
+    exact unfalsifiability the Slice 3 evidence recorded against the
+    model-level test, which stays). **RED observed and real**: a read of
+    a never-indexed missing path PUBLISHED — `remove_file_with_fences`
+    swapped-and-published unconditionally, minting a new publication out
+    of a failed observation; the same defect wore a second face at the
+    source-scope eviction lane (a never-held gitignored path "evicted"
+    and published) and a third at the embed facade (`remove_file` no-op
+    OBSERVED a removal that never happened). Minimal machinery: typed
+    `FencedRemoval { Removed(receipt) | NothingHeld | Rejected }` from
+    the one fenced-removal seam; `LiveIndex::remove_file` (the component
+    that knows) now reports whether anything was held; `NothingHeld`
+    publishes nothing and observes nothing. Mappings, each per its own
+    contract: `finalize_missing_file` → `NotFound` (absence confirmed,
+    nothing published); source-scope eviction → `Skipped` without a
+    publication (exclusion already reconciled); snapshot verify →
+    continue (already reconciled), abort only on fence rejection; the
+    embed facade keeps its frozen "no-op is applied" bool while only an
+    actual removal drives `observe_removal_active`.
+  - Cancelled non-abortable `index_folder` (frozen 028 edge case):
+    `a_cancelled_activation_never_governs_until_an_observed_resync`
+    (`src/daemon.rs` — needs the live-daemon spawn helpers). A raw
+    daemon-side default activation stands in for the caller-cancelled
+    adapter future; the control proves the daemon session's ACTIVE
+    really moved. The fence: the adapter's unqualified read stays on the
+    last OBSERVED project with body and receipt agreeing (the unobserved
+    activation never governs; no half-published root), and the caller's
+    observed retry IS the authoritative ACTIVE re-sync after which both
+    sides converge, again body+receipt agreeing. Observed green on first
+    run — the C4-era pin (`expected_daemon_project_id` written into the
+    selector) plus the activation lane already carry the fence; the
+    oracle pins the resolution the residual demanded.
+  - D16 structured boundary adjudicated
+    (`the_evidence_receipt_names_the_publication_that_rendered_the_body`):
+    the typed evidence receipt equals the publication that rendered the
+    body — not the pre-dispatch seed, and not a publication landing
+    between body render and receipt attach (deterministic interleave via
+    a direct observed-refresh publish inside the dispatch scope); the
+    wire `_meta` value round-trips as the typed `ProjectEvidence`.
+    Cross-process atomicity under arbitrary concurrent publication is
+    deliberately NOT claimed — the adjudicated boundary is per-response:
+    no response pairs one publication's body with another's receipt.
+    Observed green on first run (T046's one-capture rule holds).
+  - Battery: fmt clean; residual oracles 4/4 + daemon oracle 1/1; clippy
+    `-D warnings` on final bytes; dark suite 9/9 (FULL pin refreshed
+    from oracle actuals after fmt, twice — once more after the facade
+    repair; EXCLUDED pin unchanged, as predicted for edits outside the
+    13 sealed sources); embed cell exactly 1336; full serial suite +
+    bench smoke + validator recorded at commit.
+- T038 (multi-round adversarial review — executed and CLOSED 2026-08-20):
+  three rounds. Round 1 (`32fb1477`): five parallel lenses (mandatory
+  cfg-lens, C11 fences, adjudications challenge, oracle quality,
+  authority bypass) — zero Critical; all warnings fixed or adjudicated;
+  the round also discharged 020:T065's live snapshot format bump (7→8,
+  V10 seeds preserved+quarantined) and landed T039's migration doc.
+  Round 2 (`c1502698`): three refuters over round 1's own fixes — one
+  genuine Critical (the supersede marker guarded microseconds of a
+  milliseconds race) fixed RED-first with double-checked locking via a
+  deterministic interleave hook; heal-without-claim closed the
+  stale-marker TOCTOU; a structurally dead cfg arm removed; the CCR
+  cannot-verify case split into typed `PublicationUnverifiable`. Round 3:
+  convergence refuter verified every round-2 fix line-by-line, re-swept
+  cfg, spot-checked the evidence doc's claims — "no unresolved P0/P1/P2".
+  Full battery observed at every landing; embed cell's frozen count moved
+  1336→1339→1340 with the new unconditional oracles. Six recorded
+  residuals stand adjudicated with named owners in the evidence doc §5/
+  §7a. Evidence doc CLOSED per the T038 exit criterion.
+- C11c (T037 campaign close — executed 2026-08-20): the campaign oracle
+  `all_ingress_uses_exact_typed_authority_branch` run `--exact` at
+  `dce1cddc` (1 passed, exit 0 — TEST-SURFACE partition closure over the
+  116 slots), and the evidence document opened at
+  `docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md`: commit
+  lineage C1–C11b, the battery observed at `dce1cddc`, the five carried
+  residual-family dispositions, the adjudications on T038's roster
+  (sub-ms 2.00× bench lanes, retarget-in-place admission identity, serve
+  path without RootBinding, `project_source_authority` static, replay
+  control-state scope boundary, D16 non-claim, embed-facade no-op
+  contract), and the what-green-does-not-prove carryover. The full gate
+  battery for these code bytes is the C11b battery — C11c changes docs
+  and the task checkbox only; fmt/validator re-observed at commit. T037
+  checked; T038's review rounds append to (and close) the evidence doc.
+- Post-PR CI rounds on #601 (executed 2026-08-20): two `rust`-job tools
+  written before the cut still assumed pre-cut shapes. (1) The
+  traceability SELF-test assumed HEAD bytes equal approved-refreeze
+  bytes; fixed by building preactivation fixtures from the approved
+  ancestor `4a57aa22`'s actual source bytes (`635b3a2c`). (2)
+  `scripts/slice0-oracle-artifact.cjs` filtered lib tests by pre-cut
+  module paths; the cut mounts server modules under `src/internals.rs`,
+  so the `watcher::tests::`/`daemon::tests::` filters selected nothing —
+  fixed to `internals::…` paths. Running that producer surfaced a
+  MATERIAL finding the cut's evidence had not recorded: the seven
+  Slice 0 positive controls whose `#[ignore]` prose predicted "remove in
+  Slice 4" were each run un-ignored against the cut and observed STILL
+  FAILING at the daemon/watcher seams they drive (five with their
+  original defect messages, two with unreachable precondition windows —
+  bounded reasons preserved in the slice-0 oracle artifact of that run).
+  Adjudication per this spec's conflict rule: the executed cut activates
+  the preventive machinery behind the lifecycle seams but does not
+  discharge those seven frozen-tree acceptance predictions; they remain
+  RED positive controls on the artifact roster (as they were,
+  continuously, on every green CI run before and during the cut), their
+  attributes now name carried post-cut work instead of the falsified
+  slice prediction, and resolving them is owed by the post-cut
+  continuation of Feature 020, not by this PR.
+
+Gate battery after every commit-group, serial via TC; fmt BEFORE pin
+refresh; embed feature gate before every push.
+
+## 4b. Traceability validator lifecycle (verified against the .cjs, C2 planning)
+
+The validator classifies the live tree by comparing lib.rs's public-mod
+census against the frozen atom sets (`resolvePublicApiLifecycle`):
+
+- **Preactivation** (until C5's keyword flip): enforces (1) the frozen
+  byte-census digests over the five closure categories
+  (`RETIREMENT_CLOSURE_MISMATCH`), (2) exact equality of the
+  pattern-DERIVED semantic inventory with the frozen member lists
+  (`RETIREMENT_SOURCE_INVENTORY_MISMATCH`) — fields typed
+  `SharedIndex(Handle)` named index/project_indexes, writer/callback items
+  by file+name, `pub struct SharedIndexHandle`, pub reload methods — and
+  (3) source-anchor resolution of every member.
+- **Postactivation** (lib.rs matches kept+introduced atoms): switches to
+  (1) no retired atom reachable in the public graph
+  (`POSTACTIVATION_RETIRED_API_REACHABLE`) and (2) every frozen seam
+  anchor resolves in live source (`POSTACTIVATION_V11_SEAM_UNRESOLVED`) —
+  which REQUIRES a resolvable `V11PublicApi` construct in
+  `public_api.rs` (does not exist yet; C5 creates it) alongside
+  `activation.rs::ActivationCut` (exists). The semantic-inventory
+  equality is NOT enforced postactivation, so retained function names in
+  rerouted writers are fine after the flip.
+
+**Planned mid-cut state**: from C2 until C5 the validator is expected RED
+with exactly these codes, verified against the live run at each commit:
+
+- `RETIREMENT_CLOSURE_MISMATCH` for every category whose censused FILES a
+  landed commit edited — `writers` from C2; `callbacks` joins at C2b
+  because `persist.rs` and `knowledge_curation.rs` sit in both categories'
+  path closures; further categories join as C3/C4 touch their files.
+- `RETIREMENT_SOURCE_INVENTORY_MISMATCH` for each retired name-anchored
+  member (`extra_in_contract`), plus its mechanical shadow
+  `PREACTIVATION_SOURCE_ANCHOR_UNRESOLVED` for the same member: one
+  deletion produces both, since the frozen contract still names an anchor
+  the live tree no longer holds. First member:
+  `src/gitignore_hygiene.rs::atomic_replace` at C2b (earlier than first
+  planned — the original note expected the inventory mismatch only at D1's
+  `index: SharedIndex` field removals, which will add their own rows).
+
+C5-prep amendment (2026-08-19): hoisting the binary's dispatcher into
+`src/cli/entry.rs` moved two callbacks-census constructs out of their
+frozen `src/main.rs` anchors, adding their mechanical shadow pairs
+(`spawn_periodic_checkpoint`, `run_local_mcp_server_async::
+background_verify spawn`) — ten enumerated lines during the C5 window,
+all retired when the flip switches the validator to its postactivation
+branch.
+
+Any failure code outside this enumeration in that window is a real defect.
+Observed at C2b (2026-08-19): exactly the four lines the enumeration
+predicts — closure mismatch (writers, callbacks), inventory mismatch +
+anchor shadow (atomic_replace). Observed at C3b (2026-08-19): exactly SIX
+lines — `cache` and `publication_roots` closures joined because C3b edits
+`daemon.rs` (five cache rows + three publication_roots rows) and
+`knowledge_curation.rs` (`probe_cache` sits in the cache closure); no new
+name-anchored member was deleted, so the inventory/anchor pair is still
+only `atomic_replace`. The
+Observed at C4a (2026-08-19): exactly SEVEN lines — the C3b six plus the
+publication_roots inventory mismatch whose `extra_in_contract` names all
+six retired `index`/`project_indexes` field members (the D1 rows the C2b
+note predicted); anchors still resolve (the field names survive with the
+handle type), so no new anchor shadows. The
+validator returns green via the postactivation path at C5; that is a hard
+PR exit criterion. Tool profiles (full=39 / compact=3) must hold in BOTH
+lifecycles.
+
+**Seal transformation at C2**: the call-edge sweep inverts from "no live
+file names index_lifecycle" to a pinned reachability roster — the set of
+live files holding call edges is exactly the planned wiring set, extended
+per commit. This preserves the no-unplanned-edges property through the
+mid-cut window and becomes the executed-reachability record the frozen
+retirement contract says replaces the preactivation census.
+
+## 5. Doc-recorded cut obligations index (verified file:line)
+
+mod.rs:26 (writer lanes consume permits = Slice 4); mod.rs:30-55 (per-module
+"activation is the only planned production caller" × candidate/observer/
+query/snapshot/verification); mod.rs:57-58 (dark factory single door);
+live_index/mod.rs:21-24 (mount flip recipe); authority.rs:746-749
+(retained_generation A20 wording trap); mutation.rs:100-103
+(NoSideEffectProof becomes real behind the write lane);
+public_api.rs:6-8 (wrap_table is the work list), :219-220 (EmbedRefreshTicket
+wiring changes evidence not shape), :374-375 (shutdown wiring), :455-456
+(acquire gains refusing evidence); adapters.rs:7-9, :108, :155-156
+(execute_plan gains its production caller); embedded.rs:3-8 (module goes
+reachable), :349-352 (DeadlineElapsed becomes producible);
+registry.rs:15-18, :251-253 (lifecycle registry replaces daemon slot map as
+admission authority); runtime.rs:7-8, :10-16 (D-ledger payload obligations),
+:18-21 (fixture evidence replaced), :54 (real root lease), :63-66 (cfg
+precondition), :144-147 (VerifiedGeneration fields), :253-256 (permit return
+via fresh candidate publication), :474-476 (retrying capture);
+protocol/claim_provenance.rs:72-73 (fixture PhysicalRootLease replaced by
+the real lease acquisition).

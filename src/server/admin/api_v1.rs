@@ -235,7 +235,7 @@ pub struct SystemSnapshot {
 impl SystemSnapshot {
     /// Capture the running server's real PID / uptime / index state.
     pub fn from_runtime(runtime: &ServerRuntime) -> Self {
-        let published = runtime.index().published_state();
+        let published = runtime.index().data_plane().published_state();
         let project = runtime.project_name().to_string();
         // An empty index over no project root still names the configured project;
         // report it only when there are indexed files OR a non-default name.

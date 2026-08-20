@@ -13,6 +13,7 @@
 pub mod admin;
 pub mod analytics;
 pub mod browser;
+pub mod entry;
 pub mod harness;
 pub mod harness_apply;
 pub mod harness_command;

@@ -40,8 +40,10 @@ pub use auth::{
 /// index + dispatcher + governor + ledger.
 #[derive(Clone)]
 pub struct ServerRuntime {
-    /// The shared live index (one per server session; shared with the dispatcher).
-    index: SharedIndex,
+    /// The shared live index (one per server session; shared with the dispatcher),
+    /// held through the typed D1 handle since C4 — the frozen publication_roots
+    /// census retires bare `SharedIndex` state fields.
+    index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
     /// The existing in-process protocol dispatcher — same handle stdio uses.
     protocol: Arc<SymForgeServer>,
     /// Concurrency / timeout governor, reused from the sidecar.
@@ -78,7 +80,9 @@ impl ServerRuntime {
     ) -> Self {
         let project_name = protocol.project_name.clone();
         Self {
-            index,
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                index,
+            ),
             protocol,
             governor,
             auth,
@@ -112,8 +116,8 @@ impl ServerRuntime {
         &self.project_name
     }
 
-    /// Access the shared index.
-    pub fn index(&self) -> &SharedIndex {
+    /// Access the project runtime handle owning the shared index.
+    pub fn index(&self) -> &crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle {
         &self.index
     }
 
@@ -191,7 +195,7 @@ mod tests {
         // Governor exposes its default concurrency.
         assert!(runtime.governor().max_concurrency() > 0);
         // Index handle is live.
-        let _ = runtime.index().published_state();
+        let _ = runtime.index().data_plane().published_state();
     }
 
     #[tokio::test]

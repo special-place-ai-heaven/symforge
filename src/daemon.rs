@@ -227,6 +227,11 @@ pub struct DaemonState {
     /// read route reads those bases and `intern_base_refresh` FORCE-REPLACES the
     /// value for a key when a watched change has advanced the project's published
     /// index (B2/D12) — still one Arc per `BaseKey` (SC-002).
+    /// Cache census (C4c): each value is a projection PINNED to one
+    /// publication — keyed by `(canonical_root, commit)`, fenced by its
+    /// minted `base_generation`, force-replaced when the published index
+    /// advances, and GC'd by the strong-count orphan sweep. C5's leases
+    /// take over the pinned-publication identity.
     bases: RwLock<HashMap<BaseKey, Arc<IndexBase>>>,
     /// Monotonic source of `base_generation` fence tokens, minted only when
     /// `intern_base` publishes a NEW base. Starts at 1; a shared (interned) base
@@ -296,11 +301,18 @@ struct ProjectInstance {
     state_placement: StatePlacement,
     persistence_health: Arc<RwLock<CapabilityStatus>>,
     curation_coordinator: Arc<crate::protocol::knowledge_curation::KnowledgeCurationCoordinator>,
-    index: SharedIndex,
+    // C4 (Feature 020 Slice 4, D1): typed handle; the frozen publication_roots
+    // census retires bare `SharedIndex` state fields.
+    index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
     watcher_info: Arc<Mutex<WatcherInfo>>,
     watcher_task: Option<tokio::task::JoinHandle<()>>,
     stop_token: Arc<AtomicBool>,
     token_stats: Arc<TokenStats>,
+    /// Cache census (C4c): the project's symbol-snapshot cache. Never read
+    /// here — flows to `SessionRuntime`/`SidecarState`, whose sole reader
+    /// (the sidecar handlers) fences every hit to the current project
+    /// generation via `ensure_symbol_cache_generation`. Dropped whole with
+    /// the instance on eviction/retarget.
     symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
     session_ids: HashSet<String>,
     opened_at: SystemTime,
@@ -338,6 +350,10 @@ struct SessionRecord {
     /// keeps Principle I airtight). `Arc<RwLock>` is mandatory: `SessionRecord` is
     /// cloned on every `session_runtime` call and `WorkingSet: Clone` deep-clones
     /// overlays, so the `Arc` keeps the clone O(1) and the overlay state singular.
+    /// Cache census (C4c): entries hold interned bases pinned per
+    /// publication; every cross-project read lazily re-fences its targeted
+    /// entry against the CURRENT published index (B2/D12) before serving,
+    /// and no path writes into the overlay.
     working_set: Arc<RwLock<WorkingSet>>,
     /// Session-private protocol state, partitioned by project while shared index
     /// and project metrics remain owned by the project instance.
@@ -759,8 +775,12 @@ struct SessionRuntime {
     canonical_root: PathBuf,
     project_id: String,
     session_id: String,
-    index: SharedIndex,
+    index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
     token_stats: Arc<TokenStats>,
+    /// Cache census (C4c): a clone of the project's symbol-snapshot Arc.
+    /// Sole reader is the sidecar handler family behind
+    /// `ensure_symbol_cache_generation` — generation-keyed, deterministic
+    /// clear on mismatch, unavailability when the generation moved.
     symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
     /// Session-private, project-keyed `SymForgeServer` clone.
     server: SymForgeServer,
@@ -774,11 +794,14 @@ struct SessionRuntime {
     /// single-project behavior is byte-identical and frecency-neutral. No overlay
     /// is written. The active project's id for the targeting contract is
     /// `project_id` above (the default target when neither param is supplied).
+    /// Cache census (C4c): same adjudication as `SessionRecord::working_set`
+    /// — this is the same `Arc`, re-fenced per read via B2/D12.
     working_set: Arc<RwLock<WorkingSet>>,
     /// Session-scoped project publications used by `search_knowledge`.
     /// Capturing from this map, rather than the daemon-global project table,
     /// makes `projects=["*"]` expand only to projects open in this session.
-    project_indexes: HashMap<String, SharedIndex>,
+    project_indexes:
+        HashMap<String, crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -819,6 +842,12 @@ impl DaemonState {
         auth_token: String,
         control_state_dir: Option<ControlStateDir>,
     ) -> Self {
+        // V11 bootstrap (Feature 020 Slice 4, T030, C4b): the daemon surface
+        // runs the process activation ceremony and attaches its capacity
+        // owner BEFORE any request can be served through this state.
+        live_index::index_lifecycle::activation::activate_surface(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+        );
         Self {
             next_session_id: AtomicU64::new(1),
             bases: RwLock::new(HashMap::new()),
@@ -905,7 +934,7 @@ impl DaemonState {
     /// base is never refreshed — cross-project reads go stale after any watched
     /// change. This re-captures the current snapshot on the next cross-project read.
     ///
-    /// FRESHNESS SIGNAL: `Arc::ptr_eq(&project.index.read(), &entry.base.index)`.
+    /// FRESHNESS SIGNAL: `Arc::ptr_eq(&project.index.data_plane().read(), entry.base.index.data_plane())`.
     /// Every publish does `live.store(Arc::new(..))`, so a changed pointer means
     /// the published index advanced. HONEST LIMITATION: this OVER-triggers on
     /// mtime-only touches (`touch_mtime` stores a fresh `Arc<LiveIndex>` without
@@ -966,7 +995,7 @@ impl DaemonState {
             .iter()
             .filter_map(|(project_id, entry_index)| {
                 let slot = slots.get(project_id)?;
-                let index = Arc::clone(&slot.metadata.read().index);
+                let index = slot.metadata.read().index.shared();
                 // `read()` yields an arc_swap Guard derefing to the current
                 // `Arc<LiveIndex>`; `&current` deref-coerces to the
                 // `&Arc<LiveIndex>` ptr_eq wants (as `base()` does for clone).
@@ -1411,7 +1440,7 @@ impl DaemonState {
         // T046: one capture — the freshness verdict below describes the SAME
         // publication as the counts it is printed beside, not one from a
         // separate load 50 lines later.
-        let generation = project.index.published_generation();
+        let generation = project.index.data_plane().published_generation();
         let published = std::sync::Arc::clone(&generation.health);
         let durability = *project.persistence_health.read();
         let durable_mutation = match durability {
@@ -1451,7 +1480,7 @@ impl DaemonState {
             }
         };
         let repository_curation = project.curation_coordinator.capability_status(
-            &project.index,
+            project.index.data_plane(),
             Some(&project.canonical_root),
             Some(&project.state_placement),
             durability,
@@ -1648,7 +1677,7 @@ impl DaemonState {
         let (index, source_access_mode, state_placement, persistence_health) = {
             let project = target_slot.metadata.read();
             (
-                Arc::clone(&project.index),
+                project.index.shared(),
                 project.source_access_mode,
                 project.state_placement.clone(),
                 Arc::clone(&project.persistence_health),
@@ -1735,7 +1764,7 @@ impl DaemonState {
             Arc::clone(slot)
         };
         let server = slot.server_for_session();
-        let slot_index = Arc::clone(&slot.metadata.read().index);
+        let slot_index = slot.metadata.read().index.shared();
         slot.metadata
             .write()
             .session_ids
@@ -1745,7 +1774,7 @@ impl DaemonState {
                 let replace_server = session
                     .servers
                     .get(project_id)
-                    .map(|existing| !Arc::ptr_eq(&existing.index, &slot_index))
+                    .map(|existing| !Arc::ptr_eq(existing.index.data_plane(), &slot_index))
                     .unwrap_or(true);
                 if replace_server {
                     session.servers.insert(project_id.to_string(), server);
@@ -1956,16 +1985,27 @@ impl DaemonState {
             )
         })?;
         let project_meta = slot.metadata.read();
+        // C4c typed acquisition: dispatch requires the project's admission
+        // slot to still be the live occupancy of its key. A project the
+        // eviction/retarget stop path retired refuses here — between the stop
+        // and the map sweep, the maps can still resolve it, and without this
+        // branch the neck would serve a retired index.
+        if let Err(refusal) = project_meta.index.acquire() {
+            return Err(format!(
+                "project '{target_id}' has been retired from the process registry \
+                 ({refusal:?}); reopen it with index_folder(path=...)"
+            ));
+        }
         let project_indexes = session
             .servers
             .iter()
-            .map(|(id, server)| (id.clone(), Arc::clone(&server.index)))
+            .map(|(id, server)| (id.clone(), server.index.clone()))
             .collect();
         Ok(SessionRuntime {
             canonical_root: project_meta.canonical_root.clone(),
             project_id: target_id.clone(),
             session_id: session.session_id.clone(),
-            index: Arc::clone(&project_meta.index),
+            index: project_meta.index.clone(),
             token_stats: Arc::clone(&project_meta.token_stats),
             symbol_cache: Arc::clone(&project_meta.symbol_cache),
             server,
@@ -1999,7 +2039,7 @@ impl DaemonState {
                     continue;
                 };
                 let meta = slot.metadata.read();
-                let published = meta.index.published_state();
+                let published = meta.index.data_plane().published_state();
                 // Home and active are DISTINCT identities since the
                 // worktree-routing fix: home is the immutable session
                 // identity; active is what unqualified reads serve.
@@ -2030,7 +2070,7 @@ impl DaemonState {
                     published.file_count,
                     published.symbol_count,
                     published.status_label(),
-                    meta.index.current_project_generation(),
+                    meta.index.data_plane().current_project_generation(),
                     unix_seconds(meta.opened_at),
                     snapshot,
                 ));
@@ -3273,6 +3313,25 @@ impl ProjectInstance {
             .unwrap_or("project")
             .to_string();
 
+        // V11 bootstrap (C4b): every daemon project flows through the
+        // process registry's single-flight admission BEFORE its index is
+        // built. A refusal fails the open honestly — admission is
+        // authoritative, not advisory. The live slot rides on the runtime
+        // handle (C4c) so the dispatch neck can refuse a retired admission.
+        let admission = live_index::index_lifecycle::activation::admit_project(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+            canonical_root,
+            &binding.root_id.0,
+            binding.access_mode,
+            &state_placement,
+        )
+        .map_err(|refusal| {
+            anyhow::anyhow!(
+                "project admission refused for '{}': {refusal:?}",
+                binding.root_id.0
+            )
+        })?;
+
         let index = bootstrap_project_index(canonical_root, &state_placement)?;
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
@@ -3306,7 +3365,10 @@ impl ProjectInstance {
             state_placement,
             persistence_health,
             curation_coordinator,
-            index,
+            index:
+                crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind_admitted(
+                    index, admission,
+                ),
             watcher_info,
             watcher_task: None,
             stop_token: Arc::new(AtomicBool::new(false)),
@@ -3335,15 +3397,15 @@ impl ProjectInstance {
         self.stop_token = Arc::new(AtomicBool::new(false));
         self.watcher_task = start_project_watcher(
             self.canonical_root.clone(),
-            Arc::clone(&self.index),
+            self.index.shared(),
             Arc::clone(&self.watcher_info),
             Arc::clone(&self.stop_token),
         );
 
         // Kick off background git temporal analysis (non-blocking).
-        let expected_gen = self.index.current_project_generation();
+        let expected_gen = self.index.data_plane().current_project_generation();
         live_index::git_temporal::spawn_git_temporal_computation(
-            Arc::clone(&self.index),
+            self.index.shared(),
             self.canonical_root.clone(),
             expected_gen,
         );
@@ -3370,11 +3432,26 @@ impl ProjectSlot {
 
     fn stop(&self) {
         let _mutation = self.mutation.lock();
-        let (mut watcher_task, stop_token) = {
+        let (mut watcher_task, stop_token, project_id) = {
             let mut project = self.metadata.write();
-            (project.watcher_task.take(), Arc::clone(&project.stop_token))
+            (
+                project.watcher_task.take(),
+                Arc::clone(&project.stop_token),
+                project.project_id.clone(),
+            )
         };
         abort_watcher_task(&mut watcher_task, &stop_token);
+        // V11 bootstrap (C4b): retire the project's admission slot. A
+        // refusal here means the registry never held this project live
+        // (possible only for instances minted outside `load_bound`);
+        // surfaced at debug so an orphaned slot is observable, not silent.
+        if let Err(refusal) = live_index::index_lifecycle::activation::process_project_registry()
+            .stop(&live_index::index_lifecycle::registry::ProjectKey::new(
+                &project_id,
+            ))
+        {
+            tracing::debug!(?refusal, project_id, "admission slot stop refused");
+        }
     }
 
     fn base(&self) -> Arc<IndexBase> {
@@ -3382,7 +3459,7 @@ impl ProjectSlot {
             let project = self.metadata.read();
             (
                 project.canonical_root.clone(),
-                Arc::clone(&project.index.read()),
+                Arc::clone(&project.index.data_plane().read()),
             )
         };
         let commit = match crate::git::head_sha(&canonical_root) {
@@ -3409,7 +3486,7 @@ impl ProjectSlot {
         ) = {
             let project = self.metadata.read();
             (
-                Arc::clone(&project.index),
+                project.index.shared(),
                 project.project_name.clone(),
                 Arc::clone(&project.watcher_info),
                 project.canonical_root.clone(),
@@ -3460,7 +3537,7 @@ impl ProjectSlot {
         let (index, watcher_info, mut watcher_task, old_stop_token) = {
             let mut project = self.metadata.write();
             (
-                Arc::clone(&project.index),
+                project.index.shared(),
                 Arc::clone(&project.watcher_info),
                 project.watcher_task.take(),
                 Arc::clone(&project.stop_token),
@@ -3519,6 +3596,10 @@ impl ProjectSlot {
 // yet, so L-R03 holds across a reopen but not live. Upgrade path: a refs watcher
 // (like the filesystem watcher) that calls `reconcile_local_ref_topology` on ref
 // change.
+// V11 callbacks census (Feature 020 Slice 4, C3b): publication-fence-gated
+// DATA-PLANE enrichment — it publishes local-ref topology into the index and
+// admits no repository-source bytes, so it holds no source-observation or
+// publication authority of its own. C4's typed roots gate its publication.
 fn spawn_local_ref_reconcile(
     index: SharedIndex,
     canonical_root: PathBuf,
@@ -3618,8 +3699,21 @@ fn bootstrap_project_index(
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let bg_index = shared.clone();
             let bg_root = canonical_root.to_path_buf();
+            // V11 callbacks census (C3b): the verify callback carries the
+            // observer incarnation current at its spawn; the watcher's later
+            // registration in `activate()` makes it stale, and the lane then
+            // refuses its observations (late V10 callbacks unreachable).
+            let observer =
+                live_index::index_lifecycle::activation::project_source_authority(canonical_root)
+                    .active_observer();
             handle.spawn(async move {
-                live_index::persist::background_verify(bg_index, bg_root, snapshot_mtimes).await;
+                live_index::persist::background_verify(
+                    bg_index,
+                    bg_root,
+                    snapshot_mtimes,
+                    observer,
+                )
+                .await;
             });
         }
 
@@ -3668,6 +3762,9 @@ fn bootstrap_project_index(
     }
 }
 
+// V11 callbacks census (C3b): the observer-incarnation registration for this
+// census row lives inside `run_watcher_with_stop` (C3a) — one incarnation per
+// watcher instance, registered on the same authority every observation names.
 fn start_project_watcher(
     repo_root: PathBuf,
     index: SharedIndex,
@@ -4411,7 +4508,7 @@ async fn call_tool_handler(
         // `index_state` all come off the SAME published bundle — the atomic
         // project-generation counter is not consulted, so the evidence cannot
         // pair a newer generation number with an older publication's counts.
-        let generation = evidence_runtime.index.published_generation();
+        let generation = evidence_runtime.index.data_plane().published_generation();
         Some(crate::protocol::result_status::ProjectEvidence {
             project_id: evidence_runtime.project_id.clone(),
             project_name: evidence_runtime
@@ -5332,7 +5429,10 @@ fn execute_cross_project_read(
 fn execute_cross_project_knowledge(
     mut input: SearchKnowledgeInput,
     targets: Targets,
-    project_indexes: &HashMap<String, SharedIndex>,
+    project_indexes: &HashMap<
+        String,
+        crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
+    >,
     ccr_server: &SymForgeServer,
 ) -> anyhow::Result<String> {
     let mut selected_ids: Vec<String> = match targets {
@@ -5379,6 +5479,7 @@ fn execute_cross_project_knowledge(
             let source_set = project_indexes
                 .get(id)
                 .expect("selected projects were validated")
+                .data_plane()
                 .published_source_set();
             (id.clone(), source_set)
         })
@@ -5404,7 +5505,10 @@ fn execute_cross_project_knowledge(
 fn execute_cross_project_review(
     mut input: ReviewKnowledgeInput,
     targets: Targets,
-    project_indexes: &HashMap<String, SharedIndex>,
+    project_indexes: &HashMap<
+        String,
+        crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
+    >,
     ccr_server: &SymForgeServer,
 ) -> anyhow::Result<String> {
     let mut selected_ids: Vec<String> = match targets {
@@ -5450,6 +5554,7 @@ fn execute_cross_project_review(
             let source_set = project_indexes
                 .get(id)
                 .expect("selected projects were validated")
+                .data_plane()
                 .published_source_set();
             (id.clone(), source_set)
         })
@@ -5954,7 +6059,9 @@ async fn execute_tool_call(
 
 fn sidecar_state_for_runtime(runtime: &SessionRuntime) -> SidecarState {
     SidecarState {
-        index: Arc::clone(&runtime.index),
+        index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+            runtime.index.shared(),
+        ),
         token_stats: Arc::clone(&runtime.token_stats),
         repo_root: Some(runtime.canonical_root.clone()),
         symbol_cache: Arc::clone(&runtime.symbol_cache),
@@ -6694,7 +6801,7 @@ mod tests {
 
         // The real daemon bootstrap must restore FROM the artifact.
         let project = ProjectInstance::load(tmp.path()).expect("project load");
-        let guard = project.index.read();
+        let guard = project.index.data_plane().read();
         assert_eq!(
             guard.load_source(),
             crate::live_index::store::IndexLoadSource::SnapshotRestore,
@@ -7018,6 +7125,84 @@ mod tests {
         let projects = state.list_projects();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].session_count, 2);
+    }
+
+    /// Feature 020 Slice 4, T030 (C4b): daemon bootstrap flows through the
+    /// activation machine and the process project registry — a project open
+    /// ADMITS through `plan_admission`/`execute_plan` and installs a live
+    /// slot charged to the daemon surface's capacity owner, and the process
+    /// machine has been driven to `PreventiveV1Open` before serving. (The C1
+    /// machine oracle pins that a fresh machine starts `LegacyOpen`, so the
+    /// mode observed here is bootstrap's doing, not a default.)
+    #[test]
+    fn project_open_admits_through_the_process_activation_registry() {
+        use crate::live_index::index_lifecycle::activation::{
+            ActivationCut, ActivationMode, process_project_registry,
+        };
+        use crate::live_index::index_lifecycle::registry::ProjectKey;
+
+        let project = project_dir("symforge-daemon-admission");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(400),
+            })
+            .expect("open session");
+
+        let live = process_project_registry()
+            .live(&ProjectKey::new(&opened.project_id))
+            .expect("the opened project holds a live admission slot");
+        assert!(
+            live.capacity_owner().expect("live slot").is_some(),
+            "the admission is charged to the daemon surface's capacity owner"
+        );
+        assert_eq!(
+            ActivationCut::process().mode(),
+            ActivationMode::PreventiveV1Open,
+            "bootstrap drives the startup ceremony before serving"
+        );
+    }
+
+    /// Feature 020 Slice 4, T030 (C4c): the dispatch neck refuses a retired
+    /// admission. Stopping a project's registry slot (what the eviction and
+    /// retarget stop path does) makes `runtime_for_target` refuse instead of
+    /// serving the retired index; the live slot resolving first is the
+    /// accepting control in the same test.
+    #[test]
+    fn retired_admission_slot_refuses_dispatch_at_the_runtime_neck() {
+        use crate::live_index::index_lifecycle::activation::process_project_registry;
+        use crate::live_index::index_lifecycle::registry::ProjectKey;
+
+        let project = project_dir("symforge-daemon-retired-neck");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(401),
+            })
+            .expect("open session");
+
+        assert!(
+            state.runtime_for_target(&opened.session_id, None).is_ok(),
+            "a live admission slot resolves at the neck"
+        );
+
+        // Retire the admission out from under the daemon maps — the race the
+        // typed branch closes (the stop path ran; the maps have not yet been
+        // swept, or a stale runtime is dispatching between the two).
+        process_project_registry()
+            .stop(&ProjectKey::new(&opened.project_id))
+            .expect("stop the live slot");
+        let Err(refused) = state.runtime_for_target(&opened.session_id, None) else {
+            panic!("a retired admission slot must refuse dispatch at the neck");
+        };
+        assert!(
+            refused.contains("retired"),
+            "the refusal names the retirement: {refused}"
+        );
     }
 
     #[test]
@@ -8416,8 +8601,15 @@ mod tests {
         let _gate = EnvVarGuard::set_str(LOCAL_REF_LANES_ENV, "1");
 
         let (current_dir, _ref_dir, index) = cross_project_current_and_ref_lanes();
-        let project_indexes: HashMap<String, SharedIndex> =
-            HashMap::from([("proj-cross-scope".to_string(), Arc::clone(&index))]);
+        let project_indexes: HashMap<
+            String,
+            crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
+        > = HashMap::from([(
+            "proj-cross-scope".to_string(),
+            crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(Arc::clone(
+                &index,
+            )),
+        )]);
         let server = SymForgeServer::new(
             Arc::clone(&index),
             "proj-cross-scope".to_string(),
@@ -8517,8 +8709,15 @@ mod tests {
         let _gate = EnvVarGuard::set_str(LOCAL_REF_LANES_ENV, "1");
 
         let (current_dir, _ref_dir, index) = cross_project_current_and_ref_lanes();
-        let project_indexes: HashMap<String, SharedIndex> =
-            HashMap::from([("proj-cross-scope".to_string(), Arc::clone(&index))]);
+        let project_indexes: HashMap<
+            String,
+            crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
+        > = HashMap::from([(
+            "proj-cross-scope".to_string(),
+            crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(Arc::clone(
+                &index,
+            )),
+        )]);
         let server = SymForgeServer::new(
             Arc::clone(&index),
             "proj-cross-scope".to_string(),
@@ -9043,7 +9242,7 @@ mod tests {
             (
                 project.canonical_root.clone(),
                 project.state_placement.clone(),
-                project.index.published_generation(),
+                project.index.data_plane().published_generation(),
                 Arc::clone(&project.watcher_info),
             )
         };
@@ -9114,7 +9313,7 @@ mod tests {
             let project = slot.metadata.read();
             assert_eq!(project.canonical_root, canonical_root);
             assert_eq!(project.state_placement, placement);
-            let publication_after = project.index.published_generation();
+            let publication_after = project.index.data_plane().published_generation();
             assert!(
                 publication_after.publication_generation
                     >= publication_before.publication_generation,
@@ -9307,13 +9506,13 @@ mod tests {
             .expect("non-ready project slot remains registered");
         let project = slot.metadata.read();
 
-        assert!(!project.index.read().is_ready());
+        assert!(!project.index.data_plane().read().is_ready());
         assert!(
-            project.index.scout_plan().is_none(),
+            project.index.data_plane().scout_plan().is_none(),
             "no partial plan may publish"
         );
         assert!(matches!(
-            project.index.freshness_status().as_ref(),
+            project.index.data_plane().freshness_status().as_ref(),
             crate::domain::FreshnessStatus::Degraded {
                 last_valid_content_generation: 0,
                 reason_codes,
@@ -9671,7 +9870,10 @@ mod tests {
             &first_runtime.server.stel_ledger,
             &second_runtime.server.stel_ledger,
         ));
-        assert!(Arc::ptr_eq(&first_runtime.index, &second_runtime.index,));
+        assert!(Arc::ptr_eq(
+            first_runtime.index.data_plane(),
+            second_runtime.index.data_plane(),
+        ));
         assert!(Arc::ptr_eq(
             &first_runtime.token_stats,
             &second_runtime.token_stats,
@@ -9709,7 +9911,7 @@ mod tests {
                 .server
                 .ccr_store
                 .lock()
-                .insert("get_symbol", stored_body.to_string())
+                .insert("get_symbol", stored_body.to_string(), None)
         };
 
         // The daemon-private route pin must be accepted for this tool; the
@@ -9921,6 +10123,7 @@ mod tests {
                 .session_runtime(&opened.session_id)
                 .expect("prior runtime")
                 .index
+                .data_plane()
                 .read(),
         );
         std::fs::write(&source, "pub fn next_generation() {}\n").expect("write next");
@@ -9966,6 +10169,7 @@ mod tests {
                 .session_runtime(&opened.session_id)
                 .expect("runtime during reload")
                 .index
+                .data_plane()
                 .read(),
         );
         assert!(
@@ -9991,6 +10195,7 @@ mod tests {
                 .session_runtime(&opened.session_id)
                 .expect("runtime after reload")
                 .index
+                .data_plane()
                 .read(),
         );
         assert!(
@@ -11193,7 +11398,7 @@ mod tests {
                 let slot = projects
                     .get(&project_b_id)
                     .expect("project B loaded in daemon");
-                Arc::clone(&slot.metadata.read().index)
+                slot.metadata.read().index.shared()
             };
             index
                 .reload(&canonical_b)
@@ -11281,7 +11486,7 @@ mod tests {
                 let slot = projects
                     .get(&project_b_id)
                     .expect("project B loaded in daemon");
-                Arc::clone(&slot.metadata.read().index)
+                slot.metadata.read().index.shared()
             };
             index
                 .reload(&canonical_b)
@@ -13211,6 +13416,184 @@ mod tests {
         .await;
     }
 
+    /// Carried Slice 3 residual (T037 / 020:T072, frozen 028 edge case): a
+    /// caller that cancels a non-abortable `index_folder` after the daemon
+    /// began activation leaves the distributed outcome unknown — the daemon
+    /// session's ACTIVE moved while the adapter mirror kept the last OBSERVED
+    /// activation. The required resolution: an authoritative ACTIVE re-sync,
+    /// never a half-published root. Concretely: (1) the unobserved activation
+    /// never governs the adapter's unqualified reads — every read stays
+    /// pinned to the last observed project, body and receipt agreeing on it —
+    /// and (2) the caller's OBSERVED retry of the cancelled call is the
+    /// authoritative re-sync after which both sides agree on the new ACTIVE.
+    #[tokio::test]
+    async fn a_cancelled_activation_never_governs_until_an_observed_resync() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-cancelled-activation-home-a");
+        let project_b = project_dir("symforge-cancelled-activation-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "cancelled-activation".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // The cancellation: the daemon runs its non-abortable DEFAULT
+        // activation of B to completion, but the ADAPTER never observes the
+        // response. The raw HTTP hop below stands in for the caller-cancelled
+        // adapter future — the daemon-side outcome is identical: the
+        // session's ACTIVE moved to B and nobody on the adapter side knows.
+        let activated_b = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            })
+            .send()
+            .await
+            .expect("activate B request")
+            .error_for_status()
+            .expect("activate B status")
+            .text()
+            .await
+            .expect("activate B body");
+        assert!(
+            activated_b.starts_with("Indexed "),
+            "daemon-side activation must complete: {activated_b}"
+        );
+
+        // Control proving the divergence is real: the DAEMON's own unqualified
+        // view now serves B. Without the adapter's pin, the fence below would
+        // have nothing to defend against.
+        let daemon_view = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/get_repo_map",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({ "detail": "full" }))
+            .send()
+            .await
+            .expect("daemon view request")
+            .error_for_status()
+            .expect("daemon view status")
+            .text()
+            .await
+            .expect("daemon view body");
+        assert!(
+            daemon_view.contains("new.rs"),
+            "control: the daemon session ACTIVE must have moved to B: {daemon_view}"
+        );
+
+        // THE FENCE, half 1 — the unobserved activation must not govern: an
+        // unqualified read through the adapter serves the last OBSERVED
+        // project (home A), body and receipt agreeing on A. Serving B here
+        // would report an activation nobody observed; pairing A's body with
+        // B's receipt (or vice versa) would be the half-published root.
+        let (map_home, home_receipt) =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let input = serde_json::from_value(serde_json::json!({"detail": "full"}))
+                    .expect("map input");
+                let map = server.get_repo_map(Parameters(input)).await;
+                let receipt = crate::protocol::result_status::current_project_evidence();
+                (map, receipt)
+            })
+            .await;
+        assert!(
+            map_home.contains("old.rs") && !map_home.contains("new.rs"),
+            "an unqualified read must stay on the last OBSERVED activation: {map_home}"
+        );
+        let home_receipt = home_receipt.expect("a proxied read must carry a daemon receipt");
+        assert_eq!(
+            home_receipt.project_id, opened.project_id,
+            "the receipt must name the same project that served the body"
+        );
+
+        // THE FENCE, half 2 — the authoritative re-sync: the caller's natural
+        // retry of the cancelled call, OBSERVED through the adapter this
+        // time, resolves the unknown outcome. Both sides converge on B.
+        let retried = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        assert!(
+            retried.starts_with("Indexed "),
+            "the observed retry must complete: {retried}"
+        );
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+        let (map_b, receipt_b) =
+            crate::protocol::result_status::with_project_evidence_scope(None, async {
+                let input = serde_json::from_value(serde_json::json!({"detail": "full"}))
+                    .expect("map input");
+                let map = server.get_repo_map(Parameters(input)).await;
+                let receipt = crate::protocol::result_status::current_project_evidence();
+                (map, receipt)
+            })
+            .await;
+        assert!(
+            map_b.contains("new.rs") && !map_b.contains("old.rs"),
+            "after the observed re-sync the activation governs unqualified reads: {map_b}"
+        );
+        let receipt_b = receipt_b.expect("the re-synced read must carry a daemon receipt");
+        assert_eq!(
+            receipt_b.project_id, project_b_id,
+            "body and receipt must agree on the re-synced ACTIVE"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            daemon_port_file_name(),
+        ))
+        .await;
+    }
+
     #[tokio::test]
     async fn test_tool_receipt_carries_project_evidence() {
         let _env_lock = env_lock().await;
@@ -13927,7 +14310,7 @@ mod tests {
         // Air-tight: the front-end's OWN index stayed empty; `status` reported
         // the daemon's index, not this one. This is what was broken pre-fix.
         assert_eq!(
-            server.index().published_state().file_count,
+            server.index().data_plane().published_state().file_count,
             0,
             "front-end self.index must remain empty — status must source from the daemon"
         );
@@ -13996,7 +14379,7 @@ mod tests {
             "daemon proxy index_folder must succeed, got: {indexed}"
         );
         assert_eq!(
-            server.index().published_state().file_count,
+            server.index().data_plane().published_state().file_count,
             0,
             "front-end proxy index is intentionally empty"
         );
@@ -14137,7 +14520,7 @@ mod tests {
         // because THIS process registered the hook via `new_daemon_proxy`). An
         // empty front-end index means the daemon executed the edit.
         assert_eq!(
-            server.index().published_state().file_count,
+            server.index().data_plane().published_state().file_count,
             0,
             "front-end proxy index must be empty — the daemon must serve the edit"
         );
@@ -14438,7 +14821,7 @@ mod tests {
 
         // Simulate a prior local-fallback load: the in-process index already
         // holds OLD-project (project A) state.
-        server.index.add_file(
+        server.index.data_plane().add_file(
             "src/old.rs".to_string(),
             crate::live_index::store::IndexedFile {
                 relative_path: "src/old.rs".to_string(),
@@ -14456,7 +14839,7 @@ mod tests {
             },
         );
         assert_eq!(
-            server.index.published_state().file_count,
+            server.index.data_plane().published_state().file_count,
             1,
             "precondition: stale local index holds the OLD project"
         );
@@ -14478,12 +14861,17 @@ mod tests {
 
         // The immutable-home contract keeps the existing local fallback for A.
         assert_eq!(
-            server.index.published_state().file_count,
+            server.index.data_plane().published_state().file_count,
             1,
             "opening B must not reset the local home-A fallback, got: {result}"
         );
         assert!(
-            server.index.read().get_file("src/old.rs").is_some(),
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/old.rs")
+                .is_some(),
             "home-A fallback must remain reachable after opening B"
         );
 
@@ -14547,6 +14935,7 @@ mod tests {
         }
         server
             .index
+            .data_plane()
             .reload(&home_root)
             .expect("seed local home fallback");
 
@@ -14567,7 +14956,7 @@ mod tests {
             Some(home_root.as_path()),
             "failed proxy open must keep home root"
         );
-        let guard = server.index.read();
+        let guard = server.index.data_plane().read();
         assert!(guard.get_file("src/home.rs").is_some());
         assert!(
             guard.get_file("src/other.rs").is_none(),

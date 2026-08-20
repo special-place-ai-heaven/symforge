@@ -408,27 +408,152 @@ fn a_grant_abandoned_before_redemption_refunds_itself() {
     assert_eq!(other.unknown_refunds(), 0);
 }
 
-/// TEST-CAPACITY-INTEGRATION (T069, Slice 4). Reserved name, empty of proof.
+/// TEST-CAPACITY-INTEGRATION (T069, Slice 4 — C8, observing body). The
+/// stand-in was the armed RED (ignore + panic since Slice 2); the body
+/// measures the identity `retained[d] + candidate[d] <= pregranted[d] +
+/// scratch[d] + headroom[d]` on the LIVE runtime, in the pipeline's own
+/// dark units (candidates reserve one byte per observed source; the dark
+/// scratch/headroom vector is zero until the measured budgets land):
 ///
-/// The traceability checker requires every `planned_exact` case declared for a
-/// file to EXIST once that file exists, and Slice 2 created this file for
-/// TEST-CAPACITY. So the name is materialized here at its declared target,
-/// carrying nothing it has not observed: the activation cut whose conservation
-/// it measures does not exist before T060, so there is no runtime to hold to
-/// the identity `retained[d] + candidate[d] <= pregranted[d] + scratch[d] +
-/// headroom[d]` across all four surfaces.
-///
-/// It is RED by construction and kept out of the default suite by `#[ignore]`,
-/// the same shape Slice 0 used for its controls. Removing the attribute without
-/// writing the body fails loudly rather than reporting a pass; the release
-/// runner separately refuses an ignored-only run as execution evidence
-/// (`scripts/validate-lifecycle-oracle-traceability.cjs`, `expect_execution`).
+/// 1. The pre-granted vector exhausts the process root EXACTLY — all four
+///    surfaces attach, nothing is promisable outside the vector, and every
+///    surface starts uncharged.
+/// 2. Retained-plus-candidate peak accounting under a 64-source burst on a
+///    live observation lane, sampled after every admission; burst
+///    convergence (every candidate refunded, zero outstanding, zero
+///    unknown refunds, retention exactly the burst's sources); and
+///    no-unaccounted-residency (the identical burst repeated grows
+///    nothing and leaves no residue).
+/// 3. Capacity fairness: two lanes burst concurrently; both make full
+///    committed progress and each converges charge-free within its own
+///    pre-grant — neither can spend the other's.
 #[test]
-#[ignore = "Feature 020 planned_not_executed case for TEST-CAPACITY-INTEGRATION; remove this attribute in Slice 4 (T069) when the activation cut can be driven and conservation actually measured"]
 fn whole_runtime_capacity_is_conserved_under_activation() {
-    panic!(
-        "TEST-CAPACITY-INTEGRATION is planned_not_executed: no activation cut exists to \
-         measure, so nothing here has observed whole-runtime conservation. T069 owns the body."
+    use symforge::live_index::index_lifecycle::activation::{
+        OBSERVATION_CAPACITY_BYTES, activate_surface, process_index_runtime,
+        project_source_authority,
+    };
+    use symforge::live_index::index_lifecycle::process_runtime::SurfaceKind;
+
+    // ── 1. The pre-granted capacity vector, conserved at the promise level ──
+    for surface in SurfaceKind::ALL {
+        activate_surface(surface);
+    }
+    let runtime = process_index_runtime();
+    let ledger = runtime.ledger();
+    assert_eq!(
+        runtime.attached().len(),
+        SurfaceKind::ALL.len(),
+        "all four surfaces attach"
+    );
+    assert_eq!(
+        runtime.available(),
+        0,
+        "the four pre-grants exhaust the process budget exactly — no \
+         headroom hides outside the declared vector"
+    );
+    for surface in SurfaceKind::ALL {
+        let owner = runtime.owner_for(surface).expect("attached surface");
+        assert_eq!(ledger.charged(owner), 0, "{surface:?} starts uncharged");
+        assert_eq!(
+            ledger.available(owner),
+            OBSERVATION_CAPACITY_BYTES,
+            "{surface:?} holds its full pre-grant"
+        );
+    }
+    assert_eq!(ledger.unknown_refunds(), 0);
+
+    // ── 2. Retained + candidate peak, burst convergence, no residency ──
+    let root_a = tempfile::tempdir().expect("root a");
+    let lane_a = project_source_authority(root_a.path());
+    let observer_a = lane_a.register_observer();
+    let (_, pregranted, _, _) = lane_a.observation_capacity_ledger();
+    let mut peak = 0u64;
+    for index in 0..64 {
+        lane_a
+            .observe_admission(observer_a, &format!("src/burst_{index}.rs"))
+            .expect("current incarnation");
+        let (candidate, _, _, _) = lane_a.observation_capacity_ledger();
+        let (_, retained) = lane_a.retained_observation_artifacts();
+        peak = peak.max(candidate + retained);
+        assert!(
+            candidate + retained <= pregranted,
+            "retained[{retained}] + candidate[{candidate}] exceeded \
+             pregranted[{pregranted}] (+ zero scratch/headroom)"
+        );
+    }
+    let (charged, _, outstanding, unknown) = lane_a.observation_capacity_ledger();
+    let (sources, retained) = lane_a.retained_observation_artifacts();
+    assert_eq!(charged, 0, "burst converged: every candidate refunded");
+    assert_eq!(outstanding, 0, "no outstanding charges after convergence");
+    assert_eq!(unknown, 0, "every refund was known to the ledger");
+    assert_eq!(sources, 64, "the burst retains exactly its sources");
+    assert!(
+        peak >= retained,
+        "the sampled peak saw at least the final retention"
+    );
+    // The identical burst again: retention must not grow, and nothing may
+    // linger — the no-unaccounted-residency measurement.
+    for index in 0..64 {
+        lane_a
+            .observe_admission(observer_a, &format!("src/burst_{index}.rs"))
+            .expect("current incarnation");
+    }
+    let (charged_after, _, outstanding_after, unknown_after) = lane_a.observation_capacity_ledger();
+    let (sources_after, _) = lane_a.retained_observation_artifacts();
+    assert_eq!(
+        (charged_after, outstanding_after, unknown_after),
+        (0, 0, 0),
+        "a repeated identical burst left residue"
+    );
+    assert_eq!(
+        sources_after, 64,
+        "repeating identical work grew retention — unaccounted residency"
+    );
+
+    // ── 3. Capacity fairness across two live lanes ──
+    let root_b = tempfile::tempdir().expect("root b");
+    let lane_b = project_source_authority(root_b.path());
+    let observer_b = lane_b.register_observer();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for index in 0..64 {
+                lane_a
+                    .observe_admission(observer_a, &format!("src/fair_a_{index}.rs"))
+                    .expect("lane a current");
+            }
+        });
+        scope.spawn(|| {
+            for index in 0..64 {
+                lane_b
+                    .observe_admission(observer_b, &format!("src/fair_b_{index}.rs"))
+                    .expect("lane b current");
+            }
+        });
+    });
+    for index in 0..64 {
+        assert_eq!(
+            lane_a.committed_observations(&format!("src/fair_a_{index}.rs")),
+            1,
+            "lane a made full committed progress"
+        );
+        assert_eq!(
+            lane_b.committed_observations(&format!("src/fair_b_{index}.rs")),
+            1,
+            "lane b made full committed progress"
+        );
+    }
+    let (charged_a, pregranted_a, _, unknown_a) = lane_a.observation_capacity_ledger();
+    let (charged_b, pregranted_b, _, unknown_b) = lane_b.observation_capacity_ledger();
+    assert_eq!(
+        (charged_a, charged_b, unknown_a, unknown_b),
+        (0, 0, 0, 0),
+        "both lanes converge charge-free"
+    );
+    assert_eq!(
+        (pregranted_a, pregranted_b),
+        (pregranted, pregranted),
+        "each lane holds its OWN pre-grant — neither can spend the other's"
     );
 }
 

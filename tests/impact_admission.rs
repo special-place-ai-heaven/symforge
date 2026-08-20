@@ -69,13 +69,19 @@ async fn impact_refuses_oversized_code_file() {
     );
     // No silent admit: the file must NOT be in the Tier-1 index afterwards.
     assert!(
-        server.index().read().get_file("src/big.rs").is_none(),
+        server
+            .index()
+            .data_plane()
+            .read()
+            .get_file("src/big.rs")
+            .is_none(),
         "impact must not force-admit a Tier-2 file"
     );
     // The skip registry knows it, so health/watcher agree with the refusal.
     assert!(
         server
             .index()
+            .data_plane()
             .read()
             .compatibility_skipped_files()
             .iter()
@@ -92,7 +98,12 @@ async fn impact_admits_code_file_between_1mb_and_4mb() {
     let (_dir, server) = make_server(&[("src/medium.rs", &medium)]);
 
     assert!(
-        server.index().read().get_file("src/medium.rs").is_some(),
+        server
+            .index()
+            .data_plane()
+            .read()
+            .get_file("src/medium.rs")
+            .is_some(),
         "1.2MB code file must be Tier-1 at load under METADATA_ONLY_CODE_BYTES"
     );
     let result = server
@@ -139,7 +150,7 @@ async fn impact_normalizes_existing_path_before_catalog_lookup() {
         "normalized existing path must remain analyzable; got: {result}"
     );
 
-    let index = server.index().read();
+    let index = server.index().data_plane().read();
     assert!(index.get_file("src/lib.rs").is_some());
     assert!(
         index.get_file("./src/lib.rs").is_none(),
@@ -154,7 +165,14 @@ async fn impact_cannot_admit_gitignored_supported_source() {
         ("ignored.rs", "pub fn must_stay_ignored() {}\n"),
         ("src/lib.rs", "pub fn keep() {}\n"),
     ]);
-    assert!(server.index().read().get_file("ignored.rs").is_none());
+    assert!(
+        server
+            .index()
+            .data_plane()
+            .read()
+            .get_file("ignored.rs")
+            .is_none()
+    );
 
     let result = server
         .dispatch_tool_for_tests(
@@ -168,7 +186,12 @@ async fn impact_cannot_admit_gitignored_supported_source() {
         "scope exclusion must produce a typed non-indexed result; got: {result}"
     );
     assert!(
-        server.index().read().get_file("ignored.rs").is_none(),
+        server
+            .index()
+            .data_plane()
+            .read()
+            .get_file("ignored.rs")
+            .is_none(),
         "impact must share the watcher/cold-walk gitignore gate"
     );
 }

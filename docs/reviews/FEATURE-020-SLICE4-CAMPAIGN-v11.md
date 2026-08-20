@@ -8,6 +8,20 @@ from a three-lens recon of `specs/020-repository-knowledge-index/tasks.md`
 `src/index_lifecycle/`. This document is campaign planning under
 `docs/reviews/`; the spec tree is frozen and is never edited.
 
+> **Execution status (as_of 2026-08-20)**: EXECUTED through T039, awaiting
+> the T040 operator gate. The as-executed record (with every deviation
+> from this plan) lives in
+> `specs/028-preventive-activation-cut/activation-cut-execution-map.md`;
+> the evidence and review record is
+> `docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md` (T038
+> CLOSED, three rounds, zero unresolved P0/P1/P2). Notable deviations:
+> commit groups split beyond the planned sequence (C4a/b/c, C11a/b/c);
+> 020:T065's live persist.rs format bump was discharged inside T038
+> round 1 rather than a C-numbered group (the whole-snapshot seed gate is
+> live; `SnapshotStore` per-entry wiring stays a recorded open residual);
+> the embed test cell's frozen count moved 1336 → 1340 with the review
+> rounds' new unconditional oracles.
+
 ## Mission and governing constraints
 
 Slice 4 (T053–T073) enables the preventive lifecycle everywhere in one cut.

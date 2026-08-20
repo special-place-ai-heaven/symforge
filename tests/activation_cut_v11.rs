@@ -81,6 +81,12 @@
 //! advertised tool modes, with T064 additionally owning the hook pass-through
 //! and T072 the activation boundary.
 
+// C6: the whole file is server-gated at FILE level (invisible to the
+// traceability validator's case matcher, which rightly refuses a planned
+// oracle hidden behind a per-case feature cfg). Every CI job that builds
+// integration tests is a server build; the embed cell builds --lib only.
+#![cfg(feature = "server")]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -2112,48 +2118,364 @@ fn all_ingress_uses_exact_typed_authority_branch() {
     );
 }
 
-/// TEST-ACTIVATION (T058, Slice 4). Dark stand-in: the name exists because
-/// creating this file arms its `planned_exact` declaration. It is RED by
-/// construction and kept out of the default suite by `#[ignore]`. Removing the
-/// attribute without writing the body fails loudly rather than reporting a pass.
+/// TEST-ACTIVATION (T058, Slice 4 — C6, observing body): the process
+/// activation machine is a singleton whose live mode after ANY surface's
+/// bootstrap ceremony is `PreventiveV1Open`, and no surface's ceremony —
+/// first or repeated — can regress it. The mode set is CLOSED (the
+/// exhaustive match below fails compilation if a variant appears), and the
+/// two legacy variants exist only as the ceremony's interior: the C1
+/// fresh-machine oracle pins the `LegacyOpen` start in the lib suite,
+/// where a machine can still be observed before any surface serves.
 #[test]
-#[ignore = "Feature 020 planned_not_executed case for TEST-ACTIVATION; remove this attribute in Slice 4 (T058) when the activation cut exists and Preventive V1 can actually be observed as the only live mode"]
 fn preventive_v1_is_the_only_live_mode() {
-    panic!(
-        "TEST-ACTIVATION is planned_not_executed: no activation cut exists, so nothing here \
-         has observed a live mode. T058 owns the body."
-    );
+    use symforge::live_index::index_lifecycle::activation::{
+        ActivationCut, ActivationMode, activate_surface,
+    };
+    use symforge::live_index::index_lifecycle::process_runtime::SurfaceKind;
+
+    for surface in SurfaceKind::ALL {
+        activate_surface(surface);
+        let mode = ActivationCut::process().mode();
+        assert_eq!(
+            mode,
+            ActivationMode::PreventiveV1Open,
+            "after {surface:?}'s ceremony the ONLY live mode is Preventive V1"
+        );
+        // The closed mode set: adding a variant fails here before it can
+        // widen what "only live mode" means.
+        match mode {
+            ActivationMode::LegacyOpen
+            | ActivationMode::LegacyClosing
+            | ActivationMode::PreventiveV1Open => {}
+        }
+    }
+    // Repeating every ceremony is idempotent — a second bootstrap can
+    // neither re-open the legacy gate nor be observed mid-drain.
+    for surface in SurfaceKind::ALL {
+        activate_surface(surface);
+        assert_eq!(
+            ActivationCut::process().mode(),
+            ActivationMode::PreventiveV1Open,
+            "a repeated ceremony must not regress the live mode"
+        );
+    }
 }
 
-/// TEST-EMBED (T058, Slice 4). Dark stand-in; see the note on
-/// `preventive_v1_is_the_only_live_mode`.
+/// TEST-EMBED (T058, Slice 4 — C6, observing body): one embedded source has
+/// exactly ONE handle, and no second handle — the only raw-bypass shape the
+/// public surface can still spell — can be minted while it is held. The
+/// C5-flipped facade exposes these types as the whole embed API (pinned by
+/// the census/delta oracles); this body observes the sole-handle admission,
+/// the typed refusal of a second open, the honest no-publication view, and
+/// close-then-reopen releasing the source.
 #[test]
-#[ignore = "Feature 020 planned_not_executed case for TEST-EMBED; remove this attribute in Slice 4 (T058) when the embedded source handle is live and a raw bypass could actually be detected"]
 fn embedded_source_has_one_handle_and_no_raw_bypass() {
-    panic!(
-        "TEST-EMBED is planned_not_executed: the embedded handle is a dark stand-in, so \
-         nothing here has observed a bypass or its absence. T058 owns the body."
+    use symforge::live_index::index_lifecycle::activation::{ActivationCut, ActivationMode};
+    use symforge::live_index::index_lifecycle::public_api::{
+        EmbeddedSourceSpec, ProcessRuntimeApi, SourceRuntimePhase,
+    };
+
+    let root = tempfile::tempdir().expect("root");
+    // Acquisition IS the embed surface's bootstrap (C5): it runs the
+    // ceremony and joins the one process capacity runtime.
+    let runtime = ProcessRuntimeApi::acquire().expect("acquisition admits");
+    assert_eq!(
+        ActivationCut::process().mode(),
+        ActivationMode::PreventiveV1Open,
+        "embed acquisition drives the ceremony before serving"
+    );
+
+    let handle = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
+        .expect("the sole handle admits");
+    assert!(handle.is_open());
+
+    // The one raw-bypass shape still spellable: a SECOND handle to the held
+    // source. It refuses with the typed selection refusal, not a clone.
+    let bypass = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
+        .expect_err("a second handle to a held source is refused");
+    assert_eq!(
+        bypass.kind_name(),
+        "SelectionUnavailable",
+        "the refusal names the held selection"
+    );
+
+    // The view invents nothing: no publication, no observer, phase honest.
+    let view = handle.runtime_view();
+    assert_eq!(view.phase, SourceRuntimePhase::Loading);
+    assert!(
+        view.current_publication_identity.is_none(),
+        "a handle with no publication must not invent one"
+    );
+
+    // Close releases the source; the receipt reports what the close DID.
+    let receipt = handle.begin_close();
+    let joined = handle.begin_close();
+    assert!(!handle.is_open());
+    let _ = (receipt, joined);
+    runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
+        .expect("a closed source admits a fresh sole handle");
+}
+
+/// TEST-MUTATION (T058, Slice 4 — C6, observing body): a live ingress
+/// source write acquires exactly one mutation permit from the per-root
+/// authority — observed on the authority's own grant ledger — and a read
+/// ingress acquires none (the sealed negative in the same test). Two
+/// writes are two grants: the permit is per-write, not per-session.
+#[tokio::test]
+async fn every_source_write_requires_current_mutation_permit() {
+    use symforge::live_index::LiveIndex;
+    use symforge::live_index::index_lifecycle::activation::project_source_authority;
+    use symforge::protocol::SymForgeServer;
+
+    let dir = tempfile::tempdir().expect("root");
+    std::fs::create_dir_all(dir.path().join("src")).expect("src");
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "fn hello() {\n    println!(\"hi\");\n}\n",
+    )
+    .expect("seed");
+    let shared = LiveIndex::load(dir.path()).expect("load");
+    let server = SymForgeServer::new(
+        shared,
+        "activation-cut".to_string(),
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            symforge::watcher::WatcherInfo::default(),
+        )),
+        Some(dir.path().to_path_buf()),
+        None,
+    );
+    let authority = project_source_authority(dir.path());
+    let before = authority.grants_issued();
+
+    // Sealed negative: a read ingress mints no permit.
+    let read = server
+        .dispatch_tool_for_tests(
+            "get_symbol",
+            serde_json::json!({ "path": "src/lib.rs", "name": "hello" }),
+        )
+        .await;
+    assert!(read.contains("hello"), "the read served: {read}");
+    assert_eq!(
+        authority.grants_issued(),
+        before,
+        "a read ingress must not acquire a mutation permit"
+    );
+
+    // A live source write acquires exactly one grant.
+    let first = server
+        .dispatch_tool_for_tests(
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "name": "hello",
+                "new_body": "fn hello() {\n    println!(\"first\");\n}",
+            }),
+        )
+        .await;
+    assert!(!first.contains("Error"), "the write completed: {first}");
+    assert_eq!(
+        authority.grants_issued(),
+        before + 1,
+        "one source write, one granted permit"
+    );
+
+    // Every write, not just the first.
+    let second = server
+        .dispatch_tool_for_tests(
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "name": "hello",
+                "new_body": "fn hello() {\n    println!(\"second\");\n}",
+            }),
+        )
+        .await;
+    assert!(
+        !second.contains("Error"),
+        "the second write completed: {second}"
+    );
+    assert_eq!(
+        authority.grants_issued(),
+        before + 2,
+        "a second source write requires its own permit"
     );
 }
 
-/// TEST-MUTATION (T058, Slice 4). Dark stand-in; see the note on
-/// `preventive_v1_is_the_only_live_mode`.
+/// TEST-STATE (T058, Slice 4 — C6, observing body): admission records state
+/// owners EXACTLY — the installed slot carries the requested placement and
+/// a capacity owner, a protected root with project-local state refuses
+/// before anything is installed — and the team artifact's receipts are
+/// exact: each export discloses its precise git-visibility state and
+/// increments the persisted count by exactly one, while a refused binding
+/// persists nothing.
 #[test]
-#[ignore = "Feature 020 planned_not_executed case for TEST-MUTATION; remove this attribute in Slice 4 (T058) when SourceMutationPermit is live and a write can be observed acquiring one"]
-fn every_source_write_requires_current_mutation_permit() {
-    panic!(
-        "TEST-MUTATION is planned_not_executed: no write path acquires a permit yet, so \
-         nothing here has observed the requirement. T058 owns the body."
-    );
-}
-
-/// TEST-STATE (T058, Slice 4). Dark stand-in; see the note on
-/// `preventive_v1_is_the_only_live_mode`.
-#[test]
-#[ignore = "Feature 020 planned_not_executed case for TEST-STATE; remove this attribute in Slice 4 (T058) when state owners are live and team-artifact exactness can be measured"]
 fn state_owners_and_team_artifact_are_exact() {
-    panic!(
-        "TEST-STATE is planned_not_executed: state ownership is not wired, so nothing here \
-         has observed exactness. T058 owns the body."
+    use symforge::domain::index::{ProjectStateDir, SourceAccessMode, StatePlacement};
+    use symforge::live_index::index_lifecycle::activation::admit_project;
+    use symforge::live_index::index_lifecycle::process_runtime::SurfaceKind;
+    use symforge::live_index::index_lifecycle::registry::StatePlacement as AdmissionPlacement;
+    use symforge::live_index::index_lifecycle::snapshot::{
+        BindingClass, GitVisibility, SnapshotRefusal, SnapshotStore,
+    };
+
+    // State OWNERS, positive: a normal root with project-local state admits;
+    // the live slot records the placement exactly and is charged to the
+    // surface's capacity owner.
+    let root = tempfile::tempdir().expect("root");
+    let placement = StatePlacement::ProjectLocal {
+        directory: ProjectStateDir::new(root.path().join(".symforge")),
+    };
+    let slot = admit_project(
+        SurfaceKind::Stdio,
+        root.path(),
+        "activation-cut-state-owners",
+        SourceAccessMode::NormalProject,
+        &placement,
+    )
+    .expect("a normal project-local admission installs");
+    assert_eq!(slot.placement(), AdmissionPlacement::ProjectLocal);
+    assert!(
+        slot.capacity_owner().expect("live slot").is_some(),
+        "the admission is charged to a capacity owner"
+    );
+
+    // State OWNERS, refusal: protection forbids state beneath the root, and
+    // the refusal arrives BEFORE any installation.
+    let protected = tempfile::tempdir().expect("protected root");
+    let refused = admit_project(
+        SurfaceKind::Stdio,
+        protected.path(),
+        "activation-cut-state-protected",
+        SourceAccessMode::ExplicitProtected,
+        &StatePlacement::ProjectLocal {
+            directory: ProjectStateDir::new(protected.path().join(".symforge")),
+        },
+    );
+    assert!(
+        refused.is_err(),
+        "protected + project-local state must refuse, got a live slot"
+    );
+
+    // Team artifact EXACTNESS: each export discloses its precise visibility
+    // state and persists exactly one artifact; the unavailable state never
+    // infers shareability.
+    let mut store = SnapshotStore::new();
+    for (index, visibility) in GitVisibility::ALL.into_iter().enumerate() {
+        let receipt = store
+            .export_team_artifact(BindingClass::NormalWritable, visibility, vec![7; index + 1])
+            .expect("a normal writable binding exports");
+        assert_eq!(receipt.visibility, visibility, "the receipt is exact");
+        assert_eq!(
+            store.team_artifacts(),
+            index + 1,
+            "each export persists exactly one artifact"
+        );
+    }
+    // A refused binding persists nothing — the count is unchanged.
+    assert_eq!(
+        store
+            .export_team_artifact(
+                BindingClass::ExplicitProtected,
+                GitVisibility::AlreadyTracked,
+                b"x".to_vec(),
+            )
+            .unwrap_err(),
+        SnapshotRefusal::BindingRefusesExport(BindingClass::ExplicitProtected)
+    );
+    assert_eq!(store.team_artifacts(), GitVisibility::ALL.len());
+}
+
+/// C6 focused persistence oracle: COLD RECOVERY CANNOT MINT A PERMIT. A
+/// cold load, a checkpoint of the published index, and a snapshot restore
+/// are all observation/state work — none may acquire source-mutation
+/// authority. The accepting control in the same test: an explicit
+/// `acquire_write` on the same authority issues exactly one grant.
+#[test]
+fn cold_recovery_mints_no_mutation_permit() {
+    use symforge::domain::index::{ProjectStateDir, StatePlacement};
+    use symforge::live_index::LiveIndex;
+    use symforge::live_index::index_lifecycle::activation::project_source_authority;
+    use symforge::live_index::persist;
+
+    let dir = tempfile::tempdir().expect("root");
+    std::fs::create_dir_all(dir.path().join("src")).expect("src");
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn seed() {}\n").expect("seed");
+
+    let authority = project_source_authority(dir.path());
+    let before = authority.grants_issued();
+
+    // Cold load: parse + publish, no source mutation.
+    let shared = LiveIndex::load(dir.path()).expect("cold load");
+    // Checkpoint: ProjectStateDir persistence, permit-free by contract.
+    let placement = StatePlacement::ProjectLocal {
+        directory: ProjectStateDir::new(dir.path().join(".symforge")),
+    };
+    persist::checkpoint_shared_index(&shared, dir.path(), &placement).expect("checkpoint");
+    // Snapshot restore: state read, no source mutation.
+    let snapshot = persist::load_snapshot(dir.path(), &placement).expect("snapshot exists");
+    let _restored = persist::snapshot_to_live_index(snapshot, dir.path());
+
+    assert_eq!(
+        authority.grants_issued(),
+        before,
+        "cold load + checkpoint + restore must not mint a mutation permit"
+    );
+
+    // Accepting control: real acquisition still grants.
+    let write = authority
+        .acquire_write()
+        .expect("a real acquisition grants");
+    drop(write);
+    assert_eq!(
+        authority.grants_issued(),
+        before + 1,
+        "the authority still grants when asked properly"
+    );
+}
+
+/// C6 focused init oracle: the init writer lane (gitignore hygiene) is
+/// source-authorized and acquires its permit — one reconcile, one grant —
+/// while the explicit-protected authority path performs no write and mints
+/// nothing (the same-test accepting/refusing pair).
+#[test]
+fn init_gitignore_reconcile_acquires_exactly_one_permit() {
+    use symforge::gitignore_hygiene::{GitignoreHygieneAuthority, reconcile_project_gitignore};
+    use symforge::live_index::index_lifecycle::activation::project_source_authority;
+
+    let dir = tempfile::tempdir().expect("root");
+    std::fs::create_dir_all(dir.path().join(".symforge")).expect("state dir");
+    // A repository root (hygiene never promotes a non-repository directory)
+    // with a .gitignore missing the symforge entry: the reconcile has a real
+    // write to perform (a rootless fixture reports NoRootGitignore, performs
+    // no write, and honestly mints nothing).
+    std::fs::create_dir_all(dir.path().join(".git")).expect("git dir");
+    std::fs::write(dir.path().join(".gitignore"), "target/\n").expect("gitignore");
+    let authority = project_source_authority(dir.path());
+    let before = authority.grants_issued();
+
+    let report =
+        reconcile_project_gitignore(dir.path(), GitignoreHygieneAuthority::ProjectAwareInit);
+    assert_eq!(
+        authority.grants_issued(),
+        before + 1,
+        "the init writer lane acquires exactly one permit, report: {report:?}"
+    );
+
+    // Explicit protection: no write, no permit.
+    let held = authority.grants_issued();
+    let _ = reconcile_project_gitignore(dir.path(), GitignoreHygieneAuthority::ExplicitProtected);
+    assert_eq!(
+        authority.grants_issued(),
+        held,
+        "a protected reconcile performs no write and mints nothing"
     );
 }

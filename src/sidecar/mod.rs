@@ -15,8 +15,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::Serialize;
 
-use crate::live_index::store::SharedIndex;
-
 /// Handle returned by `spawn_sidecar`. Dropping this or sending on `shutdown_tx`
 /// gracefully stops the background axum server and cleans up port/PID files.
 ///
@@ -218,16 +216,22 @@ pub type SymbolSnapshotCache = HashMap<String, Vec<SymbolSnapshot>>;
 /// Axum state type bundling the shared index, token statistics, and pre-edit symbol cache.
 ///
 /// Passed to every handler via `State<SidecarState>`. Replaces bare `SharedIndex` as the
-/// axum state type in Plan 06-01.
+/// axum state type in Plan 06-01. Since C4 (Feature 020 Slice 4, D1) the
+/// index is held through the typed `ProjectRuntimeHandle` — the frozen
+/// publication_roots census retires bare `SharedIndex` state fields.
 #[derive(Clone)]
 pub struct SidecarState {
-    pub index: SharedIndex,
+    pub index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
     pub token_stats: Arc<TokenStats>,
     /// Canonical project root for file-system reads during impact analysis.
     /// `None` falls back to process cwd for local test setups.
     pub repo_root: Option<PathBuf>,
     /// Per-file symbol snapshot cache for impact diff.
     /// Key: relative file path. Value: symbol list captured after the last impact.
+    /// Cache census (C4c): every handler read is fenced by
+    /// `ensure_symbol_cache_generation` — a hit is served only at the
+    /// generation the cache was associated with, and a generation move
+    /// clears it deterministically.
     pub symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
 }
 
@@ -492,7 +496,9 @@ mod tests {
         });
 
         let state = SidecarState {
-            index,
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                index,
+            ),
             token_stats: TokenStats::new(),
             repo_root: None,
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),

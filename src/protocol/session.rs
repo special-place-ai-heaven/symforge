@@ -60,6 +60,11 @@ struct SessionInner {
     /// Aggregate outputs that consumed context without mapping cleanly to one file/symbol.
     summary_outputs: HashMap<String, u32>,
     /// Parameter-aware fetch records for cache-hit (011).
+    /// Cache census (C4c): the fetch key's `params_hash` binds project,
+    /// publication, and content generation (pinned by
+    /// `hash_symbol_params_binds_generation_identity`), so a publication
+    /// swap is a structural miss; a hit yields dedup METADATA only, never
+    /// content authority.
     detailed_fetches: HashMap<FetchKey, SessionFetchRecord>,
     /// Read-path cache-hit short-circuits (011 US5).
     cache_hit_count: u32,

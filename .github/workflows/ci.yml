@@ -140,7 +140,14 @@ jobs:
         run: bash execution/clone_phase0_corpora.sh
 
       - name: Run Rust tests
-        run: cargo test --all-targets -- --test-threads=1
+        # `--lib --bins --tests`, not `--all-targets`: the trailing libtest
+        # flag is forwarded to EVERY selected binary, and the criterion
+        # bench target (harness = false, T068) rejects `--test-threads`.
+        # The bench's own smoke gate runs it in criterion's --test mode.
+        run: cargo test --lib --bins --tests -- --test-threads=1
+
+      - name: Smoke the observed-refresh benchmark (criterion --test mode)
+        run: cargo bench --bench observed_refresh_gate_v1 -- --test
 
       # Slice 0's product is positive controls that MUST fail, so the step above
       # cannot check them: it runs the default suite, where every control is
@@ -201,7 +208,7 @@ jobs:
         run: cargo build --no-default-features --features embed
 
       - name: Clippy engine-only embed feature
-        run: cargo clippy --no-default-features --features embed --lib -- -D warnings
+        run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings
 
       - name: Run embed-feature lib tests
         run: cargo test --no-default-features --features embed --lib -- --test-threads=1
@@ -247,7 +254,7 @@ jobs:
       - name: Clippy engine-only embed feature for musl
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo clippy --no-default-features --features embed --target x86_64-unknown-linux-musl --lib -- -D warnings
+        run: cargo clippy --no-default-features --features embed,__test-internals --target x86_64-unknown-linux-musl --lib -- -D warnings
 
   darwin-serve-port:
     needs: release-version

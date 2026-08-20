@@ -25,6 +25,10 @@
 //!
 //! The writer lanes that consume permits are Slice 4 activation work.
 
+// T066: the activation mode machine — LegacyOpen -> LegacyClosing ->
+// PreventiveV1Open, monotonic, process-wide, non-configurable. The cut's
+// wiring (T064/T067) is its only planned production caller.
+pub mod activation;
 pub mod adapters;
 pub mod authority;
 // T059/T060: the dark per-source supervisor and isolated candidate pipeline.

@@ -246,6 +246,22 @@ pub fn run_init_with_context(
     run_init_with_paths(client, paths, home_dir, working_dir, binary_path)
 }
 
+// V11 write classification (Feature 020 Slice 4, T064): this censused
+// writer's disk writes are USER-SCOPE client registrations (Claude/Codex/
+// Gemini/Cursor/... settings, config, and guidance files under the home
+// directory) — outside any repository root, so permit-free by
+// classification. RECORDED RESIDUAL (T038 round-1 finding, not silently
+// dropped): the Kilo Code lane is the one exception — `kilo_vscode_config`
+// and `kilo_rules_guidance` write `.kilocode/mcp.json` and
+// `.kilocode/rules/symforge.md` under `working_dir`, i.e. INSIDE the
+// repository root, permit-free, same as every write here. `init` runs
+// standalone before any project index/admission exists, so routing it
+// through the mutation-permit path is a real design change, not a
+// mechanical fix; it is intentionally left open rather than silently
+// reclassified. The remaining repository-source writing this function
+// delegates to is the gitignore hygiene lane below, which IS
+// source-authorized and acquires the SourceMutationPermit inside
+// `gitignore_hygiene.rs`.
 fn run_init_with_paths(
     client: InitClient,
     paths: InitPaths,

@@ -29,7 +29,7 @@ fn ccr_hash(body: &str) -> Option<&str> {
 #[tokio::test]
 async fn get_symbol_repeat_returns_cache_hit() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
@@ -54,7 +54,7 @@ async fn get_symbol_repeat_returns_cache_hit() {
     let forced = server
         .dispatch_tool_for_tests(
             "get_symbol",
-            json!({ "path": "src/main.rs", "name": "main", "force_refresh": true }),
+            json!({ "path": "src/cli/entry.rs", "name": "run_main", "force_refresh": true }),
         )
         .await;
     assert!(
@@ -67,7 +67,7 @@ async fn get_symbol_repeat_returns_cache_hit() {
 #[tokio::test]
 async fn get_symbol_cache_hit_is_redeemable_via_retrieve() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
@@ -107,7 +107,7 @@ async fn get_symbol_cache_hit_is_redeemable_via_retrieve() {
 #[tokio::test]
 async fn shared_session_cache_hit_is_redeemable_issue_574() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
@@ -129,7 +129,7 @@ async fn shared_session_cache_hit_is_redeemable_issue_574() {
 #[tokio::test]
 async fn evicted_ccr_blob_turns_cache_hit_into_miss() {
     let server = server_for_fixture();
-    let params = json!({ "path": "src/main.rs", "name": "main" });
+    let params = json!({ "path": "src/cli/entry.rs", "name": "run_main" });
     let first = server
         .dispatch_tool_for_tests("get_symbol", params.clone())
         .await;
@@ -190,5 +190,114 @@ fn session_detailed_fetch_drives_stel_cache_hit() {
         decision.decision,
         AdmissionDecision::CacheHit,
         "generation-blind STEL admission must not cache_hit; the primitive owns the key"
+    );
+}
+
+/// The repeat-cache PUBLICATION-IDENTITY FENCE (Feature 020, carried Slice 3
+/// residual; verified after C9's benchmark flushed a stale
+/// `Decision: cache_hit` out of baseline `1521abb0`): a bare repeat read —
+/// no `force_refresh` — after the file changed ON DISK must serve the fresh
+/// bytes, never a cache hit of the old publication. The freshen-on-read
+/// lane runs BEFORE the cache key is computed, so a real change bumps the
+/// content generation and the stale record structurally cannot match. The
+/// accepting control in the same test: an UNCHANGED repeat is exactly the
+/// case the cache exists for, and it hits.
+///
+/// (C9's incident root cause, recorded honestly: the benchmark's original
+/// now-relative mtime backdate collided across revisions, so the freshen
+/// legitimately saw an unchanged mtime and the cache consistently served
+/// the unchanged publication. The fence itself holds — this oracle is what
+/// proves that, instead of the report arguing it.)
+#[tokio::test]
+async fn stale_publication_never_satisfies_the_repeat_read_cache() {
+    use symforge::live_index::LiveIndex;
+    use symforge::protocol::SymForgeServer;
+
+    let dir = tempfile::tempdir().expect("root");
+    std::fs::create_dir_all(dir.path().join("src")).expect("src");
+    let file = dir.path().join("src/lib.rs");
+    std::fs::write(&file, "pub fn fenced() -> u64 {\n    111\n}\n").expect("seed");
+    let backdate = |secs: u64| {
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ))
+            .expect("set mtime");
+    };
+    backdate(1_000_000_001);
+    let shared = LiveIndex::load(dir.path()).expect("load");
+    let server = SymForgeServer::new(
+        shared,
+        "fence".to_string(),
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            symforge::watcher::WatcherInfo::default(),
+        )),
+        Some(dir.path().to_path_buf()),
+        None,
+    );
+    let params = json!({ "path": "src/lib.rs" });
+
+    let first = server
+        .dispatch_tool_for_tests("get_file_content", params.clone())
+        .await;
+    assert!(first.contains("111"), "first read serves the body: {first}");
+
+    // Accepting control: the UNCHANGED repeat is the cache's whole job.
+    let unchanged = server
+        .dispatch_tool_for_tests("get_file_content", params.clone())
+        .await;
+    assert!(
+        unchanged.contains("Decision: cache_hit"),
+        "an unchanged repeat read hits: {unchanged}"
+    );
+
+    // The fence: the file changes ON DISK (distinct deterministic mtime);
+    // a bare repeat read must serve the fresh identity, never the old hit.
+    std::fs::write(&file, "pub fn fenced() -> u64 {\n    222\n}\n").expect("rewrite");
+    backdate(1_000_000_002);
+    let refreshed = server
+        .dispatch_tool_for_tests("get_file_content", params.clone())
+        .await;
+    assert!(
+        !refreshed.contains("Decision: cache_hit"),
+        "a stale publication satisfied the repeat-read cache: {refreshed}"
+    );
+    assert!(
+        refreshed.contains("222"),
+        "the repeat read must observe the fresh identity: {refreshed}"
+    );
+
+    // And the fence re-arms: the NEW publication's own repeat hits again.
+    let rearmed = server
+        .dispatch_tool_for_tests("get_file_content", params)
+        .await;
+    assert!(
+        rearmed.contains("Decision: cache_hit"),
+        "the fresh publication's own repeat hits: {rearmed}"
+    );
+
+    // get_file_context rides the same freshen-before-key order: after a
+    // further on-disk change, its repeat serves the fresh symbol set.
+    let context_params = json!({ "path": "src/lib.rs" });
+    let context_first = server
+        .dispatch_tool_for_tests("get_file_context", context_params.clone())
+        .await;
+    assert!(context_first.contains("fenced"), "{context_first}");
+    std::fs::write(&file, "pub fn refenced() -> u64 {\n    333\n}\n").expect("rewrite 2");
+    backdate(1_000_000_003);
+    let context_fresh = server
+        .dispatch_tool_for_tests("get_file_context", context_params)
+        .await;
+    assert!(
+        !context_fresh.contains("Decision: cache_hit"),
+        "a stale publication satisfied get_file_context's repeat cache: {context_fresh}"
+    );
+    assert!(
+        context_fresh.contains("refenced"),
+        "get_file_context must observe the fresh identity: {context_fresh}"
     );
 }

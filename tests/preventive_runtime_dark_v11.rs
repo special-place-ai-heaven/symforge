@@ -422,8 +422,103 @@ const INGRESS_LANES: &[(&str, &str)] = &[
     ("mutation", "src/protocol/edit_tools.rs"),
 ];
 
+/// The activation cut's executed-reachability roster: live files where call
+/// edges into the lifecycle directory are INTENDED, extended deliberately
+/// with each wiring commit. Every row must actually hold at least one edge
+/// (anti-vacuity below), so a stale row fails as loudly as an unplanned
+/// edge. This is the inversion the frozen retirement contract prescribes:
+/// "After activation, the executed Slice 4 reachability cases replace the
+/// preactivation census."
+const WIRED_PRODUCTION_FILES: &[&str] = &[
+    // C5 prep: the stdio bootstrap edges moved from `src/main.rs` into the
+    // hoisted dispatcher `src/cli/entry.rs`; the shim main.rs holds none.
+    "src/cli/entry.rs",
+    // C5 (the exposure flip): the V11 facade re-exports the boundary
+    // wrappers — the one public door into the lifecycle directory.
+    "src/embed.rs",
+    // C5 SEAM-HEALTH anchors: the live health surface names the V11
+    // projection it splits into its two halves.
+    "src/live_index/health_view.rs",
+    "src/daemon.rs",
+    "src/gitignore_hygiene.rs",
+    "src/live_index/persist.rs",
+    "src/live_index/single_file.rs",
+    "src/protocol/edit.rs",
+    "src/protocol/edit_tools.rs",
+    "src/protocol/knowledge_curation.rs",
+    "src/protocol/mod.rs",
+    "src/protocol/tools.rs",
+    "src/server/mod.rs",
+    "src/server/serve.rs",
+    "src/sidecar/handlers.rs",
+    "src/sidecar/mod.rs",
+    "src/sidecar/server.rs",
+    "src/watcher/mod.rs",
+];
+
+/// The frozen publication_roots census (C4): the state structs that retired
+/// their bare `index: SharedIndex` / `project_indexes: ..SharedIndex..`
+/// fields for the D1 `ProjectRuntimeHandle`. Scoped per struct so function
+/// parameters and locals spelled `index: SharedIndex` — which are values in
+/// flight, not stored roots — cannot satisfy or violate the claim.
+const ROOT_HOLDER_STRUCTS: &[(&str, &str)] = &[
+    ("src/daemon.rs", "ProjectInstance"),
+    ("src/daemon.rs", "SessionRuntime"),
+    ("src/protocol/mod.rs", "SymForgeServer"),
+    ("src/server/mod.rs", "ServerRuntime"),
+    ("src/sidecar/mod.rs", "SidecarState"),
+];
+
 #[test]
-fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
+fn root_holders_store_no_bare_shared_index() {
+    let repo = src_root().parent().expect("src has a parent").to_path_buf();
+    let mut hits = Vec::new();
+    for (file, name) in ROOT_HOLDER_STRUCTS {
+        let text =
+            std::fs::read_to_string(repo.join(file)).unwrap_or_else(|_| panic!("read {file}"));
+        let header = format!("struct {name} {{");
+        let mut in_struct = false;
+        let mut found = false;
+        for (number, line) in text.lines().enumerate() {
+            if !in_struct {
+                if line.trim_start().ends_with(&header)
+                    && (line.trim_start().starts_with("struct")
+                        || line.trim_start().starts_with("pub struct"))
+                {
+                    in_struct = true;
+                    found = true;
+                }
+                continue;
+            }
+            // rustfmt closes a top-level struct at column 0.
+            if line == "}" {
+                in_struct = false;
+                continue;
+            }
+            let field = line.trim_start();
+            if field.starts_with("//") {
+                continue;
+            }
+            let stores_bare = field
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ")
+                .starts_with("index: SharedIndex")
+                || field.contains("HashMap<String, SharedIndex>");
+            if stores_bare {
+                hits.push(format!("{file}:{}: {name}::{field}", number + 1));
+            }
+        }
+        assert!(found, "root-holder struct {name} not found in {file}");
+    }
+    assert!(
+        hits.is_empty(),
+        "bare SharedIndex stored in root-holder state (frozen publication_roots census):\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn dark_call_edges_appear_only_in_the_wired_roster() {
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     for (lane, path) in INGRESS_LANES {
         assert!(
@@ -439,19 +534,24 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
         Some(&src_root().join("index_lifecycle")),
         None,
         &[
+            // C5 (the mount flip): the dark directory is declared inside the
+            // private `internals` wrapper and re-imported at the crate root;
+            // `live_index` aliases it so every historical path resolves. Each
+            // half of each pair is a declaration edge, not a call edge —
+            // exactly the old live_index mount's status.
+            ("src/internals.rs", "#[path = \"index_lifecycle/mod.rs\"]"),
+            ("src/internals.rs", "pub mod index_lifecycle;"),
+            ("src/lib.rs", "pub(crate) use internals::index_lifecycle;"),
+            ("src/lib.rs", "pub use internals::index_lifecycle;"),
             (
                 "src/live_index/mod.rs",
-                "#[path = \"../index_lifecycle/mod.rs\"]",
+                "pub(crate) use crate::index_lifecycle;",
             ),
-            ("src/live_index/mod.rs", "pub mod index_lifecycle;"),
+            ("src/live_index/mod.rs", "pub use crate::index_lifecycle;"),
             // Round 6: quote-bearing comment lines lost the prose
             // exemption (a `"` can be a spanning-string tail handing
-            // control back to code), so the two legitimate quoting
-            // comments are decided here instead of silently tolerated.
-            (
-                "src/lib.rs",
-                "// call edge into index_lifecycle. Do NOT \"tidy\" either gate before the cut.",
-            ),
+            // control back to code), so the legitimate quoting comment is
+            // decided here instead of silently tolerated.
             (
                 "src/lifecycle_identity.rs",
                 "//!     darkness as \"`grep -rn index_lifecycle src/` returns no hit outside it\".",
@@ -459,11 +559,35 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
         ],
     );
 
+    // Partition every matched line: a roster file's edges are the wiring the
+    // cut intends; anything else is an unplanned edge and fails exactly as
+    // it did before the cut began.
+    let mut wired_counts: std::collections::BTreeMap<&str, usize> = WIRED_PRODUCTION_FILES
+        .iter()
+        .map(|file| (*file, 0usize))
+        .collect();
+    let mut unplanned = Vec::new();
+    for violation in &result.violations {
+        match WIRED_PRODUCTION_FILES
+            .iter()
+            .find(|file| violation.starts_with(&format!("{file}:")))
+        {
+            Some(file) => *wired_counts.get_mut(*file).expect("roster key") += 1,
+            None => unplanned.push(violation.clone()),
+        }
+    }
     assert!(
-        result.violations.is_empty(),
-        "call edges into the dark directory from production code:\n{}",
-        result.violations.join("\n")
+        unplanned.is_empty(),
+        "call edges into the lifecycle directory OUTSIDE the wired roster:\n{}",
+        unplanned.join("\n")
     );
+    for (file, count) in &wired_counts {
+        assert!(
+            *count > 0,
+            "roster row `{file}` holds no call edge — a stale row claims \
+             wiring that does not exist; remove it deliberately"
+        );
+    }
     // Anti-vacuity: the sweep must have SEEN what the tree is known to hold —
     // both halves of the one permitted mount, the prose mentions that prove
     // comments are tolerated rather than never encountered, and a file count
@@ -475,10 +599,11 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
     let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
         (result.allowlisted_seen.len(), seen.len()),
-        (4, 4),
-        "the live_index mount pair plus two quote-bearing prose comments: \
-         exactly four allowlisted lines, each seen exactly once; a duplicate \
-         mount or a moved/reworded line must update this test deliberately"
+        (7, 7),
+        "the internals mount pair, the two root re-import arms, the two \
+         live_index alias arms, and one quote-bearing prose comment: exactly \
+         seven allowlisted lines, each seen exactly once; a duplicate mount \
+         or a moved/reworded line must update this test deliberately"
     );
     assert!(
         result.prose_lines > 0,
@@ -494,18 +619,30 @@ fn the_dark_directory_has_no_call_edge_from_any_production_lane() {
 }
 
 #[test]
-fn the_flip_ready_module_is_declared_once_and_never_called() {
-    // `server_api::run` staying uncalled is the SIBLING assertion to the
-    // directory sweep above, not a substitute for it. C10 ruling: the dark
-    // directory is swept too — its wrap-table STRING lines are allowlisted
-    // individually below, so a real `use`/call edge from `index_lifecycle`
-    // into the stub cannot hide behind a directory exemption.
+fn the_server_door_is_declared_once_and_called_only_by_the_shim() {
+    // C5 (the keyword flip executed): the module is PUBLIC and WIRED — one
+    // declaration in lib.rs, one caller (the binary shim), and the dark
+    // directory's wrap-table STRING lines. Anything else naming the door is
+    // an unplanned edge, exactly as the pre-flip form of this test held.
     let result = sweep(
         &contains_token("server_api"),
         None,
         Some(&src_root().join("server_api.rs")),
         &[
-            ("src/lib.rs", "pub(crate) mod server_api;"),
+            ("src/lib.rs", "pub mod server_api;"),
+            // The shim: the door's ONE caller.
+            (
+                "src/main.rs",
+                "match symforge::server_api::run(std::env::args_os().collect()) {",
+            ),
+            (
+                "src/main.rs",
+                "Ok(symforge::server_api::ServerExit::Success) => std::process::ExitCode::SUCCESS,",
+            ),
+            (
+                "src/main.rs",
+                "Ok(symforge::server_api::ServerExit::RefusedToStart) => std::process::ExitCode::from(2),",
+            ),
             (
                 "src/index_lifecycle/public_api.rs",
                 "atom: \"symforge::server_api\",",
@@ -525,37 +662,46 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
             ("src/index_lifecycle/public_api.rs", "\"server_api\": {"),
             (
                 "src/index_lifecycle/public_api.rs",
-                "\"form\": \"cfg feature=server gated pub(crate) mod server_api in src/lib.rs, std-only stub\",",
+                "\"form\": \"cfg feature=server gated pub mod server_api in src/lib.rs, wired to the crate dispatcher\",",
             ),
             (
                 "src/index_lifecycle/public_api.rs",
-                "\"activation\": \"one keyword behind the already-present server cfg gate: pub(crate) becomes pub, and the census gains the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them\"",
+                "\"activation\": \"executed at C5: the pub(crate) keyword flipped behind the already-present server cfg gate, and the census carries the four server_api atoms in server graphs only - the embed-v11 projection excludes this module, so no embed cell may ever grow them\"",
             ),
             // Round 6: the quote-narrowed prose exemption surfaces the one
             // quote-bearing doc comment naming the module.
             (
                 "src/index_lifecycle/public_api.rs",
-                "/// * `\"keyword-flip\"` — `server_api`: a real `pub(crate)` module whose",
+                "/// * `\"keyword-flip\"` — `server_api`: the `pub(crate)` module whose",
             ),
         ],
     );
 
     assert!(
         result.violations.is_empty(),
-        "production references to the flip-ready module:\n{}",
+        "production references to the server door outside the shim:\n{}",
         result.violations.join("\n")
     );
-    // The declaration must be FOUND, and found in its pub(crate) form: a
-    // premature keyword flip changes the line, drops it from the allowlist,
-    // and fails this test — activation flips the keyword AND this pin in the
-    // same deliberate change, never as a tidy-up.
+    // The declaration must be FOUND, and found in its PUBLIC form: a
+    // regression back to pub(crate) (or a second declaration) changes the
+    // line, drops it from the allowlist, and fails this test — the census
+    // would lose the four contract atoms.
     assert!(
         result
             .allowlisted_seen
-            .contains(&("src/lib.rs", "pub(crate) mod server_api;")),
-        "lib.rs no longer declares server_api as pub(crate); if this is the \
-         activation cut, update this pin in the same change — if it is not, \
-         the census just widened by four atoms"
+            .contains(&("src/lib.rs", "pub mod server_api;")),
+        "lib.rs no longer declares server_api as pub; the census just lost \
+         the four server_api contract atoms"
+    );
+    // The shim's call edge must be FOUND: a door nobody calls is the
+    // reporting-invariant smell the pre-flip form of this test guarded
+    // from the other side.
+    assert!(
+        result
+            .allowlisted_seen
+            .iter()
+            .any(|(file, line)| *file == "src/main.rs" && line.contains("server_api::run")),
+        "the binary shim no longer dispatches through server_api::run"
     );
     // The wrap-table string lines must ALL have been seen: an edited atom
     // string falls off the allowlist and fails above, and a silently deleted
@@ -563,10 +709,11 @@ fn the_flip_ready_module_is_declared_once_and_never_called() {
     let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
         (result.allowlisted_seen.len(), seen.len()),
-        (9, 9),
-        "one lib.rs declaration, seven wrap-table/delta string lines, and one \
-         quote-bearing doc comment, each seen EXACTLY ONCE; a duplicate or an \
-         edit to any of them updates this allowlist deliberately, got: {:?}",
+        (12, 12),
+        "one lib.rs declaration, three shim lines, seven wrap-table/delta \
+         string lines, and one quote-bearing doc comment, each seen EXACTLY \
+         ONCE; a duplicate or an edit to any of them updates this allowlist \
+         deliberately, got: {:?}",
         result.allowlisted_seen
     );
 }
@@ -738,10 +885,39 @@ fn source_splicing_is_allowlisted() {
             ("src/live_index/coupling/lifecycle.rs", "include!(concat!("),
             ("src/live_index/coupling/walker.rs", "include!(concat!("),
             ("src/live_index/persist.rs", "include!(concat!("),
-            (
-                "src/live_index/mod.rs",
-                "#[path = \"../index_lifecycle/mod.rs\"]",
-            ),
+            // C5 (the exposure flip): the retired raw modules are declared
+            // inside the private `internals` wrapper, whose child files
+            // would otherwise resolve under src/internals/ — every remount
+            // is a same-directory `#[path]`, allowlisted individually so a
+            // new or altered mount stays a deliberate change.
+            ("src/internals.rs", "#[path = \"analytics/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"capability/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"cli/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"daemon.rs\"]"),
+            ("src/internals.rs", "#[path = \"discovery/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"domain/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"edit_safety/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"git.rs\"]"),
+            ("src/internals.rs", "#[path = \"gitignore_hygiene.rs\"]"),
+            ("src/internals.rs", "#[path = \"hash.rs\"]"),
+            ("src/internals.rs", "#[path = \"idempotency.rs\"]"),
+            ("src/internals.rs", "#[path = \"index_lifecycle/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"knowledge/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"live_index/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"observability.rs\"]"),
+            ("src/internals.rs", "#[path = \"parsing/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"path_shadow.rs\"]"),
+            ("src/internals.rs", "#[path = \"paths.rs\"]"),
+            ("src/internals.rs", "#[path = \"process_util.rs\"]"),
+            ("src/internals.rs", "#[path = \"protocol/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"server/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"sidecar/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"stel/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"stel_core/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"version_registry.rs\"]"),
+            ("src/internals.rs", "#[path = \"watcher/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"watcher_state.rs\"]"),
+            ("src/internals.rs", "#[path = \"worktree.rs\"]"),
             (
                 "src/protocol/format.rs",
                 "#[path = \"claim_provenance.rs\"]",
@@ -763,11 +939,11 @@ fn source_splicing_is_allowlisted() {
     let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
         (result.allowlisted_seen.len(), seen.len()),
-        (6, 6),
-        "three test-fixture include!(concat!( sites, two #[path] mounts, and \
-         one quoting comment, each seen EXACTLY ONCE as a (file, line) \
-         allowlist entry; a duplicate or a new splice site is a deliberate \
-         allowlist change, got: {:?}",
+        (33, 33),
+        "three test-fixture include!(concat!( sites, the 28 internals-wrapper \
+         remounts, the claim_provenance mount, and one quoting comment, each \
+         seen EXACTLY ONCE as a (file, line) allowlist entry; a duplicate or \
+         a new splice site is a deliberate allowlist change, got: {:?}",
         result.allowlisted_seen
     );
 }
@@ -780,6 +956,7 @@ fn source_splicing_is_allowlisted() {
 /// alias/macro bridge that preserves the allowlisted mount spelling. Neither is
 /// a Rust name resolver or an adversary-resistant security boundary.
 const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
+    "index_lifecycle/activation.rs",
     "index_lifecycle/adapters.rs",
     "index_lifecycle/authority.rs",
     "index_lifecycle/candidate.rs",
@@ -802,15 +979,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "c3151e5f30de575f0a5b7cf11653d94c6a88fb34de49faa8ee8f85031f387e46",
-    19,
-    288_823,
+    "708b73184ab9b356e0b0dbcd18f0e760aaf31dd0045a185d11fa071214dde1c7",
+    20,
+    388_720,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "e3b00de8b0a9019ac4064ec01f1dd2407a89f5da3a55b500261453d45ca3340b",
-    193,
-    9_074_821,
+    "96b7a77fa130a6edee6803786c06e4a673396018364e28fa9f4ba893203d478a",
+    196,
+    9_300_142,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -941,8 +1118,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "a45c1a8754a91cac:13452"),
-    ("release.yml", "6e996401bbb76142:110465"),
+    ("ci.yml", "38f09be155e1980a:13931"),
+    ("release.yml", "8ee888c1cf1be6a0:110910"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1028,11 +1205,11 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ("run: cargo check", 1),
     ("run: cargo clippy --all-targets -- -D warnings", 1),
     (
-        "run: cargo clippy --no-default-features --features embed --lib -- -D warnings",
+        "run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings",
         1,
     ),
     (
-        "run: cargo clippy --no-default-features --features embed --target x86_64-unknown-linux-musl --lib -- -D warnings",
+        "run: cargo clippy --no-default-features --features embed,__test-internals --target x86_64-unknown-linux-musl --lib -- -D warnings",
         1,
     ),
     ("run: cargo fmt --check", 1),
@@ -1041,7 +1218,20 @@ const CARGO_LINES: &[(&str, usize)] = &[
     // `--`, which is why the doctest lane stays shut; drop one and the
     // line no longer matches this pin, and drop one COPY and its count
     // no longer matches either.
-    ("run: cargo test --all-targets -- --test-threads=1", 2),
+    // C7: the suite selects `--lib --bins --tests` — explicit target
+    // selection SUPPRESSES the doctest lane (doctests build only under
+    // `--doc` or a bare no-selection `cargo test`), and the criterion
+    // bench target rejects libtest's `--test-threads`.
+    (
+        "run: cargo test --lib --bins --tests -- --test-threads=1",
+        2,
+    ),
+    // C7: `cargo bench` never builds doctests; criterion's `--test` mode
+    // runs one pass per campaign as the bench smoke gate.
+    (
+        "run: cargo bench --bench observed_refresh_gate_v1 -- --test",
+        2,
+    ),
     (
         "run: cargo test --no-default-features --features embed --lib -- --test-threads=1",
         2,
@@ -1909,9 +2099,9 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (30, 26, 2),
-        "the CI workflows hold thirty cargo-mentioning lines, twenty-six of \
-         them distinct, across two workflow files; this walk saw {:?}. A gate \
+        (32, 27, 2),
+        "the CI workflows hold thirty-two cargo-mentioning lines, twenty-seven \
+         of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \
          pin",

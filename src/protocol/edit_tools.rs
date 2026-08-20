@@ -1,3 +1,11 @@
+// V11 write classification (Feature 020 Slice 4, T064): every censused
+// writer tool in this file (`replace_symbol_body`, `insert_symbol`,
+// `delete_symbol`, `edit_within_symbol`, `batch_edit`, `batch_rename`,
+// `batch_insert`) performs no disk I/O of its own — all repository-source
+// bytes land through `edit.rs::atomic_write_file`, the permit-gated
+// chokepoint, so the SourceMutationPermit is acquired there exactly once
+// per write cycle.
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -409,38 +417,47 @@ pub(crate) fn prepare_exact_path_for_edit(
     server: &SymForgeServer,
     relative_path: &str,
 ) -> Result<(PathBuf, edit_format::EditSourceAuthority), String> {
-    let expected_gen = server.index.current_project_generation();
+    let expected_gen = server.index.data_plane().current_project_generation();
     let repo_root = server
         .capture_repo_root()
         .ok_or_else(|| "Error: no repository root configured.".to_string())?;
     let abs_path =
         safe_repo_path_for_freshen(&repo_root, relative_path).map_err(|e| format!("Error: {e}"))?;
-    let source_authority =
-        match watcher::freshen_file_if_stale(relative_path, &abs_path, &server.index, expected_gen)
-        {
-            watcher::FreshenResult::Fresh => edit_format::EditSourceAuthority::CurrentIndex,
-            watcher::FreshenResult::StaleReindexed => {
-                edit_format::EditSourceAuthority::DiskRefreshed
-            }
-            watcher::FreshenResult::StaleRemoved => {
-                return Err(format!("{}", EditError::PathNotFound { path: abs_path }));
-            }
-            watcher::FreshenResult::GenerationMismatch => {
-                return Err(format!(
-                    "{}",
-                    EditError::SessionStale {
-                        path: abs_path,
-                        recovery: session_stale_recovery(),
-                    }
-                ));
-            }
-            watcher::FreshenResult::PublicationRejected => {
-                return Err(format!(
-                    "Error: index refresh for '{}' did not publish; retry the edit.",
-                    relative_path
-                ));
-            }
-        };
+    // V11 observation lane (C4c): a request-path freshen re-admission
+    // observes under the incarnation current at call time — the edit path
+    // holds no id across time, so it cannot be a late callback.
+    let lane_authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
+    let lane_observer = lane_authority.active_observer();
+    let source_authority = match watcher::freshen_file_if_stale(
+        relative_path,
+        &abs_path,
+        server.index.data_plane(),
+        expected_gen,
+        &lane_authority,
+        lane_observer,
+    ) {
+        watcher::FreshenResult::Fresh => edit_format::EditSourceAuthority::CurrentIndex,
+        watcher::FreshenResult::StaleReindexed => edit_format::EditSourceAuthority::DiskRefreshed,
+        watcher::FreshenResult::StaleRemoved => {
+            return Err(format!("{}", EditError::PathNotFound { path: abs_path }));
+        }
+        watcher::FreshenResult::GenerationMismatch => {
+            return Err(format!(
+                "{}",
+                EditError::SessionStale {
+                    path: abs_path,
+                    recovery: session_stale_recovery(),
+                }
+            ));
+        }
+        watcher::FreshenResult::PublicationRejected => {
+            return Err(format!(
+                "Error: index refresh for '{}' did not publish; retry the edit.",
+                relative_path
+            ));
+        }
+    };
     Ok((abs_path, source_authority))
 }
 
@@ -448,7 +465,7 @@ pub(super) fn prepare_batch_paths_for_edit(
     server: &SymForgeServer,
     relative_paths: &[String],
 ) -> Result<(PathBuf, edit_format::EditSourceAuthority), String> {
-    let expected_gen = server.index.current_project_generation();
+    let expected_gen = server.index.data_plane().current_project_generation();
     let repo_root = server
         .capture_repo_root()
         .ok_or_else(|| "Error: no repository root configured.".to_string())?;
@@ -456,12 +473,23 @@ pub(super) fn prepare_batch_paths_for_edit(
     unique_paths.sort();
     unique_paths.dedup();
 
+    // V11 observation lane (C4c): request-path freshens observe under the
+    // incarnation current at call time (the C3b synchronous-facade ruling).
+    let lane_authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
+    let lane_observer = lane_authority.active_observer();
     let mut refreshed = false;
     for relative_path in unique_paths {
         let abs_path = safe_repo_path_for_freshen(&repo_root, &relative_path)
             .map_err(|e| format!("Error: {e}"))?;
-        match watcher::freshen_file_if_stale(&relative_path, &abs_path, &server.index, expected_gen)
-        {
+        match watcher::freshen_file_if_stale(
+            &relative_path,
+            &abs_path,
+            server.index.data_plane(),
+            expected_gen,
+            &lane_authority,
+            lane_observer,
+        ) {
             watcher::FreshenResult::Fresh => {}
             watcher::FreshenResult::StaleReindexed => {
                 refreshed = true;
@@ -502,7 +530,7 @@ fn prepare_project_wide_rename(
     server: &SymForgeServer,
     repo_root: &std::path::Path,
 ) -> edit_format::EditSourceAuthority {
-    if watcher::reconcile_stale_files(repo_root, &server.index) > 0 {
+    if watcher::reconcile_stale_files(repo_root, server.index.data_plane()) > 0 {
         edit_format::EditSourceAuthority::DiskRefreshed
     } else {
         edit_format::EditSourceAuthority::CurrentIndex
@@ -532,7 +560,12 @@ fn begin_mutation_replay<T: Serialize>(
     let project_state = server.capture_project_state_dir().ok_or_else(|| {
         "Error: durable project-state replay is unavailable for this binding.".to_string()
     })?;
-    match crate::idempotency::begin_tool_replay(&project_state, tool_name, raw_key, &request) {
+    match crate::idempotency::begin_tool_replay_verified(
+        &project_state,
+        tool_name,
+        raw_key,
+        &request,
+    ) {
         Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Ok(Some(active)),
         Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
         Err(error) => Err(crate::idempotency::format_tool_error(&error)),
@@ -578,7 +611,7 @@ fn probe_mutation_replay<T: Serialize>(
     let project_state = server.capture_project_state_dir().ok_or_else(|| {
         "Error: durable project-state replay is unavailable for this binding.".to_string()
     })?;
-    crate::idempotency::probe_tool_replay(&project_state, tool_name, raw_key, &request)
+    crate::idempotency::probe_tool_replay_verified(&project_state, tool_name, raw_key, &request)
         .map_err(|error| crate::idempotency::format_tool_error(&error))
 }
 
@@ -634,12 +667,35 @@ pub(crate) fn probe_symforge_edit_apply_replay(
     }
 }
 
+/// Complete a replay record from a receipt captured off written PATHS (the
+/// batch executors, which know only paths in `edit_tools.rs`). Edit tools
+/// never delete files, so a receipt with any absent or unreadable target
+/// means the read-back failed and the record must never replay (no receipt).
 fn complete_mutation_replay(
     idempotency: &Option<crate::idempotency::ActiveReplay>,
     output: &mut String,
+    written: &[std::path::PathBuf],
+) {
+    let post_image = crate::idempotency::capture_post_image(written).filter(|receipt| {
+        !receipt.targets.is_empty()
+            && receipt
+                .targets
+                .iter()
+                .all(|target| target.content_digest.is_some())
+    });
+    complete_mutation_replay_with_receipt(idempotency, output, post_image);
+}
+
+/// Complete a replay record from a receipt already built off bytes the
+/// caller wrote itself (T038 round-1: the single-target edit tools — no
+/// re-read, no post-permit window).
+fn complete_mutation_replay_with_receipt(
+    idempotency: &Option<crate::idempotency::ActiveReplay>,
+    output: &mut String,
+    post_image: Option<crate::idempotency::PostImageReceipt>,
 ) {
     if let Some(idempotency) = idempotency
-        && let Err(error) = idempotency.complete(output.clone())
+        && let Err(error) = idempotency.complete_with_post_image(output.clone(), post_image)
     {
         output.push_str(&format!(
             "\nIdempotency warning: failed to store replay result: {error}"
@@ -718,14 +774,14 @@ impl SymForgeServer {
     /// the footer text. Computes the distinct dependent file count and (when git
     /// temporal data is `Ready`) the top co-change partners via
     /// `format::edit_impact_summary`. The dependents come from the read snapshot
-    /// (`self.index.read()` → `&LiveIndex`) and the co-changes from the lock-free
-    /// temporal snapshot on the shared handle (`self.index.git_temporal()`). If the
+    /// (`self.index.data_plane().read()` → `&LiveIndex`) and the co-changes from the lock-free
+    /// temporal snapshot on the shared handle (`self.index.data_plane().git_temporal()`). If the
     /// index is not `Ready` (loading/empty), nothing is appended — the footer is
     /// best-effort and never blocks a successful edit response.
     fn append_impact_footer(&self, output: &mut String, path: &str) {
         // T046: one capture — the dependency counts and the co-change rows in
         // one footer describe the same publication.
-        let generation = self.index.published_generation();
+        let generation = self.index.data_plane().published_generation();
         let guard = &generation.live;
         if !matches!(guard.index_state(), IndexState::Ready) {
             return;
@@ -780,7 +836,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -827,7 +883,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -990,7 +1046,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -999,7 +1055,7 @@ impl SymForgeServer {
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let warnings = edit::detect_stale_references(
-            &self.index,
+            self.index.data_plane(),
             &params.0.path,
             &params.0.name,
             &old_sig,
@@ -1035,7 +1091,14 @@ impl SymForgeServer {
         ));
         append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut result, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut result);
+        complete_mutation_replay_with_receipt(
+            &idempotency,
+            &mut result,
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
+        );
         result
     }
 
@@ -1067,7 +1130,7 @@ impl SymForgeServer {
             return format!("Error: position must be 'before' or 'after', got '{position}'");
         }
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -1114,7 +1177,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -1206,7 +1269,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -1236,7 +1299,14 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut out);
+        complete_mutation_replay_with_receipt(
+            &idempotency,
+            &mut out,
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
+        );
         out
     }
 
@@ -1263,7 +1333,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -1310,7 +1380,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -1397,7 +1467,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -1427,7 +1497,14 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut out);
+        complete_mutation_replay_with_receipt(
+            &idempotency,
+            &mut out,
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
+        );
         out
     }
 
@@ -1456,7 +1533,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
                 return format::not_found_file(&params.0.path);
@@ -1503,7 +1580,7 @@ impl SymForgeServer {
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
         };
@@ -1772,7 +1849,7 @@ impl SymForgeServer {
         // spliced from.
         if !resolved_target.rerouted {
             edit::reindex_after_write(
-                &self.index,
+                self.index.data_plane(),
                 &resolved_path,
                 &params.0.path,
                 &new_content,
@@ -1812,7 +1889,14 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(&idempotency, &mut out);
+        complete_mutation_replay_with_receipt(
+            &idempotency,
+            &mut out,
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
+        );
         out
     }
 
@@ -1872,7 +1956,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
         let batch_paths: Vec<String> = params.0.edits.iter().map(|e| e.path.clone()).collect();
@@ -1897,7 +1981,7 @@ impl SymForgeServer {
             Err(output) => return output,
         };
         match edit::execute_batch_edit(
-            &self.index,
+            self.index.data_plane(),
             &repo_root,
             project_state.as_ref(),
             &params.0.edits,
@@ -1908,7 +1992,7 @@ impl SymForgeServer {
                 .as_deref()
                 .map(std::path::Path::new),
         ) {
-            Ok(summaries) => {
+            Ok((summaries, written_paths)) => {
                 let file_count = params
                     .0
                     .edits
@@ -1944,7 +2028,7 @@ impl SymForgeServer {
                 if let Some(primary) = params.0.edits.first() {
                     self.append_impact_footer(&mut result, &primary.path);
                 }
-                complete_mutation_replay(&idempotency, &mut result);
+                complete_mutation_replay(&idempotency, &mut result, &written_paths);
                 result
             }
             Err(e) => {
@@ -1986,7 +2070,7 @@ impl SymForgeServer {
             Err(message) => return message,
         };
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
         let source_authority = prepare_project_wide_rename(self, &repo_root);
@@ -2001,9 +2085,13 @@ impl SymForgeServer {
             Ok(idempotency) => idempotency,
             Err(output) => return output,
         };
-        match edit::execute_batch_rename(&self.index, &repo_root, project_state.as_ref(), &params.0)
-        {
-            Ok(summary) => {
+        match edit::execute_batch_rename(
+            self.index.data_plane(),
+            &repo_root,
+            project_state.as_ref(),
+            &params.0,
+        ) {
+            Ok((summary, written_paths)) => {
                 let write_semantics = if dry_run {
                     edit_format::EditWriteSemantics::DryRunNoWrites
                 } else {
@@ -2029,7 +2117,7 @@ impl SymForgeServer {
                     project_config_trust_suffix.as_deref(),
                 );
                 self.append_impact_footer(&mut result, &params.0.path);
-                complete_mutation_replay(&idempotency, &mut result);
+                complete_mutation_replay(&idempotency, &mut result, &written_paths);
                 result
             }
             Err(e) => {
@@ -2086,7 +2174,7 @@ impl SymForgeServer {
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
         let batch_paths: Vec<String> = params.0.targets.iter().map(|t| t.path.clone()).collect();
@@ -2110,9 +2198,13 @@ impl SymForgeServer {
             Ok(idempotency) => idempotency,
             Err(output) => return output,
         };
-        match edit::execute_batch_insert(&self.index, &repo_root, project_state.as_ref(), &params.0)
-        {
-            Ok(summaries) => {
+        match edit::execute_batch_insert(
+            self.index.data_plane(),
+            &repo_root,
+            project_state.as_ref(),
+            &params.0,
+        ) {
+            Ok((summaries, written_paths)) => {
                 let file_count = params
                     .0
                     .targets
@@ -2148,7 +2240,7 @@ impl SymForgeServer {
                 if let Some(primary) = params.0.targets.first() {
                     self.append_impact_footer(&mut result, &primary.path);
                 }
-                complete_mutation_replay(&idempotency, &mut result);
+                complete_mutation_replay(&idempotency, &mut result, &written_paths);
                 result
             }
             Err(e) => {

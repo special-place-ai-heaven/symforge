@@ -176,9 +176,15 @@ pub(crate) fn freshen_file_if_stale(
     abs_path: &Path,
     shared: &SharedIndex,
     expected_gen: u64,
+    authority: &crate::live_index::index_lifecycle::activation::ProjectSourceAuthority,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
 ) -> FreshenResult {
     if shared.current_project_generation() != expected_gen {
-        let _ = shared.remove_file_at_generation(relative_path, expected_gen);
+        if shared.remove_file_at_generation(relative_path, expected_gen)
+            && authority.observe_removal(observer, relative_path).is_err()
+        {
+            debug!("freshen: stale incarnation's removal observation refused");
+        }
         return FreshenResult::GenerationMismatch;
     }
 
@@ -211,8 +217,28 @@ pub(crate) fn freshen_file_if_stale(
 
     debug!("freshness guard: stale file detected, re-indexing {relative_path}");
     let result = maybe_reindex(relative_path, abs_path, shared, language, expected_gen);
+    // V11 observation lane (C4c): observe on the mutation EVIDENCE (the
+    // reindex outcome), before the generation re-check — a commit that landed
+    // just ahead of a reload must still be observed; a spurious observation
+    // only dirties the next cut, a missed one loses the change.
+    if matches!(result, ReindexResult::Reindexed)
+        && authority
+            .observe_admission(observer, relative_path)
+            .is_err()
+    {
+        debug!("freshen: stale incarnation's admission observation refused");
+    }
+    if matches!(result, ReindexResult::Removed)
+        && authority.observe_removal(observer, relative_path).is_err()
+    {
+        debug!("freshen: stale incarnation's removal observation refused");
+    }
     if shared.current_project_generation() != expected_gen {
-        let _ = shared.remove_file_at_generation(relative_path, expected_gen);
+        if shared.remove_file_at_generation(relative_path, expected_gen)
+            && authority.observe_removal(observer, relative_path).is_err()
+        {
+            debug!("freshen: stale incarnation's removal observation refused");
+        }
         return FreshenResult::GenerationMismatch;
     }
 
@@ -296,12 +322,14 @@ pub(crate) fn reconcile_stale_files_with_stop(
     shared: &SharedIndex,
     should_stop: impl Fn() -> bool,
     expected_gen: u64,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
 ) -> usize {
     reconcile_stale_files_with_stop_and_hook(
         repo_root,
         shared,
         should_stop,
         expected_gen,
+        observer,
         || {
             crate::discovery::scout_repository_with_exclusions(
                 repo_root,
@@ -313,17 +341,27 @@ pub(crate) fn reconcile_stale_files_with_stop(
     .repaired
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_stale_files_with_stop_and_hook<S>(
     repo_root: &Path,
     shared: &SharedIndex,
     should_stop: impl Fn() -> bool,
     expected_gen: u64,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
     scout: S,
     after_scout: impl FnOnce(),
 ) -> ReconciliationAttempt
 where
     S: FnOnce() -> anyhow::Result<crate::discovery::ScoutPlan>,
 {
+    // V11 observation lane (C4c): the sweep's per-file re-admissions and
+    // removals observe under the CARRIED incarnation — the same per-root
+    // authority every lane converges on. A stale incarnation's sweep still
+    // repairs the data plane (V10 residual until the flip) but its
+    // observations are refused, the late-callback unreachability the frozen
+    // contract demands.
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
     // Re-sync the fence to the CURRENT generation when the live index still
     // serves our repo_root, so a same-root reload that advanced the generation
     // after watcher spawn (cold start) no longer permanently rejects. A
@@ -404,14 +442,20 @@ where
             if should_stop() {
                 return stale_count.into();
             }
-            match read_and_index(&relative_path, &absolute_path, shared, language, fence_gen) {
-                ReindexResult::Reindexed | ReindexResult::HashSkip | ReindexResult::Skipped => {
-                    repairs_applied += 1
-                }
-                ReindexResult::NotFound
-                | ReindexResult::Removed
-                | ReindexResult::ReadError(_)
-                | ReindexResult::PublicationRejected => {}
+            let outcome =
+                read_and_index(&relative_path, &absolute_path, shared, language, fence_gen);
+            if matches!(outcome, ReindexResult::Reindexed)
+                && authority
+                    .observe_admission(observer, &relative_path)
+                    .is_err()
+            {
+                debug!("reconciliation: stale incarnation's admission observation refused");
+            }
+            if matches!(
+                outcome,
+                ReindexResult::Reindexed | ReindexResult::HashSkip | ReindexResult::Skipped
+            ) {
+                repairs_applied += 1;
             }
         }
         for (relative_path, expected_entry) in removed_paths {
@@ -424,6 +468,9 @@ where
                 fence_gen,
             ) {
                 repairs_applied += 1;
+                if authority.observe_removal(observer, &relative_path).is_err() {
+                    debug!("reconciliation: stale incarnation's removal observation refused");
+                }
             }
         }
 
@@ -445,7 +492,14 @@ where
                 break;
             }
             let abs_path = repo_root.join(relative_path);
-            match freshen_file_if_stale(relative_path, &abs_path, shared, fence_gen) {
+            match freshen_file_if_stale(
+                relative_path,
+                &abs_path,
+                shared,
+                fence_gen,
+                &authority,
+                observer,
+            ) {
                 FreshenResult::StaleReindexed | FreshenResult::StaleRemoved => stale_count += 1,
                 FreshenResult::Fresh
                 | FreshenResult::GenerationMismatch
@@ -495,7 +549,13 @@ where
 
 pub(crate) fn reconcile_stale_files(repo_root: &Path, shared: &SharedIndex) -> usize {
     let expected_gen = shared.current_project_generation();
-    reconcile_stale_files_with_stop(repo_root, shared, || false, expected_gen)
+    // Synchronous request-path sweep: attributed to the incarnation current
+    // at call time — the caller holds no id across time, so it cannot be a
+    // late callback (the C3b synchronous-facade ruling).
+    let observer =
+        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root)
+            .active_observer();
+    reconcile_stale_files_with_stop(repo_root, shared, || false, expected_gen, observer)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,6 +580,7 @@ enum ReconciliationCause {
     Overflow,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_for_cause(
     repo_root: &Path,
     shared: &SharedIndex,
@@ -527,6 +588,7 @@ fn reconcile_for_cause(
     stop_token: &AtomicBool,
     expected_gen: u64,
     cause: ReconciliationCause,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
 ) -> usize {
     reconcile_for_cause_with(
         repo_root,
@@ -541,6 +603,7 @@ fn reconcile_for_cause(
                 shared,
                 || stop_token.load(Ordering::Acquire),
                 expected_gen,
+                observer,
                 || {
                     crate::discovery::scout_repository_with_exclusions(
                         repo_root,
@@ -691,6 +754,10 @@ pub(crate) fn start_watcher(
     })
 }
 
+// The observer incarnation pushed this over clippy's argument bound; C4's
+// typed-authority rework of this seam owns the restructuring, so a bundle
+// struct now would be churned twice.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_events(
     events: Vec<DebouncedEvent>,
     repo_root: &Path,
@@ -699,7 +766,15 @@ pub(crate) fn process_events(
     watcher_info: &Arc<Mutex<WatcherInfo>>,
     should_stop: &dyn Fn() -> bool,
     expected_gen: u64,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
 ) {
+    // V11 observation lane (Feature 020 Slice 4, T029): every batch reports
+    // under the incarnation the surrounding watcher instance registered. A
+    // stale incarnation's observations are REFUSED by the lane (late V10
+    // callbacks unreachable); the data-plane admissions below keep their own
+    // V10 generation fence until C4 gates them too (recorded residual).
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
     let content_generation_before = shared.published_generation().content_generation;
 
     struct PendingPath {
@@ -790,11 +865,22 @@ pub(crate) fn process_events(
         if definitely_missing {
             let fence = shared.publication_fence();
             if fence.project_generation == expected_gen {
-                let _ = shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                // T038 round-1 repair: observe ONLY an applied removal. A
+                // `NothingHeld` no-op or a recreated-path rejection removed
+                // nothing, and recording a removal observation for it is the
+                // same reporting-invariant defect the D14 fence closed.
+                let removal = shared.remove_file_if_absent_at_publication_fence_with_receipt(
                     &pending.relative_path,
                     &pending.absolute_path,
                     fence,
                 );
+                if matches!(removal, crate::live_index::store::FencedRemoval::Removed(_))
+                    && authority
+                        .observe_removal(observer, &pending.relative_path)
+                        .is_err()
+                {
+                    debug!("watcher: stale incarnation's removal observation refused");
+                }
             }
         } else {
             if pending.saw_write_hint {
@@ -808,26 +894,40 @@ pub(crate) fn process_events(
             // Language inference is a target hint, never a scope filter. Unknown
             // extensions still reach metadata-first admission/cataloging.
             let language = supported_language(&pending.absolute_path);
-            if matches!(
-                read_and_index(
-                    &pending.relative_path,
-                    &pending.absolute_path,
-                    shared,
-                    language,
-                    expected_gen,
-                ),
-                ReindexResult::NotFound
-            ) {
+            let outcome = read_and_index(
+                &pending.relative_path,
+                &pending.absolute_path,
+                shared,
+                language,
+                expected_gen,
+            );
+            if matches!(outcome, ReindexResult::Reindexed)
+                && authority
+                    .observe_admission(observer, &pending.relative_path)
+                    .is_err()
+            {
+                debug!("watcher: stale incarnation's admission observation refused");
+            }
+            if matches!(outcome, ReindexResult::NotFound) {
                 // The path disappeared after the batch observation. Converge to
                 // current disk truth without serially sleeping in the event lane;
                 // any later create hint or periodic reconciliation can re-admit it.
                 let fence = shared.publication_fence();
                 if fence.project_generation == expected_gen {
-                    let _ = shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                    // T038 round-1 repair: same rule as the definitely-missing
+                    // lane above — only an applied removal is observed.
+                    let removal = shared.remove_file_if_absent_at_publication_fence_with_receipt(
                         &pending.relative_path,
                         &pending.absolute_path,
                         fence,
                     );
+                    if matches!(removal, crate::live_index::store::FencedRemoval::Removed(_))
+                        && authority
+                            .observe_removal(observer, &pending.relative_path)
+                            .is_err()
+                    {
+                        debug!("watcher: stale incarnation's removal observation refused");
+                    }
                 }
             }
         }
@@ -944,6 +1044,18 @@ pub async fn run_watcher_with_stop(
             Ok(handle) => {
                 consecutive_failures = 0;
 
+                // V11 observation lane (T029): each watcher instance is one
+                // observer incarnation. Registration is a drain-before-
+                // successor handoff whose post-barrier full-baseline
+                // obligation mirrors the fresh-instance reconciliation just
+                // below; a predecessor instance's late observations are
+                // refused by the lane from here on.
+                let observer =
+                    crate::live_index::index_lifecycle::activation::project_source_authority(
+                        &repo_root,
+                    )
+                    .register_observer();
+
                 // Registration starts a fresh watcher instance. Events lost
                 // before this point cannot be recovered from the new channel,
                 // so repair that uncertainty with an immediate full manifest
@@ -961,6 +1073,7 @@ pub async fn run_watcher_with_stop(
                         &stop_for_fresh,
                         expected_gen_for_fresh,
                         ReconciliationCause::FreshInstance,
+                        observer,
                     );
                 })
                 .await
@@ -1018,6 +1131,7 @@ pub async fn run_watcher_with_stop(
                                 &stop_for_reconcile,
                                 expected_gen_for_reconcile,
                                 ReconciliationCause::Periodic,
+                                observer,
                             );
                         });
                         // Coupling store refresh runs on its own task so a
@@ -1079,6 +1193,7 @@ pub async fn run_watcher_with_stop(
                                     &watcher_info_clone,
                                     &|| stop_for_events.load(Ordering::Acquire),
                                     expected_gen_for_events,
+                                    observer,
                                 );
                                 trackers
                             })
@@ -1093,6 +1208,19 @@ pub async fn run_watcher_with_stop(
                         }
                         Ok(Err(errors)) => {
                             let observed_errors = handle_notify_errors(&errors, || {
+                                // V11 observation lane (T029): an overflow is
+                                // a lost observation stream — latch the gap so
+                                // the next cut is a full baseline, mirroring
+                                // the data plane's overflow reconciliation.
+                                if crate::live_index::index_lifecycle::activation::
+                                    project_source_authority(&repo_root)
+                                .report_gap(observer)
+                                .is_err()
+                                {
+                                    debug!(
+                                        "watcher: stale incarnation's gap report refused"
+                                    );
+                                }
                                 let shared_clone = shared.clone();
                                 let root_clone = repo_root.clone();
                                 let watcher_info_clone = watcher_info.clone();
@@ -1106,6 +1234,7 @@ pub async fn run_watcher_with_stop(
                                         &stop_for_reconcile,
                                         expected_gen_for_reconcile,
                                         ReconciliationCause::Overflow,
+                                        observer,
                                     );
                                 });
                             });
@@ -2018,6 +2147,7 @@ mod tests {
                 &stop_token,
                 expected_gen,
                 ReconciliationCause::Overflow,
+                sweep_observer(project.path()),
             );
         });
 
@@ -2102,6 +2232,7 @@ mod tests {
                 &stop_token,
                 stale_generation,
                 ReconciliationCause::Periodic,
+                sweep_observer(project_a.path()),
             ),
             0
         );
@@ -2190,6 +2321,7 @@ mod tests {
                 &thread_shared,
                 || false,
                 expected_gen,
+                sweep_observer(&thread_root),
                 || {
                     crate::discovery::scout_repository_with_exclusions(
                         &thread_root,
@@ -2377,6 +2509,7 @@ mod tests {
             &shared,
             || false,
             expected_gen,
+            sweep_observer(project.path()),
             || Ok(degraded_plan),
             || {},
         );
@@ -2425,6 +2558,7 @@ mod tests {
                     &shared,
                     || false,
                     expected_gen,
+                    sweep_observer(project.path()),
                     || anyhow::bail!("transient rescout failure"),
                     || {},
                 )
@@ -2511,6 +2645,7 @@ mod tests {
                 &stop_token,
                 expected_gen,
                 ReconciliationCause::Periodic,
+                sweep_observer(project.path()),
             ),
             1,
             "equal-entry transient state must be re-observed"
@@ -2579,6 +2714,7 @@ mod tests {
                 &stop_token,
                 expected_gen,
                 ReconciliationCause::Periodic,
+                sweep_observer(project.path()),
             ),
             1
         );
@@ -2704,6 +2840,7 @@ mod tests {
                 &stop_token,
                 expected_gen,
                 ReconciliationCause::Periodic,
+                sweep_observer(project.path()),
             ),
             1,
             "an unchanged breaker-aborted path must be re-observed"
@@ -3142,6 +3279,182 @@ mod tests {
         assert!(!index.is_path_gitignored("/abs/path.rs"));
     }
 
+    /// Test-only: the incarnation current for `root` at call time — the
+    /// sweep-argument twin of persist.rs's `verify_observer`.
+    fn sweep_observer(root: &Path) -> crate::live_index::index_lifecycle::observer::ObserverId {
+        crate::live_index::index_lifecycle::activation::project_source_authority(root)
+            .active_observer()
+    }
+
+    /// Feature 020 Slice 4, T029 (observation lane): an event batch's
+    /// admissions flow through the observation lane under the registered
+    /// watcher incarnation, and a stale incarnation's batch observes
+    /// nothing — the late-callback unreachability the frozen contract
+    /// demands.
+    #[test]
+    fn process_events_feeds_the_observation_lane_under_the_registered_incarnation() {
+        use crate::live_index::store::LiveIndex;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seed() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let observer = authority.register_observer();
+        let expected_gen = shared.current_project_generation();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let mut trackers = HashMap::new();
+
+        std::fs::write(dir.path().join("extra.rs"), "pub fn second() {}\n").expect("new file");
+        let event = DebouncedEvent {
+            event: notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(dir.path().join("extra.rs")),
+            time: Instant::now(),
+        };
+        process_events(
+            vec![event],
+            dir.path(),
+            &shared,
+            &mut trackers,
+            &watcher_info,
+            &|| false,
+            expected_gen,
+            observer,
+        );
+        assert_eq!(
+            authority.committed_observations("extra.rs"),
+            1,
+            "an admitted batch entry reaches the candidate commit point"
+        );
+
+        // A successor registration makes the old incarnation's batches inert.
+        let successor = authority.register_observer();
+        assert_ne!(observer, successor);
+        std::fs::write(dir.path().join("late.rs"), "pub fn late() {}\n").expect("late file");
+        let late = DebouncedEvent {
+            event: notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(dir.path().join("late.rs")),
+            time: Instant::now(),
+        };
+        process_events(
+            vec![late],
+            dir.path(),
+            &shared,
+            &mut trackers,
+            &watcher_info,
+            &|| false,
+            expected_gen,
+            observer,
+        );
+        assert_eq!(
+            authority.committed_observations("late.rs"),
+            0,
+            "a stale incarnation's observations are unreachable"
+        );
+    }
+
+    /// Feature 020 Slice 4, T030 (C4c): the reconciliation sweep's per-file
+    /// re-admissions flow through the observation lane under the CARRIED
+    /// incarnation, and a stale incarnation's sweep still repairs the data
+    /// plane (V10 residual until the flip) while observing nothing.
+    #[test]
+    fn reconciliation_sweep_feeds_the_observation_lane_under_the_carried_incarnation() {
+        use crate::live_index::store::LiveIndex;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seed() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let observer = authority.register_observer();
+        let expected_gen = shared.current_project_generation();
+
+        std::fs::write(dir.path().join("swept.rs"), "pub fn swept() {}\n").expect("new file");
+        assert_eq!(
+            reconcile_stale_files_with_stop(dir.path(), &shared, || false, expected_gen, observer),
+            1,
+            "the sweep re-admits the new file into the data plane"
+        );
+        assert_eq!(
+            authority.committed_observations("swept.rs"),
+            1,
+            "a sweep re-admission reaches the candidate commit point"
+        );
+
+        // A successor registration makes the carried incarnation stale: its
+        // sweep still repairs the data plane but observes nothing.
+        let successor = authority.register_observer();
+        assert_ne!(observer, successor);
+        std::fs::write(dir.path().join("late.rs"), "pub fn late() {}\n").expect("late file");
+        assert_eq!(
+            reconcile_stale_files_with_stop(dir.path(), &shared, || false, expected_gen, observer),
+            1,
+            "the data plane still reconciles under a stale incarnation (V10 residual)"
+        );
+        assert_eq!(
+            authority.committed_observations("late.rs"),
+            0,
+            "a stale incarnation's sweep observations are unreachable"
+        );
+    }
+
+    /// Feature 020 Slice 4, T030 (C4c): a freshen-on-read re-admission flows
+    /// through the observation lane under the caller's incarnation; a stale
+    /// incarnation's freshen still repairs the data plane while observing
+    /// nothing.
+    #[test]
+    fn freshen_on_read_feeds_the_observation_lane() {
+        use crate::live_index::store::LiveIndex;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        let rel = "lib.rs";
+        let abs = dir.path().join(rel);
+        std::fs::write(&abs, "pub fn seed() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let observer = authority.register_observer();
+        let expected_gen = shared.current_project_generation();
+
+        // Backdate by a distinct offset per rewrite so each on-disk mtime
+        // differs from the indexed one (same-second writes share mtimes).
+        let backdate = |secs: u64| {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(&abs)
+                .expect("open");
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+            f.set_times(std::fs::FileTimes::new().set_modified(old))
+                .expect("set mtime");
+        };
+
+        std::fs::write(&abs, "pub fn seed_changed() {}\n").expect("stale content");
+        backdate(120);
+        assert!(matches!(
+            freshen_file_if_stale(rel, &abs, &shared, expected_gen, &authority, observer),
+            FreshenResult::StaleReindexed
+        ));
+        assert_eq!(
+            authority.committed_observations(rel),
+            1,
+            "a freshen re-admission reaches the candidate commit point"
+        );
+
+        let successor = authority.register_observer();
+        assert_ne!(observer, successor);
+        std::fs::write(&abs, "pub fn seed_changed_again() {}\n").expect("stale again");
+        backdate(240);
+        assert!(matches!(
+            freshen_file_if_stale(rel, &abs, &shared, expected_gen, &authority, observer),
+            FreshenResult::StaleReindexed
+        ));
+        assert_eq!(
+            authority.committed_observations(rel),
+            1,
+            "a stale incarnation's freshen observations are unreachable"
+        );
+    }
+
     /// Confirms that maybe_reindex returns HashSkip when content has not changed.
     #[test]
     fn test_maybe_reindex_hash_skip_on_unchanged_content() {
@@ -3316,8 +3629,13 @@ mod tests {
         let rejected_before = shared.current_rejected_stale_mutations();
         shared.reload(project_b.path()).unwrap();
 
-        let repairs =
-            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
+        let repairs = reconcile_stale_files_with_stop(
+            project_a.path(),
+            &shared,
+            || false,
+            stale_gen,
+            sweep_observer(project_a.path()),
+        );
 
         assert_eq!(
             repairs, 0,
@@ -3372,7 +3690,9 @@ mod tests {
     /// now asserts that it PASSES, so both directions are guarded: re-adding the
     /// attribute and deleting the test are each a roster change, not a silent
     /// loss. Run it with
-    /// `cargo test --lib watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture`.
+    /// `cargo test --lib internals::watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture`
+    /// (the V11 cut mounts the server modules under `src/internals.rs`, so the
+    /// lib test path carries the `internals::` prefix).
     #[test]
     fn generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b() {
         let project_a = TempDir::new().unwrap();
@@ -3414,8 +3734,13 @@ mod tests {
 
         // Replay the watcher's own reconcile with the generation it captured.
         let rejected_before = shared.current_rejected_stale_mutations();
-        let repairs =
-            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, fence_gen);
+        let repairs = reconcile_stale_files_with_stop(
+            project_a.path(),
+            &shared,
+            || false,
+            fence_gen,
+            sweep_observer(project_a.path()),
+        );
 
         let context = format!(
             "observed fence {fence_gen}, spawn generation {spawn_gen}, root \
@@ -3490,7 +3815,13 @@ mod tests {
 
         // Reconcile pinned to the STALE spawn generation, exactly as the watcher
         // does today (`expected_gen_for_reconcile = expected_gen`).
-        let _ = reconcile_stale_files_with_stop(project.path(), &shared, || false, spawn_gen);
+        let _ = reconcile_stale_files_with_stop(
+            project.path(),
+            &shared,
+            || false,
+            spawn_gen,
+            sweep_observer(project.path()),
+        );
 
         // The edit must be INDEXED, not GenerationMismatch-removed.
         let index = shared.read();
@@ -3534,8 +3865,13 @@ mod tests {
         // reconcile below resolves to `GenerationMismatch` (a repaired-zero no-op).
         shared.reload(project_b.path()).unwrap();
 
-        let repairs =
-            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
+        let repairs = reconcile_stale_files_with_stop(
+            project_a.path(),
+            &shared,
+            || false,
+            stale_gen,
+            sweep_observer(project_a.path()),
+        );
         assert_eq!(
             repairs, 0,
             "GenerationMismatch no-ops repair zero bytes and must not inflate the \
@@ -3556,8 +3892,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&abs, b"fn before() {}\nfn after() {}").unwrap();
 
-        let repairs2 =
-            reconcile_stale_files_with_stop(project.path(), &shared2, || false, expected_gen);
+        let repairs2 = reconcile_stale_files_with_stop(
+            project.path(),
+            &shared2,
+            || false,
+            expected_gen,
+            sweep_observer(project.path()),
+        );
         assert_eq!(
             repairs2, 1,
             "a genuinely stale, re-indexed file must count as one repair"
@@ -3732,7 +4073,16 @@ mod tests {
                 .unwrap();
         }
 
-        let outcome = freshen_file_if_stale(rel, &abs, &shared, expected_gen);
+        let lane =
+            crate::live_index::index_lifecycle::activation::project_source_authority(tmp.path());
+        let outcome = freshen_file_if_stale(
+            rel,
+            &abs,
+            &shared,
+            expected_gen,
+            &lane,
+            lane.active_observer(),
+        );
         assert!(
             matches!(outcome, FreshenResult::StaleReindexed),
             "freshen should report the stale file was reconciled"

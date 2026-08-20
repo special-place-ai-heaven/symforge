@@ -74,6 +74,7 @@ impl Fixture {
     fn expected_dependents(&self, path: &str) -> usize {
         self.server
             .index()
+            .data_plane()
             .read()
             .capture_find_dependents_view(path)
             .files

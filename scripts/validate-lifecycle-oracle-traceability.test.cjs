@@ -62,6 +62,51 @@ function copyFixture(root) {
   }
 }
 
+// The Slice 4 activation cut split the tree's lifecycle: the LIVE tree is
+// postactivation, while every preactivation check (V10 source anchors, the
+// retirement inventories, the frozen closure byte-digests) binds the
+// APPROVED PREACTIVATION tree. Cases exercising those checks therefore run
+// against that tree's SOURCE BYTES, extracted from the real repository
+// history. Before the cut, HEAD bytes and approved bytes coincided and
+// this distinction was invisible.
+//
+// The commit below is the Wave-1-complete `main` tree the activation branch
+// forked from. VERIFIED (2026-08-20, SYMFORGE_LIFECYCLE_EMIT_CLOSURE=1): a
+// fixture carrying exactly these source bytes reproduces all five frozen
+// closure digests byte-for-byte, resolves every V10 anchor and inventory
+// member, classifies preactivation, and passes the checker end-to-end with
+// exit 0. REFREEZE-MANIFEST-v11.md's `baseline.commit` (1521abb0…) is the
+// PERFORMANCE baseline and does NOT reproduce the closure digests — do not
+// substitute it here.
+const refreezeBaselineCommit = "4a57aa22f51f7487f551b639b8005b6a37cab009";
+
+const refreezeSourcePaths = fixturePaths.filter((relativePath) =>
+  relativePath.startsWith("src/") && relativePath.endsWith(".rs"));
+
+function refreezeSourceBytes(relativePath) {
+  const shown = childProcess.spawnSync(
+    "git",
+    ["-C", repositoryRoot, "show", `${refreezeBaselineCommit}:${relativePath}`],
+    { windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
+  );
+  if (shown.status !== 0 || !Buffer.isBuffer(shown.stdout)) {
+    throw new Error(`refreeze bytes unavailable for ${relativePath}: ${String(shown.stderr)}`);
+  }
+  return shown.stdout;
+}
+
+function applyRefreezeSourceBytes(root) {
+  for (const relativePath of refreezeSourcePaths) {
+    fs.writeFileSync(path.join(root, relativePath), refreezeSourceBytes(relativePath));
+  }
+}
+
+function restoreHeadSourceBytes(root) {
+  for (const relativePath of refreezeSourcePaths) {
+    fs.copyFileSync(path.join(repositoryRoot, relativePath), path.join(root, relativePath));
+  }
+}
+
 function mutateSentinel(root, relativePath, start, end, mutate) {
   const file = path.join(root, relativePath);
   const text = fs.readFileSync(file, "utf8");
@@ -328,11 +373,22 @@ function buildPositiveMaterializedFixture(root) {
   runGit(root, ["config", "user.email", "lifecycle-fixture@example.invalid"]);
   runGit(root, ["config", "user.name", "Lifecycle Fixture"]);
   runGit(root, ["config", "core.autocrlf", "false"]);
+  // The approved-refreeze commit must BE the refreeze tree: V10 source
+  // anchors, the retirement inventories, and the frozen closure
+  // byte-digests all bind these exact bytes. Before the Slice 4 cut, HEAD
+  // bytes coincided with refreeze bytes and this substitution was a no-op;
+  // post-cut the fixture must model production's real shape — a refreeze
+  // ancestor whose sources differ from the release tree.
+  applyRefreezeSourceBytes(root);
   runGit(root, ["add", "--all"]);
   runGit(root, ["commit", "--quiet", "-m", "approved refreeze"]);
   const approvedCommit = runGit(root, ["rev-parse", "HEAD^{commit}"]);
   const approvedTree = runGit(root, ["rev-parse", "HEAD^{tree}"]);
 
+  // The RELEASE tree is the current one: restore HEAD source bytes so the
+  // release commit descends from the refreeze ancestor with the post-cut
+  // sources, exactly as production releases do.
+  restoreHeadSourceBytes(root);
   createV11SeamStubs(root, trace);
   createPlannedExecutables(root, trace);
   writeFixtureFile(root, "tests/model/materialized.rs", "#[test]\nfn materialized_model_receipt() { assert!(true); }\n");
@@ -643,6 +699,7 @@ const cases = [
   {
     name: "new writer in a retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    preactivation: true,
     mutate(root) {
       fs.appendFileSync(
         path.join(root, "src/protocol/edit.rs"),
@@ -665,6 +722,7 @@ const cases = [
   {
     name: "string literal content changed in a retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    preactivation: true,
     mutate(root) {
       const file = path.join(root, "src/protocol/edit.rs");
       const text = fs.readFileSync(file, "utf8");
@@ -676,6 +734,7 @@ const cases = [
   {
     name: "cfg(not(test)) item added to a retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    preactivation: true,
     mutate(root) {
       // not(test) is the opposite of test-only: it ships. The census must see it.
       fs.appendFileSync(
@@ -688,6 +747,7 @@ const cases = [
   {
     name: "cfg(any(test, feature)) item added to a retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    preactivation: true,
     mutate(root) {
       // any() needs only one disjunct, so a feature build compiles this.
       fs.appendFileSync(
@@ -700,6 +760,7 @@ const cases = [
   {
     name: "new CCR path in its retirement-owned source file",
     expected: "ERROR RETIREMENT_CLOSURE_MISMATCH:",
+    preactivation: true,
     mutate(root) {
       fs.appendFileSync(
         path.join(root, "src/protocol/ccr.rs"),
@@ -1488,6 +1549,7 @@ const cases = [
   {
     name: "preactivation retirement source anchor disappears",
     expected: "ERROR PREACTIVATION_SOURCE_ANCHOR_UNRESOLVED:",
+    preactivation: true,
     mutate(root) {
       const file = path.join(root, "src/gitignore_hygiene.rs");
       const text = fs.readFileSync(file, "utf8");
@@ -1497,6 +1559,10 @@ const cases = [
   {
     name: "callback anchor requires an exact nested Rust call relation",
     expected: "ERROR PREACTIVATION_SOURCE_ANCHOR_UNRESOLVED:",
+    // Post-cut (Slice 4 activation): preactivation anchors resolve only on
+    // the APPROVED REFREEZE tree, so this case runs against the refreeze
+    // source bytes — where the pinned one-line call spelling still lives.
+    preactivation: true,
     mutate(root) {
       const file = path.join(root, "src/daemon.rs");
       const text = fs.readFileSync(file, "utf8");
@@ -1602,6 +1668,7 @@ const cases = [
   {
     name: "source-derived prompt inventory rejects an unlisted prompt",
     expected: "ERROR RETIREMENT_SOURCE_INVENTORY_MISMATCH: prompts",
+    preactivation: true,
     mutate(root) {
       const file = path.join(root, "src/protocol/prompts.rs");
       fs.appendFileSync(
@@ -1723,6 +1790,10 @@ if (baseline.error) {
 const fixtureBaselineRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
 try {
   copyFixture(fixtureBaselineRoot);
+  // Post-cut, the preactivation positive baseline is the APPROVED tree's
+  // source bytes (the postactivation positive is covered separately by
+  // createPostactivationOrdinaryFixture below).
+  applyRefreezeSourceBytes(fixtureBaselineRoot);
   const fixtureBaseline = runChecker(fixtureBaselineRoot);
   if (fixtureBaseline.error) failures.push(`fixture baseline: spawn failed (${fixtureBaseline.error.code || fixtureBaseline.error.message})`);
   else if (fixtureBaseline.status !== 0) failures.push(`fixture baseline: checker failed (${`${fixtureBaseline.stdout || ""}${fixtureBaseline.stderr || ""}`.trim()})`);
@@ -1732,6 +1803,8 @@ try {
 const closureLineEndingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
 try {
   copyFixture(closureLineEndingRoot);
+  // Closure censuses only run on a preactivation-classified tree post-cut.
+  applyRefreezeSourceBytes(closureLineEndingRoot);
   const writerPath = path.join(closureLineEndingRoot, "src/protocol/edit.rs");
   const writerText = fs.readFileSync(writerPath, "utf8").replace(/\r\n/gu, "\n");
   fs.writeFileSync(writerPath, writerText, "utf8");
@@ -1744,6 +1817,8 @@ try {
 const closureCfgTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
 try {
   copyFixture(closureCfgTestRoot);
+  // Closure censuses only run on a preactivation-classified tree post-cut.
+  applyRefreezeSourceBytes(closureCfgTestRoot);
   // The census freezes V10 authority, which is what the release build contains.
   // Test-only code is compiled out, so adding it must NOT move the digest --
   // otherwise the retirement contract forbids the very edits tasks.md requires.
@@ -1910,6 +1985,10 @@ for (const testCase of cases) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
   try {
     copyFixture(root);
+    // Preactivation-only checks bind the refreeze tree post-cut; give those
+    // cases the refreeze source bytes so their mutations hit a tree the
+    // checker actually classifies and censuses as preactivation.
+    if (testCase.preactivation) applyRefreezeSourceBytes(root);
     testCase.mutate(root);
     const result = runChecker(root, testCase.args || []);
     const output = `${result.stdout || ""}${result.stderr || ""}`;

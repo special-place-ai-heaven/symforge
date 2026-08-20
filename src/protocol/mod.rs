@@ -13,7 +13,9 @@ pub(crate) mod knowledge_model;
 pub(crate) mod knowledge_review;
 pub(crate) mod knowledge_search;
 pub mod prompts;
-pub(crate) mod read_gate;
+// Public within the crate tree for the C5 seam anchor `ReadGate` (reachable
+// externally only through the repo-internal test door).
+pub mod read_gate;
 pub(crate) mod read_tools;
 pub mod resources;
 pub mod result_status;
@@ -186,7 +188,9 @@ pub struct DaemonDegradationSnapshot {
 /// The `token_stats` field provides live hook token savings to the health tool (AD-4 simpler path).
 #[derive(Clone)]
 pub struct SymForgeServer {
-    pub(crate) index: SharedIndex,
+    // C4 (Feature 020 Slice 4, D1): held through the typed handle — the frozen
+    // publication_roots census retires bare `SharedIndex` state fields.
+    pub(crate) index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
     pub(crate) tool_router: ToolRouter<Self>,
     pub(crate) prompt_router: PromptRouter<Self>,
     pub(crate) project_name: String,
@@ -393,7 +397,9 @@ impl SymForgeServer {
         let prompt_router = Self::prompt_router();
         tracing::info!("serve: protocol/routers in {:?}", phase.elapsed());
         Self {
-            index,
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                index,
+            ),
             tool_router,
             prompt_router,
             project_name,
@@ -467,7 +473,9 @@ impl SymForgeServer {
             }
         };
         Self {
-            index: crate::live_index::LiveIndex::empty(),
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                crate::live_index::LiveIndex::empty(),
+            ),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             project_name,
@@ -794,8 +802,8 @@ impl SymForgeServer {
         crate::stel::status::DurableLedgerState::Unavailable
     }
 
-    /// Accessor for tests.
-    pub fn index(&self) -> &SharedIndex {
+    /// Accessor for tests: the project runtime handle owning the index.
+    pub fn index(&self) -> &crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle {
         &self.index
     }
 
@@ -939,6 +947,19 @@ impl SymForgeServer {
         }
     }
 
+    /// The current publication identity for CCR handle minting: the source
+    /// digest plus content generation of the bound index's published
+    /// generation. `None` for an unbound session (nothing to encode).
+    pub(crate) fn ccr_publication_identity(&self) -> Option<ccr::CcrPublicationIdentity> {
+        let published = self.index.data_plane().published_generation();
+        let source = published.source.as_deref()?;
+        let bytes = serde_json::to_vec(source).ok()?;
+        Some(ccr::CcrPublicationIdentity {
+            source_digest: crate::hash::digest_hex(&bytes),
+            content_generation: published.content_generation,
+        })
+    }
+
     /// Apply token budget with CCR offload for eligible discovery tools (011).
     pub(crate) fn apply_ccr_budget(
         &self,
@@ -948,8 +969,15 @@ impl SymForgeServer {
     ) -> String {
         let budget = ccr::resolve_tool_max_tokens(tool_name, max_tokens);
         if ccr::profile_for_tool(tool_name).is_some_and(|p| p.ccr_eligible) {
+            let publication = self.ccr_publication_identity();
             let mut store = self.ccr_store.lock();
-            return ccr::enforce_token_budget_with_ccr(&mut store, tool_name, result, budget);
+            return ccr::enforce_token_budget_with_ccr(
+                &mut store,
+                tool_name,
+                result,
+                budget,
+                publication,
+            );
         }
         format::enforce_token_budget(result, budget)
     }
@@ -970,8 +998,16 @@ impl SymForgeServer {
         };
         if ccr::profile_for_tool(tool_name).is_some_and(|profile| profile.ccr_eligible) {
             let summary = format::enforce_token_budget(summary, Some(tokens));
+            let publication = self.ccr_publication_identity();
             let mut store = self.ccr_store.lock();
-            return ccr::apply_ccr_overflow(&mut store, tool_name, summary, result, tokens);
+            return ccr::apply_ccr_overflow(
+                &mut store,
+                tool_name,
+                summary,
+                result,
+                tokens,
+                publication,
+            );
         }
         format::enforce_token_budget(result, Some(tokens))
     }
@@ -1596,7 +1632,7 @@ impl SymForgeServer {
         // Early return only when the index is non-empty AND its recorded root
         // matches the current target root (normalized compare). A non-empty
         // index built from a different root is stale: fall through to reload.
-        let published = self.index.published_state();
+        let published = self.index.data_plane().published_state();
         if published.file_count > 0 {
             let target_root = repo_root
                 .as_deref()
@@ -1619,9 +1655,9 @@ impl SymForgeServer {
                 root = %root.display(),
                 "daemon unreachable — loading local index as fallback"
             );
-            match self.index.reload(&root) {
+            match self.index.data_plane().reload(&root) {
                 Ok(()) => {
-                    let published = self.index.published_state();
+                    let published = self.index.data_plane().published_state();
                     tracing::info!(
                         files = published.file_count,
                         symbols = published.symbol_count,
@@ -1630,9 +1666,9 @@ impl SymForgeServer {
 
                     // Spawn git temporal computation so co-change queries work
                     // after daemon degradation (mirrors index_folder behaviour).
-                    let expected_gen = self.index.current_project_generation();
+                    let expected_gen = self.index.data_plane().current_project_generation();
                     crate::live_index::git_temporal::spawn_git_temporal_computation(
-                        Arc::clone(&self.index),
+                        self.index.shared(),
                         root,
                         expected_gen,
                     );
@@ -4123,18 +4159,24 @@ mod tests {
             }],
             weak_co_changes: vec![],
         };
-        server.index.update_git_temporal(GitTemporalIndex {
-            files: std::collections::HashMap::from([("src/widget.rs".to_string(), home_history)]),
-            stats: GitTemporalStats {
-                total_commits_analyzed: 14,
-                analysis_window_days: 90,
-                hotspots: vec![],
-                most_coupled: vec![],
-                computed_at: std::time::SystemTime::now(),
-                compute_duration: std::time::Duration::ZERO,
-            },
-            state: GitTemporalState::Ready,
-        });
+        server
+            .index
+            .data_plane()
+            .update_git_temporal(GitTemporalIndex {
+                files: std::collections::HashMap::from([(
+                    "src/widget.rs".to_string(),
+                    home_history,
+                )]),
+                stats: GitTemporalStats {
+                    total_commits_analyzed: 14,
+                    analysis_window_days: 90,
+                    hotspots: vec![],
+                    most_coupled: vec![],
+                    computed_at: std::time::SystemTime::now(),
+                    compute_duration: std::time::Duration::ZERO,
+                },
+                state: GitTemporalState::Ready,
+            });
 
         let foreign = crate::stel::StelRequest {
             query: "impact cfg_if".to_string(),
@@ -4215,8 +4257,9 @@ mod tests {
             "home-project".to_string(),
         );
         let mut server = SymForgeServer::new_daemon_proxy(daemon_client);
-        server.index =
-            crate::live_index::LiveIndex::load(home_root.path()).expect("load home project index");
+        server.index = crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+            crate::live_index::LiveIndex::load(home_root.path()).expect("load home project index"),
+        );
 
         let foreign = crate::stel::StelRequest {
             query: "homeanchor routing".to_string(),
@@ -4317,8 +4360,11 @@ mod tests {
                 "home-project".to_string(),
             );
             let mut server = SymForgeServer::new_daemon_proxy(daemon_client);
-            server.index = crate::live_index::LiveIndex::load(home_root.path())
-                .expect("load home project index");
+            server.index =
+                crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                    crate::live_index::LiveIndex::load(home_root.path())
+                        .expect("load home project index"),
+                );
             server
         };
 
@@ -4415,7 +4461,7 @@ mod tests {
         let server = make_local_server(Some(dir_a.path().to_path_buf()));
         server.ensure_local_index().await;
 
-        let published_a = server.index.published_state();
+        let published_a = server.index.data_plane().published_state();
         assert!(
             published_a.file_count > 0,
             "project A should have loaded a non-empty index"
@@ -4426,7 +4472,12 @@ mod tests {
             "loaded index must record project A's normalized root"
         );
         assert!(
-            server.index.read().get_file("alpha.rs").is_some(),
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("alpha.rs")
+                .is_some(),
             "project A's file should be present after the first load"
         );
 
@@ -4436,18 +4487,28 @@ mod tests {
         // 3. The next ensure_local_index must detect the root mismatch and reload B.
         server.ensure_local_index().await;
 
-        let published_b = server.index.published_state();
+        let published_b = server.index.data_plane().published_state();
         assert_eq!(
             published_b.indexed_root.as_deref(),
             Some(crate::live_index::store::normalize_root(dir_b.path()).as_path()),
             "after a root switch, ensure_local_index must serve project B's root"
         );
         assert!(
-            server.index.read().get_file("beta.rs").is_some(),
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("beta.rs")
+                .is_some(),
             "project B's file must be present after the root-mismatch reload"
         );
         assert!(
-            server.index.read().get_file("alpha.rs").is_none(),
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("alpha.rs")
+                .is_none(),
             "project A's stale file must be gone after switching to project B"
         );
     }
@@ -4466,10 +4527,15 @@ mod tests {
 
         // First call performs the one and only load.
         server.ensure_local_index().await;
-        let gen_after_first = server.index.current_project_generation();
-        let root_after_first = server.index.published_state().indexed_root.clone();
+        let gen_after_first = server.index.data_plane().current_project_generation();
+        let root_after_first = server
+            .index
+            .data_plane()
+            .published_state()
+            .indexed_root
+            .clone();
         assert!(
-            server.index.published_state().file_count > 0,
+            server.index.data_plane().published_state().file_count > 0,
             "first ensure_local_index call should have loaded project A"
         );
 
@@ -4479,12 +4545,12 @@ mod tests {
         }
 
         assert_eq!(
-            server.index.current_project_generation(),
+            server.index.data_plane().current_project_generation(),
             gen_after_first,
             "repeated same-root ensure_local_index calls must not reload (project generation must not change)"
         );
         assert_eq!(
-            server.index.published_state().indexed_root,
+            server.index.data_plane().published_state().indexed_root,
             root_after_first,
             "repeated same-root calls must leave the recorded root unchanged"
         );

@@ -56,8 +56,7 @@ pub use crate::protocol::read_gate::{
 // under embed). Re-exported here so every existing oracle path keeps
 // resolving; `pub use` outside `embed.rs` adds no census atom.
 pub use crate::lifecycle_identity::{
-    CanonicalArgumentHash, OperationKind, OperationReceipt, RetryAdvice, SourceRefusal,
-    SourceRefusalKind,
+    CanonicalArgumentHash, OperationKind, RetryAdvice, SourceRefusal, SourceRefusalKind,
 };
 
 // ── Physical root and observation leases ───────────────────────────────────
@@ -70,7 +69,9 @@ pub struct PhysicalRootLease {
 
 impl PhysicalRootLease {
     /// Fixture constructor. The real lease is acquired from the lifecycle
-    /// runtime in Slice 4; nothing in production reaches this today.
+    /// runtime; nothing in production reaches this (T038 round-1: gated so
+    /// it cannot ship in a release cell).
+    #[cfg(any(test, feature = "__test-internals"))]
     pub fn for_test_root(root: &str) -> Self {
         Self {
             root: root.to_string(),
@@ -94,7 +95,9 @@ pub struct ObservationLease {
 }
 
 impl ObservationLease {
-    /// Fixture constructor for the Slice 3 oracles.
+    /// Fixture constructor for the Slice 3 oracles (test-door gated, T038
+    /// round-1).
+    #[cfg(any(test, feature = "__test-internals"))]
     pub fn for_test_root(root: PhysicalRootLease) -> Self {
         Self {
             root,
@@ -1013,7 +1016,9 @@ impl EvaluationProvenance {
         }
     }
 
-    /// Fixture constructor for the Slice 3 oracles.
+    /// Fixture constructor for the Slice 3 oracles (test-door gated, T038
+    /// round-1).
+    #[cfg(any(test, feature = "__test-internals"))]
     pub fn for_test() -> Self {
         Self::fresh()
     }
@@ -1226,3 +1231,10 @@ impl KnowledgeVoiceFilter {
         ]
     }
 }
+
+// ── Frozen SEAM-PROVENANCE anchor (C5) ─────────────────────────────────────
+
+/// The lifecycle operation receipt under its provenance seam name: every
+/// claim this module renders carries one, minted by the process-wide
+/// identity counter.
+pub type OperationReceipt = crate::lifecycle_identity::OperationReceipt;

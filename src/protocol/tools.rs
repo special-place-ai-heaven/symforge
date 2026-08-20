@@ -1191,18 +1191,25 @@ fn freshen_exact_path_for_targeted_retrieval(
     let search::PathScope::Exact(relative_path) = path_scope else {
         return Ok(false);
     };
-    let expected_gen = server.index.current_project_generation();
+    let expected_gen = server.index.data_plane().current_project_generation();
     let Some(repo_root) = server.capture_repo_root() else {
         return Ok(false);
     };
     let Ok(abs_path) = safe_repo_path_for_freshen(&repo_root, relative_path) else {
         return Ok(false);
     };
+    // V11 observation lane (C4c): a request-path freshen observes under the
+    // incarnation current at call time (the C3b synchronous-facade ruling).
+    let lane_authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
+    let lane_observer = lane_authority.active_observer();
     classify_targeted_freshen_result(watcher::freshen_file_if_stale(
         relative_path,
         &abs_path,
-        &server.index,
+        server.index.data_plane(),
         expected_gen,
+        &lane_authority,
+        lane_observer,
     ))
 }
 
@@ -2365,7 +2372,7 @@ fn untracked_paths_not_in_index(server: &SymForgeServer) -> Vec<String> {
     };
 
     {
-        let guard = server.index.read();
+        let guard = server.index.data_plane().read();
         paths.retain(|path| guard.get_file(path).is_none());
     }
     paths.sort();
@@ -2597,7 +2604,7 @@ fn matching_untracked_paths_for_search_text(
     // which paths come back. The gate runs BEFORE any matching: a refusal drops
     // the path from the sweep entirely, disclosing neither content nor
     // existence-by-match.
-    let live = server.index.read();
+    let live = server.index.data_plane().read();
     untracked_paths_not_in_index(server)
         .into_iter()
         .filter(|path| untracked_text_path_allowed(path, options))
@@ -3632,7 +3639,7 @@ fn resolve_text_search_enclosing_symbols(
 
 fn sidecar_state_for_server(server: &SymForgeServer) -> SidecarState {
     SidecarState {
-        index: Arc::clone(&server.index),
+        index: server.index.clone(),
         token_stats: server.token_stats.clone().unwrap_or_else(TokenStats::new),
         repo_root: server.capture_repo_root(),
         symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -4106,7 +4113,7 @@ impl SymForgeServer {
         use crate::live_index::search::{
             ResultLimit, SymbolMatchTier, SymbolSearchOptions, search_symbols_with_options,
         };
-        let guard = self.index.read();
+        let guard = self.index.data_plane().read();
         // Permissive noise policy (the default) so a symbol defined only in a
         // test/vendor/generated file is still resolvable by exact name — an
         // explicit path already reaches those files. A generous limit keeps the
@@ -4236,9 +4243,16 @@ impl SymForgeServer {
             if targets.is_empty() {
                 return "Error: targets array is empty.".to_string();
             }
+            // T038 round-1 (D16): one capture records the evidence receipt
+            // from the same immutable bundle that renders the batch below —
+            // the seeded pre-dispatch receipt must never accompany a body
+            // from a later publication.
+            let generation = self.capture_local_response_generation();
+            if let Some(message) = loading_guard_message_from_published(&generation.health) {
+                return message;
+            }
             let captured = {
-                let guard = self.index.read();
-                loading_guard!(guard);
+                let guard = &generation.live;
 
                 targets
                     .iter()
@@ -4370,8 +4384,10 @@ impl SymForgeServer {
         // Capture freshness and the immutable publication before consulting the
         // repeat-read cache. The same request against a later watcher publication
         // must be a cache miss, and the bytes below must come from this exact
-        // captured generation rather than a second live-index read.
-        let generation = self.index.published_source_set().current_generation();
+        // captured generation rather than a second live-index read. T038
+        // round-1 (D16): the capture also records the evidence receipt from
+        // this same bundle.
+        let generation = self.capture_local_response_generation();
         if let Some(message) = loading_guard_message_from_published(&generation.health) {
             return message;
         }
@@ -4491,10 +4507,11 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self
-                    .ccr_store
-                    .lock()
-                    .insert("get_symbol", final_output.clone());
+                let handle = self.ccr_store.lock().insert(
+                    "get_symbol",
+                    final_output.clone(),
+                    self.ccr_publication_identity(),
+                );
                 self.session_context.record_symbol_fetch(
                     &params.0.path,
                     &params.0.name,
@@ -4534,7 +4551,7 @@ impl SymForgeServer {
         // bare empty map instead of the "index still loading / run index_folder"
         // guidance. The per-branch guards below remain as harmless redundancy.
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
         let published = self.capture_local_response_generation();
@@ -4836,10 +4853,11 @@ impl SymForgeServer {
                 context_max_tokens,
             );
             let tokens = (output.len() / 4) as u32;
-            let handle = self
-                .ccr_store
-                .lock()
-                .insert("get_file_context", output.clone());
+            let handle = self.ccr_store.lock().insert(
+                "get_file_context",
+                output.clone(),
+                self.ccr_publication_identity(),
+            );
             self.session_context.record_file_context_fetch(
                 &params.0.path,
                 params_hash,
@@ -4910,10 +4928,11 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self
-                    .ccr_store
-                    .lock()
-                    .insert("get_file_context", output.clone());
+                let handle = self.ccr_store.lock().insert(
+                    "get_file_context",
+                    output.clone(),
+                    self.ccr_publication_identity(),
+                );
                 self.session_context.record_file_context_fetch(
                     &params.0.path,
                     params_hash,
@@ -5077,7 +5096,7 @@ impl SymForgeServer {
                         search_format::SourceAuthority::never_collapse("disk-refreshed")
                     } else {
                         search_format::SourceAuthority::from_freshness(
-                            &self.index.freshness_status(),
+                            &self.index.data_plane().freshness_status(),
                         )
                     },
                     parse_state,
@@ -5429,7 +5448,7 @@ impl SymForgeServer {
         // Gate on one queryable baseline before the sidecar await. The impact
         // operation may itself publish a replacement; its returned receipt,
         // not this entry snapshot or a free post-call reload, owns the response.
-        let generation = self.index.published_generation();
+        let generation = self.index.data_plane().published_generation();
         {
             let guard = &generation.live;
             loading_guard!(guard);
@@ -5740,7 +5759,7 @@ impl SymForgeServer {
             return refusal;
         }
 
-        let source_set = self.index.published_source_set();
+        let source_set = self.index.data_plane().published_source_set();
         let output = super::knowledge_search::search_scoped(&source_set, &params.0);
         self.apply_ccr_budget("search_knowledge", output, params.0.max_tokens)
     }
@@ -5795,7 +5814,7 @@ impl SymForgeServer {
             return refusal;
         }
 
-        let source_set = self.index.published_source_set();
+        let source_set = self.index.data_plane().published_source_set();
         match super::knowledge_review::review_scoped(&source_set, &params.0) {
             Ok(output) => self.apply_ccr_budget_with_summary(
                 "review_knowledge",
@@ -5839,6 +5858,10 @@ impl SymForgeServer {
         statused_tool_result(output, outcome_class)
     }
 
+    // V11 write classification (Feature 020 Slice 4, T064): this censused
+    // writer performs no disk I/O itself — every byte lands through
+    // `knowledge_curation.rs`, whose writers carry the classification split
+    // (state-dir ledger permit-free; repo-root policy file source-authorized).
     pub(crate) async fn curate_knowledge(
         &self,
         params: Parameters<CurateKnowledgeInput>,
@@ -5860,7 +5883,7 @@ impl SymForgeServer {
         let state_placement = self.state_placement.read().clone();
         let persistence_health = *self.persistence_health.read();
         let coordinator = Arc::clone(&self.curation_coordinator);
-        let index = Arc::clone(&self.index);
+        let index = self.index.shared();
         let input = params.0;
         tokio::task::spawn_blocking(move || {
             coordinator.execute(
@@ -6138,7 +6161,7 @@ impl SymForgeServer {
             );
         }
 
-        let published = self.index.published_generation();
+        let published = self.index.data_plane().published_generation();
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             return message;
         }
@@ -6181,7 +6204,7 @@ impl SymForgeServer {
         }
 
         let view = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             guard.capture_inspect_match_view(
                 &params.0.path,
@@ -6844,7 +6867,7 @@ impl SymForgeServer {
     /// Reads only the index path view (never `get_*`), so this stays on the
     /// frecency-neutral discovery surface.
     pub(crate) fn resolve_find_fusion_cochange_anchor(&self, query: &str) -> Option<String> {
-        let guard = self.index.read();
+        let guard = self.index.data_plane().read();
         let top_hit = |q: &str| -> Option<String> {
             match guard.capture_search_files_view(q, 5, None, None) {
                 SearchFilesView::Found { hits, .. } => hits
@@ -6976,7 +6999,7 @@ impl SymForgeServer {
     /// Resolution is deterministic for a fixed index state (same query + same repo
     /// ⇒ same sizes ⇒ same decision; Constitution IV).
     fn ground_plan_economics(&self, plan: &mut crate::stel::StelPlan) {
-        let guard = self.index.read();
+        let guard = self.index.data_plane().read();
         if !guard.is_ready() {
             return;
         }
@@ -7069,7 +7092,7 @@ impl SymForgeServer {
             session_id,
             index_generation: published.generation,
             project_generation,
-            reset_project_generation: self.index.current_reset_project_generation(),
+            reset_project_generation: self.index.data_plane().current_reset_project_generation(),
             load_source: published.load_source,
         }
     }
@@ -7135,7 +7158,7 @@ impl SymForgeServer {
         // report — health, live, temporal, source rows — reads off it, so a
         // publication landing mid-render cannot mix generations inside one
         // user-visible health report.
-        let source_set = self.index.published_source_set();
+        let source_set = self.index.data_plane().published_source_set();
         let generation = source_set.current_generation();
         let published = Arc::clone(&generation.health);
         // Capture before `session_id` is consumed: a `Some` session id means the
@@ -7151,7 +7174,7 @@ impl SymForgeServer {
             project_root,
         );
         let watcher_guard = self.watcher_info.lock();
-        let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
+        let rejected_stale_mutations = self.index.data_plane().current_rejected_stale_mutations();
         let mut result = format::health_report_from_published_state_windowed(
             &published,
             &watcher_guard,
@@ -7231,7 +7254,7 @@ impl SymForgeServer {
             let repo_root = self.capture_repo_root();
             let state_placement = self.capture_state_placement();
             self.curation_coordinator.health_line(
-                &self.index,
+                self.index.data_plane(),
                 repo_root.as_deref(),
                 state_placement.as_ref(),
                 *self.persistence_health.read(),
@@ -7324,7 +7347,7 @@ impl SymForgeServer {
         project_root: Option<PathBuf>,
     ) -> String {
         // T046: same single-capture shape as health_for_runtime.
-        let source_set = self.index.published_source_set();
+        let source_set = self.index.data_plane().published_source_set();
         let generation = source_set.current_generation();
         let published = Arc::clone(&generation.health);
         let session_is_daemon = session_id.is_some();
@@ -7337,7 +7360,7 @@ impl SymForgeServer {
             project_root,
         );
         let watcher_guard = self.watcher_info.lock();
-        let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
+        let rejected_stale_mutations = self.index.data_plane().current_rejected_stale_mutations();
         let mut result = format::health_report_compact_from_published_state(
             &published,
             &watcher_guard,
@@ -7411,7 +7434,7 @@ impl SymForgeServer {
             let repo_root = self.capture_repo_root();
             let state_placement = self.capture_state_placement();
             self.curation_coordinator.health_line(
-                &self.index,
+                self.index.data_plane(),
                 repo_root.as_deref(),
                 state_placement.as_ref(),
                 *self.persistence_health.read(),
@@ -7565,7 +7588,7 @@ impl SymForgeServer {
                     .to_string();
             }
         };
-        let index = Arc::clone(&self.index);
+        let index = self.index.shared();
         let checkpoint_root = repo_root.clone();
         let checkpoint_state_placement = state_placement.clone();
         let verify_after_write = params.0.verify_after_write.unwrap_or(false);
@@ -7683,7 +7706,7 @@ impl SymForgeServer {
         // T046: one capture; generation, load_source, counts, and index_state
         // all describe the same publication. The atomic counter is not a
         // freshness side channel.
-        let generation = self.index.published_generation();
+        let generation = self.index.data_plane().published_generation();
         self.local_project_evidence_for_generation(generation.as_ref())
     }
 
@@ -7719,7 +7742,7 @@ impl SymForgeServer {
     /// Capture one local publication for a response and overwrite the ambient
     /// evidence slot from that exact immutable bundle before rendering it.
     fn capture_local_response_generation(&self) -> Arc<crate::live_index::PublishedGeneration> {
-        let generation = self.index.published_generation();
+        let generation = self.index.data_plane().published_generation();
         if let Some(evidence) = self.local_project_evidence_for_generation(generation.as_ref()) {
             super::result_status::record_project_evidence(evidence);
         } else {
@@ -8022,7 +8045,7 @@ impl SymForgeServer {
         } else {
             None
         };
-        let index = Arc::clone(&self.index);
+        let index = self.index.shared();
         let reload_root = root.clone();
         let reload_state_placement = state_placement.clone();
         match tokio::task::spawn_blocking(move || {
@@ -8050,9 +8073,9 @@ impl SymForgeServer {
                     }
                 }
                 if reset_report.is_some() {
-                    self.index.mark_index_folder_reset();
+                    self.index.data_plane().mark_index_folder_reset();
                 }
-                let published = self.index.published_state();
+                let published = self.index.data_plane().published_state();
                 let file_count = published.file_count;
                 let symbol_count = published.symbol_count;
                 let gitignore_hygiene = crate::gitignore_hygiene::reconcile_project_gitignore(
@@ -8075,7 +8098,7 @@ impl SymForgeServer {
                 // Restart the file watcher at the new root so freshness continues.
                 let watcher_handle = crate::watcher::restart_watcher(
                     root.clone(),
-                    Arc::clone(&self.index),
+                    self.index.shared(),
                     Arc::clone(&self.watcher_info),
                     None,
                 );
@@ -8083,9 +8106,9 @@ impl SymForgeServer {
                 tracing::info!(root = %root.display(), "file watcher restarted after index_folder");
 
                 // Refresh git temporal data for the new root.
-                let expected_gen = self.index.current_project_generation();
+                let expected_gen = self.index.data_plane().current_project_generation();
                 crate::live_index::git_temporal::spawn_git_temporal_computation(
-                    Arc::clone(&self.index),
+                    self.index.shared(),
                     root.clone(),
                     expected_gen,
                 );
@@ -8124,7 +8147,7 @@ impl SymForgeServer {
                     ));
                     let runtime_status = self.runtime_status_for(
                         &published,
-                        self.index.current_project_generation(),
+                        self.index.data_plane().current_project_generation(),
                         self.local_runtime_mode(),
                         None,
                         None,
@@ -8227,7 +8250,7 @@ impl SymForgeServer {
         match &mode {
             WhatChangedMode::Timestamp(since_ts) => {
                 let view = {
-                    let guard = self.index.read();
+                    let guard = self.index.data_plane().read();
                     loading_guard!(guard);
                     guard.capture_what_changed_timestamp_view()
                 };
@@ -8247,12 +8270,12 @@ impl SymForgeServer {
                                 };
                             }
                             let envelope = {
-                                let guard = self.index.read();
+                                let guard = self.index.data_plane().read();
                                 search_format::format_search_envelope(
                                     "exact (timestamp compare)",
                                     what_changed_source_authority(
                                         &mode,
-                                        &self.index.freshness_status(),
+                                        &self.index.data_plane().freshness_status(),
                                     ),
                                     search_parse_state_for_paths(
                                         &guard,
@@ -8297,7 +8320,7 @@ impl SymForgeServer {
                 }
             }
             WhatChangedMode::Uncommitted => {
-                let guard = self.index.read();
+                let guard = self.index.data_plane().read();
                 loading_guard!(guard);
                 drop(guard);
 
@@ -8349,7 +8372,7 @@ impl SymForgeServer {
                                     "exact (uncommitted working tree)",
                                     what_changed_source_authority(
                                         &mode,
-                                        &self.index.freshness_status(),
+                                        &self.index.data_plane().freshness_status(),
                                     ),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, filtered.len()),
@@ -8370,7 +8393,7 @@ impl SymForgeServer {
                                         "",
                                         &changed_refs,
                                         &repo,
-                                        &self.index.read(),
+                                        &self.index.data_plane().read(),
                                         true,
                                         false,
                                     );
@@ -8391,7 +8414,7 @@ impl SymForgeServer {
                 }
             }
             WhatChangedMode::GitRef(git_ref) => {
-                let guard = self.index.read();
+                let guard = self.index.data_plane().read();
                 loading_guard!(guard);
                 drop(guard);
 
@@ -8430,7 +8453,7 @@ impl SymForgeServer {
                                     "exact (git ref diff)",
                                     what_changed_source_authority(
                                         &mode,
-                                        &self.index.freshness_status(),
+                                        &self.index.data_plane().freshness_status(),
                                     ),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, filtered.len()),
@@ -8455,7 +8478,7 @@ impl SymForgeServer {
                                         "HEAD",
                                         &changed_refs,
                                         &repo,
-                                        &self.index.read(),
+                                        &self.index.data_plane().read(),
                                         true,
                                         false,
                                     );
@@ -8491,9 +8514,12 @@ impl SymForgeServer {
             return result;
         }
 
-        {
-            let guard = self.index.read();
-            loading_guard!(guard);
+        // T038 round-1 (D16): one capture — the evidence receipt names the
+        // exact publication the blast-radius walk below renders from, not the
+        // pre-dispatch seed.
+        let generation = self.capture_local_response_generation();
+        if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            return message;
         }
 
         let Some(repo_root) = self.effective_repo_root_for_git_tools() else {
@@ -8629,7 +8655,8 @@ impl SymForgeServer {
             None => base_branch.as_deref().unwrap_or("HEAD"),
         };
         let (changed_symbols, blast_radius) = {
-            let guard = self.index.read();
+            // Render from the SAME captured bundle the receipt names (D16).
+            let guard = Arc::clone(&generation.live);
             let mut changed_symbols: Vec<crate::live_index::graph::SymbolId> = Vec::new();
             for path in &changed_files {
                 // Kind lookup for the CURRENT symbols comes from the live index;
@@ -8920,7 +8947,7 @@ impl SymForgeServer {
         // Estimate mode: return token cost without reading content
         if input.estimate == Some(true) {
             let indexed = {
-                let guard = self.index.read();
+                let guard = self.index.data_plane().read();
                 loading_guard!(guard);
                 guard.capture_shared_file(&input.path)
             };
@@ -9044,10 +9071,11 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self
-                    .ccr_store
-                    .lock()
-                    .insert("get_file_content", final_output.clone());
+                let handle = self.ccr_store.lock().insert(
+                    "get_file_content",
+                    final_output.clone(),
+                    self.ccr_publication_identity(),
+                );
                 self.session_context.record_file_content_fetch(
                     &input.path,
                     params_hash,
@@ -9076,7 +9104,7 @@ impl SymForgeServer {
                         // The gate owns this read: it classifies the exact buffer
                         // it returns, so nothing below reopens the path.
                         // `generation.live` is the same publication that produced
-                        // the index miss above — a fresh `self.index.read()` would
+                        // the index miss above — a fresh `self.index.data_plane().read()` would
                         // be a different snapshot.
                         // T045: the index MISS above was the generation's answer;
                         // reading disk anyway is a DISK OBSERVATION, chosen by
@@ -9592,11 +9620,13 @@ impl SymForgeServer {
             return refusal;
         }
         let input = &params.0;
-        let view = {
-            let guard = self.index.read();
-            loading_guard!(guard);
-            guard.capture_find_dependents_view(&input.path)
-        };
+        // T038 round-1 (D16): one capture — the evidence receipt and the
+        // rendered view come from the same immutable bundle.
+        let generation = self.capture_local_response_generation();
+        if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            return message;
+        }
+        let view = generation.live.capture_find_dependents_view(&input.path);
         // Default per-file reference detail is capped at 5 lines (not 10) so the
         // non-compact view stays bounded on hub files with dozens of dependents;
         // callers can raise it with max_per_file or switch to compact=true.
@@ -10106,7 +10136,7 @@ impl SymForgeServer {
         let suppress_personal = !(include_noise || include_personal_tooling);
         let suppress_other_noise = !include_noise;
         let any_suppression = suppress_vendor || suppress_personal || suppress_other_noise;
-        let guard = self.index.read();
+        let guard = self.index.data_plane().read();
         loading_guard!(guard);
 
         let concept = super::explore::match_concept(&params.0.query);
@@ -10795,7 +10825,7 @@ impl SymForgeServer {
             return result;
         }
         let conv = {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
             crate::protocol::conventions::detect_conventions(&guard)
         };
@@ -10854,7 +10884,7 @@ impl SymForgeServer {
             return refusal;
         }
         // T046: one capture — plan structure and co-change data agree.
-        let generation = self.index.published_generation();
+        let generation = self.index.data_plane().published_generation();
         let guard = Arc::clone(&generation.live);
         loading_guard!(guard);
         let temporal = Arc::clone(&generation.code_signals.temporal);
@@ -10883,7 +10913,7 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
-        let guard = self.index.read();
+        let guard = self.index.data_plane().read();
         loading_guard!(guard);
         let output = crate::protocol::investigation::suggest_next_steps(
             &guard,
@@ -11544,7 +11574,7 @@ impl SymForgeServer {
             return;
         };
 
-        let temporal = self.index.git_temporal();
+        let temporal = self.index.data_plane().git_temporal();
         match temporal.state {
             crate::live_index::git_temporal::GitTemporalState::Ready => {
                 let normalized = path.replace('\\', "/");
@@ -11685,7 +11715,7 @@ impl SymForgeServer {
                 }
             }
 
-            match run_pre_apply_gates(&self.index, request, &abs_path) {
+            match run_pre_apply_gates(self.index.data_plane(), request, &abs_path) {
                 Ok(PreApplyOutcome::Ready(symbol)) => resolved_symbol = Some(symbol),
                 // F6: the already-applied check compares against the INDEXED
                 // copy, but a `working_directory` apply targets a worktree whose
@@ -11989,7 +12019,7 @@ impl SymForgeServer {
             None => (env_label, None),
         };
 
-        let guard = self.index.read();
+        let guard = self.index.data_plane().read();
         let ledger = self.stel_ledger.lock();
         // 012 D6-a bound-root visibility: surface WHICH workspace answered. This
         // is the root bound on THIS server — on the daemon side it is the warm
@@ -12107,7 +12137,12 @@ impl SymForgeServer {
     /// language whether the reset ran locally or through the proxy: a real
     /// cleared-sample count with a store, or the "no durable store" no-op note
     /// without one.
-    #[cfg(feature = "server")]
+    ///
+    /// No feature gate: `protocol/tools.rs` is mounted only under
+    /// `feature = "server"` (internals.rs), so a per-item `server` gate here
+    /// is redundant and its former `not(server)` sibling compiled in NO cell
+    /// while claiming embed behavior (T038 round-2 cfg-lens finding; both
+    /// removed).
     pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
         match self.reset_calibration() {
             Some(cleared) => format!(
@@ -12118,14 +12153,6 @@ impl SymForgeServer {
                     .to_string()
             }
         }
-    }
-
-    /// Embed/no-`server` builds have no durable calibration store wired, so the
-    /// reset is an honest no-op — mirrors the `reset_calibration() == None` arm
-    /// of the local path.
-    #[cfg(not(feature = "server"))]
-    pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
-        "calibration_reset: no durable store; in-memory calibration is already deferred".to_string()
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -12175,10 +12202,10 @@ impl SymForgeServer {
                 selected_project.unwrap_or("<unknown>")
             );
         }
-        let published = self.index.published_state();
+        let published = self.index.data_plane().published_state();
         let status = self.runtime_status_for(
             &published,
-            self.index.current_project_generation(),
+            self.index.data_plane().current_project_generation(),
             self.local_runtime_mode(),
             None,
             None,
@@ -12281,17 +12308,43 @@ impl SymForgeServer {
         if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();
         }
-        match self
-            .ccr_store
-            .lock()
-            .retrieve_checked(&hash, crate::knowledge::SECRET_POLICY_VERSION)
-        {
-            Ok(Some(body)) => body,
+        let current = self.ccr_publication_identity();
+        match self.ccr_store.lock().retrieve_checked(
+            &hash,
+            crate::knowledge::SECRET_POLICY_VERSION,
+            current.as_ref(),
+        ) {
+            Ok(Some(retrieved)) => {
+                // A rendering bound to a superseded publication is still
+                // redeemable — it is exactly the output the footer promised —
+                // but it must say so instead of passing as current (frozen:
+                // "CCR cannot originate truth or extend a lease").
+                match (&retrieved.publication, &current) {
+                    (Some(stored), Some(now)) if stored != now => format!(
+                        "CCR replay: rendering bound to content generation {} (current is {}). \
+                         A CCR blob is a bound rendering cache, not fresh authority; rerun the \
+                         originating search for current results.\n\n{}",
+                        stored.content_generation, now.content_generation, retrieved.body
+                    ),
+                    _ => retrieved.body,
+                }
+            }
             Ok(None) => {
                 "CCR retrieve: stale or expired handle; retry the originating search.".to_string()
             }
             Err(crate::protocol::ccr::CcrRetrieveError::SecretPolicyMismatch) => {
                 "CCR retrieve: secret-policy version mismatch; retry the originating search."
+                    .to_string()
+            }
+            Err(crate::protocol::ccr::CcrRetrieveError::ForeignPublication) => {
+                "CCR retrieve: handle was rendered from a different source publication; retry \
+                 the originating search in this project."
+                    .to_string()
+            }
+            Err(crate::protocol::ccr::CcrRetrieveError::PublicationUnverifiable) => {
+                "CCR retrieve: the current publication identity is unavailable (project still \
+                 binding or mid-retarget), so the handle's currency cannot be verified; retry \
+                 after the project finishes binding, or rerun the originating search."
                     .to_string()
             }
         }
@@ -12352,7 +12405,7 @@ impl SymForgeServer {
             intent,
             smart_query::QueryIntent::Understand { .. } | smart_query::QueryIntent::Explore { .. }
         ) {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             if let Some(name) =
                 Self::extract_exact_implementation_understanding_candidate(&guard, q)
             {
@@ -12662,7 +12715,7 @@ impl SymForgeServer {
 
         // Check index is not loading/empty
         {
-            let guard = self.index.read();
+            let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
 
@@ -12723,7 +12776,7 @@ impl SymForgeServer {
             changed_files_owned.len(),
             &changed_files,
             &repo,
-            &self.index.read(),
+            &self.index.data_plane().read(),
             params.0.compact.unwrap_or(false),
             params.0.summary_only.unwrap_or(false),
             params.0.path_prefix.as_deref(),
@@ -14305,7 +14358,12 @@ mod tests {
         use crate::live_index::git_temporal::GitTemporalState;
         for _ in 0..250 {
             if matches!(
-                server.index.published_generation().code_signals.state,
+                server
+                    .index
+                    .data_plane()
+                    .published_generation()
+                    .code_signals
+                    .state,
                 GitTemporalState::Ready | GitTemporalState::Unavailable(_)
             ) {
                 break;
@@ -14316,9 +14374,9 @@ mod tests {
         // but confirm the published Arc has actually stopped moving — that also
         // covers any publisher other than git temporal.
         for _ in 0..50 {
-            let before = Arc::as_ptr(&server.index.published_state());
+            let before = Arc::as_ptr(&server.index.data_plane().published_state());
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if Arc::as_ptr(&server.index.published_state()) == before {
+            if Arc::as_ptr(&server.index.data_plane().published_state()) == before {
                 return;
             }
         }
@@ -16967,7 +17025,11 @@ mod tests {
             make_live_index_ready(vec![(key, file)]),
             Some(repo.path().to_path_buf()),
         );
-        let entry_generation = server.index.published_generation().publication_generation;
+        let entry_generation = server
+            .index
+            .data_plane()
+            .published_generation()
+            .publication_generation;
 
         let (result, evidence) =
             crate::protocol::result_status::with_project_evidence_scope(None, async {
@@ -16992,7 +17054,7 @@ mod tests {
             result.contains("new_name"),
             "impact tool should re-read the file from repo_root and report new symbols; got: {result}"
         );
-        let served = server.index.published_generation();
+        let served = server.index.data_plane().published_generation();
         assert!(
             served.publication_generation > entry_generation,
             "the changed file fixture must publish a replacement generation"
@@ -17197,7 +17259,7 @@ mod tests {
         );
         let watcher = crate::watcher::restart_watcher(
             active_root.clone(),
-            Arc::clone(&server.index),
+            server.index.shared(),
             Arc::clone(&server.watcher_info),
             None,
         );
@@ -17221,8 +17283,8 @@ mod tests {
         settle_background_publications(&server).await;
 
         let root_before = server.capture_repo_root();
-        let generation_before = server.index.current_project_generation();
-        let published_before = server.index.published_state();
+        let generation_before = server.index.data_plane().current_project_generation();
+        let published_before = server.index.data_plane().published_state();
         let limit = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", "1");
         let result = server
             .index_folder(Parameters(super::IndexFolderInput {
@@ -17240,15 +17302,25 @@ mod tests {
         );
         assert_eq!(server.capture_repo_root(), root_before);
         assert_eq!(
-            server.index.current_project_generation(),
+            server.index.data_plane().current_project_generation(),
             generation_before,
             "failed retarget must not advance the live project generation"
         );
         assert!(
-            Arc::ptr_eq(&published_before, &server.index.published_state()),
+            Arc::ptr_eq(
+                &published_before,
+                &server.index.data_plane().published_state()
+            ),
             "failed retarget must preserve the exact published generation"
         );
-        assert!(server.index.read().get_file("src/active.rs").is_some());
+        assert!(
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/active.rs")
+                .is_some()
+        );
 
         {
             let watcher = server.watcher_handle.lock();
@@ -17272,6 +17344,7 @@ mod tests {
         for _ in 0..100 {
             if server
                 .index
+                .data_plane()
                 .read()
                 .get_file("src/after_failure.rs")
                 .is_some()
@@ -17283,6 +17356,7 @@ mod tests {
         assert!(
             server
                 .index
+                .data_plane()
                 .read()
                 .get_file("src/after_failure.rs")
                 .is_some(),
@@ -17639,7 +17713,7 @@ mod tests {
             "same idempotency key and same canonical request must replay stored output"
         );
         assert_eq!(
-            server.index.published_state().file_count,
+            server.index.data_plane().published_state().file_count,
             2,
             "stored output may return only after the current live binding is rebuilt"
         );
@@ -18778,7 +18852,14 @@ mod tests {
             result.contains("analyze_file_impact(\"src/new_text.rs\", new_file=true)"),
             "missing recovery call: {result}"
         );
-        assert!(server.index.read().get_file("src/new_text.rs").is_none());
+        assert!(
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/new_text.rs")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -19674,7 +19755,14 @@ mod tests {
             result.contains("analyze_file_impact(\"src/new_service.rs\", new_file=true)"),
             "missing recovery call: {result}"
         );
-        assert!(server.index.read().get_file("src/new_service.rs").is_none());
+        assert!(
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/new_service.rs")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -19764,9 +19852,8 @@ mod tests {
             (key_b, file_b),
         ]));
 
-        server
-            .index
-            .update_git_temporal(crate::live_index::git_temporal::GitTemporalIndex {
+        server.index.data_plane().update_git_temporal(
+            crate::live_index::git_temporal::GitTemporalIndex {
                 files: HashMap::from([(
                     "src/auth.rs".to_string(),
                     crate::live_index::git_temporal::GitFileHistory {
@@ -19797,7 +19884,8 @@ mod tests {
                     compute_duration: Duration::ZERO,
                 },
                 state: crate::live_index::git_temporal::GitTemporalState::Ready,
-            });
+            },
+        );
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
@@ -23969,7 +24057,11 @@ mod tests {
             !result.contains("fn stale() {}"),
             "stale indexed content should not be served after refresh: {result}"
         );
-        let served_generation = server.index.published_generation().publication_generation;
+        let served_generation = server
+            .index
+            .data_plane()
+            .published_generation()
+            .publication_generation;
         assert_ne!(
             evidence.generation, seeded_generation,
             "freshening must replace the call-scope's stale evidence"
@@ -24024,7 +24116,7 @@ mod tests {
             "expected fresh disk content, got: {result}"
         );
 
-        let guard = server.index.read();
+        let guard = server.index.data_plane().read();
         assert!(guard.get_file("src/lib.rs").is_some());
         assert!(guard.get_file("./src\\lib.rs").is_none());
     }
@@ -28621,7 +28713,14 @@ mod tests {
         .expect("confirmed removal should publish against the captured project");
 
         assert!(refreshed);
-        assert!(server.index().read().get_file("src/lib.rs").is_none());
+        assert!(
+            server
+                .index()
+                .data_plane()
+                .read()
+                .get_file("src/lib.rs")
+                .is_none()
+        );
     }
 
     #[test]
@@ -28685,7 +28784,14 @@ mod tests {
             source_authority,
             crate::protocol::edit_format::EditSourceAuthority::CurrentIndex
         );
-        assert!(server.index().read().get_file("src/lib.rs").is_some());
+        assert!(
+            server
+                .index()
+                .data_plane()
+                .read()
+                .get_file("src/lib.rs")
+                .is_some()
+        );
     }
 
     #[test]
@@ -28701,11 +28807,16 @@ mod tests {
         let stale_gen = index.current_project_generation();
         index.reload(project_b.path()).unwrap();
 
+        let lane = crate::live_index::index_lifecycle::activation::project_source_authority(
+            project_a.path(),
+        );
         let result = crate::watcher::freshen_file_if_stale(
             "src/b.rs",
             &project_a.path().join("src/b.rs"),
             &index,
             stale_gen,
+            &lane,
+            lane.active_observer(),
         );
 
         assert!(matches!(
@@ -28758,7 +28869,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(snapshots[0].path()).unwrap(), original);
 
-        let guard = server.index.read();
+        let guard = server.index.data_plane().read();
         let file = guard.get_file("src/lib.rs").unwrap();
         assert!(file.symbols.iter().any(|s| s.name == "hello"));
         assert!(file.symbols.iter().any(|s| s.name == "world"));
@@ -29134,7 +29245,7 @@ mod tests {
         assert!(on_disk.contains("hello"), "original intact: {on_disk}");
         assert!(on_disk.contains("world"), "new symbol: {on_disk}");
 
-        let guard = server.index.read();
+        let guard = server.index.data_plane().read();
         let file = guard.get_file("src/lib.rs").unwrap();
         assert!(file.symbols.iter().any(|s| s.name == "world"));
     }
@@ -29191,7 +29302,7 @@ mod tests {
         assert!(!on_disk.contains("hello"), "hello removed: {on_disk}");
         assert!(on_disk.contains("world"), "world intact: {on_disk}");
 
-        let guard = server.index.read();
+        let guard = server.index.data_plane().read();
         let file = guard.get_file("src/lib.rs").unwrap();
         assert!(!file.symbols.iter().any(|s| s.name == "hello"));
         assert!(file.symbols.iter().any(|s| s.name == "world"));
@@ -32217,6 +32328,7 @@ mod tests {
         let cache_handle = cache_server.ccr_store.lock().insert(
             "get_file_context",
             "seeded home-project evidence".to_string(),
+            None,
         );
         cache_server.session_context.record_file_context_fetch(
             "src/lib.rs",
@@ -32648,7 +32760,7 @@ mod tests {
     /// that silently stops being demoted fails loudly instead of passing
     /// vacuously.
     fn assert_security_demotion(server: &SymForgeServer, path: &str) {
-        let guard = server.index.read();
+        let guard = server.index.data_plane().read();
         assert!(
             guard.get_file(path).is_none(),
             "{path} must be absent from the Tier-1 index map"
@@ -32798,7 +32910,7 @@ mod tests {
         // raw-disk fallback and must be PERMITTED.
         let (_dir, server, _canary) = setup_admission_fixture();
         {
-            let guard = server.index.read();
+            let guard = server.index.data_plane().read();
             assert!(
                 guard.get_file("package-lock.json").is_none(),
                 "the lockfile must be absent from the Tier-1 map so the fallback is exercised"
@@ -32823,7 +32935,7 @@ mod tests {
         // content is served out of the in-memory index and adds no read.
         let (_dir, server, _canary) = setup_admission_fixture();
         {
-            let guard = server.index.read();
+            let guard = server.index.data_plane().read();
             assert!(
                 guard.get_file("src/lib.rs").is_some(),
                 "the anchor source file must be Tier-1 indexed"
@@ -34363,7 +34475,12 @@ mod tests {
             setup_edit_test_with_fresh_mtime(b"fn target() {\n    let x = 1;\n}\n");
 
         assert!(
-            server.index.read().get_file("src/lib.rs").is_some(),
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/lib.rs")
+                .is_some(),
             "E3 control: the fixture must be Tier-1 BEFORE the edit, or its \
              absence afterwards proves nothing"
         );
@@ -34396,7 +34513,12 @@ mod tests {
         );
 
         assert!(
-            server.index.read().get_file("src/lib.rs").is_none(),
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/lib.rs")
+                .is_none(),
             "E3 post-edit sensitive content was republished into Tier-1"
         );
 

@@ -1,7 +1,8 @@
 # CLAUDE.md — SymForge
 
 ## Verification (symforge)
-- Backend: `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`
+- Backend: `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib --bins --tests -- --test-threads=1`, `cargo bench --bench observed_refresh_gate_v1 -- --test`, `cargo build --release`
+- (as_of 2026-08-19, C7) the suite selects `--lib --bins --tests`, NOT `--all-targets`: the trailing libtest flag is forwarded to every selected binary and the criterion bench target (`observed_refresh_gate_v1`, harness = false) rejects `--test-threads`. The bench is smoked separately in criterion's `--test` mode (one pass per campaign).
 - `npm/` only: `cd npm && npm test`
 - Mixed: run both before reporting success
 
@@ -37,6 +38,14 @@ Run anything that can exceed ten minutes through Terminal Commander instead
 process, so the job's lifetime is independent of the tool call. Interleaving feature
 sets in one target dir (`--all-targets` then `--no-default-features --features embed`)
 causes the same `E0786` without any kill; run them one at a time.
+
+**Windows commit-limit corruption (as_of 2026-08-19).** Two suite builds died
+mid-compile to `0xc000012d` (STATUS_COMMITMENT_LIMIT — virtual-memory commit
+exhaustion) under default 16-way parallel rustc + linkers, corrupting emitted
+artifacts (the E0786 cascade below, plus one rustc ICE and `only metadata stub
+found for rlib dependency core/std` on the NEXT cold build). Cap build
+parallelism with `-j 8` on this machine for heavy `cargo test`/`bench`/`build`
+runs; the capped builds completed where the default died twice.
 
 Recovery, cheapest first: delete `target/debug/incremental`; then
 `cargo clean -p symforge`; then a full `cargo clean`. Do not diagnose a rustc ICE or a

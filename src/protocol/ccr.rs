@@ -69,6 +69,19 @@ pub fn resolve_tool_max_tokens(tool_name: &str, agent_max: Option<u64>) -> Optio
     agent_max.or_else(|| profile_for_tool(tool_name).map(|p| p.default_max_tokens))
 }
 
+/// The publication a CCR blob was rendered from (Feature 020 Slice 4, the
+/// CCR half of the publication-identity fence; frozen `ccr` category:
+/// "CCR handles encode the source publication identity"). The identity is an
+/// INPUT to the handle hash, so identical rendered bytes produced under two
+/// different publications mint two different handles; the blob keeps the
+/// identity so retrieval can label a superseded rendering and refuse a
+/// foreign one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CcrPublicationIdentity {
+    pub source_digest: String,
+    pub content_generation: u64,
+}
+
 /// Stored formatted output for reversible compression.
 #[derive(Clone, Debug)]
 pub struct CcrBlob {
@@ -77,11 +90,32 @@ pub struct CcrBlob {
     pub formatted_bytes: String,
     pub created_at: Instant,
     pub secret_policy_version: Option<u32>,
+    /// The rendering publication; `None` only for an unbound session, which
+    /// has no publication identity to encode.
+    pub publication: Option<CcrPublicationIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CcrRetrieveError {
     SecretPolicyMismatch,
+    /// The handle was rendered from a DIFFERENT source than the session's
+    /// current binding (frozen: "Evicted or foreign generations return typed
+    /// unavailability").
+    ForeignPublication,
+    /// The handle carries a publication identity but the CURRENT identity is
+    /// unavailable (unbound session, mid-bind, mid-retarget). Nothing
+    /// observed a foreign source — what was observed is that currency cannot
+    /// be verified, and "cannot verify" is not "verified current" (T038
+    /// round-2: refuse with the honest cause, never fail open).
+    PublicationUnverifiable,
+}
+
+/// A redeemed blob: the stored bytes plus the publication that rendered them,
+/// so the caller can label a superseded rendering.
+#[derive(Clone, Debug)]
+pub struct CcrRetrieved {
+    pub body: String,
+    pub publication: Option<CcrPublicationIdentity>,
 }
 
 /// Per-session CCR economics counters (011 US5, heuristic).
@@ -134,8 +168,13 @@ impl CcrStore {
         }
     }
 
-    pub fn insert(&mut self, tool_name: &str, formatted: String) -> String {
-        let handle = mint_handle(tool_name, &formatted);
+    pub fn insert(
+        &mut self,
+        tool_name: &str,
+        formatted: String,
+        publication: Option<CcrPublicationIdentity>,
+    ) -> String {
+        let handle = mint_handle(tool_name, &formatted, publication.as_ref());
         let byte_len = formatted.len();
         // Content-addressed handle: re-inserting identical output refreshes the
         // stored blob's age and must not re-count bytes or offloads (recovered
@@ -162,6 +201,7 @@ impl CcrStore {
                 created_at: Instant::now(),
                 secret_policy_version: matches!(tool_name, "search_knowledge" | "review_knowledge")
                     .then_some(crate::knowledge::SECRET_POLICY_VERSION),
+                publication,
             },
         );
         self.economics.offloads = self.economics.offloads.saturating_add(1);
@@ -183,13 +223,17 @@ impl CcrStore {
     }
 
     /// Retrieve already-safe formatted output only under the detector policy
-    /// that admitted it. Generic CCR records carry no policy tag and keep their
-    /// existing behavior; knowledge records fail closed on a version mismatch.
+    /// that admitted it and only within the source that rendered it. Generic
+    /// CCR records carry no policy tag and keep their existing behavior;
+    /// knowledge records fail closed on a version mismatch; a blob rendered
+    /// from a DIFFERENT source than the current binding fails closed as
+    /// foreign (frozen `ccr` category assertion 3).
     pub fn retrieve_checked(
         &mut self,
         handle: &str,
         current_secret_policy_version: u32,
-    ) -> Result<Option<String>, CcrRetrieveError> {
+        current_publication: Option<&CcrPublicationIdentity>,
+    ) -> Result<Option<CcrRetrieved>, CcrRetrieveError> {
         let Some(blob) = self.blobs.get(handle) else {
             return Ok(None);
         };
@@ -199,7 +243,26 @@ impl CcrStore {
         {
             return Err(CcrRetrieveError::SecretPolicyMismatch);
         }
-        Ok(self.retrieve(handle))
+        // T038 round-1 repair (variant split in round-2): a blob minted
+        // under a KNOWN publication must not fail open when the current
+        // identity is unavailable (mid-bind, mid-retarget, or mid-reset).
+        // "Cannot verify" is not "verified current" — but it is also not an
+        // OBSERVED foreign source, so the two refusals carry distinct typed
+        // causes. A blob minted with NO identity (`stored: None`) keeps its
+        // prior generic behavior, matching the secret-policy precedent above.
+        match (&blob.publication, current_publication) {
+            (Some(stored), Some(current)) if stored.source_digest != current.source_digest => {
+                return Err(CcrRetrieveError::ForeignPublication);
+            }
+            (Some(_), None) => {
+                return Err(CcrRetrieveError::PublicationUnverifiable);
+            }
+            _ => {}
+        }
+        let publication = blob.publication.clone();
+        Ok(self
+            .retrieve(handle)
+            .map(|body| CcrRetrieved { body, publication }))
     }
 
     pub fn get(&self, handle: &str) -> Option<&CcrBlob> {
@@ -229,10 +292,18 @@ impl CcrStore {
     }
 }
 
-fn mint_handle(tool_name: &str, formatted: &str) -> String {
+fn mint_handle(
+    tool_name: &str,
+    formatted: &str,
+    publication: Option<&CcrPublicationIdentity>,
+) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tool_name.hash(&mut hasher);
     formatted.hash(&mut hasher);
+    if let Some(publication) = publication {
+        publication.source_digest.hash(&mut hasher);
+        publication.content_generation.hash(&mut hasher);
+    }
     format!("{:012x}", hasher.finish() & 0xFFFF_FFFF_FFFF)
 }
 
@@ -243,6 +314,7 @@ pub fn apply_ccr_overflow(
     summary: String,
     full: String,
     max_tokens: u64,
+    publication: Option<CcrPublicationIdentity>,
 ) -> String {
     let max_bytes = (max_tokens as usize).saturating_mul(4);
     if full.len() <= max_bytes {
@@ -255,7 +327,7 @@ pub fn apply_ccr_overflow(
     if summary.len() >= full.len() {
         return summary;
     }
-    let handle = store.insert(tool_name, full);
+    let handle = store.insert(tool_name, full, publication);
     let omitted_note = "full ranked output stored";
     format!(
         "{summary}\n---\nCCR: {omitted_note} · retrieve: symforge_retrieve with hash=\"{handle}\"\n"
@@ -286,6 +358,7 @@ pub fn enforce_token_budget_with_ccr(
     tool_name: &str,
     result: String,
     max_tokens: Option<u64>,
+    publication: Option<CcrPublicationIdentity>,
 ) -> String {
     let Some(tokens) = max_tokens.filter(|t| *t > 0) else {
         return result;
@@ -294,7 +367,7 @@ pub fn enforce_token_budget_with_ccr(
         return result;
     }
     let summary = super::format::enforce_token_budget(result.clone(), Some(tokens));
-    apply_ccr_overflow(store, tool_name, summary, result, tokens)
+    apply_ccr_overflow(store, tool_name, summary, result, tokens, publication)
 }
 
 fn line_is_error_severity(line: &str) -> bool {
@@ -421,10 +494,10 @@ mod tests {
     #[test]
     fn ccr_insert_duplicate_does_not_double_count() {
         let mut store = CcrStore::new();
-        let h1 = store.insert("search_text", "payload".to_string());
+        let h1 = store.insert("search_text", "payload".to_string(), None);
         let before = store.economics();
         let total_before = store.total_bytes;
-        let h2 = store.insert("search_text", "payload".to_string());
+        let h2 = store.insert("search_text", "payload".to_string(), None);
         assert_eq!(h1, h2, "identical content mints the same handle");
         let after = store.economics();
         assert_eq!(
@@ -446,7 +519,7 @@ mod tests {
         let mut store = CcrStore::new();
         let full = "line\n".repeat(5000);
         let summary = "top hits".to_string();
-        let out = apply_ccr_overflow(&mut store, "search_text", summary, full.clone(), 100);
+        let out = apply_ccr_overflow(&mut store, "search_text", summary, full.clone(), 100, None);
         assert!(out.contains("symforge_retrieve"));
         let handle = out
             .split("hash=\"")
@@ -473,8 +546,13 @@ mod tests {
     fn ccr_footer_emitted_when_builder_truncates() {
         let mut store = CcrStore::new();
         let full = "outline symbol line of repo map text\n".repeat(2000);
-        let out =
-            enforce_token_budget_with_ccr(&mut store, "get_repo_map", full.clone(), Some(300));
+        let out = enforce_token_budget_with_ccr(
+            &mut store,
+            "get_repo_map",
+            full.clone(),
+            Some(300),
+            None,
+        );
         assert!(
             out.contains("symforge_retrieve"),
             "truncated output must offer a retrieve handle; tail: {}",
@@ -497,8 +575,13 @@ mod tests {
     fn ccr_no_footer_within_budget() {
         let mut store = CcrStore::new();
         let small = "fits\n".repeat(10);
-        let out =
-            enforce_token_budget_with_ccr(&mut store, "get_repo_map", small.clone(), Some(1000));
+        let out = enforce_token_budget_with_ccr(
+            &mut store,
+            "get_repo_map",
+            small.clone(),
+            Some(1000),
+            None,
+        );
         assert_eq!(
             out, small,
             "within-budget output must be returned unchanged"
@@ -517,7 +600,11 @@ mod tests {
     #[test]
     fn knowledge_ccr_is_policy_tagged_and_mismatch_fails_closed() {
         let mut store = CcrStore::new();
-        let handle = store.insert("search_knowledge", "safe formatted evidence".to_string());
+        let handle = store.insert(
+            "search_knowledge",
+            "safe formatted evidence".to_string(),
+            None,
+        );
         assert_eq!(
             store
                 .get(&handle)
@@ -528,17 +615,88 @@ mod tests {
         assert!(matches!(
             store.retrieve_checked(
                 &handle,
-                crate::knowledge::SECRET_POLICY_VERSION.saturating_add(1)
+                crate::knowledge::SECRET_POLICY_VERSION.saturating_add(1),
+                None,
             ),
             Err(CcrRetrieveError::SecretPolicyMismatch)
         ));
         assert_eq!(
             store
-                .retrieve_checked(&handle, crate::knowledge::SECRET_POLICY_VERSION)
+                .retrieve_checked(&handle, crate::knowledge::SECRET_POLICY_VERSION, None)
                 .expect("matching policy")
-                .expect("knowledge body"),
+                .expect("knowledge body")
+                .body,
             "safe formatted evidence"
         );
+    }
+
+    #[test]
+    fn identical_bytes_under_two_publications_mint_two_handles_and_foreign_source_refuses() {
+        let mut store = CcrStore::new();
+        let publication_a = CcrPublicationIdentity {
+            source_digest: "source-a".to_string(),
+            content_generation: 1,
+        };
+        let publication_a2 = CcrPublicationIdentity {
+            source_digest: "source-a".to_string(),
+            content_generation: 2,
+        };
+        let publication_b = CcrPublicationIdentity {
+            source_digest: "source-b".to_string(),
+            content_generation: 1,
+        };
+
+        let h1 = store.insert(
+            "search_text",
+            "same bytes".to_string(),
+            Some(publication_a.clone()),
+        );
+        let h2 = store.insert(
+            "search_text",
+            "same bytes".to_string(),
+            Some(publication_a2.clone()),
+        );
+        assert_ne!(h1, h2, "the handle must encode the publication identity");
+
+        // Same source, superseded generation: served with its own identity so
+        // the caller can label the replay.
+        let replay = store
+            .retrieve_checked(
+                &h1,
+                crate::knowledge::SECRET_POLICY_VERSION,
+                Some(&publication_a2),
+            )
+            .expect("same source")
+            .expect("stored blob");
+        assert_eq!(replay.body, "same bytes");
+        assert_eq!(replay.publication, Some(publication_a));
+
+        // Foreign source: typed refusal, never the bytes.
+        assert!(matches!(
+            store.retrieve_checked(
+                &h1,
+                crate::knowledge::SECRET_POLICY_VERSION,
+                Some(&publication_b)
+            ),
+            Err(CcrRetrieveError::ForeignPublication)
+        ));
+
+        // T038 round-2 pin: an identity-bearing blob must not fail OPEN when
+        // the CURRENT identity is unavailable (unbound/mid-retarget) — and
+        // the refusal names unverifiability, not an unobserved foreign
+        // source.
+        assert!(matches!(
+            store.retrieve_checked(&h1, crate::knowledge::SECRET_POLICY_VERSION, None),
+            Err(CcrRetrieveError::PublicationUnverifiable)
+        ));
+
+        // Control: an identity-FREE blob keeps its generic behavior under an
+        // unavailable current identity.
+        let generic = store.insert("search_text", "generic bytes".to_string(), None);
+        assert!(matches!(
+            store.retrieve_checked(&generic, crate::knowledge::SECRET_POLICY_VERSION, None),
+            Ok(Some(_))
+        ));
     }
 
     #[test]

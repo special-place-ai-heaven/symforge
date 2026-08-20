@@ -28,7 +28,12 @@ use crate::paths;
 
 use crate::domain::ParseDiagnostic;
 
-const CURRENT_VERSION: u32 = 7;
+// Feature 020 Slice 4 (frozen 020:T065): the V11 activation cut bumps the
+// on-disk format from the V10 value 7. A format-7 file found at the snapshot
+// path is a PRIOR-FORMAT SEED: it never restores, its original bytes are
+// preserved in place for rollback, and a copy is quarantined under the
+// `.symforge/v11/` migration namespace (see `try_quarantine_v10_seed`).
+const CURRENT_VERSION: u32 = 8;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -863,6 +868,12 @@ pub enum ArtifactGitVisibility {
     AlreadyTracked,
     UntrackedVisible,
     IgnoredForceAddRequired,
+    // Deliberately KEEPS the long identifier the dark-model enum in
+    // snapshot.rs renamed away: here `rename_all = "snake_case"` derives the
+    // frozen FR-051 wire label "git_visibility_unavailable" FROM the
+    // identifier, so renaming it would break the artifact-metadata format.
+    // (`enum_variant_names` does not fire — no stutter against
+    // `ArtifactGitVisibility`.)
     GitVisibilityUnavailable,
 }
 
@@ -1075,8 +1086,27 @@ fn ensure_gitattributes_merge_hint(project_root: &Path) -> anyhow::Result<()> {
     }
     updated.push_str(HINT_LINE);
     updated.push('\n');
-    std::fs::write(&path, updated)
-        .map_err(|e| anyhow::anyhow!("writing .gitattributes at {}: {}", path.display(), e))?;
+    // V11 writer lane (Feature 020 Slice 4, T064): `.gitattributes` is a
+    // repository-source byte write and routes through a SourceMutationPermit.
+    // The sibling artifact writes in this export lane (`index.bin.zst`,
+    // `artifact.json`) are post-image team-artifact STATE writes and stay
+    // permit-free per the frozen retirement contract.
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(project_root);
+    let mut write = authority.acquire_write_serialized().map_err(|refusal| {
+        anyhow::anyhow!("acquiring write authority for .gitattributes: {refusal:?}")
+    })?;
+    let receipt = write
+        .write(Path::new(".gitattributes"), updated.as_bytes())
+        .map_err(|refusal| {
+            anyhow::anyhow!("writing .gitattributes at {}: {refusal:?}", path.display())
+        })?;
+    write.finish_committed(receipt).map_err(|refusal| {
+        anyhow::anyhow!(
+            "committing .gitattributes at {}: {refusal:?}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1731,6 +1761,93 @@ fn quarantine_bad_snapshot_locked(
     Ok(quarantine_path)
 }
 
+/// Frozen 020:T065 (the live wiring): quarantine a PRIOR-format (V10) seed
+/// under the `.symforge/v11/` migration namespace, PRESERVING the original
+/// file — the legacy store is the rollback artifact and an 11.x process
+/// never destroys it. Dedupes by content digest so repeated starts against
+/// the same seed do not accumulate copies. Metadata carries structure only
+/// (paths, digest, reason), never file content beyond the seed copy itself.
+fn try_quarantine_v10_seed(
+    state_dir: &ProjectStateDir,
+    snapshot_path: &Path,
+    bytes: &[u8],
+    detail: String,
+) {
+    let dir = state_dir
+        .as_path()
+        .join("v11")
+        .join("quarantine")
+        .join("index-snapshots");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(
+            path = %snapshot_path.display(),
+            "failed to create v11 seed quarantine directory {}: {error}",
+            dir.display()
+        );
+        return;
+    }
+    let hash = crate::hash::digest_hex(bytes);
+    let hash_marker = format!("-{}-", &hash[..16]);
+    let already_quarantined = std::fs::read_dir(&dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(&hash_marker))
+    });
+    if already_quarantined {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let name = format!(
+        "{}-{:09}-{}-v10-format-seed",
+        now.as_secs(),
+        now.subsec_nanos(),
+        &hash[..16]
+    );
+    let quarantine_path = dir.join(format!("{name}.bin"));
+    let metadata_path = dir.join(format!("{name}.json"));
+    if let Err(error) = std::fs::write(&quarantine_path, bytes) {
+        warn!(
+            path = %snapshot_path.display(),
+            "failed to write v10 seed quarantine copy at {}: {error}",
+            quarantine_path.display()
+        );
+        return;
+    }
+    let metadata = serde_json::json!({
+        "source_path": snapshot_path.to_string_lossy(),
+        "quarantine_path": quarantine_path.to_string_lossy(),
+        "reason": "v10-format-seed",
+        "detail": detail,
+        "sha256": hash,
+        "bytes": bytes.len(),
+        "original_preserved": true,
+        "quarantined_at_unix_seconds": now.as_secs(),
+        "quarantined_at_unix_nanos": now.subsec_nanos(),
+    });
+    match serde_json::to_vec_pretty(&metadata) {
+        Ok(metadata_bytes) => {
+            if let Err(error) = std::fs::write(&metadata_path, metadata_bytes) {
+                warn!(
+                    path = %snapshot_path.display(),
+                    "failed to write v10 seed quarantine metadata at {}: {error}",
+                    metadata_path.display()
+                );
+            }
+        }
+        Err(error) => warn!(
+            path = %snapshot_path.display(),
+            "failed to serialize v10 seed quarantine metadata: {error}"
+        ),
+    }
+    warn!(
+        path = %snapshot_path.display(),
+        quarantine_path = %quarantine_path.display(),
+        "prior-format V10 snapshot preserved in place and copied to v11 quarantine; rebuilding"
+    );
+}
+
 fn try_quarantine_bad_snapshot(
     state_dir: &ProjectStateDir,
     snapshot_path: &Path,
@@ -1805,6 +1922,26 @@ pub fn load_snapshot(
     };
 
     if snapshot.version != CURRENT_VERSION {
+        if snapshot.version < CURRENT_VERSION {
+            // Frozen 020:T065: a prior-format (V10) snapshot is an untrusted
+            // seed — it confers no authority under V11, its original bytes
+            // stay in place as the rollback artifact, and a copy lands in the
+            // `.symforge/v11/` migration quarantine. Rebuild fallback follows.
+            warn!(
+                "index snapshot carries retired format {} (current {}) — preserved as V10 seed, will re-index",
+                snapshot.version, CURRENT_VERSION
+            );
+            try_quarantine_v10_seed(
+                state_dir,
+                &path,
+                &bytes,
+                format!(
+                    "snapshot format {}, current {}",
+                    snapshot.version, CURRENT_VERSION
+                ),
+            );
+            return None;
+        }
         warn!(
             "index snapshot version mismatch: got {}, expected {} — will re-index",
             snapshot.version, CURRENT_VERSION
@@ -2358,30 +2495,52 @@ pub async fn background_verify(
     index: crate::live_index::store::SharedIndex,
     root: std::path::PathBuf,
     snapshot_mtimes: HashMap<String, u64>,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
 ) {
-    background_verify_with_hook(index, root, snapshot_mtimes, || {}).await;
+    background_verify_with_hook(index, root, snapshot_mtimes, observer, || {}).await;
 }
 
+/// `Some(true)` — the path was actually removed (publish it, observe it).
+/// `Some(false)` — nothing held the path; already reconciled, no removal to
+/// observe or publish. `None` — a fence rejected the removal; abort the pass.
+/// T038 round-1 (D14 family): the caller must not observe a removal that did
+/// not happen — the same rule already applied to the watcher and embed
+/// lanes.
 fn remove_snapshot_deleted_file_if_still_absent(
     index: &crate::live_index::store::SharedIndex,
     root: &Path,
     path: &str,
     expected: crate::live_index::store::PublicationFence,
-) -> bool {
+) -> Option<bool> {
     let absolute_path = root.join(path);
-    index
-        .remove_file_if_absent_at_publication_fence_with_receipt(path, &absolute_path, expected)
-        .is_some()
+    match index.remove_file_if_absent_at_publication_fence_with_receipt(
+        path,
+        &absolute_path,
+        expected,
+    ) {
+        crate::live_index::store::FencedRemoval::Removed(_) => Some(true),
+        crate::live_index::store::FencedRemoval::NothingHeld => Some(false),
+        crate::live_index::store::FencedRemoval::Rejected => None,
+    }
 }
 
 async fn background_verify_with_hook<F>(
     index: crate::live_index::store::SharedIndex,
     root: std::path::PathBuf,
     snapshot_mtimes: HashMap<String, u64>,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
     after_fence: F,
 ) where
     F: FnOnce(),
 {
+    // V11 observation lane (Feature 020 Slice 4, T064/T065, C3b): this
+    // callback carries the observer incarnation current at its SPAWN. Every
+    // re-admission and removal below is observed under that incarnation; a
+    // successor registration (watcher (re)start) makes the carried id stale
+    // and the lane refuses it — late V10 callbacks are unreachable in the
+    // authority lane — while the V10 data-plane reconciliation continues
+    // under its own publication fences (recorded residual until C4 gates it).
+    let authority = crate::live_index::index_lifecycle::activation::project_source_authority(&root);
     let captured_base = index.publication_fence();
     after_fence();
     let Some(mut commit_fence) = index.mark_snapshot_verify_running_at_fence(captured_base) else {
@@ -2404,10 +2563,22 @@ async fn background_verify_with_hook<F>(
     // 2. Remove deleted files
     if !stat_result.deleted.is_empty() {
         for path in &stat_result.deleted {
-            if !remove_snapshot_deleted_file_if_still_absent(&index, &root, path, commit_fence) {
-                return;
+            match remove_snapshot_deleted_file_if_still_absent(&index, &root, path, commit_fence) {
+                Some(true) => {
+                    if let Err(active) = authority.observe_removal(observer, path) {
+                        tracing::debug!(
+                            ?observer,
+                            ?active,
+                            %path,
+                            "stale verify incarnation: removal observation refused"
+                        );
+                    }
+                    commit_fence = index.publication_fence();
+                }
+                // Already reconciled: nothing published, nothing to observe.
+                Some(false) => {}
+                None => return,
             }
-            commit_fence = index.publication_fence();
         }
     }
 
@@ -2449,8 +2620,17 @@ async fn background_verify_with_hook<F>(
                 &index,
                 expected_gen,
             ) {
-                crate::watcher::ReindexResult::Reindexed
-                | crate::watcher::ReindexResult::HashSkip => {}
+                crate::watcher::ReindexResult::Reindexed => {
+                    if let Err(active) = authority.observe_admission(observer, rel_path) {
+                        tracing::debug!(
+                            ?observer,
+                            ?active,
+                            %rel_path,
+                            "stale verify incarnation: admission observation refused"
+                        );
+                    }
+                }
+                crate::watcher::ReindexResult::HashSkip => {}
                 _ => unreconciled.push(rel_path.clone()),
             }
             if index.current_project_generation() != expected_gen {
@@ -2484,8 +2664,17 @@ async fn background_verify_with_hook<F>(
                 &index,
                 expected_gen,
             ) {
-                crate::watcher::ReindexResult::Reindexed
-                | crate::watcher::ReindexResult::HashSkip => {}
+                crate::watcher::ReindexResult::Reindexed => {
+                    if let Err(active) = authority.observe_admission(observer, rel_path) {
+                        tracing::debug!(
+                            ?observer,
+                            ?active,
+                            %rel_path,
+                            "stale verify incarnation: admission observation refused"
+                        );
+                    }
+                }
+                crate::watcher::ReindexResult::HashSkip => {}
                 // Same reasoning as the changed/new loop above: a spot-check
                 // mismatch whose re-parse did not land is still a mismatch.
                 _ => unreconciled.push(rel_path.clone()),
@@ -2542,6 +2731,13 @@ async fn background_verify_with_hook<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The incarnation a production spawn site would carry: whatever observer
+    /// is active on this root's authority at spawn time.
+    fn verify_observer(root: &Path) -> crate::live_index::index_lifecycle::observer::ObserverId {
+        crate::live_index::index_lifecycle::activation::project_source_authority(root)
+            .active_observer()
+    }
     use crate::domain::{
         AccessErrorKind, CapabilityStatus, CapabilityUnavailableReason, CatalogEntry, CatalogPath,
         FileDisposition, HardSkipReason, IndexTargets, LanguageId, MetadataOnlyReason,
@@ -2561,6 +2757,38 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/git/test_helpers.rs"
         ));
+    }
+
+    /// Feature 020 Slice 4, T064 (writers lane): the `.gitattributes` merge
+    /// hint is a repository-source byte write and must route through the
+    /// source mutation permit. The sibling artifact writes in the same export
+    /// lane are post-image team-artifact STATE writes and stay permit-free
+    /// per the frozen retirement contract.
+    #[test]
+    fn gitattributes_merge_hint_routes_through_the_source_mutation_permit() {
+        let dir = tempfile::TempDir::new().expect("fixture root");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let before = authority.grants_issued();
+
+        super::ensure_gitattributes_merge_hint(dir.path()).expect("hint write");
+
+        let written = std::fs::read_to_string(dir.path().join(".gitattributes")).expect("read");
+        assert!(
+            written
+                .lines()
+                .any(|line| line.trim() == "*.zst merge=ours")
+        );
+        assert_eq!(
+            authority.grants_issued(),
+            before + 1,
+            "the hint append must obtain a SourceMutationPermit"
+        );
+        assert!(authority.is_current());
+
+        // Idempotent second call: hint already present, no write, no grant.
+        super::ensure_gitattributes_merge_hint(dir.path()).expect("idempotent");
+        assert_eq!(authority.grants_issued(), before + 1);
     }
 
     /// Task #22 (embed snapshot export): the one-argument embedder entry
@@ -3059,7 +3287,13 @@ mod tests {
         assert_eq!(before.partial_parse_count, 0);
         assert_eq!(before.failed_count, 0);
 
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let guard = shared.read();
         assert_eq!(guard.load_source(), IndexLoadSource::SnapshotRestore);
@@ -3116,12 +3350,81 @@ mod tests {
         );
         assert!(!before_ready.authority.records.is_empty());
 
-        background_verify(restored.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            restored.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         assert!(restored.read().is_ready());
         let ready = restored.published_generation();
         assert_eq!(ready.authority.versions, before_ready.authority.versions);
         assert_eq!(ready.authority.records, before_ready.authority.records);
+    }
+
+    /// Feature 020 Slice 4, T064/T065 (callbacks, C3b): the background verify
+    /// callback carries the observer incarnation current at its spawn. Its
+    /// per-file re-admissions are observed under that incarnation, and a
+    /// SUCCESSOR incarnation makes the carried id stale — the late callback's
+    /// observations are refused (unreachable in the authority lane) while the
+    /// V10 data plane still reconciles (recorded residual until C4 gates it).
+    /// Server-only: the re-parse loops are the watcher admission path.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn background_verify_observes_admissions_under_the_carried_incarnation() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("src").join("fresh.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"pub fn fresh() {}\n").unwrap();
+
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(tmp.path());
+        let observer = authority.register_observer();
+        let before = authority.committed_observations("src/fresh.rs");
+
+        let shared =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            observer,
+        )
+        .await;
+        assert!(
+            shared.read().files.contains_key("src/fresh.rs"),
+            "the new file must be re-indexed by the verify sweep"
+        );
+        assert_eq!(
+            authority.committed_observations("src/fresh.rs"),
+            before + 1,
+            "a verify re-admission must be observed under the carried incarnation"
+        );
+
+        std::fs::write(&file_path, b"pub fn fresh() { let _ = 1; }\n").unwrap();
+        let _successor = authority.register_observer();
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            observer,
+        )
+        .await;
+        assert!(
+            shared
+                .read()
+                .files
+                .get("src/fresh.rs")
+                .is_some_and(|file| file.content == b"pub fn fresh() { let _ = 1; }\n"),
+            "the stale-incarnation sweep still reconciles the data plane (C4 residual)"
+        );
+        assert_eq!(
+            authority.committed_observations("src/fresh.rs"),
+            before + 1,
+            "a stale incarnation must not land observations"
+        );
     }
 
     // Server-only: exercises the watcher admission reparse path, which the embed
@@ -3140,7 +3443,13 @@ mod tests {
 
         let shared =
             crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
-        background_verify(shared.clone(), tmp.path().to_path_buf(), HashMap::new()).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let guard = shared.read();
         assert!(
@@ -3285,7 +3594,13 @@ mod tests {
         crate::watcher::reconcile_stale_files(tmp.path(), &reconcile);
 
         let background = make_empty_shared();
-        background_verify(background.clone(), tmp.path().to_path_buf(), HashMap::new()).await;
+        background_verify(
+            background.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let expected = capture(&cold);
         assert_eq!(capture(&watch), expected);
@@ -3306,17 +3621,23 @@ mod tests {
         let initial_project_generation = shared.current_project_generation();
         let reset_publication_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        background_verify_with_hook(shared.clone(), tmp.path().to_path_buf(), HashMap::new(), {
-            let shared = shared.clone();
-            let reset_publication_generation = reset_publication_generation.clone();
-            move || {
-                shared.reset_to_empty();
-                reset_publication_generation.store(
-                    shared.published_state().generation,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }
-        })
+        background_verify_with_hook(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+            {
+                let shared = shared.clone();
+                let reset_publication_generation = reset_publication_generation.clone();
+                move || {
+                    shared.reset_to_empty();
+                    reset_publication_generation.store(
+                        shared.published_state().generation,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -3348,35 +3669,43 @@ mod tests {
         let watcher_publication = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watcher_content = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        background_verify_with_hook(shared.clone(), tmp.path().to_path_buf(), HashMap::new(), {
-            let shared = shared.clone();
-            let watcher_publication = watcher_publication.clone();
-            let watcher_content = watcher_content.clone();
-            move || {
-                let watcher_index =
-                    make_live_index_with_files(vec![("src/watcher.rs", b"fn watcher_won() {}\n")]);
-                let indexed = watcher_index
-                    .files
-                    .get("src/watcher.rs")
-                    .expect("watcher fixture")
-                    .as_ref()
-                    .clone();
-                assert!(shared.update_file_at_generation(
-                    "src/watcher.rs",
-                    indexed,
-                    base_project_generation,
-                ));
-                let watcher = shared.published_generation();
-                watcher_publication.store(
-                    watcher.publication_generation,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-                watcher_content.store(
-                    watcher.content_generation,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }
-        })
+        background_verify_with_hook(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            HashMap::new(),
+            verify_observer(tmp.path()),
+            {
+                let shared = shared.clone();
+                let watcher_publication = watcher_publication.clone();
+                let watcher_content = watcher_content.clone();
+                move || {
+                    let watcher_index = make_live_index_with_files(vec![(
+                        "src/watcher.rs",
+                        b"fn watcher_won() {}\n",
+                    )]);
+                    let indexed = watcher_index
+                        .files
+                        .get("src/watcher.rs")
+                        .expect("watcher fixture")
+                        .as_ref()
+                        .clone();
+                    assert!(shared.update_file_at_generation(
+                        "src/watcher.rs",
+                        indexed,
+                        base_project_generation,
+                    ));
+                    let watcher = shared.published_generation();
+                    watcher_publication.store(
+                        watcher.publication_generation,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    watcher_content.store(
+                        watcher.content_generation,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            },
+        )
         .await;
 
         let current = shared.published_generation();
@@ -3422,7 +3751,13 @@ mod tests {
         assert_eq!(before.failed_count, 0);
 
         std::fs::remove_file(&file_path).expect("remove indexed file");
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let published = shared.published_state();
         assert!(
@@ -3457,18 +3792,59 @@ mod tests {
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         std::fs::write(&file_path, b"fn recreated() {}\n").unwrap();
 
-        assert!(
-            !remove_snapshot_deleted_file_if_still_absent(
+        assert_eq!(
+            remove_snapshot_deleted_file_if_still_absent(
                 &shared,
                 tmp.path(),
                 relative_path,
                 absence_fence,
             ),
+            None,
             "a disk recreation after stat must reject snapshot cleanup"
         );
         assert!(
             shared.read().get_file(relative_path).is_some(),
             "the last-valid indexed entry must survive the rejected removal"
+        );
+    }
+
+    /// T038 round-1 (A-W5): the caller must be able to tell "actually
+    /// removed" from "nothing was held" — a path never indexed and never on
+    /// disk confirms absence but has no removal to observe or publish.
+    #[test]
+    fn background_verify_deleted_file_removal_distinguishes_removed_from_nothing_held() {
+        let tmp = TempDir::new().unwrap();
+        let held_path = "src/main.rs";
+        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
+            vec![(held_path, b"fn before() {}\n")],
+        ));
+        let fence = shared.publication_fence();
+
+        assert_eq!(
+            remove_snapshot_deleted_file_if_still_absent(&shared, tmp.path(), held_path, fence),
+            Some(true),
+            "a held path confirmed absent must be REMOVED and observed"
+        );
+        let after_removal = shared.publication_fence();
+        assert!(
+            after_removal != fence,
+            "an actual removal must publish (the fence must move)"
+        );
+
+        assert_eq!(
+            remove_snapshot_deleted_file_if_still_absent(
+                &shared,
+                tmp.path(),
+                "src/never_held.rs",
+                after_removal,
+            ),
+            Some(false),
+            "a never-held path has nothing to remove — NothingHeld, not Removed"
+        );
+        assert_eq!(
+            shared.publication_fence(),
+            after_removal,
+            "a NothingHeld outcome must not publish"
         );
     }
 
@@ -3501,7 +3877,13 @@ mod tests {
         let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let shared = crate::live_index::SharedIndexHandle::shared(loaded);
 
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let published = shared.published_state();
         match &published.snapshot_verify_state {
@@ -3555,7 +3937,13 @@ mod tests {
         let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let shared = crate::live_index::SharedIndexHandle::shared(loaded);
 
-        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
 
         let published = shared.published_state();
         match &published.snapshot_verify_state {
@@ -3773,10 +4161,16 @@ mod tests {
     // Tripwire: bumping the persisted-index format version MUST be a deliberate
     // decision. If this assertion fails, the format is changing — stop and
     // escalate per `.octogent/tentacles/live-index/CONTEXT.md` §No-surprise rule.
+    //
+    // 7 → 8 (Feature 020 Slice 4 activation cut): the deliberate, frozen
+    // decision is 020:T065 ("Bump the snapshot format ... in
+    // src/live_index/persist.rs"). Format-7 files are preserved V10 seeds —
+    // never restored, never destroyed
+    // (`a_v10_format_snapshot_is_a_preserved_seed_never_authority`).
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 7,
+            CURRENT_VERSION, 8,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );
@@ -4102,6 +4496,94 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&quarantine_metadata[0]).unwrap()).unwrap();
         assert_eq!(metadata["reason"], "version-mismatch");
         assert_eq!(metadata["sha256"], crate::hash::digest_hex(&bytes));
+    }
+
+    /// Feature 020 Slice 4 (frozen 020:T065, the live wiring): a snapshot
+    /// carrying the RETIRED V10 on-disk format is an untrusted seed, never
+    /// authority. V11 must refuse to restore it, quarantine a COPY under the
+    /// `.symforge/v11/` migration namespace, and PRESERVE the original file —
+    /// the legacy store is the rollback artifact and an 11.x process never
+    /// destroys it. The rebuild fallback proceeds (load returns `None`), and
+    /// repeated starts do not accumulate duplicate quarantine copies.
+    #[test]
+    fn a_v10_format_snapshot_is_a_preserved_seed_never_authority() {
+        let tmp = TempDir::new().unwrap();
+        let mut snapshot = build_snapshot(
+            super::capture_snapshot_build_input(&make_live_index_with_files(Vec::new())),
+            tmp.path(),
+        );
+        // The V10 wire format id. The payload is byte-compatible by
+        // construction here; the FORMAT is what retires the seed.
+        snapshot.version = 7;
+        let bytes = postcard::to_stdvec(&snapshot).unwrap();
+        let dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.bin"), &bytes).unwrap();
+
+        let result = load_snapshot(tmp.path());
+        assert!(
+            result.is_none(),
+            "a V10-format snapshot must not restore under V11"
+        );
+
+        assert_eq!(
+            std::fs::read(dir.join("index.bin")).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "the V10 original must be PRESERVED for rollback, not destroyed"
+        );
+
+        let v11_quarantine = dir.join("v11").join("quarantine").join("index-snapshots");
+        let quarantined: Vec<PathBuf> = std::fs::read_dir(&v11_quarantine)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bin"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the seed must be quarantined (as a copy) under the v11 migration namespace"
+        );
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            bytes,
+            "the quarantined copy must hold the original seed bytes"
+        );
+
+        // A second start observes the same seed: no restore, no duplicate
+        // quarantine copy, original still intact.
+        assert!(load_snapshot(tmp.path()).is_none());
+        let after_second: usize = std::fs::read_dir(&v11_quarantine)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bin"))
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            after_second, 1,
+            "repeated starts must not accumulate duplicate seed quarantine copies"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("index.bin")).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "the original must survive repeated starts"
+        );
+
+        // Positive control: a CURRENT-format snapshot restores.
+        let current = build_snapshot(
+            super::capture_snapshot_build_input(&make_live_index_with_files(Vec::new())),
+            tmp.path(),
+        );
+        let current_bytes = postcard::to_stdvec(&current).unwrap();
+        std::fs::write(dir.join("index.bin"), &current_bytes).unwrap();
+        assert!(
+            load_snapshot(tmp.path()).is_some(),
+            "control: a current-format snapshot must restore"
+        );
     }
 
     #[test]

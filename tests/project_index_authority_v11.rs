@@ -15,7 +15,7 @@ use symforge::live_index::index_lifecycle::authority::{
     SourceRuntime,
 };
 use symforge::live_index::index_lifecycle::mutation::{
-    NoSideEffectProof, PermitDrainSignal, SourceMutationPermit, Termination,
+    PermitDrainSignal, SourceMutationPermit, Termination,
 };
 use symforge::live_index::index_lifecycle::physical_root::PhysicalRootLease;
 use symforge::live_index::index_lifecycle::transition::{self, TransitionKind, TransitionStep};
@@ -113,7 +113,7 @@ fn mutation_authority_is_exact_and_terminal() {
             .start_side_effect()
             .expect_err("terminal refuses restart"),
         permit
-            .no_side_effect(NoSideEffectProof::observed())
+            .no_side_effect()
             .expect_err("terminal refuses a second termination"),
     ] {
         assert_eq!(refusal, AuthorityRefusal::PermitAlreadyTerminal);
@@ -665,7 +665,7 @@ fn a_permit_is_terminal_once_it_ends() {
 
     // Positive: the declared terminal path works once.
     let ticket = permit
-        .no_side_effect(NoSideEffectProof::observed())
+        .no_side_effect()
         .expect("a granted permit may terminate with no side effect");
     assert_eq!(ticket.termination(), Termination::NoSideEffect);
     assert!(permit.is_terminal());
@@ -680,7 +680,7 @@ fn a_permit_is_terminal_once_it_ends() {
     );
     assert_eq!(
         permit
-            .no_side_effect(NoSideEffectProof::observed())
+            .no_side_effect()
             .expect_err("a terminal permit must refuse a second termination"),
         AuthorityRefusal::PermitAlreadyTerminal
     );
@@ -716,9 +716,16 @@ fn a_root_a_permit_cannot_write_after_root_b_is_installed() {
     permit
         .start_side_effect()
         .expect("a permit on the installed root may act");
-    permit
-        .no_side_effect(NoSideEffectProof::observed())
-        .expect("permit terminates");
+    // A begun side effect can no longer be attested away (the permit itself
+    // observes no-side-effect now); the honest terminal for an act-then-stop
+    // permit with no receipt is the drain path.
+    assert_eq!(
+        permit
+            .no_side_effect()
+            .expect_err("a begun side effect refuses the no-op attestation"),
+        AuthorityRefusal::SideEffectAlreadyInFlight
+    );
+    drop(permit);
 
     // Install root B through the writer-validated transition. The permit ended
     // above; retiring it is the caller obligation Slice 4's writer lane takes on.

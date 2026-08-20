@@ -282,7 +282,14 @@ jobs:
         run: bash execution/clone_phase0_corpora.sh
 
       - name: Run Rust tests
-        run: cargo test --all-targets -- --test-threads=1
+        # `--lib --bins --tests`, not `--all-targets`: the trailing libtest
+        # flag is forwarded to EVERY selected binary, and the criterion
+        # bench target (harness = false, T068) rejects `--test-threads`.
+        # The bench's own smoke gate runs it in criterion's --test mode.
+        run: cargo test --lib --bins --tests -- --test-threads=1
+
+      - name: Smoke the observed-refresh benchmark (criterion --test mode)
+        run: cargo bench --bench observed_refresh_gate_v1 -- --test
 
       - name: Build release binary on main pushes
         run: cargo build --release

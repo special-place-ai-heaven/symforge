@@ -2,7 +2,7 @@
 //!
 //! All handlers follow this contract:
 //!  - Accept `State(state): State<SidecarState>` plus optional `Query(params)`.
-//!  - Acquire `state.index.read()`, extract owned data, drop the guard, then return text or Json.
+//!  - Acquire `state.index.data_plane().read()`, extract owned data, drop the guard, then return text or Json.
 //!  - Never hold a `RwLockReadGuard` across an `.await` point.
 //!  - On file not found: return `StatusCode::NOT_FOUND`.
 
@@ -260,7 +260,20 @@ fn freshen_sidecar_path_if_stale_at_generation(
     let Ok(abs_path) = safe_sidecar_path_for_freshen(repo_root, relative_path) else {
         return Ok(ContextSourceAuthority::CurrentIndex);
     };
-    match watcher::freshen_file_if_stale(relative_path, &abs_path, &state.index, expected_gen) {
+    // V11 observation lane (C4c): a request-path freshen re-admission
+    // observes under the incarnation current at call time — the handler
+    // holds no id across time, so it cannot be a late callback.
+    let authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
+    let observer = authority.active_observer();
+    match watcher::freshen_file_if_stale(
+        relative_path,
+        &abs_path,
+        state.index.data_plane(),
+        expected_gen,
+        &authority,
+        observer,
+    ) {
         watcher::FreshenResult::Fresh => Ok(ContextSourceAuthority::CurrentIndex),
         watcher::FreshenResult::StaleReindexed => Ok(ContextSourceAuthority::DiskRefreshed),
         watcher::FreshenResult::StaleRemoved => Ok(ContextSourceAuthority::DiskRefreshed),
@@ -344,7 +357,7 @@ pub async fn caller_root_guard(
     if path != "/health"
         && path != "/stats"
         && let Some(caller_root) = query_param(request.uri().query(), "caller_root")
-        && let Some(indexed_root) = state.index.read().indexed_root.clone()
+        && let Some(indexed_root) = state.index.data_plane().read().indexed_root.clone()
         && !roots_match(std::path::Path::new(&caller_root), &indexed_root)
     {
         return (
@@ -405,7 +418,7 @@ pub(crate) fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -
 pub async fn health_handler(
     State(state): State<SidecarState>,
 ) -> Result<Json<HealthResponse>, StatusCode> {
-    let published = state.index.published_state();
+    let published = state.index.data_plane().published_state();
 
     let uptime_secs = published
         .loaded_at_system
@@ -485,9 +498,9 @@ fn published_matches_sidecar_fence(
 }
 
 fn require_queryable_sidecar_index(state: &SidecarState) -> Result<SidecarQueryFence, StatusCode> {
-    let published = state.index.published_generation();
+    let published = state.index.data_plane().published_generation();
     if published_sidecar_index_is_queryable(&published)
-        && state.index.current_project_generation() == published.project_generation
+        && state.index.data_plane().current_project_generation() == published.project_generation
     {
         let fence = sidecar_query_fence_for(&published).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         if state
@@ -507,9 +520,9 @@ fn capture_queryable_sidecar_generation(
     state: &SidecarState,
     fence: &SidecarQueryFence,
 ) -> Result<std::sync::Arc<crate::live_index::PublishedGeneration>, StatusCode> {
-    let published = state.index.published_generation();
+    let published = state.index.data_plane().published_generation();
     if published_matches_sidecar_query(&published, fence)
-        && state.index.current_project_generation() == published.project_generation
+        && state.index.data_plane().current_project_generation() == published.project_generation
     {
         Ok(published)
     } else {
@@ -521,9 +534,9 @@ fn capture_sidecar_generation_at_fence(
     state: &SidecarState,
     fence: &SidecarQueryFence,
 ) -> Result<std::sync::Arc<crate::live_index::PublishedGeneration>, StatusCode> {
-    let published = state.index.published_generation();
+    let published = state.index.data_plane().published_generation();
     if published_matches_sidecar_fence(&published, fence)
-        && state.index.current_project_generation() == published.project_generation
+        && state.index.data_plane().current_project_generation() == published.project_generation
     {
         Ok(published)
     } else {
@@ -544,7 +557,7 @@ fn ensure_symbol_cache_generation(
     state: &SidecarState,
     expected_generation: u64,
 ) -> Result<(), StatusCode> {
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let identity = std::sync::Arc::as_ptr(&state.symbol_cache) as usize;
@@ -575,7 +588,7 @@ fn ensure_symbol_cache_generation(
             );
         }
     }
-    if state.index.current_project_generation() == expected_generation {
+    if state.index.data_plane().current_project_generation() == expected_generation {
         Ok(())
     } else {
         state.symbol_cache.write().clear();
@@ -591,7 +604,7 @@ fn cached_symbols_at_generation(
 ) -> Result<Option<Vec<SymbolSnapshot>>, StatusCode> {
     ensure_symbol_cache_generation(state, expected_generation)?;
     let cache = state.symbol_cache.read();
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         drop(cache);
         state.symbol_cache.write().clear();
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -607,12 +620,12 @@ fn store_cached_symbols_at_generation(
 ) -> Result<(), StatusCode> {
     ensure_symbol_cache_generation(state, expected_generation)?;
     let mut cache = state.symbol_cache.write();
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         cache.clear();
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     cache.insert(path.to_string(), symbols);
-    if state.index.current_project_generation() == expected_generation {
+    if state.index.data_plane().current_project_generation() == expected_generation {
         Ok(())
     } else {
         cache.clear();
@@ -1030,7 +1043,7 @@ pub async fn impact_handler(
     Query(params): Query<ImpactParams>,
 ) -> Result<String, StatusCode> {
     let fence = require_queryable_sidecar_index(&state)?;
-    let impact_index = state.index.clone();
+    let impact_index = state.index.data_plane().clone();
     let _impact_guard = impact_index.lock_impact_analysis().await;
     capture_queryable_sidecar_generation(&state, &fence)?;
     let result = impact_hook_text(state.clone(), &params, &fence).await;
@@ -1064,9 +1077,9 @@ pub(crate) async fn impact_tool_text(
     state: SidecarState,
     params: &ImpactParams,
 ) -> Result<ImpactToolOutput, StatusCode> {
-    let impact_index = state.index.clone();
+    let impact_index = state.index.data_plane().clone();
     let _impact_guard = impact_index.lock_impact_analysis().await;
-    let published = state.index.published_generation();
+    let published = state.index.data_plane().published_generation();
     let expected_generation = published.project_generation;
     let root = match published.live.indexed_root.clone() {
         Some(root) => root,
@@ -1081,7 +1094,7 @@ pub(crate) async fn impact_tool_text(
         published,
     )
     .await;
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     result
@@ -1114,7 +1127,7 @@ async fn impact_text(
     expected_generation: u64,
     baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
 ) -> Result<ImpactToolOutput, StatusCode> {
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let requested = std::path::Path::new(&params.path);
@@ -1151,7 +1164,7 @@ async fn impact_text(
         // same way discovery admits them.
         let is_supported = crate::domain::LanguageId::from_path(&normalized_path).is_some();
         let indexed = {
-            let guard = state.index.read();
+            let guard = state.index.data_plane().read();
             guard.get_file(&normalized_path).is_some()
         };
         is_supported && !indexed && root.join(&normalized_path).is_file()
@@ -1269,12 +1282,12 @@ async fn handle_new_file_impact(
     expected_generation: u64,
     baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
 ) -> Result<ImpactToolOutput, StatusCode> {
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let abs_path = root.join(path);
     let path_owned = path.to_string();
-    let index = state.index.clone();
+    let index = state.index.data_plane().clone();
     let receipt = tokio::task::spawn_blocking(move || {
         crate::watcher::admit_and_index_single_path_with_receipt(
             &path_owned,
@@ -1286,7 +1299,7 @@ async fn handle_new_file_impact(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -1303,7 +1316,7 @@ async fn handle_new_file_impact(
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
         crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
-            if state.index.publication_fence() != receipt.observed_at {
+            if state.index.data_plane().publication_fence() != receipt.observed_at {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
             return Err(StatusCode::NOT_FOUND);
@@ -1362,6 +1375,7 @@ async fn handle_new_file_impact(
         let replacement = crate::live_index::store::PublicationFence::from_published(published);
         let _ = state
             .index
+            .data_plane()
             .take_pre_update_snapshot_for_publication_at_generation(
                 path,
                 expected_generation,
@@ -1433,7 +1447,7 @@ async fn handle_edit_impact(
     expected_generation: u64,
     baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
 ) -> Result<ImpactToolOutput, StatusCode> {
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     // Get pre-edit symbols and bytes from the exact index-owned baseline first.
@@ -1447,8 +1461,9 @@ async fn handle_edit_impact(
     // still needs the pre-edit baseline for an accurate diff.
     let pre_update = state
         .index
+        .data_plane()
         .peek_pre_update_snapshot_at_generation(path, expected_generation);
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let pre_snapshot_replacement = pre_update.as_ref().map(|(_, replacement)| *replacement);
@@ -1465,7 +1480,7 @@ async fn handle_edit_impact(
                 })
                 .collect();
             (symbols, Some(pre.content))
-        } else if let Some(file) = state.index.read().get_file(path).cloned() {
+        } else if let Some(file) = state.index.data_plane().read().get_file(path).cloned() {
             let symbols = file
                 .symbols
                 .iter()
@@ -1491,7 +1506,7 @@ async fn handle_edit_impact(
 
     let abs_path = root.join(path);
     let path_owned = path.to_string();
-    let index = state.index.clone();
+    let index = state.index.data_plane().clone();
     let receipt = tokio::task::spawn_blocking(move || {
         crate::watcher::admit_and_index_single_path_with_receipt(
             &path_owned,
@@ -1503,7 +1518,7 @@ async fn handle_edit_impact(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if state.index.current_project_generation() != expected_generation {
+    if state.index.data_plane().current_project_generation() != expected_generation {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -1564,7 +1579,7 @@ async fn handle_edit_impact(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     if post_generation.project_generation != expected_generation
-        || state.index.current_project_generation() != expected_generation
+        || state.index.data_plane().current_project_generation() != expected_generation
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1590,6 +1605,7 @@ async fn handle_edit_impact(
             crate::live_index::store::PublicationFence::from_published(post_generation);
         let _ = state
             .index
+            .data_plane()
             .take_pre_update_snapshot_for_publication_at_generation(
                 path,
                 expected_generation,
@@ -1600,6 +1616,7 @@ async fn handle_edit_impact(
     {
         let _ = state
             .index
+            .data_plane()
             .take_pre_update_snapshot_for_publication_at_generation(
                 path,
                 expected_generation,
@@ -3281,7 +3298,9 @@ mod tests {
     fn make_state(files: Vec<(&str, IndexedFile)>) -> SidecarState {
         let root = GENERIC_TEST_ROOT.path().to_path_buf();
         SidecarState {
-            index: build_shared_index(&root, files),
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                build_shared_index(&root, files),
+            ),
             token_stats: TokenStats::new(),
             repo_root: None,
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -3297,7 +3316,9 @@ mod tests {
             }
         }
         SidecarState {
-            index,
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                index,
+            ),
             token_stats: TokenStats::new(),
             repo_root: None,
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -3309,7 +3330,9 @@ mod tests {
         repo_root: std::path::PathBuf,
     ) -> SidecarState {
         SidecarState {
-            index: build_shared_index(&repo_root, files),
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                build_shared_index(&repo_root, files),
+            ),
             token_stats: TokenStats::new(),
             repo_root: Some(repo_root),
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -3329,7 +3352,9 @@ mod tests {
         let stale_gen = index.current_project_generation();
         index.reload(project_b.path()).unwrap();
         let state = SidecarState {
-            index,
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                index,
+            ),
             token_stats: TokenStats::new(),
             repo_root: Some(project_a.path().to_path_buf()),
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -3347,7 +3372,14 @@ mod tests {
             source_authority,
             ContextSourceAuthority::CurrentIndex
         ));
-        assert!(state.index.read().get_file("src/b.rs").is_some());
+        assert!(
+            state
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/b.rs")
+                .is_some()
+        );
     }
 
     #[test]
@@ -3372,7 +3404,7 @@ mod tests {
             vec![("src/shared.rs", initial)],
             project_a.path().to_path_buf(),
         );
-        let stale_generation = state.index.current_project_generation();
+        let stale_generation = state.index.data_plane().current_project_generation();
 
         // Seed an A-generation pre-update snapshot, then prove the project
         // retarget clears it before B can publish any path-identical state.
@@ -3382,17 +3414,18 @@ mod tests {
             vec![],
             ParseStatus::Parsed,
         );
-        assert!(state.index.update_file_at_generation(
+        assert!(state.index.data_plane().update_file_at_generation(
             "src/shared.rs",
             replacement_a,
             stale_generation,
         ));
-        state.index.reload(project_b.path()).unwrap();
-        let current_generation = state.index.current_project_generation();
+        state.index.data_plane().reload(project_b.path()).unwrap();
+        let current_generation = state.index.data_plane().current_project_generation();
         assert_ne!(current_generation, stale_generation);
         assert!(
             state
                 .index
+                .data_plane()
                 .take_pre_update_snapshot_at_generation("src/shared.rs", current_generation)
                 .is_none(),
             "retarget must discard the previous project's path-keyed snapshot"
@@ -3406,7 +3439,7 @@ mod tests {
             vec![],
             ParseStatus::Parsed,
         );
-        assert!(state.index.update_file_at_generation(
+        assert!(state.index.data_plane().update_file_at_generation(
             "src/shared.rs",
             replacement_b,
             current_generation,
@@ -3446,6 +3479,7 @@ mod tests {
         assert!(
             state
                 .index
+                .data_plane()
                 .take_pre_update_snapshot_at_generation("src/shared.rs", stale_generation)
                 .is_none(),
             "a stale impact request must not consume B's pre-update snapshot"
@@ -3457,6 +3491,7 @@ mod tests {
         );
         let project_b_snapshot = state
             .index
+            .data_plane()
             .take_pre_update_snapshot_at_generation("src/shared.rs", current_generation)
             .expect("B's snapshot must remain available to the current generation");
         assert!(
@@ -3478,7 +3513,7 @@ mod tests {
         );
         first.content_hash = "hash-alpha".to_string();
         let state = make_state(vec![("src/shared.rs", first)]);
-        let generation = state.index.current_project_generation();
+        let generation = state.index.data_plane().current_project_generation();
 
         let mut second = make_indexed_file(
             "src/shared.rs",
@@ -3487,12 +3522,12 @@ mod tests {
             ParseStatus::Parsed,
         );
         second.content_hash = "hash-aba".to_string();
-        assert!(
-            state
-                .index
-                .update_file_at_generation("src/shared.rs", second, generation)
-        );
-        let second_fence = state.index.publication_fence();
+        assert!(state.index.data_plane().update_file_at_generation(
+            "src/shared.rs",
+            second,
+            generation
+        ));
+        let second_fence = state.index.data_plane().publication_fence();
 
         let mut third = make_indexed_file(
             "src/shared.rs",
@@ -3501,16 +3536,17 @@ mod tests {
             ParseStatus::Parsed,
         );
         third.content_hash = "hash-aba".to_string();
-        assert!(
-            state
-                .index
-                .update_file_at_generation("src/shared.rs", third, generation)
-        );
-        let third_fence = state.index.publication_fence();
+        assert!(state.index.data_plane().update_file_at_generation(
+            "src/shared.rs",
+            third,
+            generation
+        ));
+        let third_fence = state.index.data_plane().publication_fence();
 
         assert!(
             state
                 .index
+                .data_plane()
                 .take_pre_update_snapshot_for_publication_at_generation(
                     "src/shared.rs",
                     generation,
@@ -3521,6 +3557,7 @@ mod tests {
         );
         let latest = state
             .index
+            .data_plane()
             .take_pre_update_snapshot_for_publication_at_generation(
                 "src/shared.rs",
                 generation,
@@ -3581,7 +3618,7 @@ mod tests {
             ParseStatus::Parsed,
         );
         let state = make_state(vec![("src/foo.rs", file)]);
-        let base = state.index.published_generation();
+        let base = state.index.data_plane().published_generation();
         assert!(base.source.is_some());
         assert!(base.live.indexed_root.is_some());
 
@@ -3666,10 +3703,15 @@ mod tests {
         );
         let state = make_state(vec![("src/foo.rs", file)]);
         let fence = require_queryable_sidecar_index(&state).expect("ready sidecar fence");
-        let last_valid_content_generation = state.index.published_generation().content_generation;
+        let last_valid_content_generation = state
+            .index
+            .data_plane()
+            .published_generation()
+            .content_generation;
 
         state
             .index
+            .data_plane()
             .set_freshness_status(crate::domain::FreshnessStatus::Degraded {
                 last_valid_content_generation,
                 reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
@@ -3689,7 +3731,7 @@ mod tests {
 
         let rebound = tempfile::tempdir().unwrap();
         std::fs::write(rebound.path().join("lib.rs"), "pub fn rebound() {}\n").unwrap();
-        state.index.reload(rebound.path()).unwrap();
+        state.index.data_plane().reload(rebound.path()).unwrap();
         assert_eq!(
             finish_impact_response_at_fence(
                 &state,
@@ -3714,14 +3756,14 @@ mod tests {
         );
         let mut state = make_bootstrap_placeholder_state(vec![("src/foo.rs", file)]);
         state.repo_root = Some(repo.path().to_path_buf());
-        let generation_before = state.index.current_project_generation();
+        let generation_before = state.index.data_plane().current_project_generation();
         let replacement = make_indexed_file(
             "src/foo.rs",
             vec![make_symbol("beta", SymbolKind::Function, 1, 5)],
             vec![],
             ParseStatus::Parsed,
         );
-        assert!(state.index.update_file_at_generation(
+        assert!(state.index.data_plane().update_file_at_generation(
             "src/foo.rs",
             replacement,
             generation_before,
@@ -3735,14 +3777,21 @@ mod tests {
         store_cached_symbols_at_generation(&state, "src/foo.rs", seeded_cache, generation_before)
             .unwrap();
         let cache_before = state.symbol_cache.read().clone();
-        let published_before = state.index.published_generation();
-        let published = state.index.published_state();
+        let published_before = state.index.data_plane().published_generation();
+        let published = state.index.data_plane().published_state();
         assert!(matches!(
             published.status,
             crate::live_index::PublishedIndexStatus::Loading
         ));
         assert_eq!(published.file_count, 1);
-        assert!(state.index.read().get_file("src/foo.rs").is_some());
+        assert!(
+            state
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/foo.rs")
+                .is_some()
+        );
         let write_fires_before = state
             .token_stats
             .write_fires
@@ -3814,8 +3863,11 @@ mod tests {
         .await
         .expect_err("the prompt hint must refuse an unready bootstrap placeholder");
         assert_eq!(prompt_error, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(state.index.current_project_generation(), generation_before);
-        let published_after = state.index.published_generation();
+        assert_eq!(
+            state.index.data_plane().current_project_generation(),
+            generation_before
+        );
+        let published_after = state.index.data_plane().published_generation();
         assert_eq!(
             published_after.publication_generation,
             published_before.publication_generation
@@ -3825,10 +3877,18 @@ mod tests {
             published_before.content_generation
         );
         assert_eq!(published_after.health.file_count, 1);
-        assert!(state.index.read().get_file("src/new.rs").is_none());
+        assert!(
+            state
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/new.rs")
+                .is_none()
+        );
         assert_eq!(&*state.symbol_cache.read(), &cache_before);
         let preserved_snapshot = state
             .index
+            .data_plane()
             .take_pre_update_snapshot_at_generation("src/foo.rs", generation_before)
             .expect("loading refusal must preserve the pre-update snapshot");
         assert!(
@@ -3875,7 +3935,9 @@ mod tests {
         assert!(published.live.indexed_root.is_none());
 
         let state = SidecarState {
-            index,
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                index,
+            ),
             token_stats: TokenStats::new(),
             repo_root: None,
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -4093,7 +4155,7 @@ mod tests {
         );
         let state = make_state_with_root(vec![("src/db.rs", file)], tmp.path().to_path_buf());
 
-        let held = state.index.lock_impact_analysis().await;
+        let held = state.index.data_plane().lock_impact_analysis().await;
         let http_state = state.clone();
         let mut http = tokio::spawn(async move {
             impact_handler(
@@ -4120,7 +4182,7 @@ mod tests {
                 .is_ok()
         );
 
-        let held = state.index.lock_impact_analysis().await;
+        let held = state.index.data_plane().lock_impact_analysis().await;
         let tool_state = state.clone();
         let mut tool = tokio::spawn(async move {
             impact_tool_text(
@@ -4194,7 +4256,14 @@ mod tests {
             text.contains("last-valid index state retained"),
             "should report that the last-valid index record was retained; got: {text}"
         );
-        assert!(state.index.read().get_file("src/db.rs").is_some());
+        assert!(
+            state
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/db.rs")
+                .is_some()
+        );
     }
 
     /// When the watcher purges the index entry before analyze_file_impact
@@ -4399,18 +4468,18 @@ mod tests {
             ParseStatus::Parsed,
         );
         let state = make_state(vec![("src/db.rs", file)]);
-        let generation = state.index.current_project_generation();
+        let generation = state.index.data_plane().current_project_generation();
         let replacement = make_indexed_file(
             "src/db.rs",
             vec![make_symbol("connect_v2", SymbolKind::Function, 1, 10)],
             vec![],
             ParseStatus::Parsed,
         );
-        assert!(
-            state
-                .index
-                .update_file_at_generation("src/db.rs", replacement, generation)
-        );
+        assert!(state.index.data_plane().update_file_at_generation(
+            "src/db.rs",
+            replacement,
+            generation
+        ));
 
         let params = ImpactParams {
             path: "src/db.rs".to_string(),
@@ -4428,7 +4497,7 @@ mod tests {
         );
 
         // Verify the last-valid file remains indexed pending confirmation.
-        let guard = state.index.read();
+        let guard = state.index.data_plane().read();
         assert!(
             guard.get_file("src/db.rs").is_some(),
             "one missing observation must not remove the last-valid index entry"
@@ -4436,6 +4505,7 @@ mod tests {
         drop(guard);
         let preserved = state
             .index
+            .data_plane()
             .take_pre_update_snapshot_at_generation("src/db.rs", generation)
             .expect("failed impact must preserve the watcher baseline");
         assert!(
@@ -4751,7 +4821,9 @@ mod tests {
         std::fs::write(&source, "pub struct OldOutlineMarker;\n").expect("old source");
         let shared = LiveIndex::load(project.path()).expect("old index");
         let state = SidecarState {
-            index: shared.clone(),
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                shared.clone(),
+            ),
             token_stats: TokenStats::new(),
             repo_root: Some(project.path().to_path_buf()),
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -4789,7 +4861,9 @@ mod tests {
         .expect("old source");
         let shared = LiveIndex::load(project.path()).expect("old index");
         let state = SidecarState {
-            index: shared.clone(),
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                shared.clone(),
+            ),
             token_stats: TokenStats::new(),
             repo_root: Some(project.path().to_path_buf()),
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -7483,7 +7557,7 @@ mod tests {
             symbol_line: None,
         };
 
-        let published = state.index.published_generation();
+        let published = state.index.data_plane().published_generation();
         let tool = symbol_context_tool_text_for_generation(&state, &published, &params)
             .expect("tool render");
 
