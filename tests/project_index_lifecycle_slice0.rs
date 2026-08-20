@@ -3,11 +3,16 @@
 //! These reproduce defects named in
 //! `docs/superpowers/specs/2026-08-11-project-index-lifecycle-prevention-design.md`
 //! against the current implementation. They are RED by design: each one must
-//! fail for the reason its name states before the slice that fixes it exists,
-//! so every control carries `#[ignore]` naming the owning slice, the way this
+//! fail for the reason its name states before the fix it names exists, so
+//! every control carries `#[ignore]` naming its carried owner, the way this
 //! repo already gates its other out-of-default-suite tests. Remove the
-//! attribute in the fixing slice; the fix's acceptance is the control passing
-//! without it.
+//! attribute in the fixing change; the fix's acceptance is the control
+//! passing without it. The Slice 4 activation cut (spec 028) ran all of
+//! these before merge and observed every one still red at the daemon/watcher
+//! seams they drive, so the attributes name carried post-cut work rather
+//! than the frozen slices their original prose predicted;
+//! `scripts/slice0-oracle-artifact.cjs` pins each control's current
+//! expected outcome.
 //!
 //! Run them with:
 //! `cargo test --test project_index_lifecycle_slice0 -- --ignored --test-threads=1`
@@ -148,7 +153,7 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
 /// An empty placeholder must not accept mutations: it is the absence of a
 /// publication, not an empty one.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.2/2.3; remove this attribute in Slice 4 (T053-T073) when only a complete candidate may publish"]
+#[ignore = "Feature 020 Slice 0 RED control for design defects 2.2/2.3; observed still red at the watcher seam after the Slice 4 activation cut (spec 028) — remove when a never-published placeholder refuses watcher mutation there"]
 fn empty_placeholder_publication_refuses_watcher_mutation() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -255,7 +260,7 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
 /// bootstrap path; on reload it propagates, which is exactly the `?` that skips
 /// the watcher restart.)
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.10; remove this attribute in Slice 4 (T053-T073) when observer handoff is non-destructive"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.10; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when observer handoff is non-destructive there"]
 fn failed_reload_retains_the_recovery_observer() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -367,7 +372,7 @@ fn failed_reload_retains_the_recovery_observer() {
 /// about the window rather than a race: the predecessor is stopped and awaited
 /// before the write, and the successor starts after it.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for observer replacement gaps; remove this attribute in Slice 4 (T053-T073) when handoff latches the gap"]
+#[ignore = "Feature 020 Slice 0 RED control for observer replacement gaps; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when handoff latches the gap there"]
 fn observer_replacement_gap_is_latched_as_non_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -475,7 +480,7 @@ fn observer_replacement_gap_is_latched_as_non_current() {
 /// present state, so the next clean publication erases it. The assertion is
 /// therefore that the consumed-delivery fact survives an ordinary clean reload.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for old-observer delivery after promotion; remove this attribute in Slice 4 (T053-T073) when a stable observer token fences delivery"]
+#[ignore = "Feature 020 Slice 0 RED control for old-observer delivery after promotion; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when a stable observer token fences delivery there"]
 fn old_observer_delivery_after_promotion_is_not_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -568,7 +573,7 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 /// mutations survive promotion. Losing them and reporting success is the one
 /// outcome that must not happen.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.7/2.9; remove this attribute in Slice 4 (T053-T073) when candidates are isolated from observer mutation"]
+#[ignore = "Feature 020 Slice 0 RED control for design defects 2.7/2.9; observed still red (precondition window unreachable) after the Slice 4 activation cut (spec 028) — remove when candidate isolation is observable at this seam"]
 fn watcher_mutation_during_candidate_build_is_not_discarded() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -666,7 +671,7 @@ fn watcher_mutation_during_candidate_build_is_not_discarded() {
 ///
 /// Sibling B's latest must survive source A's publication.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005; remove this attribute in Slice 4 (T053-T073) when one whole-project root is the sole publication unit"]
+#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005; observed still red (precondition window unreachable) after the Slice 4 activation cut (spec 028) — remove when whole-project publication is observable at this seam"]
 fn whole_project_publication_preserves_latest_siblings() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -769,7 +774,7 @@ fn whole_project_publication_preserves_latest_siblings() {
 /// A snapshot is a seed, not a publication: nothing from it may answer a query
 /// before its identity and completeness are re-proved.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.11; remove this attribute in Slice 4 (T053-T073) when a snapshot seeds a candidate instead of a publication"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.11; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when SnapshotStore per-entry verify-state wiring lands (recorded residual)"]
 fn snapshot_seed_is_not_queryable_before_verification() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");

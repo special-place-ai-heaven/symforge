@@ -44,13 +44,15 @@ const SUITES = [
     expected: "red",
     args: ["test", "--test", "project_index_lifecycle_slice0", "--", "--ignored", "--test-threads=1"],
   },
+  // Lib unit tests print their full module path, and the V11 cut mounts the
+  // server modules under `src/internals.rs`, so the paths carry `internals::`.
   {
     target: "src/watcher/mod.rs::tests",
     expected: "green",
     args: [
       "test",
       "--lib",
-      "watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
+      "internals::watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
       "--",
       "--exact",
     ],
@@ -61,7 +63,7 @@ const SUITES = [
     args: [
       "test",
       "--lib",
-      "daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
+      "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
       "--",
       "--exact",
       "--ignored",
@@ -80,12 +82,16 @@ const MAX_REASON_BYTES = 512;
 //
 // Still RED: the defect each names is unfixed, the test carries `#[ignore]`, and it
 // MUST fail.
+// The Slice 4 activation cut ran every one of these before merge (2026-08-20)
+// and observed each still failing at the daemon/watcher seam it drives, so the
+// cut did not reclassify them; they are carried post-cut work recorded in
+// specs/028-preventive-activation-cut/activation-cut-execution-map.md.
 const RED_CASES = [
   "capacity_refused_open_creates_no_slot_and_no_watcher",
   "configured_capacity_bounds_the_process_not_each_load",
-  "daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
   "empty_placeholder_publication_refuses_watcher_mutation",
   "failed_reload_retains_the_recovery_observer",
+  "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
   "observer_replacement_gap_is_latched_as_non_current",
   "old_observer_delivery_after_promotion_is_not_current",
   "same_path_root_replacement_is_not_silently_adopted",
@@ -100,7 +106,7 @@ const RED_CASES = [
 // it exists to evidence.
 const RESOLVED_CASES = new Map([
   [
-    "watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
+    "internals::watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
     {
       slice: 1,
       tasks: ["T028"],

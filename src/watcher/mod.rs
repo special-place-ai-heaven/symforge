@@ -3690,7 +3690,9 @@ mod tests {
     /// now asserts that it PASSES, so both directions are guarded: re-adding the
     /// attribute and deleting the test are each a roster change, not a silent
     /// loss. Run it with
-    /// `cargo test --lib watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture`.
+    /// `cargo test --lib internals::watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b -- --exact --nocapture`
+    /// (the V11 cut mounts the server modules under `src/internals.rs`, so the
+    /// lib test path carries the `internals::` prefix).
     #[test]
     fn generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b() {
         let project_a = TempDir::new().unwrap();

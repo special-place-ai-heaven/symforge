@@ -635,6 +635,29 @@ is the only thing allowed to touch it:
   battery for these code bytes is the C11b battery — C11c changes docs
   and the task checkbox only; fmt/validator re-observed at commit. T037
   checked; T038's review rounds append to (and close) the evidence doc.
+- Post-PR CI rounds on #601 (executed 2026-08-20): two `rust`-job tools
+  written before the cut still assumed pre-cut shapes. (1) The
+  traceability SELF-test assumed HEAD bytes equal approved-refreeze
+  bytes; fixed by building preactivation fixtures from the approved
+  ancestor `4a57aa22`'s actual source bytes (`635b3a2c`). (2)
+  `scripts/slice0-oracle-artifact.cjs` filtered lib tests by pre-cut
+  module paths; the cut mounts server modules under `src/internals.rs`,
+  so the `watcher::tests::`/`daemon::tests::` filters selected nothing —
+  fixed to `internals::…` paths. Running that producer surfaced a
+  MATERIAL finding the cut's evidence had not recorded: the seven
+  Slice 0 positive controls whose `#[ignore]` prose predicted "remove in
+  Slice 4" were each run un-ignored against the cut and observed STILL
+  FAILING at the daemon/watcher seams they drive (five with their
+  original defect messages, two with unreachable precondition windows —
+  bounded reasons preserved in the slice-0 oracle artifact of that run).
+  Adjudication per this spec's conflict rule: the executed cut activates
+  the preventive machinery behind the lifecycle seams but does not
+  discharge those seven frozen-tree acceptance predictions; they remain
+  RED positive controls on the artifact roster (as they were,
+  continuously, on every green CI run before and during the cut), their
+  attributes now name carried post-cut work instead of the falsified
+  slice prediction, and resolving them is owed by the post-cut
+  continuation of Feature 020, not by this PR.
 
 Gate battery after every commit-group, serial via TC; fmt BEFORE pin
 refresh; embed feature gate before every push.

@@ -161,6 +161,14 @@ absence; the D16 adjudication claims a per-response boundary, not
 distributed atomicity; and no live acceptance beyond the quickstart
 spot-checks recorded in the map has been performed by this document.
 
+Additionally, observed post-review on 2026-08-20 (recorded in the map's
+"Post-PR CI rounds" entry): the seven Slice 0 positive controls whose
+`#[ignore]` prose predicted resolution "in Slice 4" were each run
+un-ignored against the cut and remain red at the daemon/watcher seams
+they drive. This green therefore does not prove those seven frozen-tree
+acceptance behaviors; they stay RED on the slice-0 oracle roster as
+carried post-cut work.
+
 ## 7a. T038 Round 1 (executed 2026-08-20)
 
 Five independent reviewer lenses ran in parallel over `git diff main...HEAD`
