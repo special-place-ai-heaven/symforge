@@ -2488,6 +2488,26 @@ fn build_snapshot(
     })
 }
 
+/// Finish snapshot-restore verification synchronously when no tokio runtime is
+/// available to spawn [`background_verify`]. Runs the stat pass only; stat
+/// drift is recorded as mismatch paths so freshness degrades honestly instead
+/// of leaving the index query-blocked in `Pending` forever.
+pub fn complete_snapshot_restore_when_no_runtime(
+    index: &crate::live_index::store::SharedIndex,
+    root: &Path,
+    snapshot_mtimes: &HashMap<String, u64>,
+) {
+    let Some(fence) = index.mark_snapshot_verify_running_at_fence(index.publication_fence()) else {
+        return;
+    };
+    let verify_view = capture_verify_view(index.read().as_ref());
+    let stat_result = stat_check_files_from_view(&verify_view, snapshot_mtimes, root);
+    let mut mismatches = stat_result.changed;
+    mismatches.extend(stat_result.deleted);
+    mismatches.extend(stat_result.new_files);
+    let _ = index.mark_snapshot_verify_completed_at_fence(fence, mismatches);
+}
+
 /// Background task: verify a loaded index against disk and re-parse stale files.
 ///
 /// Run after `snapshot_to_live_index` to bring the index to current disk state.
@@ -4336,7 +4356,8 @@ mod tests {
         );
 
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let after = snapshot_to_live_index(snapshot, tmp.path());
+        let mut after = snapshot_to_live_index(snapshot, tmp.path());
+        after.mark_snapshot_verify_completed(Vec::new());
 
         // ── Query equivalence ────────────────────────────────────────────────
 

@@ -2562,13 +2562,6 @@ impl SharedIndexHandle {
         let _reload_build = ReloadBuildGuard(self);
 
         let baseline = self.live.load_full();
-        let prior_fingerprint = baseline.indexed_root_fingerprint;
-        let next_fingerprint = fingerprint_physical_root(root);
-        if let (Some(prior), Some(next)) = (prior_fingerprint, next_fingerprint)
-            && prior != next
-        {
-            self.latch_freshness_reason(FreshnessReason::PhysicalRootReplacement);
-        }
 
         // Build new index data OUTSIDE the write lock (file I/O + parsing).
         // Only the final swap acquires the mutex, reducing block time from
@@ -2580,6 +2573,13 @@ impl SharedIndexHandle {
             &source_exclusions,
         )?;
         let build_elapsed = build_started.elapsed();
+        let prior_fingerprint = baseline.indexed_root_fingerprint;
+        let next_fingerprint = fingerprint_physical_root(root);
+        if let (Some(prior), Some(next)) = (prior_fingerprint, next_fingerprint)
+            && prior != next
+        {
+            self.latch_freshness_reason(FreshnessReason::PhysicalRootReplacement);
+        }
         let scout_plan = Arc::clone(&data.scout_plan);
         let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
         let mut live = LiveIndex::from_reload_data(data);
@@ -2677,13 +2677,6 @@ impl SharedIndexHandle {
     }
 
     pub fn update_file(&self, path: String, file: IndexedFile) {
-        if !self.accepts_source_observation() {
-            tracing::debug!(
-                path,
-                "refusing mutation into a never-published empty bootstrap placeholder"
-            );
-            return;
-        }
         let _wg = self.write_mutex.lock();
         let current = self.live.load_full();
         let path_clone = path.clone();

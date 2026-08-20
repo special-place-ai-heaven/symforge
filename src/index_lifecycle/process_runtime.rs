@@ -232,4 +232,11 @@ impl ProcessIndexRuntime {
     pub fn admitted_catalog_entries(&self) -> u64 {
         self.admitted_catalog_entries.load(Ordering::Acquire)
     }
+
+    /// Test-only: reset the process-wide catalog charge ledger between cases
+    /// that mutate `SYMFORGE_MAX_INDEX_FILES` under `--test-threads=1`.
+    #[cfg(test)]
+    pub fn reset_admitted_catalog_entries_for_tests(&self) {
+        self.admitted_catalog_entries.store(0, Ordering::Release);
+    }
 }

@@ -1018,6 +1018,13 @@ pub fn process_index_runtime() -> Arc<ProcessIndexRuntime> {
         .clone()
 }
 
+/// Test-only: clear catalog charges leaked across daemon unit tests sharing one
+/// process runtime.
+#[cfg(test)]
+pub fn reset_process_catalog_admission_for_tests() {
+    process_index_runtime().reset_admitted_catalog_entries_for_tests();
+}
+
 /// The process project registry — the admission table bootstrap owns. The
 /// C4b registry-ownership move: projects enter through [`admit_project`],
 /// never by a lane minting its own slot.

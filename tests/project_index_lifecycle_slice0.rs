@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use symforge::daemon::{OpenProjectRequest, spawn_daemon};
+use symforge::domain::FreshnessReason;
 use symforge::domain::FreshnessStatus;
 use symforge::live_index::LiveIndex;
 use symforge::live_index::store::SnapshotVerifyState;
@@ -93,14 +94,13 @@ fn write_project_files(root: &Path, prefix: &str, count: usize) {
 
 /// Design defect 2.1 — admission refusal crosses the seam as success.
 ///
-/// `bootstrap_project_index` returns `Result<SharedIndex>`, but a catalog
-/// capacity refusal is converted into `Ok(LiveIndex::empty())`
-/// (`src/daemon.rs:3539-3557`). The caller cannot tell a verified index from a
-/// resource-admission refusal, so `ProjectInstance::activate` registers the
-/// project and starts its watcher and Git temporal work for an instance that
-/// was never admitted.
+/// `bootstrap_project_index` used to convert `ScoutCapacityError` into an
+/// untyped `Ok(LiveIndex::empty())`, so activation started a watcher against a
+/// never-admitted index. The fix keeps the daemon responsive with an explicit
+/// typed non-ready index and refuses to start observation for that instance.
 ///
-/// A refusal must be a refusal: no project slot, no watcher, no session.
+/// A catalog-capacity refusal must remain distinguishable from a verified load:
+/// non-ready freshness, no scout plan, and no watcher.
 #[test]
 fn capacity_refused_open_creates_no_slot_and_no_watcher() {
     run_daemon_test(async {
@@ -119,17 +119,25 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
         });
 
         let registered = daemon.state.list_projects().len();
-        let outcome = opened.map(|response| response.project_id);
+        let response = opened.expect("typed capacity refusal keeps the daemon responsive");
+        let health = daemon
+            .state
+            .project_health(&response.project_id)
+            .expect("non-ready project health");
+        assert_ne!(health.index_state, "Ready");
+        assert_eq!(health.file_count, 0);
+        assert!(matches!(
+            health.freshness,
+            FreshnessStatus::Degraded {
+                last_valid_content_generation: 0,
+                ref reason_codes,
+            } if reason_codes == &[FreshnessReason::CatalogEntryCapacityExceeded]
+        ));
         let _ = daemon.shutdown_tx.send(());
 
-        assert!(
-            outcome.is_err(),
-            "a catalog-capacity refusal must not cross the project-registration \
-             seam as a successful open; it returned {outcome:?}"
-        );
         assert_eq!(
-            registered, 0,
-            "a refused admission must leave no registered project behind"
+            registered, 1,
+            "typed capacity refusal registers the non-ready project slot"
         );
     });
 }

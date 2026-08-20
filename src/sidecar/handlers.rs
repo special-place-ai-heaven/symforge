@@ -499,9 +499,10 @@ fn published_matches_sidecar_fence(
 
 fn require_queryable_sidecar_index(state: &SidecarState) -> Result<SidecarQueryFence, StatusCode> {
     let published = state.index.data_plane().published_generation();
-    if published_sidecar_index_is_queryable(&published)
-        && state.index.data_plane().current_project_generation() == published.project_generation
-    {
+    let queryable = published_sidecar_index_is_queryable(&published);
+    let gen_match =
+        state.index.data_plane().current_project_generation() == published.project_generation;
+    if queryable && gen_match {
         let fence = sidecar_query_fence_for(&published).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         if state
             .repo_root

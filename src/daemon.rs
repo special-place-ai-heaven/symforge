@@ -1348,7 +1348,7 @@ impl DaemonState {
                 };
                 let removed = if remaining == 0 {
                     if let Some(removed) = projects.remove(&pid) {
-                        removed_slots.push(removed);
+                        removed_slots.push((pid.clone(), removed));
                     }
                     true
                 } else {
@@ -1361,8 +1361,9 @@ impl DaemonState {
                 }
             }
         }
-        for slot in removed_slots {
+        for (project_id, slot) in removed_slots {
             slot.stop();
+            self.cold_opens.lock().remove(&project_id);
         }
 
         // If this was the last session on a BaseKey, that map value is now a
@@ -1697,7 +1698,6 @@ impl DaemonState {
         let target_project_id = &binding.root_id.0;
         let target_root = &binding.canonical_root;
         let target_slot = self.ensure_project_slot_for_binding(session_id, binding)?;
-        target_slot.activate();
         let (file_count, symbol_count) = target_slot.reload_for_binding(binding)?;
 
         let (index, source_access_mode, state_placement, persistence_health) = {
@@ -1919,6 +1919,7 @@ impl DaemonState {
         };
         if let Some(slot) = evicted {
             slot.stop();
+            self.cold_opens.lock().remove(project_id);
         }
         true
     }
@@ -3359,15 +3360,21 @@ impl ProjectInstance {
         })?;
 
         let index = bootstrap_project_index(canonical_root, &state_placement)?;
-        let file_count = index.published_state().file_count as u64;
-        live_index::index_lifecycle::activation::process_index_runtime()
-            .try_charge_catalog_entries(file_count)
-            .map_err(|limit| {
-                anyhow::anyhow!(
-                    "project admission refused: {file_count} catalog entries would exceed the \
-                     configured process ceiling of {limit}"
-                )
-            })?;
+        let capacity_refused = index_is_catalog_capacity_refused(&index);
+        let charged_catalog_entries = if capacity_refused {
+            0
+        } else {
+            let file_count = index.published_state().file_count as u64;
+            live_index::index_lifecycle::activation::process_index_runtime()
+                .try_charge_catalog_entries(file_count)
+                .map_err(|limit| {
+                    anyhow::anyhow!(
+                        "project admission refused: {file_count} catalog entries would exceed the \
+                         configured process ceiling of {limit}"
+                    )
+                })?;
+            file_count
+        };
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
         let persistence_status = if matches!(
@@ -3412,7 +3419,7 @@ impl ProjectInstance {
             session_ids: HashSet::new(),
             opened_at: SystemTime::now(),
             activation_state: ActivationState::Inactive,
-            charged_catalog_entries: file_count,
+            charged_catalog_entries,
         })
     }
 
@@ -3426,6 +3433,10 @@ impl ProjectInstance {
                 state = ?self.activation_state,
                 "activate() called on a project that is not Inactive — skipping"
             );
+            return;
+        }
+        if index_is_catalog_capacity_refused(&self.index.shared()) {
+            self.activation_state = ActivationState::Active;
             return;
         }
         self.activation_state = ActivationState::Activating;
@@ -3613,6 +3624,9 @@ impl ProjectSlot {
                 .unwrap_or("project")
                 .to_string();
             project.project_id = project_key(canonical_root);
+            if project.activation_state == ActivationState::Inactive {
+                project.activation_state = ActivationState::Active;
+            }
         }
 
         let expected_gen = index.current_project_generation();
@@ -3708,6 +3722,21 @@ fn spawn_local_ref_reconcile(
 ///
 /// Cold path: no snapshot/artifact present (or it was quarantined) — fall back
 /// to a full discovery+parse [`live_index::LiveIndex::load`].
+/// Cold-start catalog capacity refusal publishes an explicit non-ready index:
+/// typed freshness, no scout plan, and no admitted files. Callers must not
+/// treat it as a verified load or start observation against it.
+fn index_is_catalog_capacity_refused(index: &SharedIndex) -> bool {
+    let live = index.read();
+    if live.is_ready() || index.scout_plan().is_some() {
+        return false;
+    }
+    matches!(
+        index.freshness_status().as_ref(),
+        crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+            if reason_codes.contains(&crate::domain::FreshnessReason::CatalogEntryCapacityExceeded)
+    )
+}
+
 fn bootstrap_project_index(
     canonical_root: &Path,
     state_placement: &StatePlacement,
@@ -3762,6 +3791,12 @@ fn bootstrap_project_index(
                 )
                 .await;
             });
+        } else {
+            live_index::persist::complete_snapshot_restore_when_no_runtime(
+                &shared,
+                canonical_root,
+                &snapshot_mtimes,
+            );
         }
 
         return Ok(shared);
@@ -3785,6 +3820,25 @@ fn bootstrap_project_index(
             )
             .map(|()| index)
     }
+    .or_else(|error| {
+        let capacity = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::discovery::ScoutCapacityError>());
+        let Some(capacity) = capacity else {
+            return Err(error);
+        };
+        let index = LiveIndex::empty();
+        index.set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+            last_valid_content_generation: 0,
+            reason_codes: vec![capacity.reason()],
+        });
+        tracing::warn!(
+            root = %canonical_root.display(),
+            reason = ?capacity.reason(),
+            "cold project observation refused by catalog capacity; keeping project non-ready"
+        );
+        Ok(index)
+    })
 }
 
 // V11 callbacks census (C3b): the observer-incarnation registration for this
@@ -6492,6 +6546,7 @@ mod tests {
     }
 
     async fn env_lock() -> MutexGuard<'static, ()> {
+        live_index::index_lifecycle::activation::reset_process_catalog_admission_for_tests();
         ENV_LOCK.lock().await
     }
 
@@ -12493,6 +12548,19 @@ mod tests {
             .expect("open B request")
             .error_for_status()
             .expect("open B status");
+
+        let health = client
+            .get(format!(
+                "{base_url}/v1/sessions/{}/sidecar/health",
+                opened.session_id
+            ))
+            .send()
+            .await
+            .expect("health request");
+        assert!(
+            health.status().is_success(),
+            "sidecar health must succeed before caller_root guard checks"
+        );
 
         let url = |extra: &str| {
             format!(
