@@ -28,7 +28,12 @@ use crate::paths;
 
 use crate::domain::ParseDiagnostic;
 
-const CURRENT_VERSION: u32 = 7;
+// Feature 020 Slice 4 (frozen 020:T065): the V11 activation cut bumps the
+// on-disk format from the V10 value 7. A format-7 file found at the snapshot
+// path is a PRIOR-FORMAT SEED: it never restores, its original bytes are
+// preserved in place for rollback, and a copy is quarantined under the
+// `.symforge/v11/` migration namespace (see `try_quarantine_v10_seed`).
+const CURRENT_VERSION: u32 = 8;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -1750,6 +1755,93 @@ fn quarantine_bad_snapshot_locked(
     Ok(quarantine_path)
 }
 
+/// Frozen 020:T065 (the live wiring): quarantine a PRIOR-format (V10) seed
+/// under the `.symforge/v11/` migration namespace, PRESERVING the original
+/// file — the legacy store is the rollback artifact and an 11.x process
+/// never destroys it. Dedupes by content digest so repeated starts against
+/// the same seed do not accumulate copies. Metadata carries structure only
+/// (paths, digest, reason), never file content beyond the seed copy itself.
+fn try_quarantine_v10_seed(
+    state_dir: &ProjectStateDir,
+    snapshot_path: &Path,
+    bytes: &[u8],
+    detail: String,
+) {
+    let dir = state_dir
+        .as_path()
+        .join("v11")
+        .join("quarantine")
+        .join("index-snapshots");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(
+            path = %snapshot_path.display(),
+            "failed to create v11 seed quarantine directory {}: {error}",
+            dir.display()
+        );
+        return;
+    }
+    let hash = crate::hash::digest_hex(bytes);
+    let hash_marker = format!("-{}-", &hash[..16]);
+    let already_quarantined = std::fs::read_dir(&dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(&hash_marker))
+    });
+    if already_quarantined {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let name = format!(
+        "{}-{:09}-{}-v10-format-seed",
+        now.as_secs(),
+        now.subsec_nanos(),
+        &hash[..16]
+    );
+    let quarantine_path = dir.join(format!("{name}.bin"));
+    let metadata_path = dir.join(format!("{name}.json"));
+    if let Err(error) = std::fs::write(&quarantine_path, bytes) {
+        warn!(
+            path = %snapshot_path.display(),
+            "failed to write v10 seed quarantine copy at {}: {error}",
+            quarantine_path.display()
+        );
+        return;
+    }
+    let metadata = serde_json::json!({
+        "source_path": snapshot_path.to_string_lossy(),
+        "quarantine_path": quarantine_path.to_string_lossy(),
+        "reason": "v10-format-seed",
+        "detail": detail,
+        "sha256": hash,
+        "bytes": bytes.len(),
+        "original_preserved": true,
+        "quarantined_at_unix_seconds": now.as_secs(),
+        "quarantined_at_unix_nanos": now.subsec_nanos(),
+    });
+    match serde_json::to_vec_pretty(&metadata) {
+        Ok(metadata_bytes) => {
+            if let Err(error) = std::fs::write(&metadata_path, metadata_bytes) {
+                warn!(
+                    path = %snapshot_path.display(),
+                    "failed to write v10 seed quarantine metadata at {}: {error}",
+                    metadata_path.display()
+                );
+            }
+        }
+        Err(error) => warn!(
+            path = %snapshot_path.display(),
+            "failed to serialize v10 seed quarantine metadata: {error}"
+        ),
+    }
+    warn!(
+        path = %snapshot_path.display(),
+        quarantine_path = %quarantine_path.display(),
+        "prior-format V10 snapshot preserved in place and copied to v11 quarantine; rebuilding"
+    );
+}
+
 fn try_quarantine_bad_snapshot(
     state_dir: &ProjectStateDir,
     snapshot_path: &Path,
@@ -1824,6 +1916,26 @@ pub fn load_snapshot(
     };
 
     if snapshot.version != CURRENT_VERSION {
+        if snapshot.version < CURRENT_VERSION {
+            // Frozen 020:T065: a prior-format (V10) snapshot is an untrusted
+            // seed — it confers no authority under V11, its original bytes
+            // stay in place as the rollback artifact, and a copy lands in the
+            // `.symforge/v11/` migration quarantine. Rebuild fallback follows.
+            warn!(
+                "index snapshot carries retired format {} (current {}) — preserved as V10 seed, will re-index",
+                snapshot.version, CURRENT_VERSION
+            );
+            try_quarantine_v10_seed(
+                state_dir,
+                &path,
+                &bytes,
+                format!(
+                    "snapshot format {}, current {}",
+                    snapshot.version, CURRENT_VERSION
+                ),
+            );
+            return None;
+        }
         warn!(
             "index snapshot version mismatch: got {}, expected {} — will re-index",
             snapshot.version, CURRENT_VERSION
@@ -2382,24 +2494,27 @@ pub async fn background_verify(
     background_verify_with_hook(index, root, snapshot_mtimes, observer, || {}).await;
 }
 
+/// `Some(true)` — the path was actually removed (publish it, observe it).
+/// `Some(false)` — nothing held the path; already reconciled, no removal to
+/// observe or publish. `None` — a fence rejected the removal; abort the pass.
+/// T038 round-1 (D14 family): the caller must not observe a removal that did
+/// not happen — the same rule already applied to the watcher and embed
+/// lanes.
 fn remove_snapshot_deleted_file_if_still_absent(
     index: &crate::live_index::store::SharedIndex,
     root: &Path,
     path: &str,
     expected: crate::live_index::store::PublicationFence,
-) -> bool {
+) -> Option<bool> {
     let absolute_path = root.join(path);
     match index.remove_file_if_absent_at_publication_fence_with_receipt(
         path,
         &absolute_path,
         expected,
     ) {
-        // `NothingHeld` means the deletion is already reconciled (nothing
-        // holds the path, so nothing publishes); the verify continues. Only a
-        // fence rejection aborts the pass.
-        crate::live_index::store::FencedRemoval::Removed(_)
-        | crate::live_index::store::FencedRemoval::NothingHeld => true,
-        crate::live_index::store::FencedRemoval::Rejected => false,
+        crate::live_index::store::FencedRemoval::Removed(_) => Some(true),
+        crate::live_index::store::FencedRemoval::NothingHeld => Some(false),
+        crate::live_index::store::FencedRemoval::Rejected => None,
     }
 }
 
@@ -2442,18 +2557,22 @@ async fn background_verify_with_hook<F>(
     // 2. Remove deleted files
     if !stat_result.deleted.is_empty() {
         for path in &stat_result.deleted {
-            if !remove_snapshot_deleted_file_if_still_absent(&index, &root, path, commit_fence) {
-                return;
+            match remove_snapshot_deleted_file_if_still_absent(&index, &root, path, commit_fence) {
+                Some(true) => {
+                    if let Err(active) = authority.observe_removal(observer, path) {
+                        tracing::debug!(
+                            ?observer,
+                            ?active,
+                            %path,
+                            "stale verify incarnation: removal observation refused"
+                        );
+                    }
+                    commit_fence = index.publication_fence();
+                }
+                // Already reconciled: nothing published, nothing to observe.
+                Some(false) => {}
+                None => return,
             }
-            if let Err(active) = authority.observe_removal(observer, path) {
-                tracing::debug!(
-                    ?observer,
-                    ?active,
-                    %path,
-                    "stale verify incarnation: removal observation refused"
-                );
-            }
-            commit_fence = index.publication_fence();
         }
     }
 
@@ -3667,18 +3786,59 @@ mod tests {
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         std::fs::write(&file_path, b"fn recreated() {}\n").unwrap();
 
-        assert!(
-            !remove_snapshot_deleted_file_if_still_absent(
+        assert_eq!(
+            remove_snapshot_deleted_file_if_still_absent(
                 &shared,
                 tmp.path(),
                 relative_path,
                 absence_fence,
             ),
+            None,
             "a disk recreation after stat must reject snapshot cleanup"
         );
         assert!(
             shared.read().get_file(relative_path).is_some(),
             "the last-valid indexed entry must survive the rejected removal"
+        );
+    }
+
+    /// T038 round-1 (A-W5): the caller must be able to tell "actually
+    /// removed" from "nothing was held" — a path never indexed and never on
+    /// disk confirms absence but has no removal to observe or publish.
+    #[test]
+    fn background_verify_deleted_file_removal_distinguishes_removed_from_nothing_held() {
+        let tmp = TempDir::new().unwrap();
+        let held_path = "src/main.rs";
+        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
+            vec![(held_path, b"fn before() {}\n")],
+        ));
+        let fence = shared.publication_fence();
+
+        assert_eq!(
+            remove_snapshot_deleted_file_if_still_absent(&shared, tmp.path(), held_path, fence),
+            Some(true),
+            "a held path confirmed absent must be REMOVED and observed"
+        );
+        let after_removal = shared.publication_fence();
+        assert!(
+            after_removal != fence,
+            "an actual removal must publish (the fence must move)"
+        );
+
+        assert_eq!(
+            remove_snapshot_deleted_file_if_still_absent(
+                &shared,
+                tmp.path(),
+                "src/never_held.rs",
+                after_removal,
+            ),
+            Some(false),
+            "a never-held path has nothing to remove — NothingHeld, not Removed"
+        );
+        assert_eq!(
+            shared.publication_fence(),
+            after_removal,
+            "a NothingHeld outcome must not publish"
         );
     }
 
@@ -3995,10 +4155,16 @@ mod tests {
     // Tripwire: bumping the persisted-index format version MUST be a deliberate
     // decision. If this assertion fails, the format is changing — stop and
     // escalate per `.octogent/tentacles/live-index/CONTEXT.md` §No-surprise rule.
+    //
+    // 7 → 8 (Feature 020 Slice 4 activation cut): the deliberate, frozen
+    // decision is 020:T065 ("Bump the snapshot format ... in
+    // src/live_index/persist.rs"). Format-7 files are preserved V10 seeds —
+    // never restored, never destroyed
+    // (`a_v10_format_snapshot_is_a_preserved_seed_never_authority`).
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 7,
+            CURRENT_VERSION, 8,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );
@@ -4324,6 +4490,94 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&quarantine_metadata[0]).unwrap()).unwrap();
         assert_eq!(metadata["reason"], "version-mismatch");
         assert_eq!(metadata["sha256"], crate::hash::digest_hex(&bytes));
+    }
+
+    /// Feature 020 Slice 4 (frozen 020:T065, the live wiring): a snapshot
+    /// carrying the RETIRED V10 on-disk format is an untrusted seed, never
+    /// authority. V11 must refuse to restore it, quarantine a COPY under the
+    /// `.symforge/v11/` migration namespace, and PRESERVE the original file —
+    /// the legacy store is the rollback artifact and an 11.x process never
+    /// destroys it. The rebuild fallback proceeds (load returns `None`), and
+    /// repeated starts do not accumulate duplicate quarantine copies.
+    #[test]
+    fn a_v10_format_snapshot_is_a_preserved_seed_never_authority() {
+        let tmp = TempDir::new().unwrap();
+        let mut snapshot = build_snapshot(
+            super::capture_snapshot_build_input(&make_live_index_with_files(Vec::new())),
+            tmp.path(),
+        );
+        // The V10 wire format id. The payload is byte-compatible by
+        // construction here; the FORMAT is what retires the seed.
+        snapshot.version = 7;
+        let bytes = postcard::to_stdvec(&snapshot).unwrap();
+        let dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.bin"), &bytes).unwrap();
+
+        let result = load_snapshot(tmp.path());
+        assert!(
+            result.is_none(),
+            "a V10-format snapshot must not restore under V11"
+        );
+
+        assert_eq!(
+            std::fs::read(dir.join("index.bin")).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "the V10 original must be PRESERVED for rollback, not destroyed"
+        );
+
+        let v11_quarantine = dir.join("v11").join("quarantine").join("index-snapshots");
+        let quarantined: Vec<PathBuf> = std::fs::read_dir(&v11_quarantine)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bin"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the seed must be quarantined (as a copy) under the v11 migration namespace"
+        );
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            bytes,
+            "the quarantined copy must hold the original seed bytes"
+        );
+
+        // A second start observes the same seed: no restore, no duplicate
+        // quarantine copy, original still intact.
+        assert!(load_snapshot(tmp.path()).is_none());
+        let after_second: usize = std::fs::read_dir(&v11_quarantine)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bin"))
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            after_second, 1,
+            "repeated starts must not accumulate duplicate seed quarantine copies"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("index.bin")).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "the original must survive repeated starts"
+        );
+
+        // Positive control: a CURRENT-format snapshot restores.
+        let current = build_snapshot(
+            super::capture_snapshot_build_input(&make_live_index_with_files(Vec::new())),
+            tmp.path(),
+        );
+        let current_bytes = postcard::to_stdvec(&current).unwrap();
+        std::fs::write(dir.join("index.bin"), &current_bytes).unwrap();
+        assert!(
+            load_snapshot(tmp.path()).is_some(),
+            "control: a current-format snapshot must restore"
+        );
     }
 
     #[test]

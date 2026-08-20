@@ -46,6 +46,19 @@ fn ccr_hash(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The compressed response with its CCR footer hash redacted, so two
+/// responses can be compared for byte-identity independent of the handles
+/// they minted (T038 round-1: the identity fence's premise control).
+fn without_ccr_hash(body: &str) -> String {
+    match body.split_once("hash=\"") {
+        Some((head, rest)) => match rest.split_once('"') {
+            Some((_, tail)) => format!("{head}hash=\"<redacted>\"{tail}"),
+            None => body.to_string(),
+        },
+        None => body.to_string(),
+    }
+}
+
 fn write_fixture(root: &Path, files: &[(&str, &str)]) {
     for (rel, content) in files {
         let path = root.join(rel);
@@ -191,7 +204,7 @@ async fn ccr_handles_bind_the_rendering_publication_identity() {
         )
         .await;
     assert!(
-        freshened.contains("2"),
+        freshened.contains("    2"),
         "the freshen must observe the moved publication:\n{freshened}"
     );
 
@@ -200,6 +213,16 @@ async fn ccr_handles_bind_the_rendering_publication_identity() {
         .await;
     let second_handle = ccr_hash(&second)
         .unwrap_or_else(|| panic!("the repeated search did not CCR-compress:\n{second}"));
+
+    // Premise control (T038 round-1): the fence below is meaningful only if
+    // the two renderings are byte-identical apart from their handles — the
+    // ONLY admissible cause of differing handles must be the publication
+    // identity, never a volatile byte in the rendering itself.
+    assert_eq!(
+        without_ccr_hash(&first),
+        without_ccr_hash(&second),
+        "the two renderings must differ only in their CCR handles"
+    );
 
     // THE FENCE: identical rendered bytes under a moved publication must not
     // collide onto one handle — the handle encodes the rendering

@@ -979,15 +979,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "62344bcf3307288c11fa1f3cea49741a6db102edd59db0444f1887d8f8006bf2",
+    "fddb469064094aeccfcfcb26b5b75cd364491dc8888947ff47c1f14a5bacb292",
     20,
-    387_832,
+    388_663,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "7f4c56e0558a9cfc2833662a2bb86ba77827f982922939027ac3cca1f7788466",
+    "b492e52c5bed62552066bacdb2b41def26754aa0fc37edd1e872603ac0cddbd0",
     196,
-    9_268_643,
+    9_290_995,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1118,7 +1118,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "d7fc46fe50bf2df8:13897"),
+    ("ci.yml", "38f09be155e1980a:13931"),
     ("release.yml", "8ee888c1cf1be6a0:110910"),
 ];
 
@@ -1205,11 +1205,11 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ("run: cargo check", 1),
     ("run: cargo clippy --all-targets -- -D warnings", 1),
     (
-        "run: cargo clippy --no-default-features --features embed --lib -- -D warnings",
+        "run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings",
         1,
     ),
     (
-        "run: cargo clippy --no-default-features --features embed --target x86_64-unknown-linux-musl --lib -- -D warnings",
+        "run: cargo clippy --no-default-features --features embed,__test-internals --target x86_64-unknown-linux-musl --lib -- -D warnings",
         1,
     ),
     ("run: cargo fmt --check", 1),

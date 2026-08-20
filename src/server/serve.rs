@@ -567,10 +567,14 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         load_serve_index(args.workspace_root.as_deref())?;
     tracing::info!("serve: index ready in {:?}", phase.elapsed());
     // V11 bootstrap (C4b): the serve project admits through the process
-    // registry. Recorded residual: this path surfaces no RootBinding, so the
-    // admission presents NormalProject — the serve loader resolves protected
-    // roots to user-local placement upstream, and C5's typed bootstrap
-    // threads the real binding through.
+    // registry. OPEN residual (T038 round-1 adjudication): this path still
+    // surfaces no RootBinding, so the admission hardcodes NormalProject.
+    // Correct today by invariant — `load_serve_index` binds via
+    // RootRequestMode::Automatic, which can never bind a protected root —
+    // but a future serve-side explicit-protected open would misdeclare here.
+    // Threading `binding.access_mode` through is the recorded follow-up
+    // (docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md); C5 did
+    // NOT discharge this.
     if let (Some(root), Some(placement)) = (repo_root.as_ref(), state_placement.as_ref()) {
         let project_id = crate::discovery::project_id_for_canonical_root(root);
         if let Err(refusal) = crate::live_index::index_lifecycle::activation::admit_project(

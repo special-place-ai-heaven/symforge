@@ -161,6 +161,156 @@ absence; the D16 adjudication claims a per-response boundary, not
 distributed atomicity; and no live acceptance beyond the quickstart
 spot-checks recorded in the map has been performed by this document.
 
+## 7a. T038 Round 1 (executed 2026-08-20)
+
+Five independent reviewer lenses ran in parallel over `git diff main...HEAD`
+at `20ea0eff`: cfg-lens (mandatory), C11 fences correctness, adjudications
+challenge (§5 above), oracle quality audit, and authority bypass hunt. Each
+was told to refute its own candidate findings before reporting. Verdicts and
+dispositions below; **zero Critical findings survived any lens**.
+
+**cfg-lens (mandatory sweep).**
+- Real defect: `src/internals.rs`'s blanket `#[cfg_attr(not(feature =
+  "__test-internals"), allow(unused_imports, dead_code))]` silently
+  disarmed the embed cell's `-D warnings` lanes for the whole engine tree,
+  because CI's embed clippy steps ran doorless (`--features embed`), the
+  exact configuration the allow fires under. **Fixed**: both CI embed
+  clippy lanes now run door-open (`--features embed,__test-internals`),
+  matching every other linting gate; `internals.rs`'s comment corrected.
+  Running the now-enforced doorless embed clippy for verification surfaced
+  one genuine, previously-invisible lint (`GitVisibility::
+  GitVisibilityUnavailable` stutters its enum name) — fixed by rename to
+  `GitVisibility::Unavailable`; no frozen contract names the Rust
+  identifier.
+- Real defect: five fixture constructors (`OperationReceipt::for_test`,
+  `PhysicalRootLease::for_test_root`, `ObservationLease::for_test_root`,
+  `EvaluationProvenance::for_test`, `CapabilityCertificate::for_test`)
+  compiled into the release binary via `#[cfg(any(test, feature =
+  "server"))]` or no gate at all, violating the execution map's own C4-era
+  precondition that fixture doors must not ship. **Fixed**: all five gated
+  to `#[cfg(any(test, feature = "__test-internals"))]`.
+
+**C11 fences correctness.**
+- Real defect (D14 family, not yet closed by C11b): the watcher's two batch
+  removal lanes (`src/watcher/mod.rs`) called `observe_removal`
+  unconditionally after a fenced removal attempt, including on
+  `NothingHeld`/`Rejected` outcomes — the same defect C11b fenced elsewhere.
+  **Fixed**: both lanes now observe only `FencedRemoval::Removed`.
+- Real defect: the unfenced `SharedIndexHandle::remove_file` (the legacy
+  content-policy eviction seam, `src/protocol/edit.rs`) discarded
+  `LiveIndex::remove_file`'s new bool and published unconditionally — a
+  vacuous publish that would falsely supersede every live CCR handle and
+  repeat-read entry. **Fixed**: publishes only when a removal actually
+  applied.
+- Adjudicated, not fixed: the replay-supersede non-atomicity (two
+  concurrent identical-key retries could both retake a reservation) is a
+  REAL race distinct from the sequential re-execution question below.
+  **Fixed** with a one-winner `try_claim_supersede`/`release_supersede`
+  marker-file claim in `src/idempotency.rs` (age-healed against a
+  crash-orphaned marker), pinned by
+  `supersede_claim_is_one_winner_releases_and_heals_orphans`.
+- Recorded, not fixed (design-scope, deliberately deferred): whether a
+  superseded (unverified) COMPLETED record should re-execute at all for a
+  non-idempotent operation, versus refuse-and-require-deliberate-retry, is
+  a product decision the frozen execution map already adjudicated
+  ("unverified completed/failed record is SUPERSEDED at begin... fresh
+  execution records the current truth" — deliberate). The authority-bypass
+  lens independently re-raised this exact question from first principles;
+  it is not a silent gap — it is the same adjudication two lenses reached
+  by different paths. Left open for T040/operator judgment rather than
+  overridden unilaterally in a review-repair pass.
+- Fixed as hardening (not a defect, a rot-risk): `capture_post_image`'s
+  disk re-read ran after the write's permit was released — reindex, hooks,
+  and formatting all ran in between. **Fixed**: the four single-target
+  edit tools (`replace_symbol_body`, `insert_symbol`, `delete_symbol`,
+  `edit_within_symbol`) now digest the bytes they just wrote
+  (`post_image_from_written_bytes`) with zero re-read and zero window; the
+  three batch executors keep the path-based `capture_post_image` (they
+  return only paths to `edit_tools.rs`, not per-file content).
+- C10 canonicalizer exclusions were narrower than declared. **Fixed**: the
+  module header now declares the variant-only comparisons for
+  non-`ResolvedExact` resolutions/`parse_status`/manifest `disposition`;
+  symbol/reference rows now render full line-end and byte-range
+  coordinates, not just the start line; ownership selectors compare by
+  resolved anchor content, not raw index/count.
+
+**Adjudications challenge (§5).** All five adjudications' text corrected to
+remove the "C5 will own it" future tense for obligations C5 did NOT
+discharge (retarget-in-place admission identity, the serve-path
+`NormalProject` hardcode, the `project_source_authority` static) — each is
+now recorded as an OPEN residual with its owner named as the post-cut
+follow-up, not silently implied resolved. The OBSERVED-REFRESH-GATE-v1.md
+sub-millisecond attribution ("+1ms is the candidate's real work") was an
+unobserved claim off a millisecond-truncated receipt; withdrawn and
+replaced with the honest bound (three orders of magnitude under budget,
+ratio unadjudicable at this resolution) plus the recorded follow-up
+(microsecond receipts). The D16 per-response claim's scope was verified
+sound for the capture-bound handlers named in this document; `get_symbol`,
+`find_dependents`, and `detect_impact` did NOT capture their evidence
+receipt from the same bundle they rendered from — **fixed** by wiring all
+three through `capture_local_response_generation` (`get_symbol`'s batch
+and single-target lanes, `find_dependents`, `detect_impact`).
+
+**Oracle quality audit.** Three falsifiability-hardening findings, all
+fixed: the delta-equivalence comparator's ability to actually detect a
+mismatch was asserted only via a bypass of the real harness — a firing
+control now exercises `compare_with_clean_rebuild` itself on a deliberately
+unrefreshed file. The CCR identity fence's premise (two renderings are
+byte-identical apart from their handles) was unasserted — now asserted via
+`without_ccr_hash`. The frecency discovery-split oracle discarded whether
+its discovery calls actually answered — both responses are now asserted to
+contain real evidence. Two nits fixed: a loose `contains("2")` tightened to
+`contains("    2")`; a dead `LEGACY_DAEMON_PORT_FILE` wait in the daemon
+oracle replaced with the real port-file wait.
+
+**Authority bypass hunt.** Beyond the C11-fences and adjudications findings
+already covered: the CCR publication-identity fence failed OPEN when
+`current_publication` is `None` but the stored identity is `Some` (mid-bind
+or mid-retarget) — a bound blob would redeem bare, unlabeled, as current.
+**Fixed**: `retrieve_checked` now refuses `ForeignPublication` on
+`(Some(stored), None)` too, not only on an explicit source mismatch. A
+`src/cli/init.rs` write-classification comment falsely claimed every write
+was user-scope; the Kilo Code lane (`.kilocode/mcp.json`,
+`.kilocode/rules/symforge.md`) writes inside the repository root,
+permit-free. **Corrected the comment** to name this as a recorded residual
+rather than reclassify a standalone pre-index tool's write path under
+review-pass time pressure.
+
+**Consequences of the repairs, both deliberate and observed:**
+- `src/live_index/persist.rs::CURRENT_VERSION` bumped 7 → 8 (part of
+  frozen 020:T065's "bump the snapshot format... implement bounded
+  untrusted-seed restore" requirement — the format bump and the
+  whole-snapshot seed-preservation gate are now live; the richer
+  per-entry `SnapshotStore` proof machinery in `src/index_lifecycle/
+  snapshot.rs` remains unwired — see `docs/migrations/
+  v11-index-lifecycle.md` §4 for the exact narrowed scope). A format-7
+  file is now a preserved, quarantined V10 seed, never authority; oracle
+  `a_v10_format_snapshot_is_a_preserved_seed_never_authority`.
+- Two new unconditionally-compiled unit tests (the V10-seed oracle above,
+  `supersede_claim_is_one_winner_releases_and_heals_orphans`) raised the
+  embed test-cell's exact count from 1336 to **1339** (1338 immediately
+  after adding both; +1 more from the `remove_snapshot_deleted_file_if_
+  still_absent` split-outcome oracle). This is the new frozen count for
+  that cell going forward.
+- Full battery re-observed clean after every fix batch: fmt, both clippy
+  lanes (`--all-targets` and door-open embed) with door-open verified
+  independently, doorless embed clippy also verified clean post-rename,
+  dark seal 9/9 (FULL pin refreshed three times across the round; EXCLUDED
+  pin moved once — for the `GitVisibility` rename inside the sealed
+  `index_lifecycle` directory, reviewed as a comment-only + mechanical-
+  rename diff before refresh), embed cell 1339, full serial suite exit 0,
+  bench smoke exit 0, validator OK, campaign oracle 1/1 exact.
+- One unrelated pre-existing hardcoded `snapshot.version == 7` assertion
+  in `tests/live_index_integration.rs` (predating this cut) updated to 8
+  in the same change that owns the bump.
+
+**T037's T065 note updated**: the migration doc's `as_of 2026-08-20` open
+marker on live persist.rs wiring (`docs/migrations/v11-index-lifecycle.md`
+§4) is narrowed, not closed — the format bump and V10-seed preservation/
+quarantine landed in this round; wiring the richer `SnapshotStore`
+per-entry proof machinery into the live restore path remains open. See
+that document for the exact scope.
+
 ## 7. Open obligations before merge
 
 - **T038**: multi-round adversarial review (cfg-lens sweep included),

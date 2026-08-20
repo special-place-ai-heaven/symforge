@@ -77,6 +77,9 @@ pub struct CapabilityCertificate {
 }
 
 impl CapabilityCertificate {
+    /// Fixture constructor (test-door gated, T038 round-1: fixture evidence
+    /// must not ship in a release cell).
+    #[cfg(any(test, feature = "__test-internals"))]
     pub fn for_test() -> Self {
         Self { _private: () }
     }

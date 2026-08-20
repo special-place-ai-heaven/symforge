@@ -4243,9 +4243,16 @@ impl SymForgeServer {
             if targets.is_empty() {
                 return "Error: targets array is empty.".to_string();
             }
+            // T038 round-1 (D16): one capture records the evidence receipt
+            // from the same immutable bundle that renders the batch below —
+            // the seeded pre-dispatch receipt must never accompany a body
+            // from a later publication.
+            let generation = self.capture_local_response_generation();
+            if let Some(message) = loading_guard_message_from_published(&generation.health) {
+                return message;
+            }
             let captured = {
-                let guard = self.index.data_plane().read();
-                loading_guard!(guard);
+                let guard = &generation.live;
 
                 targets
                     .iter()
@@ -4377,12 +4384,10 @@ impl SymForgeServer {
         // Capture freshness and the immutable publication before consulting the
         // repeat-read cache. The same request against a later watcher publication
         // must be a cache miss, and the bytes below must come from this exact
-        // captured generation rather than a second live-index read.
-        let generation = self
-            .index
-            .data_plane()
-            .published_source_set()
-            .current_generation();
+        // captured generation rather than a second live-index read. T038
+        // round-1 (D16): the capture also records the evidence receipt from
+        // this same bundle.
+        let generation = self.capture_local_response_generation();
         if let Some(message) = loading_guard_message_from_published(&generation.health) {
             return message;
         }
@@ -8509,9 +8514,12 @@ impl SymForgeServer {
             return result;
         }
 
-        {
-            let guard = self.index.data_plane().read();
-            loading_guard!(guard);
+        // T038 round-1 (D16): one capture — the evidence receipt names the
+        // exact publication the blast-radius walk below renders from, not the
+        // pre-dispatch seed.
+        let generation = self.capture_local_response_generation();
+        if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            return message;
         }
 
         let Some(repo_root) = self.effective_repo_root_for_git_tools() else {
@@ -8647,7 +8655,8 @@ impl SymForgeServer {
             None => base_branch.as_deref().unwrap_or("HEAD"),
         };
         let (changed_symbols, blast_radius) = {
-            let guard = self.index.data_plane().read();
+            // Render from the SAME captured bundle the receipt names (D16).
+            let guard = Arc::clone(&generation.live);
             let mut changed_symbols: Vec<crate::live_index::graph::SymbolId> = Vec::new();
             for path in &changed_files {
                 // Kind lookup for the CURRENT symbols comes from the live index;
@@ -9611,11 +9620,13 @@ impl SymForgeServer {
             return refusal;
         }
         let input = &params.0;
-        let view = {
-            let guard = self.index.data_plane().read();
-            loading_guard!(guard);
-            guard.capture_find_dependents_view(&input.path)
-        };
+        // T038 round-1 (D16): one capture — the evidence receipt and the
+        // rendered view come from the same immutable bundle.
+        let generation = self.capture_local_response_generation();
+        if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            return message;
+        }
+        let view = generation.live.capture_find_dependents_view(&input.path);
         // Default per-file reference detail is capped at 5 lines (not 10) so the
         // non-compact view stays bounded on hub files with dozens of dependents;
         // callers can raise it with max_per_file or switch to compact=true.
@@ -12329,7 +12340,8 @@ impl SymForgeServer {
                     .to_string()
             }
             Err(crate::protocol::ccr::CcrRetrieveError::ForeignPublication) => {
-                "CCR retrieve: handle was rendered from a different source publication; retry                  the originating search in this project."
+                "CCR retrieve: handle was rendered from a different source publication; retry \
+                 the originating search in this project."
                     .to_string()
             }
         }

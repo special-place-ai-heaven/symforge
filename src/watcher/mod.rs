@@ -865,14 +865,19 @@ pub(crate) fn process_events(
         if definitely_missing {
             let fence = shared.publication_fence();
             if fence.project_generation == expected_gen {
-                let _ = shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                // T038 round-1 repair: observe ONLY an applied removal. A
+                // `NothingHeld` no-op or a recreated-path rejection removed
+                // nothing, and recording a removal observation for it is the
+                // same reporting-invariant defect the D14 fence closed.
+                let removal = shared.remove_file_if_absent_at_publication_fence_with_receipt(
                     &pending.relative_path,
                     &pending.absolute_path,
                     fence,
                 );
-                if authority
-                    .observe_removal(observer, &pending.relative_path)
-                    .is_err()
+                if matches!(removal, crate::live_index::store::FencedRemoval::Removed(_))
+                    && authority
+                        .observe_removal(observer, &pending.relative_path)
+                        .is_err()
                 {
                     debug!("watcher: stale incarnation's removal observation refused");
                 }
@@ -909,14 +914,17 @@ pub(crate) fn process_events(
                 // any later create hint or periodic reconciliation can re-admit it.
                 let fence = shared.publication_fence();
                 if fence.project_generation == expected_gen {
-                    let _ = shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                    // T038 round-1 repair: same rule as the definitely-missing
+                    // lane above — only an applied removal is observed.
+                    let removal = shared.remove_file_if_absent_at_publication_fence_with_receipt(
                         &pending.relative_path,
                         &pending.absolute_path,
                         fence,
                     );
-                    if authority
-                        .observe_removal(observer, &pending.relative_path)
-                        .is_err()
+                    if matches!(removal, crate::live_index::store::FencedRemoval::Removed(_))
+                        && authority
+                            .observe_removal(observer, &pending.relative_path)
+                            .is_err()
                     {
                         debug!("watcher: stale incarnation's removal observation refused");
                     }

@@ -43,8 +43,10 @@ fn export_delta_matches_frozen_contract_atoms() {
     assert_eq!(atoms.len(), 64, "the frozen atom count");
 
     // Recompute leg 2: the LIVE census, by the same rule the checker uses —
-    // pub mod lines in lib.rs. server_api must NOT appear: it is pub(crate),
-    // flip-ready, invisible to the census until activation.
+    // pub mod lines in lib.rs. Post-C5 the census holds exactly the kept +
+    // introduced modules; the assertions below pin `server_api` and `embed`
+    // as PRESENT (the pre-flip prose that once lived here said the
+    // opposite and went stale the moment C5 landed).
     let lib = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("lib.rs");
     // Whitespace-tolerant, aligned with the checker's regex rather than a

@@ -58,13 +58,21 @@ Samples per case (baseline/candidate):
   the observation pipeline without adding user-visible latency). Two
   sub-millisecond lanes quantize to a nominal 2.00× (embed commit 1→2 ms,
   freshen-on-read 1→2 ms): at millisecond resolution a one-unit step is the
-  smallest representable change, and the +1 ms is the candidate's real
-  additional work (the V11 candidate pipeline and observation commit on the
-  mutation path). ADJUDICATION: pass, recorded openly — the 1.25× clause
+  smallest representable change. What that step IS was not observed — the
+  bench truncated its nanosecond-resolution `Duration`s to milliseconds at
+  receipt time, so base 1 ms → candidate 2 ms is consistent with anything
+  from ~1.0× (1.99→2.0 ms) to ~3.0× (0.7→2.0 ms). An earlier revision of
+  this paragraph attributed the +1 ms to "the candidate's real additional
+  work"; that attribution was an unobserved claim (T038 round-1 finding)
+  and is withdrawn. ADJUDICATION: pass, recorded openly — the 1.25× clause
   guards the user-scale refresh envelope, both lanes sit three orders of
-  magnitude under every absolute budget, and a ratio test below the
-  measurement's quantum is noise; flagged for the T038 adversarial review
-  to challenge.
+  magnitude under every absolute budget (embed max 3 ms, freshen max 6 ms
+  bound the hidden-regression envelope), and a ratio test below the
+  measurement's quantum is unadjudicable, not passed on its merits. A
+  microsecond-resolution receipt (`as_micros` at the receipt site) plus a
+  two-lane rerun on BOTH sides is the recorded follow-up that would settle
+  the ratio at this scale; the freshen max moving 3→6 ms across runs is
+  flagged to the same follow-up.
 - **No single-path full rebuild outside Gap/ScopeDirty:** PASS, asserted
   in-bench on BOTH sides — every campaign pins its project generation
   before timing and asserts it unchanged at campaign end (only a reload

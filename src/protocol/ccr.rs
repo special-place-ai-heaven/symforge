@@ -237,10 +237,20 @@ impl CcrStore {
         {
             return Err(CcrRetrieveError::SecretPolicyMismatch);
         }
-        if let (Some(stored), Some(current)) = (&blob.publication, current_publication)
-            && stored.source_digest != current.source_digest
-        {
-            return Err(CcrRetrieveError::ForeignPublication);
+        // T038 round-1 repair: a blob minted under a KNOWN publication must
+        // not fail open when the current identity is unavailable (mid-bind,
+        // mid-retarget, or mid-reset). "Cannot verify" is not "verified
+        // current" — refuse the same as an explicit mismatch. A blob minted
+        // with NO identity (`stored: None`) keeps its prior generic
+        // behavior, matching the secret-policy check's precedent above.
+        match (&blob.publication, current_publication) {
+            (Some(stored), Some(current)) if stored.source_digest != current.source_digest => {
+                return Err(CcrRetrieveError::ForeignPublication);
+            }
+            (Some(_), None) => {
+                return Err(CcrRetrieveError::ForeignPublication);
+            }
+            _ => {}
         }
         let publication = blob.publication.clone();
         Ok(self

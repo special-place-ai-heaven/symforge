@@ -19,9 +19,13 @@
 // Without the door, the wrapped modules' formerly-public items are
 // structurally unreachable, and rustc counts an unreachable re-export as an
 // unused import and an unreachable pub item as dead code. Suppress those
-// lints ONLY in the doorless build: every gate that lints (`cargo test`,
-// `clippy --all-targets`) builds with the door open through the self
-// dev-dependency, so genuinely dead items stay caught.
+// lints ONLY in the doorless build. Every LINTING gate must therefore run
+// door-open: `cargo test` and `clippy --all-targets` get the door through
+// the self dev-dependency, and the CI embed clippy lanes pass
+// `--features embed,__test-internals` explicitly (T038 round-1 repair: the
+// doorless embed clippy lanes were linting with this blanket allow active,
+// disarming unused-import/dead-code detection for the whole engine tree in
+// that cell). The doorless `cargo build` lanes stay as compile gates only.
 #![cfg_attr(not(feature = "__test-internals"), allow(unused_imports, dead_code))]
 
 // ── Engine: always compiled (parsing + live_index + query + git + shared base) ──

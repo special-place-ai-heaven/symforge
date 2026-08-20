@@ -13589,7 +13589,7 @@ mod tests {
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&test_daemon_path(
             daemon_home.path(),
-            LEGACY_DAEMON_PORT_FILE,
+            daemon_port_file_name(),
         ))
         .await;
     }

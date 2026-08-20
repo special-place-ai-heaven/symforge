@@ -103,7 +103,12 @@ pub enum GitVisibility {
     AlreadyTracked,
     UntrackedVisible,
     IgnoredForceAddRequired,
-    GitVisibilityUnavailable,
+    // T038 round-2 (cfg-lens): renamed from `GitVisibilityUnavailable` — the
+    // stutter tripped `clippy::enum_variant_names` in the doorless embed
+    // cell, a lane this campaign had never actually run door-open until now.
+    // No frozen contract names this Rust identifier (the frozen wire label
+    // is the separate snake_case string "git_visibility_unavailable").
+    Unavailable,
 }
 
 impl GitVisibility {
@@ -111,7 +116,7 @@ impl GitVisibility {
         GitVisibility::AlreadyTracked,
         GitVisibility::UntrackedVisible,
         GitVisibility::IgnoredForceAddRequired,
-        GitVisibility::GitVisibilityUnavailable,
+        GitVisibility::Unavailable,
     ];
 }
 
@@ -144,7 +149,7 @@ impl ExportReceipt {
         match self.visibility {
             GitVisibility::AlreadyTracked | GitVisibility::UntrackedVisible => Some(true),
             GitVisibility::IgnoredForceAddRequired => Some(false),
-            GitVisibility::GitVisibilityUnavailable => None,
+            GitVisibility::Unavailable => None,
         }
     }
 }

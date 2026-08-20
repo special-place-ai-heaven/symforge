@@ -306,9 +306,13 @@ pub struct ProjectSourceAuthority {
     /// The identity of this root's FIRST lease, presented for project
     /// admission (C4b). Every open of one canonicalized root converges on
     /// this authority and therefore presents the same physical identity —
-    /// which is what lets concurrent opens join one admission. Mid-cut
-    /// residual: a root physically replaced at the same path keeps its
-    /// admission identity until C5's transitions own rebinding.
+    /// which is what lets concurrent opens join one admission. OPEN residual
+    /// (T038 round-1 adjudication): C5 landed WITHOUT owning rebinding, so a
+    /// root physically replaced at the same path still keeps its first
+    /// admission identity (and this cached authority's lane state) across
+    /// the replacement. Owned by the post-cut follow-up recorded in
+    /// docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md — do not
+    /// treat this comment as a promise that any landed commit discharged it.
     admission_root: PhysicalRootIdentity,
     inner: Mutex<AuthorityInner>,
     // Separate mutex, strict ordering: lane state is always taken and

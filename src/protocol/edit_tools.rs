@@ -667,28 +667,39 @@ pub(crate) fn probe_symforge_edit_apply_replay(
     }
 }
 
+/// Complete a replay record from a receipt captured off written PATHS (the
+/// batch executors, which know only paths in `edit_tools.rs`). Edit tools
+/// never delete files, so a receipt with any absent or unreadable target
+/// means the read-back failed and the record must never replay (no receipt).
 fn complete_mutation_replay(
     idempotency: &Option<crate::idempotency::ActiveReplay>,
     output: &mut String,
     written: &[std::path::PathBuf],
 ) {
-    if let Some(idempotency) = idempotency {
-        // The replay-authority fence (Feature 020 Slice 4): bind the bytes
-        // this success left on disk into the record. Edit tools never delete
-        // files, so a receipt with any absent or unreadable target means the
-        // read-back failed and the record must never replay (None receipt).
-        let post_image = crate::idempotency::capture_post_image(written).filter(|receipt| {
-            !receipt.targets.is_empty()
-                && receipt
-                    .targets
-                    .iter()
-                    .all(|target| target.content_digest.is_some())
-        });
-        if let Err(error) = idempotency.complete_with_post_image(output.clone(), post_image) {
-            output.push_str(&format!(
-                "\nIdempotency warning: failed to store replay result: {error}"
-            ));
-        }
+    let post_image = crate::idempotency::capture_post_image(written).filter(|receipt| {
+        !receipt.targets.is_empty()
+            && receipt
+                .targets
+                .iter()
+                .all(|target| target.content_digest.is_some())
+    });
+    complete_mutation_replay_with_receipt(idempotency, output, post_image);
+}
+
+/// Complete a replay record from a receipt already built off bytes the
+/// caller wrote itself (T038 round-1: the single-target edit tools — no
+/// re-read, no post-permit window).
+fn complete_mutation_replay_with_receipt(
+    idempotency: &Option<crate::idempotency::ActiveReplay>,
+    output: &mut String,
+    post_image: Option<crate::idempotency::PostImageReceipt>,
+) {
+    if let Some(idempotency) = idempotency
+        && let Err(error) = idempotency.complete_with_post_image(output.clone(), post_image)
+    {
+        output.push_str(&format!(
+            "\nIdempotency warning: failed to store replay result: {error}"
+        ));
     }
 }
 
@@ -1080,10 +1091,13 @@ impl SymForgeServer {
         ));
         append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut result, &params.0.path);
-        complete_mutation_replay(
+        complete_mutation_replay_with_receipt(
             &idempotency,
             &mut result,
-            std::slice::from_ref(&resolved_target.target_path),
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
         );
         result
     }
@@ -1285,10 +1299,13 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(
+        complete_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
-            std::slice::from_ref(&resolved_target.target_path),
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
         );
         out
     }
@@ -1480,10 +1497,13 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(
+        complete_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
-            std::slice::from_ref(&resolved_target.target_path),
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
         );
         out
     }
@@ -1869,10 +1889,13 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay(
+        complete_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
-            std::slice::from_ref(&resolved_target.target_path),
+            Some(crate::idempotency::post_image_from_written_bytes(
+                &resolved_target.target_path,
+                &new_content,
+            )),
         );
         out
     }

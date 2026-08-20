@@ -217,7 +217,9 @@ impl OperationReceipt {
     }
 
     /// Fixture constructor for oracles that do not vary the arguments.
-    #[cfg(any(test, feature = "server"))]
+    /// T038 round-1 repair: behind the test door, never in a shipped cell —
+    /// the `server` disjunct compiled this fixture into the release binary.
+    #[cfg(any(test, feature = "__test-internals"))]
     pub fn for_test(operation_kind: OperationKind) -> Self {
         Self::for_dark_refusal(operation_kind)
     }

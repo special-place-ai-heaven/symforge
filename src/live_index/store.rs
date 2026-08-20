@@ -2855,11 +2855,19 @@ impl SharedIndexHandle {
         let _wg = self.write_mutex.lock();
         let mut live = (*self.live.load_full()).clone();
         let path_owned = path.to_string();
+        let mut removed = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            live.remove_file(path);
+            removed = live.remove_file(path);
         }));
         match result {
             Ok(()) => {
+                // T038 round-1 repair (same rule as `remove_file_with_fences`):
+                // a path nothing held has no removal to publish — a vacuous
+                // publish moves the content generation over identical bytes,
+                // falsely superseding every CCR handle and repeat-read entry.
+                if !removed {
+                    return;
+                }
                 self.swap_and_publish(live);
                 self.pre_update_snapshots.lock().remove(path);
             }
@@ -5230,9 +5238,8 @@ impl LiveIndex {
     ///
     /// Indexed bytes and the canonical manifest entry are cleared together. If
     /// neither lane contains the path, this is a no-op (no timestamp update).
-    /// Remove a file's parsed entry and manifest row. Returns whether the
-    /// index actually HELD anything for this path — the caller that reports a
-    /// removal (or publishes one) must know, not assume.
+    /// Returns whether the index actually HELD anything for this path — the
+    /// caller that reports a removal (or publishes one) must know, not assume.
     pub fn remove_file(&mut self, path: &str) -> bool {
         self.remove_reverse_index_for_path(path);
         let removed_file = self.files.remove(path).is_some();

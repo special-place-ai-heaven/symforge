@@ -115,10 +115,34 @@ pub struct PostImageReceipt {
     pub targets: Vec<PostImageTarget>,
 }
 
+/// Digest a SINGLE target's post-image from bytes already in hand — the
+/// caller's own just-written content — rather than reopening the file from
+/// disk. T038 round-1 repair: `capture_post_image`'s disk re-read ran after
+/// the write's permit was released (reindex, hooks, and formatting all run
+/// between write and the original capture point), an unfenced window in
+/// which a concurrent writer's bytes could be digested and bound to THIS
+/// response's receipt. The single-target edit tools hold the bytes they
+/// wrote for the rest of the call; using them here makes the receipt
+/// describe exactly what THIS operation committed, with no reopen and no
+/// window at all.
+pub fn post_image_from_written_bytes(path: &Path, bytes: &[u8]) -> PostImageReceipt {
+    PostImageReceipt {
+        targets: vec![PostImageTarget {
+            path: path.display().to_string(),
+            content_digest: Some(crate::hash::digest_hex(bytes)),
+        }],
+    }
+}
+
 /// Read back the current bytes of the written paths and digest them into a
 /// receipt. A missing file records absence; any OTHER read error returns
 /// `None` — capture failure means NO receipt, and a record without a receipt
 /// never replays (fail closed rather than binding bytes nobody read).
+///
+/// For a single target whose bytes are already known, prefer
+/// [`post_image_from_written_bytes`] — this disk re-read exists for the
+/// batch executors, which return only written PATHS to `edit_tools.rs`, not
+/// their per-file content.
 pub fn capture_post_image(written: &[PathBuf]) -> Option<PostImageReceipt> {
     let mut targets = Vec::with_capacity(written.len());
     for path in written {
@@ -279,6 +303,11 @@ pub enum IdempotencyError {
     Json(#[from] serde_json::Error),
 }
 
+/// Age past which a supersede marker is an orphan (its owner crashed between
+/// two adjacent fs writes) and may be reclaimed. Generous against clock skew;
+/// a healthy claim lives for microseconds.
+const SUPERSEDE_MARKER_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct FileReplayStore {
     records_dir: PathBuf,
@@ -381,6 +410,49 @@ impl FileReplayStore {
 
     pub fn record_path(&self, key: &IdempotencyKey) -> PathBuf {
         self.record_path_for_hash(&key.key_hash())
+    }
+
+    /// One-winner supersede claim (T038 round-1): `create_new` is the same
+    /// atomic first-claim primitive `check_or_reserve` uses, so exactly one
+    /// of N concurrent contenders superseding the same unverified record may
+    /// retake its reservation — the losers answer as reserved instead of
+    /// double-executing the mutation. A marker orphaned by a crash between
+    /// claim and release (two adjacent fs writes) heals by age.
+    pub fn try_claim_supersede(&self, key_hash: &str) -> Result<bool, IdempotencyError> {
+        let marker = self.supersede_marker_path(key_hash);
+        for attempt in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+            {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&marker)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > SUPERSEDE_MARKER_STALE);
+                    if attempt == 0 && stale {
+                        let _ = fs::remove_file(&marker);
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                Err(error) => return Err(IdempotencyError::Io(error)),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Release a claim taken by [`Self::try_claim_supersede`]. Best-effort:
+    /// an unremovable marker degrades to the age-healing path.
+    pub fn release_supersede(&self, key_hash: &str) {
+        let _ = fs::remove_file(self.supersede_marker_path(key_hash));
+    }
+
+    fn supersede_marker_path(&self, key_hash: &str) -> PathBuf {
+        self.records_dir.join(format!("{key_hash}.superseding"))
     }
 
     fn ensure_same_hash(
@@ -620,8 +692,21 @@ pub fn begin_tool_replay_verified(
             if verified || record.status == ReplayStatus::Reserved {
                 return Ok(ReplayStart::Replay(replay_response(&record)));
             }
+            // T038 round-1 repair: superseding must have ONE winner. Without
+            // the claim, two concurrent identical-key retries could both
+            // retake the reservation and both execute the mutation. Losers
+            // answer as reserved — transient by construction (the winner's
+            // record write and marker release are adjacent, and an orphaned
+            // marker heals by age).
+            if !store.try_claim_supersede(&key.key_hash())? {
+                return Ok(ReplayStart::Replay(replay_response(
+                    &ReplayRecord::reserved(key.key_hash(), request_hash.clone()),
+                )));
+            }
             let superseding = ReplayRecord::reserved(key.key_hash(), request_hash.clone());
-            store.write_record_atomic(&superseding)?;
+            let written = store.write_record_atomic(&superseding);
+            store.release_supersede(&key.key_hash());
+            written?;
             Ok(ReplayStart::FirstExecution(ActiveReplay {
                 store,
                 key,
@@ -749,6 +834,44 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T038 round-1 (replay supersede atomicity): the supersede claim has
+    /// exactly one winner, releases cleanly, and heals a crash-orphaned
+    /// marker by age. A deterministic RED for the underlying race is not
+    /// constructible; this pins the primitive the race fix rests on.
+    #[test]
+    fn supersede_claim_is_one_winner_releases_and_heals_orphans() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = FileReplayStore::open_in(dir.path().join("idempotency")).expect("store");
+
+        assert!(store.try_claim_supersede("k1").expect("first claim"));
+        assert!(
+            !store.try_claim_supersede("k1").expect("second claim"),
+            "a live claim must have exactly one winner"
+        );
+        store.release_supersede("k1");
+        assert!(
+            store.try_claim_supersede("k1").expect("post-release claim"),
+            "a released claim is reclaimable"
+        );
+
+        // Crash-orphan healing: backdate the marker past the staleness bound;
+        // the next claim reclaims it instead of wedging the key forever.
+        let marker = store.supersede_marker_path("k1");
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .expect("open marker")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - (SUPERSEDE_MARKER_STALE * 2)),
+            )
+            .expect("backdate marker");
+        assert!(
+            store.try_claim_supersede("k1").expect("stale reclaim"),
+            "an orphaned marker past the staleness bound must be reclaimable"
+        );
+    }
 
     #[test]
     fn index_folder_identity_uses_native_project_identity() {

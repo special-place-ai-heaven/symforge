@@ -15,9 +15,15 @@
 //! inside per-row anchors (asserted once per instance instead, see the
 //! generation-binding section of the knowledge oracle), document timelines
 //! (filesystem/git time evidence, environment-bound), and resource-usage
-//! telemetry. Excluding a field here is a claim that it is NOT part of the
-//! artifact's identity; every exclusion is listed in this paragraph so review
-//! can challenge it.
+//! telemetry. Additionally (declared in T038 round-1, previously implicit):
+//! non-`ResolvedExact` resolution payloads, `parse_status` payloads, and
+//! manifest `disposition` payloads are compared by VARIANT NAME only
+//! (`variant_tag`) — their payloads carry diagnostic/evidence wording and
+//! instance-bound fields, not artifact identity; the resolved-exact payload
+//! and full symbol/reference coordinates (both line ends plus byte ranges)
+//! are content-bound and rendered. Excluding a field here is a claim that it
+//! is NOT part of the artifact's identity; every exclusion is listed in this
+//! paragraph so review can challenge it.
 //!
 //! FAIRNESS (frozen: "every edit and projection class runs even after a
 //! mismatch"): comparisons never assert mid-loop. Mismatches accumulate into
@@ -166,10 +172,23 @@ fn canonical_code(published: &PublishedGeneration) -> Vec<String> {
         .live
         .all_files()
         .map(|(path, file)| {
+            // Full coordinates (T038 round-1): both line ends and the byte
+            // range are content-bound — a delta path serving a shifted span
+            // must not pass on the start line alone.
             let mut symbols: Vec<String> = file
                 .symbols
                 .iter()
-                .map(|symbol| format!("{}:{:?}@l{}", symbol.name, symbol.kind, symbol.line_range.0))
+                .map(|symbol| {
+                    format!(
+                        "{}:{:?}@l{}..{}b{}..{}",
+                        symbol.name,
+                        symbol.kind,
+                        symbol.line_range.0,
+                        symbol.line_range.1,
+                        symbol.byte_range.0,
+                        symbol.byte_range.1
+                    )
+                })
                 .collect();
             symbols.sort();
             let mut references: Vec<String> = file
@@ -177,8 +196,13 @@ fn canonical_code(published: &PublishedGeneration) -> Vec<String> {
                 .iter()
                 .map(|reference| {
                     format!(
-                        "{}:{:?}@l{}",
-                        reference.name, reference.kind, reference.line_range.0
+                        "{}:{:?}@l{}..{}b{}..{}",
+                        reference.name,
+                        reference.kind,
+                        reference.line_range.0,
+                        reference.line_range.1,
+                        reference.byte_range.0,
+                        reference.byte_range.1
                     )
                 })
                 .collect();
@@ -266,6 +290,18 @@ fn canonical_knowledge(bridge: &KnowledgeBridge) -> Vec<String> {
             "knowledge-link|{}|{resolution}",
             anchor_row(&link.evidence)
         ));
+    }
+    // Ownership selectors by CONTENT (T038 round-1): the raw `u32` card
+    // indices are ordering-bound, so each selector is rendered as the anchor
+    // of the card it selects — a delta path carrying one stale selector and
+    // dropping one fresh one no longer passes on equal count alone.
+    for &selector in &bridge.ownership_selectors {
+        let anchor = bridge
+            .cards
+            .get(selector as usize)
+            .map(|card| anchor_row(&card.anchor))
+            .unwrap_or_else(|| format!("dangling-card-index:{selector}"));
+        rows.push(format!("ownership-selector|{anchor}"));
     }
     rows.sort();
     rows.push(format!(
@@ -431,6 +467,28 @@ async fn every_edit_matches_clean_full_rebuild() {
 
     // Baseline: two loads of the same bytes agree before any edit.
     compare_with_clean_rebuild(root, &shared, "baseline", &mut mismatches);
+
+    // Firing control (T038 round-1): prove the comparator CAN record a
+    // mismatch through the REAL harness before trusting its silence — a
+    // comparator regressed into comparing an instance against itself would
+    // pass every equivalence assertion below vacuously, forever. An on-disk
+    // file the delta instance has NOT refreshed must diverge.
+    std::fs::write(
+        root.join("src/firing_control.rs"),
+        "pub fn firing_control_anchor() -> u64 {\n    1\n}\n",
+    )
+    .expect("firing-control write");
+    let mut firing = Vec::new();
+    compare_with_clean_rebuild(root, &shared, "firing-control", &mut firing);
+    assert!(
+        firing
+            .iter()
+            .any(|mismatch| mismatch.starts_with("[firing-control/code]")),
+        "control: an unrefreshed on-disk file must diverge through the real \
+         comparison harness, got: {firing:?}"
+    );
+    refresh(&shared, root, "src/firing_control.rs");
+    compare_with_clean_rebuild(root, &shared, "firing-control-refreshed", &mut mismatches);
 
     // add — code and prose.
     std::fs::write(
@@ -655,13 +713,23 @@ async fn frecency_discovery_commitment_split() {
         .as_path()
         .join(symforge::paths::FRECENCY_DB_NAME);
 
-    // Discovery-only calls: search must not create frecency.
-    server
+    // Discovery-only calls: search must not create frecency. Each response
+    // is asserted to have ACTUALLY answered (T038 round-1): a failed
+    // dispatch would satisfy "no frecency" without exercising the split.
+    let discovered_files = server
         .dispatch_tool_for_tests("search_files", json!({ "query": "alpha" }))
         .await;
-    server
+    assert!(
+        discovered_files.contains("alpha"),
+        "the discovery search_files call did not answer:\n{discovered_files}"
+    );
+    let discovered_text = server
         .dispatch_tool_for_tests("search_text", json!({ "query": "alpha_entry" }))
         .await;
+    assert!(
+        discovered_text.contains("alpha_entry"),
+        "the discovery search_text call did not answer:\n{discovered_text}"
+    );
     let after_discovery = FrecencyStore::open_existing_readonly(&db_path)
         .expect("readonly open")
         .map(|store| store.last_10_bumps().expect("bumps"))
