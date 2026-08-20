@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 import uuid
 from copy import deepcopy
@@ -539,8 +540,26 @@ class RefreezeV11Tests(unittest.TestCase):
                 return
 
         for path in reversed(created):
-            if path.exists():
-                shutil.rmtree(path, onexc=remove_readonly)
+            if not path.exists():
+                continue
+            # The sibling race the handler above cannot see. A `git` process
+            # can still be finishing a write under `.git/objects` while the
+            # walk is inside it, so the rmdir of a directory the walk had just
+            # emptied raises ENOTEMPTY. chmod-and-retry cannot help — nothing
+            # is read-only and the path is not gone — so the handler re-raises
+            # and a passing test is reported as an ERROR. That is what cost
+            # prepare-release a full cycle on 2026-08-20, on a tree whose same
+            # 274 tests had reported OK in verify-release-ref 38 minutes
+            # earlier. Retry the whole walk: the writer finishes in
+            # milliseconds and the next pass finds the directory empty.
+            for attempt in range(5):
+                try:
+                    shutil.rmtree(path, onexc=remove_readonly)
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.2)
 
     def assert_internal_error(
         self,
