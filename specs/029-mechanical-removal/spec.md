@@ -26,18 +26,28 @@ while the tree gets smaller.
 
 ## User Scenarios & Testing *(mandatory)*
 
-### User Story 1 - A removal can be proven behaviour-neutral (Priority: P1)
+### User Story 1 - A removal can be proven behaviour-neutral (Priority: P2 — admission instrument)
+
+> **Demoted from P1 on 2026-08-21** by two independent uncontaminated reviews
+> (LINUS, HOLMES). The bracket is the **admission gate for a removal**, not the
+> slice's product. The frozen job is delete-only-proven-unreachable; shipping a
+> bracketing platform so the slice has something to show when it deletes
+> nothing is exactly the inversion they called out. **US2 is P1 whenever
+> anything is evidenced-unreachable.**
+>
+> What is explicitly *kept*: C-1 and Acceptance Scenario 3, the control. Both
+> reviewers said so unprompted — the canary stays, only its billing changes.
 
 A maintainer removes something from `src/` and needs to establish, from evidence
 rather than assertion, that runtime authority, public behaviour, writer
 reachability, and activation mode are unchanged. Today no bracketing artifact
 exists: the only way to argue neutrality is to reason about the diff.
 
-**Why this priority**: Every subsequent removal depends on it, and it carries
-standalone value — once the bracket exists, *any* future removal in this
-codebase can be held to the same standard, whether or not Slice 5 removes a
-single line. It is also the only part of the slice that cannot be skipped if the
-recon finds nothing removable.
+**Why this priority**: Every removal must pass through it, so it gates US2 —
+but it is a gate, not a deliverable. The "standalone value for any future
+removal" argument that originally justified P1 is YAGNI: this slice was not
+asked for a reusable bracketing platform, and building one is how a
+delete-only slice quietly becomes a methodology project.
 
 **Independent Test**: Capture the baseline, introduce a deliberate control
 change, re-capture, and confirm the comparison **names the field that moved**.
@@ -70,15 +80,17 @@ broken comparison would also do.
 
 ---
 
-### User Story 2 - Retired V10 authority is gone from the tree (Priority: P2)
+### User Story 2 - Retired V10 authority is gone from the tree (Priority: P1 when anything is evidenced-unreachable)
 
 A reader of `src/` currently cannot distinguish V10 authority that the cut
 retired from V11 machinery that is live. Both compile; both are named; only one
 runs. The retirement inventory records the disposition, but the source does not.
 
-**Why this priority**: This is the slice's headline product, but it is worthless
-and dangerous without US1's bracket — an unbracketed removal is exactly the
-"confidently wrong" failure this project treats as unrecoverable.
+**Why this priority**: This IS the slice. The frozen goal is to delete code
+proven unreachable; everything else exists to make that safe. It is still
+gated on US1's bracket — an unbracketed removal is exactly the "confidently
+wrong" failure this project treats as unrecoverable — but a gate is not a
+product, and if the recon finds removable code this story is the deliverable.
 
 **Independent Test**: For each candidate, produce the evidence that it is
 unreachable *before* deleting it, delete it, and show the US1 bracket reports no
@@ -98,9 +110,10 @@ and is recorded as retained with the reason.
    is removed, **Then** those tests are removed in the same change, and no test
    with a surviving subject is removed.
 4. **Given** any removal, **When** the whole-source seals are re-derived,
-   **Then** the recorded file count and byte total move in the direction of the
-   removal and the new digests are taken from the tool's own actuals, never
-   hand-computed.
+   **Then** each pin is judged against **its own file set**: a pin the removal
+   intersected shows a lower byte count (and a lower file count only if a whole
+   file went), while a pin the removal did not touch stays byte-identical. New
+   digests come from the tool's own actuals, never hand-computed.
 
 ---
 

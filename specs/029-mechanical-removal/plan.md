@@ -17,12 +17,25 @@ required by contract to exist. **Slice 5 therefore cannot remove a public atom
 at all; its removal surface is strictly non-public code.** That single finding
 does more to bound this slice than the whole of Phase 7's task text.
 
-The technical approach is consequently inverted from a normal slice. The
-primary deliverable is not the removal but the **neutrality bracket** — a
-baseline captured before, re-captured after, compared field by field, and
-proven capable of detecting a real change before it is trusted to certify the
-absence of one. The removal is whatever survives that bracket's admission
-rules, and may legitimately be empty.
+**The deliverable is the removal.** The **neutrality bracket** — a baseline
+captured before, re-captured after, compared field by field, and proven capable
+of detecting a real change before it is trusted to certify the absence of one —
+is the *admission gate* every removal passes through. It is not the product.
+
+> **Corrected 2026-08-21.** This paragraph originally said the primary
+> deliverable was the bracket rather than the removal. Two independent
+> uncontaminated reviews (LINUS, HOLMES) both called that over-engineering, and
+> they are right: the frozen goal is delete-only-proven-unreachable, and
+> promoting the measuring instrument to the product is how a delete-only slice
+> acquires a platform it was never asked for. The control (C-1, US1 scenario 3)
+> is kept — both reviewers insisted on that unprompted. Only the billing
+> changed.
+>
+> Worth recording honestly: the two *contaminated* reviews of this same
+> question, run from a brief that told the reviewer this decision was
+> deliberate, both endorsed it. The two run without that framing both rejected
+> it. Same question, opposite answers, and the only variable was how the brief
+> was written.
 
 ## Technical Context
 
