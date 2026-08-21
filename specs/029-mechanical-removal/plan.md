@@ -56,14 +56,25 @@ Assessed against Constitution v1.0.0 (ratified 2026-08-18).
 | **II. RED-First Evidence** | PASS | The bracket is a negative instrument, so it carries its positive control: a deliberate change the comparison must catch, run *before* any removal (research R5, contract C-1). A bracket failing its control is `void` and authorizes nothing. |
 | **III. Frozen Contracts Win** | PASS | `specs/020-…` is input only; SC-005 requires zero bytes changed there. Contract identifiers are quoted exactly. Where the roster's prose and the tree disagree — "legacy mode branches" versus the live `LegacyOpen`/`LegacyClosing` bootstrap states — the plan records the divergence as a stated assumption instead of editing the frozen text. |
 | **IV. Verification Gates** | PASS | Research R6 fixes the full gate set unchanged, one cargo invocation at a time, long runs through Terminal Commander. The slice adds no gate and relaxes none. |
-| **V. Unrepresentable Over Checked** | PASS | Applied to artifacts: `NeutralityComparison` has no edge from `void` to `armed`, so an unproven bracket cannot authorize a removal by oversight. Pin refresh is oracle-only, after `fmt`, with counts that must move downward — an auditable direction, not just a new digest. |
+| **V. Unrepresentable Over Checked** | **PASS, with a stated limit — the weakest of the six** | Pin refresh is genuinely oracle-only and after `fmt`, with a per-pin audit direction. But the `void → armed` prohibition on `NeutralityComparison` is a **document convention drawn in a markdown state diagram, not a type**. Nothing makes the illegal transition unspellable; an executor can write an evidence document that skips it, and C-1 is a human gate. Enforcement is T077's review. Recorded as a limit rather than claimed as full compliance. |
 | **VI. Independent Review Before Merge** | PASS | T077 carries an independent adversarial review including the mandatory cfg-lens sweep; findings fixed RED-first or adjudicated with rationale, never dropped. |
 
-**Post-Phase-1 re-check**: PASS, unchanged. The Phase 1 artifacts strengthened
-two of these rather than straining them — C-2 made Principle III's boundary
-mechanical (a checker error string, not a judgement call), and C-7 made
-Principle I's honesty requirement explicit for the awkward case where the
-honest answer is "nothing was removable".
+**Post-Phase-1 re-check**: PASS, with Principle V carrying the limit above.
+
+**Post-review re-check (2026-08-21)**: PASS. Two independent reviews
+(`REVIEW-FINDINGS-grok-4-6-…`, `REVIEW-FINDINGS-composer-…`) returned no
+BLOCKER and a verdict of *amend, then implement*. Four MAJORs were confirmed
+against source and amended: C-2 narrowed from "the definition of public
+behaviour" to one of three owners; C-5's pin arithmetic corrected per-pin;
+research observation 1 closed as `postactivation`; and US1's Independent Test
+replaced, because as written it closed the story on the null re-run — the
+vacuous negative Principle II exists to forbid, in the document that invokes
+Principle II. Principle V's PASS was downgraded to a stated limit in the same
+pass.
+
+That last one is worth naming plainly: the Constitution Check above originally
+claimed PASS on a principle the artifacts only partly satisfy, and no amount of
+re-reading my own reasoning surfaced it. An outside reader did, immediately.
 
 **Violations requiring justification**: none. Complexity Tracking is omitted
 because it would be empty.

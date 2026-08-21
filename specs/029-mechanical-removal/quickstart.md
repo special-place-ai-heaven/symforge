@@ -15,16 +15,22 @@ like. The rules behind each step are in
 
 ## Step 1 — Observe the lifecycle phase before anything else
 
+The traceability checker prints counts, **not the phase**, so it cannot fill
+`lifecycle_phase` on its own. Run both:
+
 ```
 node scripts/validate-lifecycle-oracle-traceability.cjs
+node scripts/lifecycle-phase-probe.cjs
 ```
 
-**Expected**: `OK` with its requirement/oracle/category counts.
+**Expected**: `OK (…)` from the first; from the second, a line naming the phase
+and the three set sizes. At the time of writing that is
+`PHASE: postactivation` with `actual: 34  pre: 83  post: 34`.
 
-This step exists to record which frozen set the tree currently matches. Per
-research R1, if the tree is already `postactivation` then **no public atom may
-be removed at all**, which bounds the entire slice. Record the observation;
-do not assume it.
+Paste the probe's stdout into `commands.lifecycle_phase`. Per research R1, a
+`postactivation` tree means **no 3-segment public atom may be removed at all**,
+which bounds the entire slice — so this field decides the slice's scope and may
+not be inherited from a document. Observe it on the tree you are working on.
 
 ## Step 2 — Capture the baseline (T074)
 
@@ -39,15 +45,26 @@ cargo test --no-default-features --features embed --lib -- --test-threads=1
 cargo build --release
 node scripts/verify-tools.cjs --bin target/release/symforge
 node scripts/validate-lifecycle-oracle-traceability.cjs
+node scripts/lifecycle-phase-probe.cjs
+python execution/refreeze_v11.py verify-internal --target-ref HEAD
 node scripts/slice0-oracle-artifact.cjs
 cd npm && npm test
 ```
 
-Also record the two whole-source pins and the activation and
-writer-reachability results.
+The remaining baseline fields, with the command each one comes from — the
+data model requires a command per field, so none of these is "also record":
+
+| Field | Command |
+|---|---|
+| `writer_reachability_verdict` | `cargo test --test activation_cut_v11 all_ingress_uses_exact_typed_authority_branch -- --exact` |
+| `activation_result` | `cargo test --test activation_cut_v11 preventive_v1_is_the_only_live_mode -- --exact` |
+| `source_pins` | the two constants observed in `tests/preventive_runtime_dark_v11.rs` after the dark-seal test runs above |
 
 **Expected**: every gate green, every field paired with its command. A field
 without a command is not a captured field.
+
+`slice0-oracle-artifact.cjs` spawns `cargo test` per case — budget for it as a
+build, not a quick check.
 
 ## Step 3 — Arm the bracket with a control (do this before removing anything)
 
@@ -100,8 +117,17 @@ investigate rather than transcribe.
 Repeat Step 2 and compare field by field into
 `docs/reviews/FEATURE-020-SLICE5-EVIDENCE-v11.md`.
 
-**Expected**: `differing_fields` is empty, apart from the two source pins,
-whose movement is the removal itself and must match the removed amount.
+Re-run the full public-surface trio, not just the lifecycle checker:
+
+```
+node scripts/validate-lifecycle-oracle-traceability.cjs
+node scripts/lifecycle-phase-probe.cjs
+python execution/refreeze_v11.py verify-internal --target-ref HEAD
+```
+
+**Expected**: `differing_fields` is empty, apart from any source pin whose own
+file set the removal actually intersected. A pin the removal did not touch must
+be byte-identical — see C-5.
 
 **If any other field moved**: investigate to root cause before attributing it
 to the removal, and record the cause. A difference explained away without a
@@ -115,9 +141,10 @@ Silently dropping a finding is forbidden.
 
 ## Validation checklist
 
-- [ ] Lifecycle phase observed and recorded, not assumed
+- [ ] Lifecycle phase observed with `lifecycle-phase-probe.cjs`, not inferred from a green checker
 - [ ] Baseline captured with a command behind every field
 - [ ] Control detected a real change **before** any removal
+- [ ] `refreeze_v11.py verify-internal` re-run after **every** removal, not only the embed one
 - [ ] Control edit discarded; working tree clean before removal
 - [ ] Every removal cites admissible unreachability evidence
 - [ ] No public atom removed; no frozen V11 seam removed

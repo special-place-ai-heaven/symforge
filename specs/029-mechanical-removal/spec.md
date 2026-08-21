@@ -39,10 +39,20 @@ codebase can be held to the same standard, whether or not Slice 5 removes a
 single line. It is also the only part of the slice that cannot be skipped if the
 recon finds nothing removable.
 
-**Independent Test**: Capture the baseline, change nothing at all, re-run the
-baseline, and confirm the two records are identical. A bracket that cannot
-detect the null change is not a bracket; a bracket that reports a difference
-across an empty diff is broken and must be fixed before any removal.
+**Independent Test**: Capture the baseline, introduce a deliberate control
+change, re-capture, and confirm the comparison **names the field that moved**.
+Then discard the control. The story is closed by the bracket detecting a real
+change — not by it staying quiet across an empty diff, which a permanently
+broken comparison would also do.
+
+> **Amended 2026-08-21** after independent review. The original Independent
+> Test was the null re-run alone. Spec-kit Independent Tests are what an
+> executor uses to close a story on its own, so that wording let US1 close
+> without ever exercising the only thing that makes a bracket a bracket — the
+> exact vacuous-negative shape Constitution Principle II forbids, in the same
+> document that invokes Principle II three sections later. The null re-run
+> remains valuable and is kept as Acceptance Scenario 2; it is no longer the
+> standalone proof.
 
 **Acceptance Scenarios**:
 
@@ -158,9 +168,11 @@ no dead code remains, record that finding with its evidence and remove nothing.
 - **FR-005**: The slice MUST NOT remove any frozen V11 production seam.
 - **FR-006**: The slice MUST NOT change runtime authority, public behaviour,
   writer reachability, or activation mode.
-- **FR-007**: The public API atom set after removal MUST equal exactly one of
-  the two frozen sets the traceability checker accepts; landing between them is
-  a failure, not a partial success.
+- **FR-007**: The tree is observed `postactivation`. After removal the derived
+  3-segment lifecycle atom set MUST still equal the frozen postactivation set
+  exactly. Additionally the full 64-atom introduced set MUST still resolve, and
+  the consumer fixtures MUST still compile as expected — the lifecycle checker
+  alone cannot see the 34 four-segment atoms, so its green is not sufficient.
 - **FR-008**: The slice MUST NOT edit any byte of the frozen spec tree,
   including checkbox bytes.
 - **FR-009**: Tests MUST be removed only when their subject was removed in the
@@ -199,8 +211,10 @@ no dead code remains, record that finding with its evidence and remove nothing.
   least one** differing field and names it.
 - **SC-003**: **100%** of removals cite pre-existing unreachability evidence;
   removals citing none: **zero**.
-- **SC-004**: The post-removal public API atom set matches one of the two
-  accepted frozen sets exactly; atoms outside both: **zero**.
+- **SC-004**: The post-removal 3-segment lifecycle atom set matches the frozen
+  postactivation set exactly (atoms outside it: **zero**), **and** the refreeze
+  allowlist resolves all 64 introduced atoms, **and** the consumer fixtures
+  compile as expected. All three, not any one.
 - **SC-005**: Bytes changed inside the frozen spec tree: **zero**.
 - **SC-006**: Frozen V11 production seams removed: **zero**.
 - **SC-007**: Tests removed whose subject still exists: **zero**.

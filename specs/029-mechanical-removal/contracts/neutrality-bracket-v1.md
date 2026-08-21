@@ -27,24 +27,34 @@ whose control was not run before the removal.
 
 ---
 
-## C-2 — The public atom set does not move
+## C-2 — The public surface does not move, and THREE owners enforce that
 
-**Requires**: the derived public atom set after removal equals the frozen
-**postactivation** set exactly (kept ∪ introduced).
+**Requires**: all three of the following after every removal —
 
-**Refuses**: any removal that changes the set, in either direction.
+| # | Requirement | Owner |
+|---|---|---|
+| C-2a | The derived 3-segment lifecycle atom set still equals the frozen postactivation set (34 atoms on this tree) | `scripts/validate-lifecycle-oracle-traceability.cjs`, `ordinaryRetirementLifecycle` |
+| C-2b | The full 64-atom `introduced_v11_atoms` set still resolves | `python execution/refreeze_v11.py verify-internal --target-ref HEAD` |
+| C-2c | The consumer fixtures still compile as expected | `tests/fixtures/public-api-v11-consumer/` compile-fail + dependent-positive |
 
-**Emits on refusal**:
+**Refuses**: any removal that changes any of the three, in either direction.
+
+**Emits on refusal (C-2a)**:
 `RETIREMENT_LIFECYCLE_PHASE_INVALID: public API is neither frozen preactivation (N) nor postactivation (M); actual=K`
 
-**Owner**: `scripts/validate-lifecycle-oracle-traceability.cjs`,
-`ordinaryRetirementLifecycle`.
-
-> This is not a rule Slice 5 invents; it is a gate that already exists and
-> already fails closed. It is written here because its consequence is
-> counter-intuitive for a slice named "mechanical removal": **no public atom is
-> removable**, since every surviving one is required by the postactivation
-> definition. The removal surface is non-public code only.
+> **Amended 2026-08-21** after independent review. The original clause named
+> C-2a alone and called it the definition of public-behaviour neutrality. It is
+> not. `directPublicAtoms` filters to `split("::").length <= 3`, and 34 of the
+> 64 introduced atoms are 4-segment associated methods — all under `embed`,
+> which is also excluded from the regex scan. **Deleting
+> `symforge::embed::Claim::value` would have left C-2a green** while real
+> public API shrank. C-2b is the owner that catches it, and it runs in about
+> six seconds, so it belongs on *every* removal landing rather than only the
+> T076 embed path.
+>
+> The practical rule is unchanged and still counter-intuitive for a slice named
+> "mechanical removal": **no public atom is removable.** What changed is which
+> gate you must run to know that.
 
 ---
 
@@ -93,22 +103,46 @@ actuals transcribed into the pins.
 
 **Emits on refusal**: the pin name and both values.
 
-**Audit property**: file and byte counts must move **downward** by the amount
-removed. A refresh whose counts rise, or stay flat across a non-empty removal,
-is a defect and not a formality.
+**Audit property, per pin** — evaluated against *that pin's own file set*:
+
+| Situation | Required outcome |
+|---|---|
+| Deletion intersects the pin's file set | Byte count moves **down**. File count moves down **only if a whole file was deleted**; flat is correct for an in-file deletion. |
+| Deletion does **not** intersect the pin's file set | The pin is **byte-identical**. Refreshing it at all is the defect. |
+| Any pin | Counts must never **rise**. |
+
+> **Amended 2026-08-21** after independent review. The original required both
+> pins' counts to move downward and called a flat count across a non-empty
+> removal a defect. That is false twice over. `EXCLUDED_RUNTIME_SOURCE_PIN_V1`
+> covers only 19 `index_lifecycle/*.rs` plus `server_api.rs` — T076's target
+> `src/embed.rs` is outside it — and deleting *within* a file never changes a
+> file count. The original clause would have refused the correct refresh for
+> the one removal the roster explicitly predicts, and an executor obeying it
+> would have "fixed" a pin that legitimately never moved. A seal corrupted to
+> satisfy a contract clause is worse than the drift the seal exists to catch.
 
 ---
 
 ## C-6 — A predicted removal that does not happen leaves a record
 
 **Requires**: a `DischargedExpectation` for each roster-predicted removal not
-performed, carrying the observation that discharged it.
+performed, carrying **the discharging command and its output verbatim** — not a
+prose summary of what the command showed.
 
 **Refuses**: silent omission; substituting an adjacent deletion to make the
-slice look productive.
+slice look productive; a discharge whose evidence is an assertion rather than a
+transcript.
 
 **Emits on refusal**: the predicted item and the phrase
 `prediction neither performed nor discharged`.
+
+> **Amended 2026-08-21** after independent review flagged that nothing
+> machine-checks this document, so "already gone" with no command would still
+> parse as a filled-in record. Requiring the command and its verbatim output
+> is the cheapest thing with teeth: a reviewer can re-run the transcript. No
+> new gate is added — T077's review remains the enforcer, and a slice that
+> needed a new gate to police its own honesty would have a worse problem than
+> this clause solves.
 
 ---
 

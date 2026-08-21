@@ -8,8 +8,13 @@ from task wording; each decision cites the artifact that establishes it.
 
 ## R1 — What does "do not change public behavior" mean mechanically?
 
-**Decision**: It means the derived public atom set must continue to equal, byte
-for byte, the frozen **postactivation** set — not merely "stay close to it".
+**Decision**: The traceability checker freezes the **3-segment lifecycle atom
+set** — 34 atoms on this tree — and that set must not move. It is **one
+conjunct of public-behaviour neutrality, not the definition of it.**
+
+> **Amended 2026-08-21** after independent review (grok-4-6 MAJOR, composer
+> MAJOR). The original text made this checker the whole definition. It is not,
+> and the gap is load-bearing — see the depth truncation below.
 
 **Rationale**: `scripts/validate-lifecycle-oracle-traceability.cjs` already owns
 this as a three-state check (`ordinaryRetirementLifecycle`). It derives the
@@ -27,15 +32,35 @@ Anything that is neither fails closed with
 This has a consequence sharper than the roster's prose, and it is the single
 most useful thing this research produced:
 
-> **The postactivation set is defined as kept ∪ introduced. Every public atom
-> that survives the cut is therefore already required to exist by the frozen
-> contract. Slice 5 cannot remove a public atom at all** — removing one drops
-> the tree out of both accepted states and fails the gate.
+> **The postactivation set is kept ∪ introduced, filtered to atoms of three
+> `::` segments or fewer. Every 3-segment public atom that survived the cut is
+> therefore required by contract to exist, and removing one fails the gate.**
 
-So Slice 5's removal surface is **strictly non-public code**: private items,
-crate-internal helpers, unreachable branches behind public entry points, and
-tests whose subjects go with them. "Do not change public behavior" is not a
-caution to be careful; it is a closed set the checker enforces.
+**But the filter is the catch.** `directPublicAtoms` drops every atom with more
+than three segments:
+
+```js
+.filter((atom) => typeof atom === "string" && atom.split("::").length <= 3)
+```
+
+The manifest's 64 `introduced_v11_atoms` split by depth as `{2: 1, 3: 29,
+4: 34}`. So **34 of the 64 are associated methods the lifecycle checker never
+sees** — all of them under `embed`, which line 2043 also excludes from the
+regex scan. Deleting `symforge::embed::Claim::value` leaves
+`symforge::embed::Claim` in the derived set and `ordinaryRetirementLifecycle`
+stays green, while real public API shrinks.
+
+So Slice 5's removal surface is **non-public code**, and that boundary is
+enforced by *three* owners, not one:
+
+| Owner | Covers | Command |
+|---|---|---|
+| lifecycle checker | the 34-atom 3-segment set | `node scripts/validate-lifecycle-oracle-traceability.cjs` |
+| refreeze allowlist | the full 64-atom introduced set | `python execution/refreeze_v11.py verify-internal --target-ref HEAD` |
+| consumer fixtures | names the checker does not pin | `tests/fixtures/public-api-v11-consumer/` (compile-fail, dependent-positive) |
+
+**A green lifecycle checker is not "public behaviour unchanged."** It is one
+third of that claim, and the weakest third for method-level API.
 
 **Alternatives considered**: treating the retirement inventory's `disposition`
 fields as the removal authority. Rejected — dispositions describe what the
@@ -48,14 +73,23 @@ still requires.
 
 ## R2 — Which sealed values move when source is deleted, and who may recompute them?
 
-**Decision**: Two whole-source pins in `tests/preventive_runtime_dark_v11.rs`
-move on any `src/` deletion, and only the owning Rust oracle may recompute
-them:
+**Decision**: A whole-source pin moves when the deletion **intersects that
+pin's own file set** — not on any `src/` deletion — and only the owning Rust
+oracle may recompute it.
 
-| Pin | Shape | Current recorded value |
+| Pin | Covers | Current recorded value |
 |---|---|---|
-| `FULL_SOURCE_PIN_V1` | (digest, file count, byte count) | 196 files, 9 300 142 bytes |
-| `EXCLUDED_RUNTIME_SOURCE_PIN_V1` | (digest, file count, byte count) | 20 files, 388 720 bytes |
+| `FULL_SOURCE_PIN_V1` | all of `src/` | 196 files, 9 300 142 bytes |
+| `EXCLUDED_RUNTIME_SOURCE_PIN_V1` | exactly the 20 paths in `EXCLUDED_RUNTIME_SOURCE_PATHS` — 19 `index_lifecycle/*.rs` plus `server_api.rs` | 20 files, 388 720 bytes |
+
+> **Amended 2026-08-21** after independent review (grok-4-6 MAJOR, composer
+> MINOR). The original said both pins move on any `src/` deletion. They do not,
+> and the error was dangerous rather than cosmetic: T076's target `src/embed.rs`
+> is **outside** the excluded pin's set entirely. A real embed deletion moves
+> `FULL_SOURCE_PIN_V1`'s byte count, leaves its *file* count flat (no file was
+> deleted), and leaves `EXCLUDED_RUNTIME_SOURCE_PIN_V1` wholly unchanged. The
+> original C-5 would have refused that correct refresh, and an executor
+> "fixing" the excluded pin to satisfy it would corrupt a seal that never moved.
 
 **Rationale**: Constitution Principle V forbids out-of-band recomputation of
 sealed values outright — "the Rust oracle that owns the seal is the only
@@ -157,8 +191,9 @@ invocation at a time with long runs through Terminal Commander.
 | Full serial suite (`--test-threads=1`) | Behaviour |
 | `cargo test --no-default-features --features embed --lib` | The cfg cell no default-feature gate can see |
 | Release build + `verify-tools.cjs` | Tool correctness |
-| `node scripts/validate-lifecycle-oracle-traceability.cjs` | The R1 three-state public-API check |
-| `node scripts/slice0-oracle-artifact.cjs` | Fails closed if a control's status flips |
+| `node scripts/validate-lifecycle-oracle-traceability.cjs` | The R1 three-state check — the 34-atom 3-segment set only |
+| `python execution/refreeze_v11.py verify-internal --target-ref HEAD` | The full 64-atom introduced set, including the 34 the checker cannot see. **Runs on every removal landing, not only the T076 embed path** (~6 s) |
+| `node scripts/slice0-oracle-artifact.cjs` | Fails closed if a control's status flips. Note: spawns `cargo test` per case — it is a build, not a quick check |
 | npm suite | Package surface |
 
 **Rationale**: Principle IV fixes the set and the serial discipline; the
@@ -186,14 +221,35 @@ nothing, so narrowing the gates assumes the conclusion.
 | Constraints | Public atom set must remain exactly the postactivation set (R1); frozen tree unedited; seals refreshed only by their oracle (R2) |
 | Scale/Scope | Bounded by evidenced-unreachable non-public items; may legitimately be empty |
 
+## Observation 1 — CLOSED 2026-08-21: the tree is `postactivation`
+
+Originally deferred to execution. That was wrong: it is a one-second
+derivation, and deferring an observation that cheap is not caution, it is an
+unobserved field in a record that requires provenance. Both reviewers said so.
+
+Derived by replicating `ordinaryRetirementLifecycle` against the working tree:
+
+```
+scannedModules: [ 'server_api' ]
+actual: 34   pre: 83   post: 34
+PHASE: postactivation
+actualOnly: []   postOnly: []
+```
+
+Cross-check: `node scripts/validate-lifecycle-oracle-traceability.cjs` →
+`OK (78 requirements, 24 acceptance oracles, 13 retirement categories)`.
+
+**Consequence**: R1's bound is live *now*, not contingent on a future cut. No
+3-segment public atom is removable on this tree. The executed baseline still
+records the phase — the value is known, but a baseline that cites this document
+instead of observing the tree it runs on would be inheriting a fact rather than
+capturing one.
+
 ## Open observations the executed plan must make
 
-1. Which lifecycle phase the tree reports today — `preactivation` or
-   `postactivation`. R1 makes this decisive for whether the atom set may move
-   at all, and it is cheap to observe but must not be assumed.
-2. Whether any evidenced-unreachable non-public code actually remains.
-3. Whether `src/embed.rs` still holds dead V10 implementation (R4).
+1. Whether any evidenced-unreachable non-public code actually remains.
+2. Whether `src/embed.rs` still holds dead V10 implementation (R4).
 
-All three are observations, not predictions. If the answer to 2 and 3 is "no",
-the slice closes with the bracket, the baseline, and a recorded discharge —
-which spec Edge Cases already admits as a valid outcome.
+Both are observations, not predictions. If both answers are "no", the slice
+closes with the bracket, the baseline, and a recorded discharge — which spec
+Edge Cases already admits as a valid outcome.
