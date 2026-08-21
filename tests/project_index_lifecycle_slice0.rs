@@ -106,7 +106,7 @@ fn write_project_files(root: &Path, prefix: &str, count: usize) {
 ///
 /// A refusal must be a refusal: no project slot, no watcher, no session.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.1; remove this attribute in Slice 2 (T030-T040) when admission refusal is a typed outcome"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.1. CONTROL-STALE as of the 2026-08-21 Track A read: V11 answers a refused open with Ok plus a typed SourceRefusal and a non-ready slot, not the Err-plus-zero-slots this body asserts, and FR-004 strict acquisition is the lease. Retarget the body to the typed refusal; do NOT switch production to satisfy the old encoding. Unmeasured residual: activate still starts a watcher (daemon.rs:3398-3403)"]
 fn capacity_refused_open_creates_no_slot_and_no_watcher() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -153,7 +153,7 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
 /// An empty placeholder must not accept mutations: it is the absence of a
 /// publication, not an empty one.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.2/2.3; observed still red at the watcher seam after the Slice 4 activation cut (spec 028) — remove when a never-published placeholder refuses watcher mutation there"]
+#[ignore = "Feature 020 Slice 0 RED control for design defects 2.2/2.3. CODE-WRONG as of the 2026-08-21 Track A read: add_file (live_index/store.rs:2820-2831) has no EmptyBootstrap gate, and the default-suite check at store.rs:6402-6412 papers over it rather than closing it. Keep ignored and fail-closed until a seam owner exists"]
 fn empty_placeholder_publication_refuses_watcher_mutation() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -260,7 +260,7 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
 /// bootstrap path; on reload it propagates, which is exactly the `?` that skips
 /// the watcher restart.)
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.10; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when observer handoff is non-destructive there"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.10. CODE-WRONG as of the 2026-08-21 Track A read: the path aborts the watcher and then returns via ?, installing no replacement on the Err branch, so the recovery observer is lost. Keep ignored and fail-closed until a seam owner exists"]
 fn failed_reload_retains_the_recovery_observer() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -372,7 +372,7 @@ fn failed_reload_retains_the_recovery_observer() {
 /// about the window rather than a race: the predecessor is stopped and awaited
 /// before the write, and the successor starts after it.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for observer replacement gaps; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when handoff latches the gap there"]
+#[ignore = "Feature 020 Slice 0 RED control for observer replacement gaps. CODE-WRONG as of the 2026-08-21 Track A read: recompute_freshness_locked drops the historical gap and rederives Current, so nothing latches. Keep ignored and fail-closed until a seam owner exists"]
 fn observer_replacement_gap_is_latched_as_non_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -480,7 +480,7 @@ fn observer_replacement_gap_is_latched_as_non_current() {
 /// present state, so the next clean publication erases it. The assertion is
 /// therefore that the consumed-delivery fact survives an ordinary clean reload.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for old-observer delivery after promotion; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when a stable observer token fences delivery there"]
+#[ignore = "Feature 020 Slice 0 RED control for old-observer delivery after promotion. CODE-WRONG as of the 2026-08-21 Track A read: the same rederive path runs with no stable observer token fencing delivery. Keep ignored and fail-closed until a seam owner exists"]
 fn old_observer_delivery_after_promotion_is_not_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -573,7 +573,7 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 /// mutations survive promotion. Losing them and reporting success is the one
 /// outcome that must not happen.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.7/2.9; observed still red (precondition window unreachable) after the Slice 4 activation cut (spec 028) — remove when candidate isolation is observable at this seam"]
+#[ignore = "Feature 020 Slice 0 RED control for design defects 2.7/2.9. CODE-WRONG. The earlier claim that the precondition window was unreachable is FALSE on this tree: live_index/store.rs:2403-2436 still reaches swap_and_publish and IsolatedCandidate appears nowhere in store.rs, so the seam never routes through the candidate pipeline. Keep ignored and fail-closed until a deterministic pause exists at this seam; the official TEST-CANDIDATE case does not retire it"]
 fn watcher_mutation_during_candidate_build_is_not_discarded() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -671,7 +671,7 @@ fn watcher_mutation_during_candidate_build_is_not_discarded() {
 ///
 /// Sibling B's latest must survive source A's publication.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005; observed still red (precondition window unreachable) after the Slice 4 activation cut (spec 028) — remove when whole-project publication is observable at this seam"]
+#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005. CONTROL-STALE as of the 2026-08-21 Track A read: the frozen oracle is pause A / publish B / rebase / tokens / one store, but this body races V10 LiveIndex::reload against 1500 files in 150ms. Retarget the body to the frozen oracle; making reload win that race is not the property"]
 fn whole_project_publication_preserves_latest_siblings() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -774,7 +774,7 @@ fn whole_project_publication_preserves_latest_siblings() {
 /// A snapshot is a seed, not a publication: nothing from it may answer a query
 /// before its identity and completeness are re-proved.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.11; observed still red at the daemon seam after the Slice 4 activation cut (spec 028) — remove when SnapshotStore per-entry verify-state wiring lands (recorded residual)"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.11. CODE-WRONG as of the 2026-08-21 Track A read: persist hydrates files immediately, get_file has no Pending gate, and is_ready() is status-only. The SnapshotStore per-entry verify-state wiring remains a recorded open residual. Keep ignored and fail-closed until a seam owner exists"]
 fn snapshot_seed_is_not_queryable_before_verification() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -855,7 +855,7 @@ fn snapshot_seed_is_not_queryable_before_verification() {
 ///
 /// A configured ceiling must bound the process, not each load in isolation.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5; remove this attribute in Slice 2 (T030-T040) when capacity is a process-wide reservation"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5. CONTROL-STALE as of the 2026-08-21 Track A read: FR-004 makes capacity a per-candidate catalog and SC-025 owns the ProcessCapacityPool, while SYMFORGE_MAX_INDEX_FILES is per discovery pass. Making that env var process-wide would fight FR-004 and still miss SC-025. Retarget the body at ProcessCapacityPool"]
 fn configured_capacity_bounds_the_process_not_each_load() {
     run_daemon_test(async {
         const CEILING: usize = 10;
@@ -919,7 +919,7 @@ fn configured_capacity_bounds_the_process_not_each_load() {
 /// survives a subsequent clean publication: V10's freshness is a pure function
 /// of present state, so a transient non-Current proves nothing.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for same-path physical-root replacement; remove this attribute in Slice 1 (T022-T029) when physical root identity is canonical and fenced"]
+#[ignore = "Feature 020 Slice 0 RED control for same-path physical-root replacement. CODE-WRONG as of the 2026-08-21 Track A read: the registry stays path-keyed and publishes Current, so a replaced root at the same path is adopted silently. Slice 1 shipped without discharging it. Keep ignored and fail-closed until a seam owner exists"]
 fn same_path_root_replacement_is_not_silently_adopted() {
     run_daemon_test(async {
         let parent = TempDir::new().expect("parent dir");

@@ -142,36 +142,64 @@ owed and currently unowned by any remaining slice.
 **Run it**: `node scripts/slice0-oracle-artifact.cjs` → writes
 `target/ci/lifecycle-v11/slice-0-oracle-contract.json`. CI's `rust` job runs it.
 
-| Control | Named owner (already shipped) | Defect / seam |
-|---|---|---|
-| `capacity_refused_open_creates_no_slot_and_no_watcher` | Slice 2 (T030–T040) | 2.1 — admission refusal is not a typed outcome |
-| `configured_capacity_bounds_the_process_not_each_load` | Slice 2 (T030–T040) | 2.5 — capacity is not a process-wide reservation |
-| `internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load` | Slice 2 (T030–T040) | 2.4 — project admission is not single-flight |
-| `same_path_root_replacement_is_not_silently_adopted` | Slice 1 (T022–T029) | physical root identity not canonical/fenced |
-| `empty_placeholder_publication_refuses_watcher_mutation` | Slice 4 (spec 028) | 2.2/2.3 — watcher seam |
-| `failed_reload_retains_the_recovery_observer` | Slice 4 (spec 028) | 2.10 — observer handoff destructive at daemon seam |
-| `observer_replacement_gap_is_latched_as_non_current` | Slice 4 (spec 028) | handoff does not latch the gap |
-| `old_observer_delivery_after_promotion_is_not_current` | Slice 4 (spec 028) | no stable observer token fencing delivery |
-| `watcher_mutation_during_candidate_build_is_not_discarded` | Slice 4 (spec 028) | 2.7/2.9 — precondition window unreachable at this seam |
-| `whole_project_publication_preserves_latest_siblings` | Slice 4 (spec 028) | FR-008/FR-009/SC-005 — precondition window unreachable |
-| `snapshot_seed_is_not_queryable_before_verification` | Slice 4 (spec 028) | 2.11 — `SnapshotStore` per-entry verify-state wiring absent |
+**DISPOSITIONED 2026-08-21** by two independent read-only passes (LINUS,
+HOLMES) on shipped `main`, reconciled with no `cargo` battery and no patches.
+This is a **disposition table, not an implementation queue.**
 
-Two sub-shapes, and they need different work:
+The eleven split into two kinds, and the distinction decides who is wrong:
 
-- **"Still red at the seam"** (watcher/daemon) — the behavior is genuinely
-  absent. Ordinary RED-first fix work.
-- **"Precondition window unreachable"** (`watcher_mutation_during_candidate_build…`,
-  `whole_project_publication_preserves_latest_siblings`) — the control cannot
-  *reach* the state it asserts on at this seam. Fixing production code will not
-  turn these green on its own; the control needs a seam where the window is
-  observable, or an explicit adjudication recorded in the evidence doc. Do not
-  quietly weaken the assertion.
+### Control-stale (3) — retarget the test body; do NOT change production to win
 
-The four Slice-1/Slice-2 rows still carry **stale prose** predicting a slice that
-already landed ("remove this attribute in Slice 2 …"). Whoever picks these up
-must rewrite those `#[ignore]` reasons to name the real carried owner, exactly as
-the seven Slice-4 rows were rewritten on 2026-08-20 — a prediction that has been
-falsified is not allowed to stand in the tree.
+The property is still worth having, but the body asserts a *retired encoding*.
+Rewriting production to satisfy the old assertion would move the code away from
+the frozen oracle, not toward it.
+
+| Control | Why the body is stale |
+|---|---|
+| `capacity_refused_open_creates_no_slot_and_no_watcher` | V11 answers a refused open with `Ok` + typed `SourceRefusal` + a non-ready slot, not `Err` + zero slots. FR-004 strict acquisition is the lease. Unmeasured residual: `activate` still starts a watcher (`daemon.rs:3398-3403`) |
+| `whole_project_publication_preserves_latest_siblings` | Frozen oracle is pause A / publish B / rebase / tokens / one store. The body races V10 `LiveIndex::reload` against 1500 files in 150 ms |
+| `configured_capacity_bounds_the_process_not_each_load` | FR-004 makes capacity a per-candidate catalog; SC-025 owns `ProcessCapacityPool`; `SYMFORGE_MAX_INDEX_FILES` is per discovery pass. Forcing it process-wide fights FR-004 and still misses SC-025 |
+
+### Code-wrong (8) — keep ignored and fail-closed; do not un-ignore for green
+
+| Control | Live miss |
+|---|---|
+| `empty_placeholder_publication_refuses_watcher_mutation` | `add_file` (`store.rs:2820-2831`) has no EmptyBootstrap gate; the default-suite check at `store.rs:6402-6412` is a paper-over |
+| `failed_reload_retains_the_recovery_observer` | aborts the watcher then `?`; no replacement on `Err` |
+| `observer_replacement_gap_is_latched_as_non_current` | `recompute_freshness_locked` drops the historical gap → `Current` |
+| `old_observer_delivery_after_promotion_is_not_current` | same rederive; no token fence |
+| `snapshot_seed_is_not_queryable_before_verification` | persist hydrates files immediately; `get_file` has no Pending gate; `is_ready()` is status-only |
+| `same_path_root_replacement_is_not_silently_adopted` | path-keyed map; publishes `Current` |
+| `concurrent_first_open_performs_exactly_one_cold_load` | load happens outside the lock then `or_insert`; `admit_project` does not skip bootstrap |
+| `watcher_mutation_during_candidate_build_is_not_discarded` | `store.rs:2403-2436` still reaches `swap_and_publish`; `IsolatedCandidate` appears **zero** times in `store.rs` |
+
+### The "precondition window unreachable" claim was false
+
+Two controls carried `#[ignore]` text asserting their precondition window was
+unreachable. On `watcher_mutation_during_candidate_build_is_not_discarded` that
+is **false on the shipped tree** — the window is reachable; the seam simply
+never routes through the candidate pipeline. The other, 
+`whole_project_publication_preserves_latest_siblings`, is control-stale rather
+than unreachable. Both strings were corrected in the tree on 2026-08-21.
+
+That claim originated from a process that ran the controls un-ignored, observed
+failure, and wrote down *that* they failed — then described *why* without
+having established it. It stood unchallenged for a day and would have
+misdirected whoever picked this up next.
+
+### Owed, not done
+
+`src/daemon.rs`'s `#[ignore]` string still predicts "remove this attribute in
+Slice 2", a slice that shipped. The correction is written and was reverted
+unapplied: `daemon.rs` is inside `FULL_SOURCE_PIN_V1`'s file set, so editing it
+moves a seal that only the Rust oracle may recompute, which needs a full gate
+run. Do it in a change that can afford one.
+
+### Track A residuals from the reviewers
+
+- No `cargo test` battery was run against the ignored roster in these passes.
+- `src/server_api` was not fetched; MCP `is_ready` vs `get_file` is unaudited.
+- Do not reopen PR #603 to discharge any of this.
 
 **The roster's fail-closed contract, so you do not fight it:**
 
