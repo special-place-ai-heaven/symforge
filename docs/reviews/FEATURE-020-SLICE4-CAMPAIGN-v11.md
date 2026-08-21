@@ -8,8 +8,26 @@ from a three-lens recon of `specs/020-repository-knowledge-index/tasks.md`
 `src/index_lifecycle/`. This document is campaign planning under
 `docs/reviews/`; the spec tree is frozen and is never edited.
 
-> **Execution status (as_of 2026-08-20)**: EXECUTED through T039, awaiting
-> the T040 operator gate. The as-executed record (with every deviation
+> **Execution status (as_of 2026-08-20)**: CLOSED. The T040 operator gate
+> was given, the cut squash-merged as PR #601, and the release-please cycle
+> carried it to **11.0.0** on npm, crates.io, and GitHub Releases. SC-008
+> holds: `git diff` over `specs/020-repository-knowledge-index/` is empty
+> from the approved ancestor through the merge and through `main` today —
+> the frozen tree was never touched. Two post-merge CI fixes were required,
+> both to tools written before the cut: the traceability self-test needed
+> preactivation fixtures built from the approved ancestor's own bytes, and
+> `scripts/slice0-oracle-artifact.cjs` needed `internals::`-prefixed lib
+> test paths (the cut mounts the server modules under `src/internals.rs`,
+> so every pre-cut `--exact` filter silently selected nothing).
+>
+> **Carried, not discharged**: the seven Slice 0 positive controls whose
+> `#[ignore]` prose predicted resolution "in Slice 4" were each run
+> un-ignored against the cut and remain red at the daemon/watcher seams.
+> That prediction is falsified, not satisfied. They stay on the slice-0
+> oracle roster as post-cut work; the standing ledger of what Feature 020
+> still owes is `docs/reviews/FEATURE-020-POST-V11-LEDGER.md`.
+>
+> The as-executed record (with every deviation
 > from this plan) lives in
 > `specs/028-preventive-activation-cut/activation-cut-execution-map.md`;
 > the evidence and review record is

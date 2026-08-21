@@ -284,13 +284,17 @@ part of what it checks.
 
 ### Track E — bookkeeping leftovers (minutes, not days)
 
-| Item | Where |
-|---|---|
-| `specs/028-preventive-activation-cut/tasks.md` T040/T041 still `- [ ]` although the cut merged, released, and the worktree was cleaned | `specs/028-preventive-activation-cut/tasks.md:167-168` |
-| `docs/reviews/FEATURE-020-SLICE4-CAMPAIGN-v11.md` status line still reads *"EXECUTED through T039, awaiting the T040 operator gate"* — stale; the gate was given and it shipped | that file, "Execution status" block |
-| Trailing "merge the PR" checkboxes in already-closed specs: 002 T053, 018 T027, 025 T252 | those `tasks.md` files |
+**Done 2026-08-20** — `specs/028-preventive-activation-cut/tasks.md` T040/T041 are
+marked complete (SC-008 re-verified first: `git diff` over the frozen tree is empty
+from the approved ancestor through the merge and through `main` today), and the
+`FEATURE-020-SLICE4-CAMPAIGN-v11.md` status line now reads CLOSED with the carried
+work named.
 
-Track E is safe for any agent to do first as a warm-up; it changes no code.
+**Deliberately left open**, and this is a decision rather than an oversight:
+
+| Item | Where | Why untouched |
+|---|---|---|
+| Trailing "merge the PR" / "run the full gate" checkboxes: 002 T053, 018 T027, 025 T252 | those `tasks.md` files | Ticking them asserts a verification nobody living observed. Those specs are dormant (§3) and their work landed through PRs months ago, but "the gate was run and was green" is a claim about an event, and the reporting invariant (§1.5) does not get suspended for checkboxes. Anyone who can reconstruct the evidence should tick them and cite it; nobody should tick them to tidy the file. |
 
 ---
 
