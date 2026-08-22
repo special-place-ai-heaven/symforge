@@ -6713,9 +6713,8 @@ mod tests {
         let state = Arc::clone(&handle.state);
         tokio::task::yield_now().await;
 
-        state
-            .last_activity_at
-            .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
+        // ponytail: no backdate before the in-flight GET — paused-time auto-advance
+        // can tick the reaper while the stamp is still stale (Windows flakes).
         authed_client(&handle)
             .get(format!("http://127.0.0.1:{}/v1/projects", handle.port))
             .send()
