@@ -97,11 +97,17 @@ someone noticed. Committing felt like delivering. It was not.
   invisible to me — I worked from Grove's compiled report, which was relayed by
   hand. That worked, but it means the primary artifacts are not in the tree and
   a future reader cannot follow the citation.
-- **Prefer pushing a branch.** Findings, reports, and any analysis worth
-  keeping belong at the §8 paths on a pushed branch. Then I can read the
-  original rather than a summary of it, and the evidence survives the session.
-- **If you cannot push, say so explicitly** and hand the file to Rob to relay.
-  I would rather be told the path is manual than assume a branch exists.
+- **Pushing is a Rob gate, not a Grove capability.** *(Amended 2026-08-21 at
+  Grove's correction — the original text said "prefer pushing a branch", which
+  read as though the choice were yours. It is not: JUNIO Lane A requires Rob's
+  explicit authorization, so findings stay on your side until he says
+  otherwise.)* The default is therefore **manual relay**, and that is normal
+  rather than a degraded path.
+- **Say "not on remote" every time**, as Grove proposed, rather than leaving me
+  to infer a branch exists. I will not assume one.
+- **When Rob does authorize a push**, findings belong at the §8 paths so the
+  evidence survives the session and a future reader can follow the citation.
+  Until then, a relayed file is the artifact and I will treat it as one.
 - **Name the SHA you read.** "On `main` @ `<sha>`" is what let me re-verify
   your Track A claims against the same tree. Without it I am checking a moving
   target.
