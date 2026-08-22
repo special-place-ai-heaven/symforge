@@ -344,11 +344,11 @@ struct AuthorityInner {
 ///
 /// D1 applies: this is the AUTHORITY plane (`ObservationLane`). The
 /// LiveIndex data plane (`ProjectRuntimeHandle::data_plane` → `SharedIndex`)
-/// still serves admissions. C5 landed (`ProjectSourceAuthority` residual
-/// at `:310`). It did not make this lane, nor `ProjectPublicationRoot`,
+/// still serves admissions. C5 landed (the `ProjectSourceAuthority` residual).
+/// It did not make this lane, nor `ProjectPublicationRoot`,
 /// query-visible. The leftover door is this `data_plane` path — the same
-/// D1 mid-cut recorded on `ProjectRuntimeHandle` (`:925-928`). Retiring
-/// it is not this pass.
+/// D1 mid-cut recorded on `ProjectRuntimeHandle`'s `data_plane` naming comment.
+/// Retiring it is not this pass.
 #[derive(Debug)]
 struct ObservationLane {
     slot: ObserverSlot,
@@ -1046,12 +1046,14 @@ pub fn process_project_registry() -> Arc<ProjectRegistry> {
 /// The ceremony runs BEFORE the surface serves its first request, which is
 /// what makes each drain confirmation truthful: at that moment the
 /// bootstrapper IS every lane's owner, and it can observe that nothing has
-/// entered the legacy gate because serving has not begun. After [`ActivationCut::open_preventive`], [`ActivationMode`] is
+/// entered the legacy gate because serving has not begun. After
+/// [`ActivationCut::open_preventive`], [`ActivationMode`] is
 /// `PreventiveV1Open` and the `LegacyOpen` gate admits no further
 /// [`LaneRegistration`]. That is the observation the ceremony records as
 /// typed evidence. Query traffic is a different door: it still goes through
-/// [`ProjectRuntimeHandle::data_plane`] → `SharedIndex` (D1 mid-cut,
-/// `:337-339` and `:925-928`). Retiring that door is not this pass.
+/// [`ProjectRuntimeHandle::data_plane`] → `SharedIndex` (the D1 mid-cut
+/// recorded at `ObservationLane` and at `ProjectRuntimeHandle`). Retiring
+/// that door is not this pass.
 pub fn activate_surface(surface: SurfaceKind) {
     let _bootstrap = PROCESS_BOOTSTRAP.lock().expect("process bootstrap lock");
     let machine = ActivationCut::process();
