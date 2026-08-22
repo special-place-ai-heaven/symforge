@@ -17,11 +17,19 @@
 //! stranding the machine short of `PreventiveV1Open`: a mis-sequenced
 //! bootstrap fails loudly at the cut, never silently half-open.
 //!
-//! Companion invariant (enforced by construction across the cut, recorded
-//! here): the two publication roots are never simultaneously authoritative —
-//! legacy authority serves only in `LegacyOpen`, the V11 publication root
-//! serves only in `PreventiveV1Open`, and the window between them is
-//! drain-only.
+//! Two claims, recorded separately because they are not the same construction.
+//!
+//! Mode occupancy is enforced by [`ActivationMode`] (one `u8` behind
+//! [`ActivationCut::process`]) and the typed transitions below: the process
+//! is in exactly one of `LegacyOpen`, `LegacyClosing`, `PreventiveV1Open`.
+//! No reverse edge. `LegacyClosing` is drain-only for the mode machine —
+//! [`LaneRegistration`] tokens, not publication.
+//!
+//! Publication exclusivity is not enforced here. Ingress still answers
+//! through [`ProjectRuntimeHandle::data_plane`] → [`crate::live_index::store::SharedIndex`].
+//! That leftover door is the D1 mid-cut already recorded at the
+//! `ObservationLane` doc and at the `ProjectRuntimeHandle` mid-cut claim.
+//! Retiring it is not this pass.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -334,9 +342,13 @@ struct AuthorityInner {
 /// PERMIT-FREE, per the frozen contract (observation never mutates source
 /// bytes; it has no business in the mutation lane).
 ///
-/// D1 applies: this is the AUTHORITY plane. The LiveIndex data plane keeps
-/// serving admissions itself mid-cut; the lane runs the frozen lifecycle
-/// semantics beside it (dark stamp payloads) until C4/C5 make it the root.
+/// D1 applies: this is the AUTHORITY plane (`ObservationLane`). The
+/// LiveIndex data plane (`ProjectRuntimeHandle::data_plane` → `SharedIndex`)
+/// still serves admissions. C5 landed (`ProjectSourceAuthority` residual
+/// at `:310`). It did not make this lane, nor `ProjectPublicationRoot`,
+/// query-visible. The leftover door is this `data_plane` path — the same
+/// D1 mid-cut recorded on `ProjectRuntimeHandle` (`:925-928`). Retiring
+/// it is not this pass.
 #[derive(Debug)]
 struct ObservationLane {
     slot: ObserverSlot,
@@ -1034,10 +1046,12 @@ pub fn process_project_registry() -> Arc<ProjectRegistry> {
 /// The ceremony runs BEFORE the surface serves its first request, which is
 /// what makes each drain confirmation truthful: at that moment the
 /// bootstrapper IS every lane's owner, and it can observe that nothing has
-/// entered the legacy gate because serving has not begun. After this PR's
-/// compile-time flip there is no legacy traffic left to drain at runtime;
-/// the machine records that observation as typed evidence instead of
-/// assuming it.
+/// entered the legacy gate because serving has not begun. After [`ActivationCut::open_preventive`], [`ActivationMode`] is
+/// `PreventiveV1Open` and the `LegacyOpen` gate admits no further
+/// [`LaneRegistration`]. That is the observation the ceremony records as
+/// typed evidence. Query traffic is a different door: it still goes through
+/// [`ProjectRuntimeHandle::data_plane`] → `SharedIndex` (D1 mid-cut,
+/// `:337-339` and `:925-928`). Retiring that door is not this pass.
 pub fn activate_surface(surface: SurfaceKind) {
     let _bootstrap = PROCESS_BOOTSTRAP.lock().expect("process bootstrap lock");
     let machine = ActivationCut::process();
