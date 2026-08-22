@@ -160,7 +160,7 @@ pub(crate) fn parse_diagnostic_from_span(
     parse_diagnostic(parser, message, line, column, byte_span, fallback_used)
 }
 
-/// Converts usize to Option<u32>. Returns None for 0 (convention: 0 means unavailable in
+/// Converts usize to `Option<u32>`. Returns None for 0 (convention: 0 means unavailable in
 /// 1-based line/column APIs).
 pub(crate) fn optional_u32(value: usize) -> Option<u32> {
     if value == 0 {

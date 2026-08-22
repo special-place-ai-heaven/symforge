@@ -702,7 +702,7 @@ where
     hits
 }
 
-/// Compute the [`PathMatchSignal`] tier score the given anchor path earns for
+/// Compute the [`crate::live_index::rank_signals::PathMatchSignal`] tier score the given anchor path earns for
 /// `query`, using the same normalization and tokenization `search_files` uses
 /// for candidate classification. The co-change anchor-confidence gate compares
 /// this score against `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR`; the caller reuses it

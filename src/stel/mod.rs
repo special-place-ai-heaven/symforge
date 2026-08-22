@@ -1,6 +1,6 @@
 //! STEL (SymForge Token Economics Layer) — Phase 1 product module.
 //!
-//! Checkpoint: `31d9bf1` on `v8/stel-architecture` — see [`docs/phase1-stel-checkpoint.md`].
+//! Checkpoint: `31d9bf1` on `v8/stel-architecture` — see `docs/phase1-stel-checkpoint.md`.
 //!
 //! Shipped layers on compact `symforge`:
 //! - **L0:** MCP compact surface (`symforge` | `symforge_edit` | `status`); production list via

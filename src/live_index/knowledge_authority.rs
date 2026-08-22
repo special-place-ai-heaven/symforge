@@ -1214,7 +1214,7 @@ fn agent_instruction_path_domain(path_lower: &str) -> Option<(PathConventionDoma
 }
 
 /// Path conventions over whole path *tokens*, mirroring
-/// [`super::knowledge_bridge::path_convention_roles`]: split on `/`, then on every
+/// `knowledge_bridge::path_convention_roles`: split on `/`, then on every
 /// non-ASCII-alphanumeric character, lowercase, and match exact tokens. Substring
 /// matching classified `docs/special/report.md` as normative intent via `/spec`.
 ///
