@@ -303,8 +303,11 @@ self-consistent, not a hole.
    Release gates arm, and the three `required_*` arrays stop being empty — they
    become the receipt roster T089/T090 must satisfy. The file is the switch; do
    not treat it as configuration to be tidied.
-2. **The skip does not mean those paths are unexercised.** `ci.yml:78-86` runs
-   both gates **unconditionally** on every PR, with no `if:` guard. They ran on
+2. **The skip does not mean those paths are unexercised.** `ci.yml` runs both
+   gates **unconditionally** on every PR, with no `if:` guard — the steps named
+   *Verify Feature 020 V11 refreeze integrity* and *Test and verify Feature 020
+   V11 lifecycle traceability*, inside the `rust` job. Grep the step names; do
+   not trust a line number here, they move. They ran on
    every PR that reached `main`. The Release-side skip means only that *that
    run* did not exercise them.
 
