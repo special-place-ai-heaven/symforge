@@ -58,7 +58,7 @@ missing-crate error as a code defect until the build directory is known clean.
 
 ## CI Gates
 
-- PR and push CI run version sync, `cargo fmt --check`,
+- PR CI runs version sync, `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, the full Rust test suite,
   `cargo build --release`, and npm tests.
 - The `rust` job is compile-dominated (~25 min wall as_of 2026-08-05; the suite
@@ -85,9 +85,29 @@ missing-crate error as a code defect until the build directory is known clean.
   a `cargo check` pass, so running both compiled the graph twice for one answer.
 - `cargo build --release` is NOT droppable from PR CI: the tool-correctness
   harness runs `verify-tools.cjs --bin target/release/symforge`.
-- One CI run per PR (`pull_request`); `push` runs fire only on `main` after a
-  merge. Verified 2026-08-05 against `gh run list` — feature-branch pushes do
-  not double-trigger.
+- One CI run per PR (`pull_request`). **`push` never triggers `ci.yml` at all** —
+  not on branches, not on `main` (as_of 2026-08-22). All-time counts:
+  `gh api "repos/:owner/:repo/actions/workflows/ci.yml/runs?event=push"` returns
+  `total_count` **0**, against **666** for `event=pull_request`. The earlier note
+  here said push runs "fire only on `main` after a merge"; that was wrong. The 37
+  push runs visible in `gh run list` all belong to `release.yml`, which declares
+  `on: push: branches: [main]`.
+
+  **The cause is `ci.yml`'s own trigger.** It declares `push:` with only
+  `tags-ignore: ["v*"]`. When a push trigger carries *only* tag filters, GitHub
+  does not run it for branch pushes at all — so this filter means "non-`v*` tag
+  pushes only", and the only tags this repo pushes are `v*`. The trigger is
+  therefore unreachable in both directions.
+
+  **What that costs:** `ci.yml`'s `Validate pushed commit subjects` step
+  (`conventional_commits.py check-push-range`) has never executed, ever. It is
+  the gate meant to stop a non-conventional subject reaching `main` outside a PR
+  — the exact failure that reddened Release run #938. Adding `branches: ['**']`
+  to the push trigger would arm it, at the cost of a full CI run on every merge
+  to `main`. That is a live cost/benefit call, not a typo fix; do not flip it
+  casually. Note also that arming it is what would make a per-run concurrency
+  group for `main` meaningful — while push CI stays unreachable, any such change
+  guards a queue that has no entrants.
 - Scheduled and manual CI additionally run ignored performance smoke coverage:
   `test_load_perf_1000_files` and `calibrate_current_repo_smoke`.
 - Full real-repo coupling calibration is operator-triggered with
@@ -306,6 +326,34 @@ phrases survived in `AGENTS.md`. CI went red 25 minutes later, on `main`.
 
 A docs edit is a code change when a test reads the docs. Run the suite, or at minimum
 replicate the assertion — the check is pure string containment and takes seconds.
+
+### CI workflows are pinned by a test too (as_of 2026-08-22 — binding)
+
+`tests/preventive_runtime_dark_v11.rs` carries `WORKFLOW_FINGERPRINTS`, a
+whole-file `<fnv1a-64>:<bytes>` seal over **`.github/workflows/ci.yml` and
+`.github/workflows/release.yml`**. Any byte of either workflow moving fails the
+suite. The file states its own purpose: *"no workflow byte may change without a
+human revisiting the judgement that no gate builds doctests."* It is a change
+detector, not a security boundary — FNV-1a is not collision-resistant and
+whoever edits a workflow can edit the pin. What it buys is that the edit is
+never silent.
+
+**So every CI workflow edit is a two-file change**: the workflow, and its
+fingerprint in the same commit. Nothing in either workflow file says it is
+load-bearing; the only thing that tells you is a red `rust` job. PR #612 — a
+four-line `concurrency:` block — went red on exactly this before anyone noticed
+the seal existed.
+
+Recompute is arithmetic, not judgement: FNV-1a-64 over the LF-normalized file,
+`:` , then the normalized byte length. The `rust` job is the observing authority;
+a pin refreshed any other way is plausible rather than verified. Same-file
+neighbours `CARGO_LINES` pin the occurrence count of each cargo invocation, so
+adding, rewording, or duplicating a cargo gate needs that reconciled too — and
+reconciled deliberately, never by loosening the pin.
+
+This is the same trap as the README/AGENTS.md phrase pinning above, in different
+clothes: **a workflow edit is a code change when a test reads the workflow.**
+Before touching either workflow, grep `tests/` for its filename.
 
 ### Never hand-write volatile state (binding, as_of 2026-08-05)
 
