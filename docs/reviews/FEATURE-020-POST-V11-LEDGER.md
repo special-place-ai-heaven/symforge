@@ -206,8 +206,17 @@ The seam map collapses part of the board, which nobody had connected before:
 
 | Seam | Is also Track B residual |
 |---|---|
-| 4 — persist hydrate + `get_file` | **B4** — `SnapshotStore` per-entry verify-state wiring |
-| 5 — path-keyed `PROJECT_AUTHORITIES` | **B1** (retarget-in-place admission identity), and plausibly **B2** (`project_source_authority` per-root static) — the mechanism is the same `HashMap<PathBuf, _>` |
+| 4 — persist hydrate (`persist.rs:2121-2129`, `SnapshotStore` unwired) | **B4**. LINUS draws a line HOLMES did not: `get_file` (`query.rs:1220`) is the same *family* but is not B4 itself. Treat B4 as the hydrate half. |
+| 5 — path-keyed `PROJECT_AUTHORITIES` (`activation.rs:894-911`) | **B1** — retarget-in-place admission identity |
+
+**Not B2, and the distinction is worth keeping.** The requester initially
+recorded seam 5 as "plausibly B2 as well"; both reviewers rejected that and
+were right to. The subtlety: `activation.rs:894-911` is simultaneously the
+`PathBuf`-keyed map (seam 5's mechanism) *and* `project_source_authority`
+(B2's subject) — same file, same function, different claim. B1 is the identity
+behaviour the control asserts; B2 is a separate observation about the lookup
+staying a per-root static after the flip. Sharing a code site does not make
+them the same residual.
 
 So two "unowned Track A controls" already have named Track B owners, and
 closing B1/B2/B4 discharges Track A work as a side effect. Plan them as one
@@ -268,7 +277,7 @@ in the C-group records of
 | # | Residual | Where it lives |
 |---|---|---|
 | B1 | Retarget-in-place admission identity — a root physically replaced at the same path keeps its admission identity | `src/index_lifecycle/` admission + transitions (C4b/C5 records) |
-| B2 | `project_source_authority` remains a per-root static convergence lookup after the flip | `src/index_lifecycle/authority.rs` |
+| B2 | `project_source_authority` remains a per-root static convergence lookup after the flip | `src/index_lifecycle/activation.rs:899` — **corrected 2026-08-21**; the previously recorded `authority.rs` path is stale, that file holds no such function and no `PathBuf` map |
 | B3 | Serve access-mode threading — the serve path surfaces no `RootBinding` and presents `NormalProject` | serve loader path |
 | B4 | `SnapshotStore` per-entry verify-state wiring into the live restore path | `src/live_index/persist.rs`; scope stated in `docs/migrations/v11-index-lifecycle.md` §4 |
 | B5 | Supersede multi-party heal residual — a multi-party interleave following a crash-orphan can still strip a live marker (bounded to a microsecond window by a double-checked re-read; no name-based marker scheme closes it fully) | stale-marker heal path, comment states the bound in code |
