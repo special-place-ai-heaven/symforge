@@ -3545,7 +3545,30 @@ impl ProjectSlot {
         };
         abort_watcher_task(&mut watcher_task, &old_stop_token);
 
-        reload_index(&index, canonical_root)?;
+        // A failed rebuild must not leave the project blind. The abort above
+        // stopped the observer and `take()` already cleared its handle, so
+        // returning straight through `?` here drops the project's only
+        // source-change trigger until it is reopened -- the retained index
+        // stays queryable, but no later edit is ever observed. Start a
+        // replacement before propagating the error, on the root the project is
+        // STILL bound to: the success path below is what retargets
+        // `canonical_root`, so on this path the old root is the one to watch.
+        if let Err(error) = reload_index(&index, canonical_root) {
+            let retained_root = self.metadata.read().canonical_root.clone();
+            let stop_token = Arc::new(AtomicBool::new(false));
+            let watcher_task = start_project_watcher(
+                retained_root,
+                Arc::clone(&index),
+                Arc::clone(&watcher_info),
+                Arc::clone(&stop_token),
+            );
+            {
+                let mut project = self.metadata.write();
+                project.stop_token = stop_token;
+                project.watcher_task = watcher_task;
+            }
+            return Err(error);
+        }
         let published = index.published_state();
         let counts = (published.file_count, published.symbol_count);
         let stop_token = Arc::new(AtomicBool::new(false));
