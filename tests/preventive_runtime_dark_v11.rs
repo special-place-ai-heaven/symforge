@@ -523,8 +523,8 @@ fn release_push_subject_validation_uses_last_successful_run_head() {
     let release = std::fs::read_to_string(repo.join(".github/workflows/release.yml"))
         .expect("read release.yml");
     assert!(
-        release.contains("gh run list") && release.contains("headSha"),
-        "release.yml push subject validation must resolve the last successful Release push run"
+        release.contains("check-push-range \"$LAST\""),
+        "release.yml push subject validation must pass the resolved range start to check-push-range"
     );
     assert!(
         !release.contains(
@@ -1136,7 +1136,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
     ("ci.yml", "26d8df149f93dc45:14056"),
-    ("release.yml", "6e78e0e18ea045c6:111477"),
+    ("release.yml", "5ba0053f77407dfa:111485"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an

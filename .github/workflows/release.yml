@@ -253,7 +253,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          LAST=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow Release --branch main --event push --status success --limit 5 --json databaseId,headSha --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID)] | .[0].headSha // empty")
+          LAST=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow Release --branch main --event push --status success --limit 5 --json databaseId,headSha --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID)] | .[0].headSha // empty" || true)
           if [ -z "$LAST" ]; then
             echo "No prior successful Release push run; falling back to github.event.before"
             LAST='${{ github.event.before }}'
