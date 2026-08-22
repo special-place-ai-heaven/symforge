@@ -242,12 +242,15 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
 }
 
 /// Design defect 2.10 — a failed reload removes the recovery observer.
+/// **Resolved by Track A seam 2.** This is now a regression guard, not a
+/// positive control, and it carries no `#[ignore]`.
 ///
 /// `ProjectSlot::reload_with` stops the old watcher before building the
-/// replacement (`src/daemon.rs:3341`). When the build fails, `?` returns before
-/// a replacement watcher starts, so last-known-good content stays in memory
-/// with its only source-change retry trigger gone: later edits are never
-/// observed and nothing retries.
+/// replacement. When the build failed, the error path returned without
+/// starting one, so last-known-good content stayed in memory with its only
+/// source-change retry trigger gone: later edits were never observed and
+/// nothing retried. That path now starts a replacement observer before
+/// propagating the error, on the root the project is still bound to.
 ///
 /// A failed reload must leave the project as observable as it was before.
 ///
@@ -256,9 +259,9 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
 /// in `ensure_project_slot_for_binding` while the old watcher is still running.
 /// `index_folder` on an open project is the path that reloads it in place, and
 /// a catalog-capacity limit imposed between the two calls is what makes that
-/// rebuild fail. (Capacity refusal is only converted to `Ok(empty)` on the cold
-/// bootstrap path; on reload it propagates, which is exactly the `?` that skips
-/// the watcher restart.)
+/// rebuild fail. Capacity refusal is only converted to `Ok(empty)` on the cold
+/// bootstrap path; on reload it propagates, which is what drives the error path
+/// this control exercises.
 #[test]
 fn failed_reload_retains_the_recovery_observer() {
     run_daemon_test(async {
