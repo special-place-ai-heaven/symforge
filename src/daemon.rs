@@ -3335,25 +3335,7 @@ impl ProjectInstance {
         let index = match bootstrap_project_index(canonical_root, &state_placement) {
             Ok(index) => index,
             Err(error) => {
-                let cleanup = admission.cleanup_candidate().then(|| {
-                    (
-                        live_index::index_lifecycle::registry::ProjectKey::new(&binding.root_id.0),
-                        admission.slot().slot(),
-                    )
-                });
-                drop(admission);
-                if let Some((key, slot)) = cleanup {
-                    if let Err(refusal) =
-                        live_index::index_lifecycle::activation::process_project_registry()
-                            .stop_if_unheld(&key, slot)
-                    {
-                        tracing::debug!(
-                            project_id = %binding.root_id.0,
-                            refusal = ?refusal,
-                            "failed daemon bootstrap left admission cleanup to another holder"
-                        );
-                    }
-                }
+                cleanup_failed_daemon_admission(&binding.root_id.0, admission);
                 return Err(error);
             }
         };
@@ -3436,6 +3418,29 @@ impl ProjectInstance {
         );
 
         self.activation_state = ActivationState::Active;
+    }
+}
+
+fn cleanup_failed_daemon_admission(
+    project_id: &str,
+    admission: live_index::index_lifecycle::activation::ProjectAdmission,
+) {
+    let cleanup = admission.cleanup_candidate().then(|| {
+        (
+            live_index::index_lifecycle::registry::ProjectKey::new(project_id),
+            admission.slot().slot(),
+        )
+    });
+    drop(admission);
+    if let Some((key, slot)) = cleanup
+        && let Err(refusal) = live_index::index_lifecycle::activation::process_project_registry()
+            .stop_if_unheld(&key, slot)
+    {
+        tracing::debug!(
+            project_id = %project_id,
+            refusal = ?refusal,
+            "failed daemon bootstrap left admission cleanup to another holder"
+        );
     }
 }
 
@@ -6867,24 +6872,27 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let canonical_root = dunce::canonicalize(tmp.path()).expect("canonical root");
         let root_id = crate::discovery::project_id_for_canonical_root(&canonical_root);
-        let binding = RootBinding {
-            source: RootCandidateSource::ExplicitIndexFolder,
-            canonical_root: canonical_root.clone(),
-            root_id: root_id.clone(),
-            access_mode: SourceAccessMode::NormalProject,
-        };
         let state_placement = StatePlacement::ProjectLocal {
             directory: crate::domain::ProjectStateDir::new(canonical_root.join(".symforge")),
         };
-        drop(tmp);
+        let admission = live_index::index_lifecycle::activation::admit_project_with_outcome(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+            &canonical_root,
+            &root_id.0,
+            SourceAccessMode::NormalProject,
+            &state_placement,
+        )
+        .expect("admit daemon project");
 
-        let failed = ProjectInstance::load_bound(&binding, state_placement);
+        let key = live_index::index_lifecycle::registry::ProjectKey::new(root_id.0.clone());
         assert!(
-            failed.is_err(),
-            "precondition: removed root must fail daemon bootstrap"
+            live_index::index_lifecycle::activation::process_project_registry()
+                .live(&key)
+                .is_ok(),
+            "precondition: daemon admission is live before bootstrap cleanup"
         );
 
-        let key = live_index::index_lifecycle::registry::ProjectKey::new(root_id.0);
+        cleanup_failed_daemon_admission(&root_id.0, admission);
         assert!(
             matches!(
                 live_index::index_lifecycle::activation::process_project_registry().live(&key),
