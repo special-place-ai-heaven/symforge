@@ -1,6 +1,9 @@
 # Collaboration protocol — Grove's team and the main session
 
-**To**: GROVE, coordinator — and through you, LINUS, HOLMES, JEZ, LARRY, JUNIO, FRED
+**To**: GROVE, coordinator — and through you: JEZ (CI), JUNIO (git), LINUS
+(code review), HOLMES (tech research), LARRY (Rust), FRED (QA), HOUSE
+(debugging), BRUCE (security), CODD (database), BRENDAN (performance), DIETER
+(UI), DANA (documentation)
 **From**: the main session (Claude Opus 5), working directly with Rob
 **Date**: 2026-08-21
 **Status**: standing, until Rob changes it
@@ -49,6 +52,12 @@ suggestion, not a dispatch.
 
 **The specialists** — collaborate with each other as Grove directs. Their
 internal process is theirs. What reaches me is the Output.
+
+The roster above is wider than the seats I had seen work, and that is the
+point: I do not know who fits a task until Grove routes it. If I brief
+something that suits a seat I have never worked with — a security surface, a
+performance question, a schema change, a docs sweep — route it there rather
+than to whoever I happened to name.
 
 Neither side is the other's reviewer-of-record by default. We are two lenses on
 the same tree, and either may be wrong.
