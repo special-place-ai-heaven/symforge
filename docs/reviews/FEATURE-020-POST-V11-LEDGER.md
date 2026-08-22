@@ -173,6 +173,46 @@ the frozen oracle, not toward it.
 | `concurrent_first_open_performs_exactly_one_cold_load` | load happens outside the lock then `or_insert`; `admit_project` does not skip bootstrap |
 | `watcher_mutation_during_candidate_build_is_not_discarded` | `store.rs:2403-2436` still reaches `swap_and_publish`; `IsolatedCandidate` appears **zero** times in `store.rs` |
 
+### Seam map — the eight code-wrong controls are SIX seams, not eight bugs
+
+**Established 2026-08-21** by two independent read-only passes (LINUS, HOLMES)
+on `main` @ `fd4de8dc`, briefed under the sealed protocol so neither saw the
+other's table or the requester's guess. They agree.
+
+| Seam | Mechanism | Closes |
+|---|---|---|
+| 1 | `EmptyBootstrap` / `add_file` gate | `empty_placeholder_publication_refuses_watcher_mutation` |
+| 2 | `reload_with` abort-then-`?` (no replacement on the error path) | `failed_reload_retains_the_recovery_observer` |
+| 3 | **Store reload trunk** — `recompute_freshness_locked` + `swap_and_publish` | `observer_replacement_gap…`, `old_observer_delivery…`, `watcher_mutation_during_candidate_build…`, **and the Current-half of** `same_path_root_replacement…` |
+| 4 | persist hydrate + `get_file` Pending gate | `snapshot_seed_is_not_queryable_before_verification` |
+| 5 | path-keyed `PROJECT_AUTHORITIES` (`activation.rs:894`, `HashMap<PathBuf, _>`) | the **identity-half of** `same_path_root_replacement…` |
+| 6 | `ensure_project_slot` / `or_insert` in `src/daemon.rs` | `concurrent_first_open_performs_exactly_one_cold_load` |
+
+**Three things this changes:**
+
+1. **Seam 3 is the prize.** One owner closes four of the eight. It is also the
+   seam where `IsolatedCandidate` appears **zero** times in `store.rs` —
+   independently re-verified — so the candidate pipeline was never wired into
+   the publication trunk at all.
+2. **`same_path_root_replacement…` is two problems wearing one name.** It needs
+   seams 3 *and* 5. Any plan that treats it as one item will half-fix it.
+3. **Owning any single seam leaves leftovers.** There is no ordering that
+   discharges Track A incrementally without carrying residue, and a plan that
+   claims otherwise has mis-grouped something.
+
+### Track A and Track B are not disjoint
+
+The seam map collapses part of the board, which nobody had connected before:
+
+| Seam | Is also Track B residual |
+|---|---|
+| 4 — persist hydrate + `get_file` | **B4** — `SnapshotStore` per-entry verify-state wiring |
+| 5 — path-keyed `PROJECT_AUTHORITIES` | **B1** (retarget-in-place admission identity), and plausibly **B2** (`project_source_authority` per-root static) — the mechanism is the same `HashMap<PathBuf, _>` |
+
+So two "unowned Track A controls" already have named Track B owners, and
+closing B1/B2/B4 discharges Track A work as a side effect. Plan them as one
+body of work, not two tracks.
+
 ### The "precondition window unreachable" claim was false
 
 Two controls carried `#[ignore]` text asserting their precondition window was
