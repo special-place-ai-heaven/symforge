@@ -13,7 +13,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Main push CI validates github.event.before..GITHUB_SHA. If main runs share
+  # refs/heads/main, GitHub's default single pending concurrency slot can replace
+  # an unobserved push range before its conventional-commit gate runs.
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:

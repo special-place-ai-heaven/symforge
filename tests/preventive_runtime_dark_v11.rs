@@ -1118,9 +1118,28 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "26d8df149f93dc45:14056"),
+    ("ci.yml", "1156bd3077730156:14340"),
     ("release.yml", "8ee888c1cf1be6a0:110910"),
 ];
+
+#[test]
+fn ci_main_push_runs_do_not_share_the_replaceable_ref_queue() {
+    let src = src_root();
+    let repo = src.parent().expect("src has a parent");
+    let ci = std::fs::read_to_string(repo.join(".github").join("workflows").join("ci.yml"))
+        .expect("read CI workflow");
+
+    assert!(
+        ci.contains("github.ref == 'refs/heads/main' && github.run_id || github.ref"),
+        "main CI runs validate github.event.before..GITHUB_SHA; if they share only \
+         refs/heads/main, GitHub's single pending concurrency slot can cancel an \
+         unobserved push range"
+    );
+    assert!(
+        ci.contains("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}"),
+        "non-main CI runs should still cancel superseded branch and PR refs"
+    );
+}
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
 /// `[alias]` table here re-points a gate command without touching a
