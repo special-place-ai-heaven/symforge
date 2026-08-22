@@ -271,6 +271,54 @@ in the repo.
 Central artifact for all of T078–T090:
 `docs/reviews/FEATURE-020-V11-RELEASE-GATE.md` — **does not exist**.
 
+### The switch that arms Phase 8's release gates
+
+**`.github/release-evidence-requirements-v11.json`** — found 2026-08-21 while
+tracing why two V11 gates never appear in a Release run.
+
+Two steps in `.github/workflows/release.yml` are guarded by
+`if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'`:
+
+- *Verify Feature 020 V11 refreeze integrity* (`refreeze_v11.py verify-internal`)
+- *Test and verify Feature 020 V11 lifecycle traceability*
+
+`lifecycle_gate_active` is derived from that JSON file, which currently reads:
+
+```json
+{ "phase": "pre_activation",
+  "required_oracle_receipts": [],
+  "required_review_documents": [],
+  "required_task_receipts": [] }
+```
+
+So both steps **skip on every Release run**, and have since the file was
+frozen. The workflow asserts the inverse too — `gate-release-ref` fails with
+*"The pre-activation Feature 020 lifecycle gate unexpectedly ran"* if the phase
+is `pre_activation` and the gate did not skip. This is intentional and
+self-consistent, not a hole.
+
+**Two things a Phase 8 executor needs from this:**
+
+1. **Flipping `phase` to `active` is Track D work.** Once flipped, those two
+   Release gates arm, and the three `required_*` arrays stop being empty — they
+   become the receipt roster T089/T090 must satisfy. The file is the switch; do
+   not treat it as configuration to be tidied.
+2. **The skip does not mean those paths are unexercised.** `ci.yml:78-86` runs
+   both gates **unconditionally** on every PR, with no `if:` guard. They ran on
+   every PR that reached `main`. The Release-side skip means only that *that
+   run* did not exercise them.
+
+The distinction matters because the two statements read almost identically and
+only one is true: *"the gates did not run on that Release run"* is correct;
+*"those paths were not exercised"* is not.
+
+There is a real oddity to sit with, though, and it is not a defect: the tree
+**activated** in V11 — 11.0.0 shipped, `PreventiveV1Open` is the only live mode
+— while the release-evidence phase still says `pre_activation`. That is
+correct today, because the phase tracks Phase 8's *evidence* obligation rather
+than the runtime's mode, and Phase 8 has not started. It will read as a
+contradiction to whoever finds it cold, which is why it is written down here.
+
 Never-materialized code artifacts:
 
 | Path | Owed by | Status |
