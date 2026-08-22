@@ -518,6 +518,23 @@ fn root_holders_store_no_bare_shared_index() {
 }
 
 #[test]
+fn release_push_subject_validation_uses_last_successful_run_head() {
+    let repo = src_root().parent().expect("src has a parent").to_path_buf();
+    let release = std::fs::read_to_string(repo.join(".github/workflows/release.yml"))
+        .expect("read release.yml");
+    assert!(
+        release.contains("gh run list") && release.contains("headSha"),
+        "release.yml push subject validation must resolve the last successful Release push run"
+    );
+    assert!(
+        !release.contains(
+            "run: python execution/conventional_commits.py check-push-range \"${{ github.event.before }}\" \"$GITHUB_SHA\""
+        ),
+        "release.yml must not validate push subjects solely from github.event.before"
+    );
+}
+
+#[test]
 fn dark_call_edges_appear_only_in_the_wired_roster() {
     let repo = src_root().parent().expect("src has a parent").to_path_buf();
     for (lane, path) in INGRESS_LANES {
@@ -1119,7 +1136,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
     ("ci.yml", "26d8df149f93dc45:14056"),
-    ("release.yml", "8ee888c1cf1be6a0:110910"),
+    ("release.yml", "6e78e0e18ea045c6:111477"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
