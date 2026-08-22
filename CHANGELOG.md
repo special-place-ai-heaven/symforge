@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.0...v11.0.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **daemon:** restart the observer when an in-place reload fails ([d6552a9](https://github.com/special-place-ai-heaven/symforge/commit/d6552a9c0dca1d45b2118df7a1ee93aad87e882f))
+
 ## [11.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v10.11.1...v11.0.0) (2026-08-20)
 
 
