@@ -307,6 +307,34 @@ phrases survived in `AGENTS.md`. CI went red 25 minutes later, on `main`.
 A docs edit is a code change when a test reads the docs. Run the suite, or at minimum
 replicate the assertion — the check is pure string containment and takes seconds.
 
+### CI workflows are pinned by a test too (as_of 2026-08-22 — binding)
+
+`tests/preventive_runtime_dark_v11.rs` carries `WORKFLOW_FINGERPRINTS`, a
+whole-file `<fnv1a-64>:<bytes>` seal over **`.github/workflows/ci.yml` and
+`.github/workflows/release.yml`**. Any byte of either workflow moving fails the
+suite. The file states its own purpose: *"no workflow byte may change without a
+human revisiting the judgement that no gate builds doctests."* It is a change
+detector, not a security boundary — FNV-1a is not collision-resistant and
+whoever edits a workflow can edit the pin. What it buys is that the edit is
+never silent.
+
+**So every CI workflow edit is a two-file change**: the workflow, and its
+fingerprint in the same commit. Nothing in either workflow file says it is
+load-bearing; the only thing that tells you is a red `rust` job. PR #612 — a
+four-line `concurrency:` block — went red on exactly this before anyone noticed
+the seal existed.
+
+Recompute is arithmetic, not judgement: FNV-1a-64 over the LF-normalized file,
+`:` , then the normalized byte length. The `rust` job is the observing authority;
+a pin refreshed any other way is plausible rather than verified. Same-file
+neighbours `CARGO_LINES` pin the occurrence count of each cargo invocation, so
+adding, rewording, or duplicating a cargo gate needs that reconciled too — and
+reconciled deliberately, never by loosening the pin.
+
+This is the same trap as the README/AGENTS.md phrase pinning above, in different
+clothes: **a workflow edit is a code change when a test reads the workflow.**
+Before touching either workflow, grep `tests/` for its filename.
+
 ### Never hand-write volatile state (binding, as_of 2026-08-05)
 
 Handover and campaign docs rot because volatile facts get TYPED into them. Reading
