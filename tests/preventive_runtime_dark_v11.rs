@@ -526,6 +526,12 @@ fn release_push_subject_validation_uses_last_successful_run_head() {
         release.contains("check-push-range \"$LAST\""),
         "release.yml push subject validation must pass the resolved range start to check-push-range"
     );
+    for line in release.lines().filter(|line| line.contains("gh run list")) {
+        assert!(
+            !line.contains("|| true"),
+            "release.yml must fail closed when the prior successful Release lookup fails"
+        );
+    }
     assert!(
         !release.contains(
             "run: python execution/conventional_commits.py check-push-range \"${{ github.event.before }}\" \"$GITHUB_SHA\""
@@ -1136,7 +1142,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
     ("ci.yml", "26d8df149f93dc45:14056"),
-    ("release.yml", "5ba0053f77407dfa:111485"),
+    ("release.yml", "6e78e0e18ea045c6:111477"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
