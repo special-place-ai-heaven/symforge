@@ -173,6 +173,142 @@ the frozen oracle, not toward it.
 | `concurrent_first_open_performs_exactly_one_cold_load` | load happens outside the lock then `or_insert`; `admit_project` does not skip bootstrap |
 | `watcher_mutation_during_candidate_build_is_not_discarded` | `store.rs:2403-2436` still reaches `swap_and_publish`; `IsolatedCandidate` appears **zero** times in `store.rs` |
 
+### Seam map — the eight code-wrong controls are SIX seams, not eight bugs
+
+**Established 2026-08-21** by two independent read-only passes (LINUS, HOLMES)
+on `main` @ `fd4de8dc`, briefed under the sealed protocol so neither saw the
+other's table or the requester's guess. They agree.
+
+| Seam | Mechanism | Closes |
+|---|---|---|
+| 1 | `EmptyBootstrap` / `add_file` gate | `empty_placeholder_publication_refuses_watcher_mutation` |
+| 2 | `reload_with` abort-then-`?` (no replacement on the error path) | `failed_reload_retains_the_recovery_observer` |
+| 3 | **Store reload trunk** — `recompute_freshness_locked` + `swap_and_publish` | `observer_replacement_gap…`, `old_observer_delivery…`, `watcher_mutation_during_candidate_build…`, **and the Current-half of** `same_path_root_replacement…` |
+| 4 | persist hydrate + `get_file` Pending gate | `snapshot_seed_is_not_queryable_before_verification` |
+| 5 | path-keyed `PROJECT_AUTHORITIES` (`activation.rs:894`, `HashMap<PathBuf, _>`) | the **identity-half of** `same_path_root_replacement…` |
+| 6 | `ensure_project_slot` / `or_insert` in `src/daemon.rs` | `concurrent_first_open_performs_exactly_one_cold_load` |
+
+**Three things this changes:**
+
+1. **Seam 3 is the prize.** One owner closes four of the eight. It is also the
+   seam where `IsolatedCandidate` appears **zero** times in `store.rs` —
+   independently re-verified — so the candidate pipeline was never wired into
+   the publication trunk at all.
+2. **`same_path_root_replacement…` is two problems wearing one name.** It needs
+   seams 3 *and* 5. Any plan that treats it as one item will half-fix it.
+3. **Owning any single seam leaves leftovers.** There is no ordering that
+   discharges Track A incrementally without carrying residue, and a plan that
+   claims otherwise has mis-grouped something.
+
+### Seam 3 is one function with TWO jobs — and 3b alone leaves three of four RED
+
+**Established 2026-08-22** (HOLMES design read on `fd4de8dc`), verified here
+against source.
+
+| Job | What it is | Closes |
+|---|---|---|
+| **3a — freshness latch** | `recompute_freshness_locked` (`store.rs:1883-1890`) explicitly filters out `ObservationFailed`, `ReconciliationPending` and `SnapshotVerificationFailed`; and `store.rs:2417-2424` writes `FreshnessStatus::Current` unconditionally when coverage is not degraded | `observer_replacement_gap…`, `old_observer_delivery…`, Current-half of `same_path…` |
+| **3b — candidate wiring** | the reload trunk reaches `swap_and_publish` and never touches the candidate pipeline | `watcher_mutation_during_candidate_build…` |
+
+**The trap**: "wire `IsolatedCandidate` into publication" sounds like the whole
+of seam 3. It is only 3b. `IsolatedCandidate` does not mention
+`FreshnessStatus` at all, so owning it without the two 3a edits leaves **three
+of seam 3's four controls red** — while looking like the seam was closed.
+
+The 3a filter is worth seeing, because it is deliberate code rather than an
+omission:
+
+```rust
+for reason in reason_codes.iter().copied().filter(|reason| {
+    !matches!(reason,
+        FreshnessReason::ObservationFailed
+        | FreshnessReason::ReconciliationPending
+        | FreshnessReason::SnapshotVerificationFailed)
+}) {
+```
+
+### 3b is a data-plane cut, not a helper call — the types do not meet
+
+Verified: `IsolatedCandidate::commit(self, root: &ProjectArtifactRoot) ->
+Result<Arc<ProjectArtifacts>, PromotionRefusal>` (`candidate.rs:373-376`), and
+**`LiveIndex` appears zero times in `candidate.rs`**. There is no overload that
+publishes a `LiveIndex`.
+
+So the store trunk cannot call into the candidate pipeline and keep publishing
+through `swap_and_publish`. Doing both is not wiring — it is a second dark run
+beside the same V10 swap. Real 3b means ending the mid-cut split: query necks
+stop reading `ProjectRuntimeHandle::data_plane()` and start reading the
+publication root. That is a census of `data_plane()` call sites (the C4/C5
+work), not a one-function edit.
+
+### Activation mode is NOT at risk, and that matters for scoping
+
+`reload_for_binding_with_exclusions` does not call `ActivationCut`; neither does
+`IsolatedCandidate::commit`. Mode changes only by typed transition evidence and
+has no reverse edge. The process is already `PreventiveV1Open`. **Seam 3 work
+cannot flip it.**
+
+But the corollary is the scoping finding:
+
+> The frozen Slice 5 constraint is "do not change runtime authority, public
+> behavior, writer reachability, or activation mode." Seam 3 satisfies the
+> activation-mode half — and **violates the public-behaviour half by design**,
+> because closing those four controls *is* a behaviour change.
+
+**Therefore Track A seam work is not Slice-5-shaped and must not ride under
+Slice 5's neutrality bracket.** They are different kinds of work: Slice 5
+removes what is provably dead and changes nothing; seam work changes behaviour
+on purpose. Anyone tempted to fold them into one campaign should stop here.
+
+### PR #609 touches none of the eight
+
+**Established 2026-08-22** (LINUS read on the same merge-base, `fd4de8dc`).
+#609 is an orphan-admission cleanup on failed daemon *bootstrap*: it retires a
+pending admission when bootstrap returns a non-capacity `Err` and the opener is
+the last holder. Real, local, and unrelated to the map.
+
+- **S5 (`PROJECT_AUTHORITIES`, `activation.rs:894-911`): not in the diff.**
+- **S6 (`ensure_project_slot…/or_insert`, `daemon.rs:1137-1142`): not in the diff.**
+- `registry.rs` (+93) adds `AdmissionJoin` / `AdmissionAttempt` / `stop_if_unheld`,
+  keyed by `ProjectKey` — adjacent types, not a missed seam.
+- All eight controls remain red; #609 adds a ninth, already-aimed cleanup.
+
+**Its pin refresh is honest.** LINUS could not recompute (no local tree) and
+recorded it as an unverified residual. Recomputed here from the git blobs, and
+the method was validated by reproducing `main`'s pins exactly first:
+
+```
+main @ fd4de8dc  FULL     96b7a77f… 196 9300142   claimed identical   MATCH
+#609 @ 65f96c97  FULL     258ee682… 196 9307806   claimed identical   MATCH
+#609 @ 65f96c97  EXCLUDED b4c9f548…  20  393840   claimed identical   MATCH
+```
+
+Note the file set is **all** files under `src/`, not just `*.rs` — three
+non-Rust assets under `src/server/admin/assets/` are included, which is why a
+`.rs`-only recompute yields 193 files and the wrong digest.
+
+### Track A and Track B are not disjoint
+
+The seam map collapses part of the board, which nobody had connected before:
+
+| Seam | Is also Track B residual |
+|---|---|
+| 4 — persist hydrate (`persist.rs:2121-2129`, `SnapshotStore` unwired) | **B4**. LINUS draws a line HOLMES did not: `get_file` (`query.rs:1220`) is the same *family* but is not B4 itself. Treat B4 as the hydrate half. |
+| 5 — path-keyed `PROJECT_AUTHORITIES` (`activation.rs:894-911`) | **B1** — retarget-in-place admission identity |
+
+**Not B2, and the distinction is worth keeping.** The requester initially
+recorded seam 5 as "plausibly B2 as well"; both reviewers rejected that and
+were right to. The subtlety: `activation.rs:894-911` is simultaneously the
+`PathBuf`-keyed map (seam 5's mechanism) *and* `project_source_authority`
+(B2's subject) — same file, same function, different claim. B1 is the identity
+behaviour the control asserts; B2 is a separate observation about the lookup
+staying a per-root static after the flip. Sharing a code site does not make
+them the same residual.
+
+So two "unowned Track A controls" already have named Track B owners, and
+closing B1/B2/B4 discharges Track A work as a side effect. Plan them as one
+body of work, not two tracks.
+
 ### The "precondition window unreachable" claim was false
 
 Two controls carried `#[ignore]` text asserting their precondition window was
@@ -228,7 +364,7 @@ in the C-group records of
 | # | Residual | Where it lives |
 |---|---|---|
 | B1 | Retarget-in-place admission identity — a root physically replaced at the same path keeps its admission identity | `src/index_lifecycle/` admission + transitions (C4b/C5 records) |
-| B2 | `project_source_authority` remains a per-root static convergence lookup after the flip | `src/index_lifecycle/authority.rs` |
+| B2 | `project_source_authority` remains a per-root static convergence lookup after the flip | `src/index_lifecycle/activation.rs:899` — **corrected 2026-08-21**; the previously recorded `authority.rs` path is stale, that file holds no such function and no `PathBuf` map |
 | B3 | Serve access-mode threading — the serve path surfaces no `RootBinding` and presents `NormalProject` | serve loader path |
 | B4 | `SnapshotStore` per-entry verify-state wiring into the live restore path | `src/live_index/persist.rs`; scope stated in `docs/migrations/v11-index-lifecycle.md` §4 |
 | B5 | Supersede multi-party heal residual — a multi-party interleave following a crash-orphan can still strip a live marker (bounded to a microsecond window by a double-checked re-read; no name-based marker scheme closes it fully) | stale-marker heal path, comment states the bound in code |
