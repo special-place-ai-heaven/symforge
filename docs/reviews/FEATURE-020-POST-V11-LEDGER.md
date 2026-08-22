@@ -200,6 +200,93 @@ other's table or the requester's guess. They agree.
    discharges Track A incrementally without carrying residue, and a plan that
    claims otherwise has mis-grouped something.
 
+### Seam 3 is one function with TWO jobs — and 3b alone leaves three of four RED
+
+**Established 2026-08-22** (HOLMES design read on `fd4de8dc`), verified here
+against source.
+
+| Job | What it is | Closes |
+|---|---|---|
+| **3a — freshness latch** | `recompute_freshness_locked` (`store.rs:1883-1890`) explicitly filters out `ObservationFailed`, `ReconciliationPending` and `SnapshotVerificationFailed`; and `store.rs:2417-2424` writes `FreshnessStatus::Current` unconditionally when coverage is not degraded | `observer_replacement_gap…`, `old_observer_delivery…`, Current-half of `same_path…` |
+| **3b — candidate wiring** | the reload trunk reaches `swap_and_publish` and never touches the candidate pipeline | `watcher_mutation_during_candidate_build…` |
+
+**The trap**: "wire `IsolatedCandidate` into publication" sounds like the whole
+of seam 3. It is only 3b. `IsolatedCandidate` does not mention
+`FreshnessStatus` at all, so owning it without the two 3a edits leaves **three
+of seam 3's four controls red** — while looking like the seam was closed.
+
+The 3a filter is worth seeing, because it is deliberate code rather than an
+omission:
+
+```rust
+for reason in reason_codes.iter().copied().filter(|reason| {
+    !matches!(reason,
+        FreshnessReason::ObservationFailed
+        | FreshnessReason::ReconciliationPending
+        | FreshnessReason::SnapshotVerificationFailed)
+}) {
+```
+
+### 3b is a data-plane cut, not a helper call — the types do not meet
+
+Verified: `IsolatedCandidate::commit(self, root: &ProjectArtifactRoot) ->
+Result<Arc<ProjectArtifacts>, PromotionRefusal>` (`candidate.rs:373-376`), and
+**`LiveIndex` appears zero times in `candidate.rs`**. There is no overload that
+publishes a `LiveIndex`.
+
+So the store trunk cannot call into the candidate pipeline and keep publishing
+through `swap_and_publish`. Doing both is not wiring — it is a second dark run
+beside the same V10 swap. Real 3b means ending the mid-cut split: query necks
+stop reading `ProjectRuntimeHandle::data_plane()` and start reading the
+publication root. That is a census of `data_plane()` call sites (the C4/C5
+work), not a one-function edit.
+
+### Activation mode is NOT at risk, and that matters for scoping
+
+`reload_for_binding_with_exclusions` does not call `ActivationCut`; neither does
+`IsolatedCandidate::commit`. Mode changes only by typed transition evidence and
+has no reverse edge. The process is already `PreventiveV1Open`. **Seam 3 work
+cannot flip it.**
+
+But the corollary is the scoping finding:
+
+> The frozen Slice 5 constraint is "do not change runtime authority, public
+> behavior, writer reachability, or activation mode." Seam 3 satisfies the
+> activation-mode half — and **violates the public-behaviour half by design**,
+> because closing those four controls *is* a behaviour change.
+
+**Therefore Track A seam work is not Slice-5-shaped and must not ride under
+Slice 5's neutrality bracket.** They are different kinds of work: Slice 5
+removes what is provably dead and changes nothing; seam work changes behaviour
+on purpose. Anyone tempted to fold them into one campaign should stop here.
+
+### PR #609 touches none of the eight
+
+**Established 2026-08-22** (LINUS read on the same merge-base, `fd4de8dc`).
+#609 is an orphan-admission cleanup on failed daemon *bootstrap*: it retires a
+pending admission when bootstrap returns a non-capacity `Err` and the opener is
+the last holder. Real, local, and unrelated to the map.
+
+- **S5 (`PROJECT_AUTHORITIES`, `activation.rs:894-911`): not in the diff.**
+- **S6 (`ensure_project_slot…/or_insert`, `daemon.rs:1137-1142`): not in the diff.**
+- `registry.rs` (+93) adds `AdmissionJoin` / `AdmissionAttempt` / `stop_if_unheld`,
+  keyed by `ProjectKey` — adjacent types, not a missed seam.
+- All eight controls remain red; #609 adds a ninth, already-aimed cleanup.
+
+**Its pin refresh is honest.** LINUS could not recompute (no local tree) and
+recorded it as an unverified residual. Recomputed here from the git blobs, and
+the method was validated by reproducing `main`'s pins exactly first:
+
+```
+main @ fd4de8dc  FULL     96b7a77f… 196 9300142   claimed identical   MATCH
+#609 @ 65f96c97  FULL     258ee682… 196 9307806   claimed identical   MATCH
+#609 @ 65f96c97  EXCLUDED b4c9f548…  20  393840   claimed identical   MATCH
+```
+
+Note the file set is **all** files under `src/`, not just `*.rs` — three
+non-Rust assets under `src/server/admin/assets/` are included, which is why a
+`.rs`-only recompute yields 193 files and the wrong digest.
+
 ### Track A and Track B are not disjoint
 
 The seam map collapses part of the board, which nobody had connected before:
