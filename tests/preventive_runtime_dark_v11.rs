@@ -1118,7 +1118,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "26d8df149f93dc45:14056"),
+    ("ci.yml", "bd967b1c6ff2b50a:14157"),
     ("release.yml", "8ee888c1cf1be6a0:110910"),
 ];
 
@@ -1254,6 +1254,24 @@ const CARGO_CONFIG_SKIP_GITIGNORE_LINES: &[&str] = &["/target", "node_modules/"]
 const GITIGNORE_FINGERPRINT: &str = "b5011af9576da616:1186";
 const PRODUCTION_TARGET_TOPOLOGY: &[(&str, &str)] =
     &[("lib", "src/lib.rs"), ("bin:symforge", "src/main.rs")];
+
+#[test]
+fn main_ci_runs_do_not_share_a_pending_concurrency_slot() {
+    let repo = src_root().parent().expect("src has a parent").to_path_buf();
+    let ci = std::fs::read_to_string(repo.join(".github").join("workflows").join("ci.yml"))
+        .expect("read CI workflow");
+
+    assert!(
+        ci.contains("github.ref == 'refs/heads/main'") && ci.contains("github.run_id"),
+        "main push CI must not share a ref-level concurrency group. GitHub keeps only one \
+         pending run per group, so a third main push can cancel the middle push before \
+         `check-push-range` observes its commit subject."
+    );
+    assert!(
+        ci.contains("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}"),
+        "main CI must still avoid canceling an already-running main gate"
+    );
+}
 
 fn production_target_topology(manifest: &str) -> Vec<(String, String)> {
     let document = manifest
