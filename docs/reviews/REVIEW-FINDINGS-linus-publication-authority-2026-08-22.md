@@ -3,7 +3,7 @@
 Reviewer: LINUS
 Tree: `main` @ `48d1d0ab` (src/ byte-identical to `fd4de8dc`; compare `fd4de8dc...48d1d0ab` has no `src/` files)
 Brief: `docs/reviews/REVIEW-REQUEST-publication-authority-invariant-2026-08-22.md` @ `8f5a39e4`
-Status: **on origin.** Parts 1–5 only.
+Status: **on origin.** Parts 1–6. Part 6 after appendix `ac266d12`.
 
 ---
 
@@ -99,7 +99,7 @@ Under that reading: **does not hold.**
 
 I accepted the brief's `data_plane()` file split without a full recount. I verified the return type, the "not a root" comment, and production call sites in protocol/server/sidecar. I verified `src/` did not move: `gh api .../compare/fd4de8dc...48d1d0ab` lists `.github/workflows/ci.yml` and `tests/preventive_runtime_dark_v11.rs` only.
 
-PR #609 not read. `specs/020` read only for the retirement inventory assertion above. No cargo. No appendix opened.
+PR #609 not read. `specs/020` read only for the retirement inventory assertion above. No cargo. Appendix opened only for Part 6.
 
 ---
 
@@ -111,3 +111,44 @@ PR #609 not read. `specs/020` read only for the retirement inventory assertion a
 - I did not find a second process `ActivationCut`, a reverse edge, or a config/env read that selects a mode.
 - I did not find `ProjectPublicationRoot` answering a protocol/daemon/sidecar query. The failure mode is "V11 root does not serve", not "two roots serve".
 
+
+---
+
+## Part 6 — Delta
+
+Appendix: `docs/reviews/APPENDIX-publication-authority-suspicions-2026-08-22.md` @ `ac266d12`.
+Read after Parts 1–5. Nothing in Parts 1–5 was rewritten. The Part 1 verdict survives.
+
+### Already reached
+
+| Suspicion | Mine, independently |
+|---|---|
+| S1 tension (machine in `PreventiveV1Open`; LiveIndex still serving; `:337-339` vs `:19-24`) | Yes. Part 1 and Part 4. I did not need Holmes. |
+| S1.3 C4/C5 ran and did something else | The "until C4/C5" hang I already named (Part 3 Q5, Part 4). The appendix's dates and "THE EXPOSURE FLIP" I did not have. I checked: execution map pins C4a–C4c and C5 as executed 2026-08-19; C5 is the public-census / `pub` flip (`activation-cut-execution-map.md:199-294`, `src/main.rs` C5 comment). Confirmed: those owners ran. They did not make the lane the publication root. |
+| S3 unearned guarantee (mode without serving) | Yes, as the *conditional* in Part 2, under query-visible. I did not adopt it as the Part 1 verdict because the sentence is unbound. |
+| S4 count is not a verdict; dark wiring is a real discipline | Yes. Part 3 Q2. 226 vs 0 is a fact. It does not decide "serves". |
+| S6 binary is the wrong shape; type-level half vs runtime half | **This was the Part 1 verdict.** "cannot be evaluated as written" is S6 said first, without the appendix. Mode construction holds. Publication exclusivity is not a construction. I refused to pick holds/does-not-hold to satisfy the brief. |
+
+### Now think are wrong
+
+**S2 is not a resolution.** I did not reach "serves = write/publication authority" and I do not adopt it now. It is another unbound guess. The same file that would have to host that meaning calls every `SharedIndex` field a "V10 publication root" (`activation.rs:933`) and hands that type to ingress via `data_plane()`. `ProjectPublicationRoot` still has no production callers. Writers retirement is also `planned_not_executed`. If "serves" meant publish, the production publisher is still `SharedIndex`, not the type documented as SOLE. S2's "V10 is a cache/serving layer, nothing is violated" does not survive contact with `:933` or with `swap_and_publish` living on that store. Wording-is-misleading is true either way. "Invariant is sound" is not established.
+
+**S3 as "the unlikely one".** Under any bound operational reading (query-visible, or publish-visible), S3 is the one that matches the artifact: the machine is in the post-cut mode; the named V11 root does not serve. The appendix author's prior (S2 likely, S3 rule-out) is the thing I reject. I still will not promote S3 to the Part 1 verdict, because that would pretend the sentence defined "serves".
+
+### Changed a verdict
+
+None. Part 1 remains **cannot be evaluated as written.** Part 2 remains the conditional: bind query-visible → does not hold, documentation overclaim, not two roots answering.
+
+S6 is the appendix agreeing with Part 1 after the fact. That is not a change.
+
+### S5 — fourth
+
+The class is real. I already had two members in this file: `:337-339` ("until C4/C5 make it the root") and `:19-24` itself (predicts exclusive V11 service; the mode shipped; the service did not).
+
+A sibling on the same tree, not named in Parts 1–5: `activate_surface` asserts "after this PR's compile-time flip there is no legacy traffic left to drain at runtime" (`activation.rs:1037-1039`) and then flips the machine. Ingress still drains `SharedIndex`. Same class: prose that predicted a flip, now written as an observation.
+
+The retirement inventory's "Only ProjectPublicationRoot is query-visible" is *not* a fourth. It still says `planned_not_executed`. That one aged honestly.
+
+### What I did not take from the appendix
+
+I did not take S2 as the likely answer. I did not reclassify this as a release defect or as sound-but-misleading. I did not open #609. I did not run cargo.
