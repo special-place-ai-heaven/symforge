@@ -3318,7 +3318,7 @@ impl ProjectInstance {
         // built. A refusal fails the open honestly — admission is
         // authoritative, not advisory. The live slot rides on the runtime
         // handle (C4c) so the dispatch neck can refuse a retired admission.
-        let admission = live_index::index_lifecycle::activation::admit_project(
+        let admission = live_index::index_lifecycle::activation::admit_project_with_outcome(
             live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
             canonical_root,
             &binding.root_id.0,
@@ -3332,7 +3332,13 @@ impl ProjectInstance {
             )
         })?;
 
-        let index = bootstrap_project_index(canonical_root, &state_placement)?;
+        let index = match bootstrap_project_index(canonical_root, &state_placement) {
+            Ok(index) => index,
+            Err(error) => {
+                cleanup_failed_daemon_admission(&binding.root_id.0, admission);
+                return Err(error);
+            }
+        };
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
         let persistence_status = if matches!(
@@ -3367,7 +3373,8 @@ impl ProjectInstance {
             curation_coordinator,
             index:
                 crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind_admitted(
-                    index, admission,
+                    index,
+                    admission.into_slot(),
                 ),
             watcher_info,
             watcher_task: None,
@@ -3411,6 +3418,29 @@ impl ProjectInstance {
         );
 
         self.activation_state = ActivationState::Active;
+    }
+}
+
+fn cleanup_failed_daemon_admission(
+    project_id: &str,
+    admission: live_index::index_lifecycle::activation::ProjectAdmission,
+) {
+    let cleanup = admission.cleanup_candidate().then(|| {
+        (
+            live_index::index_lifecycle::registry::ProjectKey::new(project_id),
+            admission.slot().slot(),
+        )
+    });
+    drop(admission);
+    if let Some((key, slot)) = cleanup
+        && let Err(refusal) = live_index::index_lifecycle::activation::process_project_registry()
+            .stop_if_unheld(&key, slot)
+    {
+        tracing::debug!(
+            project_id = %project_id,
+            refusal = ?refusal,
+            "failed daemon bootstrap left admission cleanup to another holder"
+        );
     }
 }
 
@@ -6834,6 +6864,41 @@ mod tests {
         assert!(
             guard.get_file("main.rs").is_some(),
             "the artifact-restored index must serve the indexed files"
+        );
+    }
+
+    #[test]
+    fn failed_project_instance_load_retires_its_admission() {
+        let tmp = TempDir::new().expect("tempdir");
+        let canonical_root = dunce::canonicalize(tmp.path()).expect("canonical root");
+        let root_id = crate::discovery::project_id_for_canonical_root(&canonical_root);
+        let state_placement = StatePlacement::ProjectLocal {
+            directory: crate::domain::ProjectStateDir::new(canonical_root.join(".symforge")),
+        };
+        let admission = live_index::index_lifecycle::activation::admit_project_with_outcome(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+            &canonical_root,
+            &root_id.0,
+            SourceAccessMode::NormalProject,
+            &state_placement,
+        )
+        .expect("admit daemon project");
+
+        let key = live_index::index_lifecycle::registry::ProjectKey::new(root_id.0.clone());
+        assert!(
+            live_index::index_lifecycle::activation::process_project_registry()
+                .live(&key)
+                .is_ok(),
+            "precondition: daemon admission is live before bootstrap cleanup"
+        );
+
+        cleanup_failed_daemon_admission(&root_id.0, admission);
+        assert!(
+            matches!(
+                live_index::index_lifecycle::activation::process_project_registry().live(&key),
+                Err(live_index::index_lifecycle::registry::RegistryRefusal::NotAdmitted)
+            ),
+            "a failed bootstrap must not leave a live lifecycle admission behind"
         );
     }
 

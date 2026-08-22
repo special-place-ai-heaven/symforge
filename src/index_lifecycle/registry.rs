@@ -153,6 +153,44 @@ impl PendingProjectAdmission {
     }
 }
 
+/// What the caller joined when it asked to admit a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionJoin {
+    /// This caller created the pending admission entry.
+    CreatedPending,
+    /// This caller joined a not-yet-installed admission.
+    JoinedPending,
+    /// This caller found an already-live slot.
+    JoinedLive,
+}
+
+/// Result of admitting or joining one project key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionAttempt {
+    slot: SlotIdentity,
+    join: AdmissionJoin,
+}
+
+impl AdmissionAttempt {
+    /// The slot identity this admission names.
+    pub fn slot(self) -> SlotIdentity {
+        self.slot
+    }
+
+    /// Whether this request created pending, joined pending, or joined live.
+    pub fn join(self) -> AdmissionJoin {
+        self.join
+    }
+
+    /// True when a failed bootstrap may retire this slot if no other holder won.
+    pub fn cleanup_candidate(self) -> bool {
+        matches!(
+            self.join,
+            AdmissionJoin::CreatedPending | AdmissionJoin::JoinedPending
+        )
+    }
+}
+
 /// A live slot.
 ///
 /// **Revocation is enforced, not advised.** Rust cannot take an `Arc` back from
@@ -285,6 +323,20 @@ impl ProjectRegistry {
         authorized: bool,
         placement: StatePlacement,
     ) -> Result<SlotIdentity, RegistryRefusal> {
+        self.admit_with_outcome(key, binding, protection, authorized, placement)
+            .map(AdmissionAttempt::slot)
+    }
+
+    /// Begin admitting `key`, returning whether the caller created, joined
+    /// pending, or joined live occupancy.
+    pub fn admit_with_outcome(
+        self: &Arc<Self>,
+        key: ProjectKey,
+        binding: BindingAuthority,
+        protection: RootProtection,
+        authorized: bool,
+        placement: StatePlacement,
+    ) -> Result<AdmissionAttempt, RegistryRefusal> {
         if protection == RootProtection::Protected {
             if !authorized {
                 return Err(RegistryRefusal::ProtectedWithoutAuthorization);
@@ -322,7 +374,10 @@ impl ProjectRegistry {
                     });
                 }
                 pending.joiners += 1;
-                Ok(pending.slot)
+                Ok(AdmissionAttempt {
+                    slot: pending.slot,
+                    join: AdmissionJoin::JoinedPending,
+                })
             }
             Some(Occupancy::Live(live)) => {
                 if live.binding.physical_root() != binding.physical_root() {
@@ -337,7 +392,10 @@ impl ProjectRegistry {
                         presented: placement,
                     });
                 }
-                Ok(live.slot())
+                Ok(AdmissionAttempt {
+                    slot: live.slot(),
+                    join: AdmissionJoin::JoinedLive,
+                })
             }
             None => {
                 let slot = SlotIdentity::fresh();
@@ -351,7 +409,10 @@ impl ProjectRegistry {
                         joiners: 1,
                     }),
                 );
-                Ok(slot)
+                Ok(AdmissionAttempt {
+                    slot,
+                    join: AdmissionJoin::CreatedPending,
+                })
             }
         }
     }
@@ -448,6 +509,35 @@ impl ProjectRegistry {
         let slot = live.slot();
         state.tombstones.insert(slot, live.key().clone());
         Ok(slot)
+    }
+
+    /// Stop `key` only when it still names `slot` and the registry is the last
+    /// remaining holder.
+    pub fn stop_if_unheld(
+        self: &Arc<Self>,
+        key: &ProjectKey,
+        slot: SlotIdentity,
+    ) -> Result<SlotIdentity, RegistryRefusal> {
+        let mut state = self.occupancy.lock().expect("registry mutex");
+        match state.keys.get(key) {
+            Some(Occupancy::Live(live)) if live.slot() == slot => {
+                // The caller must drop its local admission before calling this.
+                // Any extra ref is another opener or a constructed ProjectSlot.
+                if Arc::strong_count(live) > 1 {
+                    return Err(RegistryRefusal::StillPending);
+                }
+            }
+            Some(Occupancy::Live(_)) => return Err(RegistryRefusal::NotAdmitted),
+            Some(Occupancy::Pending(_)) => return Err(RegistryRefusal::StillPending),
+            None => return Err(RegistryRefusal::NotAdmitted),
+        };
+        let Some(Occupancy::Live(live)) = state.keys.remove(key) else {
+            return Err(RegistryRefusal::NotAdmitted);
+        };
+        live.revoke();
+        let stopped = live.slot();
+        state.tombstones.insert(stopped, live.key().clone());
+        Ok(stopped)
     }
 
     /// Whether `slot` is the identity currently serving `key`.

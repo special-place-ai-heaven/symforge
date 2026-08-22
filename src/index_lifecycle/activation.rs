@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::adapters::{AdapterRefusal, execute_plan, plan_admission};
+use super::adapters::{AdapterRefusal, execute_plan_with_outcome, plan_admission};
 use super::authority::{
     AuthorityRefusal, BindingAuthority, CurrentPublication, MutationGrantInput, ObserverToken,
     SourceRuntime,
@@ -1102,6 +1102,43 @@ pub fn admit_project(
     access_mode: crate::domain::index::SourceAccessMode,
     placement: &crate::domain::StatePlacement,
 ) -> Result<Arc<LiveProjectSlot>, AdapterRefusal> {
+    admit_project_with_outcome(surface, canonical_root, project_id, access_mode, placement)
+        .map(ProjectAdmission::into_slot)
+}
+
+/// A project admission plus the ownership evidence needed to clean up a failed
+/// bootstrap without retiring another opener's already-live slot.
+#[derive(Debug, Clone)]
+pub struct ProjectAdmission {
+    slot: Arc<LiveProjectSlot>,
+    cleanup_candidate: bool,
+}
+
+impl ProjectAdmission {
+    /// The admitted live slot.
+    pub fn slot(&self) -> &Arc<LiveProjectSlot> {
+        &self.slot
+    }
+
+    /// Consume the outcome and return the live slot.
+    pub fn into_slot(self) -> Arc<LiveProjectSlot> {
+        self.slot
+    }
+
+    /// True when this admission came from a pending group this bootstrap may
+    /// retire on failure if no other holder won.
+    pub fn cleanup_candidate(&self) -> bool {
+        self.cleanup_candidate
+    }
+}
+
+pub fn admit_project_with_outcome(
+    surface: SurfaceKind,
+    canonical_root: &Path,
+    project_id: &str,
+    access_mode: crate::domain::index::SourceAccessMode,
+    placement: &crate::domain::StatePlacement,
+) -> Result<ProjectAdmission, AdapterRefusal> {
     use crate::domain::index::SourceAccessMode as Mode;
 
     activate_surface(surface);
@@ -1129,13 +1166,23 @@ pub fn admit_project(
         requested,
     )?;
     let binding = project_source_authority(canonical_root).admission_binding();
-    let (_slot, owner) = execute_plan(&registry, &plan, binding)?;
+    let (attempt, owner) = execute_plan_with_outcome(&registry, &plan, binding)?;
+    let cleanup_candidate = attempt.cleanup_candidate();
     match registry.install(&key, Some(owner)) {
-        Ok(live) => Ok(live),
+        Ok(live) => Ok(ProjectAdmission {
+            slot: live,
+            cleanup_candidate,
+        }),
         // Not pending any more: either a concurrent opener installed between
         // our admit and install, or the admit above JOINED an occupancy that
         // is already live. Both resolve to the same live slot.
-        Err(RegistryRefusal::NotAdmitted) => registry.live(&key).map_err(AdapterRefusal::Registry),
+        Err(RegistryRefusal::NotAdmitted) => registry
+            .live(&key)
+            .map(|live| ProjectAdmission {
+                slot: live,
+                cleanup_candidate,
+            })
+            .map_err(AdapterRefusal::Registry),
         Err(refusal) => Err(AdapterRefusal::Registry(refusal)),
     }
 }
