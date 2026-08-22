@@ -69,6 +69,19 @@ const SUITES = [
       "--ignored",
     ],
   },
+  {
+    target: "tests/project_index_lifecycle_slice0.rs::failed_reload_retains_the_recovery_observer",
+    expected: "green",
+    args: [
+      "test",
+      "--test",
+      "project_index_lifecycle_slice0",
+      "failed_reload_retains_the_recovery_observer",
+      "--",
+      "--exact",
+      "--test-threads=1",
+    ],
+  },
 ];
 
 const NEWLINE = String.fromCharCode(10);
@@ -90,7 +103,6 @@ const RED_CASES = [
   "capacity_refused_open_creates_no_slot_and_no_watcher",
   "configured_capacity_bounds_the_process_not_each_load",
   "empty_placeholder_publication_refuses_watcher_mutation",
-  "failed_reload_retains_the_recovery_observer",
   "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
   "observer_replacement_gap_is_latched_as_non_current",
   "old_observer_delivery_after_promotion_is_not_current",
@@ -105,6 +117,19 @@ const RED_CASES = [
 // delete the regression guard and leave this artifact silent about the transition
 // it exists to evidence.
 const RESOLVED_CASES = new Map([
+  [
+    "failed_reload_retains_the_recovery_observer",
+    {
+      // Track A seam 2. No frozen slice task owns this one: every slice that
+      // could have owned it had already shipped by the time the control was
+      // written, which is exactly why it sat RED after the cut. Recorded
+      // against the campaign rather than attributed to an invented task id.
+      slice: null,
+      tasks: [],
+      defect: "2.10 a failed reload loses the recovery observer",
+      fix: "src/daemon.rs::ProjectSlot::reload_with starts a replacement observer before propagating the rebuild error",
+    },
+  ],
   [
     "internals::watcher::tests::generation_before_root_split_cannot_authorize_root_a_reindex_into_root_b",
     {

@@ -260,7 +260,6 @@ fn empty_placeholder_publication_refuses_watcher_mutation() {
 /// bootstrap path; on reload it propagates, which is exactly the `?` that skips
 /// the watcher restart.)
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.10. CODE-WRONG as of the 2026-08-21 Track A read: the path aborts the watcher and then returns via ?, installing no replacement on the Err branch, so the recovery observer is lost. Keep ignored and fail-closed until a seam owner exists"]
 fn failed_reload_retains_the_recovery_observer() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
