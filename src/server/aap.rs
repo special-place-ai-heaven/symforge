@@ -15,7 +15,7 @@
 //!    `symforge` package version (or `None` when the lock is missing /
 //!    unparseable / has no symforge package — never a panic).
 //! 3. [`EmbedPinComparison`] — compare the pinned version against the running
-//!    crate version (`env!("CARGO_PKG_VERSION")`): [`Drift`] / [`Match`] /
+//!    crate version (`env!("CARGO_PKG_VERSION")`): [`EmbedPinComparison::Drift`] / [`EmbedPinComparison::Match`] /
 //!    [`PinUnknown`](EmbedPinComparison::PinUnknown).
 //! 4. [`IntegrationMode`] — classify embed / MCP-URL / both / none from the
 //!    configured state.

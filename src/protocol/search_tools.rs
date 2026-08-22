@@ -471,7 +471,7 @@ pub struct FindReferencesInput {
     /// Maximum number of reference hits per file (default 10, capped at 50). Ignored when mode='implementations'.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_per_file: Option<u32>,
-    /// When true, show compact output: file:line [kind] in symbol — no source text (60-75% smaller). Ignored when mode='implementations'.
+    /// When true, show compact output: file:line \[kind\] in symbol — no source text (60-75% smaller). Ignored when mode='implementations'.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub compact: Option<bool>,
     /// Mode: "references" (default — call sites, imports, type usages) or "implementations" (trait/interface implementors and implemented traits). When mode='implementations', only name, direction, and limit are used.

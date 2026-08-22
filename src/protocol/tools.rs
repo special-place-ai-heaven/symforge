@@ -1471,7 +1471,7 @@ fn cochange_ranking_evidence(
 /// 4. neighbors appear among candidates but were filtered out by a later gate.
 ///
 /// The anchor-confidence reason (1 and 2) is computed once at anchor level via
-/// [`classify_anchor_cochange_rejection`], not per candidate.
+/// [`crate::live_index::rank_signals::classify_anchor_cochange_rejection`], not per candidate.
 fn cochange_fallback_detail(
     query: &str,
     anchor_path: &str,
@@ -6995,7 +6995,7 @@ impl SymForgeServer {
     ///
     /// For a grounded step it resolves the target file — `args["path"]` directly,
     /// or the file a `get_symbol` `args["name"]` is defined in (single unambiguous
-    /// match only) — and records its `content.len()` as an [`IndexRef`].
+    /// match only) — and records its `content.len()` as an [`crate::stel_core::types::IndexRef`].
     /// Resolution is deterministic for a fixed index state (same query + same repo
     /// ⇒ same sizes ⇒ same decision; Constitution IV).
     fn ground_plan_economics(&self, plan: &mut crate::stel::StelPlan) {
@@ -12080,7 +12080,7 @@ impl SymForgeServer {
     /// worker-rendered `status` body misrepresents on the daemon-backed default
     /// (D2-ROOT).
     ///
-    /// Builds the SAME [`StelStatusContext`] that [`Self::render_stel_status_body`]
+    /// Builds the SAME [`crate::stel::StelStatusContext`] that [`Self::render_stel_status_body`]
     /// builds (the proxy's `stel_ledger` session events, `durable_ledger_summary`,
     /// and durable `calibration` verdict) — only WITHOUT the index/project lines,
     /// which stay the worker's (TR-01). Used by `status_stel_tool` to overlay the

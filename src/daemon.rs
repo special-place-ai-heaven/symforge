@@ -2933,7 +2933,7 @@ pub(crate) enum DaemonStopOutcome {
 /// Stop the currently-recorded global daemon regardless of its version, for the
 /// update flow: the binary is about to be replaced, so even a same-version
 /// daemon must exit and let the next launch respawn the new one. Unlike
-/// [`stop_incompatible_recorded_daemon`], this does not skip a same-identity
+/// [`stop_incompatible_recorded_daemon_at`], this does not skip a same-identity
 /// daemon — but it preserves the exact ownership/executable safety gate
 /// (`should_terminate_recorded_daemon`) so an unrelated or pid-recycled process
 /// is never terminated.
@@ -5305,7 +5305,7 @@ fn reject_unsupported_cross_project_scoping(
 }
 
 /// Feature 012 (Phase 3): execute one of the three cross-project READ verbs
-/// against the session's working set and format the attributed [`ProjectHit`]
+/// against the session's working set and format the attributed [`crate::live_index::view::ProjectHit`]
 /// results with `── project: <id> ──` section headers (flat, no header, when a
 /// single project is targeted). This is reached ONLY when `targets` is not the
 /// single active project; the active-project path never enters here.

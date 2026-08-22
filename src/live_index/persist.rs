@@ -2289,7 +2289,7 @@ fn spot_verify_sample_from_view(
 ///    `Err` here aborts the cycle and preserves the stored HEAD so the next
 ///    session retries; `Ok(None)` signals "unrelated history / branch change"
 ///    which the policy correctly maps to a zero reset.
-/// 5. Apply the graduated policy via [`FrecencyStore::reset_or_halve_on_head_change`],
+/// 5. Apply the graduated policy via [`crate::live_index::frecency::FrecencyStore::reset_or_halve_on_head_change`],
 ///    which also persists `current_head` as the new stored HEAD.
 ///
 /// Any error along the happy path is silently dropped: a bad store, a git read

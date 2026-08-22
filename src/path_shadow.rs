@@ -395,7 +395,7 @@ fn version_label(version: &Option<String>) -> String {
 }
 
 /// The install-prefix `bin` directory derived from a binary path: its parent
-/// directory. Used to phrase "ensure <our prefix>/bin precedes <shadow dir>".
+/// directory. Used to phrase "ensure \<our prefix\>/bin precedes \<shadow dir\>".
 fn prefix_bin_dir(binary: &Path) -> Option<PathBuf> {
     binary.parent().map(Path::to_path_buf)
 }

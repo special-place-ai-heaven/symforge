@@ -303,7 +303,7 @@ impl FrecencyStore {
     /// Apply the graduated HEAD-change reset policy against `repo_root`'s git HEAD.
     ///
     /// Wraps `last_head` lookup + git HEAD resolution + commit-distance computation
-    /// around [`reset_or_halve_on_head_change`]. Used by both the explicit boot-time
+    /// around [`Self::reset_or_halve_on_head_change`]. Used by both the explicit boot-time
     /// `init_frecency_store` path and the lazy first-bump cache-miss path, so the
     /// policy applies wherever the store is first opened for a session.
     ///
@@ -562,7 +562,7 @@ fn cached_session_store_for(repo_root: &Path) -> Option<Arc<FrecencyStore>> {
     guard.get(repo_root).map(Arc::clone)
 }
 
-/// [`EditHook`] implementation that records a frecency bump after every
+/// [`crate::protocol::edit_hooks::EditHook`] implementation that records a frecency bump after every
 /// successful edit commit. Delegates to [`bump`], so the
 /// collection policy check happens there — registering the hook is itself
 /// unconditional.

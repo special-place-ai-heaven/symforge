@@ -17,7 +17,7 @@
 //!
 //! Every handler takes `State<ServerRuntime>` and returns `axum::Json<…>`. The
 //! router built here is mounted behind the shared Bearer-auth + Origin-gate
-//! layers by [`super::router`] / [`crate::server::serve::run`] — there is no
+//! layers by [`super::build_admin_router`] / [`crate::server::serve::run`] — there is no
 //! per-handler auth (one enforcement point, same as `/mcp`).
 
 use axum::Json;
