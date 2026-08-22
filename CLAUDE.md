@@ -58,7 +58,7 @@ missing-crate error as a code defect until the build directory is known clean.
 
 ## CI Gates
 
-- PR and push CI run version sync, `cargo fmt --check`,
+- PR CI runs version sync, `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, the full Rust test suite,
   `cargo build --release`, and npm tests.
 - The `rust` job is compile-dominated (~25 min wall as_of 2026-08-05; the suite
@@ -85,9 +85,29 @@ missing-crate error as a code defect until the build directory is known clean.
   a `cargo check` pass, so running both compiled the graph twice for one answer.
 - `cargo build --release` is NOT droppable from PR CI: the tool-correctness
   harness runs `verify-tools.cjs --bin target/release/symforge`.
-- One CI run per PR (`pull_request`); `push` runs fire only on `main` after a
-  merge. Verified 2026-08-05 against `gh run list` — feature-branch pushes do
-  not double-trigger.
+- One CI run per PR (`pull_request`). **`push` never triggers `ci.yml` at all** —
+  not on branches, not on `main` (as_of 2026-08-22). All-time counts:
+  `gh api "repos/:owner/:repo/actions/workflows/ci.yml/runs?event=push"` returns
+  `total_count` **0**, against **666** for `event=pull_request`. The earlier note
+  here said push runs "fire only on `main` after a merge"; that was wrong. The 37
+  push runs visible in `gh run list` all belong to `release.yml`, which declares
+  `on: push: branches: [main]`.
+
+  **The cause is `ci.yml`'s own trigger.** It declares `push:` with only
+  `tags-ignore: ["v*"]`. When a push trigger carries *only* tag filters, GitHub
+  does not run it for branch pushes at all — so this filter means "non-`v*` tag
+  pushes only", and the only tags this repo pushes are `v*`. The trigger is
+  therefore unreachable in both directions.
+
+  **What that costs:** `ci.yml`'s `Validate pushed commit subjects` step
+  (`conventional_commits.py check-push-range`) has never executed, ever. It is
+  the gate meant to stop a non-conventional subject reaching `main` outside a PR
+  — the exact failure that reddened Release run #938. Adding `branches: ['**']`
+  to the push trigger would arm it, at the cost of a full CI run on every merge
+  to `main`. That is a live cost/benefit call, not a typo fix; do not flip it
+  casually. Note also that arming it is what would make a per-run concurrency
+  group for `main` meaningful — while push CI stays unreachable, any such change
+  guards a queue that has no entrants.
 - Scheduled and manual CI additionally run ignored performance smoke coverage:
   `test_load_perf_1000_files` and `calibrate_current_repo_smoke`.
 - Full real-repo coupling calibration is operator-triggered with
