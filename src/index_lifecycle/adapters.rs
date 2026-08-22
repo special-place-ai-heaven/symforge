@@ -24,7 +24,8 @@ use super::authority::BindingAuthority;
 use super::capacity::OwnerIdentity;
 use super::process_runtime::{ProcessIndexRuntime, SurfaceKind};
 use super::registry::{
-    ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection, SlotIdentity, StatePlacement,
+    AdmissionAttempt, ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection, SlotIdentity,
+    StatePlacement,
 };
 
 /// What an adapter decided for one admission, without performing it.
@@ -170,8 +171,19 @@ pub fn execute_plan(
     plan: &AdmissionPlan,
     binding: BindingAuthority,
 ) -> Result<(SlotIdentity, OwnerIdentity), AdapterRefusal> {
-    let slot = registry
-        .admit(
+    let (attempt, owner) = execute_plan_with_outcome(registry, plan, binding)?;
+    Ok((attempt.slot(), owner))
+}
+
+/// Execute a plan and report whether it created pending, joined pending, or
+/// joined an already-live slot.
+pub fn execute_plan_with_outcome(
+    registry: &Arc<ProjectRegistry>,
+    plan: &AdmissionPlan,
+    binding: BindingAuthority,
+) -> Result<(AdmissionAttempt, OwnerIdentity), AdapterRefusal> {
+    let attempt = registry
+        .admit_with_outcome(
             plan.key().clone(),
             binding,
             plan.protection(),
@@ -179,5 +191,5 @@ pub fn execute_plan(
             plan.placement(),
         )
         .map_err(AdapterRefusal::Registry)?;
-    Ok((slot, plan.owner()))
+    Ok((attempt, plan.owner()))
 }
