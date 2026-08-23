@@ -1167,7 +1167,8 @@ pub fn admit_project_with_outcome(
     // `open_project_session` under contention.
     //
     // A torn-down occupancy is a lost race, not a refusal, so re-admit into a
-    // fresh occupancy instead. Retrying is side-effect free: `plan_admission`
+    // fresh occupancy or join the pending opener that appeared after our failed
+    // install. Retrying is side-effect free: `plan_admission`
     // only resolves an owner and validates placement, and
     // `execute_plan_with_outcome` takes no capacity permit, so a discarded pass
     // leaves nothing behind. Bounded, because an unbounded retry would turn a
@@ -1207,8 +1208,9 @@ pub fn admit_project_with_outcome(
                         cleanup_candidate,
                     });
                 }
-                // Neither pending nor live: stopped mid-flight. Re-admit.
-                Err(RegistryRefusal::NotAdmitted)
+                // Stopped mid-flight. If another opener has already recreated
+                // Pending, re-admit joins that single-flight instead.
+                Err(RegistryRefusal::NotAdmitted | RegistryRefusal::StillPending)
                     if torn_down_retries + 1 < TORN_DOWN_ADMIT_ATTEMPTS =>
                 {
                     torn_down_retries += 1;
