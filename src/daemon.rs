@@ -3573,7 +3573,12 @@ impl ProjectSlot {
                 Arc::clone(&project.stop_token),
             )
         };
-        abort_watcher_task(&mut watcher_task, &old_stop_token);
+        if abort_watcher_task(&mut watcher_task, &old_stop_token) {
+            let expected_generation = index.current_project_generation();
+            if !index.latch_observer_gap_at_generation(expected_generation) {
+                tracing::debug!("watcher: daemon reload cancellation latch refused");
+            }
+        }
 
         // A failed rebuild must not leave the project blind. The abort above
         // stopped the observer and `take()` already cleared its handle, so
@@ -3837,10 +3842,13 @@ fn start_project_watcher(
 fn abort_watcher_task(
     task: &mut Option<tokio::task::JoinHandle<()>>,
     stop_token: &Arc<AtomicBool>,
-) {
+) -> bool {
     stop_token.store(true, Ordering::Release);
     if let Some(task) = task.take() {
         task.abort();
+        true
+    } else {
+        false
     }
 }
 
@@ -10117,6 +10125,59 @@ mod tests {
             .expect("A reload thread")
             .expect("A reload result");
         reader.join().expect("B reader thread");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_reload_latches_gap_when_abort_bypasses_watcher_tail() {
+        let project = project_dir("symforge-daemon-abort-gap");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn daemon_abort_gap() {}\n",
+        )
+        .expect("write source");
+
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "daemon-abort-gap".to_string(),
+                pid: None,
+            })
+            .expect("open project");
+        let slot = state
+            .projects
+            .read()
+            .get(&opened.project_id)
+            .cloned()
+            .expect("project slot");
+        {
+            let mut project = slot.metadata.write();
+            let existing = project
+                .watcher_task
+                .take()
+                .expect("tokio-backed activation must install a watcher task");
+            existing.abort();
+            project.stop_token = Arc::new(AtomicBool::new(false));
+            project.watcher_task = Some(tokio::spawn(std::future::pending::<()>()));
+        }
+
+        let root = canonical_project_root(project.path()).expect("canonical project");
+        slot.reload_with(&root, |index, root| index.reload(root))
+            .expect("reload");
+
+        let freshness = {
+            let project = slot.metadata.read();
+            project.index.shared().freshness_status()
+        };
+        assert!(
+            matches!(
+                freshness.as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            ),
+            "daemon abort skips the watcher's cooperative tail, so reload must latch the gap itself"
+        );
+        slot.stop();
     }
 
     /// Feature 020 Slice 0 causal control for design defect 2.4 — project
