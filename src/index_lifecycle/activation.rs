@@ -1207,9 +1207,15 @@ pub fn admit_project_with_outcome(
                         cleanup_candidate,
                     });
                 }
-                // Neither pending nor live: stopped mid-flight. Re-admit.
-                Err(RegistryRefusal::NotAdmitted)
-                    if torn_down_retries + 1 < TORN_DOWN_ADMIT_ATTEMPTS =>
+                // Either nothing is live any more, or another opener recreated
+                // Pending between our failed install and this live lookup.
+                // Both are lost races, so join the current occupancy again.
+                Err(refusal)
+                    if retry_admission_after_lost_race(
+                        &refusal,
+                        torn_down_retries,
+                        TORN_DOWN_ADMIT_ATTEMPTS,
+                    ) =>
                 {
                     torn_down_retries += 1;
                     continue;
@@ -1221,17 +1227,56 @@ pub fn admit_project_with_outcome(
     }
 }
 
+fn retry_admission_after_lost_race(
+    refusal: &RegistryRefusal,
+    retries: u32,
+    max_attempts: u32,
+) -> bool {
+    matches!(
+        refusal,
+        RegistryRefusal::NotAdmitted | RegistryRefusal::StillPending
+    ) && retries + 1 < max_attempts
+}
+
 /// Feature 020 V11, T066 — activation machine oracles (in-crate per the
 /// discharged fixture-door precondition; see `runtime.rs`).
 #[cfg(all(test, feature = "server"))]
 mod activation_oracles {
-    use super::{ActivationCut, ActivationMode, ActivationRefusal, RegisteredLane};
+    use super::{
+        ActivationCut, ActivationMode, ActivationRefusal, RegisteredLane,
+        retry_admission_after_lost_race,
+    };
+    use crate::live_index::index_lifecycle::registry::RegistryRefusal;
 
     fn register_all(machine: &ActivationCut) -> Vec<super::LaneRegistration> {
         RegisteredLane::ALL
             .iter()
             .map(|lane| machine.register_lane(*lane).expect("fresh lane registers"))
             .collect()
+    }
+
+    #[test]
+    fn admission_retry_treats_reappeared_pending_as_lost_race() {
+        assert!(retry_admission_after_lost_race(
+            &RegistryRefusal::NotAdmitted,
+            0,
+            4
+        ));
+        assert!(retry_admission_after_lost_race(
+            &RegistryRefusal::StillPending,
+            0,
+            4
+        ));
+        assert!(!retry_admission_after_lost_race(
+            &RegistryRefusal::StillPending,
+            3,
+            4
+        ));
+        assert!(!retry_admission_after_lost_race(
+            &RegistryRefusal::ProtectedWithoutAuthorization,
+            0,
+            4
+        ));
     }
 
     #[test]

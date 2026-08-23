@@ -839,3 +839,72 @@ fn a_stopped_occupancy_refuses_install_and_live_until_readmitted() {
         "a re-admission must mint a new slot identity, not resurrect the stopped one"
     );
 }
+
+/// D17 sibling window: after a joined-live admission loses its live occupancy,
+/// another opener can recreate Pending before the loser asks `live`.
+///
+/// The caller must treat `StillPending` as the same lost race as
+/// `NotAdmitted`: re-admit and join the fresh pending group instead of
+/// surfacing a session-open refusal.
+#[test]
+fn a_reappeared_pending_occupancy_is_joined_by_readmission() {
+    let registry = ProjectRegistry::new();
+    let key = ProjectKey::new("d17-reappeared-pending");
+
+    registry
+        .admit(
+            key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::MemoryOnly,
+        )
+        .expect("first admission is pending");
+    let live = registry.install(&key, None).expect("pending installs");
+    drop(live);
+    registry.stop(&key).expect("the live occupancy stops");
+
+    assert_eq!(
+        registry
+            .install(&key, None)
+            .expect_err("the stopped occupancy has nothing pending to install"),
+        RegistryRefusal::NotAdmitted
+    );
+    let reappeared_binding = binding();
+    let pending_slot = registry
+        .admit(
+            key.clone(),
+            reappeared_binding.clone(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::MemoryOnly,
+        )
+        .expect("another opener recreates pending");
+
+    assert_eq!(
+        registry
+            .live(&key)
+            .expect_err("the recreated occupancy is pending, not live"),
+        RegistryRefusal::StillPending
+    );
+
+    let readmitted_slot = registry
+        .admit(
+            key.clone(),
+            reappeared_binding,
+            RootProtection::Normal,
+            false,
+            StatePlacement::MemoryOnly,
+        )
+        .expect("re-admission joins the recreated pending occupancy");
+    assert_eq!(
+        readmitted_slot, pending_slot,
+        "re-admission must join the fresh pending slot rather than minting another one"
+    );
+    assert_eq!(registry.pending_joiners(&key), Some(2));
+
+    let readmitted = registry
+        .install(&key, None)
+        .expect("the reappeared pending occupancy installs");
+    assert_eq!(readmitted.slot(), pending_slot);
+}
