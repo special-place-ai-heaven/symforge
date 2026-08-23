@@ -934,10 +934,15 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
 /// acquisitions progressively narrow — a `data_plane()` call site is a
 /// member of the rerouting set by construction, not by grep luck.
 ///
-/// Mid-cut bridging claim, recorded: the accessors expose the V10 data
-/// plane unchanged (behavior-preserving ownership move); typed acquisition
-/// branches arrive at the dispatch necks with C4's bootstrap and gating
-/// commits, not by rewriting each handler body.
+/// Recorded ownership claim: the accessors expose the V10 data plane
+/// unchanged, so moving a field onto this handle is behavior-preserving.
+///
+/// `acquire` is the typed branch -- it refuses when the carried admission
+/// slot is no longer the live occupancy of its key. It is NOT how the
+/// dispatch necks acquire in general: only a surface that binds WITH a slot
+/// can be gated at all, and the untyped `data_plane` / `shared` doors carry
+/// the rest. That is the state of the call sites, enumerable through the two
+/// accessors above; nothing here promises it changes.
 // No Debug derive: `SharedIndexHandle` itself carries none.
 #[derive(Clone)]
 pub struct ProjectRuntimeHandle {
