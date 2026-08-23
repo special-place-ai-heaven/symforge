@@ -2066,17 +2066,20 @@ impl SharedIndexHandle {
             None => true,
         };
         self.scout_plan.store(Some(Arc::clone(&scout_plan)));
-        // The ONLY place a latched observer gap is retired. Reaching here means
-        // this pass survived every stale-generation rejection above and is
-        // committing its plan, so complete coverage here is observed rather
-        // than intended. The sweep's own `Complete` check authorizes catalog
-        // removals and can still abort before publish, which is why the latch
-        // is not cleared there.
-        let coverage_complete = scout_plan.coverage == crate::domain::CoverageStatus::Complete;
+        // A latched observer gap is deliberately NOT retired here. This lane
+        // runs on every ordinary file event -- `watcher::run_watcher_with_stop`
+        // publishes a reconciled plan per event and its coverage is `Complete`
+        // in the steady state -- so retiring on it clears the latch at the
+        // first event after any handoff, whether or not the missed window was
+        // ever recovered. That is not a latch, and
+        // `observer_replacement_gap_is_latched_as_non_current` fails on it.
+        //
+        // Nor would a full rebuild serve: a file created and deleted inside the
+        // gap leaves no trace in present state, so no amount of re-walking can
+        // prove it was not missed. Retirement belongs to the observer handoff
+        // that can prove a successor's coverage began before the predecessor's
+        // ended; until that exists the honest answer stays Degraded.
         let freshness_changed = self.recompute_freshness_locked(&live, Some(&scout_plan));
-        if coverage_complete {
-            self.retire_observer_gap_locked();
-        }
         if scout_plan_changed || freshness_changed {
             // The scout plan and freshness are part of the published trust
             // bundle. Republish only when that bundle changed; an unchanged
@@ -2150,37 +2153,6 @@ impl SharedIndexHandle {
             }));
         let live = (*self.live.load_full()).clone();
         self.swap_and_publish_retaining_content(live);
-    }
-
-    /// Retire a latched observer gap. Callers MUST hold `write_mutex` and MUST
-    /// have observed a committed reconcile whose coverage is `Complete`;
-    /// anything weaker retires a gap nothing proved was recovered.
-    fn retire_observer_gap_locked(&self) {
-        let current = self.freshness_status.load_full();
-        let FreshnessStatus::Degraded {
-            last_valid_content_generation,
-            reason_codes,
-        } = current.as_ref()
-        else {
-            return;
-        };
-        if !reason_codes.contains(&FreshnessReason::WatcherUnavailable) {
-            return;
-        }
-        let remaining: Vec<FreshnessReason> = reason_codes
-            .iter()
-            .copied()
-            .filter(|reason| *reason != FreshnessReason::WatcherUnavailable)
-            .collect();
-        self.freshness_status
-            .store(Arc::new(if remaining.is_empty() {
-                FreshnessStatus::Current
-            } else {
-                FreshnessStatus::Degraded {
-                    last_valid_content_generation: *last_valid_content_generation,
-                    reason_codes: remaining,
-                }
-            }));
     }
 
     pub(crate) fn set_freshness_status(&self, status: FreshnessStatus) {
@@ -7417,6 +7389,52 @@ mod tests {
             "an unchanged Complete reconciliation must not mint a publication"
         );
         assert_eq!(unchanged.content_generation, healed.content_generation);
+    }
+
+    #[test]
+    fn a_latched_gap_survives_an_ordinary_complete_reconcile() {
+        let project = TempDir::new().unwrap();
+        write_file(
+            project.path(),
+            "main.rs",
+            "fn main() {}
+",
+        );
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let complete_plan = (*shared.scout_plan().expect("cold scout plan")).clone();
+        let project_generation = shared.current_project_generation();
+
+        shared.latch_observer_gap();
+        // Positive control: the latch engaged and reached the published
+        // bundle, so the survival asserted below is a real retention and not
+        // a reason that was never there.
+        assert!(
+            matches!(
+                shared.published_generation().freshness.as_ref(),
+                FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&FreshnessReason::WatcherUnavailable)
+            ),
+            "the latch must reach the published bundle"
+        );
+
+        // The reconciled-publication lane runs on EVERY ordinary file event and
+        // its coverage is Complete in the steady state. If that retired the
+        // gap, the first event after any handoff would clear it while proving
+        // nothing about the missed window.
+        assert!(shared.publish_reconciled_scout_plan_at_generation(
+            Some(&complete_plan),
+            complete_plan.clone(),
+            project_generation,
+        ));
+        assert!(
+            matches!(
+                shared.published_generation().freshness.as_ref(),
+                FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&FreshnessReason::WatcherUnavailable)
+            ),
+            "an ordinary Complete reconcile must not retire an observer gap: it \
+             rebuilds present state and proves nothing about the missed window"
+        );
     }
 
     #[test]

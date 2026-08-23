@@ -374,7 +374,6 @@ fn failed_reload_retains_the_recovery_observer() {
 /// about the window rather than a race: the predecessor is stopped and awaited
 /// before the write, and the successor starts after it.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for observer replacement gaps. CODE-WRONG as of the 2026-08-21 Track A read: recompute_freshness_locked drops the historical gap and rederives Current, so nothing latches. Keep ignored and fail-closed until a seam owner exists"]
 fn observer_replacement_gap_is_latched_as_non_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
@@ -482,7 +481,6 @@ fn observer_replacement_gap_is_latched_as_non_current() {
 /// present state, so the next clean publication erases it. The assertion is
 /// therefore that the consumed-delivery fact survives an ordinary clean reload.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for old-observer delivery after promotion. CODE-WRONG as of the 2026-08-21 Track A read: the same rederive path runs with no stable observer token fencing delivery. Keep ignored and fail-closed until a seam owner exists"]
 fn old_observer_delivery_after_promotion_is_not_current() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
