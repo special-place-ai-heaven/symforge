@@ -1207,8 +1207,11 @@ pub fn admit_project_with_outcome(
                         cleanup_candidate,
                     });
                 }
-                // Neither pending nor live: stopped mid-flight. Re-admit.
-                Err(RegistryRefusal::NotAdmitted)
+                // Neither live nor installable by this opener. `NotAdmitted`
+                // means nobody has recreated the occupancy yet; `StillPending`
+                // means another opener recreated it in this tiny window. In
+                // both cases a fresh admit either creates or joins the survivor.
+                Err(RegistryRefusal::NotAdmitted | RegistryRefusal::StillPending)
                     if torn_down_retries + 1 < TORN_DOWN_ADMIT_ATTEMPTS =>
                 {
                     torn_down_retries += 1;
