@@ -1002,15 +1002,15 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "db6bad87336a07b83ac417b7d2efda450b644408f081da2680530a843c886f08",
+    "707dd7a7dcbf1d5c70a21983ede40b4b0c56c3c43e70ea398a1690da5f08faad",
     20,
-    403_688,
+    403_999,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "2b3f42b0606e898e5bc3951f702c718f052796df85c7de0f05482c74e0bdcca0",
+    "eb10e17a11560049a7886da3f446f38b2e0a1565a4d30807138de3d3db3599bf",
     196,
-    9_325_959,
+    9_326_270,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
