@@ -2128,10 +2128,27 @@ impl SharedIndexHandle {
     /// `WatcherUnavailable` is the carrier because
     /// [`Self::recompute_freshness_locked`] already retains it verbatim rather
     /// than rederiving it, so the latch survives every ordinary republication.
-    /// Only a committed reconcile that proves complete coverage retires it —
-    /// see `publish_reconciled_scout_plan_at_generation`.
+    /// The latch is one-way for this handle; no current lane can prove the
+    /// missed window was recovered.
+    #[cfg(test)]
     pub(crate) fn latch_observer_gap(&self) {
         let _wg = self.write_mutex.lock();
+        self.latch_observer_gap_locked();
+    }
+
+    pub(crate) fn latch_observer_gap_at_generation(
+        &self,
+        expected_project_generation: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        if self.published_generation().project_generation != expected_project_generation {
+            return false;
+        }
+        self.latch_observer_gap_locked();
+        true
+    }
+
+    fn latch_observer_gap_locked(&self) {
         let current = self.freshness_status.load_full();
         let (last_valid, mut reasons) = match current.as_ref() {
             FreshnessStatus::Degraded {
