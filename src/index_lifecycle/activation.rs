@@ -1191,6 +1191,9 @@ pub fn admit_project_with_outcome(
         let binding = project_source_authority(canonical_root).admission_binding();
         let (attempt, owner) = execute_plan_with_outcome(&registry, &plan, binding)?;
         let cleanup_candidate = attempt.cleanup_candidate();
+        // The window a concurrent `stop` uses to strand this joiner.
+        #[cfg(all(test, feature = "server"))]
+        admit_before_install::fire();
         match registry.install(&key, Some(owner)) {
             Ok(live) => {
                 return Ok(ProjectAdmission {
@@ -1225,6 +1228,178 @@ pub fn admit_project_with_outcome(
 
 /// Feature 020 V11, T066 — activation machine oracles (in-crate per the
 /// discharged fixture-door precondition; see `runtime.rs`).
+/// Deterministic observation point inside [`admit_project_with_outcome`],
+/// fired after a successful admit and BEFORE its `install`. That is exactly
+/// the window a concurrent `stop` uses to strand a joiner, so a test can
+/// occupy it on purpose instead of hoping a stress run trips the race.
+///
+/// Unlike `store.rs`'s mid-commit hook this is deliberately NOT consumed on
+/// fire. The property under test is how many times the bounded retry re-enters
+/// the window, so the observation must land on EVERY pass; a consume-once hook
+/// would silently measure one.
+///
+/// Gated on `server` as well as `test` for the reason recorded in `store.rs`:
+/// under `--no-default-features --features embed` the lib tests still compile,
+/// and a bare `#[cfg(test)]` module whose only consumer is server-only is an
+/// unused item there, which `-D warnings` rejects.
+#[cfg(all(test, feature = "server"))]
+pub(crate) mod admit_before_install {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// RAII guard so a hook cannot leak across the thread-local into a sibling
+    /// test sharing this thread.
+    pub(crate) struct BeforeInstallGuard;
+
+    impl Drop for BeforeInstallGuard {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn() + 'static) -> BeforeInstallGuard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        BeforeInstallGuard
+    }
+
+    /// Take the hook out for the duration of the call, then re-arm it. Taking
+    /// it first means a hook that re-enters this window cannot double-borrow
+    /// the `RefCell`; re-arming only when the slot is still empty means a hook
+    /// that deliberately uninstalls itself stays uninstalled.
+    pub(crate) fn fire() {
+        let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        hook();
+        HOOK.with(|h| {
+            let mut slot = h.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+/// Coverage for the bounded re-admit loop itself.
+///
+/// The window control in `tests/project_registry_lifecycle_v11.rs` pins that
+/// the empty occupancy is reachable and that a fresh admit clears it. It never
+/// enters the loop, so neither the retry nor its bound was exercised. These do
+/// both, deterministically, by occupying the admit/install window on purpose.
+#[cfg(all(test, feature = "server"))]
+mod admit_retry_loop {
+    use super::{
+        SurfaceKind, admit_before_install, admit_project_with_outcome, process_project_registry,
+    };
+    use crate::domain::index::SourceAccessMode;
+    use crate::domain::{ProjectStateDir, StatePlacement};
+    use crate::live_index::index_lifecycle::registry::ProjectKey;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn placement(root: &std::path::Path) -> StatePlacement {
+        StatePlacement::ProjectLocal {
+            directory: ProjectStateDir::new(root.join(".symforge")),
+        }
+    }
+
+    /// The retry fires: a joiner stranded ONCE re-admits and still returns a
+    /// live slot, instead of surfacing the D17 refusal.
+    ///
+    /// The first admission must install, because the race needs an admit that
+    /// JOINS a live occupancy and therefore holds no pending claim of its own.
+    /// A pending occupancy cannot be stranded this way at all: `stop`
+    /// re-inserts what it refused to remove.
+    #[test]
+    fn a_joiner_stranded_once_is_re_admitted() {
+        let root = tempfile::tempdir().expect("root");
+        let id = "d17-loop-retry-once";
+        let key = ProjectKey::new(id);
+        let registry = process_project_registry();
+
+        admit_project_with_outcome(
+            SurfaceKind::Stdio,
+            root.path(),
+            id,
+            SourceAccessMode::NormalProject,
+            &placement(root.path()),
+        )
+        .expect("the first admission installs and goes live");
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        let strand = Arc::clone(&registry);
+        let stranded_key = key.clone();
+        let _hook = admit_before_install::install(move || {
+            // Strand the FIRST pass only, so the retry has something to prove.
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = strand.stop(&stranded_key);
+            }
+        });
+
+        admit_project_with_outcome(
+            SurfaceKind::Stdio,
+            root.path(),
+            id,
+            SourceAccessMode::NormalProject,
+            &placement(root.path()),
+        )
+        .expect("a joiner stranded mid-flight must re-admit, not refuse");
+
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            2,
+            "the window must be entered twice: the stranded pass and its retry"
+        );
+    }
+
+    /// The bound terminates: a key held torn-down on every pass propagates
+    /// after exactly `TORN_DOWN_ADMIT_ATTEMPTS` entries rather than spinning.
+    ///
+    /// `stop` clears a live occupancy and `cancel` clears a pending one, so
+    /// firing both keeps the key empty whichever shape each pass produced.
+    #[test]
+    fn a_permanently_torn_down_key_propagates_after_the_bound() {
+        let root = tempfile::tempdir().expect("root");
+        let id = "d17-loop-bound-exhausts";
+        let key = ProjectKey::new(id);
+        let registry = process_project_registry();
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        let strand = Arc::clone(&registry);
+        let stranded_key = key.clone();
+        let _hook = admit_before_install::install(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = strand.stop(&stranded_key);
+            let _ = strand.cancel(&stranded_key);
+        });
+
+        let refused = admit_project_with_outcome(
+            SurfaceKind::Stdio,
+            root.path(),
+            id,
+            SourceAccessMode::NormalProject,
+            &placement(root.path()),
+        );
+
+        assert!(
+            refused.is_err(),
+            "a key that is torn down on every pass must eventually refuse, not spin"
+        );
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            4,
+            "the bound is four attempts; a change here is a deliberate change to              TORN_DOWN_ADMIT_ATTEMPTS, not an incidental one"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "server"))]
 mod activation_oracles {
     use super::{ActivationCut, ActivationMode, ActivationRefusal, RegisteredLane};
