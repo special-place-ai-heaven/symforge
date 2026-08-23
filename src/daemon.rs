@@ -12581,9 +12581,21 @@ mod tests {
             .send()
             .await
             .expect("matched request");
+        // The status and body are read BEFORE asserting. A bare `assert!` on
+        // `is_success()` reports only its own message, so a failure here could
+        // not be told apart from a 409 the guard raised, a 5xx the sidecar
+        // returned, or anything else non-2xx -- which is exactly what left
+        // Release 32660381244 undiagnosable. Reading the body consumes the
+        // response, which is safe: nothing uses `matched` after this.
+        let matched_status = matched.status();
+        let matched_body = matched
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<body unreadable: {error}>"));
         assert!(
-            matched.status().is_success(),
-            "caller_root=B (the active project) must be served"
+            matched_status.is_success(),
+            "caller_root=B (the active project) must be served, got {matched_status}: \
+             {matched_body}"
         );
 
         let unpinned = client.get(url("")).send().await.expect("unpinned request");
