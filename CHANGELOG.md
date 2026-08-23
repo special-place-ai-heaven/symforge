@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.5...v11.0.6) (2026-08-23)
+
+
+### Bug Fixes
+
+* **harness:** name which field is stale instead of only that it is ([#636](https://github.com/special-place-ai-heaven/symforge/issues/636)) ([d403feb](https://github.com/special-place-ai-heaven/symforge/commit/d403febe9f47496b67346ed68f7eae6155c30beb))
+
 ## [11.0.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.4...v11.0.5) (2026-08-23)
 
 
