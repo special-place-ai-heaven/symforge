@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.4](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.3...v11.0.4) (2026-08-23)
+
+
+### Bug Fixes
+
+* **activation:** retry reappeared pending admission ([2e7f2ed](https://github.com/special-place-ai-heaven/symforge/commit/2e7f2ed6bcb9d9dc2bcf7b82c920c7d94260dc61))
+
 ## [11.0.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.2...v11.0.3) (2026-08-23)
 
 
