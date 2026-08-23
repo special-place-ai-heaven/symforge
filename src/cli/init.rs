@@ -208,8 +208,8 @@ pub fn run_scan(
                 HarnessState::NotInstalled => "not installed".to_string(),
                 HarnessState::Absent => "no SymForge entry".to_string(),
                 HarnessState::PresentCurrent => "SymForge entry present".to_string(),
-                HarnessState::PresentStale => {
-                    "SymForge entry present (different URL/key)".to_string()
+                HarnessState::PresentStale(fields) => {
+                    format!("SymForge entry present ({})", fields.description())
                 }
                 HarnessState::Malformed(why) => format!("config does not parse: {why}"),
             };

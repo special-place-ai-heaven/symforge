@@ -600,7 +600,7 @@ fn format_harness_state(state: &HarnessState) -> &'static str {
         HarnessState::NotInstalled => "not installed",
         HarnessState::Absent => "not configured",
         HarnessState::PresentCurrent => "configured (current)",
-        HarnessState::PresentStale => "configured (stale)",
+        HarnessState::PresentStale(_) => "configured (stale)",
         HarnessState::Malformed(_) => "unreadable",
     }
 }

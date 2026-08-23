@@ -150,7 +150,14 @@ pub struct HarnessEntryView {
     /// One of: `not_installed`, `absent`, `present_current`, `present_stale`,
     /// `malformed`.
     pub state: String,
-    /// Detail for the `malformed` state (parse error), else `null`.
+    /// Detail for the states that carry one: the parse error for
+    /// `malformed`, and which field is stale for `present_stale`. `null`
+    /// otherwise.
+    ///
+    /// Never the value of a stale field: `AttachEntry::bearer_key` is a
+    /// Bearer token and this payload is public, so `present_stale` details
+    /// come from `StaleFields::description`, whose `&'static str` return
+    /// type cannot carry one.
     pub detail: Option<String>,
 }
 
@@ -201,7 +208,10 @@ fn entry_view(status: HarnessStatus) -> HarnessEntryView {
         HarnessState::NotInstalled => ("not_installed".to_string(), None),
         HarnessState::Absent => ("absent".to_string(), None),
         HarnessState::PresentCurrent => ("present_current".to_string(), None),
-        HarnessState::PresentStale => ("present_stale".to_string(), None),
+        HarnessState::PresentStale(fields) => (
+            "present_stale".to_string(),
+            Some(fields.description().to_string()),
+        ),
         HarnessState::Malformed(msg) => ("malformed".to_string(), Some(msg.clone())),
     };
     HarnessEntryView {

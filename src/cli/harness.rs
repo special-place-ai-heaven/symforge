@@ -103,9 +103,57 @@ pub enum HarnessState {
     /// A `symforge` entry exists and matches the target URL + key.
     PresentCurrent,
     /// A `symforge` entry exists but its URL or key differs from the target.
-    PresentStale,
+    /// Carries WHICH field differs, never the value -- see [`StaleFields`].
+    PresentStale(StaleFields),
     /// Config exists but does not parse; never overwritten.
     Malformed(String),
+}
+
+/// Which part of an existing entry differs from the target.
+///
+/// The comparison that detects staleness holds both entries, so throwing the
+/// difference away leaves the caller told THAT something differs and never
+/// WHAT -- six harnesses reporting `present stale` with no way to tell why.
+///
+/// It carries the fields, NOT their values. `AttachEntry::bearer_key` is a
+/// Bearer token and this state is rendered into the admin API's public
+/// `detail`, so a value-carrying payload here would publish a credential.
+/// `None` from [`Self::between`] is the only spelling of "identical", so a
+/// `PresentStale` that names no difference cannot be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleFields {
+    Url,
+    BearerKey,
+    Both,
+}
+
+impl StaleFields {
+    /// The difference between an existing entry and the target, or `None`
+    /// when they match.
+    fn between(found: &AttachEntry, desired: &AttachEntry) -> Option<Self> {
+        match (
+            found.url != desired.url,
+            found.bearer_key != desired.bearer_key,
+        ) {
+            (false, false) => None,
+            (true, false) => Some(Self::Url),
+            (false, true) => Some(Self::BearerKey),
+            (true, true) => Some(Self::Both),
+        }
+    }
+
+    /// A fixed phrase naming which field differs.
+    ///
+    /// `&'static str` on purpose: the return type cannot carry runtime data,
+    /// so this description is incapable of leaking the bearer key no matter
+    /// how a caller renders it.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Url => "url differs from the target",
+            Self::BearerKey => "bearer key differs from the target",
+            Self::Both => "url and bearer key differ from the target",
+        }
+    }
 }
 
 /// A `HarnessTarget` paired with its current scan state.
@@ -224,13 +272,10 @@ fn scan_target(target: &HarnessTarget, desired: &AttachEntry) -> HarnessState {
     match existing {
         Err(e) => HarnessState::Malformed(e),
         Ok(None) => HarnessState::Absent,
-        Ok(Some(found)) => {
-            if found == *desired {
-                HarnessState::PresentCurrent
-            } else {
-                HarnessState::PresentStale
-            }
-        }
+        Ok(Some(found)) => match StaleFields::between(&found, desired) {
+            None => HarnessState::PresentCurrent,
+            Some(fields) => HarnessState::PresentStale(fields),
+        },
     }
 }
 
@@ -515,6 +560,82 @@ mod tests {
 
     fn entry() -> AttachEntry {
         AttachEntry::new("http://127.0.0.1:8787/mcp", Some("sf_key_123".to_string()))
+    }
+
+    /// A bearer key used ONLY as a leak sentinel: no assertion depends on its
+    /// value, only on its absence from anything a caller can render.
+    const LEAK_SENTINEL: &str = "sentinel-must-never-be-rendered";
+
+    fn json_config(dir: &std::path::Path, name: &str, url: &str, key: &str) -> HarnessTarget {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "mcpServers": {
+                    SYMFORGE_SERVER_NAME: {
+                        "type": "http",
+                        "url": url,
+                        "headers": { "Authorization": format!("Bearer {key}") },
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        HarnessTarget {
+            id: HarnessId::ClaudeCode,
+            config_path: path,
+            format: HarnessFormat::Json,
+        }
+    }
+
+    #[test]
+    fn a_stale_entry_reports_which_field_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let desired = entry();
+        let key_only = json_config(dir.path(), "key.json", &desired.url, "a-different-key");
+        let url_only = json_config(
+            dir.path(),
+            "url.json",
+            "http://127.0.0.1:9999/mcp",
+            desired.bearer_key.as_deref().unwrap(),
+        );
+
+        let key_state = scan_target(&key_only, &desired);
+        let url_state = scan_target(&url_only, &desired);
+
+        // Positive controls: both really are stale, so the inequality below is
+        // a distinction between two stale states and not an accident of one
+        // of them being Current or Malformed.
+        assert_ne!(key_state, HarnessState::PresentCurrent);
+        assert_ne!(url_state, HarnessState::PresentCurrent);
+
+        assert_ne!(
+            key_state, url_state,
+            "a key-only difference and a url-only difference must not report \
+             identically: the comparison holds both entries and must keep what \
+             it learned"
+        );
+    }
+
+    #[test]
+    fn a_stale_state_never_renders_the_bearer_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let desired = entry();
+        let stale = json_config(dir.path(), "leak.json", &desired.url, LEAK_SENTINEL);
+
+        let state = scan_target(&stale, &desired);
+        // Positive control: this really is the stale path, so absence below is
+        // not the absence of a state.
+        assert_ne!(state, HarnessState::PresentCurrent);
+
+        let rendered = format!("{state:?}");
+        assert!(
+            !rendered.contains(LEAK_SENTINEL),
+            "a stale state must name WHICH field differs, never the value: \
+             bearer_key is a Bearer token and this state is rendered into the \
+             admin API's public `detail` field. Got: {rendered}"
+        );
     }
 
     #[test]
