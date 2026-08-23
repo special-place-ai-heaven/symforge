@@ -2468,8 +2468,12 @@ impl SharedIndexHandle {
         // A latched observer gap outlives a reload. This rebuild proves present
         // state; it does not prove the missed window was recovered, and the two
         // are not the same claim. Carrying it forward is the whole difference
-        // between "the tree looks clean now" and "nothing was lost". Only a
-        // committed reconcile with complete coverage retires it.
+        // between "the tree looks clean now" and "nothing was lost".
+        //
+        // Nothing retires the latch. No lane reachable from here can prove a
+        // change that landed unseen was recovered -- a file created and
+        // deleted inside the gap leaves no trace to rebuild from -- so the
+        // latch is one-way for the life of this handle.
         let latched_gap = matches!(
             self.freshness_status.load_full().as_ref(),
             FreshnessStatus::Degraded { reason_codes, .. }
