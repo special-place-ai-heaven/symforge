@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.2...v11.0.3) (2026-08-23)
+
+
+### Bug Fixes
+
+* **activation:** re-admit when a joined occupancy is stopped mid-flight ([d1a6923](https://github.com/special-place-ai-heaven/symforge/commit/d1a69233102387f4da9c5c5772c86de2025f6aa2))
+
 ## [11.0.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.1...v11.0.2) (2026-08-22)
 
 
