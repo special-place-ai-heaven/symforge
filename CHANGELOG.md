@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.4...v11.0.5) (2026-08-23)
+
+
+### Bug Fixes
+
+* **freshness:** latch the observer gap and do not retire it on an ordinary reconcile ([9b3ebb3](https://github.com/special-place-ai-heaven/symforge/commit/9b3ebb3e952d8e5adab9375221b711816f0b2a1f))
+
 ## [11.0.4](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.3...v11.0.4) (2026-08-23)
 
 
