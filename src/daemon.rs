@@ -12576,11 +12576,29 @@ mod tests {
             "caller_root=A must 409 once B is active"
         );
 
-        let matched = client
-            .get(url(&format!("?caller_root={}", project_b.path().display())))
-            .send()
-            .await
-            .expect("matched request");
+        // B was made ACTIVE moments ago. `require_queryable_sidecar_index`
+        // answers 503 until B's publication catches up with its project
+        // generation, and on a loaded runner the assertion below can land
+        // inside that window -- which is what reddened Release 32660381244 and
+        // 32665940448 with no regression behind it.
+        //
+        // Retry ONLY the readiness condition. Any other status is decided
+        // immediately, so a real 409 still fails fast with its evidence rather
+        // than being polled into a timeout.
+        let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let matched = loop {
+            let response = client
+                .get(url(&format!("?caller_root={}", project_b.path().display())))
+                .send()
+                .await
+                .expect("matched request");
+            if response.status() != StatusCode::SERVICE_UNAVAILABLE
+                || std::time::Instant::now() >= readiness_deadline
+            {
+                break response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         // The status and body are read BEFORE asserting. A bare `assert!` on
         // `is_success()` reports only its own message, so a failure here could
         // not be told apart from a 409 the guard raised, a 5xx the sidecar
