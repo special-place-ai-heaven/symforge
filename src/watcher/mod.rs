@@ -720,6 +720,9 @@ pub struct WatcherTaskHandle {
     pub stop_token: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
+static FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Create a new debouncer watching `repo_root` recursively.
 ///
 /// `debounce_ms` controls the debounce window (base 200ms, extended to 500ms during bursts).
@@ -1030,12 +1033,15 @@ pub async fn run_watcher_with_stop(
                     consecutive_failures, e
                 );
                 if consecutive_failures >= MAX_FAILURES {
-                    let mut info = watcher_info.lock();
-                    info.state = WatcherState::Degraded;
+                    {
+                        let mut info = watcher_info.lock();
+                        info.state = WatcherState::Degraded;
+                    }
                     error!(
                         "watcher: entering degraded mode after {} consecutive failures",
                         MAX_FAILURES
                     );
+                    shared.latch_observer_gap();
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1112,6 +1118,10 @@ pub async fn run_watcher_with_stop(
                     if stop_token.load(Ordering::Acquire) {
                         cancelled = true;
                         break 'watcher;
+                    }
+                    #[cfg(test)]
+                    if FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.swap(false, Ordering::AcqRel) {
+                        break;
                     }
 
                     // Periodic reconciliation sweep (belt-and-suspenders against missed events).
@@ -1258,10 +1268,18 @@ pub async fn run_watcher_with_stop(
                 }
 
                 // Inner loop exited — count as a failure and try to restart
+                {
+                    let mut info = watcher_info.lock();
+                    info.state = WatcherState::Starting;
+                }
+                drop(handle);
+                shared.latch_observer_gap();
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_FAILURES {
-                    let mut info = watcher_info.lock();
-                    info.state = WatcherState::Degraded;
+                    {
+                        let mut info = watcher_info.lock();
+                        info.state = WatcherState::Degraded;
+                    }
                     error!(
                         "watcher: entering degraded mode after {} consecutive failures",
                         MAX_FAILURES
@@ -1488,6 +1506,78 @@ mod tests {
         // runtime to completion.
         handle.stop_token.store(true, Ordering::Release);
         handle.task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_watcher_start_latches_unavailable_freshness() {
+        let project = TempDir::new().unwrap();
+        create_test_source(project.path(), "src/main.rs", b"fn main() {}\n");
+        let shared = crate::live_index::store::LiveIndex::load(project.path()).unwrap();
+        assert!(matches!(
+            shared.freshness_status().as_ref(),
+            crate::domain::FreshnessStatus::Current
+        ));
+
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        run_watcher_with_stop(
+            project.path().join("missing-root"),
+            shared.clone(),
+            Arc::clone(&watcher_info),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert_eq!(watcher_info.lock().state, WatcherState::Degraded);
+        assert!(
+            matches!(
+                shared.freshness_status().as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            ),
+            "an unavailable watcher must not leave the index reporting Current"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_watcher_restart_latches_unavailable_freshness() {
+        let project = TempDir::new().unwrap();
+        create_test_source(project.path(), "src/main.rs", b"fn main() {}\n");
+        let shared = crate::live_index::store::LiveIndex::load(project.path()).unwrap();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let stop_token = Arc::new(AtomicBool::new(false));
+        FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.store(true, Ordering::Release);
+
+        let watcher = tokio::spawn(run_watcher_with_stop(
+            project.path().to_path_buf(),
+            shared.clone(),
+            Arc::clone(&watcher_info),
+            Arc::clone(&stop_token),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut latched = false;
+        while Instant::now() < deadline {
+            latched = matches!(
+                shared.freshness_status().as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            );
+            if latched {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        stop_token.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(3), watcher)
+            .await
+            .expect("watcher must stop after the forced restart")
+            .expect("watcher task must not panic");
+
+        assert!(
+            latched,
+            "an active watcher restart must latch the uncovered restart window"
+        );
     }
 
     #[test]
