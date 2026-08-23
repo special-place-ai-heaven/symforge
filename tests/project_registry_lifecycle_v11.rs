@@ -767,3 +767,75 @@ fn overlapping_admits_of_one_key_mint_one_identity() {
     let live = registry.install(&key, None).expect("install");
     assert_eq!(live.slot(), slots[0]);
 }
+
+/// D17 regression window: a stopped occupancy refuses BOTH `install` and
+/// `live`, and re-admitting is what resolves it.
+///
+/// `admit_project_with_outcome` recovers from `install` refusing `NotAdmitted`
+/// by asking `live`, on the reading that a concurrent opener must have
+/// installed the slot. That reading has a third case. An admit that JOINS an
+/// already-live occupancy holds no pending claim, so when the last session
+/// closes and `stop` removes the live occupancy in that window, `install`
+/// refuses because nothing is pending and `live` refuses because nothing is
+/// live. Under contention that propagated out of `open_project_session`, which
+/// D17 forbids.
+///
+/// This pins the shape rather than the race: the double refusal is reachable
+/// deterministically, and a fresh admit clears it. The accepting control is in
+/// the same test because a registry that refuses everything would satisfy the
+/// negative half perfectly.
+#[test]
+fn a_stopped_occupancy_refuses_install_and_live_until_readmitted() {
+    let registry = ProjectRegistry::new();
+    let key = ProjectKey::new("d17-torn-down-occupancy");
+
+    registry
+        .admit(
+            key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::MemoryOnly,
+        )
+        .expect("first admission is pending");
+    let live = registry.install(&key, None).expect("pending installs");
+    let first_slot = live.slot();
+    drop(live);
+
+    registry.stop(&key).expect("the live occupancy stops");
+
+    // The window itself: neither pending nor live, so BOTH doors refuse.
+    assert_eq!(
+        registry
+            .install(&key, None)
+            .expect_err("a stopped occupancy has nothing pending to install"),
+        RegistryRefusal::NotAdmitted
+    );
+    assert_eq!(
+        registry
+            .live(&key)
+            .expect_err("a stopped occupancy has nothing live to hand back"),
+        RegistryRefusal::NotAdmitted
+    );
+
+    // The accepting control, and the strategy the caller relies on: a torn-down
+    // occupancy is a lost race, not a refusal, so re-admitting succeeds and
+    // yields a DIFFERENT slot identity than the one that was stopped.
+    registry
+        .admit(
+            key.clone(),
+            binding(),
+            RootProtection::Normal,
+            false,
+            StatePlacement::MemoryOnly,
+        )
+        .expect("re-admission after a stop is accepted");
+    let readmitted = registry
+        .install(&key, None)
+        .expect("the re-admitted occupancy installs");
+    assert_ne!(
+        readmitted.slot(),
+        first_slot,
+        "a re-admission must mint a new slot identity, not resurrect the stopped one"
+    );
+}

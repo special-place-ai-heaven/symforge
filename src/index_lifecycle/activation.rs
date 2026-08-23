@@ -1157,33 +1157,67 @@ pub fn admit_project_with_outcome(
         crate::domain::StatePlacement::UserLocal { .. } => AdmissionStatePlacement::UserLocal,
         crate::domain::StatePlacement::MemoryOnly { .. } => AdmissionStatePlacement::MemoryOnly,
     };
-    let plan = plan_admission(
-        &runtime,
-        surface,
-        key.clone(),
-        protection,
-        authorized,
-        requested,
-    )?;
-    let binding = project_source_authority(canonical_root).admission_binding();
-    let (attempt, owner) = execute_plan_with_outcome(&registry, &plan, binding)?;
-    let cleanup_candidate = attempt.cleanup_candidate();
-    match registry.install(&key, Some(owner)) {
-        Ok(live) => Ok(ProjectAdmission {
-            slot: live,
-            cleanup_candidate,
-        }),
-        // Not pending any more: either a concurrent opener installed between
-        // our admit and install, or the admit above JOINED an occupancy that
-        // is already live. Both resolve to the same live slot.
-        Err(RegistryRefusal::NotAdmitted) => registry
-            .live(&key)
-            .map(|live| ProjectAdmission {
-                slot: live,
-                cleanup_candidate,
-            })
-            .map_err(AdapterRefusal::Registry),
-        Err(refusal) => Err(AdapterRefusal::Registry(refusal)),
+    // D17 is fail-never under contention, and the install/live pair below has
+    // THREE outcomes rather than the two its original comment named. An admit
+    // that JOINS an already-live occupancy holds no pending claim of its own.
+    // So when the last session closes and `ProjectRegistry::stop` removes that
+    // live occupancy in the window between our admit and our install, `install`
+    // refuses `NotAdmitted` because nothing is pending AND `live` refuses
+    // `NotAdmitted` because nothing is live. Propagating that is what broke
+    // `open_project_session` under contention.
+    //
+    // A torn-down occupancy is a lost race, not a refusal, so re-admit into a
+    // fresh occupancy instead. Retrying is side-effect free: `plan_admission`
+    // only resolves an owner and validates placement, and
+    // `execute_plan_with_outcome` takes no capacity permit, so a discarded pass
+    // leaves nothing behind. Bounded, because an unbounded retry would turn a
+    // genuinely persistent refusal into a spin.
+    //
+    // Note `stop` cannot produce this against a PENDING occupancy: it
+    // re-inserts what it refused to remove, precisely so a joiner's claim
+    // survives. Only the joined-live shape reaches here.
+    const TORN_DOWN_ADMIT_ATTEMPTS: u32 = 4;
+    let mut torn_down_retries = 0u32;
+    loop {
+        let plan = plan_admission(
+            &runtime,
+            surface,
+            key.clone(),
+            protection,
+            authorized,
+            requested,
+        )?;
+        let binding = project_source_authority(canonical_root).admission_binding();
+        let (attempt, owner) = execute_plan_with_outcome(&registry, &plan, binding)?;
+        let cleanup_candidate = attempt.cleanup_candidate();
+        match registry.install(&key, Some(owner)) {
+            Ok(live) => {
+                return Ok(ProjectAdmission {
+                    slot: live,
+                    cleanup_candidate,
+                });
+            }
+            // Not pending any more: either a concurrent opener installed between
+            // our admit and install, or the admit above JOINED an occupancy that
+            // is already live. Both resolve to the same live slot.
+            Err(RegistryRefusal::NotAdmitted) => match registry.live(&key) {
+                Ok(live) => {
+                    return Ok(ProjectAdmission {
+                        slot: live,
+                        cleanup_candidate,
+                    });
+                }
+                // Neither pending nor live: stopped mid-flight. Re-admit.
+                Err(RegistryRefusal::NotAdmitted)
+                    if torn_down_retries + 1 < TORN_DOWN_ADMIT_ATTEMPTS =>
+                {
+                    torn_down_retries += 1;
+                    continue;
+                }
+                Err(refusal) => return Err(AdapterRefusal::Registry(refusal)),
+            },
+            Err(refusal) => return Err(AdapterRefusal::Registry(refusal)),
+        }
     }
 }
 
