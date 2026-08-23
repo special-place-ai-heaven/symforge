@@ -82,6 +82,32 @@ const SUITES = [
       "--test-threads=1",
     ],
   },
+  {
+    target: "tests/project_index_lifecycle_slice0.rs::observer_replacement_gap_is_latched_as_non_current",
+    expected: "green",
+    args: [
+      "test",
+      "--test",
+      "project_index_lifecycle_slice0",
+      "observer_replacement_gap_is_latched_as_non_current",
+      "--",
+      "--exact",
+      "--test-threads=1",
+    ],
+  },
+  {
+    target: "tests/project_index_lifecycle_slice0.rs::old_observer_delivery_after_promotion_is_not_current",
+    expected: "green",
+    args: [
+      "test",
+      "--test",
+      "project_index_lifecycle_slice0",
+      "old_observer_delivery_after_promotion_is_not_current",
+      "--",
+      "--exact",
+      "--test-threads=1",
+    ],
+  },
 ];
 
 const NEWLINE = String.fromCharCode(10);
@@ -104,8 +130,6 @@ const RED_CASES = [
   "configured_capacity_bounds_the_process_not_each_load",
   "empty_placeholder_publication_refuses_watcher_mutation",
   "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
-  "observer_replacement_gap_is_latched_as_non_current",
-  "old_observer_delivery_after_promotion_is_not_current",
   "same_path_root_replacement_is_not_silently_adopted",
   "snapshot_seed_is_not_queryable_before_verification",
   "watcher_mutation_during_candidate_build_is_not_discarded",
@@ -140,6 +164,29 @@ const RESOLVED_CASES = new Map([
       // both values from one `Arc<PublishedGeneration>`, so the generation and
       // the root that publication served cannot disagree.
       fix: "src/watcher/mod.rs::effective_fence_generation reads one published generation",
+    },
+  ],
+  [
+    "observer_replacement_gap_is_latched_as_non_current",
+    {
+      // Track A seam 3a. Deliberately no task id: no frozen Feature 020 task
+      // owns this seam, and inventing one would name an owner the roster does
+      // not have.
+      slice: null,
+      tasks: [],
+      defect: "2.6 an observer replacement gap is not latched and any later clean publication erases it",
+      fix: "src/live_index/store.rs::latch_observer_gap latches WatcherUnavailable when an observer is cancelled, and the reload trunk carries it forward instead of rebuilding freshness without it",
+    },
+  ],
+  [
+    "old_observer_delivery_after_promotion_is_not_current",
+    {
+      slice: null,
+      tasks: [],
+      defect: "2.8 a predecessor observation delivered after promotion leaves the promoted generation claiming Current",
+      // Same latch: the gap is retained rather than rederived, so the promoted
+      // generation cannot report Current about a window it never observed.
+      fix: "src/live_index/store.rs::latch_observer_gap, retained verbatim by recompute_freshness_locked",
     },
   ],
 ]);

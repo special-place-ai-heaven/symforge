@@ -16,6 +16,17 @@ every default-feature gate above passes. Run that exact command before pushing
 anything that adds a `#[cfg(test)]` helper. Found the slow way on 2026-08-12: green
 locally and on the `rust` job, red on `embed-build`.
 
+**But that gate only catches unused *imports*, not unused *items* (as_of
+2026-08-23).** `src/lib.rs:4` carries
+`#![cfg_attr(not(feature = "server"), allow(dead_code))]`, so under the embed cell
+`dead_code` is blanket-allowed crate-wide. A non-`cfg(test)` item -- an ordinary
+`pub(crate) fn` -- whose only caller lives in a `server`-gated module therefore
+passes `embed-build` silently. `unused_imports` is a separate lint and stays armed,
+which is why the import case above really does go red. Do not read a green embed
+cell as proof that a newly server-only-consumed item is still reachable; it cannot
+observe that. Measured on 2026-08-23 while landing seam 3a, whose
+`latch_observer_gap` is exactly this shape.
+
 When such a helper's consumer is server-only, gate it on
 `#[cfg(all(test, feature = "server"))]`. The Feature 020 retirement census
 understands cfg predicates: `all(..)` is test-only when any conjunct is, `any(..)`
