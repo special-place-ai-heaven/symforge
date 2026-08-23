@@ -2066,7 +2066,17 @@ impl SharedIndexHandle {
             None => true,
         };
         self.scout_plan.store(Some(Arc::clone(&scout_plan)));
+        // The ONLY place a latched observer gap is retired. Reaching here means
+        // this pass survived every stale-generation rejection above and is
+        // committing its plan, so complete coverage here is observed rather
+        // than intended. The sweep's own `Complete` check authorizes catalog
+        // removals and can still abort before publish, which is why the latch
+        // is not cleared there.
+        let coverage_complete = scout_plan.coverage == crate::domain::CoverageStatus::Complete;
         let freshness_changed = self.recompute_freshness_locked(&live, Some(&scout_plan));
+        if coverage_complete {
+            self.retire_observer_gap_locked();
+        }
         if scout_plan_changed || freshness_changed {
             // The scout plan and freshness are part of the published trust
             // bundle. Republish only when that bundle changed; an unchanged
@@ -2102,6 +2112,75 @@ impl SharedIndexHandle {
     #[must_use]
     pub fn freshness_status(&self) -> Arc<FreshnessStatus> {
         Arc::clone(&self.published_generation().freshness)
+    }
+
+    /// Latch an observer-replacement gap as a durable freshness reason.
+    ///
+    /// A gap is a HISTORICAL fact: for some window no observer covered this
+    /// root, so a change could have landed unseen. Freshness is otherwise a
+    /// pure function of present state, which is why a later publication that
+    /// happens to look clean used to rederive `Current` with nothing having
+    /// proved the missed window was recovered.
+    ///
+    /// `WatcherUnavailable` is the carrier because
+    /// [`Self::recompute_freshness_locked`] already retains it verbatim rather
+    /// than rederiving it, so the latch survives every ordinary republication.
+    /// Only a committed reconcile that proves complete coverage retires it —
+    /// see `publish_reconciled_scout_plan_at_generation`.
+    pub(crate) fn latch_observer_gap(&self) {
+        let _wg = self.write_mutex.lock();
+        let current = self.freshness_status.load_full();
+        let (last_valid, mut reasons) = match current.as_ref() {
+            FreshnessStatus::Degraded {
+                last_valid_content_generation,
+                reason_codes,
+            } => (*last_valid_content_generation, reason_codes.clone()),
+            FreshnessStatus::Current | FreshnessStatus::Verifying => {
+                (self.published_generation().content_generation, Vec::new())
+            }
+        };
+        if reasons.contains(&FreshnessReason::WatcherUnavailable) {
+            return;
+        }
+        reasons.push(FreshnessReason::WatcherUnavailable);
+        self.freshness_status
+            .store(Arc::new(FreshnessStatus::Degraded {
+                last_valid_content_generation: last_valid,
+                reason_codes: reasons,
+            }));
+        let live = (*self.live.load_full()).clone();
+        self.swap_and_publish_retaining_content(live);
+    }
+
+    /// Retire a latched observer gap. Callers MUST hold `write_mutex` and MUST
+    /// have observed a committed reconcile whose coverage is `Complete`;
+    /// anything weaker retires a gap nothing proved was recovered.
+    fn retire_observer_gap_locked(&self) {
+        let current = self.freshness_status.load_full();
+        let FreshnessStatus::Degraded {
+            last_valid_content_generation,
+            reason_codes,
+        } = current.as_ref()
+        else {
+            return;
+        };
+        if !reason_codes.contains(&FreshnessReason::WatcherUnavailable) {
+            return;
+        }
+        let remaining: Vec<FreshnessReason> = reason_codes
+            .iter()
+            .copied()
+            .filter(|reason| *reason != FreshnessReason::WatcherUnavailable)
+            .collect();
+        self.freshness_status
+            .store(Arc::new(if remaining.is_empty() {
+                FreshnessStatus::Current
+            } else {
+                FreshnessStatus::Degraded {
+                    last_valid_content_generation: *last_valid_content_generation,
+                    reason_codes: remaining,
+                }
+            }));
     }
 
     pub(crate) fn set_freshness_status(&self, status: FreshnessStatus) {
@@ -2414,14 +2493,32 @@ impl SharedIndexHandle {
         let _wg = self.write_mutex.lock();
         self.source_exclusions.store(Arc::new(source_exclusions));
         self.scout_plan.store(Some(scout_plan));
-        self.freshness_status.store(Arc::new(if is_degraded {
-            FreshnessStatus::Degraded {
-                last_valid_content_generation: self.published_generation().content_generation,
-                reason_codes: vec![FreshnessReason::ReconciliationPending],
-            }
-        } else {
-            FreshnessStatus::Current
-        }));
+        // A latched observer gap outlives a reload. This rebuild proves present
+        // state; it does not prove the missed window was recovered, and the two
+        // are not the same claim. Carrying it forward is the whole difference
+        // between "the tree looks clean now" and "nothing was lost". Only a
+        // committed reconcile with complete coverage retires it.
+        let latched_gap = matches!(
+            self.freshness_status.load_full().as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::WatcherUnavailable)
+        );
+        let mut reason_codes = Vec::new();
+        if is_degraded {
+            reason_codes.push(FreshnessReason::ReconciliationPending);
+        }
+        if latched_gap {
+            reason_codes.push(FreshnessReason::WatcherUnavailable);
+        }
+        self.freshness_status
+            .store(Arc::new(if reason_codes.is_empty() {
+                FreshnessStatus::Current
+            } else {
+                FreshnessStatus::Degraded {
+                    last_valid_content_generation: self.published_generation().content_generation,
+                    reason_codes,
+                }
+            }));
         self.project_state_dir
             .store(project_state_dir.map(Arc::new));
         self.project_generation.fetch_add(1, Ordering::AcqRel);

@@ -1274,8 +1274,16 @@ pub async fn run_watcher_with_stop(
     }
 
     if cancelled {
-        let mut info = watcher_info.lock();
-        info.state = WatcherState::Off;
+        {
+            let mut info = watcher_info.lock();
+            info.state = WatcherState::Off;
+        }
+        // The observer is going away. Until a successor proves complete
+        // coverage, no one is watching this root, so any change landing in that
+        // window is unseen. Latch it: freshness is otherwise a pure function of
+        // present state, and the next publication that happens to look clean
+        // would rederive `Current` with nothing having proved the gap closed.
+        shared.latch_observer_gap();
     }
 }
 

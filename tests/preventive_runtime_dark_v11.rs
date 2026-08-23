@@ -1008,9 +1008,9 @@ const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "575a95f48d5f3af80a0d9fd18b6e21918947051f9c79378c6d06b9f3d70143e5",
+    "d475f66d074dc5b20b34d4d89acaad36f4298366685ed490bb61e446fedf0b3b",
     196,
-    9_318_863,
+    9_323_828,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
