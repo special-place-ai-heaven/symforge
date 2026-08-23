@@ -1286,7 +1286,10 @@ pub async fn run_watcher_with_stop(
         //
         // The latch is one-way. A successor absorbing later events proves
         // present state, not the missed window, so nothing here retires it.
-        shared.latch_observer_gap();
+        let effective_generation = effective_fence_generation(&shared, &repo_root, expected_gen);
+        if !shared.latch_observer_gap_at_generation(effective_generation) {
+            debug!("watcher: stale incarnation's cancellation latch refused");
+        }
     }
 }
 
@@ -3958,6 +3961,43 @@ mod tests {
             effective_fence_generation(&shared, project_a.path(), spawn_gen),
             spawn_gen,
             "cross-project retarget -> keep stale spawn gen so the fence rejects"
+        );
+    }
+
+    #[test]
+    fn stale_watcher_cancellation_does_not_latch_retargeted_project() {
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        std::fs::create_dir_all(project_a.path().join("src")).unwrap();
+        std::fs::create_dir_all(project_b.path().join("src")).unwrap();
+        std::fs::write(project_a.path().join("src/a.rs"), b"fn a() {}").unwrap();
+        std::fs::write(project_b.path().join("src/b.rs"), b"fn b() {}").unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(project_a.path()).unwrap();
+        let spawn_gen = shared.current_project_generation();
+        shared.reload(project_b.path()).unwrap();
+
+        let stale_generation = effective_fence_generation(&shared, project_a.path(), spawn_gen);
+        assert_eq!(
+            stale_generation, spawn_gen,
+            "a cancelled watcher from the old root must keep its stale fence"
+        );
+        assert!(
+            !shared.latch_observer_gap_at_generation(stale_generation),
+            "the old root's cancellation must not degrade the retargeted project"
+        );
+        let published = shared.published_generation();
+        assert_eq!(
+            published.live.indexed_root.as_deref(),
+            Some(project_b.path())
+        );
+        assert!(
+            !matches!(
+                published.freshness.as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            ),
+            "WatcherUnavailable would make sidecar reads return 503 for the new project"
         );
     }
 
