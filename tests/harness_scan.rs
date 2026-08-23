@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use symforge::cli::harness::{
     AttachEntry, HarnessFormat, HarnessId, HarnessRegistry, HarnessState, HarnessTarget,
+    StaleFields,
 };
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/harness");
@@ -57,12 +58,13 @@ fn empty_config_is_absent() {
 #[test]
 fn stale_symforge_entry_is_present_stale() {
     // The fixture has url=http://127.0.0.1:9999/mcp + Bearer sf_old_stale_key,
-    // which differs from `desired()`.
+    // which differs from `desired()` in BOTH fields -- so the state must name
+    // both, not merely report that something differs.
     let state = scan_one(json_target(
         HarnessId::ClaudeCode,
         fixture("claude_stale_symforge.json"),
     ));
-    assert_eq!(state, HarnessState::PresentStale);
+    assert_eq!(state, HarnessState::PresentStale(StaleFields::Both));
 }
 
 #[test]

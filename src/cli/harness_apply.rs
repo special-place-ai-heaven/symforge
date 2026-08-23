@@ -90,7 +90,7 @@ pub fn plan(registry: &HarnessRegistry, entry: &AttachEntry) -> ApplyPlan {
                 }
                 HarnessState::PresentCurrent => PlannedAction::Skip("already current".to_string()),
                 HarnessState::Absent => PlannedAction::Add,
-                HarnessState::PresentStale => PlannedAction::Refresh,
+                HarnessState::PresentStale(_) => PlannedAction::Refresh,
                 HarnessState::Malformed(why) => {
                     PlannedAction::Error(format!("config does not parse: {why}"))
                 }
