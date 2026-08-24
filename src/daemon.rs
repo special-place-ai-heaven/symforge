@@ -6760,9 +6760,8 @@ mod tests {
         let state = Arc::clone(&handle.state);
         tokio::task::yield_now().await;
 
-        state
-            .last_activity_at
-            .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
+        // Do not backdate before the in-flight GET: paused-time auto-advance can
+        // fire the 15 s reaper interval while last_activity_at is still stale.
         authed_client(&handle)
             .get(format!("http://127.0.0.1:{}/v1/projects", handle.port))
             .send()
@@ -6772,9 +6771,10 @@ mod tests {
             .expect("authenticated status");
 
         tokio::time::advance(Duration::from_secs(15)).await;
-        tokio::task::yield_now().await;
+        // Reaper tick is driven by advance above. Duration::ZERO observes the
+        // Notify without a 1 ms auto-advance window (virtual clock, not wall).
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), state.idle_shutdown.notified())
+            tokio::time::timeout(Duration::ZERO, state.idle_shutdown.notified())
                 .await
                 .is_err(),
             "authenticated activity must defer idle shutdown"
@@ -6784,10 +6784,9 @@ mod tests {
             .last_activity_at
             .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
         tokio::time::advance(Duration::from_secs(15)).await;
-        tokio::task::yield_now().await;
-        tokio::time::timeout(Duration::from_millis(1), state.idle_shutdown.notified())
-            .await
-            .expect("idle reaper must request shutdown");
+        // Permit must already be stored: reaper runs during advance, idle check
+        // uses wall-clock now_epoch_millis() against the backdated stamp above.
+        state.idle_shutdown.notified().await;
 
         handle.reaper_task.abort();
         let _ = handle.shutdown_tx.send(());
