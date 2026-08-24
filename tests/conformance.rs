@@ -229,6 +229,28 @@ const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
         dry_run_preserves_file: Some("src/lib.rs"),
     },
     PublicContractCase {
+        name: "edit_delete_symbol_missing_v1",
+        tool_name: "delete_symbol",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_delete_symbol_missing,
+        expected_outcome: OutcomeClass::NotFound,
+        expected_edit_status: Some("not_found"),
+        expected_text_contains: &["Symbol not found"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: Some("src/lib.rs"),
+    },
+    PublicContractCase {
+        name: "edit_batch_rename_missing_v1",
+        tool_name: "batch_rename",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_batch_rename_missing,
+        expected_outcome: OutcomeClass::NotFound,
+        expected_edit_status: Some("not_found"),
+        expected_text_contains: &["Symbol not found"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: Some("src/lib.rs"),
+    },
+    PublicContractCase {
         name: "invalid_get_file_content_mode_hint_v1",
         tool_name: "get_file_content",
         fixture_kind: ConformanceFixtureKind::Ready,
@@ -888,7 +910,7 @@ async fn public_contract_conformance_corpus_replays() {
             assert_eq!(
                 fixture.read(path),
                 original,
-                "case `{}` must not write `{path}` in dry-run mode",
+                "case `{}` must not write `{path}` (dry run or failed mutation)",
                 case.name
             );
         }
@@ -1082,6 +1104,23 @@ fn request_replace_symbol_body_dry_run(_fixture: &ConformanceFixture) -> Value {
     })
 }
 
+fn request_delete_symbol_missing(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "path": "src/lib.rs",
+        "name": "missing",
+        "dry_run": false
+    })
+}
+
+fn request_batch_rename_missing(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "path": "src/lib.rs",
+        "name": "missing",
+        "new_name": "renamed",
+        "dry_run": false
+    })
+}
+
 fn request_batch_edit_dry_run(_fixture: &ConformanceFixture) -> Value {
     json!({
         "dry_run": true,
@@ -1139,10 +1178,18 @@ fn assert_result_status(case: &PublicContractCase, serialized: &Value) {
         "case `{}` outcome class mismatch",
         case.name
     );
+    // Reads: `isError` follows the outcome class (an empty or not-found read
+    // is still a successful query). Mutations: anything that did not apply is
+    // a host-visible error, because some hosts keep only `isError` + content.
+    let expected_is_error = if case.expected_edit_status.is_some() {
+        case.expected_outcome != OutcomeClass::Found
+    } else {
+        case.expected_outcome.is_error()
+    };
     assert_eq!(
         serialized["isError"],
-        json!(case.expected_outcome.is_error()),
-        "case `{}` isError must match the result-status outcome class",
+        json!(expected_is_error),
+        "case `{}` isError must match the mutation-aware result-status contract",
         case.name
     );
 

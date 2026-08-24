@@ -62,6 +62,44 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
+    fn edit_output_shapes_that_applied_nothing_never_classify_as_success() {
+        use super::{EditResultStatus as S, classify_edit_output as c};
+        assert_eq!(
+            c("Error: file not found at /repo/src/gone.rs", false),
+            S::NotFound
+        );
+        assert_eq!(
+            c("`old` not found within symbol `present`", false),
+            S::NotFound
+        );
+        assert_eq!(
+            c("symbol not found: missing in src/lib.rs", false),
+            S::NotFound
+        );
+        assert_eq!(
+            c("file not found in index: src/gone.rs", false),
+            S::NotFound
+        );
+        assert_eq!(
+            c(
+                "replace_symbol_body: edit safety blocked
+Required safety: structural",
+                false
+            ),
+            S::InternalFailure
+        );
+    }
+
+    #[test]
+    fn batch_insert_target_failures_name_the_failed_operation() {
+        let statuses = super::failed_batch_operation_statuses(
+            "Target 2: Symbol not found: beta",
+            super::EditResultStatus::NotFound,
+        );
+        assert_eq!(statuses, vec![(2, super::EditResultStatus::NotFound)]);
+    }
+
+    #[test]
     fn daemon_wrapped_edit_errors_classify_as_invalid_request() {
         assert_eq!(
             classify_edit_output(
@@ -254,6 +292,15 @@ impl EditResultStatus {
             Self::InternalFailure => OutcomeClass::InternalFailure,
         }
     }
+
+    /// The mutation rule: anything that did not apply (or preview) a change is
+    /// a host-visible failure. This is deliberately stricter than the read-side
+    /// [`OutcomeClass::is_error`]: an empty or not-found READ is a successful
+    /// query, but a not-found or ambiguous WRITE performed no write, and some
+    /// hosts keep only `isError` + content, so `_meta` alone cannot say so.
+    const fn is_terminal_failure(self) -> bool {
+        !matches!(self.outcome_class(), OutcomeClass::Found)
+    }
 }
 
 fn statused_edit_tool_result(
@@ -285,7 +332,7 @@ fn statused_edit_tool_result(
     meta.insert(RESULT_STATUS_META_KEY.to_string(), status_payload);
 
     let content = vec![rmcp::model::ContentBlock::text(text)];
-    let result = if status.outcome_class().is_error() {
+    let result = if status.is_terminal_failure() {
         rmcp::model::CallToolResult::error(content)
     } else {
         rmcp::model::CallToolResult::success(content)
@@ -309,6 +356,14 @@ fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
         || text.starts_with("Symbol not found:")
         || text.contains("Symbol not found:")
         || text.contains("File not indexed:")
+        // `EditError::PathNotFound` renders with an `Error:` prefix, which the
+        // InvalidRequest arm below would otherwise claim first.
+        || text.starts_with("Error: file not found at ")
+        // `edit_within_symbol` resolved the symbol but not the old text.
+        || text.contains(" not found within symbol ")
+        // STEL planner/apply spell the same refusals in lowercase.
+        || text.contains("symbol not found:")
+        || text.contains("file not found in index:")
     {
         EditResultStatus::NotFound
     } else if text.contains("no repository root configured")
@@ -317,6 +372,9 @@ fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
         || text.starts_with("Error writing ")
         || text.contains("Write failed")
         || text.contains("ROLLBACK INCOMPLETE")
+        // A safety refusal applied nothing; the compact facade already treats
+        // it as an apply failure (`symforge_edit_internal_failure`).
+        || text.contains(": edit safety blocked")
         || text.contains("File disappeared:")
         || text.contains("byte range")
         || text.contains("Session stale")
@@ -353,16 +411,21 @@ fn failed_batch_operation_statuses(
     text: &str,
     status: EditResultStatus,
 ) -> Vec<(usize, EditResultStatus)> {
-    let Some(rest) = text.strip_prefix("Edit ") else {
+    // `batch_edit` reports `Edit N: ...`; `batch_insert` reports
+    // `Target N (path): ...`. Both carry the 1-based operation index first.
+    let Some(rest) = text
+        .strip_prefix("Edit ")
+        .or_else(|| text.strip_prefix("Target "))
+    else {
         return Vec::new();
     };
     let digits = rest
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
-    let Some(':') = rest.chars().nth(digits.len()) else {
+    if digits.is_empty() || !matches!(rest.chars().nth(digits.len()), Some(':' | ' ')) {
         return Vec::new();
-    };
+    }
     match digits.parse::<usize>() {
         Ok(index) => vec![(index, status)],
         Err(_) => Vec::new(),
@@ -815,11 +878,12 @@ impl SymForgeServer {
         let dry_run = params.0.dry_run.unwrap_or(false);
         let output = self.replace_symbol_body(params).await;
         let status = classify_edit_output(&output, dry_run);
-        self.record_tool_completion(
+        self.record_tool_completion_with_success(
             "replace_symbol_body",
             &output,
             started.elapsed(),
             status.outcome_class(),
+            !status.is_terminal_failure(),
         );
         statused_edit_tool_result(output, status, Vec::new())
     }
@@ -1106,6 +1170,7 @@ impl SymForgeServer {
     /// symbol's indentation level — provide unindented code.
     /// NOT for replacing existing code (use replace_symbol_body or edit_within_symbol).
     #[tool(
+        name = "insert_symbol",
         description = "Insert code before or after a named symbol. Set position='before' or 'after' (default 'after'). Content is auto-indented to match the target symbol's indentation level — provide unindented code. Use symbol_line to disambiguate overloaded names. NOT for replacing existing code (use replace_symbol_body or edit_within_symbol).",
         annotations(
             read_only_hint = false,
@@ -1114,6 +1179,24 @@ impl SymForgeServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn insert_symbol_tool(
+        &self,
+        params: Parameters<edit::InsertSymbolInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let output = self.insert_symbol(params).await;
+        let status = classify_edit_output(&output, dry_run);
+        self.record_tool_completion_with_success(
+            "insert_symbol",
+            &output,
+            started.elapsed(),
+            status.outcome_class(),
+            !status.is_terminal_failure(),
+        );
+        statused_edit_tool_result(output, status, Vec::new())
+    }
+
     pub(crate) async fn insert_symbol(
         &self,
         params: Parameters<edit::InsertSymbolInput>,
@@ -1313,6 +1396,7 @@ impl SymForgeServer {
     /// Remove a symbol's entire definition and clean up surrounding blank lines.
     /// NOT for replacing a symbol (use replace_symbol_body).
     #[tool(
+        name = "delete_symbol",
         description = "Remove a symbol's entire definition and clean up surrounding blank lines. Use symbol_line to disambiguate overloaded names. NOT for replacing a symbol (use replace_symbol_body).",
         annotations(
             read_only_hint = false,
@@ -1321,6 +1405,24 @@ impl SymForgeServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn delete_symbol_tool(
+        &self,
+        params: Parameters<edit::DeleteSymbolInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let output = self.delete_symbol(params).await;
+        let status = classify_edit_output(&output, dry_run);
+        self.record_tool_completion_with_success(
+            "delete_symbol",
+            &output,
+            started.elapsed(),
+            status.outcome_class(),
+            !status.is_terminal_failure(),
+        );
+        statused_edit_tool_result(output, status, Vec::new())
+    }
+
     pub(crate) async fn delete_symbol(
         &self,
         params: Parameters<edit::DeleteSymbolInput>,
@@ -1513,6 +1615,7 @@ impl SymForgeServer {
     /// NOT for replacing the entire symbol (use replace_symbol_body).
     /// NOT for adding new symbols (use insert_before/after_symbol).
     #[tool(
+        name = "edit_within_symbol",
         description = "Find-and-replace scoped to a symbol's byte range — won't affect code outside it. The LLM never needs to read the symbol body — just provide the old and new text. Set replace_all=true for every occurrence within the symbol. NOT for replacing the entire symbol (use replace_symbol_body). NOT for adding new symbols (use insert_before/after_symbol).",
         annotations(
             read_only_hint = false,
@@ -1521,6 +1624,24 @@ impl SymForgeServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn edit_within_symbol_tool(
+        &self,
+        params: Parameters<edit::EditWithinSymbolInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let output = self.edit_within_symbol(params).await;
+        let status = classify_edit_output(&output, dry_run);
+        self.record_tool_completion_with_success(
+            "edit_within_symbol",
+            &output,
+            started.elapsed(),
+            status.outcome_class(),
+            !status.is_terminal_failure(),
+        );
+        statused_edit_tool_result(output, status, Vec::new())
+    }
+
     pub(crate) async fn edit_within_symbol(
         &self,
         params: Parameters<edit::EditWithinSymbolInput>,
@@ -1929,11 +2050,12 @@ impl SymForgeServer {
             }
             _ => failed_batch_operation_statuses(&output, status),
         };
-        self.record_tool_completion(
+        self.record_tool_completion_with_success(
             "batch_edit",
             &output,
             started.elapsed(),
             status.outcome_class(),
+            !status.is_terminal_failure(),
         );
         statused_edit_tool_result(output, status, operation_statuses)
     }
@@ -2041,6 +2163,7 @@ impl SymForgeServer {
     /// Rename a symbol and update all references project-wide.
     /// Set dry_run=true for a read-only preview that makes no file changes.
     #[tool(
+        name = "batch_rename",
         description = "Rename a symbol and update all references across the project. Finds the definition and all usage sites via the index's reverse reference map. Set dry_run=true for a READ-ONLY preview that lists affected files without writing any changes (safe, no confirmation needed). Applies confident matches transactionally across files; uncertain matches are surfaced for manual review instead of being modified. Common names (e.g. `new`, `get`) can still produce false positives — verify with what_changed afterward. NOT for replacing a symbol's body (use replace_symbol_body).",
         annotations(
             read_only_hint = false,
@@ -2049,6 +2172,24 @@ impl SymForgeServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn batch_rename_tool(
+        &self,
+        params: Parameters<edit::BatchRenameInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let output = self.batch_rename(params).await;
+        let status = classify_edit_output(&output, dry_run);
+        self.record_tool_completion_with_success(
+            "batch_rename",
+            &output,
+            started.elapsed(),
+            status.outcome_class(),
+            !status.is_terminal_failure(),
+        );
+        statused_edit_tool_result(output, status, Vec::new())
+    }
+
     pub(crate) async fn batch_rename(&self, params: Parameters<edit::BatchRenameInput>) -> String {
         // N-6 (TR-06 boundary): no `if_match` guard on the batch path (same
         // TOCTOU window as batch_edit if extended). See the note on
@@ -2153,11 +2294,12 @@ impl SymForgeServer {
             }
             _ => failed_batch_operation_statuses(&output, status),
         };
-        self.record_tool_completion(
+        self.record_tool_completion_with_success(
             "batch_insert",
             &output,
             started.elapsed(),
             status.outcome_class(),
+            !status.is_terminal_failure(),
         );
         statused_edit_tool_result(output, status, operation_statuses)
     }

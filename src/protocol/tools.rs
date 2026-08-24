@@ -11637,8 +11637,10 @@ impl SymForgeServer {
         use crate::stel::planner::confidence_label;
 
         if let Err(error) = crate::stel::edit_planner::validate_edit_request(request) {
-            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                .into_call_tool_result(error.message));
+            return Ok(
+                ResultStatus::new(Self::mutation_refusal_outcome(&error.message))
+                    .into_mutation_call_tool_result(error.message),
+            );
         }
         // Knowingly STILL OPEN, deliberately out of scope (same gap as the
         // retrieve facade's guard): on the daemon-CONFIGURED-but-DEGRADED
@@ -11662,8 +11664,8 @@ impl SymForgeServer {
                 match super::edit_tools::prepare_exact_path_for_edit(self, request.path.as_str()) {
                     Ok((path, _)) => path,
                     Err(message) => {
-                        return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                            .into_call_tool_result(message));
+                        return Ok(ResultStatus::new(Self::mutation_refusal_outcome(&message))
+                            .into_mutation_call_tool_result(message));
                     }
                 };
 
@@ -11703,8 +11705,8 @@ impl SymForgeServer {
                         }
                         Ok(None) => {}
                         Err(output) => {
-                            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                                .into_call_tool_result(output));
+                            return Ok(ResultStatus::new(Self::mutation_refusal_outcome(&output))
+                                .into_mutation_call_tool_result(output));
                         }
                     }
                 }
@@ -11760,8 +11762,10 @@ impl SymForgeServer {
                     return statused_tool_result(output, OutcomeClass::Found);
                 }
                 Err(error) => {
-                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                        .into_call_tool_result(error.message));
+                    return Ok(
+                        ResultStatus::new(Self::mutation_refusal_outcome(&error.message))
+                            .into_mutation_call_tool_result(error.message),
+                    );
                 }
             }
         }
@@ -11769,8 +11773,10 @@ impl SymForgeServer {
         let plan = match build_edit_plan(request) {
             Ok(plan) => plan,
             Err(error) => {
-                return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                    .into_call_tool_result(error.message));
+                return Ok(
+                    ResultStatus::new(Self::mutation_refusal_outcome(&error.message))
+                        .into_mutation_call_tool_result(error.message),
+                );
             }
         };
         let decision = evaluate_edit_plan(&plan);
@@ -11832,7 +11838,29 @@ impl SymForgeServer {
             .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
 
         let outcome_class = Self::classify_symforge_edit_outcome(&tool_body, apply, &body);
-        statused_tool_result(output, outcome_class)
+        // Mutation exit: a preview or apply that found nothing to change is a
+        // host-visible failure, same rule as every granular edit tool.
+        Ok(ResultStatus::new(outcome_class).into_mutation_call_tool_result(output))
+    }
+
+    /// Classify a facade refusal body. A target that does not exist is
+    /// `NotFound`, a selector that matches several is `Ambiguous`, anything
+    /// else the caller asked for wrongly is `InvalidRequest`. Every arm is a
+    /// mutation that applied nothing, so every arm is `isError:true` at the
+    /// host seam via `into_mutation_call_tool_result`.
+    fn mutation_refusal_outcome(text: &str) -> OutcomeClass {
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("symbol not found")
+            || lower.contains("file not found")
+            || lower.contains("file not indexed:")
+            || lower.contains(" not found within symbol ")
+        {
+            OutcomeClass::NotFound
+        } else if text.contains("Ambiguous:") {
+            OutcomeClass::Ambiguous
+        } else {
+            OutcomeClass::InvalidRequest
+        }
     }
 
     fn classify_symforge_edit_outcome(
@@ -11841,7 +11869,13 @@ impl SymForgeServer {
         full_body: &str,
     ) -> OutcomeClass {
         use super::edit_format::symforge_edit_internal_failure;
-        if is_error_output(tool_body) || tool_body.starts_with("Invalid") {
+        // Missing/ambiguous targets first: `Error: file not found at` would
+        // otherwise be claimed by the generic `Error:` prefix below. The
+        // refusal text sits in the full summary, not the envelope header.
+        let refusal = Self::mutation_refusal_outcome(full_body);
+        if !matches!(refusal, OutcomeClass::InvalidRequest) {
+            refusal
+        } else if is_error_output(tool_body) || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
         } else if symforge_edit_internal_failure(tool_body, apply, full_body) {
             OutcomeClass::InternalFailure
@@ -22762,6 +22796,220 @@ mod tests {
             serialized_tool_result(server.find_references_tool(Parameters(ambiguous)).await);
         assert_tool_result_status(&ambiguous, OutcomeClass::Ambiguous);
         assert!(tool_result_text(&ambiguous).contains("Ambiguous symbol selector"));
+    }
+
+    /// Every public mutation tool must report a mutation that did not apply as a
+    /// host-visible MCP error. `_meta` alone is not enough: some hosts keep only
+    /// `isError` and the content, and `isError:false` for a write that never
+    /// happened is a false success the agent then builds on.
+    #[tokio::test]
+    async fn mutation_tools_report_no_apply_as_mcp_errors() {
+        use crate::protocol::edit::{
+            BatchEditInput, BatchInsertInput, BatchRenameInput, DeleteSymbolInput,
+            EditWithinSymbolInput, InsertSymbolInput, ReplaceSymbolBodyInput,
+        };
+        let source = b"fn present() {\n    println!(\"old\");\n}\nfn other() {}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let before = std::fs::read(&file_path).unwrap();
+        let lib = "src/lib.rs";
+
+        macro_rules! call {
+            ($tool:ident, $ty:ty, $json:tt) => {
+                serialized_tool_result(
+                    server
+                        .$tool(Parameters(
+                            serde_json::from_value::<$ty>(serde_json::json!($json)).unwrap(),
+                        ))
+                        .await,
+                )
+            };
+        }
+
+        let outcomes: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "replace_symbol_body",
+                call!(replace_symbol_body_tool, ReplaceSymbolBodyInput, {
+                    "path": lib, "name": "missing", "new_body": "fn missing() {}", "dry_run": false
+                }),
+            ),
+            (
+                "insert_symbol",
+                call!(insert_symbol_tool, InsertSymbolInput, {
+                    "path": lib, "name": "missing", "content": "fn added() {}", "dry_run": false
+                }),
+            ),
+            (
+                "delete_symbol",
+                call!(delete_symbol_tool, DeleteSymbolInput, {
+                    "path": lib, "name": "missing", "dry_run": false
+                }),
+            ),
+            (
+                "edit_within_symbol",
+                call!(edit_within_symbol_tool, EditWithinSymbolInput, {
+                    "path": lib, "name": "missing", "old_text": "old", "new_text": "new",
+                    "dry_run": false
+                }),
+            ),
+            (
+                "edit_within_symbol(old_text absent)",
+                call!(edit_within_symbol_tool, EditWithinSymbolInput, {
+                    "path": lib, "name": "present", "old_text": "no such text",
+                    "new_text": "new", "dry_run": false
+                }),
+            ),
+            (
+                "batch_rename",
+                call!(batch_rename_tool, BatchRenameInput, {
+                    "path": lib, "name": "missing", "new_name": "renamed", "dry_run": false
+                }),
+            ),
+            (
+                "batch_edit",
+                call!(batch_edit_tool, BatchEditInput, {
+                    "dry_run": false,
+                    "edits": ["src/lib.rs::missing => replace fn missing() {}"]
+                }),
+            ),
+            (
+                "batch_insert",
+                call!(batch_insert_tool, BatchInsertInput, {
+                    "dry_run": false, "content": "fn added() {}", "position": "after",
+                    "targets": [{"path": lib, "name": "missing"}]
+                }),
+            ),
+        ];
+
+        for (tool, serialized) in &outcomes {
+            assert_eq!(
+                serialized["isError"],
+                serde_json::json!(true),
+                "{tool}: a mutation that applied nothing must be a host-visible error: {serialized}"
+            );
+            assert_eq!(
+                serialized["_meta"][RESULT_STATUS_META_KEY]["status"],
+                serde_json::json!("not_found"),
+                "{tool}: {serialized}"
+            );
+            assert_eq!(
+                serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+                serde_json::json!("not_found"),
+                "{tool}: {serialized}"
+            );
+        }
+        // batch_insert must name WHICH operation failed, not just that one did.
+        let batch_insert = &outcomes
+            .iter()
+            .find(|(t, _)| *t == "batch_insert")
+            .unwrap()
+            .1;
+        assert_eq!(
+            batch_insert["_meta"][RESULT_STATUS_META_KEY]["operations"][0]["operation_index"],
+            serde_json::json!(1),
+            "batch_insert failure metadata must carry the failed operation: {batch_insert}"
+        );
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            before,
+            "no failed mutation may touch the file"
+        );
+
+        // Positive controls: a dry run and an applied mutation stay successful.
+        let dry_run = call!(delete_symbol_tool, DeleteSymbolInput, {
+            "path": lib, "name": "other", "dry_run": true
+        });
+        assert_eq!(dry_run["isError"], serde_json::json!(false), "{dry_run}");
+        assert_tool_result_edit_status(&dry_run, "dry_run_success", OutcomeClass::Found);
+        assert_eq!(std::fs::read(&file_path).unwrap(), before);
+        let applied = call!(delete_symbol_tool, DeleteSymbolInput, {
+            "path": lib, "name": "other", "dry_run": false
+        });
+        assert_eq!(applied["isError"], serde_json::json!(false), "{applied}");
+        assert_tool_result_edit_status(&applied, "success", OutcomeClass::Found);
+        assert!(
+            !std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("fn other")
+        );
+    }
+
+    /// The compact facade is a public mutation surface too: a preview or apply
+    /// against a symbol that does not exist applied nothing and must say so at
+    /// the host seam, not only in the body.
+    #[tokio::test]
+    async fn symforge_edit_missing_target_is_an_mcp_error() {
+        let (_dir, server, file_path) = setup_edit_test(b"fn present() {}\n");
+        let before = std::fs::read(&file_path).unwrap();
+        for apply in [false, true] {
+            let request = crate::stel::StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                symbol: Some("missing".to_string()),
+                body: Some("fn missing() {}".to_string()),
+                apply: Some(apply),
+                ..Default::default()
+            };
+            let result = server
+                .symforge_edit_facade_tool(Parameters(request))
+                .await
+                .expect("symforge_edit dispatch");
+            let serialized = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                serialized["isError"],
+                serde_json::json!(true),
+                "apply={apply}: missing target must be host-visible: {serialized}"
+            );
+            assert_eq!(
+                serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+                serde_json::json!("not_found"),
+                "apply={apply}: {serialized}"
+            );
+        }
+        assert_eq!(std::fs::read(&file_path).unwrap(), before);
+    }
+
+    /// Analytics must agree with the wire: a mutation the host sees as failed
+    /// cannot be counted as a success in the usage record.
+    #[tokio::test]
+    async fn analytics_records_a_no_apply_mutation_as_unsuccessful() {
+        use crate::analytics::{AnalyticsRecorder, AnalyticsScope};
+        use crate::protocol::edit::DeleteSymbolInput;
+
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<parking_lot::Mutex<Vec<(String, bool)>>>);
+        impl crate::analytics::AnalyticsWriter for Capture {
+            fn write(
+                &mut self,
+                o: &crate::analytics::AnalyticsObservation,
+            ) -> anyhow::Result<crate::analytics::AnalyticsWriteOutcome> {
+                self.0.lock().push((o.tool_name.clone(), o.success));
+                Ok(crate::analytics::AnalyticsWriteOutcome::Recorded { id: 1 })
+            }
+        }
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (_dir, server, _file_path) = setup_edit_test(b"fn present() {}\n");
+        server.set_analytics_recorder_for_tests(AnalyticsRecorder::start_with_writer_for_tests(
+            AnalyticsScope::Session,
+            8,
+            Capture(std::sync::Arc::clone(&seen)),
+        ));
+        let _ = server
+            .delete_symbol_tool(Parameters(
+                serde_json::from_value::<DeleteSymbolInput>(serde_json::json!({
+                    "path": "src/lib.rs", "name": "missing", "dry_run": false
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.lock().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let observed = seen.lock().clone();
+        assert_eq!(
+            observed,
+            vec![("delete_symbol".to_string(), false)],
+            "a not_found mutation must be recorded as unsuccessful"
+        );
     }
 
     #[tokio::test]

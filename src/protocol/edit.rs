@@ -3066,7 +3066,7 @@ pub(crate) fn execute_batch_insert(
                 target.kind.as_deref(),
                 target.symbol_line,
             )
-            .map_err(|e| format!("Target {}: {e}", target.path))?;
+            .map_err(|e| format!("Target {} ({}): {e}", i + 1, target.path))?;
             resolved.push(ResolvedTarget {
                 path: target.path.clone(),
                 sym,
