@@ -9,7 +9,7 @@
 //! it extracts `Authorization: Bearer <key>`, applies the policy here (constant-time
 //! verify), returns `401 Unauthorized` on a missing/invalid key when auth is
 //! required, and otherwise calls the next handler. [`super::serve::run`] layers it
-//! in front of `/mcp` via [`bearer_auth_layer`].
+//! in front of `/mcp` via [`apply_bearer_auth`].
 
 /// Authentication configuration for one server instance.
 ///
@@ -67,7 +67,7 @@ impl AuthConfig {
 /// Shared state for the [`require_bearer`] middleware.
 ///
 /// Carries the resolved [`AuthConfig`], whether the bind is loopback, and an
-/// optional hashed [`ApiKeyStore`] so a presented Bearer token can be verified
+/// optional hashed [`super::api_keys::ApiKeyStore`] so a presented Bearer token can be verified
 /// against **either** the bootstrap `--api-key` **or** any active minted key
 /// (G-039). The middleware applies the exact secure-default rule
 /// ([`AuthConfig::requires_auth`]) without re-deriving it per request.
@@ -77,7 +77,7 @@ pub struct AuthLayerState {
     is_loopback: bool,
     /// Optional hashed product key store. When present, a Bearer token that is
     /// not the bootstrap key is additionally checked against every active
-    /// minted key. `None` (or [`ApiKeyStore::Disabled`]) falls back to the
+    /// minted key. `None` (or [`super::api_keys::ApiKeyStore::Disabled`]) falls back to the
     /// bootstrap key only.
     key_store: Option<std::sync::Arc<super::api_keys::ApiKeyStore>>,
 }
@@ -136,7 +136,7 @@ fn parse_bearer(header: &str) -> Option<&str> {
 ///   present and constant-time-equal to the configured key; otherwise the
 ///   request is rejected with `401 Unauthorized` and **no tool executes**.
 ///
-/// Layered via [`bearer_auth_layer`]. Kept as a thin policy adapter so the
+/// Layered via [`apply_bearer_auth`]. Kept as a thin policy adapter so the
 /// constant-time verify and the secure-default rule live only on [`AuthConfig`].
 #[cfg(feature = "server")]
 pub async fn require_bearer(

@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.8](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.7...v11.0.8) (2026-08-24)
+
+
+### Bug Fixes
+
+* **daemon:** make the idle-shutdown test observation non-racy ([#645](https://github.com/special-place-ai-heaven/symforge/issues/645)) ([2e848d8](https://github.com/special-place-ai-heaven/symforge/commit/2e848d870cd6d30b6b866eee40280b1deaafc04a))
+
+## [11.0.7](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.6...v11.0.7) (2026-08-24)
+
+
+### Bug Fixes
+
+* **deps:** require patched cap-std floor ([#642](https://github.com/special-place-ai-heaven/symforge/issues/642)) ([12864dc](https://github.com/special-place-ai-heaven/symforge/commit/12864dc4b4367ae9bd4821e003488505a5408450))
+* **watcher:** complete the observer-gap latch on every uncovered path ([#643](https://github.com/special-place-ai-heaven/symforge/issues/643)) ([cb1ad24](https://github.com/special-place-ai-heaven/symforge/commit/cb1ad245b472855c27f796dda55024be6bbc516f))
+
 ## [11.0.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.5...v11.0.6) (2026-08-23)
 
 

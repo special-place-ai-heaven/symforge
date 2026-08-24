@@ -202,7 +202,7 @@ pub(crate) trait UpdateOps {
     fn reregister_clients(&mut self) -> anyhow::Result<bool>;
     /// Remove the retired durable-install leftovers ONLY when `reregistered` is
     /// true (otherwise clients still point at the orphan and deleting it would
-    /// break them). Registry pruning is handled separately by [`prune_registry`].
+    /// break them). Registry pruning is handled separately by [`UpdateOps::prune_registry`].
     /// Returns summary lines.
     fn reconcile_durable(&mut self, reregistered: bool) -> Vec<String>;
     /// Detect whether a DIFFERENT install shadows the binary npm just installed

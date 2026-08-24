@@ -1,4 +1,4 @@
-//! Observational calibration summary derived from in-memory [`SessionLedger`] events,
+//! Observational calibration summary derived from in-memory [`crate::stel::ledger::SessionLedger`] events,
 //! plus the feature-013 auto-tune: derive corrected token-estimate constants from
 //! accumulated predicted-vs-actual error and accept them only when they reduce
 //! held-out prediction error (US2).

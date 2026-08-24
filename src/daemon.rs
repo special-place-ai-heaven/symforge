@@ -2933,7 +2933,7 @@ pub(crate) enum DaemonStopOutcome {
 /// Stop the currently-recorded global daemon regardless of its version, for the
 /// update flow: the binary is about to be replaced, so even a same-version
 /// daemon must exit and let the next launch respawn the new one. Unlike
-/// [`stop_incompatible_recorded_daemon`], this does not skip a same-identity
+/// [`stop_incompatible_recorded_daemon_at`], this does not skip a same-identity
 /// daemon — but it preserves the exact ownership/executable safety gate
 /// (`should_terminate_recorded_daemon`) so an unrelated or pid-recycled process
 /// is never terminated.
@@ -3570,7 +3570,7 @@ impl ProjectSlot {
                 Arc::clone(&project.stop_token),
             )
         };
-        abort_watcher_task(&mut watcher_task, &old_stop_token);
+        let observer_aborted = abort_watcher_task(&mut watcher_task, &old_stop_token);
 
         // A failed rebuild must not leave the project blind. The abort above
         // stopped the observer and `take()` already cleared its handle, so
@@ -3581,6 +3581,20 @@ impl ProjectSlot {
         // STILL bound to: the success path below is what retargets
         // `canonical_root`, so on this path the old root is the one to watch.
         if let Err(error) = reload_index(&index, canonical_root) {
+            // `task.abort()` is a hard abort: the watcher's cooperative tail --
+            // the one place that latches its own cancellation gap -- never
+            // runs on this path. The RETAINED index keeps serving, and every
+            // change between the abort and the replacement below is unseen,
+            // so the daemon must latch the gap the watcher could not. The
+            // success path needs no latch: a completed reload is a full
+            // re-scan that supersedes anything the old observer missed.
+            //
+            // Unfenced on purpose. `_mutation` is held for this whole window,
+            // so no concurrent retarget can make this a stale incarnation's
+            // gap -- the fenced variant would compare a generation to itself.
+            if observer_aborted {
+                index.latch_observer_gap();
+            }
             let retained_root = self.metadata.read().canonical_root.clone();
             let stop_token = Arc::new(AtomicBool::new(false));
             let watcher_task = start_project_watcher(
@@ -3834,10 +3848,13 @@ fn start_project_watcher(
 fn abort_watcher_task(
     task: &mut Option<tokio::task::JoinHandle<()>>,
     stop_token: &Arc<AtomicBool>,
-) {
+) -> bool {
     stop_token.store(true, Ordering::Release);
     if let Some(task) = task.take() {
         task.abort();
+        true
+    } else {
+        false
     }
 }
 
@@ -5332,7 +5349,7 @@ fn reject_unsupported_cross_project_scoping(
 }
 
 /// Feature 012 (Phase 3): execute one of the three cross-project READ verbs
-/// against the session's working set and format the attributed [`ProjectHit`]
+/// against the session's working set and format the attributed [`crate::live_index::view::ProjectHit`]
 /// results with `── project: <id> ──` section headers (flat, no header, when a
 /// single project is targeted). This is reached ONLY when `targets` is not the
 /// single active project; the active-project path never enters here.
@@ -6740,9 +6757,8 @@ mod tests {
         let state = Arc::clone(&handle.state);
         tokio::task::yield_now().await;
 
-        state
-            .last_activity_at
-            .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
+        // Do not backdate before the in-flight GET: paused-time auto-advance can
+        // fire the 15 s reaper interval while last_activity_at is still stale.
         authed_client(&handle)
             .get(format!("http://127.0.0.1:{}/v1/projects", handle.port))
             .send()
@@ -6752,9 +6768,10 @@ mod tests {
             .expect("authenticated status");
 
         tokio::time::advance(Duration::from_secs(15)).await;
-        tokio::task::yield_now().await;
+        // Reaper tick is driven by advance above. Duration::ZERO observes the
+        // Notify without a 1 ms auto-advance window (virtual clock, not wall).
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), state.idle_shutdown.notified())
+            tokio::time::timeout(Duration::ZERO, state.idle_shutdown.notified())
                 .await
                 .is_err(),
             "authenticated activity must defer idle shutdown"
@@ -6764,10 +6781,9 @@ mod tests {
             .last_activity_at
             .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
         tokio::time::advance(Duration::from_secs(15)).await;
-        tokio::task::yield_now().await;
-        tokio::time::timeout(Duration::from_millis(1), state.idle_shutdown.notified())
-            .await
-            .expect("idle reaper must request shutdown");
+        // Permit must already be stored: reaper runs during advance, idle check
+        // uses wall-clock now_epoch_millis() against the backdated stamp above.
+        state.idle_shutdown.notified().await;
 
         handle.reaper_task.abort();
         let _ = handle.shutdown_tx.send(());
@@ -10164,6 +10180,104 @@ mod tests {
         reader.join().expect("B reader thread");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_reload_latches_gap_when_abort_bypasses_watcher_tail() {
+        let project = project_dir("symforge-daemon-abort-gap");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn daemon_abort_gap() {}\n",
+        )
+        .expect("write source");
+
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "daemon-abort-gap".to_string(),
+                pid: None,
+            })
+            .expect("open project");
+        let slot = state
+            .projects
+            .read()
+            .get(&opened.project_id)
+            .cloned()
+            .expect("project slot");
+        {
+            let mut project = slot.metadata.write();
+            let existing = project
+                .watcher_task
+                .take()
+                .expect("tokio-backed activation must install a watcher task");
+            existing.abort();
+            project.stop_token = Arc::new(AtomicBool::new(false));
+            project.watcher_task = Some(tokio::spawn(std::future::pending::<()>()));
+        }
+
+        let root = canonical_project_root(project.path()).expect("canonical project");
+        let latched = |slot: &ProjectSlot| {
+            let project = slot.metadata.read();
+            let freshness = project.index.shared().freshness_status();
+            matches!(
+                freshness.as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            )
+        };
+
+        // Positive control first: the FAILED reload is the hole. The abort
+        // already ran, the retained index keeps serving, and nothing covered
+        // the root until the replacement watcher started.
+        let error = slot
+            .reload_with(&root, |_index, _root| anyhow::bail!("rebuild refused"))
+            .expect_err("the injected rebuild failure must propagate");
+        assert!(
+            error.to_string().contains("rebuild refused"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            latched(&slot),
+            "daemon abort skips the watcher's cooperative tail, so a failed reload must latch the gap itself"
+        );
+        assert!(
+            slot.metadata.read().watcher_task.is_some(),
+            "a failed reload must still install a replacement watcher"
+        );
+
+        // Negative control on a fresh slot: a SUCCESSFUL reload is a full
+        // re-scan that supersedes anything the aborted observer missed, so it
+        // must NOT latch -- `WatcherUnavailable` would 503 every sidecar read
+        // of a project that was just rebuilt from scratch.
+        let fresh = DaemonState::new();
+        let reopened = fresh
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "daemon-abort-gap-success".to_string(),
+                pid: None,
+            })
+            .expect("open project again");
+        let fresh_slot = fresh
+            .projects
+            .read()
+            .get(&reopened.project_id)
+            .cloned()
+            .expect("fresh project slot");
+        assert!(
+            !latched(&fresh_slot),
+            "precondition: a freshly opened project must start un-latched"
+        );
+        fresh_slot
+            .reload_with(&root, |index, root| index.reload(root))
+            .expect("successful reload");
+        assert!(
+            !latched(&fresh_slot),
+            "a successful reload is a full re-scan and must not report WatcherUnavailable"
+        );
+
+        fresh_slot.stop();
+        slot.stop();
+    }
+
     /// Feature 020 Slice 0 causal control for design defect 2.4 — project
     /// loading is not single-flight.
     ///
@@ -12621,11 +12735,29 @@ mod tests {
             "caller_root=A must 409 once B is active"
         );
 
-        let matched = client
-            .get(url(&format!("?caller_root={}", project_b.path().display())))
-            .send()
-            .await
-            .expect("matched request");
+        // B was made ACTIVE moments ago. `require_queryable_sidecar_index`
+        // answers 503 until B's publication catches up with its project
+        // generation, and on a loaded runner the assertion below can land
+        // inside that window -- which is what reddened Release 32660381244 and
+        // 32665940448 with no regression behind it.
+        //
+        // Retry ONLY the readiness condition. Any other status is decided
+        // immediately, so a real 409 still fails fast with its evidence rather
+        // than being polled into a timeout.
+        let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let matched = loop {
+            let response = client
+                .get(url(&format!("?caller_root={}", project_b.path().display())))
+                .send()
+                .await
+                .expect("matched request");
+            if response.status() != StatusCode::SERVICE_UNAVAILABLE
+                || std::time::Instant::now() >= readiness_deadline
+            {
+                break response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         // The status and body are read BEFORE asserting. A bare `assert!` on
         // `is_success()` reports only its own message, so a failure here could
         // not be told apart from a 409 the guard raised, a 5xx the sidecar

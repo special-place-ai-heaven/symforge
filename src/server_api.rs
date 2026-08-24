@@ -54,7 +54,7 @@ pub enum ServerExit {
     Success,
 }
 
-/// The contract entry point: run the symforge CLI with `args` (argv[0]
+/// The contract entry point: run the symforge CLI with `args` (`argv\[0\]`
 /// included). Dispatches every subcommand exactly as the binary always
 /// has — daemon, serve, stdio MCP, init/setup/admin/hook/trust/update —
 /// and maps the typed outcome onto the contract shapes. Argument-parse

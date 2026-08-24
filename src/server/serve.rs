@@ -121,7 +121,7 @@ pub fn resolve_api_key(api_key: Option<&str>, api_key_env: Option<&str>) -> Opti
 /// `is_loopback` is computed by the caller from the parsed bind address. The
 /// warning is emitted via `tracing::warn!` AND to stderr so an operator running
 /// without a tracing subscriber still sees it. Returns
-/// [`AuthStartupError::InlineKeyOnNonLoopback`] on a refused config so `run`
+/// [`super::auth::AuthStartupError::InlineKeyOnNonLoopback`] on a refused config so `run`
 /// exits before binding.
 pub fn enforce_api_key_source_policy(
     api_key: Option<&str>,

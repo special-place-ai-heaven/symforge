@@ -2092,8 +2092,8 @@ impl ServerHandler for SymForgeServer {
     /// The `#[tool_handler]` macro only generates `call_tool` when the impl block
     /// does not already define one; by providing this method we replace the
     /// generated body while preserving its exact router delegation. The added
-    /// gate enforces [`FR-008`] at dispatch (not just at `tools/list`): when the
-    /// active surface is [`SurfaceProfile::Compact`], a `tools/call` for any tool
+    /// gate enforces FR-008 at dispatch (not just at `tools/list`): when the
+    /// active surface is [`crate::protocol::surface_probe::SurfaceProfile::Compact`], a `tools/call` for any tool
     /// name NOT in the advertised compact-3 set
     /// ([`crate::stel::surface::COMPACT_TOOL_NAMES`]) is rejected with an MCP
     /// `InvalidRequest` error. Full and Meta surfaces are unaffected, so the

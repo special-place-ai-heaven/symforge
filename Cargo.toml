@@ -1,6 +1,6 @@
 [package]
 name = "symforge"
-version = "11.0.6"
+version = "11.0.8"
 edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
@@ -148,7 +148,7 @@ socket2 = { version = "0.6", optional = true }
 # Team artifact compression (R-11/D-015-009): backs the always-on
 # `index.bin.zst` export/import (contracts/team-artifact.md, C-S1A-005).
 zstd = "0.13"
-cap-std = "4.0.2"
+cap-std = "4.0.3"
 
 [target.'cfg(windows)'.dependencies]
 # Native process control for the self-update binary swap (cli/update.rs):
