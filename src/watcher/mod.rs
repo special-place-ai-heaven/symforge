@@ -720,6 +720,9 @@ pub struct WatcherTaskHandle {
     pub stop_token: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
+static FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Create a new debouncer watching `repo_root` recursively.
 ///
 /// `debounce_ms` controls the debounce window (base 200ms, extended to 500ms during bursts).
@@ -1030,12 +1033,24 @@ pub async fn run_watcher_with_stop(
                     consecutive_failures, e
                 );
                 if consecutive_failures >= MAX_FAILURES {
-                    let mut info = watcher_info.lock();
-                    info.state = WatcherState::Degraded;
+                    {
+                        let mut info = watcher_info.lock();
+                        info.state = WatcherState::Degraded;
+                    }
                     error!(
                         "watcher: entering degraded mode after {} consecutive failures",
                         MAX_FAILURES
                     );
+                    // Fenced for the same reason as the cancellation latch at
+                    // the tail of this function: a degraded incarnation proves
+                    // a gap in ITS root's coverage only. If the publication has
+                    // since been retargeted, latching here would report the
+                    // successor project as stale and 503 its reads.
+                    let effective_generation =
+                        effective_fence_generation(&shared, &repo_root, expected_gen);
+                    if !shared.latch_observer_gap_at_generation(effective_generation) {
+                        debug!("watcher: stale incarnation's start-failure latch refused");
+                    }
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1112,6 +1127,10 @@ pub async fn run_watcher_with_stop(
                     if stop_token.load(Ordering::Acquire) {
                         cancelled = true;
                         break 'watcher;
+                    }
+                    #[cfg(test)]
+                    if FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.swap(false, Ordering::AcqRel) {
+                        break;
                     }
 
                     // Periodic reconciliation sweep (belt-and-suspenders against missed events).
@@ -1258,10 +1277,26 @@ pub async fn run_watcher_with_stop(
                 }
 
                 // Inner loop exited — count as a failure and try to restart
+                {
+                    let mut info = watcher_info.lock();
+                    info.state = WatcherState::Starting;
+                }
+                drop(handle);
+                // The restart window is uncovered: this handle is dropped and
+                // its successor has not started. Fenced like the other two
+                // latch sites so a stale incarnation cannot degrade the project
+                // that replaced it.
+                let effective_generation =
+                    effective_fence_generation(&shared, &repo_root, expected_gen);
+                if !shared.latch_observer_gap_at_generation(effective_generation) {
+                    debug!("watcher: stale incarnation's restart latch refused");
+                }
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_FAILURES {
-                    let mut info = watcher_info.lock();
-                    info.state = WatcherState::Degraded;
+                    {
+                        let mut info = watcher_info.lock();
+                        info.state = WatcherState::Degraded;
+                    }
                     error!(
                         "watcher: entering degraded mode after {} consecutive failures",
                         MAX_FAILURES
@@ -1286,7 +1321,10 @@ pub async fn run_watcher_with_stop(
         //
         // The latch is one-way. A successor absorbing later events proves
         // present state, not the missed window, so nothing here retires it.
-        shared.latch_observer_gap();
+        let effective_generation = effective_fence_generation(&shared, &repo_root, expected_gen);
+        if !shared.latch_observer_gap_at_generation(effective_generation) {
+            debug!("watcher: stale incarnation's cancellation latch refused");
+        }
     }
 }
 
@@ -1488,6 +1526,78 @@ mod tests {
         // runtime to completion.
         handle.stop_token.store(true, Ordering::Release);
         handle.task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_watcher_start_latches_unavailable_freshness() {
+        let project = TempDir::new().unwrap();
+        create_test_source(project.path(), "src/main.rs", b"fn main() {}\n");
+        let shared = crate::live_index::store::LiveIndex::load(project.path()).unwrap();
+        assert!(matches!(
+            shared.freshness_status().as_ref(),
+            crate::domain::FreshnessStatus::Current
+        ));
+
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        run_watcher_with_stop(
+            project.path().join("missing-root"),
+            shared.clone(),
+            Arc::clone(&watcher_info),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert_eq!(watcher_info.lock().state, WatcherState::Degraded);
+        assert!(
+            matches!(
+                shared.freshness_status().as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            ),
+            "an unavailable watcher must not leave the index reporting Current"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_watcher_restart_latches_unavailable_freshness() {
+        let project = TempDir::new().unwrap();
+        create_test_source(project.path(), "src/main.rs", b"fn main() {}\n");
+        let shared = crate::live_index::store::LiveIndex::load(project.path()).unwrap();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let stop_token = Arc::new(AtomicBool::new(false));
+        FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.store(true, Ordering::Release);
+
+        let watcher = tokio::spawn(run_watcher_with_stop(
+            project.path().to_path_buf(),
+            shared.clone(),
+            Arc::clone(&watcher_info),
+            Arc::clone(&stop_token),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut latched = false;
+        while Instant::now() < deadline {
+            latched = matches!(
+                shared.freshness_status().as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            );
+            if latched {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        stop_token.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(3), watcher)
+            .await
+            .expect("watcher must stop after the forced restart")
+            .expect("watcher task must not panic");
+
+        assert!(
+            latched,
+            "an active watcher restart must latch the uncovered restart window"
+        );
     }
 
     #[test]
@@ -3958,6 +4068,43 @@ mod tests {
             effective_fence_generation(&shared, project_a.path(), spawn_gen),
             spawn_gen,
             "cross-project retarget -> keep stale spawn gen so the fence rejects"
+        );
+    }
+
+    #[test]
+    fn stale_watcher_cancellation_does_not_latch_retargeted_project() {
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        std::fs::create_dir_all(project_a.path().join("src")).unwrap();
+        std::fs::create_dir_all(project_b.path().join("src")).unwrap();
+        std::fs::write(project_a.path().join("src/a.rs"), b"fn a() {}").unwrap();
+        std::fs::write(project_b.path().join("src/b.rs"), b"fn b() {}").unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(project_a.path()).unwrap();
+        let spawn_gen = shared.current_project_generation();
+        shared.reload(project_b.path()).unwrap();
+
+        let stale_generation = effective_fence_generation(&shared, project_a.path(), spawn_gen);
+        assert_eq!(
+            stale_generation, spawn_gen,
+            "a cancelled watcher from the old root must keep its stale fence"
+        );
+        assert!(
+            !shared.latch_observer_gap_at_generation(stale_generation),
+            "the old root's cancellation must not degrade the retargeted project"
+        );
+        let published = shared.published_generation();
+        assert_eq!(
+            published.live.indexed_root.as_deref(),
+            Some(project_b.path())
+        );
+        assert!(
+            !matches!(
+                published.freshness.as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            ),
+            "WatcherUnavailable would make sidecar reads return 503 for the new project"
         );
     }
 
