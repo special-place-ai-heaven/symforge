@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.9](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.8...v11.0.9) (2026-08-24)
+
+
+### Bug Fixes
+
+* **daemon:** retire joined-live daemon bootstrap failures ([#648](https://github.com/special-place-ai-heaven/symforge/issues/648)) ([972af23](https://github.com/special-place-ai-heaven/symforge/commit/972af23e1f518abb8f694f9749fa0a66b9fcc1c0))
+* **protocol:** avoid false watcher gap on same-root reindex ([#652](https://github.com/special-place-ai-heaven/symforge/issues/652)) ([05f7e60](https://github.com/special-place-ai-heaven/symforge/commit/05f7e60e4e1bbcb1d811f4c93c49a23910a7ba06))
+
 ## [11.0.8](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.7...v11.0.8) (2026-08-24)
 
 
