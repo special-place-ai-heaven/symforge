@@ -131,7 +131,7 @@ identity_newtype!(
 /// variants under this name; that both diverged from the contract this module's
 /// own header declares authoritative AND squatted the name T047's runtime
 /// vocabulary owns. Provenance SHAPES are named by
-/// [`ClaimProvenance::kind_name`], not here.
+/// [`crate::protocol::format::claim_provenance::ClaimProvenance::kind_name`], not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OperationKind {
     AcquireRuntime,

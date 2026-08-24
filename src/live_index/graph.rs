@@ -302,13 +302,13 @@ pub struct BlastNode {
 /// 2. **Owner-name match** (019 recall-recovery): the hint == the target type of
 ///    a candidate's enclosing `impl` block recovers `Target::method` calls that
 ///    the module-stem match cannot. Computed from physical defs via
-///    [`enclosing_impl_owner`]; if two physical defs share that owner name
+///    [`crate::live_index::enclosing_impl_owner`]; if two physical defs share that owner name
 ///    (twin `impl Target` in different files), the hint does NOT disambiguate
 ///    and we drop — mirroring the module-stem uniqueness guard.
 ///
 /// ponytail: both matches are syntactic heuristics, not real name resolution;
 /// the resolver at C-S2-001 supersedes them. Owner-name recovery is
-/// Rust-`impl`-shaped (see [`enclosing_impl_owner`]) — non-Rust grammars whose
+/// Rust-`impl`-shaped (see [`crate::live_index::enclosing_impl_owner`]) — non-Rust grammars whose
 /// containers aren't `SymbolKind::Impl` yield no owner and keep the drop path.
 fn resolve_ambiguous_callee<'a>(
     candidates: &'a [SymbolId],

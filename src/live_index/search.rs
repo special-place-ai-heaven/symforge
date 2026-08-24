@@ -1322,7 +1322,7 @@ fn file_matches_text_options(
 /// `SearchScope::Code` (code class only) + the default `NoisePolicy`
 /// (generated and test files hidden; vendor kept) + personal-tooling exclusion.
 /// It is single-sourced through [`SearchScope::allows`],
-/// [`NoisePolicy::allows`], and [`is_personal_tooling_path`] so the overlay
+/// [`NoisePolicy::allows`], and [`crate::live_index::query::is_personal_tooling_path`] so the overlay
 /// scan cannot diverge from the base classifier.
 ///
 /// `pub(super)` for the overlay post-filter in `live_index::view`; the base

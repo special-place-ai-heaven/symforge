@@ -270,7 +270,7 @@ pub fn run(args: SetupCliArgs) -> anyhow::Result<()> {
 }
 
 /// Keep an interactive `symforge setup` in the foreground when the wizard STARTED
-/// the operator server, so the "Dashboard: <url>" it just printed actually keeps
+/// the operator server, so the "Dashboard: \<url\>" it just printed actually keeps
 /// serving (D21 sibling of the admin-verb fix). A reused server is owned by
 /// another process (return immediately); a run that started nothing (in-harness
 /// mode, or a declined plan) also returns. Only a server we started ourselves
