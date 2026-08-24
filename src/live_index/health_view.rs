@@ -179,7 +179,7 @@ pub(crate) fn is_expected_framework_partial_parse(file: &IndexedFile) -> bool {
 /// structurally 0 on every other repo and the headline "unexpected repo-owned
 /// partial" metric was dominated by vendored / generated / fixture / template
 /// noise. This reuses the SAME path heuristics the search filters use
-/// ([`FileClassification`] + [`NoisePolicy::classify_path`]) plus a content
+/// ([`crate::domain::FileClassification`] + [`NoisePolicy::classify_path`]) plus a content
 /// signal for template DSLs, so the buckets actually fire.
 ///
 /// These buckets are HEURISTIC and PATH-BASED — they are an honest best-effort

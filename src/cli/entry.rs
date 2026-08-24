@@ -27,7 +27,7 @@ pub enum MainExit {
     ServeRefusedToStart,
 }
 
-/// Run the symforge CLI with `args` (argv[0] included), exactly as the
+/// Run the symforge CLI with `args` (`argv\[0\]` included), exactly as the
 /// binary's `main` always has.
 pub fn run_main(args: Vec<OsString>) -> anyhow::Result<MainExit> {
     // Record this binary's path+version so a stale durable binary can be

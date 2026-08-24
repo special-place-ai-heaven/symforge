@@ -4030,7 +4030,7 @@ pub fn find_references_result_view(
     lines.join("\n")
 }
 
-/// Render a compact find_references result: file:line [kind] in symbol — no source text.
+/// Render a compact find_references result: file:line \[kind\] in symbol — no source text.
 pub fn find_references_compact_view(
     view: &FindReferencesView,
     name: &str,
@@ -4201,7 +4201,7 @@ pub fn find_dependents_result_view(
     lines.join("\n")
 }
 
-/// Render a compact find_dependents result: file:line [kind] without source text.
+/// Render a compact find_dependents result: file:line \[kind\] without source text.
 pub fn find_dependents_compact_view(
     view: &FindDependentsView,
     path: &str,

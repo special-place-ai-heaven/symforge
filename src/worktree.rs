@@ -435,8 +435,8 @@ const MISUSE_WINDOW: Duration = Duration::from_secs(3600);
 /// `health` tool as a rolling "last hour" signal so regressions stay
 /// visible after the feature ships.
 ///
-/// The window rolls lazily: [`record_missing_working_directory`] and
-/// [`current_window_count`] both reset the counter when the previous
+/// The window rolls lazily: [`WorktreeMisuseCounter::record_missing_working_directory`] and
+/// [`WorktreeMisuseCounter::current_window_count`] both reset the counter when the previous
 /// window has elapsed before reading or incrementing it.
 #[derive(Debug)]
 pub struct WorktreeMisuseCounter {

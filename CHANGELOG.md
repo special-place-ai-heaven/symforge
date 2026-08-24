@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.8](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.7...v11.0.8) (2026-08-24)
+
+
+### Bug Fixes
+
+* **daemon:** make the idle-shutdown test observation non-racy ([#645](https://github.com/special-place-ai-heaven/symforge/issues/645)) ([2e848d8](https://github.com/special-place-ai-heaven/symforge/commit/2e848d870cd6d30b6b866eee40280b1deaafc04a))
+
 ## [11.0.7](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.6...v11.0.7) (2026-08-24)
 
 
