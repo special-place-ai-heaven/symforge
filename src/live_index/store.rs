@@ -2130,12 +2130,25 @@ impl SharedIndexHandle {
     /// than rederiving it, so the latch survives every ordinary republication.
     /// The latch is one-way for this handle; no current lane can prove the
     /// missed window was recovered.
-    #[cfg(test)]
+    ///
+    /// Unfenced. Use this ONLY from a caller that already excludes a
+    /// concurrent retarget -- today that is `ProjectSlot::reload_with`, which
+    /// holds the slot's mutation lock across the whole abort/rebuild window.
+    /// Every caller that cannot exclude one (a watcher incarnation that may
+    /// have been superseded) must use
+    /// [`Self::latch_observer_gap_at_generation`] instead, or it will degrade
+    /// the project that replaced it -- and `WatcherUnavailable` makes sidecar
+    /// reads answer 503.
     pub(crate) fn latch_observer_gap(&self) {
         let _wg = self.write_mutex.lock();
         self.latch_observer_gap_locked();
     }
 
+    /// Latch only if the publication still carries `expected_project_generation`.
+    ///
+    /// Returns whether the latch committed. A refusal is not an error: it
+    /// means this caller's incarnation no longer serves the published root, so
+    /// its gap is not this project's gap.
     pub(crate) fn latch_observer_gap_at_generation(
         &self,
         expected_project_generation: u64,

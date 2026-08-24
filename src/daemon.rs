@@ -3573,12 +3573,7 @@ impl ProjectSlot {
                 Arc::clone(&project.stop_token),
             )
         };
-        if abort_watcher_task(&mut watcher_task, &old_stop_token) {
-            let expected_generation = index.current_project_generation();
-            if !index.latch_observer_gap_at_generation(expected_generation) {
-                tracing::debug!("watcher: daemon reload cancellation latch refused");
-            }
-        }
+        let observer_aborted = abort_watcher_task(&mut watcher_task, &old_stop_token);
 
         // A failed rebuild must not leave the project blind. The abort above
         // stopped the observer and `take()` already cleared its handle, so
@@ -3589,6 +3584,20 @@ impl ProjectSlot {
         // STILL bound to: the success path below is what retargets
         // `canonical_root`, so on this path the old root is the one to watch.
         if let Err(error) = reload_index(&index, canonical_root) {
+            // `task.abort()` is a hard abort: the watcher's cooperative tail --
+            // the one place that latches its own cancellation gap -- never
+            // runs on this path. The RETAINED index keeps serving, and every
+            // change between the abort and the replacement below is unseen,
+            // so the daemon must latch the gap the watcher could not. The
+            // success path needs no latch: a completed reload is a full
+            // re-scan that supersedes anything the old observer missed.
+            //
+            // Unfenced on purpose. `_mutation` is held for this whole window,
+            // so no concurrent retarget can make this a stale incarnation's
+            // gap -- the fenced variant would compare a generation to itself.
+            if observer_aborted {
+                index.latch_observer_gap();
+            }
             let retained_root = self.metadata.read().canonical_root.clone();
             let stop_token = Arc::new(AtomicBool::new(false));
             let watcher_task = start_project_watcher(
@@ -10162,21 +10171,66 @@ mod tests {
         }
 
         let root = canonical_project_root(project.path()).expect("canonical project");
-        slot.reload_with(&root, |index, root| index.reload(root))
-            .expect("reload");
-
-        let freshness = {
+        let latched = |slot: &ProjectSlot| {
             let project = slot.metadata.read();
-            project.index.shared().freshness_status()
-        };
-        assert!(
+            let freshness = project.index.shared().freshness_status();
             matches!(
                 freshness.as_ref(),
                 crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
                     if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
-            ),
-            "daemon abort skips the watcher's cooperative tail, so reload must latch the gap itself"
+            )
+        };
+
+        // Positive control first: the FAILED reload is the hole. The abort
+        // already ran, the retained index keeps serving, and nothing covered
+        // the root until the replacement watcher started.
+        let error = slot
+            .reload_with(&root, |_index, _root| anyhow::bail!("rebuild refused"))
+            .expect_err("the injected rebuild failure must propagate");
+        assert!(
+            error.to_string().contains("rebuild refused"),
+            "unexpected error: {error}"
         );
+        assert!(
+            latched(&slot),
+            "daemon abort skips the watcher's cooperative tail, so a failed reload must latch the gap itself"
+        );
+        assert!(
+            slot.metadata.read().watcher_task.is_some(),
+            "a failed reload must still install a replacement watcher"
+        );
+
+        // Negative control on a fresh slot: a SUCCESSFUL reload is a full
+        // re-scan that supersedes anything the aborted observer missed, so it
+        // must NOT latch -- `WatcherUnavailable` would 503 every sidecar read
+        // of a project that was just rebuilt from scratch.
+        let fresh = DaemonState::new();
+        let reopened = fresh
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "daemon-abort-gap-success".to_string(),
+                pid: None,
+            })
+            .expect("open project again");
+        let fresh_slot = fresh
+            .projects
+            .read()
+            .get(&reopened.project_id)
+            .cloned()
+            .expect("fresh project slot");
+        assert!(
+            !latched(&fresh_slot),
+            "precondition: a freshly opened project must start un-latched"
+        );
+        fresh_slot
+            .reload_with(&root, |index, root| index.reload(root))
+            .expect("successful reload");
+        assert!(
+            !latched(&fresh_slot),
+            "a successful reload is a full re-scan and must not report WatcherUnavailable"
+        );
+
+        fresh_slot.stop();
         slot.stop();
     }
 
