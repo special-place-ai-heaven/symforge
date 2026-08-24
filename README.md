@@ -81,38 +81,39 @@ Measured token savings, with their method and date, live on the wiki: [Benchmark
 ## How it works
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}}}%%
 flowchart TD
     accTitle: SymForge architecture
     accDescr: MCP clients reach the server over stdio or HTTP. Startup restores a current-format snapshot or treats a V10 file as an untrusted seed, then the preventive lifecycle and admission scout feed the live index.
 
     subgraph Clients["Clients"]
-        MCP["MCP clients<br/>Claude, Codex, Gemini, Cursor, Grok, Kilo"]
-        LIB["Embedding platforms<br/>(no MCP)"]
+        MCP["MCP clients\nClaude · Codex · Gemini\nCursor · Grok · Kilo"]
+        LIB["Embedding platforms\n(no MCP)"]
     end
 
     subgraph Surfaces["Server surfaces"]
         STDIO["stdio MCP server"]
-        HTTP["symforge serve<br/>Streamable HTTP /mcp + /admin"]
-        DAEMON["optional shared daemon<br/>loopback, token auth"]
+        HTTP["symforge serve\nStreamable HTTP\n/mcp + /admin"]
+        DAEMON["optional shared daemon\nloopback, token auth"]
     end
 
     subgraph Startup["Index startup"]
-        SNAP["current-format snapshot<br/>or untrusted V10 seed"]
-        SCOUT["metadata-first scout<br/>one disposition per file"]
-        PARSE["tree-sitter<br/>25 grammars"]
-        KNOW["knowledge lane<br/>docs, specs, safe configs"]
-        LIFE["preventive lifecycle<br/>candidates, leases, verify"]
+        SNAP["current-format snapshot\nor untrusted V10 seed"]
+        SCOUT["metadata-first scout\none disposition per file"]
+        PARSE["tree-sitter, 19 grammars\n+ 6 text/config parsers"]
+        KNOW["knowledge lane\ndocs, specs, safe configs"]
+        LIFE["preventive lifecycle\ncandidates, leases, verify"]
     end
 
     subgraph Core["Live index"]
-        IDX["LiveIndex<br/>symbols, refs, content"]
-        SIG["git signals<br/>frecency, co-change"]
-        VERIFY["background verify<br/>reconcile vs disk"]
+        IDX["LiveIndex\nsymbols, refs, content"]
+        SIG["git signals\nfrecency, co-change"]
+        VERIFY["background verify\nreconcile vs disk"]
     end
 
     subgraph Lanes["Answer + write lanes"]
-        TOOLS["39 advertised tools<br/>resources + prompts<br/>trust envelopes"]
-        GATE["read_gate<br/>admit_disk_read"]
+        TOOLS["39 advertised tools\nresources + prompts\ntrust envelopes"]
+        GATE["read_gate\nadmit_disk_read"]
         EDITS["structural edit engine"]
     end
 
