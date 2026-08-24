@@ -3425,16 +3425,13 @@ fn cleanup_failed_daemon_admission(
     project_id: &str,
     admission: live_index::index_lifecycle::activation::ProjectAdmission,
 ) {
-    let cleanup = admission.cleanup_candidate().then(|| {
-        (
-            live_index::index_lifecycle::registry::ProjectKey::new(project_id),
-            admission.slot().slot(),
-        )
-    });
+    let key = live_index::index_lifecycle::registry::ProjectKey::new(project_id);
+    let slot = admission.slot().slot();
+    // A JoinedLive daemon opener may be joining a slot installed before
+    // ProjectSlot construction; stop_if_unheld is the holder-safety guard.
     drop(admission);
-    if let Some((key, slot)) = cleanup
-        && let Err(refusal) = live_index::index_lifecycle::activation::process_project_registry()
-            .stop_if_unheld(&key, slot)
+    if let Err(refusal) = live_index::index_lifecycle::activation::process_project_registry()
+        .stop_if_unheld(&key, slot)
     {
         tracing::debug!(
             project_id = %project_id,
@@ -6915,6 +6912,54 @@ mod tests {
                 Err(live_index::index_lifecycle::registry::RegistryRefusal::NotAdmitted)
             ),
             "a failed bootstrap must not leave a live lifecycle admission behind"
+        );
+    }
+
+    #[test]
+    fn joined_live_failed_project_load_retires_after_last_failed_holder() {
+        let tmp = TempDir::new().expect("tempdir");
+        let canonical_root = dunce::canonicalize(tmp.path()).expect("canonical root");
+        let root_id = crate::discovery::project_id_for_canonical_root(&canonical_root);
+        let state_placement = StatePlacement::ProjectLocal {
+            directory: crate::domain::ProjectStateDir::new(canonical_root.join(".symforge")),
+        };
+        let first = live_index::index_lifecycle::activation::admit_project_with_outcome(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+            &canonical_root,
+            &root_id.0,
+            SourceAccessMode::NormalProject,
+            &state_placement,
+        )
+        .expect("first daemon admission");
+        let second = live_index::index_lifecycle::activation::admit_project_with_outcome(
+            live_index::index_lifecycle::process_runtime::SurfaceKind::Daemon,
+            &canonical_root,
+            &root_id.0,
+            SourceAccessMode::NormalProject,
+            &state_placement,
+        )
+        .expect("second daemon admission joins the live lifecycle slot");
+        assert!(
+            !second.cleanup_candidate(),
+            "precondition: second opener joined a slot already installed as live"
+        );
+
+        let key = live_index::index_lifecycle::registry::ProjectKey::new(root_id.0.clone());
+        cleanup_failed_daemon_admission(&root_id.0, first);
+        assert!(
+            live_index::index_lifecycle::activation::process_project_registry()
+                .live(&key)
+                .is_ok(),
+            "the first failed holder must not retire while another opener still holds the slot"
+        );
+
+        cleanup_failed_daemon_admission(&root_id.0, second);
+        assert!(
+            matches!(
+                live_index::index_lifecycle::activation::process_project_registry().live(&key),
+                Err(live_index::index_lifecycle::registry::RegistryRefusal::NotAdmitted)
+            ),
+            "the last failed holder must retire the lifecycle slot even after joining it live"
         );
     }
 
