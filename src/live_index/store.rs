@@ -2128,10 +2128,40 @@ impl SharedIndexHandle {
     /// `WatcherUnavailable` is the carrier because
     /// [`Self::recompute_freshness_locked`] already retains it verbatim rather
     /// than rederiving it, so the latch survives every ordinary republication.
-    /// Only a committed reconcile that proves complete coverage retires it —
-    /// see `publish_reconciled_scout_plan_at_generation`.
+    /// The latch is one-way for this handle; no current lane can prove the
+    /// missed window was recovered.
+    ///
+    /// Unfenced. Use this ONLY from a caller that already excludes a
+    /// concurrent retarget -- today that is `ProjectSlot::reload_with`, which
+    /// holds the slot's mutation lock across the whole abort/rebuild window.
+    /// Every caller that cannot exclude one (a watcher incarnation that may
+    /// have been superseded) must use
+    /// [`Self::latch_observer_gap_at_generation`] instead, or it will degrade
+    /// the project that replaced it -- and `WatcherUnavailable` makes sidecar
+    /// reads answer 503.
     pub(crate) fn latch_observer_gap(&self) {
         let _wg = self.write_mutex.lock();
+        self.latch_observer_gap_locked();
+    }
+
+    /// Latch only if the publication still carries `expected_project_generation`.
+    ///
+    /// Returns whether the latch committed. A refusal is not an error: it
+    /// means this caller's incarnation no longer serves the published root, so
+    /// its gap is not this project's gap.
+    pub(crate) fn latch_observer_gap_at_generation(
+        &self,
+        expected_project_generation: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        if self.published_generation().project_generation != expected_project_generation {
+            return false;
+        }
+        self.latch_observer_gap_locked();
+        true
+    }
+
+    fn latch_observer_gap_locked(&self) {
         let current = self.freshness_status.load_full();
         let (last_valid, mut reasons) = match current.as_ref() {
             FreshnessStatus::Degraded {

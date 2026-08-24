@@ -1,3 +1,35 @@
+# SymForge v11.0.5 Blind Stress Evaluation — 2026-08-24
+
+## Plan
+
+- [x] Freeze an evidence rubric for correctness, latency, token economy, severity, and confidence before inspecting any external assessment.
+- [x] Inventory the full 39-tool surface and exercise every safe read/guidance/recovery tool plus preview/error/idempotency paths for mutation tools.
+- [x] Build a reproducible external corpus spanning Rust, Python, JavaScript/TypeScript, Go, C/C++, C#, and documentation-heavy repositories.
+- [x] Measure cold and warm indexing, repeated-query latency, resource use where observable, and correctness against independent repository/native-tool oracles.
+- [x] Quantify token economics at schema, response, retrieval, and equivalent-workflow levels; distinguish measured savings from estimates and enabled-host effects.
+- [x] Stress repository knowledge across Markdown and other text, authority/source scopes, refs/worktrees, curation availability, provenance, and stale/malformed content.
+- [x] Exercise health, checkpoint verification, watcher refresh, syntax validation, change/impact analysis, cross-project routing, compression/retrieval, and deterministic error contracts.
+- [x] Inspect implementation paths only after black-box findings are frozen, then identify likely root causes without converting hypotheses into observed facts.
+- [ ] Produce a blind provisional verdict, compare it separately with the Grok 4.6 report, and classify overlap, misses, false positives, and unsupported claims. Blind verdict is frozen; external comparison awaits the user's report.
+- [x] Record measured evidence and final review in this section.
+
+## Evidence Log
+
+- Evaluation began 2026-08-24 with the external Grok report intentionally withheld to avoid anchoring.
+- Initial MCP health was unbound/empty despite repository CWD; explicit indexing completed in 47.449 s for 1,129 files and 35,294 symbols.
+- Post-index compact health reported 1,123 parsed, 4 expected-vendor partial, 2 failed, knowledge manifest complete, bridge truncated, and knowledge curation unavailable because atomic durability was unavailable.
+- Installed MCP runtime reports version 11.0.5; repository guidance still describes the shipped v8.14.0 surface.
+- Exercised all 39 installed tools plus six static resources, four resource templates, and eight prompts across a deterministic seven-language oracle and seven public repositories (1,139 indexed public files, 16,364 symbols).
+- Public-repo cold/warm indexing totaled 6.001 s / 3.613 s. Six non-spdlog corpora parsed 953/959 files fully; macro-heavy spdlog parsed only 56/180 fully and missed the decorated async_logger class declaration.
+- Fifteen-repeat warm medians were 216-246 ms for core code reads/searches and 1,558 ms for search_knowledge. Full/compact tools/list measured 85,608 / 4,768 JSON characters (about 21.4k / 1.2k tokens).
+- A clean current-checkout 11.0.6 release build completed in 18m 23s. It reproduced the ask path-punctuation bug and tests.rs filter leak.
+- Current 11.0.6 compact mode served from a healthy snapshot in 0.94 s, but after oracle -> p-limit -> oracle switching, the next compact launch remained Loading beyond 20 s in 3/3 cycles despite watcher reconciliation reporting now fresh; full index_folder repaired it.
+- Blind report frozen before Grok review at research/token-cost/symforge-blind-stress-evaluation-2026-08-24.md.
+
+## Review
+
+Blind phase complete. Core code navigation and guarded mutation are genuinely useful; correctness was strong across six ordinary language families, watcher refresh/checkpoint/idempotency controls passed, and targeted large-file retrieval produced substantial token reductions. The product is not yet a universal token win: the full surface costs about 21.4k schema tokens, knowledge is about seven times slower than code search and provenance-heavy, macro-decorated C++ loses declarations, automatic indexing dirties tracked .gitignore files, and current 11.0.6 has a reproducible post-project-switch snapshot/compact Loading transition. Realized token economy is scored 6.5/10, with 8.5/10 potential after compact-state and response-composition fixes. Grok comparison remains intentionally pending.
+
 # SymForge MCP Token-Economics Evaluation
 
 ## Release train — 2026-07-14
