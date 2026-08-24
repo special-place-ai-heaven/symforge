@@ -18,7 +18,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::http::StatusCode;
 use rmcp::handler::server::wrapper::Parameters;
@@ -8060,17 +8060,12 @@ impl SymForgeServer {
                 // completely untouched.
                 let previous_watcher = self.watcher_handle.lock().take();
                 if let Some(previous_watcher) = previous_watcher {
+                    // A successful reload is a full baseline. Do not drive the
+                    // predecessor's cooperative cancellation tail: same-root
+                    // handoffs would adopt the new generation and falsely latch
+                    // WatcherUnavailable on the rebuilt index.
                     previous_watcher.stop_token.store(true, Ordering::Release);
-                    let mut previous_task = previous_watcher.task;
-                    if tokio::time::timeout(Duration::from_secs(2), &mut previous_task)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            "watcher: previous watcher did not stop during successful index handoff"
-                        );
-                        previous_task.abort();
-                    }
+                    previous_watcher.task.abort();
                 }
                 if reset_report.is_some() {
                     self.index.data_plane().mark_index_folder_reset();
@@ -17543,6 +17538,18 @@ mod tests {
             first.contains("Indexed 1 files"),
             "first local index_folder should succeed, got: {first}"
         );
+        for _ in 0..100 {
+            if server.watcher_info.lock().state == crate::watcher_state::WatcherState::Active {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            server.watcher_info.lock().state,
+            crate::watcher_state::WatcherState::Active,
+            "predecessor watcher must be active before exercising same-root handoff"
+        );
+        settle_background_publications(&server).await;
 
         fs::write(repo.path().join("src/lib.rs"), "pub fn second() {}\n").expect("update file");
         let second = server
@@ -17556,6 +17563,11 @@ mod tests {
         assert!(
             second.contains("Indexed 1 files"),
             "second local index_folder should also succeed, got: {second}"
+        );
+        assert_eq!(
+            server.index.data_plane().freshness_status().as_ref(),
+            &crate::domain::FreshnessStatus::Current,
+            "successful same-root reindex must not be degraded by the retired watcher"
         );
 
         let outline = server
