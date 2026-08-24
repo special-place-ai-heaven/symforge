@@ -57,9 +57,58 @@ impl ProjectConfigTrustMode {
 #[cfg(test)]
 #[cfg(test)]
 mod tests {
-    use super::{EditResultStatus, classify_edit_output, session_stale_recovery};
+    use super::{
+        EditResultStatus, classify_edit_output, session_stale_recovery, statused_edit_tool_result,
+    };
     use crate::protocol::surface_probe::{SurfaceProfile, with_connection_surface};
     use std::ffi::OsString;
+
+    fn serialized_edit_result(status: EditResultStatus) -> serde_json::Value {
+        let result =
+            statused_edit_tool_result("edit result".to_string(), status, Vec::new()).unwrap();
+        serde_json::to_value(&result).unwrap()
+    }
+
+    #[test]
+    fn edit_statuses_without_an_applied_mutation_are_mcp_errors() {
+        for (status, expected_status, expected_outcome) in [
+            (EditResultStatus::NotFound, "not_found", "not_found"),
+            (EditResultStatus::Ambiguous, "ambiguous", "ambiguous"),
+            (
+                EditResultStatus::InvalidRequest,
+                "invalid_request",
+                "invalid_request",
+            ),
+            (
+                EditResultStatus::InternalFailure,
+                "internal_failure",
+                "internal_failure",
+            ),
+        ] {
+            let serialized = serialized_edit_result(status);
+            assert_eq!(
+                serialized["isError"],
+                serde_json::json!(true),
+                "{expected_status} must be host-visible failure: {serialized}"
+            );
+            assert_eq!(
+                serialized["_meta"][crate::protocol::result_status::RESULT_STATUS_META_KEY]["status"],
+                serde_json::json!(expected_status)
+            );
+            assert_eq!(
+                serialized["_meta"][crate::protocol::result_status::RESULT_STATUS_META_KEY]["outcome_class"],
+                serde_json::json!(expected_outcome)
+            );
+        }
+    }
+
+    #[test]
+    fn edit_success_and_dry_run_remain_successful_mcp_results() {
+        for status in [EditResultStatus::Success, EditResultStatus::DryRunSuccess] {
+            let serialized = serialized_edit_result(status);
+            assert_eq!(serialized["isError"], serde_json::json!(false));
+        }
+    }
 
     #[test]
     fn daemon_wrapped_edit_errors_classify_as_invalid_request() {
@@ -254,6 +303,10 @@ impl EditResultStatus {
             Self::InternalFailure => OutcomeClass::InternalFailure,
         }
     }
+
+    const fn is_terminal_failure(self) -> bool {
+        !matches!(self, Self::Success | Self::DryRunSuccess)
+    }
 }
 
 fn statused_edit_tool_result(
@@ -285,7 +338,7 @@ fn statused_edit_tool_result(
     meta.insert(RESULT_STATUS_META_KEY.to_string(), status_payload);
 
     let content = vec![rmcp::model::ContentBlock::text(text)];
-    let result = if status.outcome_class().is_error() {
+    let result = if status.is_terminal_failure() {
         rmcp::model::CallToolResult::error(content)
     } else {
         rmcp::model::CallToolResult::success(content)
