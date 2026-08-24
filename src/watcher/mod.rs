@@ -1041,7 +1041,16 @@ pub async fn run_watcher_with_stop(
                         "watcher: entering degraded mode after {} consecutive failures",
                         MAX_FAILURES
                     );
-                    shared.latch_observer_gap();
+                    // Fenced for the same reason as the cancellation latch at
+                    // the tail of this function: a degraded incarnation proves
+                    // a gap in ITS root's coverage only. If the publication has
+                    // since been retargeted, latching here would report the
+                    // successor project as stale and 503 its reads.
+                    let effective_generation =
+                        effective_fence_generation(&shared, &repo_root, expected_gen);
+                    if !shared.latch_observer_gap_at_generation(effective_generation) {
+                        debug!("watcher: stale incarnation's start-failure latch refused");
+                    }
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1273,7 +1282,15 @@ pub async fn run_watcher_with_stop(
                     info.state = WatcherState::Starting;
                 }
                 drop(handle);
-                shared.latch_observer_gap();
+                // The restart window is uncovered: this handle is dropped and
+                // its successor has not started. Fenced like the other two
+                // latch sites so a stale incarnation cannot degrade the project
+                // that replaced it.
+                let effective_generation =
+                    effective_fence_generation(&shared, &repo_root, expected_gen);
+                if !shared.latch_observer_gap_at_generation(effective_generation) {
+                    debug!("watcher: stale incarnation's restart latch refused");
+                }
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_FAILURES {
                     {
