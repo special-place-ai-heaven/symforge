@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.12](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.11...v11.0.12) (2026-08-25)
+
+
+### Bug Fixes
+
+* **edit:** let the edit envelope outrank echoed refusal phrases ([#665](https://github.com/special-place-ai-heaven/symforge/issues/665)) ([5bd5eaf](https://github.com/special-place-ai-heaven/symforge/commit/5bd5eafc5c306bcb821e978e59995372c1e028c7))
+
 ## [11.0.11](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.10...v11.0.11) (2026-08-25)
 
 
