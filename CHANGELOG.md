@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.10](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.9...v11.0.10) (2026-08-25)
+
+
+### Bug Fixes
+
+* **edit:** report every mutation that applied nothing as an MCP error ([#657](https://github.com/special-place-ai-heaven/symforge/issues/657)) ([d4c5b6c](https://github.com/special-place-ai-heaven/symforge/commit/d4c5b6c9233cb5c6a5f4a8a85a8c3ec6f150fbbb))
+
 ## [11.0.9](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.8...v11.0.9) (2026-08-24)
 
 
