@@ -1043,6 +1043,26 @@ impl SymForgeServer {
         duration: Duration,
         outcome_class: OutcomeClass,
     ) {
+        self.record_tool_completion_with_success(
+            tool_name,
+            response_text,
+            duration,
+            outcome_class,
+            !outcome_class.is_error(),
+        );
+    }
+
+    /// Mutation tools pass their own `success`: the usage record must agree
+    /// with the wire, and a not-found write is `isError:true` there while a
+    /// not-found read is not.
+    pub(crate) fn record_tool_completion_with_success(
+        &self,
+        tool_name: &'static str,
+        response_text: &str,
+        duration: Duration,
+        outcome_class: OutcomeClass,
+        success: bool,
+    ) {
         let recorder = self.analytics_recorder.read().clone();
         let response_bytes = response_text.len() as u64;
         let observation = crate::analytics::AnalyticsObservation::new(
@@ -1052,7 +1072,7 @@ impl SymForgeServer {
             response_bytes,
             Some(estimate_tokens(response_bytes)),
             duration,
-            !outcome_class.is_error(),
+            success,
             outcome_class,
         );
         let _ = recorder.enqueue(observation);
@@ -1947,6 +1967,12 @@ impl SymForgeServer {
                 call_statused!(replace_symbol_body_tool, edit::ReplaceSymbolBodyInput)
             }
             "batch_edit" => call_statused!(batch_edit_tool, edit::BatchEditInput),
+            "insert_symbol" => call_statused!(insert_symbol_tool, edit::InsertSymbolInput),
+            "delete_symbol" => call_statused!(delete_symbol_tool, edit::DeleteSymbolInput),
+            "edit_within_symbol" => {
+                call_statused!(edit_within_symbol_tool, edit::EditWithinSymbolInput)
+            }
+            "batch_rename" => call_statused!(batch_rename_tool, edit::BatchRenameInput),
             "batch_insert" => call_statused!(batch_insert_tool, edit::BatchInsertInput),
             "search_files" => call_statused!(search_files_tool, tools::SearchFilesInput),
             "search_text" => call_statused!(search_text_tool, tools::SearchTextInput),

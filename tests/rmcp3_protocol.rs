@@ -435,6 +435,86 @@ async fn binding_rung_index_folder_over_modern_dispatch() {
     server.shutdown().await;
 }
 
+/// Mutation truth at a real transport seam: over serialized JSON-RPC, a
+/// mutation that applied nothing must arrive as `isError:true`, and a dry run
+/// that previewed one must not. Some hosts keep only `isError` + content, so
+/// `_meta` alone cannot carry this contract.
+#[tokio::test]
+async fn mutation_no_apply_is_error_over_http_transport() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("src dir");
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn present() {}\npub fn other() {}\n",
+    )
+    .expect("seed file");
+
+    let server = start_server(test_runtime()).await;
+    let mut client = McpHttpClient::new(server.mcp_url());
+    let path = dir.path().to_str().expect("utf8 tempdir").to_string();
+
+    let mut index_headers = modern_headers("tools/call");
+    index_headers.push(("Mcp-Name", "index_folder"));
+    client
+        .call(
+            "tools/call",
+            with_modern_meta(json!({"name": "index_folder", "arguments": {"path": path}})),
+            &index_headers,
+        )
+        .await;
+
+    let mut edit_headers = modern_headers("tools/call");
+    edit_headers.push(("Mcp-Name", "delete_symbol"));
+    let missing = client
+        .call(
+            "tools/call",
+            with_modern_meta(json!({
+                "name": "delete_symbol",
+                "arguments": {"path": "src/lib.rs", "name": "missing", "dry_run": false}
+            })),
+            &edit_headers,
+        )
+        .await;
+    assert_eq!(
+        missing["isError"],
+        json!(true),
+        "a delete that found nothing to delete must be a transport-visible error: {missing}"
+    );
+    assert_eq!(
+        missing["_meta"]["symforge/result_status"]["status"],
+        json!("not_found"),
+        "{missing}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).expect("read back"),
+        "pub fn present() {}\npub fn other() {}\n",
+        "a failed mutation must not touch the file"
+    );
+
+    let preview = client
+        .call(
+            "tools/call",
+            with_modern_meta(json!({
+                "name": "delete_symbol",
+                "arguments": {"path": "src/lib.rs", "name": "other", "dry_run": true}
+            })),
+            &edit_headers,
+        )
+        .await;
+    assert_eq!(
+        preview["isError"],
+        json!(false),
+        "a dry run is not a failure: {preview}"
+    );
+    assert_eq!(
+        preview["_meta"]["symforge/result_status"]["status"],
+        json!("dry_run_success"),
+        "{preview}"
+    );
+
+    server.shutdown().await;
+}
+
 /// Rung 3: the CWD walk — exercised directly against `find_project_root` with
 /// the env override absent (serial suite; CWD is restored on exit).
 #[tokio::test]

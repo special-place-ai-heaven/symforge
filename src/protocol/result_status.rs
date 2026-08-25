@@ -180,7 +180,27 @@ impl ResultStatus {
         }
     }
 
+    /// Mutation exit: `isError` is true for every outcome except `Found`.
+    ///
+    /// Reads keep [`Self::into_call_tool_result`], where an empty or not-found
+    /// result is still a successful query. A mutation that found nothing to
+    /// change performed no change, and hosts that keep only `isError` +
+    /// content must not see it as success.
+    pub fn into_mutation_call_tool_result(self, human_text: impl Into<String>) -> CallToolResult {
+        let is_error = !matches!(self.outcome_class, OutcomeClass::Found);
+        self.into_call_tool_result_with(human_text, is_error)
+    }
+
     pub fn into_call_tool_result(self, human_text: impl Into<String>) -> CallToolResult {
+        let is_error = self.outcome_class.is_error();
+        self.into_call_tool_result_with(human_text, is_error)
+    }
+
+    fn into_call_tool_result_with(
+        self,
+        human_text: impl Into<String>,
+        is_error: bool,
+    ) -> CallToolResult {
         let mut meta = JsonObject::new();
         meta.insert(
             RESULT_STATUS_META_KEY.to_string(),
@@ -196,7 +216,7 @@ impl ResultStatus {
         }
 
         let content = vec![ContentBlock::text(human_text.into())];
-        let result = if self.outcome_class.is_error() {
+        let result = if is_error {
             CallToolResult::error(content)
         } else {
             CallToolResult::success(content)
