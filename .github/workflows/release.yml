@@ -261,14 +261,17 @@ jobs:
           # Floor the baseline at the latest release tag. The lookup above once
           # returned a SHA from the v10.11.1 era (2026-08-24), which swept two
           # legacy non-conventional inner commits into the range and reddened a
-          # push that owed no release. A baseline older than the latest tag is
-          # never legitimate: every tagged release was itself a successful
-          # Release push. Fail closed rather than widen the range silently.
+          # push that owed no release. The tag is created before the build and
+          # publish jobs run, so a tag can exist while its own Release run
+          # failed and left no newer success; the baseline then legitimately
+          # predates the tag. Clamp to the tag and say so, rather than either
+          # widening the range silently or blocking every later push until a
+          # manual rerun succeeds (review finding, 2026-08-25).
           git fetch --tags --force --quiet
           FLOOR=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA" 2>/dev/null || true)
           if [ -n "$FLOOR" ] && ! git merge-base --is-ancestor "$FLOOR" "$LAST"; then
-            echo "::error::Last successful Release SHA $LAST predates the latest release tag $FLOOR; refusing a stale baseline."
-            exit 1
+            echo "::warning::Last successful Release SHA $LAST predates the latest release tag $FLOOR; validating from the tag instead."
+            LAST=$(git rev-parse "$FLOOR^{commit}")
           fi
           echo "Validating subjects in $LAST..$GITHUB_SHA (floor $FLOOR)"
           python execution/conventional_commits.py check-push-range "$LAST" "$GITHUB_SHA"
