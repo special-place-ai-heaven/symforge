@@ -337,10 +337,13 @@ pub(crate) fn classify_intent_with_match(query: &str) -> (QueryIntent, bool) {
     }
 
     // --- Heuristic: looks like a file path (contains / or common extensions) ---
-    if looks_like_path(q) {
+    // A path typed as a question (`src/lib.rs?`) is still a path; the sentence
+    // mark must not travel into the route as part of the filename.
+    let path_candidate = strip_terminal_punctuation(q);
+    if looks_like_path(path_candidate) {
         return (
             QueryIntent::FindFile {
-                hint: q.to_string(),
+                hint: path_candidate.to_string(),
             },
             false,
         );
@@ -696,13 +699,20 @@ fn split_trailing_scope_hint(value: &str) -> (String, Option<String>) {
     for needle in [" within ", " inside ", " under ", " in "] {
         if let Some((head, tail)) = value.rsplit_once(needle) {
             let head = head.trim();
-            let tail = tail.trim();
+            let tail = strip_terminal_punctuation(tail.trim());
             if !head.is_empty() && looks_like_scope_hint(tail) {
                 return (head.to_string(), Some(tail.to_string()));
             }
         }
     }
     (value.trim().to_string(), None)
+}
+
+/// Drop trailing sentence punctuation from an extracted path token. Only the
+/// terminal run goes: interior dots (`v1.2/`, `lib.rs.bak`) and a real
+/// extension are part of the path and stay.
+fn strip_terminal_punctuation(value: &str) -> &str {
+    value.trim_end_matches(['?', '!', '.', ',', ';', ':'])
 }
 
 fn looks_like_scope_hint(value: &str) -> bool {
@@ -1117,6 +1127,49 @@ mod tests {
         match classify_intent("src/protocol/mod.rs") {
             QueryIntent::FindFile { hint } => assert_eq!(hint, "src/protocol/mod.rs"),
             other => panic!("Expected FindFile, got {:?}", other),
+        }
+    }
+
+    /// A path typed as a question keeps its terminal punctuation out of the
+    /// route: `src/lib.rs?` was sent onward as a literal path ending in `?`.
+    #[test]
+    fn test_classify_path_strips_terminal_sentence_punctuation() {
+        for (query, expected) in [
+            ("src/lib.rs?", "src/lib.rs"),
+            ("src/lib.rs.", "src/lib.rs"),
+            ("src/protocol/mod.rs?!", "src/protocol/mod.rs"),
+        ] {
+            match classify_intent(query) {
+                QueryIntent::FindFile { hint } => assert_eq!(hint, expected, "query {query:?}"),
+                other => panic!("Expected FindFile for {query:?}, got {:?}", other),
+            }
+        }
+    }
+
+    /// The same normalization applies to a path extracted as a scope hint.
+    #[test]
+    fn test_classify_scope_hint_path_strips_terminal_punctuation() {
+        match classify_intent("who calls AddCoreServices in src/protocol/tools.rs?") {
+            QueryIntent::FindCallers { path, .. } => {
+                assert_eq!(path.as_deref(), Some("src/protocol/tools.rs"));
+            }
+            other => panic!("Expected FindCallers, got {:?}", other),
+        }
+    }
+
+    /// Punctuation that is part of a legal path is preserved: only the
+    /// trailing sentence marks go, never interior dots or a real extension.
+    #[test]
+    fn test_classify_path_preserves_interior_punctuation() {
+        for (query, expected) in [
+            ("src/lib.rs.bak", "src/lib.rs.bak"),
+            ("src/v1.2/mod.rs", "src/v1.2/mod.rs"),
+            ("docs/README.md", "docs/README.md"),
+        ] {
+            match classify_intent(query) {
+                QueryIntent::FindFile { hint } => assert_eq!(hint, expected, "query {query:?}"),
+                other => panic!("Expected FindFile for {query:?}, got {:?}", other),
+            }
         }
     }
 

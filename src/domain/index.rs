@@ -407,6 +407,9 @@ impl FileClassification {
         let is_test = segments
             .iter()
             .any(|segment| TEST_PATH_SEGMENTS.contains(segment))
+            // Exact stems: `tests.rs`, `test.go`, and the `testutil` family.
+            // Exact, not substring, so `contest.rs` and `latest.rs` stay source.
+            || matches!(stem, "test" | "tests" | "testutil" | "testutils")
             || stem.starts_with("test_")
             || stem.ends_with("_test")
             || stem.ends_with(".test")
@@ -1959,6 +1962,45 @@ mod tests {
         assert!(!classification.is_generated);
         assert!(!classification.is_test);
         assert!(!classification.is_vendor);
+    }
+
+    /// Exact `test`/`tests` stems and the `testutil` family are test files.
+    /// The affix rules (`test_`, `_test`, `.spec`) never matched a bare stem,
+    /// so `tests.rs` and `testutil.rs` leaked through `include_tests=false`.
+    #[test]
+    fn test_file_classification_marks_exact_test_stems_and_testutil() {
+        for path in [
+            "src/tests.rs",
+            "src/test.rs",
+            "src/protocol/tests.rs",
+            "src/testutil.rs",
+            "src/testutils.rs",
+            "lib/testutil.py",
+            "pkg/tests.go",
+        ] {
+            assert!(
+                FileClassification::for_code_path(path).is_test,
+                "{path} must classify as a test file"
+            );
+        }
+    }
+
+    /// Positive controls: the stem rule is exact, not a substring rule.
+    #[test]
+    fn test_file_classification_keeps_look_alike_stems_as_source() {
+        for path in [
+            "src/contest.rs",
+            "src/latest.rs",
+            "src/attest.rs",
+            "src/protest_handler.rs",
+            "src/testament.rs",
+            "src/testing_ground.rs",
+        ] {
+            assert!(
+                !FileClassification::for_code_path(path).is_test,
+                "{path} must stay ordinary source"
+            );
+        }
     }
 
     #[test]
