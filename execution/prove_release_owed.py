@@ -155,6 +155,29 @@ def owed_lines(root: Path, since: str, head: str = "HEAD") -> list[str]:
     return lines
 
 
+def release_merged_ahead(
+    root: Path, head: str = "HEAD", remote_ref: str = "origin/main"
+) -> tuple[str, str] | None:
+    """A release commit already on the remote branch but not yet in `head`.
+
+    Push runs queue behind one another in the release concurrency group while
+    release-please reads the live branch. An older run can therefore execute
+    after the release PR for a newer version has merged, at a HEAD that does
+    not contain that merge; the owed commits it sees are exactly the ones that
+    PR released, and that PR's own push run owns the tagging. Returns
+    `(short_sha, version)` of the nearest such release commit, or `None`.
+    """
+    if run_git(root, ["rev-parse", "--verify", "--quiet", remote_ref]).returncode != 0:
+        return None
+    log = git_text(root, ["log", "--format=%h %s", f"{head}..{remote_ref}"])
+    for line in log.splitlines():
+        sha, _, subject = line.strip().partition(" ")
+        version = release_subject_version(subject)
+        if version is not None:
+            return sha, version
+    return None
+
+
 def prove(root: Path, head: str = "HEAD") -> str:
     """Return a success message, or raise ProveError if a skip is not proven."""
     if not list_v_tags(root):
@@ -181,6 +204,13 @@ def prove(root: Path, head: str = "HEAD") -> str:
 
     owed = owed_subjects(root, expected_tag, head)
     if owed:
+        ahead = release_merged_ahead(root, head)
+        if ahead is not None:
+            sha, ahead_version = ahead
+            return (
+                f"Release PR for {ahead_version} already merged ahead of this run at "
+                f"{sha}; its own push run owns tagging. Skipping here is correct."
+            )
         listed = "\n".join(f"  {line}" for line in owed_lines(root, expected_tag, head))
         raise ProveError(
             f"{len(owed)} user-facing commit(s) since {expected_tag} produced no "
