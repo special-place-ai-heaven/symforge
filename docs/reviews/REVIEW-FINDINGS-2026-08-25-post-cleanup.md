@@ -16,6 +16,19 @@ throughout; frozen trees read but never edited; repository otherwise untouched.
 | `--test preventive_runtime_dark_v11` (darkness seal incl. FULL_SOURCE_PIN + WORKFLOW_FINGERPRINTS + CARGO_LINES) | 10 passed / 0 failed |
 | independent FNV fingerprint recompute of both workflows (Python, seal algorithm) | `release.yml 113a444332929e37:112348`, `ci.yml 26d8df149f93dc45:14056` — byte-consistent with pins |
 
+**Dispositions (2026-08-25, later the same day; reviewer re-verified each):**
+
+| Finding | Disposition |
+|---|---|
+| d4c5b6c9 HIGH — echoed refusal phrases downgrade a reached apply path | Fixed in #665 (envelope-first classifier); reviewer ran the hostile-source e2e green |
+| c636b078 MEDIUM — explicit-prefix file route leaks `?` | Fixed in #665 |
+| dd441ae2 HIGH — fail-after-tagging deadlock | Fixed in #664 (clamp to tag with warning); reviewer SHIP |
+| dd441ae2 LOW — gate never completed a push run | Superseded: the floor step passed its first real run during the 11.0.11 release (`bd29447b`) |
+| 1cdcc897 MEDIUM — p95 smoke unreachable from CI | Open: wire into the scheduled perf lane (workflow edit, fingerprint reseal) after #664 lands |
+| Outside 1 — pin refusal arms untested | **Retracted** (see below) |
+| Outside 2, 3 — facade analytics silence; unknown-shape fall-through | Ledger items |
+| New residual (#665 review) — `torn_after_envelope` phrases are `contains` matches, so an echoed source line quoting `ROLLBACK INCOMPLETE`, `Write failed` or `File disappeared:` can still push an envelope'd success to `InternalFailure` | Ledger item, LOW/MEDIUM; same echo family, rarer phrases |
+
 ---
 
 ## Commit d4c5b6c9 — fix(edit): mutations that applied nothing are MCP errors (#657)
@@ -251,6 +264,8 @@ Findings:
    time `bd29447b`'s run was in progress. Logic above was verified by local
    dry-run only; the first completed push run should be eyeballed against scenario
    1's receipt.
+   *Superseded 2026-08-25:* `bd29447b`'s run completed green and was the floor
+   step's first real execution. Finding 1 (deadlock) is fixed by #664's clamp.
 
 ---
 
@@ -290,7 +305,7 @@ Both sides, from the code:
   hazard the comments document at `mod.rs:1320-1325`.
 - Coverage debt found during adjudication: the four refusal arms of
   `take_private_project_route_pin` (wrong tool, combined-with-public-selector,
-  non-string, blank/untrimmed — `daemon.rs:4257-4277`) have **no tests anywhere**;
+  non-string, blank/untrimmed — `daemon.rs:4257-4277`) have **no tests anywhere** — *retracted below*;
   only the happy binding path is pinned
   (`src/protocol/mod.rs:3228`, `:3628`). Whatever the decision, these negatives need
   RED-first tests before anything else touches the seam.
@@ -341,9 +356,15 @@ frozen clauses; neither may ship before a derived successor contract is approved
 
 ## Findings outside the questions (mandatory section)
 
-1. **MEDIUM — `take_private_project_route_pin` refusal arms untested**
-   (`src/daemon.rs:4257-4277`; detail under A0). Security-adjacent routing seam with
-   four unreachable-by-test error paths.
+1. **Retracted 2026-08-25 — `take_private_project_route_pin` refusal arms untested.**
+   All four refusal arms are driven by
+   `daemon_private_route_pin_is_exact_allowlisted_and_conflict_free`
+   (`src/daemon.rs`: non-allowlisted tool, blank, untrimmed, non-string, and pin
+   combined with `project` / `projects`, each asserted `is_err()`), plus the
+   end-to-end ACTIVE-override proof later in the same test module. Only the
+   refusal message text is unpinned. Reviewer search error: index searches and
+   message-literal greps cannot see `.is_err()` assertions; the test filter
+   `cargo test private_route_pin` surfaces the test immediately.
 2. **LOW — facade analytics silence**: `symforge_edit` records token summaries only
    (`tools.rs:11760-11761`), never a usage observation with a success flag, so M0-style
    net-accounting will systematically miss the compact edit path. Observation, not a
