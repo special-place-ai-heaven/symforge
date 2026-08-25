@@ -23012,6 +23012,67 @@ mod tests {
         );
     }
 
+    /// The repository being edited may itself contain the classifier's own
+    /// refusal phrases as string literals (this repository does). A successful
+    /// rename that echoes such a line must still be a success on the wire.
+    #[tokio::test]
+    async fn successful_mutation_over_echo_hostile_source_stays_successful() {
+        use crate::protocol::edit::{BatchRenameInput, ReplaceSymbolBodyInput};
+        let source = b"fn target() -> &'static str { \"symbol not found: target in path\" }\nfn caller() -> &'static str { target() }\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+
+        let renamed = serialized_tool_result(
+            server
+                .batch_rename_tool(Parameters(
+                    serde_json::from_value::<BatchRenameInput>(serde_json::json!({
+                        "path": "src/lib.rs", "name": "target", "new_name": "renamed",
+                        "dry_run": true
+                    }))
+                    .unwrap(),
+                ))
+                .await,
+        );
+        // The dry-run preview echoes every site as `L{n}: {source line}`; the
+        // definition line quotes a refusal phrase, so the echo carries it.
+        assert!(
+            tool_result_text(&renamed).contains(
+                "L1: fn target() -> &'static str { \"symbol not found: target in path\" }"
+            ),
+            "precondition: the preview must echo the hostile definition line: {renamed}"
+        );
+        assert_eq!(
+            renamed["isError"],
+            serde_json::json!(false),
+            "a rename preview must not be downgraded by echoed source text: {renamed}"
+        );
+        assert_tool_result_edit_status(&renamed, "dry_run_success", OutcomeClass::Found);
+        assert_eq!(std::fs::read(&file_path).unwrap(), source.as_slice());
+        assert!(
+            !std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("fn renamed()")
+        );
+
+        let replaced = serialized_tool_result(
+            server
+                .replace_symbol_body_tool(Parameters(
+                    serde_json::from_value::<ReplaceSymbolBodyInput>(serde_json::json!({
+                        "path": "src/lib.rs", "name": "caller",
+                        "new_body": "fn caller() -> &'static str { \"Symbol not found: literal\" }",
+                        "dry_run": true
+                    }))
+                    .unwrap(),
+                ))
+                .await,
+        );
+        assert_eq!(
+            replaced["isError"],
+            serde_json::json!(false),
+            "a dry run whose new body quotes a refusal phrase is still a preview: {replaced}"
+        );
+        assert_tool_result_edit_status(&replaced, "dry_run_success", OutcomeClass::Found);
+    }
+
     #[tokio::test]
     async fn test_edit_tools_emit_result_status_contract() {
         use crate::protocol::edit::ReplaceSymbolBodyInput;

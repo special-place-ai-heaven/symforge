@@ -61,6 +61,24 @@ mod tests {
     use crate::protocol::surface_probe::{SurfaceProfile, with_connection_surface};
     use std::ffi::OsString;
 
+    /// Successful outputs echo source lines and agent-provided content. A
+    /// refusal phrase inside that echo is data, not a status: the envelope
+    /// (or the rename header) proves the apply path was reached and must win
+    /// over prose matching, or a successful write reports `isError:true`.
+    #[test]
+    fn echoed_refusal_phrases_never_downgrade_a_reached_apply_path() {
+        use super::{EditResultStatus as S, classify_edit_output as c};
+        let rename = "Renamed `old` -> `new` - 2 site(s) across 1 file(s)\n\n                      -- Uncertain matches (NOT applied - review manually) - 1 site(s) --\n                        src/lib.rs\n    L3: let m = \"symbol not found: {name} in {path}\";\n";
+        assert_eq!(c(rename, false), S::Success);
+        let applied = "Edit safety: structural-edit-safe\nPath authority: repository-bound\n                       Source authority: disk-refreshed\nWrite semantics: atomic write + reindex\n                       Evidence: symbol anchor `src/lib.rs:1`\nReplaced `f`.\n                       Symbol not found: this is the NEW BODY text, echoed back\n";
+        assert_eq!(c(applied, false), S::Success);
+        let preview = "Edit safety: structural-edit-safe\nPath authority: repository-bound\n                       Source authority: disk-refreshed\nWrite semantics: dry run (no writes)\n                       Evidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would replace `f`\n                       Ambiguous: quoted from the preview body\n";
+        assert_eq!(c(preview, true), S::DryRunSuccess);
+        // A genuine failure sentinel after the envelope still fails.
+        let torn = "Edit safety: structural-edit-safe\nWrite semantics: transactional write + rollback + reindex\n                    ROLLBACK INCOMPLETE: src/lib.rs left modified\n";
+        assert_eq!(c(torn, false), S::InternalFailure);
+    }
+
     #[test]
     fn edit_output_shapes_that_applied_nothing_never_classify_as_success() {
         use super::{EditResultStatus as S, classify_edit_output as c};
@@ -349,8 +367,31 @@ fn statused_edit_tool_result(
 /// for a write that never happened. One predicate, one place to teach a shape.
 fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
     if is_index_unavailable_output(text) {
-        EditResultStatus::InternalFailure
-    } else if text.contains("Ambiguous:") || text.starts_with("Ambiguous:") {
+        return EditResultStatus::InternalFailure;
+    }
+    // Envelope first. Successful outputs echo source lines (`L3: ...`) and
+    // agent-provided bodies, and the repository being edited may itself
+    // contain this classifier's refusal phrases as string literals. The edit
+    // envelope (`Write semantics:`) and the rename header are emitted only
+    // once the apply/preview path was reached, so they are evidence and the
+    // prose below is not. Only a genuine post-envelope failure sentinel may
+    // still override them.
+    let reached_apply_path = text.contains("Write semantics: ") || text.starts_with("Renamed `");
+    let torn_after_envelope = text.contains("ROLLBACK INCOMPLETE")
+        || text.contains("Write failed")
+        || text.starts_with("Error writing ")
+        || text.contains("File disappeared:");
+    if reached_apply_path && !torn_after_envelope {
+        return if dry_run
+            || text.contains("[DRY RUN]")
+            || text.contains("Write semantics: dry run (no writes)")
+        {
+            EditResultStatus::DryRunSuccess
+        } else {
+            EditResultStatus::Success
+        };
+    }
+    if text.contains("Ambiguous:") || text.starts_with("Ambiguous:") {
         EditResultStatus::Ambiguous
     } else if text.starts_with("File not found:")
         || text.starts_with("Symbol not found:")
