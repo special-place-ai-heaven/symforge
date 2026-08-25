@@ -202,7 +202,7 @@ pub(crate) fn classify_intent_with_match(query: &str) -> (QueryIntent, bool) {
     ) {
         return (
             QueryIntent::FindFile {
-                hint: hint.to_string(),
+                hint: strip_terminal_punctuation(hint).to_string(),
             },
             true,
         );
@@ -1138,6 +1138,9 @@ mod tests {
             ("src/lib.rs?", "src/lib.rs"),
             ("src/lib.rs.", "src/lib.rs"),
             ("src/protocol/mod.rs?!", "src/protocol/mod.rs"),
+            // The explicit-prefix route must normalize the same way.
+            ("find file src/lib.rs?", "src/lib.rs"),
+            ("where is file src/lib.rs.", "src/lib.rs"),
         ] {
             match classify_intent(query) {
                 QueryIntent::FindFile { hint } => assert_eq!(hint, expected, "query {query:?}"),
