@@ -365,6 +365,20 @@ Do not make read-side empty/not-found queries into protocol errors.
 
 ### PR 3 — indexing is observational; init owns hygiene writes
 
+> **ADJUDICATE (2026-08-25): blocked on a frozen contract, not on code.**
+> `specs/020-repository-knowledge-index/contracts/source-binding-and-state.md`
+> requires the shared `.gitignore` mutation to run after successful explicit
+> normal `index_folder` binding (steps 1-6 under "The shared `.gitignore`
+> mutation") and pins it as invariant 14 ("Explicit normal `index_folder` and
+> project-aware init share a byte-for-byte ... matrix"). Two tests on `main`
+> pin the same behavior: `explicit_normal_index_folder_reconciles_existing_root_gitignore`
+> and `daemon_index_folder_reconciles_existing_root_gitignore`, both asserting
+> `changed=true`. Making indexing observe-only therefore needs a derived
+> amendment/successor spec and approval first, exactly as C0 does. `ObserveOnly`
+> already exists and is already used by `health`, so the code change is small
+> once the contract decision is made; do not land it before then.
+
+
 **Depends on:** none.  
 **Likely modules:** `gitignore_hygiene`, `daemon`, `protocol/tools`, `cli/init`, tests.
 
