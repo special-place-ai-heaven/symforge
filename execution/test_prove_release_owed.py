@@ -39,6 +39,36 @@ def _commit(root: Path, message: str, filename: str, content: str) -> None:
 
 
 class ProveReleaseOwedTests(unittest.TestCase):
+    def test_release_pr_merged_ahead_of_head_is_the_tagging_path(self) -> None:
+        # Observed 2026-08-25 (run 32891474365): an older push run was still
+        # queued when release-please, reading origin/main, opened and
+        # auto-merged the release PR for the newer version. When the older
+        # run finally executed, its HEAD did not contain that merge, so the
+        # gate saw owed commits and no release PR and went red -- while the
+        # release PR's own push run was already tagging.
+        with tempfile.TemporaryDirectory(prefix="prove-release-") as temp:
+            root = Path(temp)
+            _init_repo(root)
+            _write_manifest(root, "1.0.0")
+            _git(root, "add", ".github")
+            _commit(root, "chore(main): release 1.0.0", "changelog.txt", "1.0.0\n")
+            _git(root, "tag", "v1.0.0")
+            _commit(root, "fix: owed by an older push", "a.txt", "a\n")
+            older_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            _write_manifest(root, "1.0.1")
+            _git(root, "add", ".github")
+            _commit(root, "chore(main): release 1.0.1", "changelog.txt", "1.0.1\n")
+            _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+            _git(root, "checkout", "--quiet", older_head)
+
+            message = prove_release_owed.prove(root)
+
+            self.assertIn("1.0.1", message)
+            self.assertIn("ahead", message)
+
     def test_no_tags_is_vacuous_success(self) -> None:
         with tempfile.TemporaryDirectory(prefix="prove-release-") as temp:
             root = Path(temp)
