@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.11](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.10...v11.0.11) (2026-08-25)
+
+
+### Bug Fixes
+
+* **index:** classify exact test stems and strip sentence marks from ask paths ([#658](https://github.com/special-place-ai-heaven/symforge/issues/658)) ([c636b07](https://github.com/special-place-ai-heaven/symforge/commit/c636b078bdf84d8da7825f9515b1df64d6d33045))
+
 ## [11.0.10](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.9...v11.0.10) (2026-08-25)
 
 
