@@ -293,7 +293,7 @@ When merging tools A into B:
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at specs/028-preventive-activation-cut/plan.md
+at specs/032-repeat-call-breaker/plan.md
 <!-- SPECKIT END -->
 
 ## Documentation hygiene (as_of 2026-07-13 — binding)
