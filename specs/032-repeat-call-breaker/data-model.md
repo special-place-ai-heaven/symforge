@@ -8,7 +8,7 @@ All types are in-memory only; nothing here is persisted or serialized except the
 
 | Field | Type | Notes |
 |---|---|---|
-| `session` | `SessionDiscriminator` | Observed session identity: on a single-client transport (stdio) a process-constant value; on a shared transport, the per-session identity observable at the seam. When NO session identity is observable for a request, the tracker does not accumulate for it at all (spec FR-002 / Scenario 5). |
+| `session` | `SessionDiscriminator` | Observed session identity: on a single-client transport (stdio) a process-constant value; on a shared transport, the per-session identity observable at the seam. When NO session identity is observable for a request, the tracker does not accumulate for it at all (spec FR-002 / Scenario 5). **Resolved by T001 (2026-09-02, research.md R9)**: `enum SessionDiscriminator { Stdio, HttpInert }`, observed from `RequestContext::extensions` (`HttpInert` iff rmcp's `http::request::Parts` is present — the stateless HTTP lane has no per-session identity; `Stdio` otherwise, where the server instance is the session). `HttpInert` never touches the tracker; only `Stdio` keys are ever inserted, so the field is a witness that the lane was observed, not a namespace. |
 | `tool` | `String` | MCP tool name as dispatched |
 | `request_hash` | `RequestHash` | `RequestHash::for_tool_request(tool, &args)` over canonical JSON args (`src/idempotency.rs:42-57`). NOTE: `RequestHash` currently derives `PartialEq, Eq` but NOT `std::hash::Hash` (`src/idempotency.rs:37-39`) — add `Hash` to its derive (the inner String hashes canonically); `src/idempotency.rs` is in the touched-file set. |
 
