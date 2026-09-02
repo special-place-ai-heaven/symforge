@@ -253,6 +253,16 @@ Key source files:
   the sentence instead and bumped `contract_version` to 2. The rendered-body digest,
   not any eligibility rule, is what keeps this honest: a serve whose bytes differ
   restarts the run. See the contract's "Why there is no unfenced input bullet".
+  **The closing sentence must not prescribe a remedy either** (round 4). Telling the
+  agent to change project state nudged it, from a read-only condition, toward creating
+  what it had failed to find; telling it to change the request is wrong inside the
+  watcher publication window, where three identical serves off one bundle mean the edit
+  simply has not been published yet and retrying the SAME request shortly is correct.
+  No prescription is right on both lanes, so the notice reports and stops.
+  **Reach limit worth knowing**: the feature is inert on the compact surface —
+  `enforce_compact_surface` rejects every tool outside `COMPACT_TOOL_NAMES` before the
+  repeat key is minted, and none of `symforge`/`symforge_edit`/`status` is eligible, so
+  `SYMFORGE_SURFACE=compact` never emits a notice.
 - `src/protocol/format.rs` — Output formatters
 - `src/daemon.rs` — Daemon proxy with backward-compat aliases
 - `src/cli/init.rs` — Tool name list for client init
@@ -323,6 +333,8 @@ This file is the ONLY live-truth document in this repo; volatile claims carry an
 - `CLAUDE.md` — live state + rules. UPDATE it when a change falsifies a claim here.
 - `specs/NNN-*/` — feature lifecycle (spec-kit), if used.
 - `docs/solutions/` — compounded learnings (`/ce-compound` files them).
+- `docs/reviews/` — review findings and RED/GREEN receipt records for a feature
+  campaign. Written once, then append-only; cite them, do not rewrite their history.
 - `docs/archive/` — historical; never trust, never update, only append moves.
 - Other docs are legacy pending triage — verify against code before believing them.
 - Durable decisions/lessons go to agentmemory with the `[symforge]` content prefix;

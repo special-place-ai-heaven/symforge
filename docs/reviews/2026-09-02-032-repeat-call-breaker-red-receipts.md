@@ -536,7 +536,7 @@ state."
 ### What the notice says now
 
 ```
-Repeat notice: identical request served {N}x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first.
+Repeat notice: identical request served {N}x. Across these serves, no index change was published and the response text before this notice was unchanged. Retrying it unchanged has not produced new information.
 ```
 
 Every factual clause is something the tracker had to observe to reach the threshold:
@@ -595,3 +595,102 @@ Net `src/`: 57 insertions, 219 deletions. `FULL_SOURCE_PIN_V1` moved on bytes on
 `excluded_runtime_source_set_matches_reviewed_baseline` and
 `dark_call_edges_appear_only_in_the_wired_roster` were both observed passing, so the set
 the seal protects is unchanged and the diff introduces no new bridge.
+
+## Round 4 (2026-09-02) — two independent reviews of the round-3 commit
+
+Commit `d16d50b7` was reviewed twice, independently and without being shown each
+other's findings: a correctness/false-claim review and a security review. Neither
+found a Critical or High defect, and neither could construct a sequence in which a
+factual clause of the new notice is false. Two verifications are worth recording
+because they were done the hard way:
+
+- The correctness review recomputed `FULL_SOURCE_PIN_V1` from scratch in Python
+  (walk `src/`, CRLF→LF, sort by normalized path, SHA-256 over the domain plus
+  LE64 count plus per-record length-framed path and content) and got
+  `8dc6c49251e09f1b266d8adfc9954abdb1bd281fbb9e21c4a3e790e1ad1a92e6 197 9495123`
+  — byte-exact to the refreshed pin.
+- The security review traced the untracked sweep and confirmed
+  `admit_worktree_text` still runs BEFORE `untracked_text_matches`, so the
+  anchored-regex character-recovery attack the read-gate exists to stop is
+  unaffected by the latch removal. Both reviews independently grepped the four
+  removed symbols to zero hits.
+
+### The one real defect: the closing sentence
+
+Round 3 closed with "Do not retry unchanged; change the request or relevant project
+state first." Both reviews rejected it, for different reasons that turn out to be the
+same reason.
+
+The security review: on a zero-hit `search_text` — a read whose whole condition is
+that nothing was found — telling an agent with edit tools to change project state
+nudges it toward creating what it could not find. Excessive agency originating from a
+read-only condition.
+
+The correctness review: the advice is backwards inside the watcher publication
+window. An agent edits a tracked file adding `newFn`, then calls
+`search_symbols("newFn")` three times before the debounce elapses. All three render
+from the same published bundle, so evidence and body are identical and every factual
+clause is true — but the project state was ALREADY changed, and retrying the same
+request a moment later is exactly the right move.
+
+No prescription survives both. For the index-determined tools the body moves only
+when the index does, so "wait and retry unchanged" is right; for the zero-hit sweep
+the body can move with no publication at all, so it is wrong. The notice therefore
+stops prescribing:
+
+```
+Repeat notice: identical request served {N}x. Across these serves, no index change was published and the response text before this notice was unchanged. Retrying it unchanged has not produced new information.
+```
+
+Every clause, including the last, is now retrospective. The loop-breaking signal
+survives — an agent told it has served the same request three times for no new
+information has what it needs — while the choice of remedy returns to the agent,
+which is the only party that knows whether it just edited a file.
+
+### Also fixed: prose that did not follow the code
+
+The correctness review's other warnings were all documentation drift from round 3,
+where the code changed and its surrounding prose did not. Each is a real hazard
+because these are the artifacts the next person reads:
+
+- `REPEAT_ELIGIBLE_TOOLS`' own doc comment still demanded "a per-tool proof that
+  every input is fenced", which is both the retired rule and false about two of its
+  five members. Rewritten to the round-3 rule.
+- `data-model.md`'s state machine — which declares itself the single normative rule —
+  still carried the `UnfencedInput` transition and still required "the dispatch did
+  not report an unfenced input" in its definition of Observed, while line 59 of the
+  same file said the opposite. Both removed.
+- `research.md` R4 still stated the fully-index-determined criterion and headed its
+  exclusion table "Why a notice could be false", contradicting FR-006 as amended in
+  the same commit. Amended, and the table re-headed "Why a notice could never be
+  earned" — the rows are still right, their premise was not.
+
+### Recorded, deliberately not fixed here
+
+- **`admission_degradation_view_from_disk` does not route through `read_gate`**
+  (`src/protocol/tools.rs`). It renders `Size:` for a path the index does not hold,
+  so `find_references(name=…, path=".env")` confirms the file exists and discloses
+  its exact length — a length oracle on a gitignored credential file. Path
+  confinement is sound (canonicalize-then-`starts_with`, so symlinks resolve before
+  the check) and no file bytes reach the output, so this is metadata only. It is
+  PRE-EXISTING and contradicts CLAUDE.md's "single admission gate" claim. The fix is
+  one `refuse_by_policy` call before building the view. Out of scope for a PR about
+  notice wording; it should not ride along on an unrelated change.
+- **`search_text` renders one response from three separate index reads.** The search
+  half comes from the captured `generation.live` bundle whose id the evidence receipt
+  names; the untracked diagnostic takes its own `data_plane().read()`, and
+  `untracked_paths_not_in_index` takes a third. A watcher publication between them
+  renders half the body from G and half from G+1 while the receipt says G. The
+  reviewer could not turn this into a false notice clause and invited down-ranking,
+  and I agree it cannot: three serves that all capture G mean no publication landed
+  before serve 3. But the single-bundle discipline held elsewhere is not held here,
+  and this commit is what made the lane notice-eligible. Fix is to thread the captured
+  bundle into both helpers.
+- **The body digest ignores non-text content blocks.** Unreachable today — all five
+  eligible tools return one `String` — and the notice's wording is scoped to "the
+  response text", so no clause is false. A comment now records that the framing must
+  widen before the tool list does.
+- **A router `Err` skips the tracker entirely**, neither advancing nor removing the
+  run, while a Complete result with `is_error` and no outcome class DOES remove it.
+  Unreachable today because all five eligible handlers return `String`. Worth a
+  comment before a fallible-signature tool becomes eligible.

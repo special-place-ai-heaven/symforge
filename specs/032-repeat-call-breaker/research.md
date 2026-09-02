@@ -35,11 +35,13 @@ Consequence: US1 detection is serve-path state; the spec assumption was amended 
 
 **Decision (revised by R12)**: `REPEAT_ELIGIBLE_TOOLS`, pinned by a test, membership exactly **5 tools**: `search_symbols`, `search_text`, `get_repo_map`, `find_references`, `find_dependents`.
 
-**Rationale**: eligibility means "the rendered output is fully determined by the published index generation the response's evidence names". The adversarial round proved the original 7-tool list failed its own criterion twice — the per-tool proof this section demands was not actually performed for two members. Both are now excluded (rows one and two below).
+**Rationale**: eligibility originally meant "the rendered output is fully determined by the published index generation the response's evidence names", and the adversarial round proved the original 7-tool list failed that criterion twice. Both are excluded (rows one and two below).
 
-**Exclusion table (each exclusion is load-bearing; widening requires a per-tool proof)**:
+**Amended by review round 3 (2026-09-02)**: that criterion is no longer what makes the notice safe, and it was never true of every member — `search_text`'s zero-hit sweep and `find_references`'s disk fallback are not index-determined either. The rendered-body digest is the enforcing mechanism: a tool whose output varies on an unchanged index never matches its own prior serve, so it cannot reach the threshold. The two rows below still hold, but read them as "could never earn a notice, so tracking them is dead weight" rather than "could produce a false claim". See spec.md FR-006 and `contracts/repeat-notice.md`.
 
-| Excluded | Why a notice could be false |
+**Exclusion table**:
+
+| Excluded | Why a notice could never be earned |
 |---|---|
 | `get_symbol` (R12 refutation) | Repeat serves short-circuit into the session cache-hit advisory body, which embeds wall-clock `session_age_secs` twice (`src/protocol/format.rs:5833-5865`; recomputed per hit, `src/protocol/session.rs:243`), and the `force_refresh` lane appends an elapsed-seconds dedup footer (`src/protocol/tools.rs:4487-4510`). Serves 1/2/3 are three different byte sequences on a fully unchanged index. Its repeats already get a purpose-built "you already have this" advisory — the notice adds nothing there. |
 | `search_files` (R12 refutation) | `rank_by="frecency"` reorders hits with `SystemTime::now`-decayed scores from the frecency store (`src/protocol/tools.rs:6650-6710`), which is bumped by interleaved commitment reads that deliberately do NOT reset runs (spec FR-002), and is a cross-process SQLite other symforge processes mutate with no publication anywhere (`src/live_index/frecency.rs`). Ordering can change while evidence stays equal — and those mutations are unobservable from the serve path: a textbook "cannot observe ⇒ cannot claim". |

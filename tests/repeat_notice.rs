@@ -48,7 +48,7 @@ const MODERN_VERSION: &str = "2026-07-28";
 /// Byte-canonical notice text (contracts/repeat-notice.md §2).
 fn notice_text(count: u32) -> String {
     format!(
-        "Repeat notice: identical request served {count}x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first."
+        "Repeat notice: identical request served {count}x. Across these serves, no index change was published and the response text before this notice was unchanged. Retrying it unchanged has not produced new information."
     )
 }
 

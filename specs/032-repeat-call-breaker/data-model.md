@@ -21,7 +21,7 @@ Equality/Hash derive from all three fields. Two calls are "identical" iff `tool`
 | `count` | `u32` | Serves of this key with a continuously-equal observation; `saturating_add` |
 | `observed` | `ObservedServe` | The run's FIRST serve, as TYPED values: the `ProjectEvidence` (`src/protocol/result_status.rs`) **and** a digest of the response's rendered text content. The tracker never stores raw `_meta` JSON — the `{"bound": false}` unavailable marker and any non-deserializable value are "unobserved", full stop. The body digest was added 2026-09-02 (review round 1): evidence alone does not fence every input a renderer reads. |
 
-State transitions (per eligible-tool response at the seam). "Observed" means ALL of: the `symforge/project_evidence` value on the outgoing response deserializes as a full `ProjectEvidence`; its `project_id` is not the `"unbound"` placeholder (an unbound adapter has no project to be current about); and the dispatch did not report consulting an input the index does not fence (review round 2 — see the `UnfencedInput` row):
+State transitions (per eligible-tool response at the seam). "Observed" means ALL of: the `symforge/project_evidence` value on the outgoing response deserializes as a full `ProjectEvidence`; its `project_id` is not the `"unbound"` placeholder (an unbound adapter has no project to be current about). Review round 2 added a third condition here — that the dispatch reported no unfenced input — and round 3 removed it again, together with the forward claim it existed to protect; see `contracts/repeat-notice.md`:
 
 ```
 no entry                --serve, observed-->                 count=1, store the observation
@@ -29,9 +29,6 @@ entry, evidence == AND body digest ==  --serve-->            count+=1   (notice 
 entry, evidence != OR  body digest !=  --serve-->            replace: count=1, new observation
 entry, evidence NOT observed (marker / non-deserializable
         / project_id "unbound") --serve-->                   remove entry (cannot observe)
-entry, the dispatch reported an unfenced input
-        (live git status / raw worktree read)  --serve-->    remove entry (round 2: the forward
-                                                             claim is not observable there)
 entry, ResultStatus observed as InternalFailure --serve-->   remove entry (R5)
 entry, OutcomeClass unobservable on this lane AND
         result.is_error == true --serve-->                   remove entry (conservative; R5)

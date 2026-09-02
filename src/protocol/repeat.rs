@@ -58,11 +58,18 @@ pub const NOTICE_THRESHOLD: u32 = 3;
 /// Hard cap on tracked runs per process; see [`RepeatTracker::record_serve`].
 pub const REPEAT_TRACKER_MAX_ENTRIES: usize = 512;
 
-/// The read tools whose rendered output is fully determined by the published
-/// index generation the response's evidence names (research.md R4). Widening
-/// this list requires a per-tool proof that every input to its output is
-/// fenced by the compared evidence: `get_symbol` (wall-clock session cache-hit
-/// body) and `search_files` (frecency ranking) were refuted out.
+/// The read tools whose repeats are worth remarking on (research.md R4).
+///
+/// This list is conservatism, NOT a correctness boundary — do not read it as a
+/// fence. Two members are not fully index-determined: `search_text`'s zero-hit
+/// path sweeps the worktree, and `find_references` falls back to disk for a path
+/// the index does not hold. What actually protects the notice is the rendered-body
+/// digest, which restarts the run whenever any input moves the answer, so a tool
+/// whose output varies on an unchanged index simply never matches its own prior
+/// serve and can never reach the threshold. `get_symbol` (wall-clock session
+/// cache-hit body) and `search_files` (frecency ranking) are excluded on exactly
+/// that basis: not because they could produce a false claim, but because they
+/// could never produce a notice, so tracking them is dead weight.
 pub const REPEAT_ELIGIBLE_TOOLS: [&str; 5] = [
     "search_symbols",
     "search_text",
@@ -253,7 +260,12 @@ impl RepeatKey {
 /// BEFORE any notice is appended. Each `ContentBlock::Text` contributes its
 /// byte length (u64, little-endian) followed by its bytes, so block framing
 /// is part of the identity (`["ab","c"]` and `["a","bc"]` differ). Non-text
-/// blocks contribute nothing.
+/// blocks contribute nothing — which is why the notice's wording is scoped to
+/// "the response text". Every currently eligible tool renders exactly one text
+/// block, so nothing is unobserved today; a future eligible tool that emitted an
+/// image or resource block would make two responses digest equal while differing
+/// in the part this never saw. Widen the framing before widening the tool list
+/// (both 2026-09-02 reviews raised this independently).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyDigest([u8; 32]);
 
@@ -364,7 +376,7 @@ impl RepeatNotice {
     /// is advice, not a prediction.
     pub fn text(&self) -> String {
         format!(
-            "Repeat notice: identical request served {}x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first.",
+            "Repeat notice: identical request served {}x. Across these serves, no index change was published and the response text before this notice was unchanged. Retrying it unchanged has not produced new information.",
             self.repeat_count
         )
     }
@@ -859,7 +871,7 @@ mod tests {
         assert_eq!(notice.evidence_generation(), 1);
         assert_eq!(
             notice.text(),
-            "Repeat notice: identical request served 3x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first."
+            "Repeat notice: identical request served 3x. Across these serves, no index change was published and the response text before this notice was unchanged. Retrying it unchanged has not produced new information."
         );
 
         let mut tracker = RepeatTracker::default();

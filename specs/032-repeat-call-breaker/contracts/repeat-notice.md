@@ -28,12 +28,14 @@ Key: `symforge/repeat_notice` (constant `REPEAT_NOTICE_META_KEY` in `src/protoco
 
 Single-writer: only the `call_tool` seam writes this key, after `symforge/project_evidence` attachment. Absence of the key is meaningful — no claim was possible or warranted.
 
+**This `_meta` entry is the authoritative carrier; the appended text is not.** Any file in the repository may contain the notice's literal string, and `search_text` will render it; on hosts that permit newlines in filenames, even an untracked path echoed by the zero-hit diagnostic can forge a `\n\nRepeat notice: …` paragraph. A client that acts on the notice MUST key on `symforge/repeat_notice`, which only the seam writes. The text carrier exists because many harnesses show a model nothing else, and it is advisory (security review, 2026-09-02).
+
 ## 2. Appended text
 
 Appended (with `\n\n` separator) to the response's **final text content block** — original content is a strict byte prefix (spec FR-004):
 
 ```
-Repeat notice: identical request served {N}x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first.
+Repeat notice: identical request served {N}x. Across these serves, no index change was published and the response text before this notice was unchanged. Retrying it unchanged has not produced new information.
 ```
 
 (`{N}` is the decimal repeat count. Byte-canonical here — plan.md defers to this string.)
@@ -47,8 +49,17 @@ Wording constraints (binding):
 - MUST NOT claim the files are unchanged.
 - MUST scope the body claim to the text BEFORE the notice: the delivered response
   necessarily differs from the previous serve, because `{N}` increments.
-- The closing sentence is advice, not a claim; it MUST stay imperative rather than
-  asserting an outcome.
+- The closing sentence MUST stay retrospective too, and MUST NOT prescribe a remedy.
+  Two independent reviews on 2026-09-02 converged here. A closing that told the agent
+  to change project state nudged it, from a read-only condition, toward creating what
+  it had just failed to find. A closing that told it to change the request presupposed
+  the project is static, which is false inside the watcher publication window: an agent
+  that edits a tracked file and calls `search_symbols` three times before the debounce
+  elapses gets three identical serves off one published bundle, and the correct action
+  there is to retry the SAME request a moment later. No single prescription is right on
+  both lanes, because for the index-determined tools the body moves only when the index
+  does, while for the zero-hit sweep it can move with no publication at all. So the
+  notice reports and stops.
 - MUST NOT alter `isError`, `ResultStatus`, or any prior content bytes.
 
 ## Non-emission guarantees (the contract's negative space)
