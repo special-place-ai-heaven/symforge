@@ -83,9 +83,52 @@ async function loadEconomics() {
     el.appendChild(card("Net vs manual (tokens)", String(data.total_net_vs_manual)));
     el.appendChild(card("Accepted", String(data.accepted_count)));
     el.appendChild(card("Sessions", String(data.session_count)));
+    renderRecentRuns(el, data);
   } catch (e) {
     note(el, "Failed to load economics.", "unavailable");
   }
+}
+
+// Collapsed recent-run list (032 US2). Each row is one run of consecutive,
+// identity-identical ledger events: ×count, session, decision, intent and the
+// first/last timestamps. A run touching the fetch-window edge is marked
+// "clipped" — its count is window-bounded, not a total. The totals in the
+// cards above still count every stored event.
+function renderRecentRuns(container, data) {
+  const runs = data.recent_runs || [];
+  if (!runs.length) return;
+  const table = document.createElement("table");
+  table.className = "recent-runs";
+  table.innerHTML = "<thead><tr><th>Run</th><th>Session</th><th>Decision</th><th>Intent</th><th>First</th><th>Last</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  runs.forEach(function (run) {
+    const tr = document.createElement("tr");
+    tr.appendChild(td("×" + run.count + (run.window_clipped ? " (clipped)" : "")));
+    tr.appendChild(td(run.session_id));
+    tr.appendChild(td(run.decision));
+    tr.appendChild(td(run.intent));
+    tr.appendChild(td(stamp(run.first_ts_ms)));
+    tr.appendChild(td(stamp(run.last_ts_ms)));
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  const scroll = document.createElement("div");
+  scroll.className = "table-scroll";
+  scroll.appendChild(table);
+  container.appendChild(scroll);
+  if (data.recent_runs_window) {
+    const p = document.createElement("p");
+    p.className = "note";
+    p.textContent = "Recent runs within the newest " + data.recent_runs_window + " ledger rows; ×N counts consecutive identical events.";
+    container.appendChild(p);
+  }
+}
+
+// Millisecond epoch → ISO string; falls back to the raw integer when the value
+// is outside the Date range rather than throwing.
+function stamp(ms) {
+  const d = new Date(ms);
+  return isNaN(d.getTime()) ? String(ms) : d.toISOString();
 }
 
 async function loadSurface() {

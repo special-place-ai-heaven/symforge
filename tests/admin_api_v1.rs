@@ -356,7 +356,21 @@ fn run_shapes(body: &serde_json::Value) -> Vec<(u64, String, String, u64, u64, b
 
 #[tokio::test]
 async fn admin_recent_runs_collapses_and_scopes_by_session() {
-    // (a) FR-008 control: the pre-existing seed is three identity-identical
+    // (a) Negative control first: an unavailable store fabricates no rows and
+    // claims no window.
+    let body = summary_for(StelLedgerStore::Disabled).await;
+    assert_eq!(body["available"], false);
+    assert_eq!(
+        body["recent_runs"],
+        serde_json::json!([]),
+        "unavailable store renders an empty run list, never null/fake rows:\n{body:#}"
+    );
+    assert!(
+        body.get("recent_runs_window").is_none(),
+        "no fetch window may be claimed for a store that was not read:\n{body:#}"
+    );
+
+    // (b) FR-008 control: the pre-existing seed is three identity-identical
     // events (they differ only in ts_ms/plan_id), so it collapses to ONE run
     // of 3 while every total stays exactly as pinned by
     // `summary_returns_seeded_economics` — collapse is presentation-only.
@@ -385,7 +399,7 @@ async fn admin_recent_runs_collapses_and_scopes_by_session() {
         "one collapsed run with the stored string forms verbatim:\n{body:#}"
     );
 
-    // (b) Two sessions writing interleaved rows into ONE file-backed db (two
+    // (c) Two sessions writing interleaved rows into ONE file-backed db (two
     // `open` handles on the same path — `open_in_memory` binds one session per
     // private db). Rows: s1:A s1:A s2:A s2:A s1:B. Without `session_id` in the
     // identity the four A rows would merge into ×4 across the session
@@ -441,19 +455,6 @@ async fn admin_recent_runs_collapses_and_scopes_by_session() {
             ),
         ],
         "chronological runs that never merge across sessions:\n{body:#}"
-    );
-
-    // (c) Unavailable store: no rows are fabricated and no window is claimed.
-    let body = summary_for(StelLedgerStore::Disabled).await;
-    assert_eq!(body["available"], false);
-    assert_eq!(
-        body["recent_runs"],
-        serde_json::json!([]),
-        "unavailable store renders an empty run list, never null/fake rows:\n{body:#}"
-    );
-    assert!(
-        body.get("recent_runs_window").is_none(),
-        "no fetch window may be claimed for a store that was not read:\n{body:#}"
     );
 }
 

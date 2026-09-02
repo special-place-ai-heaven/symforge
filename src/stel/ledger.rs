@@ -195,7 +195,6 @@ fn ledger_timestamp_ms() -> u64 {
 /// Rendering-only (spec FR-009): a run is computed from the rows a view is
 /// about to render and is never written back — the stored events, in-memory
 /// and durable, stay individually intact.
-#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Run<T> {
     /// The chronologically first row of the run.
@@ -218,7 +217,6 @@ pub(crate) struct Run<T> {
 /// `first_ts_ms`/`last_ts_ms` are positional (the first and last row of the
 /// run as read through `ts_ms`), not min/max — callers pass rows in
 /// chronological order.
-#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
 pub(crate) fn collapse_runs<'a, T: Clone + 'a, K: PartialEq>(
     items: &'a [T],
     identity: impl Fn(&'a T) -> K,
@@ -257,7 +255,6 @@ pub(crate) fn collapse_runs<'a, T: Clone + 'a, K: PartialEq>(
 /// per-call measurements are bound and ignored; every other field is identity
 /// (data-model.md Lane A). A field added to the event fails compilation there
 /// and forces an identity decision instead of silently joining or skipping.
-#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EventIdentity<'a> {
     surface: &'a str,
@@ -272,7 +269,6 @@ pub(crate) struct EventIdentity<'a> {
 }
 
 /// Lane A identity extractor — see [`EventIdentity`].
-#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
 pub(crate) fn ledger_event_identity(event: &StelLedgerEvent) -> EventIdentity<'_> {
     let StelLedgerEvent {
         ts_ms: _,
@@ -314,7 +310,6 @@ pub(crate) fn ledger_event_identity(event: &StelLedgerEvent) -> EventIdentity<'_
 /// never merge (data-model.md Lane B). `accepted`/`eligible_h6` are excluded
 /// by construction — the row type does not read them back. `equivalence` has
 /// no column at all: a documented durable-lane coarseness.
-#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredRecordIdentity<'a> {
     session_id: &'a str,
@@ -329,7 +324,6 @@ pub(crate) struct StoredRecordIdentity<'a> {
 }
 
 /// Lane B identity extractor — see [`StoredRecordIdentity`].
-#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
 pub(crate) fn stored_record_identity(record: &StoredLedgerRecord) -> StoredRecordIdentity<'_> {
     let StoredLedgerRecord {
         id: _,

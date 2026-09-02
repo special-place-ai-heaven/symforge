@@ -170,6 +170,19 @@ async fn admin_page_references_endpoints_and_summary_has_real_values() {
     // The JS binds the real economics fields into cards (the values rendered).
     assert!(js.contains("total_events"));
     assert!(js.contains("total_net_vs_manual"));
+    // 032 US2: the JS also renders the collapsed recent-run list
+    // (contracts/admin-recent-runs.md) — the run count, session, the time
+    // span, and the window-edge marker.
+    for field in [
+        "recent_runs",
+        "recent_runs_window",
+        "window_clipped",
+        "session_id",
+        "first_ts_ms",
+        "last_ts_ms",
+    ] {
+        assert!(js.contains(field), "app.js renders {field}");
+    }
 
     // (3) The endpoint the dashboard binds returns the SEEDED real values
     // (not placeholders / zeros) — the data a browser would paint.
@@ -184,6 +197,11 @@ async fn admin_page_references_endpoints_and_summary_has_real_values() {
     assert_eq!(summary["available"], true);
     assert_eq!(summary["total_events"], 4);
     assert_eq!(summary["total_net_vs_manual"], 840); // 4 * 210
+    // 032 US2: the four identity-identical seeded events collapse to ONE run
+    // of 4 in the list the dashboard renders, while the totals above still
+    // count all four (FR-008).
+    assert_eq!(summary["recent_runs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(summary["recent_runs"][0]["count"], 4);
 
     server.shutdown().await;
 }
