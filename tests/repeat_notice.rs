@@ -754,3 +754,89 @@ async fn sessions_never_share_runs() {
     assert_eq!(serves[0], serves[1]);
     assert_eq!(serves[1], serves[2]);
 }
+
+// ---------------------------------------------------------------------------
+// Property pin — every eligible tool is byte-stable on an unchanged index and
+// notices on its third identical serve. A RED state is not constructible on
+// this code (the list is already exactly these five and each is
+// index-determined), the same posture as the `mcp_http` config pin: it exists
+// so a future widening of `REPEAT_ELIGIBLE_TOOLS` or a rendering drift in one
+// of the five fails a test instead of shipping a false "cannot differ".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_eligible_tool_is_byte_stable_and_notices_on_third_serve() {
+    let workspace = Workspace::seed();
+    let mut client = StdioClient::spawn(workspace.root());
+    let stable = stabilize(&mut client);
+
+    // One distinct fingerprint per tool (and distinct from stabilize()'s
+    // probes) so the five runs are independent; every argument set hits real
+    // content in the seeded workspace, pinned by `expected`.
+    let cases: [(&str, Value, &str); 5] = [
+        (
+            "search_symbols",
+            json!({"query": "anchor", "limit": 20}),
+            "fn alpha_anchor",
+        ),
+        (
+            "search_text",
+            json!({"query": "alpha_anchor"}),
+            "alpha_anchor",
+        ),
+        (
+            "get_repo_map",
+            json!({"detail": "tree", "depth": 2}),
+            "alpha.rs",
+        ),
+        (
+            "find_references",
+            json!({"name": "alpha_anchor"}),
+            "beta.rs",
+        ),
+        (
+            "find_dependents",
+            json!({"path": "src/alpha.rs"}),
+            "beta.rs",
+        ),
+    ];
+    for (tool, args, expected) in cases {
+        let serve1 = client.call_tool_result(tool, args.clone());
+        assert_no_notice(&serve1, &format!("{tool} serve 1"));
+        assert_ne!(
+            serve1.get("isError"),
+            Some(&json!(true)),
+            "{tool} serve 1 must not be an error: {serve1}"
+        );
+        assert!(
+            text_of(&serve1).contains(expected),
+            "{tool} serve 1 must hit real workspace content ({expected:?}): {}",
+            text_of(&serve1)
+        );
+        assert_eq!(evidence(&serve1), &stable, "{tool} serve 1 evidence");
+
+        let serve2 = client.call_tool_result(tool, args.clone());
+        assert_no_notice(&serve2, &format!("{tool} serve 2"));
+        assert_eq!(
+            serve2, serve1,
+            "{tool}: serve 2 must be byte-identical to serve 1 (content, isError, _meta)"
+        );
+
+        let serve3 = client.call_tool_result(tool, args);
+        let stripped = assert_notice_and_strip(&serve3, 3, tool, &format!("{tool} serve 3"));
+        assert_eq!(
+            stripped, serve1,
+            "{tool}: serve 3 minus the notice must equal serve 1 byte-for-byte"
+        );
+        assert_eq!(
+            evidence(&serve3)["generation"],
+            evidence(&serve1)["generation"],
+            "{tool}: evidence generation must be equal across the run"
+        );
+        assert_eq!(
+            serve3.get("isError"),
+            serve1.get("isError"),
+            "{tool}: the notice must never alter isError"
+        );
+    }
+}
