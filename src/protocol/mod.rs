@@ -3498,7 +3498,7 @@ mod tests {
         let args: rmcp::model::JsonObject =
             serde_json::from_value(serde_json::json!({ "query": "anchor" })).expect("object");
         let key = repeat::RepeatKey::observe(
-            repeat::SessionDiscriminator::Stdio,
+            repeat::LaneWitness::assume(repeat::SessionDiscriminator::Stdio),
             "search_symbols",
             Some(&args),
         )
@@ -3514,12 +3514,10 @@ mod tests {
             index_symbols: 1,
         };
         let observed = || {
-            repeat::ServeObservation::Observed(repeat::ObservedServe {
-                evidence: evidence.clone(),
-                body_digest: repeat::BodyDigest::of_content(&[rmcp::model::ContentBlock::text(
-                    "body",
-                )]),
-            })
+            repeat::ServeObservation::observed_for_test(repeat::ObservedServe::for_test(
+                evidence.clone(),
+                &[rmcp::model::ContentBlock::text("body")],
+            ))
         };
         let mut tracker = server.repeat_tracker.lock();
         assert!(tracker.record_serve(key.clone(), observed()).is_none());

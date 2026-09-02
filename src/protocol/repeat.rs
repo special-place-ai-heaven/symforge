@@ -83,17 +83,34 @@ impl SessionDiscriminator {
     /// inbound `http::request::Parts` into the request extensions. Only that
     /// transport does (both of its stateless paths); the stdio transport
     /// inserts nothing. Presence is therefore the inert lane and absence is
-    /// stdio — there is no third outcome to misreport.
-    pub fn observe(context: &RequestContext<RoleServer>) -> Self {
-        if context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .is_some()
-        {
-            Self::HttpInert
-        } else {
-            Self::Stdio
-        }
+    /// stdio — there is no third outcome to misreport. The result is a
+    /// [`LaneWitness`]: proof the lane was read off a real request context.
+    pub fn observe(context: &RequestContext<RoleServer>) -> LaneWitness {
+        LaneWitness(
+            if context
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .is_some()
+            {
+                Self::HttpInert
+            } else {
+                Self::Stdio
+            },
+        )
+    }
+}
+
+/// Proof that the session lane was OBSERVED from a request context rather
+/// than asserted by a caller. The private field means only
+/// [`SessionDiscriminator::observe`] (and the in-crate test door) can mint
+/// one, so no seam can hand the tracker a `Stdio` it never observed.
+#[derive(Debug, Clone, Copy)]
+pub struct LaneWitness(SessionDiscriminator);
+
+impl LaneWitness {
+    #[cfg(test)]
+    pub(crate) fn assume(lane: SessionDiscriminator) -> Self {
+        Self(lane)
     }
 }
 
@@ -114,11 +131,8 @@ impl RepeatKey {
     /// lane structurally withholds per-project evidence — research.md R6).
     /// `None` means no tracker interaction at all: the seam cannot key what
     /// it cannot attribute. Absent arguments fingerprint as the empty object.
-    pub fn observe(
-        session: SessionDiscriminator,
-        tool: &str,
-        arguments: Option<&JsonObject>,
-    ) -> Option<Self> {
+    pub fn observe(lane: LaneWitness, tool: &str, arguments: Option<&JsonObject>) -> Option<Self> {
+        let session = lane.0;
         if session != SessionDiscriminator::Stdio || !is_repeat_eligible(tool) {
             return None;
         }
@@ -155,7 +169,7 @@ impl RepeatKey {
 pub struct BodyDigest([u8; 32]);
 
 impl BodyDigest {
-    pub fn of_content(content: &[ContentBlock]) -> Self {
+    fn of_content(content: &[ContentBlock]) -> Self {
         let mut frame = Vec::new();
         for block in content {
             if let ContentBlock::Text(text) = block {
@@ -169,10 +183,22 @@ impl BodyDigest {
 
 /// Everything the seam positively observed about one serve: the typed
 /// evidence the response carried and the digest of the body it rendered.
+/// Built only by [`ServeObservation::from_result`] (and the in-crate test
+/// door), so no caller can assert an observation it did not make.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedServe {
-    pub evidence: ProjectEvidence,
-    pub body_digest: BodyDigest,
+    evidence: ProjectEvidence,
+    body_digest: BodyDigest,
+}
+
+impl ObservedServe {
+    #[cfg(test)]
+    pub(crate) fn for_test(evidence: ProjectEvidence, content: &[ContentBlock]) -> Self {
+        Self {
+            evidence,
+            body_digest: BodyDigest::of_content(content),
+        }
+    }
 }
 
 /// Proof that two observed serves were equal — typed evidence AND rendered
@@ -190,11 +216,14 @@ impl RepeatWitness {
     /// `Some` only on FULL evidence equality — any drift in generation, index
     /// state, file/symbol counts, root, load source, or identity — AND body
     /// digest equality. A body that differs under equal evidence is exactly
-    /// the result that just differed; the claim cannot survive it.
-    pub fn observe(prior: &ObservedServe, current: &ObservedServe) -> Option<Self> {
-        (prior == current).then_some(Self {
-            generation: current.evidence.generation,
-        })
+    /// the result that just differed; the claim cannot survive it. Private:
+    /// only [`RepeatTracker::record_serve`] may witness.
+    fn observe(prior: &ObservedServe, current: &ObservedServe) -> Option<Self> {
+        (prior.evidence == current.evidence && prior.body_digest == current.body_digest).then_some(
+            Self {
+                generation: current.evidence.generation,
+            },
+        )
     }
 
     pub fn evidence_generation(&self) -> u64 {
@@ -214,7 +243,8 @@ pub struct RepeatNotice {
 }
 
 impl RepeatNotice {
-    pub fn new(witness: RepeatWitness, repeat_count: u32, key: &RepeatKey) -> Option<Self> {
+    /// Private: only [`RepeatTracker::record_serve`] may spell a notice.
+    fn new(witness: RepeatWitness, repeat_count: u32, key: &RepeatKey) -> Option<Self> {
         (repeat_count >= NOTICE_THRESHOLD).then(|| Self {
             witness,
             repeat_count,
@@ -302,13 +332,40 @@ pub enum UnobservedReason {
 }
 
 /// What the seam observed on the OUTGOING response of one eligible call.
+/// Constructible only by [`ServeObservation::from_result`] (and the in-crate
+/// test door): the inner enum is private, so a caller cannot assert an
+/// observation it did not make.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServeObservation {
+pub struct ServeObservation(Observation);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Observation {
     Observed(ObservedServe),
     Unobserved(UnobservedReason),
 }
 
 impl ServeObservation {
+    #[cfg(test)]
+    pub(crate) fn observed_for_test(serve: ObservedServe) -> Self {
+        Self(Observation::Observed(serve))
+    }
+
+    #[cfg(test)]
+    fn observed_serve(&self) -> Option<&ObservedServe> {
+        match &self.0 {
+            Observation::Observed(serve) => Some(serve),
+            Observation::Unobserved(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn unobserved_reason(&self) -> Option<UnobservedReason> {
+        match &self.0 {
+            Observation::Observed(_) => None,
+            Observation::Unobserved(reason) => Some(*reason),
+        }
+    }
+
     /// Observation: the response's own `_meta` — the evidence the seam
     /// attached (or the statused writer attached first), the outcome class
     /// read leniently from `symforge/result_status` — and the digest of the
@@ -323,25 +380,27 @@ impl ServeObservation {
             .and_then(|meta| meta.0.get(PROJECT_EVIDENCE_META_KEY))
             .and_then(|value| serde_json::from_value::<ProjectEvidence>(value.clone()).ok())
         else {
-            return Self::Unobserved(UnobservedReason::EvidenceUnavailable);
+            return Self(Observation::Unobserved(
+                UnobservedReason::EvidenceUnavailable,
+            ));
         };
         if evidence.project_id == UNBOUND_PROJECT_ID {
-            return Self::Unobserved(UnobservedReason::ProjectUnbound);
+            return Self(Observation::Unobserved(UnobservedReason::ProjectUnbound));
         }
         let observed = || ObservedServe {
             evidence: evidence.clone(),
             body_digest: BodyDigest::of_content(&result.content),
         };
-        match result_status::observed_outcome_class(meta) {
+        Self(match result_status::observed_outcome_class(meta) {
             Some(OutcomeClass::InternalFailure) => {
-                Self::Unobserved(UnobservedReason::InternalFailure)
+                Observation::Unobserved(UnobservedReason::InternalFailure)
             }
-            Some(_) => Self::Observed(observed()),
+            Some(_) => Observation::Observed(observed()),
             None if result.is_error == Some(true) => {
-                Self::Unobserved(UnobservedReason::ErrorWithoutOutcomeClass)
+                Observation::Unobserved(UnobservedReason::ErrorWithoutOutcomeClass)
             }
-            None => Self::Observed(observed()),
-        }
+            None => Observation::Observed(observed()),
+        })
     }
 }
 
@@ -374,9 +433,9 @@ impl RepeatTracker {
         key: RepeatKey,
         observation: ServeObservation,
     ) -> Option<RepeatNotice> {
-        let current = match observation {
-            ServeObservation::Observed(current) => current,
-            ServeObservation::Unobserved(_) => {
+        let current = match observation.0 {
+            Observation::Observed(current) => current,
+            Observation::Unobserved(_) => {
                 self.runs.remove(&key);
                 return None;
             }
@@ -472,13 +531,13 @@ mod tests {
         serde_json::from_value(value).expect("object arguments")
     }
 
+    fn stdio() -> LaneWitness {
+        LaneWitness::assume(SessionDiscriminator::Stdio)
+    }
+
     fn key(tool: &str, query: &str) -> RepeatKey {
-        RepeatKey::observe(
-            SessionDiscriminator::Stdio,
-            tool,
-            Some(&args(json!({ "query": query }))),
-        )
-        .expect("an eligible stdio call keys the tracker")
+        RepeatKey::observe(stdio(), tool, Some(&args(json!({ "query": query }))))
+            .expect("an eligible stdio call keys the tracker")
     }
 
     /// A result carrying `_meta` exactly as the seam would see it after
@@ -515,7 +574,7 @@ mod tests {
     }
 
     fn observed(generation: u64) -> ServeObservation {
-        ServeObservation::Observed(observed_serve(generation))
+        ServeObservation::observed_for_test(observed_serve(generation))
     }
 
     /// Serve `key` `n` times with equal observed evidence; return the LAST
@@ -549,7 +608,7 @@ mod tests {
         for tool in REPEAT_ELIGIBLE_TOOLS {
             assert!(is_repeat_eligible(tool), "{tool} must be eligible");
             assert!(
-                RepeatKey::observe(SessionDiscriminator::Stdio, tool, None).is_some(),
+                RepeatKey::observe(stdio(), tool, None).is_some(),
                 "{tool} must key the tracker on stdio"
             );
         }
@@ -567,7 +626,7 @@ mod tests {
         ] {
             assert!(!is_repeat_eligible(tool), "{tool} must stay ineligible");
             assert!(
-                RepeatKey::observe(SessionDiscriminator::Stdio, tool, None).is_none(),
+                RepeatKey::observe(stdio(), tool, None).is_none(),
                 "{tool} must never key the tracker"
             );
         }
@@ -673,28 +732,31 @@ mod tests {
         let unbound = serde_json::to_value(&unbound_evidence).expect("serializes");
 
         // The typed observation rule.
-        assert!(matches!(
-            ServeObservation::from_result(&result_with(full.clone(), None, None)),
-            ServeObservation::Observed(ref serve) if *serve == observed_serve(5)
-        ));
-        assert!(matches!(
-            ServeObservation::from_result(&result_with(marker.clone(), None, None)),
-            ServeObservation::Unobserved(UnobservedReason::EvidenceUnavailable)
-        ));
-        assert!(matches!(
-            ServeObservation::from_result(&result_with(garbage.clone(), None, None)),
-            ServeObservation::Unobserved(UnobservedReason::EvidenceUnavailable)
-        ));
-        assert!(matches!(
-            ServeObservation::from_result(&result_with(unbound.clone(), None, None)),
-            ServeObservation::Unobserved(UnobservedReason::ProjectUnbound)
-        ));
+        assert_eq!(
+            ServeObservation::from_result(&result_with(full.clone(), None, None)).observed_serve(),
+            Some(&observed_serve(5))
+        );
+        assert_eq!(
+            ServeObservation::from_result(&result_with(marker.clone(), None, None))
+                .unobserved_reason(),
+            Some(UnobservedReason::EvidenceUnavailable)
+        );
+        assert_eq!(
+            ServeObservation::from_result(&result_with(garbage.clone(), None, None))
+                .unobserved_reason(),
+            Some(UnobservedReason::EvidenceUnavailable)
+        );
+        assert_eq!(
+            ServeObservation::from_result(&result_with(unbound.clone(), None, None))
+                .unobserved_reason(),
+            Some(UnobservedReason::ProjectUnbound)
+        );
         // A missing `_meta` entirely is unobserved too.
         let bare = CallToolResult::success(vec![ContentBlock::text("body")]);
-        assert!(matches!(
-            ServeObservation::from_result(&bare),
-            ServeObservation::Unobserved(UnobservedReason::EvidenceUnavailable)
-        ));
+        assert_eq!(
+            ServeObservation::from_result(&bare).unobserved_reason(),
+            Some(UnobservedReason::EvidenceUnavailable)
+        );
 
         for (label, unobserved) in [
             ("bound:false marker", marker),
@@ -757,10 +819,10 @@ mod tests {
             Some(status_value(OutcomeClass::InternalFailure)),
             Some(true),
         );
-        assert!(matches!(
-            ServeObservation::from_result(&failure),
-            ServeObservation::Unobserved(UnobservedReason::InternalFailure)
-        ));
+        assert_eq!(
+            ServeObservation::from_result(&failure).unobserved_reason(),
+            Some(UnobservedReason::InternalFailure)
+        );
         assert!(
             tracker
                 .record_serve(k.clone(), ServeObservation::from_result(&failure))
@@ -795,10 +857,10 @@ mod tests {
         let mut tracker = RepeatTracker::default();
         assert!(serve_equal(&mut tracker, &k, 9, 2).is_none());
         let plain_error = result_with(full.clone(), None, Some(true));
-        assert!(matches!(
-            ServeObservation::from_result(&plain_error),
-            ServeObservation::Unobserved(UnobservedReason::ErrorWithoutOutcomeClass)
-        ));
+        assert_eq!(
+            ServeObservation::from_result(&plain_error).unobserved_reason(),
+            Some(UnobservedReason::ErrorWithoutOutcomeClass)
+        );
         assert!(
             tracker
                 .record_serve(k.clone(), ServeObservation::from_result(&plain_error))
@@ -880,7 +942,7 @@ mod tests {
         let single = args(json!({ "query": "anchor" }));
         assert!(
             RepeatKey::observe(
-                SessionDiscriminator::HttpInert,
+                LaneWitness::assume(SessionDiscriminator::HttpInert),
                 "search_symbols",
                 Some(&single)
             )
@@ -889,30 +951,19 @@ mod tests {
         );
         let fan_out = args(json!({ "query": "anchor", "projects": ["*"] }));
         assert!(
-            RepeatKey::observe(
-                SessionDiscriminator::Stdio,
-                "search_symbols",
-                Some(&fan_out)
-            )
-            .is_none(),
+            RepeatKey::observe(stdio(), "search_symbols", Some(&fan_out)).is_none(),
             "a set-valued projects fan-out never keys"
         );
         let null_projects = args(json!({ "query": "anchor", "projects": null }));
-        let keyed = RepeatKey::observe(
-            SessionDiscriminator::Stdio,
-            "search_symbols",
-            Some(&null_projects),
-        )
-        .expect("projects:null is absence");
-        let control =
-            RepeatKey::observe(SessionDiscriminator::Stdio, "search_symbols", Some(&single))
-                .expect("stdio single-project keys");
+        let keyed = RepeatKey::observe(stdio(), "search_symbols", Some(&null_projects))
+            .expect("projects:null is absence");
+        let control = RepeatKey::observe(stdio(), "search_symbols", Some(&single))
+            .expect("stdio single-project keys");
         assert_eq!(control.tool(), "search_symbols");
         // Fingerprint identity: same args => same key; different args => different.
         assert_eq!(
             control,
-            RepeatKey::observe(SessionDiscriminator::Stdio, "search_symbols", Some(&single))
-                .expect("same")
+            RepeatKey::observe(stdio(), "search_symbols", Some(&single)).expect("same")
         );
         assert_ne!(
             control, keyed,
@@ -921,15 +972,13 @@ mod tests {
         let other = args(json!({ "query": "other" }));
         assert_ne!(
             control,
-            RepeatKey::observe(SessionDiscriminator::Stdio, "search_symbols", Some(&other))
-                .expect("other")
+            RepeatKey::observe(stdio(), "search_symbols", Some(&other)).expect("other")
         );
         // Absent arguments hash as the empty object.
         let empty = args(json!({}));
         assert_eq!(
-            RepeatKey::observe(SessionDiscriminator::Stdio, "get_repo_map", None).expect("none"),
-            RepeatKey::observe(SessionDiscriminator::Stdio, "get_repo_map", Some(&empty))
-                .expect("empty")
+            RepeatKey::observe(stdio(), "get_repo_map", None).expect("none"),
+            RepeatKey::observe(stdio(), "get_repo_map", Some(&empty)).expect("empty")
         );
     }
 
