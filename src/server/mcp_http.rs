@@ -201,4 +201,38 @@ mod tests {
         // Loopback defaults are preserved alongside the routable host.
         assert!(hosts.iter().any(|h| h == "localhost"));
     }
+
+    /// Feature 032 (US1): the repeat tracker treats every `/mcp` request as
+    /// `SessionDiscriminator::HttpInert` because this lane is sessionless by
+    /// construction — rmcp never creates a session or issues `Mcp-Session-Id`
+    /// while `legacy_session_mode` is false. Flipping it would let sessions
+    /// exist here without the tracker observing them, so a flip must fail a
+    /// test instead of silently keying counts on a header no modern client
+    /// sends.
+    #[test]
+    fn mcp_service_config_pins_the_sessionless_lane() {
+        use crate::live_index::LiveIndex;
+        use crate::server::AuthConfig;
+        use crate::watcher::WatcherInfo;
+        use parking_lot::Mutex;
+
+        let index = LiveIndex::empty();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let protocol = Arc::new(SymForgeServer::new(
+            Arc::clone(&index),
+            "mcp_http_config_pin".to_string(),
+            watcher_info,
+            None,
+            None,
+        ));
+        let governor = Arc::new(RequestGovernor::new());
+        let runtime =
+            ServerRuntime::build_runtime(index, protocol, governor, AuthConfig::new(None), None);
+
+        let service = build_mcp_service(&runtime, "127.0.0.1");
+        assert!(
+            !service.config.legacy_session_mode,
+            "the /mcp lane must stay sessionless: the repeat tracker's HttpInert              discriminator depends on it"
+        );
+    }
 }
