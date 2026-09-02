@@ -232,18 +232,30 @@ impl LedgerRunView {
     /// Project one collapsed run onto the wire shape; `window_clipped` is
     /// decided by the caller, which alone sees the sentinel row beyond the
     /// window.
+    ///
+    /// EXHAUSTIVE destructure, mirroring the identity extractor: the excluded
+    /// columns (`id`, `ts_ms`, `plan_id`, the four token measurements) are bound
+    /// and ignored by name, so a column added to `StoredLedgerRecord` fails
+    /// compilation here and forces a wire decision instead of silently
+    /// staying off the view.
     fn from_run(run: &Run<StoredLedgerRecord>, window_clipped: bool) -> Self {
         let StoredLedgerRecord {
+            id: _,
+            ts_ms: _,
             session_id,
+            plan_id: _,
             surface,
             intent,
             decision,
             tools_called_json,
+            predicted_response_tokens: _,
+            actual_response_tokens: _,
+            manual_baseline_tokens: _,
+            net_vs_manual: _,
             route_confidence,
             pff_bypass,
             cache_hit,
             degrade_flags_json,
-            ..
         } = &run.canonical;
         Self {
             count: run.count,
