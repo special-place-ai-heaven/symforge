@@ -1014,9 +1014,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-13 after re-reviewing the complete src diff:
 // the embed handle activation described on the excluded-source pin above.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "28ef5eb7e464ca8d3244f11ab72740357ef41d7e1b32bea5e89d324ba796bb4d",
+    "8a64286b87f5368feb5421a93fff8fee1efc143223fcb0bcb632981f8aa068d9",
     197,
-    9_559_823,
+    9_577_814,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
