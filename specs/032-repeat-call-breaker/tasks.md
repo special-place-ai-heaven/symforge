@@ -85,7 +85,7 @@ Single Rust crate at repo root: `src/`, `tests/`. All cargo invocations: serial,
 
 - [X] T019 Full gate battery per quickstart.md, in order, one cargo process at a time via Terminal Commander: fmt → clippy `--all-targets -D warnings` → full serial suite → embed cell (stel_core regression only — R10) → bench `observed_refresh_gate_v1 -- --test` → release build → `node scripts/verify-tools.cjs --bin target/release/symforge` (both fixtures; flags per ci.yml) → npm suite. ALL observed green (Constitution IV) — receipts kept.
 - [X] T020 Confirm no doc/test seal was tripped: no `.github/workflows` byte changed (`WORKFLOW_FINGERPRINTS`), no README/AGENTS.md pinned phrase touched, no `SYMFORGE_TOOL_NAMES`/tool-count change; answer the doc-staleness hook's injected CLAUDE.md claims at commit time honestly.
-- [ ] T021 `cargo clean` (heavy-session discipline), then commit(s) with conventional subjects and open ONE behavior-changing PR referencing this spec; request independent adversarial review including the cfg-lens sweep (Constitution VI); squash-merge only with explicit `--subject`/`--body` per repo merge rules. Durable finding (if any) → agentmemory with `[symforge]` prefix.
+- [X] T021 `cargo clean` (heavy-session discipline), then commit(s) with conventional subjects and open ONE behavior-changing PR referencing this spec; request independent adversarial review including the cfg-lens sweep (Constitution VI); squash-merge only with explicit `--subject`/`--body` per repo merge rules. Durable finding (if any) → agentmemory with `[symforge]` prefix.
 
 ---
 

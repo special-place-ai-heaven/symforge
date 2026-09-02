@@ -458,3 +458,39 @@ The latch sits in a hot render path and changed no existing rendering: the 501 i
 - The latch is a no-op outside a dispatch scope, so a future renderer that moves one of these reads onto another task would lose the fence. Both production callers run inline on the dispatch task today, and the two integration oracles would fail if that changed. A scope-required token threaded to the reading sites would make it structural; that is a larger refactor than this round warranted.
 - A sweep of every disk and git read reachable from the five eligible tools found no unfenced input beyond the two fixed. That was a grep-and-map exercise, not a proof; `get_repo_map` and `find_dependents` were confirmed by absence rather than by reading their render paths line by line.
 - The proxy overlay matches the annotated line by prefix, so the annotation must stay a suffix. Nothing pins that ordering inside the formatter.
+
+## Full gate battery (Constitution IV), 2026-09-02, Windows
+
+Run with `-j 4`, tests `--test-threads=1`, one cargo invocation at a time. The embed cell ran in a separate worktree so the two feature sets never shared a target directory, which is the documented way to avoid the interleaving corruption.
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean, exit 0 |
+| `cargo build --no-default-features --features embed` | clean |
+| `cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings` | clean, exit 0 |
+| `cargo test --no-default-features --features embed --lib -- --test-threads=1` | ok. 1344 passed; 0 failed; 4 ignored |
+| `cargo bench --bench observed_refresh_gate_v1 -- --test` | exit 0 |
+| `cargo build --release` | Finished in 5m 23s |
+| `node scripts/verify-tools.cjs --bin target/release/symforge.exe` | 7 PASS, 1 REVIEW, 0 FAIL — every snapshot byte-identical |
+| `node scripts/verify-tools.cjs --fixture verify-tools-real --bin target/release/symforge.exe` | 10 PASS, 1 REVIEW, 0 FAIL — every snapshot byte-identical |
+| `npm test` (in `npm/`) | 0 failed |
+| `cargo test --lib --bins --tests -- --test-threads=1` | see below |
+
+The two REVIEW rows are the harness's documented grep-over-match cases, which it does not count as failures; both invocations exited 0. That the snapshots are byte-identical is the load-bearing result here: the repeat notice did not leak into a release-gate snapshot.
+
+### The full serial suite, stated precisely
+
+One real failure surfaced and was fixed: `full_source_set_matches_reviewed_darkness_baseline`, the broad in-tree source seal, which fired on exactly one added file (197 vs the pinned 196) and its bytes. Before refreshing the pin I verified what the seal exists to protect: the excluded runtime source set is unchanged and its own seal still passes, no file in that set was touched, and the diff adds no reference to it. The pin was then set to the value the oracle itself computed, on an already formatted tree, per the rule that the oracle is the only recompute authority.
+
+Beyond that, no test failed for a reason in this diff. Across four runs of the suite, every test binary has been observed passing, and the only other failures were three separate loopback-socket transients, each in a different pre-existing test that binds a local HTTP server, each passing repeatedly when rerun in isolation:
+
+| Test | Failure | In isolation |
+|---|---|---|
+| `hook_enrichment_integration::loading_sidecar_refuses_all_content_routes_without_mutation` | health body not JSON, while a release build was compiling concurrently (my own doing) | 4 runs, 13/13 each |
+| `serve_auth::missing_bearer_with_key_is_unauthorized` | the HTTP send itself failed, not an auth assertion | 3 runs, 5/5 each |
+| `hook_enrichment_integration::test_edit_hook_impact_diff` | `GET /impact must succeed: An existing connection was forcibly closed by the remote host. (os error 10054)` | passes |
+
+`os error 10054` is a Windows TCP reset on loopback. None of these tests reference the dispatch scope or any other code this feature changed, which was checked rather than assumed; the one HTTP-module change in the diff is confined to a hunk inside `mod tests`. A single no-fail-fast pass covered every target and reported exactly one failing target, the second row above.
+
+The honest summary is therefore: every gate is green, the suite has no failure attributable to this change, and this Windows host intermittently resets loopback connections during a ten-minute serial run. The Linux `rust` job in CI is the authoritative observation of that gate and runs the same command.
