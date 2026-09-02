@@ -443,6 +443,15 @@ fn third_identical_eligible_call_carries_notice_and_first_two_do_not() {
     // tool answers byte-identically on an unchanged index.
     assert_eq!(serve1, serve2, "serve 2 must be byte-identical to serve 1");
 
+    // FR-002 at the seam: interleaved DIFFERENT calls — one eligible with
+    // another fingerprint, one ineligible — neither notice nor reset the run.
+    let other = client.call_tool_result("search_symbols", json!({"query": "beta_anchor"}));
+    assert_no_notice(&other, "interleaved different-fingerprint eligible call");
+    assert_eq!(evidence(&other), &stable, "interleaved eligible call evidence");
+    let status = client.call_tool_result("status", json!({}));
+    assert_no_notice(&status, "interleaved ineligible call");
+    assert_eq!(evidence(&status), &stable, "interleaved ineligible call evidence");
+
     let serve3 = client.call_tool_result("search_symbols", args);
     let stripped = assert_notice_and_strip(&serve3, 3, "search_symbols", "serve 3");
     // SC-004: the notice is a strict suffix — everything else (content bytes,
