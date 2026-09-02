@@ -494,3 +494,104 @@ Beyond that, no test failed for a reason in this diff. Across four runs of the s
 `os error 10054` is a Windows TCP reset on loopback. None of these tests reference the dispatch scope or any other code this feature changed, which was checked rather than assumed; the one HTTP-module change in the diff is confined to a hunk inside `mod tests`. A single no-fail-fast pass covered every target and reported exactly one failing target, the second row above.
 
 The honest summary is therefore: every gate is green, the suite has no failure attributable to this change, and this Windows host intermittently resets loopback connections during a ten-minute serial run. The Linux `rust` job in CI is the authoritative observation of that gate and runs the same command.
+
+## Round 3 (2026-09-02) — the withholding rule is itself the defect
+
+Round 2's fix was accepted and shipped in this branch. Re-reading it against the
+feature's purpose showed it had traded away the thing the feature exists to do.
+
+### The finding
+
+The notice's version-1 text ended with "The result cannot differ until the index
+changes." Round 2 correctly established that no equality of past serves licenses that
+sentence when the renderer reads state the index never publishes, and withheld the
+notice on those lanes. But the most common such lane is a zero-hit `search_text` —
+which is precisely the shape a looping agent produces. The guard fired on the primary
+case.
+
+It was also incoherent as observed behavior. The untracked sweep runs only when
+`result.files.is_empty() && result.suppressed_by_noise == 0`
+(`src/protocol/tools.rs`), so of two zero-hit searches, one could notice and the other
+not, decided by a counter no caller can see or predict.
+
+### The adjudication
+
+Four alternatives were considered; three were refuted on evidence.
+
+| Option | Verdict |
+|---|---|
+| Keep withholding (shipped round 2) | Refuted — discards a valid observation to protect one clause, and does so unpredictably |
+| Widen the claim to "no file changed" | Refuted — `git add` moves a path out of untracked without changing a byte; so do ignore rules, repo config, path existence, permissions, and symlink resolution |
+| Fence the inputs by digesting what was read | Refuted — a digest witnesses what one serve observed; it does not freeze the next. A real fence would have to snapshot git classification, the path set, metadata, bytes, failures, and filesystem identity |
+| Emit the observed facts and drop the prediction | **Adopted** |
+
+A conditional variant (emit the strong sentence only when nothing unfenced was read)
+was also rejected: "nothing unfenced was read" is not positive proof when the report is
+opt-in — one future renderer that forgets to latch silently restores the false claim —
+and the latch was never literally that fact anyway. It fired at the top of
+`matching_untracked_paths_for_search_text`, ahead of the structural, missing-repository,
+and failed-git-open early returns, so it meant "entered a path that may depend on live
+state."
+
+### What the notice says now
+
+```
+Repeat notice: identical request served {N}x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first.
+```
+
+Every factual clause is something the tracker had to observe to reach the threshold:
+the serve count, `ProjectEvidence` equality across the run, and `BodyDigest` equality of
+the text rendered before the notice. The closing sentence is advice, not a prediction.
+`contract_version` goes 1 → 2: the JSON shape is unchanged, but its meaning is not, and
+a client keyed to version 1's promise would otherwise silently mis-read version 2.
+
+The scoping of the body clause is deliberate. The delivered response necessarily differs
+between serves because `{N}` increments, so the claim names the text *before* the notice
+— which is exactly the bytes the digest compares.
+
+### RED receipt
+
+`zero_hit_search_text_notices_on_third_identical_serve` — three byte-identical zero-hit
+serves under unchanged evidence, nothing planted between them:
+
+```
+test zero_hit_search_text_notices_on_third_identical_serve ... FAILED
+thread panicked at tests\repeat_notice.rs:283:47:
+zero-hit serve 3: must carry symforge/repeat_notice: {"_meta":{"symforge/project_evidence":{...}}}
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out
+```
+
+### GREEN, and why the honesty guarantee survives
+
+```
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The load-bearing result is not that the new test passes; it is which old test does.
+`untracked_file_diagnostic_never_earns_a_notice` was written in round 1, plants an
+untracked file between serves so the body moves under unchanged evidence, and asserts
+no notice. **It passes unchanged.** The body digest — not the latch — was always what
+caught the real hazard; round 2 added a second mechanism in front of one that already
+worked, and only that second mechanism cost the feature its primary case.
+
+`find_references_disk_fallback_never_claims_cannot_differ` was inverted rather than
+deleted, as `find_references_disk_fallback_notices_then_resets_when_the_body_moves`:
+three identical serves on the disk-fallback lane now notice, and the half where the
+gitignored log is appended still asserts no notice, because the rendered `Size:` line
+moves and the digest restarts the run. The lane keeps its coverage and demonstrates the
+mechanism.
+
+### Removed
+
+The unfenced-input latch is deleted, not left dormant: `note_unfenced_input`,
+`unfenced_input_consulted`, `UnobservedReason::UnfencedInput`, the `DispatchObservations`
+struct (whose second slot was the latch — the task-local returns to the single-slot
+`PROJECT_EVIDENCE` shape it had before round 2), and both call sites. Dead code behind a
+`server` cfg is invisible to the embed cell (CLAUDE.md records why), so leaving it would
+have been leaving a trap.
+
+Net `src/`: 57 insertions, 219 deletions. `FULL_SOURCE_PIN_V1` moved on bytes only —
+197 files before and after, no file added or removed. Before refreshing it,
+`excluded_runtime_source_set_matches_reviewed_baseline` and
+`dark_call_edges_appear_only_in_the_wired_roster` were both observed passing, so the set
+the seal protects is unchanged and the diff introduces no new bridge.

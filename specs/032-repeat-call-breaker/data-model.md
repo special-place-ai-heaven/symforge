@@ -56,7 +56,7 @@ RepeatWitness::observe(prior: &ObservedServe, current: &ObservedServe) -> Option
 
 Private field and private constructor; `Some` **only** on full equality of the two TYPED observations — every field of `ProjectEvidence` and the rendered-body digest, compared as whole values so a future `ObservedServe` field joins the witness automatically. No other constructor. Mirrors the `SourceAuthority::from_freshness` repair (`src/protocol/search_format.rs:3-26`).
 
-The witness is necessary but not sufficient for the notice's *forward* sentence ("the result cannot differ until the index changes"): equality of three past serves does not prove the fourth cannot differ if the renderer reads something the index never publishes. That gap is closed by eligibility plus the unfenced-input report above, not by the witness — see `contracts/repeat-notice.md`.
+The witness is exactly sufficient for what the notice says, because since round 3 the notice says exactly what the witness observed: the serves matched on every evidence field and on the rendered body. It carries no forward sentence for the witness to fall short of. A renderer that reads something the index never publishes — `search_text`'s untracked sweep, `find_references`'s disk fallback — does not threaten the claim; when such an input moves the answer, the body digest differs and the run restarts before a notice is due. See `contracts/repeat-notice.md` for why the round-2 unfenced-input withholding was removed.
 
 ### RepeatNotice
 

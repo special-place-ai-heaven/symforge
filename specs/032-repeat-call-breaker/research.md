@@ -78,7 +78,7 @@ A serve of an eligible fingerprint with equal observed evidence ADVANCES the run
 
 ## R8 — Notice delivery: text append + `_meta`, threshold 3
 
-**Decision**: at count ≥ `NOTICE_THRESHOLD = 3`: append the notice paragraph to the response's final text content block, and insert `_meta["symforge/repeat_notice"]` (contract in `contracts/repeat-notice.md`, versioned like `RESULT_STATUS_META_KEY` with `contract_version: 1`).
+**Decision**: at count ≥ `NOTICE_THRESHOLD = 3`: append the notice paragraph to the response's final text content block, and insert `_meta["symforge/repeat_notice"]` (contract in `contracts/repeat-notice.md`, versioned like `RESULT_STATUS_META_KEY`; `contract_version: 2` since review round 3 changed what the notice claims — see the contract).
 
 **Rationale**: the notice's purpose is to stop an LLM retry loop, and many harnesses show models only the text content — `_meta`-only would be invisible where it matters most; text-only would be invisible to programmatic clients. Both, or it under-delivers. Appending (never prepending/rewriting) keeps FR-004's byte-stability: original content is a strict prefix. Threshold 3 honors both the spec rationale (first retry after a transient failure is legitimate) and the repo's B5 counter-precedent against always-on tips (`src/protocol/tools.rs:4335-4336` — "tips stay rare + contextual"). A new `ResultStatus` field was rejected: the struct is `Copy` with a frozen two-field contract (`result_status.rs:169-173`); a separate single-writer `_meta` key follows the established FR-319 seam pattern instead.
 

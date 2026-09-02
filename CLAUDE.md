@@ -243,6 +243,16 @@ Key source files:
   `legacy_session_mode == false`) and never accumulates; any incarnation change
   (daemon reconnect, degraded flip, local reload) clears the tracker. Contract:
   `specs/032-repeat-call-breaker/contracts/repeat-notice.md`.
+  **The notice text is retrospective only — do not re-add a forward claim.** An
+  earlier revision ended with "the result cannot differ until the index changes",
+  which is unobservable in principle: `search_text`'s zero-hit untracked sweep and
+  `find_references`'s disk fallback render from state the index never publishes, so
+  the next serve really can differ with no publication in between. Withholding the
+  notice on those lanes (review round 2) preserved the sentence and cost the feature
+  its primary case, an agent looping on a query that finds nothing. Round 3 deleted
+  the sentence instead and bumped `contract_version` to 2. The rendered-body digest,
+  not any eligibility rule, is what keeps this honest: a serve whose bytes differ
+  restarts the run. See the contract's "Why there is no unfenced input bullet".
 - `src/protocol/format.rs` — Output formatters
 - `src/daemon.rs` — Daemon proxy with backward-compat aliases
 - `src/cli/init.rs` — Tool name list for client init

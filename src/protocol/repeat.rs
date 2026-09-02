@@ -9,21 +9,26 @@
 //! response — text and `_meta`, contract in
 //! `specs/032-repeat-call-breaker/contracts/repeat-notice.md`.
 //!
-//! Zero false claims dominates every trade-off here (spec SC-002). The notice
-//! makes a claim about the FUTURE ("the result cannot differ until the index
-//! changes"), so equality of the past serves is necessary but not sufficient —
-//! it must also be true that every input to the rendered answer is fenced by
-//! the compared evidence. Two independent guards enforce that:
+//! Zero false claims dominates every trade-off here (spec SC-002), which is
+//! why the notice states only what was OBSERVED and predicts nothing: this
+//! request was served N times, no index change was published across those
+//! serves, and the response text was unchanged. Each clause is a fact the
+//! tracker had to establish to reach the threshold at all — a
+//! [`RepeatNotice`] is constructible ONLY from a [`RepeatWitness`], which
+//! exists only on observed full equality of two typed evidence values AND of
+//! the rendered result bytes. The advice that follows ("do not retry
+//! unchanged") is advice, not a claim about what the next serve would return.
 //!
-//! 1. A [`RepeatNotice`] is constructible ONLY from a [`RepeatWitness`], which
-//!    exists only on observed full equality of two typed evidence values AND
-//!    of the rendered result bytes.
-//! 2. A renderer that reaches outside the index — `search_text`'s zero-hit
-//!    untracked-file sweep (live `git status` + raw worktree bytes), the
-//!    admission-tier disk fallback (`fs::metadata` + first bytes) — latches
-//!    [`result_status::note_unfenced_input`] on the dispatch scope, and the
-//!    seam reads it back as [`UnobservedReason::UnfencedInput`]: the run is
-//!    REMOVED, so such a response never notices and never accumulates.
+//! An earlier revision promised the reader that "the result cannot differ
+//! until the index changes". That is a claim about the FUTURE, and no
+//! equality of past serves can license it for a body rendered from something
+//! the index never published — `search_text`'s zero-hit untracked-file sweep
+//! (live `git status` + raw worktree bytes) or the admission-tier disk
+//! fallback (`fs::metadata` + first bytes). Withholding the notice on those
+//! lanes bought the promise at the cost of the feature's primary case, an
+//! agent looping on a query that finds nothing. Dropping the promise instead
+//! costs nothing real: the body digest already restarts the run whenever such
+//! an input moves the answer, so what remains is true on every lane.
 //!
 //! Anything else the seam cannot observe — an inert lane, an unavailable-
 //! evidence marker, an unbound project, an internal failure, a serve whose
@@ -351,12 +356,15 @@ impl RepeatNotice {
         self.witness.evidence_generation()
     }
 
-    /// Byte-canonical text (contract §2). It says "published" — the
-    /// observation is publication-level, never disk-level — and never claims
-    /// the files are unchanged.
+    /// Byte-canonical text (contract §2). Every clause is retrospective and
+    /// was observed: the serve count, evidence equality across the run
+    /// ("published" — the observation is publication-level, never disk-level,
+    /// and never claims the files are unchanged), and body-digest equality of
+    /// the text rendered BEFORE this notice was appended. The closing sentence
+    /// is advice, not a prediction.
     pub fn text(&self) -> String {
         format!(
-            "Repeat notice: identical request served {}x with no index change published in between (project evidence unchanged). The result cannot differ until the index changes - change the request instead of retrying.",
+            "Repeat notice: identical request served {}x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first.",
             self.repeat_count
         )
     }
@@ -419,12 +427,6 @@ pub enum UnobservedReason {
     /// `OutcomeClass` unobservable on this lane (no `symforge/result_status`)
     /// and `isError == true`: cleared conservatively.
     ErrorWithoutOutcomeClass,
-    /// A renderer in this dispatch consulted an input the published index does
-    /// not fence (`result_status::note_unfenced_input`). Evidence equality
-    /// witnesses that the PAST serves matched; the notice's sentence is about
-    /// the FUTURE, and nothing here fences that input, so the claim is
-    /// withheld and the run removed.
-    UnfencedInput,
 }
 
 /// What the seam observed on the OUTGOING response of one eligible call.
@@ -462,27 +464,24 @@ impl ServeObservation {
         }
     }
 
-    /// Observation: the dispatch's own unfenced-input latch, then the
-    /// response's `_meta` — the evidence the seam attached (or the statused
-    /// writer attached first), the outcome class read leniently from
-    /// `symforge/result_status` — and the digest of the text content the
-    /// response renders (before any notice is appended).
+    /// Observation: the response's `_meta` — the evidence the seam attached
+    /// (or the statused writer attached first) and the outcome class read
+    /// leniently from `symforge/result_status` — plus the digest of the text
+    /// content the response renders, taken BEFORE any notice is appended.
     ///
-    /// The latch is read FIRST because it is the claim-killer: no amount of
-    /// observed equality can license "the result cannot differ" for a body
-    /// built from something the index never published. Every outcome other
-    /// than that, an observed `InternalFailure`, or an unclassifiable error
-    /// ADVANCES a run: `NotFound`, `EmptyResult`, `InvalidRequest` loops are
-    /// the motivating case (data-model.md state machine). Anything this cannot
-    /// read emits `Unobserved`, never a default.
+    /// The digest is what keeps the notice honest on a lane whose renderer
+    /// reached outside the index. It does not fence the next serve — nothing
+    /// here could — but the notice no longer claims anything about the next
+    /// serve; it reports that these serves rendered the same bytes, and a
+    /// serve that renders different bytes restarts the run before any notice
+    /// is due.
     ///
-    /// Called at the `call_tool` seam INSIDE the dispatch's evidence scope, so
-    /// the latch it reads is the one this response's renderers set and no
-    /// other; the scope is constructed per dispatch and dropped with it.
+    /// Every outcome other than an observed `InternalFailure` or an
+    /// unclassifiable error ADVANCES a run: `NotFound`, `EmptyResult`,
+    /// `InvalidRequest` loops are the motivating case (data-model.md state
+    /// machine). Anything this cannot read emits `Unobserved`, never a
+    /// default.
     pub fn from_result(result: &CallToolResult) -> Self {
-        if result_status::unfenced_input_consulted() {
-            return Self(Observation::Unobserved(UnobservedReason::UnfencedInput));
-        }
         let meta = result.meta.as_ref();
         let Some(evidence) = meta
             .and_then(|meta| meta.0.get(PROJECT_EVIDENCE_META_KEY))
@@ -860,7 +859,7 @@ mod tests {
         assert_eq!(notice.evidence_generation(), 1);
         assert_eq!(
             notice.text(),
-            "Repeat notice: identical request served 3x with no index change published in between (project evidence unchanged). The result cannot differ until the index changes - change the request instead of retrying."
+            "Repeat notice: identical request served 3x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first."
         );
 
         let mut tracker = RepeatTracker::default();
@@ -1346,92 +1345,6 @@ mod tests {
         assert_eq!(notice.repeat_count(), 3);
     }
 
-    // F1 (round 2) — a response that consulted an input the index does NOT
-    // fence can never carry the forward claim, however equal the past serves
-    // were. The reading code latches the fact on the dispatch scope; the seam
-    // reads it back and REMOVES the run.
-    #[tokio::test]
-    async fn unfenced_input_removes_the_run_and_never_notices() {
-        let full = serde_json::to_value(evidence(2)).expect("evidence serializes");
-        let k = key("search_text", "needle-zz");
-        let serve = |latched: bool| {
-            let full = full.clone();
-            async move {
-                result_status::with_project_evidence_scope(None, async {
-                    if latched {
-                        result_status::note_unfenced_input();
-                    }
-                    ServeObservation::from_result(&result_with(full, None, None))
-                })
-                .await
-            }
-        };
-
-        // A run at 2, then one latched serve: removed, never noticed.
-        let mut tracker = RepeatTracker::default();
-        assert!(serve_equal(&mut tracker, &k, 2, 2).is_none());
-        assert_eq!(tracker.count_of(&k), Some(2), "the run reached 2");
-        let observation = serve(true).await;
-        assert_eq!(
-            observation.unobserved_reason(),
-            Some(UnobservedReason::UnfencedInput)
-        );
-        assert!(
-            tracker.record_serve(k.clone(), observation).is_none(),
-            "an unfenced serve never notices"
-        );
-        assert_eq!(
-            tracker.count_of(&k),
-            None,
-            "the run is removed, not merely skipped"
-        );
-
-        // And it never accumulates on that lane: three more latched serves
-        // with identical evidence and body still leave nothing behind.
-        for _ in 0..3 {
-            assert!(tracker.record_serve(k.clone(), serve(true).await).is_none());
-        }
-        assert_eq!(tracker.count_of(&k), None, "still nothing");
-
-        // Positive control: the SAME evidence and the SAME body, with no
-        // unfenced input consulted, advance to a notice at 3.
-        let mut tracker = RepeatTracker::default();
-        let mut last = None;
-        for _ in 0..3 {
-            last = tracker.record_serve(k.clone(), serve(false).await);
-        }
-        assert_eq!(last.expect("the fenced control notices").repeat_count(), 3);
-
-        // Scope discipline: the latch is idempotent within one dispatch and
-        // dies with it — a following dispatch starts clean, so one call's
-        // latch can never leak into the next.
-        result_status::with_project_evidence_scope(None, async {
-            assert!(
-                !result_status::unfenced_input_consulted(),
-                "a fresh dispatch scope starts clean"
-            );
-            result_status::note_unfenced_input();
-            assert!(result_status::unfenced_input_consulted());
-            result_status::note_unfenced_input();
-            assert!(
-                result_status::unfenced_input_consulted(),
-                "the latch is idempotent"
-            );
-            // Clearing the evidence slot must not clear the latch: they answer
-            // different questions about the same dispatch.
-            result_status::clear_project_evidence();
-            assert!(result_status::unfenced_input_consulted());
-        })
-        .await;
-        result_status::with_project_evidence_scope(None, async {
-            assert!(
-                !result_status::unfenced_input_consulted(),
-                "the next dispatch scope must not observe the previous one's latch"
-            );
-        })
-        .await;
-    }
-
     // Delivery: both carriers, appended to the FINAL text block, prior bytes
     // and isError untouched; a text block is created when none exists.
     #[test]
@@ -1466,7 +1379,7 @@ mod tests {
         assert_eq!(
             view,
             &json!({
-                "contract_version": 1,
+                "contract_version": 2,
                 "repeat_count": 3,
                 "tool": "get_repo_map",
                 "request_hash": k.request_hash().as_str(),

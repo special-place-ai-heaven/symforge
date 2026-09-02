@@ -48,7 +48,7 @@ const MODERN_VERSION: &str = "2026-07-28";
 /// Byte-canonical notice text (contracts/repeat-notice.md §2).
 fn notice_text(count: u32) -> String {
     format!(
-        "Repeat notice: identical request served {count}x with no index change published in between (project evidence unchanged). The result cannot differ until the index changes - change the request instead of retrying."
+        "Repeat notice: identical request served {count}x. Across these serves, no index change was published and the response text before this notice was unchanged. Do not retry unchanged; change the request or relevant project state first."
     )
 }
 
@@ -283,7 +283,7 @@ fn assert_notice_and_strip(result: &Value, count: u32, tool: &str, label: &str) 
         notice_meta(result).unwrap_or_else(|| panic!("{label}: must carry {NOTICE_KEY}: {result}"));
     assert_eq!(
         meta["contract_version"],
-        json!(1),
+        json!(2),
         "{label}: contract_version"
     );
     assert_eq!(meta["repeat_count"], json!(count), "{label}: repeat_count");
@@ -968,104 +968,14 @@ fn untracked_file_diagnostic_never_earns_a_notice() {
 }
 
 // ---------------------------------------------------------------------------
-// F1 (round 2) — the notice's claim is about the FUTURE ("the result cannot
-// differ until the index changes"), and a body digest only witnesses that the
-// PAST serves were equal. Two eligible renderers read inputs the published
-// index does not fence, so NO serve on those lanes may carry the claim — not
-// even one whose three bodies happened to be byte-identical.
-//
-// Lane 1: `search_text`'s zero-hit path sweeps live `git status` and raw
-// worktree bytes (`matching_untracked_paths_for_search_text`). Three identical
-// zero-hit serves notice under the round-1 rule; the fourth serve here proves
-// that claim was false.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn zero_hit_search_text_never_claims_cannot_differ() {
-    let workspace = Workspace::seed();
-    git_init_with_initial_commit(workspace.root());
-    let mut client = StdioClient::spawn(workspace.root());
-    let stable = stabilize(&mut client);
-
-    // Three byte-identical zero-hit serves. Nothing an equality witness can
-    // see distinguishes them — which is exactly why body equality is not
-    // enough to license the forward claim.
-    let args = json!({"query": "needle-zz"});
-    let serve1 = client.call_tool_result("search_text", args.clone());
-    assert_no_notice(&serve1, "zero-hit serve 1");
-    assert_eq!(evidence(&serve1), &stable, "zero-hit serve 1 evidence");
-    assert!(
-        !text_of(&serve1).contains("untracked file may match"),
-        "zero-hit serve 1 must carry no untracked diagnostic yet: {}",
-        text_of(&serve1)
-    );
-    let serve2 = client.call_tool_result("search_text", args.clone());
-    assert_no_notice(&serve2, "zero-hit serve 2");
-    assert_eq!(serve2, serve1, "zero-hit serve 2 must be byte-identical");
-    let serve3 = client.call_tool_result("search_text", args.clone());
-    assert_eq!(serve3, serve2, "zero-hit serve 3 must be byte-identical");
-    assert_no_notice(
-        &serve3,
-        "zero-hit serve 3 renders from live git status and raw worktree bytes, \
-         which project evidence does not fence",
-    );
-
-    // Why the claim would have been false. `.symforge/` is hard-scope-excluded
-    // from BOTH the walker and the watcher, so an untracked file planted there
-    // publishes nothing: the evidence stays byte-equal while the rendered body
-    // changes. An agent doing exactly this (zero-hit search, write the missing
-    // file, search again) is the ordinary flow, not a contrivance.
-    let tee = workspace.root().join(".symforge").join("tee");
-    std::fs::create_dir_all(&tee).expect("tee dir");
-    std::fs::write(
-        tee.join("snapshot.rs"),
-        "// needle-zz lives here, outside the index\n",
-    )
-    .expect("plant untracked snapshot");
-
-    let serve4 = client.call_tool_result("search_text", args);
-    assert_eq!(
-        evidence(&serve4),
-        &stable,
-        "the planted file must not move the published evidence (it is outside the index)"
-    );
-    assert!(
-        text_of(&serve4).contains("untracked file may match"),
-        "serve 4 must render the untracked diagnostic: {}",
-        text_of(&serve4)
-    );
-    assert_ne!(
-        text_of(&serve4),
-        text_of(&serve3),
-        "serve 4 body must differ from serve 3 while the evidence is unchanged — \
-         this is the counterexample that makes a serve-3 notice a false claim"
-    );
-    assert_no_notice(&serve4, "zero-hit serve 4");
-
-    // Positive control, same session, same tool: a query with real hits takes
-    // no sweep arm at all, so its third identical serve still notices.
-    let control = json!({"query": "alpha_anchor"});
-    let c1 = client.call_tool_result("search_text", control.clone());
-    assert_no_notice(&c1, "control serve 1");
-    assert!(
-        text_of(&c1).contains("alpha_anchor"),
-        "the control must hit real content: {}",
-        text_of(&c1)
-    );
-    let c2 = client.call_tool_result("search_text", control.clone());
-    assert_no_notice(&c2, "control serve 2");
-    assert_eq!(c2, c1, "control serve 2 must be byte-identical");
-    let c3 = client.call_tool_result("search_text", control);
-    let stripped = assert_notice_and_strip(&c3, 3, "search_text", "control serve 3");
-    assert_eq!(stripped, c1);
-}
-
-// ---------------------------------------------------------------------------
-// F1 (round 2), lane 2: `find_references` with a `path` the index does not hold
+// F1 (round 3), lane 2: `find_references` with a `path` the index does not hold
 // falls back to `admission_degradation_view_from_disk`, which `fs::metadata`s
 // the file (rendered as the `Size:` line) and reads its first bytes. A
 // gitignored file is neither walked nor watched, so it can change with no
-// publication at all — the rendered size is an unfenced input.
+// publication at all. The notice is still honest on this lane because it
+// reports only what happened: three serves rendered the same bytes. When the
+// file moves underneath, the body moves with it and the digest restarts the
+// run — which is the second half of this test.
 // ---------------------------------------------------------------------------
 
 /// Filler text for the ignored log; `bytes` is the approximate target size.
@@ -1084,7 +994,7 @@ fn rendered_size_line(text: &str) -> String {
 }
 
 #[test]
-fn find_references_disk_fallback_never_claims_cannot_differ() {
+fn find_references_disk_fallback_notices_then_resets_when_the_body_moves() {
     let workspace = Workspace::seed();
     std::fs::write(workspace.root().join(".gitignore"), "logs/\n").expect("seed .gitignore");
     let logs = workspace.root().join("logs");
@@ -1113,20 +1023,19 @@ fn find_references_disk_fallback_never_claims_cannot_differ() {
         serve2, serve1,
         "disk-fallback serve 2 must be byte-identical"
     );
+    // Serve 3: same request, same evidence, same rendered bytes. Every clause
+    // the notice states was observed, so it is emitted — and stripping it
+    // restores serve 2 exactly.
     let serve3 = client.call_tool_result("find_references", args.clone());
+    let stripped = assert_notice_and_strip(&serve3, 3, "find_references", "disk-fallback serve 3");
     assert_eq!(
-        serve3, serve2,
-        "disk-fallback serve 3 must be byte-identical"
-    );
-    assert_no_notice(
-        &serve3,
-        "disk-fallback serve 3 renders fs::metadata and raw file bytes, \
-         which project evidence does not fence",
+        stripped, serve2,
+        "disk-fallback serve 3 must be byte-identical once the notice is removed"
     );
 
-    // The counterexample: append to the gitignored log. Nothing walks it,
-    // nothing watches it, so no publication happens — and the rendered size
-    // changes anyway.
+    // Now move the file underneath. Nothing walks the gitignored log, nothing
+    // watches it, so no publication happens — and the rendered size changes
+    // anyway. The body digest, not the evidence, is what catches this.
     let mut appended = std::fs::read_to_string(&log).expect("read app.log");
     appended.push_str(&log_filler(1024));
     std::fs::write(&log, appended).expect("append app.log");
@@ -1142,9 +1051,12 @@ fn find_references_disk_fallback_never_claims_cannot_differ() {
     assert_ne!(
         size4, size1,
         "the rendered size must change while the evidence is unchanged — \
-         this is the counterexample that makes a serve-3 notice a false claim"
+         the digest is the only thing that can observe this"
     );
-    assert_no_notice(&serve4, "disk-fallback serve 4");
+    assert_no_notice(
+        &serve4,
+        "disk-fallback serve 4 renders different bytes, so the run restarts",
+    );
 
     // Positive control, same session, same tool: with no `path` argument the
     // disk fallback is never reached, so the third identical serve notices.
@@ -1162,4 +1074,46 @@ fn find_references_disk_fallback_never_claims_cannot_differ() {
     let c3 = client.call_tool_result("find_references", control);
     let stripped = assert_notice_and_strip(&c3, 3, "find_references", "control serve 3");
     assert_eq!(stripped, c1);
+}
+
+// ---------------------------------------------------------------------------
+// F1 (round 3) — the RESTORATION. The round-2 rule withheld the notice for any
+// response whose renderer entered a live-state path, which killed the feature's
+// primary case: an agent looping on a query that finds nothing. This test is the
+// inverse of the round-2 withholding rule and must pass once
+// the notice stops making a claim about the future.
+//
+// Nothing here is planted between serves, so the three bodies really are
+// byte-identical and the evidence really is unchanged — which is the whole of
+// what the notice now says. The companion
+// `untracked_file_diagnostic_never_earns_a_notice` above is the negative half:
+// when live state DOES move the body, the digest resets the run and no notice
+// is emitted. Together they show the body digest, not the latch, is what makes
+// the notice honest.
+// ---------------------------------------------------------------------------
+#[test]
+fn zero_hit_search_text_notices_on_third_identical_serve() {
+    let workspace = Workspace::seed();
+    git_init_with_initial_commit(workspace.root());
+    let mut client = StdioClient::spawn(workspace.root());
+    let stable = stabilize(&mut client);
+
+    let args = json!({"query": "needle-zz"});
+    let serve1 = client.call_tool_result("search_text", args.clone());
+    assert_no_notice(&serve1, "zero-hit serve 1");
+    assert_eq!(evidence(&serve1), &stable, "serve 1 evidence");
+
+    let serve2 = client.call_tool_result("search_text", args.clone());
+    assert_no_notice(&serve2, "zero-hit serve 2");
+    assert_eq!(serve2, serve1, "serve 2 must be byte-identical to serve 1");
+
+    // Serve 3: identical request, identical body, evidence never republished.
+    // Every clause the notice states was observed, so it must be emitted.
+    let serve3 = client.call_tool_result("search_text", args);
+    assert_eq!(evidence(&serve3), &stable, "serve 3 evidence");
+    let stripped = assert_notice_and_strip(&serve3, 3, "search_text", "zero-hit serve 3");
+    assert_eq!(
+        stripped, serve1,
+        "stripping the notice must restore serve 1 byte-for-byte"
+    );
 }
