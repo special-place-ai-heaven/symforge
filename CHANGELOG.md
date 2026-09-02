@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.1.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.13...v11.1.0) (2026-09-02)
+
+
+### Features
+
+* **032:** repeat-call notice and ledger retry collapse ([#672](https://github.com/special-place-ai-heaven/symforge/issues/672)) ([4d4c49f](https://github.com/special-place-ai-heaven/symforge/commit/4d4c49fc0f3441d1ff24e2cdab18162bbc4eabeb))
+
 ## [11.0.13](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.12...v11.0.13) (2026-09-02)
 
 
