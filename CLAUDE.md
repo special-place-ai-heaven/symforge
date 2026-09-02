@@ -226,7 +226,7 @@ Helper: `execution/prove_release_owed.py`.
 
 Rust MCP server providing symbol-aware code and repository-knowledge navigation, review, curation, and editing tools. The **default** MCP `tools/list` surface **advertises 39 tools** while **40 are registered** (as_of 2026-08-07). Registration count: `#[tool(` attribute sites — 33 in `tools.rs` + 7 in `edit_tools.rs` — equal to the 40 names in `SYMFORGE_TOOL_NAMES` (including `health_compact`, `search_knowledge`, `review_knowledge`, and `curate_knowledge`), pinned by `test_client_allow_lists_match_registered_tool_surface`. The advertised count is one lower because `list_tools_for_profile` filters the compact-only `symforge` facade out of the full profile (`src/protocol/surface_probe.rs:173`) — `symforge_retrieve` is its full-surface equivalent. Do not "fix" a client reporting 39; that is correct. the compact-3 surface (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
 
-Protocol (as_of 2026-08-04, spec 025): rmcp 3.1.0 serving MCP 2026-07-28 alongside every legacy revision; the advertised set is a frozen allow-list in `supported_protocol_versions()` (`src/protocol/mod.rs`) — extend deliberately, never let a dependency bump widen it. Static list surfaces carry SEP-2549 cache hints (1h, `Public`); `resources/read` is pinned `ttl_ms=0`/`Private` (INV-4). **Mixed-surface deployment warning (FR-311c)**: `CacheScope::Public` on `tools/list` assumes ONE surface configuration per HTTP origin — operators fronting a full-surface and a compact-surface symforge under one origin must not share a public cache, or full-surface tool schemas leak to compact-deployment clients (the dispatch gate blocks the calls, not the schema disclosure). Legacy roots binding (`bind_workspace_from_client_roots`) is on a deletion clock: when rmcp removes the deprecated Roots API (`Peer::list_roots`), that function is deleted and clients are directed to `index_folder`.
+Protocol (as_of 2026-08-04, spec 025; rmcp patch level re-verified 2026-09-02 against `Cargo.lock`): rmcp 3.1.4 serving MCP 2026-07-28 alongside every legacy revision; the advertised set is a frozen allow-list in `supported_protocol_versions()` (`src/protocol/mod.rs`) — extend deliberately, never let a dependency bump widen it. Static list surfaces carry SEP-2549 cache hints (1h, `Public`); `resources/read` is pinned `ttl_ms=0`/`Private` (INV-4). **Mixed-surface deployment warning (FR-311c)**: `CacheScope::Public` on `tools/list` assumes ONE surface configuration per HTTP origin — operators fronting a full-surface and a compact-surface symforge under one origin must not share a public cache, or full-surface tool schemas leak to compact-deployment clients (the dispatch gate blocks the calls, not the schema disclosure). Legacy roots binding (`bind_workspace_from_client_roots`) is on a deletion clock: when rmcp removes the deprecated Roots API (`Peer::list_roots`), that function is deleted and clients are directed to `index_folder`.
 
 Key source files:
 - `src/protocol/tools.rs` — Tool handlers, input structs, tests
@@ -234,6 +234,15 @@ Key source files:
   reads. Every lane that reopens a file from disk (rather than serving bytes
   already in the in-memory index) routes through `admit_disk_read`, which owns
   the read and returns the buffer only on a permit verdict.
+- `src/protocol/repeat.rs` — Feature 032 repeat-call notice (as_of 2026-09-02): the
+  `call_tool` seam fingerprints five index-determined read tools (`search_symbols`,
+  `search_text`, `get_repo_map`, `find_references`, `find_dependents`) and, on the 3rd
+  identical serve in one stdio session with typed project evidence AND a rendered-body
+  digest equal across the run, appends the contract text plus `_meta["symforge/repeat_notice"]`.
+  The HTTP `/mcp` lane is stateless by construction (`mcp_http.rs` pins
+  `legacy_session_mode == false`) and never accumulates; any incarnation change
+  (daemon reconnect, degraded flip, local reload) clears the tracker. Contract:
+  `specs/032-repeat-call-breaker/contracts/repeat-notice.md`.
 - `src/protocol/format.rs` — Output formatters
 - `src/daemon.rs` — Daemon proxy with backward-compat aliases
 - `src/cli/init.rs` — Tool name list for client init
