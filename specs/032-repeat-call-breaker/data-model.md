@@ -1,0 +1,143 @@
+# Phase 1 Data Model: Repeat-Call Notice and Ledger Retry Collapse
+
+All types are in-memory only; nothing here is persisted or serialized except the two wire views defined in `contracts/`. Revised 2026-09-01 after the adversarial round (research.md R12) — the eligible list shrank to 5, the tracker key gained a session discriminator, evidence handling is typed-deserialization-based, and collapse is generic over two lane identities.
+
+## US1 — Repeat tracking (`src/protocol/repeat.rs`, new; server-only by location — `src/protocol/` is `#[cfg(feature = "server")]` at the crate root)
+
+### RepeatKey
+
+| Field | Type | Notes |
+|---|---|---|
+| `session` | `SessionDiscriminator` | Observed session identity: on a single-client transport (stdio) a process-constant value; on a shared transport, the per-session identity observable at the seam. When NO session identity is observable for a request, the tracker does not accumulate for it at all (spec FR-002 / Scenario 5). **Resolved by T001 (2026-09-02, research.md R9), hardened in review round 2**: `enum SessionDiscriminator { Stdio, HttpInert }`, observed from two facts that must agree — the transport the entry point positively DECLARED (`with_stdio_transport_lane()`, only the two stdio entry points) and the absence of rmcp's `http::request::Parts`. `Stdio` requires both; every other combination is `HttpInert`, which therefore covers the stateless `/mcp` lane and any transport that did not declare itself. `HttpInert` never touches the tracker; only `Stdio` keys are ever inserted, so the field is a witness that the lane was observed, not a namespace. The key additionally carries the tracker's incarnation epoch, so a serve whose key was minted before a clear is refused rather than seeding a fresh run. |
+| `tool` | `String` | MCP tool name as dispatched |
+| `request_hash` | `RequestHash` | `RequestHash::for_tool_request(tool, &args)` over canonical JSON args (`src/idempotency.rs:42-57`). NOTE: `RequestHash` currently derives `PartialEq, Eq` but NOT `std::hash::Hash` (`src/idempotency.rs:37-39`) — add `Hash` to its derive (the inner String hashes canonically); `src/idempotency.rs` is in the touched-file set. |
+
+Equality/Hash derive from all three fields. Two calls are "identical" iff `tool` + `request_hash` match; `session` scopes WHERE a run may accumulate (spec FR-001/FR-002; canonical-JSON strictness accepted — false negatives only).
+
+### RepeatRun
+
+| Field | Type | Notes |
+|---|---|---|
+| `count` | `u32` | Serves of this key with a continuously-equal observation; `saturating_add` |
+| `observed` | `ObservedServe` | The run's FIRST serve, as TYPED values: the `ProjectEvidence` (`src/protocol/result_status.rs`) **and** a digest of the response's rendered text content. The tracker never stores raw `_meta` JSON — the `{"bound": false}` unavailable marker and any non-deserializable value are "unobserved", full stop. The body digest was added 2026-09-02 (review round 1): evidence alone does not fence every input a renderer reads. |
+
+State transitions (per eligible-tool response at the seam). "Observed" means ALL of: the `symforge/project_evidence` value on the outgoing response deserializes as a full `ProjectEvidence`; its `project_id` is not the `"unbound"` placeholder (an unbound adapter has no project to be current about). Review round 2 added a third condition here — that the dispatch reported no unfenced input — and round 3 removed it again, together with the forward claim it existed to protect; see `contracts/repeat-notice.md`:
+
+```
+no entry                --serve, observed-->                 count=1, store the observation
+entry, evidence == AND body digest ==  --serve-->            count+=1   (notice when count >= 3)
+entry, evidence != OR  body digest !=  --serve-->            replace: count=1, new observation
+entry, evidence NOT observed (marker / non-deserializable
+        / project_id "unbound") --serve-->                   remove entry (cannot observe)
+entry, ResultStatus observed as InternalFailure --serve-->   remove entry (R5)
+entry, OutcomeClass unobservable on this lane AND
+        result.is_error == true --serve-->                   remove entry (conservative; R5)
+any state               --tracker at cap on insert-->        clear() all, then insert fresh
+any state               --index incarnation change-->        clear() all runs (round 1: daemon
+                                                             reconnect, degrade flip, local reload)
+serve whose key was minted before a clear      -->           not inserted (round 2 epoch guard:
+                                                             an in-flight serve never bridges
+                                                             an incarnation change)
+no observable session identity for the request  -->          no tracker interaction at all
+```
+
+Outcome classes other than the two clearing rows — including `NotFound`, `EmptyResult`, `InvalidRequest` — ADVANCE the run like any serve (the A019 motivating loop is agents re-issuing failing identical calls). This is the single normative rule; plan.md and research.md R5 defer to it.
+
+Ineligible tools never touch the tracker. Interleaved *different* calls never reset a run (spec FR-002); evidence drift is how "index change" is observed (R6).
+
+### RepeatWitness (unrepresentable-claim guard, Constitution P5)
+
+```
+RepeatWitness::observe(prior: &ObservedServe, current: &ObservedServe) -> Option<RepeatWitness>
+```
+
+Private field and private constructor; `Some` **only** on full equality of the two TYPED observations — every field of `ProjectEvidence` and the rendered-body digest, compared as whole values so a future `ObservedServe` field joins the witness automatically. No other constructor. Mirrors the `SourceAuthority::from_freshness` repair (`src/protocol/search_format.rs:3-26`).
+
+The witness is exactly sufficient for what the notice says, because since round 3 the notice says exactly what the witness observed: the serves matched on every evidence field and on the rendered body. It carries no forward sentence for the witness to fall short of. A renderer that reads something the index never publishes — `search_text`'s untracked sweep, `find_references`'s disk fallback — does not threaten the claim; when such an input moves the answer, the body digest differs and the run restarts before a notice is due. See `contracts/repeat-notice.md` for why the round-2 unfenced-input withholding was removed.
+
+### RepeatNotice
+
+| Field | Type | Notes |
+|---|---|---|
+| `witness` | `RepeatWitness` | Required by the only constructor — a notice without an observed equality is unspellable |
+| `repeat_count` | `u32` | ≥ `NOTICE_THRESHOLD` (3) |
+| `tool` | `String` | |
+| `request_hash` | `RequestHash` | |
+| `evidence_generation` | `u64` | From the witnessed evidence, for the wire view |
+
+Renders to: appended text paragraph + `_meta["symforge/repeat_notice"]` — byte-canonical text lives in `contracts/repeat-notice.md` (the contract is the single normative source for the string).
+
+### Constants (all pinned by tests)
+
+| Constant | Value | Rationale |
+|---|---|---|
+| `NOTICE_THRESHOLD` | `3` | First retry legitimate; second identical retry is the loop signal (spec Assumptions; B5 tip-saturation precedent) |
+| `REPEAT_TRACKER_MAX_ENTRIES` | `512` | Overflow → `clear()`; loses only true notices, never creates a false one (R9) |
+| `REPEAT_ELIGIBLE_TOOLS` | **5 tools** (R4, post-adversarial) | `search_symbols`, `search_text`, `get_repo_map`, `find_references`, `find_dependents`. `get_symbol` EXCLUDED (repeat serves return the session cache-hit body embedding wall-clock `session_age_secs`, `src/protocol/format.rs:5833-5865`, plus the `force_refresh` dedup footer with elapsed seconds — output varies on an unchanged index). `search_files` EXCLUDED (`rank_by="frecency"` reorders by a `SystemTime::now`-decayed, cross-process-mutable frecency store bumped by interleaved reads, `src/protocol/tools.rs:6650-6710`, `src/live_index/frecency.rs`). |
+
+## US2 — Run-length collapse (`src/stel/ledger.rs`; server-only by location)
+
+`collapse_runs` is **generic over an identity key**: `collapse_runs(items: &[T], key: impl Fn(&T) -> K) -> Vec<Run<T>>` (or two thin typed wrappers) — one algorithm, two lane identities, because the two lanes carry different row types and the "one pure function over `StelLedgerEvent`" framing was refuted (R12: `recent()` returns `StoredLedgerRecord`, not events).
+
+### Lane A identity — in-memory `StelLedgerEvent` (`src/stel_core/types.rs:391-411`), feeds the status view
+
+| Field | In identity? | Why |
+|---|---|---|
+| `ts_ms` | NO | Wall clock |
+| `plan_id` | NO | Embeds wall-clock millis (`src/stel/planner.rs:1230-1236`) |
+| `surface` | YES | |
+| `intent` | YES | |
+| `decision` | YES | |
+| `tools_called` | YES | |
+| `predicted_response_tokens` | NO | Per-call measurement (spec FR-007) |
+| `actual_response_tokens` | NO | Per-call measurement |
+| `manual_baseline_tokens` | NO | Per-call measurement |
+| `net_vs_manual` | NO | Derived measurement |
+| `equivalence` | YES | Always `None` in production today; identity-relevant if it ever isn't |
+| `route_confidence` | YES | |
+| `pff_bypass` | YES | |
+| `cache_hit` | YES | |
+| `degrade_flags` | YES | |
+
+The identity comparator **exhaustively destructures** the struct (every field named, ignored ones bound explicitly) so adding a field to `StelLedgerEvent` fails compilation here and forces an identity decision (Constitution P5).
+
+### Lane B identity — durable `StoredLedgerRecord` (`src/stel_core/ledger_store.rs:211-226`), feeds the admin view
+
+`recent()` today SELECTs 13 columns and omits `pff_bypass`, `cache_hit`, `degrade_flags_json`, `accepted`, `eligible_h6`; `equivalence` has no column at all. **Design decision (R12 adjudication): widen `recent()`'s SELECT and `StoredLedgerRecord` additively with `pff_bypass`, `cache_hit`, `degrade_flags_json`** so the durable identity does not silently merge rows that differ in them.
+
+| Field | In identity? | Why |
+|---|---|---|
+| `id` | NO | Autoincrement |
+| `ts_ms` | NO | Wall clock |
+| `session_id` | YES | Runs never span sessions (spec Assumptions) |
+| `plan_id` | NO | Clock-bearing |
+| `surface`, `intent`, `decision`, `tools_called_json`, `route_confidence` | YES | Stored string forms compared verbatim |
+| four token columns | NO | Per-call measurements |
+| `pff_bypass`, `cache_hit`, `degrade_flags_json` | YES | Newly read back (see decision above) |
+| `accepted`, `eligible_h6` | NO — excluded, deliberately | Derived admission/estimator-lane flags (`accepted` derives from `decision`, already in identity; `eligible_h6` is tuning bookkeeping). Recorded here so the exclusion is a decision, not an oversight. |
+| `equivalence` | N/A | Not persisted; durable lane cannot compare it — documented coarseness (spec Assumptions) |
+
+Ordering: `recent()` returns `ORDER BY id DESC` (newest first, pinned by `recent_with_limit_caps_result_set`). The admin lane **reverses to insert order (oldest→newest by `id`) before collapsing**, so "canonical = the row that opened the run" keeps its natural meaning; `recent_runs` renders in that order. `first_ts_ms`/`last_ts_ms` are the min/max `ts_ms` over the run rather than its positional ends, so out-of-order inserts between concurrent writers cannot understate or invert the span.
+
+### Run&lt;T&gt; (LedgerRun)
+
+| Field | Type | Notes |
+|---|---|---|
+| `canonical` | `T` | The run's first row in the order the rows were fed to the collapse — insert order (`id`) on the durable lane, push order on the event lane (clone). Under clock skew between concurrent writers this is not necessarily the row with the smallest `ts_ms`; the span below is the min/max, and `canonical` is deliberately the positional first so it names a row that really did open the run. |
+| `count` | `u64` | Run length ≥ 1 |
+| `first_ts_ms` | `u64` | |
+| `last_ts_ms` | `u64` | |
+
+Invariants (property oracles, per lane):
+1. `runs.iter().map(|r| r.count).sum() == items.len()`
+2. Flattening runs by identity reproduces the input identity sequence in order
+3. All-distinct input ⇒ every `count == 1` and rendering is byte-identical to today
+4. Admin lane: the run holding the oldest fetched row is marked window-clipped **only when a sentinel row fetched beyond the window shares its identity**, i.e. only when the run is observed to continue past the window. Its `count` and its `first_ts_ms`/`last_ts_ms` then describe the in-window rows alone, which is what `window_clipped` warns the reader about — see `contracts/admin-recent-runs.md`
+
+### Status-view plumbing (refuted as a formatter-local tweak — it is a context-shape change)
+
+`format_last_ledger_lines(ctx)` renders from two pre-extracted `Option<String>`s and never sees events (`src/stel/status.rs:75-153, 226-240`). The trailing run is therefore computed in `StelStatusContext::from_server` (from `ledger.events()`) and carried in **new context fields** `trailing_run: Option<(u64 /*count*/, u64 /*first_ts_ms*/, u64 /*last_ts_ms*/)>`; every context construction site absorbs the field (`src/protocol/tools.rs:12064, 12130, 13124` and the in-file `sample_context` fixture at `src/stel/status.rs:421-434`). The `×N` suffix goes on the `last_ledger_decision:` line ONLY (single-line placement, byte-exact in the oracle); the proxy overlay's `starts_with("last_ledger_decision:")` line replacement (`src/protocol/tools.rs:3826`) tolerates a suffix — verified during implementation, not assumed.
+
+### LedgerRunView (admin wire type)
+
+See `contracts/admin-recent-runs.md`. Additive field on `LedgerSummaryView` (`src/server/admin/api_v1.rs:65-79`); `[]` when the store is unavailable (never fabricated rows — matches the existing `available:false` / nulls honesty).

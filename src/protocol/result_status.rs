@@ -45,6 +45,46 @@ impl OutcomeClass {
 /// `_meta` key carrying the selected-project trust evidence (Task 7).
 pub const PROJECT_EVIDENCE_META_KEY: &str = "symforge/project_evidence";
 
+/// `_meta` key carrying the Feature 032 repeat-call notice
+/// (`specs/032-repeat-call-breaker/contracts/repeat-notice.md`). Single-writer:
+/// only the `call_tool` seam writes it, after project evidence attachment.
+/// Absence is meaningful — no claim was possible or warranted.
+pub const REPEAT_NOTICE_META_KEY: &str = "symforge/repeat_notice";
+pub const REPEAT_NOTICE_CONTRACT_VERSION: u8 = 2;
+
+/// Wire view under [`REPEAT_NOTICE_META_KEY`] (contract §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatNoticeView {
+    pub contract_version: u8,
+    /// Total serves of this fingerprint in the current run (>= 3).
+    pub repeat_count: u32,
+    /// Tool name as dispatched.
+    pub tool: String,
+    /// Hex `RequestHash` fingerprint (diagnostic; lets a client correlate).
+    pub request_hash: String,
+    /// The `generation` of the witnessed (unchanged) `ProjectEvidence`.
+    pub evidence_generation: u64,
+}
+
+/// Lenient typed reader for the `outcome_class` under [`RESULT_STATUS_META_KEY`].
+///
+/// Two writers produce that key with different shapes — [`ResultStatus`]'s
+/// two fields and the wider edit-tools payload (`status`, `operations`) — so
+/// this reads ONLY `outcome_class` and tolerates every other field.
+/// Observation: the key's value on `meta`. Emits `None` ("unobservable",
+/// never a default class) when the meta, the key, or an `outcome_class` in
+/// the enum's serde spelling is absent.
+pub fn observed_outcome_class(meta: Option<&MetaObject>) -> Option<OutcomeClass> {
+    #[derive(Deserialize)]
+    struct OutcomeClassOnly {
+        outcome_class: OutcomeClass,
+    }
+    let value = meta?.0.get(RESULT_STATUS_META_KEY)?;
+    serde_json::from_value::<OutcomeClassOnly>(value.clone())
+        .ok()
+        .map(|view| view.outcome_class)
+}
+
 /// HTTP response header carrying the daemon's selected-project evidence for a
 /// proxied tool call (JSON-serialized [`ProjectEvidence`]). Out-of-band so the
 /// human-readable body stays byte-identical for existing consumers.
@@ -103,8 +143,7 @@ tokio::task_local! {
     static PROJECT_EVIDENCE: std::cell::RefCell<Option<ProjectEvidence>>;
 }
 
-/// Run one `tools/call` dispatch with the evidence slot bound. `seed` is the
-/// local bound-project evidence (or `None` when nothing is bound yet).
+/// Run one `tools/call` dispatch with the evidence slot bound.
 pub async fn with_project_evidence_scope<F, T>(seed: Option<ProjectEvidence>, future: F) -> T
 where
     F: Future<Output = T>,
@@ -249,5 +288,66 @@ mod tests {
             "a legal trailing space must not be normalized onto another project name"
         );
         assert!(project_evidence_matches_selector(&evidence, Some("   ")));
+    }
+
+    /// Feature 032: two writers produce `symforge/result_status` with
+    /// different shapes — `ResultStatus`'s two fields and the wider edit-tools
+    /// object (`status`, `operations`). The repeat seam reads ONLY
+    /// `outcome_class` and must tolerate every other field; anything it cannot
+    /// read is "unobservable", never a guess.
+    #[test]
+    fn observed_outcome_class_reads_only_outcome_class_and_tolerates_unknown_fields() {
+        fn meta_with(value: serde_json::Value) -> MetaObject {
+            let mut meta = JsonObject::new();
+            meta.insert(RESULT_STATUS_META_KEY.to_string(), value);
+            MetaObject(meta)
+        }
+
+        // Writer 1: the two-field `ResultStatus` shape, as actually emitted.
+        let statused = ResultStatus::new(OutcomeClass::EmptyResult).into_call_tool_result("x");
+        assert_eq!(
+            observed_outcome_class(statused.meta.as_ref()),
+            Some(OutcomeClass::EmptyResult)
+        );
+
+        // Writer 2: the wider edit-tools shape (`edit_tools::statused_edit_tool_result`).
+        let wider = meta_with(serde_json::json!({
+            "contract_version": 1,
+            "outcome_class": "internal_failure",
+            "status": "failed",
+            "operations": [
+                { "operation_index": 0, "status": "failed", "outcome_class": "internal_failure" }
+            ],
+        }));
+        assert_eq!(
+            observed_outcome_class(Some(&wider)),
+            Some(OutcomeClass::InternalFailure)
+        );
+
+        // Unobservable: no meta, no key, malformed value, unknown spelling,
+        // missing field — every one reads as `None`, never as a default class.
+        assert_eq!(observed_outcome_class(None), None);
+        assert_eq!(
+            observed_outcome_class(Some(&MetaObject(JsonObject::new()))),
+            None
+        );
+        assert_eq!(
+            observed_outcome_class(Some(&meta_with(serde_json::json!("found")))),
+            None
+        );
+        assert_eq!(
+            observed_outcome_class(Some(&meta_with(serde_json::json!({
+                "contract_version": 1,
+                "outcome_class": "FOUND",
+            })))),
+            None,
+            "the enum's real serde spelling is snake_case; anything else is unobservable"
+        );
+        assert_eq!(
+            observed_outcome_class(Some(&meta_with(
+                serde_json::json!({ "contract_version": 1 })
+            ))),
+            None
+        );
     }
 }

@@ -17,6 +17,7 @@ pub mod prompts;
 // externally only through the repo-internal test door).
 pub mod read_gate;
 pub(crate) mod read_tools;
+pub(crate) mod repeat;
 pub mod resources;
 pub mod result_status;
 pub(crate) mod search_format;
@@ -253,6 +254,20 @@ pub struct SymForgeServer {
     pub(crate) ccr_store: Arc<Mutex<ccr::CcrStore>>,
     /// In-memory STEL L4 ledger for compact `symforge` invocations (no persistence yet).
     pub(crate) stel_ledger: Arc<Mutex<crate::stel::ledger::SessionLedger>>,
+    /// Feature 032 (US1): the session-scoped repeat-call tracker. Every clone
+    /// of this server (the HTTP factory clones per request, the daemon per
+    /// project) shares the ONE map behind this `Arc`; the `call_tool` seam
+    /// locks it synchronously after the awaited dispatch and never holds it
+    /// across an `.await`.
+    pub(crate) repeat_tracker: Arc<Mutex<repeat::RepeatTracker>>,
+    /// Feature 032 (US1, F3): the transport this server was WIRED for,
+    /// declared at construction and never inferred from a request. Defaults to
+    /// [`repeat::TransportLane::Shared`] (inert) so a transport that reaches
+    /// `call_tool` without declaring itself single-client gets no repeat
+    /// notice, rather than silently becoming one shared accumulating bucket
+    /// for every client behind it. Only [`Self::with_stdio_transport_lane`]
+    /// moves it, and only the two stdio entry points call that.
+    pub(crate) transport_lane: repeat::TransportLane,
     /// Tracks edit-tool calls that omitted `working_directory` while the
     /// transitional worktree observability knob was on. Surfaced by the
     /// `health` tool as a rolling "last hour" signal.
@@ -420,6 +435,8 @@ impl SymForgeServer {
             session_context: Arc::new(session::SessionContext::new()),
             ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
+            repeat_tracker: Arc::new(Mutex::new(repeat::RepeatTracker::default())),
+            transport_lane: repeat::TransportLane::default(),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
             #[cfg(feature = "server")]
@@ -496,6 +513,8 @@ impl SymForgeServer {
             session_context: Arc::new(session::SessionContext::new()),
             ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
+            repeat_tracker: Arc::new(Mutex::new(repeat::RepeatTracker::default())),
+            transport_lane: repeat::TransportLane::default(),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
             #[cfg(feature = "server")]
@@ -518,6 +537,21 @@ impl SymForgeServer {
         store: Arc<crate::stel::ledger_store::StelLedgerStore>,
     ) -> Self {
         self.stel_ledger_store = Some(store);
+        self
+    }
+
+    /// Feature 032 (F3): declare this server's transport as single-client
+    /// stdio, the ONE condition under which the repeat tracker may attribute
+    /// a run to a session.
+    ///
+    /// Called only by the two stdio entry points (`src/cli/entry.rs`: the
+    /// local server and the daemon-proxy adapter), where one process serves
+    /// exactly one client, so the server instance IS the session. Every other
+    /// wiring leaves the lane [`repeat::TransportLane::Shared`] and never
+    /// accumulates — a lane that cannot be attributed produces no notice
+    /// instead of a count shared across clients (spec FR-002 / Scenario 5).
+    pub fn with_stdio_transport_lane(mut self) -> Self {
+        self.transport_lane = repeat::TransportLane::Stdio;
         self
     }
 
@@ -1450,6 +1484,12 @@ impl SymForgeServer {
                 Ok(new_client) => {
                     tracing::info!("daemon reconnected successfully");
                     let old_client = std::mem::replace(&mut *client, new_client);
+                    // Feature 032 (F2): a replacement daemon session is a new
+                    // index incarnation whose evidence can be byte-equal to
+                    // the dead daemon's (`generation` is a per-process
+                    // counter). A repeat run must not survive it: drop every
+                    // run before anything is served through the new client.
+                    self.repeat_tracker.lock().clear();
                     // Lifecycle fence: republish this adapter's session
                     // descriptor for the NEW session/endpoint, then close the
                     // previous session best-effort (the old daemon is usually
@@ -1543,21 +1583,44 @@ impl SymForgeServer {
 
     /// Mark the daemon proxy healthy again (successful call or reconnect).
     fn note_daemon_recovered(&self) {
-        let mut state = self.daemon_degraded.lock();
-        if state.degraded {
-            tracing::info!("daemon proxy recovered; clearing degraded state");
+        let was_degraded = {
+            let mut state = self.daemon_degraded.lock();
+            let was_degraded = state.degraded;
+            if was_degraded {
+                tracing::info!("daemon proxy recovered; clearing degraded state");
+            }
+            *state = DaemonDegradation::default();
+            was_degraded
+        };
+        // Feature 032 (F2): locally-served -> daemon-served is an incarnation
+        // change. A repeat run must not survive a change of the index
+        // instance it was observed against, so every run is dropped here
+        // (a false negative at worst, never a false claim).
+        if was_degraded {
+            self.repeat_tracker.lock().clear();
         }
-        *state = DaemonDegradation::default();
     }
 
     /// Record a proxy failure with endpoint provenance (base URL only — never
     /// auth material) for health rendering and rediscovery decisions.
     fn note_daemon_failure(&self, endpoint: &str, failure: String) {
-        let mut state = self.daemon_degraded.lock();
-        state.degraded = true;
-        state.last_failure = Some(failure);
-        state.last_failure_at = Some(std::time::Instant::now());
-        state.last_endpoint = Some(endpoint.to_string());
+        let was_healthy = {
+            let mut state = self.daemon_degraded.lock();
+            let was_healthy = !state.degraded;
+            state.degraded = true;
+            state.last_failure = Some(failure);
+            state.last_failure_at = Some(std::time::Instant::now());
+            state.last_endpoint = Some(endpoint.to_string());
+            was_healthy
+        };
+        // Feature 032 (F2): daemon-served -> degraded is an incarnation
+        // change: whatever serves next (a replacement daemon or the local
+        // fallback) is not the index the runs were observed against, so every
+        // run is dropped. Repeated failures while already degraded change
+        // nothing and keep the local lane's runs intact.
+        if was_healthy {
+            self.repeat_tracker.lock().clear();
+        }
     }
 
     /// Health surface hook: the current degradation snapshot, or `None` when
@@ -1683,6 +1746,10 @@ impl SymForgeServer {
                         symbols = published.symbol_count,
                         "local fallback index loaded"
                     );
+                    // Feature 032 (F2): a reloaded local index is a new
+                    // incarnation; runs observed against the previous
+                    // publication (daemon or local) must not survive it.
+                    self.repeat_tracker.lock().clear();
 
                     // Spawn git temporal computation so co-change queries work
                     // after daemon degradation (mirrors index_folder behaviour).
@@ -2151,6 +2218,28 @@ impl ServerHandler for SymForgeServer {
                 })
                 .and_then(|input| Some((input.probe_legacy_tool?, input.probe_legacy_args?)))
                 .is_some_and(|(tool, args)| Self::facade_probe_is_measurement_safe(&tool, &args));
+        // Feature 032 (US1): observe the lane and fingerprint the request
+        // BEFORE `ToolCallContext::new` moves it. `None` means this call never
+        // touches the tracker: an inert lane (no observable session identity),
+        // an ineligible tool, or a set-valued `projects` fan-out.
+        //
+        // F2: the tracker's incarnation epoch is read HERE, before dispatch,
+        // and carried on the key. rmcp runs each request in its own task, so a
+        // concurrent request's transition `clear()` can land between this read
+        // and the post-dispatch record; a key stamped with the superseded
+        // epoch is refused there instead of anchoring a run across the change.
+        // The epoch is read under the same lock that owns the run map — one
+        // owner, so a reader can never see a bumped epoch beside stale runs.
+        // Read unconditionally rather than behind an eligibility pre-check so
+        // `RepeatKey::observe` stays the single owner of "does this call touch
+        // the tracker"; an uncontended `parking_lot` lock on a `u64` is far
+        // below the per-call budget of a handler that queries the index.
+        let repeat_key = repeat::RepeatKey::observe(
+            repeat::SessionDiscriminator::observe(self.transport_lane, &context),
+            self.repeat_tracker.lock().epoch(),
+            request.name.as_ref(),
+            request.arguments.as_ref(),
+        );
         let initial_project_evidence = self
             .initial_project_evidence_for_call(request.arguments.as_ref())
             .await;
@@ -2187,6 +2276,18 @@ impl ServerHandler for SymForgeServer {
                             .join("\n");
                         if !body.is_empty() && tools::is_error_output(&body) {
                             result.is_error = Some(true);
+                        }
+                    }
+                    // Feature 032 (US1): AFTER evidence attachment (the
+                    // tracker reads the evidence this response actually
+                    // carries) and AFTER the error reclassification (the
+                    // notice text must never reach `is_error_output`). The
+                    // lock is taken and released right here, synchronously.
+                    if let Some(key) = repeat_key {
+                        let observation = repeat::ServeObservation::from_result(&result);
+                        let notice = self.repeat_tracker.lock().record_serve(key, observation);
+                        if let Some(notice) = notice {
+                            notice.attach(&mut result);
                         }
                     }
                     rmcp::model::CallToolResponse::Complete(result)
@@ -3429,6 +3530,85 @@ mod tests {
         );
     }
 
+    /// Feature 032 (F3): repeat runs accumulate only on a lane an entry point
+    /// positively DECLARED single-client. Every constructor therefore leaves
+    /// the lane shared/inert; only [`SymForgeServer::with_stdio_transport_lane`]
+    /// moves it, and only the two stdio entry points in `src/cli/entry.rs`
+    /// call that. A new transport that forgets to declare itself gets no
+    /// notice rather than one shared accumulating bucket.
+    #[test]
+    fn constructed_servers_default_to_an_inert_transport_lane() {
+        let local = make_local_server(None);
+        assert_eq!(
+            local.transport_lane,
+            repeat::TransportLane::Shared,
+            "new_with_state_placement must leave the lane inert"
+        );
+        assert_eq!(
+            local.clone().transport_lane,
+            repeat::TransportLane::Shared,
+            "a clone (the HTTP factory clones per request) inherits the lane"
+        );
+
+        let proxy =
+            SymForgeServer::new_daemon_proxy(crate::daemon::DaemonSessionClient::new_for_test(
+                "http://127.0.0.1:1".to_string(),
+                "project-id".to_string(),
+                "session-id".to_string(),
+                "project-name".to_string(),
+            ));
+        assert_eq!(
+            proxy.transport_lane,
+            repeat::TransportLane::Shared,
+            "new_daemon_proxy_with_state_placement must leave the lane inert"
+        );
+
+        // Positive control: the declaration is what moves it, and it survives
+        // the clone the transports take.
+        let declared = local.with_stdio_transport_lane();
+        assert_eq!(declared.transport_lane, repeat::TransportLane::Stdio);
+        assert_eq!(
+            declared.clone().transport_lane,
+            repeat::TransportLane::Stdio
+        );
+    }
+
+    /// Feature 032 (F2): seed one repeat run at count 2 on `server`, as the
+    /// seam would after two identical eligible serves, and return its key.
+    fn seed_repeat_run(server: &SymForgeServer) -> repeat::RepeatKey {
+        let args: rmcp::model::JsonObject =
+            serde_json::from_value(serde_json::json!({ "query": "anchor" })).expect("object");
+        let epoch = server.repeat_tracker.lock().epoch();
+        let key = repeat::RepeatKey::observe(
+            repeat::LaneWitness::assume(repeat::SessionDiscriminator::Stdio),
+            epoch,
+            "search_symbols",
+            Some(&args),
+        )
+        .expect("an eligible stdio call keys the tracker");
+        let evidence = result_status::ProjectEvidence {
+            project_id: "project-v1-seed".to_string(),
+            project_name: "seed".to_string(),
+            canonical_root: Some("C:/seed".to_string()),
+            generation: 1,
+            index_state: "Ready".to_string(),
+            load_source: "memory".to_string(),
+            index_files: 1,
+            index_symbols: 1,
+        };
+        let observed = || {
+            repeat::ServeObservation::observed_for_test(repeat::ObservedServe::for_test(
+                evidence.clone(),
+                &[rmcp::model::ContentBlock::text("body")],
+            ))
+        };
+        let mut tracker = server.repeat_tracker.lock();
+        assert!(tracker.record_serve(key.clone(), observed()).is_none());
+        assert!(tracker.record_serve(key.clone(), observed()).is_none());
+        assert_eq!(tracker.len(), 1, "one run seeded at count 2");
+        key
+    }
+
     #[tokio::test]
     async fn daemon_degraded_clears_on_next_success() {
         let (base_url, shutdown, calls) = spawn_fake_tool_server("daemon-ok").await;
@@ -3440,6 +3620,9 @@ mod tests {
         );
         let server = SymForgeServer::new_daemon_proxy(daemon_client);
         server.daemon_degraded.lock().degraded = true;
+        // Feature 032 (F2): runs accumulated while degraded (locally served)
+        // must not survive the switch back to daemon-served responses.
+        let _seeded = seed_repeat_run(&server);
 
         let result = server
             .proxy_tool_call("health", &serde_json::json!({}))
@@ -3455,6 +3638,41 @@ mod tests {
         assert!(
             !server.daemon_degraded.lock().degraded,
             "successful proxy call should clear daemon_degraded"
+        );
+        assert!(
+            server.repeat_tracker.lock().is_empty(),
+            "the degraded -> daemon-served transition must clear every repeat run"
+        );
+    }
+
+    /// Feature 032 (F2): the FIRST daemon failure of a healthy adapter flips
+    /// serving from the daemon to a local fallback (or a replacement daemon).
+    /// Runs observed against the dead daemon's index must not survive it: a
+    /// replacement can return evidence byte-equal to the dead daemon's
+    /// (generation is a per-process counter).
+    #[tokio::test]
+    async fn daemon_failure_transition_clears_repeat_runs() {
+        // No listener on port 1: the probe fails fast, the reconnect fails
+        // (auto-spawn disabled in tests), and the call falls back locally.
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "project-id".to_string(),
+            "session-id".to_string(),
+            "project-name".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        assert!(!server.daemon_degraded.lock().degraded, "starts healthy");
+        let _seeded = seed_repeat_run(&server);
+
+        let result = server
+            .proxy_tool_call("health", &serde_json::json!({}))
+            .await;
+
+        assert!(result.is_none(), "the failed daemon falls back locally");
+        assert!(server.daemon_degraded.lock().degraded);
+        assert!(
+            server.repeat_tracker.lock().is_empty(),
+            "the daemon-served -> locally-served transition must clear every repeat run"
         );
     }
 
@@ -4507,11 +4725,19 @@ mod tests {
             "project A's file should be present after the first load"
         );
 
+        // Feature 032 (F2): runs observed against project A's index must not
+        // survive the reload into project B's.
+        let _seeded = seed_repeat_run(&server);
+
         // 2. Switch the target root to B WITHOUT calling reset_to_empty.
         server.set_repo_root(Some(dir_b.path().to_path_buf()));
 
         // 3. The next ensure_local_index must detect the root mismatch and reload B.
         server.ensure_local_index().await;
+        assert!(
+            server.repeat_tracker.lock().is_empty(),
+            "a local index reload is a new incarnation: every repeat run must be cleared"
+        );
 
         let published_b = server.index.data_plane().published_state();
         assert_eq!(
@@ -4565,11 +4791,20 @@ mod tests {
             "first ensure_local_index call should have loaded project A"
         );
 
+        // Feature 032 (F2) negative control: no reload means no incarnation
+        // change, so runs observed against this index survive.
+        let _seeded = seed_repeat_run(&server);
+
         // Repeated calls with the same root must be no-ops (no reload).
         for _ in 0..3 {
             server.ensure_local_index().await;
         }
 
+        assert_eq!(
+            server.repeat_tracker.lock().len(),
+            1,
+            "a same-root no-op must leave repeat runs untouched"
+        );
         assert_eq!(
             server.index.data_plane().current_project_generation(),
             gen_after_first,

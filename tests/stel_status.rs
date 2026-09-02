@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
+use symforge::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent};
 use symforge::stel::{self, GoldenRouteRow};
 
 fn repo_root() -> PathBuf {
@@ -170,4 +171,161 @@ async fn full_status_includes_project_and_ledger_summary() {
     assert!(output.contains("serve: 1"));
     assert!(output.contains("legacy_executed: 1"));
     assert!(output.contains("tuning:"));
+}
+
+/// A server over an empty index — the status body needs no corpus, only the
+/// session ledger this test seeds directly (032 US2 T012).
+fn empty_index_server(project: &str) -> SymForgeServer {
+    SymForgeServer::new(
+        LiveIndex::empty(),
+        project.to_string(),
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            symforge::watcher::WatcherInfo::default(),
+        )),
+        None,
+        None,
+    )
+}
+
+/// A literal serve event. `ts_ms`/`plan_id` are the clocks the collapse
+/// identity ignores; `equivalence` is the one identity field the control flips
+/// (calibration never reads it, so every aggregate line stays byte-stable).
+fn serve_event(ts_ms: u64, equivalence: Option<serde_json::Value>) -> StelLedgerEvent {
+    StelLedgerEvent {
+        ts_ms,
+        plan_id: format!("plan-{ts_ms}"),
+        surface: "symforge".to_string(),
+        intent: IntentBucket::Trace,
+        decision: AdmissionDecision::Serve,
+        tools_called: vec!["find_references".to_string()],
+        predicted_response_tokens: 400,
+        actual_response_tokens: 380,
+        manual_baseline_tokens: 800,
+        net_vs_manual: 420,
+        equivalence,
+        route_confidence: RouteConfidence::Exact,
+        pff_bypass: None,
+        cache_hit: None,
+        degrade_flags: vec![],
+    }
+}
+
+fn exact_line<'a>(output: &'a str, prefix: &str) -> &'a str {
+    output
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("missing `{prefix}` line in:\n{output}"))
+}
+
+#[tokio::test]
+async fn status_full_annotates_trailing_run() {
+    // 032 US2 (spec FR-007 / SC-003, status lane): a trailing run of N≥2
+    // ledger-identical events renders ` ×N (first=…, last=…)` on the
+    // `last_ledger_decision:` line ONLY; a trailing run of 1 renders today's
+    // bare line byte-for-byte, and no other line moves.
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    // Control 1: a single event — today's format, no annotation anywhere.
+    let single = empty_index_server("status-runs");
+    single.stel_ledger().lock().push(serve_event(1_000, None));
+    let single_body = dispatch_status(&single, Some("full")).await;
+    assert_eq!(
+        exact_line(&single_body, "last_ledger_decision:"),
+        "last_ledger_decision: serve",
+        "single event renders the bare line:\n{single_body}"
+    );
+    assert!(
+        !single_body.contains('×'),
+        "single event must carry no run annotation:\n{single_body}"
+    );
+
+    // Positive: a trailing run of three events identical in every identity
+    // field (they differ only in ts_ms/plan_id).
+    let tripled = empty_index_server("status-runs");
+    {
+        let ledger = tripled.stel_ledger().lock();
+        for ts_ms in 1_000..1_003 {
+            ledger.push(serve_event(ts_ms, None));
+        }
+    }
+    let tripled_body = dispatch_status(&tripled, Some("full")).await;
+    assert_eq!(
+        exact_line(&tripled_body, "last_ledger_decision:"),
+        "last_ledger_decision: serve ×3 (first=1000, last=1002)",
+        "trailing run of 3 must be annotated on the decision line:\n{tripled_body}"
+    );
+    assert_eq!(
+        exact_line(&tripled_body, "last_ledger_route:"),
+        "last_ledger_route: find_references",
+        "the route line is never annotated:\n{tripled_body}"
+    );
+    assert_eq!(
+        tripled_body.matches('×').count(),
+        1,
+        "exactly one annotated line:\n{tripled_body}"
+    );
+
+    // Control 2: the SAME three-event totals, but the middle event breaks the
+    // run (trailing run of 1). Its decision line is today's bare format, and
+    // every OTHER line equals the tripled render — the aggregates count the
+    // uncollapsed events (FR-008) and the suffix is the only difference.
+    let broken = empty_index_server("status-runs");
+    {
+        let ledger = broken.stel_ledger().lock();
+        ledger.push(serve_event(1_000, None));
+        ledger.push(serve_event(
+            1_001,
+            Some(serde_json::json!({ "probe": true })),
+        ));
+        ledger.push(serve_event(1_002, None));
+    }
+    let broken_body = dispatch_status(&broken, Some("full")).await;
+    assert_eq!(
+        exact_line(&broken_body, "last_ledger_decision:"),
+        "last_ledger_decision: serve",
+        "a trailing run of 1 renders today's bare line:\n{broken_body}"
+    );
+    assert!(
+        broken_body.contains("ledger_events: 3"),
+        "the aggregate still counts every stored event:\n{broken_body}"
+    );
+    assert_eq!(
+        tripled_body.lines().count(),
+        broken_body.lines().count(),
+        "annotation must not add or remove lines:\n{tripled_body}\n---\n{broken_body}"
+    );
+    let differing: Vec<(&str, &str)> = tripled_body
+        .lines()
+        .zip(broken_body.lines())
+        .filter(|(annotated, bare)| annotated != bare)
+        .collect();
+    assert_eq!(
+        differing,
+        vec![(
+            "last_ledger_decision: serve ×3 (first=1000, last=1002)",
+            "last_ledger_decision: serve"
+        )],
+        "only the decision line may differ:\n{tripled_body}\n---\n{broken_body}"
+    );
+
+    // Large-N control (spec SC-003, status lane): 10,000 identical events
+    // render ×10000 — never overflowed, never truncated.
+    let large = empty_index_server("status-runs");
+    {
+        let ledger = large.stel_ledger().lock();
+        for ts_ms in 1_000..11_000 {
+            ledger.push(serve_event(ts_ms, None));
+        }
+    }
+    let large_body = dispatch_status(&large, Some("full")).await;
+    assert_eq!(
+        exact_line(&large_body, "last_ledger_decision:"),
+        "last_ledger_decision: serve ×10000 (first=1000, last=10999)",
+        "a 10,000-run must be counted in full:\n{large_body}"
+    );
+    assert!(
+        large_body.contains("ledger_events: 10000"),
+        "the aggregate is the uncollapsed count:\n{large_body}"
+    );
 }

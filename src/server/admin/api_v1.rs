@@ -32,6 +32,12 @@ use crate::protocol::surface_probe::{
 };
 use crate::server::ServerRuntime;
 use crate::server::aap::{AapDetection, AapPresets, EmbedPinComparison, IntegrationMode};
+use crate::stel::ledger::{Run, collapse_runs, stored_record_identity};
+use crate::stel::ledger_store::{StelLedgerStore, StoredLedgerRecord};
+
+/// Raw-row fetch limit behind [`LedgerSummaryView::recent_runs`] — the
+/// contract's `recent_runs_window` (032 US2).
+const RECENT_RUNS_WINDOW: usize = 50;
 
 // ---------------------------------------------------------------------------
 // View DTOs (T005)
@@ -76,29 +82,195 @@ pub struct LedgerSummaryView {
     pub session_count: Option<u64>,
     /// Per-session compression heuristic counters (011 US5).
     pub compression_heuristic: CompressionHeuristicView,
+    /// Collapsed runs of consecutive, identity-identical durable rows within
+    /// the most recent `recent_runs_window` rows, chronological (032 US2,
+    /// `contracts/admin-recent-runs.md`). Empty when the store is unavailable
+    /// or its read failed — never fabricated rows.
+    ///
+    /// The totals above and this list are TWO separate store reads (two lock
+    /// acquisitions, `summary()` then `recent()`), so a row recorded between
+    /// them is counted in one and not the other: a transient dashboard
+    /// inconsistency on a live ledger, never a false count — each figure is
+    /// exact for the instant it was read.
+    pub recent_runs: Vec<LedgerRunView>,
+    /// The raw-row fetch limit `recent_runs` was computed over. Present
+    /// whenever the rows were actually read (even when zero rows exist);
+    /// absent when the store is unavailable or the read failed, so an empty
+    /// `recent_runs` is never mistaken for "read zero rows".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_runs_window: Option<u64>,
+}
+
+/// One collapsed run of consecutive, identity-identical durable ledger rows
+/// (032 US2, `contracts/admin-recent-runs.md`). Presentation-only: built from
+/// the rows [`crate::stel::ledger_store::StelLedgerStore::recent`] returned and
+/// never written back (spec FR-009).
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerRunView {
+    /// Rows of the run INSIDE the fetch window — a window-bounded figure, not
+    /// the run's true extent, whenever `window_clipped` is set.
+    pub count: u64,
+    /// `ts_ms` of the run's chronologically first fetched row.
+    pub first_ts_ms: u64,
+    /// `ts_ms` of the run's chronologically last fetched row.
+    pub last_ts_ms: u64,
+    /// OBSERVED, never assumed: `true` only on the run containing the
+    /// chronologically-oldest in-window row, and only when the row immediately
+    /// older than the window (the sentinel — the builder fetches one row beyond
+    /// the window to see it) shares that run's collapse identity, i.e. the run
+    /// really does continue past the edge and `count` is window-bounded rather
+    /// than a total. A run whose extent ends exactly at the edge, or a ledger
+    /// with no row beyond the window, is `false`. Session id is part of the
+    /// identity, so a sentinel from another session never clips.
+    pub window_clipped: bool,
+    /// Stored string form, verbatim.
+    pub session_id: String,
+    /// Stored string form, verbatim.
+    pub surface: String,
+    /// Stored string form, verbatim.
+    pub intent: String,
+    /// Stored string form, verbatim.
+    pub decision: String,
+    /// The stored `tools_called_json` parsed as a string array. `None` (`null`
+    /// on the wire) when the stored form does not parse — the writer bounds
+    /// the column to 1024 bytes, so a truncated row is representable — rather
+    /// than a fabricated `[]` that would claim "no tools called".
+    pub tools_called: Option<Vec<String>>,
+    /// Stored string form, verbatim.
+    pub route_confidence: String,
+    /// The stored nullable flag (`null` = stored absent).
+    pub pff_bypass: Option<bool>,
+    /// The stored nullable flag (`null` = stored absent).
+    pub cache_hit: Option<bool>,
+    /// The stored `degrade_flags_json` parsed as a string array; `None` on an
+    /// unparseable stored form, same rule as `tools_called`.
+    pub degrade_flags: Option<Vec<String>>,
 }
 
 impl LedgerSummaryView {
     /// Build from the runtime's optional ledger store.
     pub fn from_runtime(runtime: &ServerRuntime) -> Self {
         let compression_heuristic = CompressionHeuristicView::from_runtime(runtime);
-        match runtime.ledger_store().and_then(|s| s.summary()) {
-            Some(summary) => Self {
+        if let Some(store) = runtime.ledger_store()
+            && let Some(summary) = store.summary()
+        {
+            let (recent_runs, recent_runs_window) = Self::recent_runs(store);
+            Self {
                 available: true,
                 total_events: Some(summary.total_events),
                 total_net_vs_manual: Some(summary.total_net_vs_manual),
                 accepted_count: Some(summary.accepted_count),
                 session_count: Some(summary.session_count),
                 compression_heuristic,
-            },
-            None => Self {
+                recent_runs,
+                recent_runs_window,
+            }
+        } else {
+            Self {
                 available: false,
                 total_events: None,
                 total_net_vs_manual: None,
                 accepted_count: None,
                 session_count: None,
                 compression_heuristic,
-            },
+                recent_runs: Vec::new(),
+                recent_runs_window: None,
+            }
+        }
+    }
+
+    /// Observe the collapsed recent-run list from `store` (032 US2).
+    ///
+    /// What this observes: `store.recent(RECENT_RUNS_WINDOW + 1)` — the newest
+    /// rows (`ORDER BY id DESC`). If the extra row came back it is the SENTINEL,
+    /// the row immediately older than the window: it is set aside (never
+    /// counted, never rendered) and the remaining `RECENT_RUNS_WINDOW` rows are
+    /// reversed to chronological and collapsed with `session_id` in the
+    /// identity so a run never spans sessions. `window_clipped` on the oldest
+    /// in-window run is then the observed equality of the sentinel's identity
+    /// with that run's — not an inference from the fetch having filled the
+    /// window. What it emits when the observation fails: `(vec![], None)` — no
+    /// rows and NO window claim, distinguishable from "read zero rows in a
+    /// 50-row window" (`(vec![], Some(50))`) — with the failure logged. Totals
+    /// are never derived from this list; they come from `summary()` over the
+    /// uncollapsed rows (spec FR-008).
+    fn recent_runs(store: &StelLedgerStore) -> (Vec<LedgerRunView>, Option<u64>) {
+        let mut rows = match store.recent(RECENT_RUNS_WINDOW + 1) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "stel ledger recent rows unreadable; admin recent_runs withheld"
+                );
+                return (Vec::new(), None);
+            }
+        };
+        // Newest-first, so the oldest fetched row is last: when the fetch
+        // reached past the window, that row is the sentinel.
+        let sentinel = if rows.len() > RECENT_RUNS_WINDOW {
+            rows.pop()
+        } else {
+            None
+        };
+        rows.reverse();
+        let runs = collapse_runs(&rows, stored_record_identity, |row| row.ts_ms)
+            .iter()
+            .enumerate()
+            .map(|(index, run)| {
+                let window_clipped = index == 0
+                    && sentinel.as_ref().is_some_and(|sentinel| {
+                        stored_record_identity(sentinel) == stored_record_identity(&run.canonical)
+                    });
+                LedgerRunView::from_run(run, window_clipped)
+            })
+            .collect();
+        (runs, Some(RECENT_RUNS_WINDOW as u64))
+    }
+}
+
+impl LedgerRunView {
+    /// Project one collapsed run onto the wire shape; `window_clipped` is
+    /// decided by the caller, which alone sees the sentinel row beyond the
+    /// window.
+    ///
+    /// EXHAUSTIVE destructure, mirroring the identity extractor: the excluded
+    /// columns (`id`, `ts_ms`, `plan_id`, the four token measurements) are bound
+    /// and ignored by name, so a column added to `StoredLedgerRecord` fails
+    /// compilation here and forces a wire decision instead of silently
+    /// staying off the view.
+    fn from_run(run: &Run<StoredLedgerRecord>, window_clipped: bool) -> Self {
+        let StoredLedgerRecord {
+            id: _,
+            ts_ms: _,
+            session_id,
+            plan_id: _,
+            surface,
+            intent,
+            decision,
+            tools_called_json,
+            predicted_response_tokens: _,
+            actual_response_tokens: _,
+            manual_baseline_tokens: _,
+            net_vs_manual: _,
+            route_confidence,
+            pff_bypass,
+            cache_hit,
+            degrade_flags_json,
+        } = &run.canonical;
+        Self {
+            count: run.count,
+            first_ts_ms: run.first_ts_ms,
+            last_ts_ms: run.last_ts_ms,
+            window_clipped,
+            session_id: session_id.clone(),
+            surface: surface.clone(),
+            intent: intent.clone(),
+            decision: decision.clone(),
+            tools_called: serde_json::from_str(tools_called_json).ok(),
+            route_confidence: route_confidence.clone(),
+            pff_bypass: *pff_bypass,
+            cache_hit: *cache_hit,
+            degrade_flags: serde_json::from_str(degrade_flags_json).ok(),
         }
     }
 }
@@ -639,6 +811,51 @@ mod tests {
         assert_eq!(view.total_events, Some(1));
         assert_eq!(view.total_net_vs_manual, Some(210));
         assert_eq!(view.compression_heuristic.cache_hits, 0);
+    }
+
+    #[test]
+    fn ledger_run_view_withholds_unparseable_stored_arrays() {
+        // 032 US2: the writer bounds `tools_called_json` to 1024 bytes, so a
+        // truncated (unparseable) stored form is representable. The view renders
+        // `null` for it rather than a fabricated `[]`; a well-formed row is the
+        // control and parses to the contract's arrays.
+        let row = |tools_called_json: &str, degrade_flags_json: &str| StoredLedgerRecord {
+            id: 1,
+            ts_ms: 1,
+            session_id: "s".into(),
+            plan_id: "p".into(),
+            surface: "symforge".into(),
+            intent: "trace".into(),
+            decision: "serve".into(),
+            tools_called_json: tools_called_json.into(),
+            predicted_response_tokens: 1,
+            actual_response_tokens: 1,
+            manual_baseline_tokens: 1,
+            net_vs_manual: 0,
+            route_confidence: "exact".into(),
+            pff_bypass: None,
+            cache_hit: None,
+            degrade_flags_json: degrade_flags_json.into(),
+        };
+        let run = |canonical: StoredLedgerRecord| Run {
+            canonical,
+            count: 2,
+            first_ts_ms: 1,
+            last_ts_ms: 2,
+        };
+        let parsed = LedgerRunView::from_run(&run(row(r#"["find_references"]"#, "[]")), false);
+        assert_eq!(
+            parsed.tools_called,
+            Some(vec!["find_references".to_string()])
+        );
+        assert_eq!(parsed.degrade_flags, Some(vec![]));
+        assert!(!parsed.window_clipped);
+
+        let truncated = LedgerRunView::from_run(&run(row(r#"["find_refer"#, r#"["outl"#)), true);
+        assert_eq!(truncated.tools_called, None, "unparseable → withheld");
+        assert_eq!(truncated.degrade_flags, None, "unparseable → withheld");
+        assert!(truncated.window_clipped);
+        assert_eq!(truncated.count, 2);
     }
 
     #[test]

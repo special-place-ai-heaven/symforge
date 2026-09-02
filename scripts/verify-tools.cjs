@@ -344,7 +344,12 @@ async function startSession(READINESS_PROBE) {
         ready = true; // no known symbol to probe; a source-bound Ready generation is the signal
       } else {
         // Confirm the index actually answers before we trust it. Empty/error → wait.
-        const probe = await callTool("search_symbols", { query: READINESS_PROBE });
+        // `limit: 50` is search_symbols' own default (same answer, distinct request
+        // fingerprint from the `{ query }`-only cases). This harness relays through
+        // the compact `symforge` facade, which is repeat-notice-ineligible today, so
+        // the distinct fingerprint is insurance only if the harness ever runs the
+        // full surface.
+        const probe = await callTool("search_symbols", { query: READINESS_PROBE, limit: 50 });
         if (!probe.isError && probe.text.includes(READINESS_PROBE)) ready = true;
       }
     }
@@ -463,7 +468,10 @@ function firstDiff(a, b) {
   }
   const cases = loadCases();
   // Readiness probe: reuse the first search_symbols case's query — a symbol we know
-  // exists in this fixture — so the poll confirms the index actually answers.
+  // exists in this fixture — so the poll confirms the index actually answers. The
+  // probe call carries an explicit default `limit` (see startSession); the harness
+  // relays through the compact facade, which is repeat-notice-ineligible, so that
+  // distinct fingerprint only matters if the harness ever runs the full surface.
   const probe = (cases.find((c) => c.tool === "search_symbols") || {}).args?.query || "";
   const session = await startSession(probe);
   const results = [];
