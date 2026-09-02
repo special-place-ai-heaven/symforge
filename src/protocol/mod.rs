@@ -2197,8 +2197,21 @@ impl ServerHandler for SymForgeServer {
         // BEFORE `ToolCallContext::new` moves it. `None` means this call never
         // touches the tracker: an inert lane (no observable session identity),
         // an ineligible tool, or a set-valued `projects` fan-out.
+        //
+        // F2: the tracker's incarnation epoch is read HERE, before dispatch,
+        // and carried on the key. rmcp runs each request in its own task, so a
+        // concurrent request's transition `clear()` can land between this read
+        // and the post-dispatch record; a key stamped with the superseded
+        // epoch is refused there instead of anchoring a run across the change.
+        // The epoch is read under the same lock that owns the run map — one
+        // owner, so a reader can never see a bumped epoch beside stale runs.
+        // Read unconditionally rather than behind an eligibility pre-check so
+        // `RepeatKey::observe` stays the single owner of "does this call touch
+        // the tracker"; an uncontended `parking_lot` lock on a `u64` is far
+        // below the per-call budget of a handler that queries the index.
         let repeat_key = repeat::RepeatKey::observe(
             repeat::SessionDiscriminator::observe(&context),
+            self.repeat_tracker.lock().epoch(),
             request.name.as_ref(),
             request.arguments.as_ref(),
         );
@@ -3497,8 +3510,10 @@ mod tests {
     fn seed_repeat_run(server: &SymForgeServer) -> repeat::RepeatKey {
         let args: rmcp::model::JsonObject =
             serde_json::from_value(serde_json::json!({ "query": "anchor" })).expect("object");
+        let epoch = server.repeat_tracker.lock().epoch();
         let key = repeat::RepeatKey::observe(
             repeat::LaneWitness::assume(repeat::SessionDiscriminator::Stdio),
+            epoch,
             "search_symbols",
             Some(&args),
         )

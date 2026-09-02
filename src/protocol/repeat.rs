@@ -125,13 +125,38 @@ impl LaneWitness {
     }
 }
 
-/// Identity of one repeatable request: the observed lane, the tool as
-/// dispatched, and the canonical-JSON fingerprint of its arguments. Two calls
-/// are "identical" iff `tool` and `request_hash` match; only `Stdio` keys are
-/// ever constructed, so `session` is a witness that the lane was observed.
+/// The tracker's incarnation counter, minted ONLY by [`RepeatTracker::epoch`]
+/// (and the in-crate test door) so no caller can assert an epoch it did not
+/// read off the tracker.
+///
+/// The seam reads it BEFORE dispatch and carries it on the [`RepeatKey`];
+/// [`RepeatTracker::record_serve`] refuses any serve whose epoch is not the
+/// current one. That is what stops an in-flight serve — observed against
+/// incarnation X, recorded after a concurrent request's transition
+/// [`RepeatTracker::clear`] — from anchoring a run that spans X and its
+/// replacement (`ProjectEvidence.generation` is a per-process counter, so a
+/// replacement index can return evidence byte-equal to the dead one's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrackerEpoch(u64);
+
+impl TrackerEpoch {
+    #[cfg(test)]
+    pub(crate) const fn assume(epoch: u64) -> Self {
+        Self(epoch)
+    }
+}
+
+/// Identity of one repeatable request: the observed lane, the tracker
+/// incarnation the seam read before dispatch, the tool as dispatched, and the
+/// canonical-JSON fingerprint of its arguments. Two calls are "identical" iff
+/// `tool` and `request_hash` match within one incarnation; only `Stdio` keys
+/// are ever constructed, so `session` is a witness that the lane was observed.
+/// `epoch` is part of the derived identity as well as an explicit guard, so a
+/// pre-clear key cannot even hash-match a post-clear run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepeatKey {
     session: SessionDiscriminator,
+    epoch: TrackerEpoch,
     tool: String,
     request_hash: RequestHash,
 }
@@ -142,7 +167,16 @@ impl RepeatKey {
     /// lane structurally withholds per-project evidence — research.md R6).
     /// `None` means no tracker interaction at all: the seam cannot key what
     /// it cannot attribute. Absent arguments fingerprint as the empty object.
-    pub fn observe(lane: LaneWitness, tool: &str, arguments: Option<&JsonObject>) -> Option<Self> {
+    ///
+    /// `epoch` must be read from the tracker BEFORE the dispatch whose result
+    /// this key will record, so an incarnation change during the dispatch is
+    /// observable at record time.
+    pub fn observe(
+        lane: LaneWitness,
+        epoch: TrackerEpoch,
+        tool: &str,
+        arguments: Option<&JsonObject>,
+    ) -> Option<Self> {
         let session = lane.0;
         if session != SessionDiscriminator::Stdio || !is_repeat_eligible(tool) {
             return None;
@@ -157,6 +191,7 @@ impl RepeatKey {
         let request_hash = RequestHash::for_tool_request(tool, &args).ok()?;
         Some(Self {
             session,
+            epoch,
             tool: tool.to_string(),
             request_hash,
         })
@@ -445,23 +480,45 @@ struct RepeatRun {
 
 /// Bounded per-process map of runs (data-model.md state machine). Shared by
 /// every clone of `SymForgeServer` behind one `Arc<Mutex<_>>`; the seam locks
-/// it synchronously after the awaited dispatch.
+/// it synchronously (before dispatch to read [`Self::epoch`], after dispatch
+/// to record) and never holds it across an `.await`.
 #[derive(Debug, Default)]
 pub struct RepeatTracker {
     runs: HashMap<RepeatKey, RepeatRun>,
+    /// Incarnation counter, bumped by [`Self::clear`]. Kept INSIDE the mutex
+    /// rather than in a sibling `AtomicU64` so the bump and the run drop are
+    /// one atomic step for every reader: with two cells a pre-dispatch reader
+    /// could observe the new epoch while the map still held the old runs (or
+    /// the reverse), which is exactly the interleaving this field exists to
+    /// rule out. The cost is one extra uncontended lock per eligible call.
+    epoch: u64,
 }
 
 impl RepeatTracker {
+    /// The current incarnation. The seam reads this BEFORE dispatch and mints
+    /// the [`RepeatKey`] with it; [`Self::record_serve`] refuses anything else.
+    pub fn epoch(&self) -> TrackerEpoch {
+        TrackerEpoch(self.epoch)
+    }
+
     /// Apply one observed serve and return the notice when the run reaches
-    /// [`NOTICE_THRESHOLD`]. Unobserved ⇒ the run is removed. Observed and
-    /// witnessed equal (evidence AND body) ⇒ `count += 1` (saturating).
-    /// Observed and unequal in either ⇒ the run restarts at 1 on the new
-    /// observation.
+    /// [`NOTICE_THRESHOLD`]. A key from a superseded incarnation is refused
+    /// outright. Unobserved ⇒ the run is removed. Observed and witnessed equal
+    /// (evidence AND body) ⇒ `count += 1` (saturating). Observed and unequal
+    /// in either ⇒ the run restarts at 1 on the new observation.
     pub fn record_serve(
         &mut self,
         key: RepeatKey,
         observation: ServeObservation,
     ) -> Option<RepeatNotice> {
+        if key.epoch != self.epoch() {
+            // F2: this serve was observed against an index incarnation the
+            // tracker has since dropped, and a replacement's evidence can be
+            // byte-equal to the dead one's. Refuse it entirely — not even as a
+            // fresh run, since the observation it carries describes the old
+            // incarnation's answer.
+            return None;
+        }
         let current = match observation.0 {
             Observation::Observed(current) => current,
             Observation::Unobserved(_) => {
@@ -487,6 +544,11 @@ impl RepeatTracker {
             // every in-flight run at once — losing only true notices, never
             // creating a false one; upgrade path is LRU eviction keyed on
             // last-serve order if a real session ever fills this map.
+            //
+            // Deliberately drops the runs WITHOUT bumping the epoch: this is
+            // memory pressure, not an incarnation change. The index that
+            // served those keys is still the one serving now, so their next
+            // serve honestly restarts at 1 instead of being refused forever.
             self.runs.clear();
         }
         self.runs.insert(
@@ -499,15 +561,22 @@ impl RepeatTracker {
         None
     }
 
-    /// Drop every run. The rule: a run must not survive a change of the index
-    /// INCARNATION it was observed against — a daemon reconnect (a replacement
-    /// daemon's evidence can be byte-equal to the dead one's: `generation` is
-    /// a per-process counter), the degrade-to-local and restore-from-local
-    /// transitions, and a local index reload. The adapter calls this at each
-    /// of those sites; a cleared run can only cost a true notice, never
-    /// create a false one.
+    /// Drop every run and advance the incarnation. The rule: a run must not
+    /// survive a change of the index INCARNATION it was observed against — a
+    /// daemon reconnect (a replacement daemon's evidence can be byte-equal to
+    /// the dead one's: `generation` is a per-process counter), the
+    /// degrade-to-local and restore-from-local transitions, and a local index
+    /// reload. The adapter calls this at each of those sites; a cleared run
+    /// can only cost a true notice, never create a false one.
+    ///
+    /// The epoch bump is what makes this safe under concurrency: dropping the
+    /// map alone would still let a serve already in flight against the old
+    /// incarnation be inserted afterwards and anchor a run that spans the
+    /// transition. `wrapping_add` because 2^64 incarnation changes in one
+    /// process is not a reachable state.
     pub(crate) fn clear(&mut self) {
         self.runs.clear();
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     #[cfg(test)]
@@ -564,9 +633,21 @@ mod tests {
         LaneWitness::assume(SessionDiscriminator::Stdio)
     }
 
+    /// The epoch of a freshly constructed [`RepeatTracker`]. Tests that never
+    /// call [`RepeatTracker::clear`] key against this; the ones that do mint
+    /// their keys from `tracker.epoch()` instead.
+    fn epoch0() -> TrackerEpoch {
+        TrackerEpoch::assume(0)
+    }
+
     fn key(tool: &str, query: &str) -> RepeatKey {
-        RepeatKey::observe(stdio(), tool, Some(&args(json!({ "query": query }))))
-            .expect("an eligible stdio call keys the tracker")
+        RepeatKey::observe(
+            stdio(),
+            epoch0(),
+            tool,
+            Some(&args(json!({ "query": query }))),
+        )
+        .expect("an eligible stdio call keys the tracker")
     }
 
     /// A result carrying `_meta` exactly as the seam would see it after
@@ -637,7 +718,7 @@ mod tests {
         for tool in REPEAT_ELIGIBLE_TOOLS {
             assert!(is_repeat_eligible(tool), "{tool} must be eligible");
             assert!(
-                RepeatKey::observe(stdio(), tool, None).is_some(),
+                RepeatKey::observe(stdio(), epoch0(), tool, None).is_some(),
                 "{tool} must key the tracker on stdio"
             );
         }
@@ -655,7 +736,7 @@ mod tests {
         ] {
             assert!(!is_repeat_eligible(tool), "{tool} must stay ineligible");
             assert!(
-                RepeatKey::observe(stdio(), tool, None).is_none(),
+                RepeatKey::observe(stdio(), epoch0(), tool, None).is_none(),
                 "{tool} must never key the tracker"
             );
         }
@@ -944,8 +1025,13 @@ mod tests {
     }
 
     // F2 — an incarnation change (daemon reconnect, degrade-to-local,
-    // restore-from-local, local reload) clears every run: the next serve of
-    // any key restarts at 1 and re-accumulates honestly.
+    // restore-from-local, local reload) clears every run: a call keyed AFTER
+    // the clear restarts at 1 and re-accumulates honestly. (Round 2: the key
+    // is now re-minted after the clear because a pre-clear key is refused
+    // outright — see `serve_observed_before_a_clear_never_joins_a_run`, which
+    // owns that half. Re-serving the SAME key across a clear is exactly the
+    // in-flight bridge F2 forbids, so it can no longer be this test's model of
+    // "the next serve".)
     #[test]
     fn clear_restarts_runs_at_one() {
         let mut tracker = RepeatTracker::default();
@@ -954,6 +1040,13 @@ mod tests {
         assert_eq!(tracker.count_of(&k), Some(2));
         tracker.clear();
         assert!(tracker.is_empty(), "clear() drops every run");
+        let k = RepeatKey::observe(
+            stdio(),
+            tracker.epoch(),
+            "search_symbols",
+            Some(&args(json!({ "query": "anchor" }))),
+        )
+        .expect("the same call, keyed against the new incarnation");
         assert!(
             serve_equal(&mut tracker, &k, 1, 1).is_none(),
             "count 1 after clear"
@@ -964,6 +1057,67 @@ mod tests {
         assert_eq!(notice.repeat_count(), 3);
     }
 
+    // F2 (round 2) — the seam mints the key BEFORE dispatch and records the
+    // serve AFTER it, and rmcp runs every request in its own task, so a
+    // concurrent request's incarnation `clear()` can land in between. A serve
+    // whose observation predates that clear must never anchor or join a run
+    // that spans it: `generation` is a per-process counter, so a replacement
+    // index can hand back evidence byte-equal to the dead one's.
+    #[test]
+    fn serve_observed_before_a_clear_never_joins_a_run() {
+        let mint = |tracker: &RepeatTracker| {
+            RepeatKey::observe(
+                stdio(),
+                tracker.epoch(),
+                "search_symbols",
+                Some(&args(json!({ "query": "anchor" }))),
+            )
+            .expect("an eligible stdio call keys the tracker")
+        };
+
+        let mut tracker = RepeatTracker::default();
+        // A run already accumulating when the incarnation changes.
+        let stale = mint(&tracker);
+        assert!(serve_equal(&mut tracker, &stale, 1, 2).is_none());
+        assert_eq!(tracker.count_of(&stale), Some(2));
+        tracker.clear();
+        assert_eq!(tracker.len(), 0, "the clear dropped the run");
+
+        // Three in-flight serves keyed before the clear: no notice, and not
+        // even an insertion — a stale observation may not seed a new run.
+        for serve in 1..=3 {
+            assert!(
+                tracker.record_serve(stale.clone(), observed(1)).is_none(),
+                "serve {serve} of a pre-clear key must never notice"
+            );
+            assert_eq!(
+                tracker.len(),
+                0,
+                "serve {serve} of a pre-clear key must not be recorded at all"
+            );
+        }
+
+        // Positive control: a key minted AFTER the clear accumulates normally
+        // and notices at 3.
+        let fresh = mint(&tracker);
+        assert_ne!(
+            fresh, stale,
+            "the epoch is part of the key, so a re-minted key is a different key"
+        );
+        assert!(tracker.record_serve(fresh.clone(), observed(1)).is_none());
+        assert!(tracker.record_serve(fresh.clone(), observed(1)).is_none());
+        let notice = tracker
+            .record_serve(fresh.clone(), observed(1))
+            .expect("a post-clear key notices at 3");
+        assert_eq!(notice.repeat_count(), 3);
+        assert_eq!(tracker.len(), 1);
+
+        // The stale key stays inert even alongside the live run it shadows.
+        assert!(tracker.record_serve(stale, observed(1)).is_none());
+        assert_eq!(tracker.len(), 1, "the stale serve added nothing");
+        assert_eq!(tracker.count_of(&fresh), Some(3), "and disturbed nothing");
+    }
+
     // Structural non-keys: the inert HTTP lane and set-valued fan-out never
     // touch the tracker; a stdio single-project call does (control).
     #[test]
@@ -972,6 +1126,7 @@ mod tests {
         assert!(
             RepeatKey::observe(
                 LaneWitness::assume(SessionDiscriminator::HttpInert),
+                epoch0(),
                 "search_symbols",
                 Some(&single)
             )
@@ -980,19 +1135,19 @@ mod tests {
         );
         let fan_out = args(json!({ "query": "anchor", "projects": ["*"] }));
         assert!(
-            RepeatKey::observe(stdio(), "search_symbols", Some(&fan_out)).is_none(),
+            RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&fan_out)).is_none(),
             "a set-valued projects fan-out never keys"
         );
         let null_projects = args(json!({ "query": "anchor", "projects": null }));
-        let keyed = RepeatKey::observe(stdio(), "search_symbols", Some(&null_projects))
+        let keyed = RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&null_projects))
             .expect("projects:null is absence");
-        let control = RepeatKey::observe(stdio(), "search_symbols", Some(&single))
+        let control = RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&single))
             .expect("stdio single-project keys");
         assert_eq!(control.tool(), "search_symbols");
         // Fingerprint identity: same args => same key; different args => different.
         assert_eq!(
             control,
-            RepeatKey::observe(stdio(), "search_symbols", Some(&single)).expect("same")
+            RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&single)).expect("same")
         );
         assert_ne!(
             control, keyed,
@@ -1001,13 +1156,13 @@ mod tests {
         let other = args(json!({ "query": "other" }));
         assert_ne!(
             control,
-            RepeatKey::observe(stdio(), "search_symbols", Some(&other)).expect("other")
+            RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&other)).expect("other")
         );
         // Absent arguments hash as the empty object.
         let empty = args(json!({}));
         assert_eq!(
-            RepeatKey::observe(stdio(), "get_repo_map", None).expect("none"),
-            RepeatKey::observe(stdio(), "get_repo_map", Some(&empty)).expect("empty")
+            RepeatKey::observe(stdio(), epoch0(), "get_repo_map", None).expect("none"),
+            RepeatKey::observe(stdio(), epoch0(), "get_repo_map", Some(&empty)).expect("empty")
         );
     }
 
