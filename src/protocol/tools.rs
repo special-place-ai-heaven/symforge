@@ -2360,21 +2360,20 @@ fn untracked_common_path_filters_allow(
         && (include_personal_tooling || !crate::live_index::query::is_personal_tooling_path(path))
 }
 
-fn untracked_paths_not_in_index(server: &SymForgeServer) -> Vec<String> {
-    let Some(repo_root) = server.effective_repo_root_for_git_tools() else {
-        return Vec::new();
-    };
-    let Ok(repo) = crate::git::GitRepo::open(&repo_root) else {
-        return Vec::new();
-    };
+/// The untracked paths `live` does not know.
+///
+/// `live` is the caller's CAPTURED publication — the same bundle that produced
+/// the response beside this verdict — so "not in the index" cannot disagree
+/// with the rows the receipt names. Taking a `&LiveIndex` rather than the
+/// server is what enforces that: this function has no route to
+/// `SharedIndexHandle`, so a second, later read is a compile error rather than
+/// something a reviewer has to catch.
+fn untracked_paths_not_in_index(repo: &crate::git::GitRepo, live: &LiveIndex) -> Vec<String> {
     let Ok(mut paths) = repo.untracked_paths() else {
         return Vec::new();
     };
 
-    {
-        let guard = server.index.data_plane().read();
-        paths.retain(|path| guard.get_file(path).is_none());
-    }
+    paths.retain(|path| live.get_file(path).is_none());
     paths.sort();
     paths.dedup();
     paths
@@ -2462,11 +2461,18 @@ fn untracked_path_matches_search_files_query(path: &str, query: &str) -> bool {
 
 fn matching_untracked_paths_for_search_files(
     server: &SymForgeServer,
+    live: &LiveIndex,
     query: &str,
     include_vendor: bool,
     include_personal_tooling: bool,
 ) -> Vec<String> {
-    untracked_paths_not_in_index(server)
+    let Some(repo_root) = server.effective_repo_root_for_git_tools() else {
+        return Vec::new();
+    };
+    let Ok(repo) = crate::git::GitRepo::open(&repo_root) else {
+        return Vec::new();
+    };
+    untracked_paths_not_in_index(&repo, live)
         .into_iter()
         .filter(|path| {
             untracked_common_path_filters_allow(path, include_vendor, include_personal_tooling)
@@ -2583,6 +2589,7 @@ fn untracked_text_matches(
 
 fn matching_untracked_paths_for_search_text(
     server: &SymForgeServer,
+    live: &LiveIndex,
     query: Option<&str>,
     terms: Option<&[String]>,
     structural: bool,
@@ -2604,12 +2611,11 @@ fn matching_untracked_paths_for_search_text(
     // which paths come back. The gate runs BEFORE any matching: a refusal drops
     // the path from the sweep entirely, disclosing neither content nor
     // existence-by-match.
-    let live = server.index.data_plane().read();
-    untracked_paths_not_in_index(server)
+    untracked_paths_not_in_index(&repo, live)
         .into_iter()
         .filter(|path| untracked_text_path_allowed(path, options))
         .filter(|path| {
-            crate::protocol::read_gate::admit_worktree_text(&live, &repo, path)
+            crate::protocol::read_gate::admit_worktree_text(live, &repo, path)
                 .ok()
                 .flatten()
                 .is_some_and(|content| {
@@ -2650,6 +2656,7 @@ fn admission_degradation_view_from_lookup(
 }
 
 fn admission_degradation_view_from_disk(
+    live: &LiveIndex,
     repo_root: &Path,
     path: &str,
 ) -> Option<AdmissionDegradationView> {
@@ -2667,6 +2674,22 @@ fn admission_degradation_view_from_disk(
 
     let metadata = std::fs::metadata(&canonical_candidate).ok()?;
     if !metadata.is_file() {
+        return None;
+    }
+
+    let relative_path = canonical_candidate
+        .strip_prefix(&canonical_root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .filter(|relative| !relative.is_empty())
+        .unwrap_or_else(|| normalize_admission_degradation_path(path));
+
+    // The binary sniff below OPENS the file, so the admission gate's no-bytes
+    // policy decides first and a demoted path is never read here. Callers
+    // already refuse through `admission_degradation_view_for_path`, so this
+    // changes no rendered output; it is what makes the READ honest and stops a
+    // future caller reopening the hole.
+    if crate::protocol::read_gate::refuse_by_policy(live, &relative_path).is_some() {
         return None;
     }
 
@@ -2708,13 +2731,6 @@ fn admission_degradation_view_from_disk(
         return None;
     }
 
-    let relative_path = canonical_candidate
-        .strip_prefix(&canonical_root)
-        .ok()
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .filter(|relative| !relative.is_empty())
-        .unwrap_or_else(|| normalize_admission_degradation_path(path));
-
     Some(AdmissionDegradationView {
         tier: decision.tier,
         path: relative_path,
@@ -2725,6 +2741,45 @@ fn admission_degradation_view_from_disk(
     })
 }
 
+/// Resolve the degradation view for `path`, refusing by ADMISSION POLICY
+/// before any view exists.
+///
+/// `Err` is the caller-ready refusal, returned verbatim; `Ok(None)` means the
+/// path is Tier-1 or genuinely absent and the caller falls through to its own
+/// handling. Gating here rather than at the two renderers is what stops the
+/// degraded block from reporting a withheld file's exact byte length: the view
+/// a renderer could leak from is never built.
+///
+/// The first refusal runs BEFORE any syscall, so the answer is a pure function
+/// of the requested path plus the manifest and is identical for a demoted file
+/// that exists and one that does not — otherwise the difference between this
+/// block and `File not found:` is a one-bit existence oracle. The second runs
+/// on the RESOLVED path, which can differ from the requested string (absolute
+/// arguments do not normalize against a catalog key) and is the only clause
+/// that catches a content-detected demotion reached that way.
+fn admission_degradation_view_for_path(
+    index: &LiveIndex,
+    repo_root: Option<&Path>,
+    path: &str,
+) -> Result<Option<AdmissionDegradationView>, String> {
+    if let Some(refusal) = crate::protocol::read_gate::refuse_by_policy(index, path) {
+        return Err(refusal);
+    }
+    let Some(view) = index
+        .capture_admission_tier_lookup_view(path)
+        .map(admission_degradation_view_from_lookup)
+        .or_else(|| {
+            repo_root.and_then(|root| admission_degradation_view_from_disk(index, root, path))
+        })
+    else {
+        return Ok(None);
+    };
+    if let Some(refusal) = crate::protocol::read_gate::refuse_by_policy(index, &view.path) {
+        return Err(refusal);
+    }
+    Ok(Some(view))
+}
+
 fn admission_tier_degradation_for_path(
     index: &LiveIndex,
     repo_root: Option<&Path>,
@@ -2732,10 +2787,11 @@ fn admission_tier_degradation_for_path(
     path: &str,
     symbol_name: &str,
 ) -> Option<String> {
-    let view = index
-        .capture_admission_tier_lookup_view(path)
-        .map(admission_degradation_view_from_lookup)
-        .or_else(|| repo_root.and_then(|root| admission_degradation_view_from_disk(root, path)))?;
+    let view = match admission_degradation_view_for_path(index, repo_root, path) {
+        Err(refusal) => return Some(refusal),
+        Ok(None) => return None,
+        Ok(Some(view)) => view,
+    };
     match view.tier {
         AdmissionTier::Normal => None,
         AdmissionTier::MetadataOnly => Some(format!(
@@ -2795,15 +2851,18 @@ fn admission_tier_degradation_for_path(
 /// `admission_degradation_view_from_disk` (path must stay within the repo root)
 /// is preserved. `None` means the path is either Tier-1 (indexed) or genuinely
 /// absent — the caller should fall through to its normal not-found handling.
+/// A path the admission policy withholds is refused by that shared resolver,
+/// so no size ever reaches this formatter.
 fn admission_tier_file_degradation_for_path(
     index: &LiveIndex,
     repo_root: Option<&Path>,
     path: &str,
 ) -> Option<String> {
-    let view = index
-        .capture_admission_tier_lookup_view(path)
-        .map(admission_degradation_view_from_lookup)
-        .or_else(|| repo_root.and_then(|root| admission_degradation_view_from_disk(root, path)))?;
+    let view = match admission_degradation_view_for_path(index, repo_root, path) {
+        Err(refusal) => return Some(refusal),
+        Ok(None) => return None,
+        Ok(Some(view)) => view,
+    };
     if view.tier == AdmissionTier::Normal {
         return None;
     }
@@ -3547,7 +3606,13 @@ fn render_search_text_output(
     let matching_untracked_paths = match &result {
         Ok(result) if result.files.is_empty() && result.suppressed_by_noise == 0 => {
             matching_untracked_paths_for_search_text(
-                server, query, terms, structural, is_regex, options,
+                server,
+                &generation.live,
+                query,
+                terms,
+                structural,
+                is_regex,
+                options,
             )
         }
         _ => Vec::new(),
@@ -6367,6 +6432,7 @@ impl SymForgeServer {
             if matches!(view, SearchFilesResolveView::NotFound { .. }) {
                 let matching_untracked_paths = matching_untracked_paths_for_search_files(
                     self,
+                    &generation.live,
                     &params.0.query,
                     include_vendor,
                     include_personal_tooling,
@@ -6829,6 +6895,7 @@ impl SymForgeServer {
         if matches!(view, SearchFilesView::NotFound { .. }) {
             let matching_untracked_paths = matching_untracked_paths_for_search_files(
                 self,
+                &generation.live,
                 &params.0.query,
                 include_vendor,
                 include_personal_tooling,
@@ -18940,6 +19007,135 @@ mod tests {
         );
     }
 
+    /// A zero-hit `search_text` result: the shape the untracked-file
+    /// diagnostic exists to annotate.
+    fn empty_text_search_result() -> super::search::TextSearchResult {
+        super::search::TextSearchResult {
+            label: "'unique_untracked_needle'".to_string(),
+            total_matches: 0,
+            files: vec![],
+            suppressed_by_noise: 0,
+            overflow_count: 0,
+        }
+    }
+
+    /// RED (B1). `search_text` captures ONE publication and its `_meta` receipt
+    /// names it, but the zero-hit untracked sweep takes two FRESH
+    /// `SharedIndexHandle::read()`s of whatever is published when the sweep
+    /// runs — one as the read gate's authority, one to decide "not in the
+    /// index". `read_gate.rs` states the requirement that breaks, verbatim:
+    /// `live` "must be the SAME publication snapshot that produced the caller's
+    /// 'not in the index' verdict".
+    ///
+    /// The harm is a plain false negative whose trigger correlates with its own
+    /// subject. The diagnostic exists to announce NEWLY CREATED files — exactly
+    /// the files the watcher is racing to index. An agent writes a file and
+    /// searches it: the search runs on G and misses, the watcher publishes G+1
+    /// with the file indexed, the sweep runs on G+1, sees `get_file` is `Some`,
+    /// drops the path — and the answer is "No matches" with no hint at all.
+    ///
+    /// No thread race is needed to observe it. `render_search_text_output`
+    /// already takes the captured generation as a parameter, so the test hands
+    /// it G after publishing G+1 by hand.
+    #[tokio::test]
+    async fn untracked_sweep_answers_from_the_captured_publication_not_the_current_one() {
+        let dir = init_git_repo();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "fn tracked() {}\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "tracked"]);
+        let untracked_body = "fn new_text() { let _ = \"unique_untracked_needle\"; }\n";
+        fs::write(dir.path().join("src/new_text.rs"), untracked_body).unwrap();
+
+        let (key, file) = make_file("src/lib.rs", b"fn tracked() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(dir.path().into()),
+        );
+
+        // The bundle the response is rendered from, and the one its receipt
+        // names. Anti-vacuity: it does not know the untracked file.
+        let generation = server.index.data_plane().published_generation();
+        assert!(
+            generation.live.get_file("src/new_text.rs").is_none(),
+            "control: the captured publication must not know the untracked file"
+        );
+
+        // Exactly what the watcher lands moments later: a NEW publication that
+        // does know it.
+        let (indexed_key, indexed_file) =
+            make_file("src/new_text.rs", untracked_body.as_bytes(), vec![]);
+        server
+            .index
+            .data_plane()
+            .update_file(indexed_key, indexed_file);
+        assert!(
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/new_text.rs")
+                .is_some(),
+            "control: the CURRENT publication must know the untracked file"
+        );
+        assert!(
+            server
+                .index
+                .data_plane()
+                .published_generation()
+                .publication_generation
+                > generation.publication_generation,
+            "control: the two bundles must actually differ"
+        );
+
+        let options = super::search::TextSearchOptions::for_current_code_search();
+        let rendered = super::render_search_text_output(
+            &server,
+            &generation,
+            Ok(empty_text_search_result()),
+            Some("unique_untracked_needle"),
+            false,
+            None,
+            None,
+            &options,
+            false,
+            false,
+            false,
+        );
+
+        assert!(
+            rendered.contains("untracked file may match: 1 untracked path(s) are not indexed"),
+            "the sweep must answer from the CAPTURED publication; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("analyze_file_impact(\"src/new_text.rs\", new_file=true)"),
+            "missing recovery call; got: {rendered}"
+        );
+
+        // GREEN-CONTROL: rendered from the bundle that DOES know the file, the
+        // diagnostic must be absent. This holds on both sides of the fix, which
+        // is the point — it proves the assertion above tracks the bundle rather
+        // than the sweep having been made unconditional.
+        let current = server.index.data_plane().published_generation();
+        let rendered_current = super::render_search_text_output(
+            &server,
+            &current,
+            Ok(empty_text_search_result()),
+            Some("unique_untracked_needle"),
+            false,
+            None,
+            None,
+            &options,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            !rendered_current.contains("untracked file may match"),
+            "a publication that knows the file must not advertise it as untracked; got: {rendered_current}"
+        );
+    }
+
     #[tokio::test]
     async fn test_search_text_non_empty_result_omits_untracked_diagnostic() {
         let dir = init_git_repo();
@@ -19840,6 +20036,85 @@ mod tests {
                 .read()
                 .get_file("src/new_service.rs")
                 .is_none()
+        );
+    }
+
+    /// The `search_files` half of the same seam. Its `NotFound` view is built
+    /// from the captured publication, so the untracked sweep beside it must
+    /// answer from that bundle too.
+    ///
+    /// HONEST PROVENANCE: this oracle could not be observed failing against the
+    /// pre-fix code, because `matching_untracked_paths_for_search_files` took no
+    /// publication parameter at all — the property was not expressible and a
+    /// "RED" here would have been a compile error, which proves nothing. Its
+    /// behavioural receipt came from the mutation step instead: with the fix in
+    /// place, reverting only the `live` threading (restoring the second
+    /// `data_plane().read()`) makes it fail with real output.
+    #[tokio::test]
+    async fn search_files_untracked_sweep_answers_from_the_captured_publication() {
+        let dir = init_git_repo();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "fn tracked() {}\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "tracked"]);
+        let untracked_body = "fn new_service() {}\n";
+        fs::write(dir.path().join("src/new_service.rs"), untracked_body).unwrap();
+
+        let (key, file) = make_file("src/lib.rs", b"fn tracked() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(dir.path().into()),
+        );
+
+        let generation = server.index.data_plane().published_generation();
+        assert!(
+            generation.live.get_file("src/new_service.rs").is_none(),
+            "control: the captured publication must not know the untracked file"
+        );
+
+        let (indexed_key, indexed_file) =
+            make_file("src/new_service.rs", untracked_body.as_bytes(), vec![]);
+        server
+            .index
+            .data_plane()
+            .update_file(indexed_key, indexed_file);
+        assert!(
+            server
+                .index
+                .data_plane()
+                .read()
+                .get_file("src/new_service.rs")
+                .is_some(),
+            "control: the CURRENT publication must know the untracked file"
+        );
+
+        let captured = super::matching_untracked_paths_for_search_files(
+            &server,
+            &generation.live,
+            "new_service",
+            false,
+            false,
+        );
+        assert_eq!(
+            captured,
+            vec!["src/new_service.rs".to_string()],
+            "the sweep must answer from the CAPTURED publication"
+        );
+
+        // GREEN-CONTROL: the same sweep against the publication that DOES know
+        // the file returns nothing, so the assertion above is the bundle being
+        // tracked and not the sweep having been made unconditional.
+        let current = server.index.data_plane().published_generation();
+        let from_current = super::matching_untracked_paths_for_search_files(
+            &server,
+            &current.live,
+            "new_service",
+            false,
+            false,
+        );
+        assert!(
+            from_current.is_empty(),
+            "a publication that knows the file must not report it as untracked; got: {from_current:?}"
         );
     }
 
@@ -33184,6 +33459,139 @@ mod tests {
             |_input| {},
         )
         .await;
+    }
+
+    /// RED (A1). The admission-tier degradation renderer answers a
+    /// security-demoted path with a Tier-2 block that names the file's EXACT
+    /// byte length, so `find_references(path=".env")` reports a successful
+    /// measurement of a file every content lane refuses to open. The admission
+    /// gate must decide BEFORE the view exists, so the answer is the same
+    /// "content withheld" refusal the read lanes give — with no size in it.
+    ///
+    /// Lookup lane: `.env` is cataloged with a `SensitivePath` disposition, so
+    /// `capture_admission_tier_lookup_view` hits and the disk fallback is never
+    /// reached.
+    #[tokio::test]
+    async fn find_references_withholds_a_security_demoted_path_instead_of_its_size() {
+        let (dir, server, canary) = setup_admission_fixture();
+        assert_security_demotion(&server, ".env");
+        let demoted_len = std::fs::metadata(dir.path().join(".env"))
+            .expect("the demoted fixture must exist on disk")
+            .len();
+
+        let mut input = find_references_input("anything");
+        input.path = Some(".env".to_string());
+        let serialized =
+            serialized_tool_result(server.find_references_tool(Parameters(input)).await);
+        let text = tool_result_text(&serialized);
+
+        // Content first: once this holds the body carries no fixture material,
+        // so the remaining diagnostics may quote it.
+        assert!(
+            !text.contains(canary.as_str()),
+            "find_references leaked fixture content; response shape: {}",
+            refusal_shape(text)
+        );
+        assert!(
+            text.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "a security-demoted path must be withheld, not measured; got: {text}"
+        );
+        assert!(
+            !text.contains("Size:"),
+            "the refusal must not report a size; got: {text}"
+        );
+        assert!(
+            !text.contains(&format!("{demoted_len} bytes")),
+            "the refusal must not report the file's exact byte length; got: {text}"
+        );
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+
+        // GREEN-CONTROL: a Tier-2 file that is NOT policy-withheld keeps its
+        // honest degraded block, size and all. A gate that refuses everything
+        // cannot pass this.
+        let mut admitted = find_references_input("anything");
+        admitted.path = Some("package-lock.json".to_string());
+        let control = server.find_references(Parameters(admitted)).await;
+        assert!(
+            !control.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "an admitted Tier-2 file must not be refused; got: {control}"
+        );
+        assert!(
+            control.contains("degraded result (Tier 2 metadata-only)") && control.contains("Size:"),
+            "an admitted Tier-2 file must keep its degraded block; got: {control}"
+        );
+    }
+
+    /// RED (A2). The same leak through the DISK lane, which the manifest never
+    /// sees: `admission_degradation_view_from_disk` canonicalizes, stats, OPENS
+    /// the file for the binary sniff, and renders its exact byte length.
+    /// `.env.local` is written after the load so the manifest lookup misses and
+    /// the disk fallback is the only resolver. `sensitive_path_rule` matches it
+    /// (`.env.` prefix) and `is_safe_template_basename` does not exempt it.
+    #[tokio::test]
+    async fn find_references_withholds_an_uncataloged_demoted_path_instead_of_its_size() {
+        let (dir, server, canary) = setup_admission_fixture();
+        let demoted = dir.path().join(".env.local");
+        std::fs::write(&demoted, format!("{}={canary}\n", kw_password()))
+            .expect("write demoted fixture");
+        let demoted_len = std::fs::metadata(&demoted)
+            .expect("the demoted fixture must exist on disk")
+            .len();
+
+        // Anti-vacuity: the index has nothing to say about this path, so the
+        // disk fallback really is the lane under test.
+        {
+            let guard = server.index.data_plane().read();
+            assert!(
+                guard
+                    .capture_admission_tier_lookup_view(".env.local")
+                    .is_none(),
+                ".env.local must be uncataloged so the disk lane resolves it"
+            );
+        }
+
+        let mut input = find_references_input("anything");
+        input.path = Some(".env.local".to_string());
+        let serialized =
+            serialized_tool_result(server.find_references_tool(Parameters(input)).await);
+        let text = tool_result_text(&serialized);
+
+        assert!(
+            !text.contains(canary.as_str()),
+            "find_references leaked fixture content; response shape: {}",
+            refusal_shape(text)
+        );
+        assert!(
+            text.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "an uncataloged demoted path must be withheld, not measured; got: {text}"
+        );
+        assert!(
+            !text.contains("Size:"),
+            "the refusal must not report a size; got: {text}"
+        );
+        assert!(
+            !text.contains(&format!("{demoted_len} bytes")),
+            "the refusal must not report the file's exact byte length; got: {text}"
+        );
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+
+        // GREEN-CONTROL: the disk lane's binary sniff must still run for a
+        // benign file. `.dat` is not denylisted and carries no grammar, so a
+        // `binary` reason (rather than `unsupported language`) can only come
+        // from the sniff read this fix must leave in place.
+        std::fs::write(dir.path().join("notes.dat"), [0x00, 0x01, 0x02, 0x00, 0x03])
+            .expect("write benign binary fixture");
+        let mut control_input = find_references_input("anything");
+        control_input.path = Some("notes.dat".to_string());
+        let control = server.find_references(Parameters(control_input)).await;
+        assert!(
+            !control.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "a benign uncataloged file must not be refused; got: {control}"
+        );
+        assert!(
+            control.contains("Reason: binary") && control.contains("Size:"),
+            "the disk lane's sniff read must still classify benign bytes; got: {control}"
+        );
     }
 
     #[tokio::test]

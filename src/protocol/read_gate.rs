@@ -157,25 +157,12 @@ pub(crate) fn disk_read_would_refuse(
     size.is_some_and(|size| crate::knowledge::exceeds_scan_limit(size as usize))
 }
 
-/// Read `canon_path` and return its bytes only if the file is admissible for
-/// content disclosure.
-///
-/// `live` must be the SAME publication snapshot that produced the caller's
-/// "not in the index" verdict; a second `self.index.read()` is a different
-/// snapshot and would let the manifest and the index-miss disagree.
-///
-/// `relative_path` is the repo-relative path the caller was asked for, already
-/// normalized by `normalize_exact_path`. It is used for the path rule, the
-/// manifest lookup, and target derivation — never re-joined to read from.
-///
-/// Returns `Err` with the caller-ready refusal or IO message; the caller
-/// returns it verbatim.
 /// Policy refusals that need NO bytes: the current path rule and the recorded
 /// disposition on the publication that produced the miss.
 ///
 /// Split out so both the disk lane and the git-object lane consult exactly the
 /// same policy, and so the disk lane can still refuse WITHOUT reading the file.
-fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
+pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
     // Current path rule — no read needed.
     if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
         return Some(format::content_withheld_by_admission(relative_path));
@@ -257,6 +244,19 @@ pub(crate) fn admit_git_text(
     Ok(String::from_utf8(admitted).ok())
 }
 
+/// Read `canon_path` and return its bytes only if the file is admissible for
+/// content disclosure.
+///
+/// `live` must be the SAME publication snapshot that produced the caller's
+/// "not in the index" verdict; a second `self.index.read()` is a different
+/// snapshot and would let the manifest and the index-miss disagree.
+///
+/// `relative_path` is the repo-relative path the caller was asked for, already
+/// normalized by `normalize_exact_path`. It is used for the path rule, the
+/// manifest lookup, and target derivation — never re-joined to read from.
+///
+/// Returns `Err` with the caller-ready refusal or IO message; the caller
+/// returns it verbatim.
 pub(crate) fn admit_disk_read(
     live: &LiveIndex,
     relative_path: &str,
