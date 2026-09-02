@@ -86,6 +86,12 @@ pub struct LedgerSummaryView {
     /// the most recent `recent_runs_window` rows, chronological (032 US2,
     /// `contracts/admin-recent-runs.md`). Empty when the store is unavailable
     /// or its read failed — never fabricated rows.
+    ///
+    /// The totals above and this list are TWO separate store reads (two lock
+    /// acquisitions, `summary()` then `recent()`), so a row recorded between
+    /// them is counted in one and not the other: a transient dashboard
+    /// inconsistency on a live ledger, never a false count — each figure is
+    /// exact for the instant it was read.
     pub recent_runs: Vec<LedgerRunView>,
     /// The raw-row fetch limit `recent_runs` was computed over. Present
     /// whenever the rows were actually read (even when zero rows exist);
@@ -108,13 +114,14 @@ pub struct LedgerRunView {
     pub first_ts_ms: u64,
     /// `ts_ms` of the run's chronologically last fetched row.
     pub last_ts_ms: u64,
-    /// `true` only on the run containing the chronologically-oldest fetched row
-    /// AND only when the fetch actually filled the window: its true extent may
-    /// continue beyond the window, so `count` must not be read as a total.
-    /// When fewer rows exist than the window, the oldest run was counted in
-    /// full and is NOT labeled clipped — a refinement of the contract's wording
-    /// on zero-false-claims grounds (a "may be clipped" label on a run that
-    /// provably was not is itself a false claim).
+    /// OBSERVED, never assumed: `true` only on the run containing the
+    /// chronologically-oldest in-window row, and only when the row immediately
+    /// older than the window (the sentinel — the builder fetches one row beyond
+    /// the window to see it) shares that run's collapse identity, i.e. the run
+    /// really does continue past the edge and `count` is window-bounded rather
+    /// than a total. A run whose extent ends exactly at the edge, or a ledger
+    /// with no row beyond the window, is `false`. Session id is part of the
+    /// identity, so a sentinel from another session never clips.
     pub window_clipped: bool,
     /// Stored string form, verbatim.
     pub session_id: String,
@@ -174,16 +181,21 @@ impl LedgerSummaryView {
 
     /// Observe the collapsed recent-run list from `store` (032 US2).
     ///
-    /// What this observes: `store.recent(RECENT_RUNS_WINDOW)` — the newest rows
-    /// (`ORDER BY id DESC`), reversed to chronological, then collapsed with
-    /// `session_id` in the identity so a run never spans sessions. What it
-    /// emits when the observation fails: `(vec![], None)` — no rows and NO
-    /// window claim, distinguishable from "read zero rows in a 50-row window"
-    /// (`(vec![], Some(50))`) — with the failure logged. Totals are never
-    /// derived from this list; they come from `summary()` over the
+    /// What this observes: `store.recent(RECENT_RUNS_WINDOW + 1)` — the newest
+    /// rows (`ORDER BY id DESC`). If the extra row came back it is the SENTINEL,
+    /// the row immediately older than the window: it is set aside (never
+    /// counted, never rendered) and the remaining `RECENT_RUNS_WINDOW` rows are
+    /// reversed to chronological and collapsed with `session_id` in the
+    /// identity so a run never spans sessions. `window_clipped` on the oldest
+    /// in-window run is then the observed equality of the sentinel's identity
+    /// with that run's — not an inference from the fetch having filled the
+    /// window. What it emits when the observation fails: `(vec![], None)` — no
+    /// rows and NO window claim, distinguishable from "read zero rows in a
+    /// 50-row window" (`(vec![], Some(50))`) — with the failure logged. Totals
+    /// are never derived from this list; they come from `summary()` over the
     /// uncollapsed rows (spec FR-008).
     fn recent_runs(store: &StelLedgerStore) -> (Vec<LedgerRunView>, Option<u64>) {
-        let mut rows = match store.recent(RECENT_RUNS_WINDOW) {
+        let mut rows = match store.recent(RECENT_RUNS_WINDOW + 1) {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(
@@ -193,14 +205,24 @@ impl LedgerSummaryView {
                 return (Vec::new(), None);
             }
         };
+        // Newest-first, so the oldest fetched row is last: when the fetch
+        // reached past the window, that row is the sentinel.
+        let sentinel = if rows.len() > RECENT_RUNS_WINDOW {
+            rows.pop()
+        } else {
+            None
+        };
         rows.reverse();
-        // Only a fetch that filled the window can have left rows behind it; a
-        // shorter fetch counted the oldest run in full.
-        let window_filled = rows.len() == RECENT_RUNS_WINDOW;
         let runs = collapse_runs(&rows, stored_record_identity, |row| row.ts_ms)
             .iter()
             .enumerate()
-            .map(|(index, run)| LedgerRunView::from_run(run, window_filled && index == 0))
+            .map(|(index, run)| {
+                let window_clipped = index == 0
+                    && sentinel.as_ref().is_some_and(|sentinel| {
+                        stored_record_identity(sentinel) == stored_record_identity(&run.canonical)
+                    });
+                LedgerRunView::from_run(run, window_clipped)
+            })
             .collect();
         (runs, Some(RECENT_RUNS_WINDOW as u64))
     }
@@ -208,7 +230,7 @@ impl LedgerSummaryView {
 
 impl LedgerRunView {
     /// Project one collapsed run onto the wire shape; `window_clipped` is
-    /// decided by the caller, which alone knows whether the fetch filled the
+    /// decided by the caller, which alone sees the sentinel row beyond the
     /// window.
     fn from_run(run: &Run<StoredLedgerRecord>, window_clipped: bool) -> Self {
         let StoredLedgerRecord {
