@@ -232,7 +232,7 @@ mod tests {
         let service = build_mcp_service(&runtime, "127.0.0.1");
         assert!(
             !service.config.legacy_session_mode,
-            "the /mcp lane must stay sessionless: the repeat tracker's HttpInert              discriminator depends on it"
+            "the /mcp lane must stay sessionless: the repeat tracker's HttpInert discriminator depends on it"
         );
     }
 }
