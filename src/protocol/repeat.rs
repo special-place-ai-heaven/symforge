@@ -76,13 +76,37 @@ pub fn is_repeat_eligible(tool: &str) -> bool {
     REPEAT_ELIGIBLE_TOOLS.contains(&tool)
 }
 
+/// How the server serving this request was WIRED — declared once at
+/// construction by the entry point, never inferred from a request.
+///
+/// `Stdio` is set ONLY by [`crate::protocol::SymForgeServer::with_stdio_transport_lane`],
+/// which only the two stdio entry points in `src/cli/entry.rs` call: one
+/// process serves exactly one client there, so the server instance IS the
+/// session. Everything else — the shared HTTP `/mcp` server, the daemon
+/// worker, an in-process `serve_directly`, a future SSE or socket adapter —
+/// keeps the default `Shared` and never accumulates. Absence of a declaration
+/// is not evidence of single-client-ness (F3 / research.md R12 finding 3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransportLane {
+    Stdio,
+    #[default]
+    Shared,
+}
+
 /// The session lane the seam OBSERVED for one request (research.md R9).
 ///
-/// * `Stdio`: one client per process, so the server instance is the session.
-/// * `HttpInert`: the shared, stateless `/mcp` lane. rmcp never creates a
-///   session there (`mcp_http.rs` pins `legacy_session_mode == false`), so no
-///   per-session identity is observable and the tracker never interacts — an
-///   unattributable count would be an unobserved claim (spec FR-002).
+/// * `Stdio`: the entry point declared a single-client transport AND rmcp's
+///   HTTP marker is absent, so the server instance is the session.
+/// * `HttpInert`: everything else — the shared, stateless `/mcp` lane (rmcp
+///   never creates a session there: `mcp_http.rs` pins
+///   `legacy_session_mode == false`) and any transport that did not declare
+///   itself single-client. No per-session identity is observable, so the
+///   tracker never interacts: an unattributable count would be an unobserved
+///   claim (spec FR-002).
+///
+/// (Round 2 note: `HttpInert` now also covers undeclared non-HTTP transports.
+/// The variant name is the one data-model.md pins; the wider meaning is
+/// documented here rather than renamed under a spec this change may not edit.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionDiscriminator {
     Stdio,
@@ -90,31 +114,40 @@ pub enum SessionDiscriminator {
 }
 
 impl SessionDiscriminator {
-    /// Observation: whether rmcp's streamable-HTTP transport inserted the
-    /// inbound `http::request::Parts` into the request extensions. Only that
-    /// transport does (both of its stateless paths); the stdio transport
-    /// inserts nothing. Presence is therefore the inert lane and absence is
-    /// stdio — there is no third outcome to misreport. The result is a
-    /// [`LaneWitness`]: proof the lane was read off a real request context.
-    pub fn observe(context: &RequestContext<RoleServer>) -> LaneWitness {
-        LaneWitness(
-            if context
+    /// Observation: the lane the entry point DECLARED, plus whether rmcp's
+    /// streamable-HTTP transport inserted the inbound `http::request::Parts`
+    /// into the request extensions. The result is a [`LaneWitness`]: proof the
+    /// lane was read off a real request context and a real declaration.
+    pub fn observe(declared: TransportLane, context: &RequestContext<RoleServer>) -> LaneWitness {
+        Self::from_observations(
+            declared,
+            context
                 .extensions
                 .get::<axum::http::request::Parts>()
-                .is_some()
-            {
-                Self::HttpInert
-            } else {
-                Self::Stdio
-            },
+                .is_some(),
         )
+    }
+
+    /// The rule, separated from the un-constructible `RequestContext` so it is
+    /// directly testable (research.md R12 finding 13: no test can build one).
+    ///
+    /// `Stdio` requires BOTH a positive declaration and the absence of the
+    /// HTTP marker. Either observation failing yields the inert lane — a
+    /// missing declaration is not a `Stdio`, and a declared-stdio server that
+    /// somehow sees an HTTP request is a contradiction, not a session.
+    fn from_observations(declared: TransportLane, http_parts_present: bool) -> LaneWitness {
+        LaneWitness(match (declared, http_parts_present) {
+            (TransportLane::Stdio, false) => Self::Stdio,
+            _ => Self::HttpInert,
+        })
     }
 }
 
-/// Proof that the session lane was OBSERVED from a request context rather
-/// than asserted by a caller. The private field means only
-/// [`SessionDiscriminator::observe`] (and the in-crate test door) can mint
-/// one, so no seam can hand the tracker a `Stdio` it never observed.
+/// Proof that the session lane was OBSERVED from a request context and the
+/// server's own declaration rather than asserted by a caller. The private
+/// field means only [`SessionDiscriminator::observe`] (and the in-crate test
+/// door) can mint one, so no seam can hand the tracker a `Stdio` it never
+/// observed.
 #[derive(Debug, Clone, Copy)]
 pub struct LaneWitness(SessionDiscriminator);
 
@@ -122,6 +155,11 @@ impl LaneWitness {
     #[cfg(test)]
     pub(crate) fn assume(lane: SessionDiscriminator) -> Self {
         Self(lane)
+    }
+
+    #[cfg(test)]
+    fn lane(&self) -> SessionDiscriminator {
+        self.0
     }
 }
 
@@ -1116,6 +1154,56 @@ mod tests {
         assert!(tracker.record_serve(stale, observed(1)).is_none());
         assert_eq!(tracker.len(), 1, "the stale serve added nothing");
         assert_eq!(tracker.count_of(&fresh), Some(3), "and disturbed nothing");
+    }
+
+    // F3 (round 2) — the accumulating lane must be a POSITIVE declaration, not
+    // the absence of an HTTP marker. A future transport that reaches
+    // `call_tool` without inserting rmcp's `http::request::Parts` — its SSE
+    // server, a socket adapter, an in-process `serve_directly` — would
+    // otherwise silently become ONE shared accumulating bucket, which is the
+    // cross-client false-notice shape research.md R12 finding 3 rated a
+    // BLOCKER. The `Parts` check stays as the belt.
+    #[test]
+    fn only_a_declared_stdio_transport_ever_accumulates() {
+        // The default is inert: a server whose entry point never declared its
+        // transport cannot accumulate, with or without the HTTP marker.
+        assert_eq!(TransportLane::default(), TransportLane::Shared);
+        for http_parts_present in [false, true] {
+            let witness =
+                SessionDiscriminator::from_observations(TransportLane::Shared, http_parts_present);
+            assert_eq!(
+                witness.lane(),
+                SessionDiscriminator::HttpInert,
+                "an undeclared lane is inert (http_parts_present={http_parts_present})"
+            );
+            assert!(
+                RepeatKey::observe(witness, epoch0(), "search_symbols", None).is_none(),
+                "an undeclared lane must never key the tracker \
+                 (http_parts_present={http_parts_present})"
+            );
+        }
+
+        // Belt: a declared stdio server that nonetheless sees the HTTP marker
+        // is inert too — the two observations must agree.
+        let contradicted = SessionDiscriminator::from_observations(TransportLane::Stdio, true);
+        assert_eq!(contradicted.lane(), SessionDiscriminator::HttpInert);
+        assert!(RepeatKey::observe(contradicted, epoch0(), "search_symbols", None).is_none());
+
+        // Positive control: a declared stdio lane with no HTTP marker keys the
+        // tracker and notices on the third identical serve.
+        let declared = SessionDiscriminator::from_observations(TransportLane::Stdio, false);
+        assert_eq!(declared.lane(), SessionDiscriminator::Stdio);
+        let k = RepeatKey::observe(
+            declared,
+            epoch0(),
+            "search_symbols",
+            Some(&args(json!({ "query": "anchor" }))),
+        )
+        .expect("a declared stdio lane keys the tracker");
+        let mut tracker = RepeatTracker::default();
+        assert!(serve_equal(&mut tracker, &k, 1, 2).is_none());
+        let notice = serve_equal(&mut tracker, &k, 1, 1).expect("declared stdio notices at 3");
+        assert_eq!(notice.repeat_count(), 3);
     }
 
     // Structural non-keys: the inert HTTP lane and set-valued fan-out never
