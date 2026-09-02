@@ -1459,6 +1459,12 @@ impl SymForgeServer {
                 Ok(new_client) => {
                     tracing::info!("daemon reconnected successfully");
                     let old_client = std::mem::replace(&mut *client, new_client);
+                    // Feature 032 (F2): a replacement daemon session is a new
+                    // index incarnation whose evidence can be byte-equal to
+                    // the dead daemon's (`generation` is a per-process
+                    // counter). A repeat run must not survive it: drop every
+                    // run before anything is served through the new client.
+                    self.repeat_tracker.lock().clear();
                     // Lifecycle fence: republish this adapter's session
                     // descriptor for the NEW session/endpoint, then close the
                     // previous session best-effort (the old daemon is usually
@@ -1552,21 +1558,44 @@ impl SymForgeServer {
 
     /// Mark the daemon proxy healthy again (successful call or reconnect).
     fn note_daemon_recovered(&self) {
-        let mut state = self.daemon_degraded.lock();
-        if state.degraded {
-            tracing::info!("daemon proxy recovered; clearing degraded state");
+        let was_degraded = {
+            let mut state = self.daemon_degraded.lock();
+            let was_degraded = state.degraded;
+            if was_degraded {
+                tracing::info!("daemon proxy recovered; clearing degraded state");
+            }
+            *state = DaemonDegradation::default();
+            was_degraded
+        };
+        // Feature 032 (F2): locally-served -> daemon-served is an incarnation
+        // change. A repeat run must not survive a change of the index
+        // instance it was observed against, so every run is dropped here
+        // (a false negative at worst, never a false claim).
+        if was_degraded {
+            self.repeat_tracker.lock().clear();
         }
-        *state = DaemonDegradation::default();
     }
 
     /// Record a proxy failure with endpoint provenance (base URL only — never
     /// auth material) for health rendering and rediscovery decisions.
     fn note_daemon_failure(&self, endpoint: &str, failure: String) {
-        let mut state = self.daemon_degraded.lock();
-        state.degraded = true;
-        state.last_failure = Some(failure);
-        state.last_failure_at = Some(std::time::Instant::now());
-        state.last_endpoint = Some(endpoint.to_string());
+        let was_healthy = {
+            let mut state = self.daemon_degraded.lock();
+            let was_healthy = !state.degraded;
+            state.degraded = true;
+            state.last_failure = Some(failure);
+            state.last_failure_at = Some(std::time::Instant::now());
+            state.last_endpoint = Some(endpoint.to_string());
+            was_healthy
+        };
+        // Feature 032 (F2): daemon-served -> degraded is an incarnation
+        // change: whatever serves next (a replacement daemon or the local
+        // fallback) is not the index the runs were observed against, so every
+        // run is dropped. Repeated failures while already degraded change
+        // nothing and keep the local lane's runs intact.
+        if was_healthy {
+            self.repeat_tracker.lock().clear();
+        }
     }
 
     /// Health surface hook: the current degradation snapshot, or `None` when
@@ -1692,6 +1721,10 @@ impl SymForgeServer {
                         symbols = published.symbol_count,
                         "local fallback index loaded"
                     );
+                    // Feature 032 (F2): a reloaded local index is a new
+                    // incarnation; runs observed against the previous
+                    // publication (daemon or local) must not survive it.
+                    self.repeat_tracker.lock().clear();
 
                     // Spawn git temporal computation so co-change queries work
                     // after daemon degradation (mirrors index_folder behaviour).
@@ -3459,6 +3492,42 @@ mod tests {
         );
     }
 
+    /// Feature 032 (F2): seed one repeat run at count 2 on `server`, as the
+    /// seam would after two identical eligible serves, and return its key.
+    fn seed_repeat_run(server: &SymForgeServer) -> repeat::RepeatKey {
+        let args: rmcp::model::JsonObject =
+            serde_json::from_value(serde_json::json!({ "query": "anchor" })).expect("object");
+        let key = repeat::RepeatKey::observe(
+            repeat::SessionDiscriminator::Stdio,
+            "search_symbols",
+            Some(&args),
+        )
+        .expect("an eligible stdio call keys the tracker");
+        let evidence = result_status::ProjectEvidence {
+            project_id: "project-v1-seed".to_string(),
+            project_name: "seed".to_string(),
+            canonical_root: Some("C:/seed".to_string()),
+            generation: 1,
+            index_state: "Ready".to_string(),
+            load_source: "memory".to_string(),
+            index_files: 1,
+            index_symbols: 1,
+        };
+        let observed = || {
+            repeat::ServeObservation::Observed(repeat::ObservedServe {
+                evidence: evidence.clone(),
+                body_digest: repeat::BodyDigest::of_content(&[rmcp::model::ContentBlock::text(
+                    "body",
+                )]),
+            })
+        };
+        let mut tracker = server.repeat_tracker.lock();
+        assert!(tracker.record_serve(key.clone(), observed()).is_none());
+        assert!(tracker.record_serve(key.clone(), observed()).is_none());
+        assert_eq!(tracker.len(), 1, "one run seeded at count 2");
+        key
+    }
+
     #[tokio::test]
     async fn daemon_degraded_clears_on_next_success() {
         let (base_url, shutdown, calls) = spawn_fake_tool_server("daemon-ok").await;
@@ -3470,6 +3539,9 @@ mod tests {
         );
         let server = SymForgeServer::new_daemon_proxy(daemon_client);
         server.daemon_degraded.lock().degraded = true;
+        // Feature 032 (F2): runs accumulated while degraded (locally served)
+        // must not survive the switch back to daemon-served responses.
+        let _seeded = seed_repeat_run(&server);
 
         let result = server
             .proxy_tool_call("health", &serde_json::json!({}))
@@ -3485,6 +3557,41 @@ mod tests {
         assert!(
             !server.daemon_degraded.lock().degraded,
             "successful proxy call should clear daemon_degraded"
+        );
+        assert!(
+            server.repeat_tracker.lock().is_empty(),
+            "the degraded -> daemon-served transition must clear every repeat run"
+        );
+    }
+
+    /// Feature 032 (F2): the FIRST daemon failure of a healthy adapter flips
+    /// serving from the daemon to a local fallback (or a replacement daemon).
+    /// Runs observed against the dead daemon's index must not survive it: a
+    /// replacement can return evidence byte-equal to the dead daemon's
+    /// (generation is a per-process counter).
+    #[tokio::test]
+    async fn daemon_failure_transition_clears_repeat_runs() {
+        // No listener on port 1: the probe fails fast, the reconnect fails
+        // (auto-spawn disabled in tests), and the call falls back locally.
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "project-id".to_string(),
+            "session-id".to_string(),
+            "project-name".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        assert!(!server.daemon_degraded.lock().degraded, "starts healthy");
+        let _seeded = seed_repeat_run(&server);
+
+        let result = server
+            .proxy_tool_call("health", &serde_json::json!({}))
+            .await;
+
+        assert!(result.is_none(), "the failed daemon falls back locally");
+        assert!(server.daemon_degraded.lock().degraded);
+        assert!(
+            server.repeat_tracker.lock().is_empty(),
+            "the daemon-served -> locally-served transition must clear every repeat run"
         );
     }
 
@@ -4537,11 +4644,19 @@ mod tests {
             "project A's file should be present after the first load"
         );
 
+        // Feature 032 (F2): runs observed against project A's index must not
+        // survive the reload into project B's.
+        let _seeded = seed_repeat_run(&server);
+
         // 2. Switch the target root to B WITHOUT calling reset_to_empty.
         server.set_repo_root(Some(dir_b.path().to_path_buf()));
 
         // 3. The next ensure_local_index must detect the root mismatch and reload B.
         server.ensure_local_index().await;
+        assert!(
+            server.repeat_tracker.lock().is_empty(),
+            "a local index reload is a new incarnation: every repeat run must be cleared"
+        );
 
         let published_b = server.index.data_plane().published_state();
         assert_eq!(
@@ -4595,11 +4710,20 @@ mod tests {
             "first ensure_local_index call should have loaded project A"
         );
 
+        // Feature 032 (F2) negative control: no reload means no incarnation
+        // change, so runs observed against this index survive.
+        let _seeded = seed_repeat_run(&server);
+
         // Repeated calls with the same root must be no-ops (no reload).
         for _ in 0..3 {
             server.ensure_local_index().await;
         }
 
+        assert_eq!(
+            server.repeat_tracker.lock().len(),
+            1,
+            "a same-root no-op must leave repeat runs untouched"
+        );
         assert_eq!(
             server.index.data_plane().current_project_generation(),
             gen_after_first,

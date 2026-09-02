@@ -411,6 +411,17 @@ impl RepeatTracker {
         None
     }
 
+    /// Drop every run. The rule: a run must not survive a change of the index
+    /// INCARNATION it was observed against — a daemon reconnect (a replacement
+    /// daemon's evidence can be byte-equal to the dead one's: `generation` is
+    /// a per-process counter), the degrade-to-local and restore-from-local
+    /// transitions, and a local index reload. The adapter calls this at each
+    /// of those sites; a cleared run can only cost a true notice, never
+    /// create a false one.
+    pub(crate) fn clear(&mut self) {
+        self.runs.clear();
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.runs.len()
@@ -838,6 +849,27 @@ mod tests {
         assert_eq!(tracker.count_of(&k0), Some(1));
         assert!(serve_equal(&mut tracker, &k0, 1, 1).is_none());
         let notice = serve_equal(&mut tracker, &k0, 1, 1).expect("re-accumulated to 3");
+        assert_eq!(notice.repeat_count(), 3);
+    }
+
+    // F2 — an incarnation change (daemon reconnect, degrade-to-local,
+    // restore-from-local, local reload) clears every run: the next serve of
+    // any key restarts at 1 and re-accumulates honestly.
+    #[test]
+    fn clear_restarts_runs_at_one() {
+        let mut tracker = RepeatTracker::default();
+        let k = key("search_symbols", "anchor");
+        assert!(serve_equal(&mut tracker, &k, 1, 2).is_none());
+        assert_eq!(tracker.count_of(&k), Some(2));
+        tracker.clear();
+        assert!(tracker.is_empty(), "clear() drops every run");
+        assert!(
+            serve_equal(&mut tracker, &k, 1, 1).is_none(),
+            "count 1 after clear"
+        );
+        assert_eq!(tracker.count_of(&k), Some(1));
+        assert!(serve_equal(&mut tracker, &k, 1, 1).is_none(), "count 2");
+        let notice = serve_equal(&mut tracker, &k, 1, 1).expect("count 3 notices again");
         assert_eq!(notice.repeat_count(), 3);
     }
 
