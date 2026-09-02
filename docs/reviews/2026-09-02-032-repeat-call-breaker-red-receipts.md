@@ -221,16 +221,16 @@ Blast-radius sweep (research.md R11 inventory), all green with no assertion chan
 ### Reporting-invariant answers (US2)
 
 - The ` ×N (first=…, last=…)` suffix observes `collapse_runs` over the same `ledger.events()` snapshot the decision and route lines are read from, last run, count ≥ 2. Otherwise the line is byte-identical to before. `from_server` is the only producer; the proxy overlay renders through the same formatter.
-- `recent_runs` observes `store.recent(50)` reversed to chronological and collapsed with `session_id` in the identity. When the store is disabled or absent, or `recent()` errs, it is `[]` with no `recent_runs_window` (and a warning on the error path). Never fabricated rows.
+- `recent_runs` observes the durable rows read back through `StelLedgerStore::recent`, reversed to insert order and collapsed with `session_id` in the identity. When the store is disabled or absent, or the read errs, it is `[]` with no `recent_runs_window` (and a warning on the error path). Never fabricated rows. (Round 1 changed the fetch to the window plus one sentinel row; the honesty properties are unchanged.)
 - `recent_runs_window` is emitted only when rows were actually read, so `[]` with a window means "read zero rows" and `[]` without one means "not read".
-- `window_clipped` observes that the run holds the chronologically oldest fetched row and that the fetch filled the window; otherwise `false`.
+- `window_clipped` observes that the run holds the chronologically oldest fetched row and that the fetch filled the window; otherwise `false`. **SUPERSEDED by review round 1** (see the round-1 section below): inferring the label from a full window is a hedge, not an observation, and in steady state it labelled a run that had in fact been counted in full. The shipped rule fetches one sentinel row beyond the window and sets the label only when the sentinel shares the oldest run's identity.
 - `tools_called` / `degrade_flags` observe that the stored JSON parses as a string array; otherwise `null`, never `[]`.
 - The widened `StoredLedgerRecord` fields are read through one shared mapper by both `recent()` and `samples_for_estimator()`, pinned with a plain-row control.
 
 ### Deviations recorded by the implementer
 
 - `tools_called` / `degrade_flags` are `Option<Vec<String>>` (contract updated to match).
-- `window_clipped` only when the fetch filled the window (contract updated to match).
+- `window_clipped` only when the fetch filled the window (contract updated to match). **SUPERSEDED by review round 1**: replaced with the sentinel-row observation described below.
 - One shared `STORED_RECORD_COLUMNS` constant builds both SELECTs so positional mapping cannot drift.
 - The stale module doc on `src/stel_core/ledger_store.rs` (claimed `server`-gated; the module compiles under `any(server, embed)`) was corrected.
 

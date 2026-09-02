@@ -18,21 +18,29 @@ Equality/Hash derive from all three fields. Two calls are "identical" iff `tool`
 
 | Field | Type | Notes |
 |---|---|---|
-| `count` | `u32` | Serves of this key with continuously-equal evidence; `saturating_add` |
-| `evidence` | `ProjectEvidence` | TYPED evidence deserialized from the run's FIRST serve (`src/protocol/result_status.rs:58-68`). The tracker never stores raw `_meta` JSON — the `{"bound": false}` unavailable marker and any non-deserializable value are "unobserved", full stop. |
+| `count` | `u32` | Serves of this key with a continuously-equal observation; `saturating_add` |
+| `observed` | `ObservedServe` | The run's FIRST serve, as TYPED values: the `ProjectEvidence` (`src/protocol/result_status.rs`) **and** a digest of the response's rendered text content. The tracker never stores raw `_meta` JSON — the `{"bound": false}` unavailable marker and any non-deserializable value are "unobserved", full stop. The body digest was added 2026-09-02 (review round 1): evidence alone does not fence every input a renderer reads. |
 
-State transitions (per eligible-tool response at the seam). "Evidence observed" means: the `symforge/project_evidence` value on the outgoing response deserializes as a full `ProjectEvidence` AND its `project_id` is not the `"unbound"` placeholder (`result_status.rs:149-150` — an unbound adapter has no project to be current about):
+State transitions (per eligible-tool response at the seam). "Observed" means ALL of: the `symforge/project_evidence` value on the outgoing response deserializes as a full `ProjectEvidence`; its `project_id` is not the `"unbound"` placeholder (an unbound adapter has no project to be current about); and the dispatch did not report consulting an input the index does not fence (review round 2 — see the `UnfencedInput` row):
 
 ```
-no entry                --serve, evidence observed-->        count=1, store typed evidence
-entry, evidence ==      --serve-->                           count+=1   (notice when count >= 3)
-entry, evidence !=      --serve-->                           replace: count=1, new evidence
+no entry                --serve, observed-->                 count=1, store the observation
+entry, evidence == AND body digest ==  --serve-->            count+=1   (notice when count >= 3)
+entry, evidence != OR  body digest !=  --serve-->            replace: count=1, new observation
 entry, evidence NOT observed (marker / non-deserializable
         / project_id "unbound") --serve-->                   remove entry (cannot observe)
+entry, the dispatch reported an unfenced input
+        (live git status / raw worktree read)  --serve-->    remove entry (round 2: the forward
+                                                             claim is not observable there)
 entry, ResultStatus observed as InternalFailure --serve-->   remove entry (R5)
 entry, OutcomeClass unobservable on this lane AND
         result.is_error == true --serve-->                   remove entry (conservative; R5)
 any state               --tracker at cap on insert-->        clear() all, then insert fresh
+any state               --index incarnation change-->        clear() all runs (round 1: daemon
+                                                             reconnect, degrade flip, local reload)
+serve whose key was minted before a clear      -->           not inserted (round 2 epoch guard:
+                                                             an in-flight serve never bridges
+                                                             an incarnation change)
 no observable session identity for the request  -->          no tracker interaction at all
 ```
 
@@ -43,10 +51,12 @@ Ineligible tools never touch the tracker. Interleaved *different* calls never re
 ### RepeatWitness (unrepresentable-claim guard, Constitution P5)
 
 ```
-RepeatWitness::observe(prior: &ProjectEvidence, current: &ProjectEvidence) -> Option<RepeatWitness>
+RepeatWitness::observe(prior: &ObservedServe, current: &ObservedServe) -> Option<RepeatWitness>
 ```
 
-Private field; `Some` **only** on full struct equality of the two TYPED evidence values. No other constructor. Mirrors the `SourceAuthority::from_freshness` repair (`src/protocol/search_format.rs:3-26`).
+Private field and private constructor; `Some` **only** on full equality of the two TYPED observations — every field of `ProjectEvidence` and the rendered-body digest, compared as whole values so a future `ObservedServe` field joins the witness automatically. No other constructor. Mirrors the `SourceAuthority::from_freshness` repair (`src/protocol/search_format.rs:3-26`).
+
+The witness is necessary but not sufficient for the notice's *forward* sentence ("the result cannot differ until the index changes"): equality of three past serves does not prove the fourth cannot differ if the renderer reads something the index never publishes. That gap is closed by eligibility plus the unfenced-input report above, not by the witness — see `contracts/repeat-notice.md`.
 
 ### RepeatNotice
 
@@ -110,13 +120,13 @@ The identity comparator **exhaustively destructures** the struct (every field na
 | `accepted`, `eligible_h6` | NO — excluded, deliberately | Derived admission/estimator-lane flags (`accepted` derives from `decision`, already in identity; `eligible_h6` is tuning bookkeeping). Recorded here so the exclusion is a decision, not an oversight. |
 | `equivalence` | N/A | Not persisted; durable lane cannot compare it — documented coarseness (spec Assumptions) |
 
-Ordering: `recent()` returns `ORDER BY id DESC` (newest first, pinned by `recent_with_limit_caps_result_set`). The admin lane **reverses to chronological (oldest→newest) before collapsing**, so `first_ts_ms`/`last_ts_ms` and "canonical = first event of the run" keep their natural meaning; `recent_runs` renders chronological.
+Ordering: `recent()` returns `ORDER BY id DESC` (newest first, pinned by `recent_with_limit_caps_result_set`). The admin lane **reverses to insert order (oldest→newest by `id`) before collapsing**, so "canonical = the row that opened the run" keeps its natural meaning; `recent_runs` renders in that order. `first_ts_ms`/`last_ts_ms` are the min/max `ts_ms` over the run rather than its positional ends, so out-of-order inserts between concurrent writers cannot understate or invert the span.
 
 ### Run&lt;T&gt; (LedgerRun)
 
 | Field | Type | Notes |
 |---|---|---|
-| `canonical` | `T` | Chronologically first row of the run (clone) |
+| `canonical` | `T` | The run's first row in the order the rows were fed to the collapse — insert order (`id`) on the durable lane, push order on the event lane (clone). Under clock skew between concurrent writers this is not necessarily the row with the smallest `ts_ms`; the span below is the min/max, and `canonical` is deliberately the positional first so it names a row that really did open the run. |
 | `count` | `u64` | Run length ≥ 1 |
 | `first_ts_ms` | `u64` | |
 | `last_ts_ms` | `u64` | |
@@ -125,7 +135,7 @@ Invariants (property oracles, per lane):
 1. `runs.iter().map(|r| r.count).sum() == items.len()`
 2. Flattening runs by identity reproduces the input identity sequence in order
 3. All-distinct input ⇒ every `count == 1` and rendering is byte-identical to today
-4. Admin lane: a run containing the chronologically-oldest fetched row is marked window-clipped (its true start may lie outside the fetch window) — see `contracts/admin-recent-runs.md`
+4. Admin lane: the run holding the oldest fetched row is marked window-clipped **only when a sentinel row fetched beyond the window shares its identity**, i.e. only when the run is observed to continue past the window. Its `count` and its `first_ts_ms`/`last_ts_ms` then describe the in-window rows alone, which is what `window_clipped` warns the reader about — see `contracts/admin-recent-runs.md`
 
 ### Status-view plumbing (refuted as a formatter-local tweak — it is a context-shape change)
 
