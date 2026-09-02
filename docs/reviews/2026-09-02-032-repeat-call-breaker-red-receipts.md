@@ -351,3 +351,110 @@ test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 3293 filtered out; 
 ```
 
 Final US2 sweep after the fix commits: lib filters 32/32; `stel_status` 4/4, `admin_api_v1` 10/10, `admin_render` 2/2, `surface_honesty` 14/14, `stel_l4_ledger` 5/5, `stel_ledger_persistence` 18/18, `stel_symforge_edit` 17/17; clippy on lib, bins and the three test targets clean; `cargo fmt --all -- --check` clean.
+
+## Review round 2 (2026-09-02) — the forward claim, and what closed it
+
+Round 2 ran all seven lenses (the false-claim and cfg-sweep lenses that round 1 lost to a usage limit ran here for the first time). Thirty-one findings; the substantive result was one defect reported independently by three lenses and reproduced end to end by two verifiers.
+
+### The blocker: the notice's forward sentence was unfenced
+
+The notice promises "The result cannot differ until the index changes". Round 1's body digest witnesses that the serves that already happened were byte-identical; it cannot make that forward promise true, because two eligible render paths read inputs the index never publishes:
+
+- `search_text` on a zero-hit result runs an untracked-file sweep over live `git status` plus raw worktree bytes, and appends an "untracked file may match" diagnostic.
+- `find_references` with a `path` the index does not hold falls back to an on-disk admission view that reads file metadata and the first bytes, and renders the on-disk size.
+
+Either can render a different answer on the next serve with no publication in between, so a notice emitted on serve 3 is falsified by serve 4. Spec FR-006 already forbids this: a read operation whose answer can vary on an unchanged index must be excluded.
+
+**Fix, per the Reporting Invariant: the component that knows is the component that reports.** The per-dispatch scope that already carries the project evidence gained a latch. The two reading sites set it as their first act, whenever they execute, regardless of what the read returned this time. The seam reads it back and records the serve as unobserved, which removes the run — so the notice is not merely skipped, it is unconstructible there. No string matching of response bodies was used; that is the defect class this feature exists to avoid.
+
+The cost is recorded in `contracts/repeat-notice.md`: a zero-hit `search_text` and a path-qualified `find_references` outside the index no longer earn a notice. Four of the five eligible tools still notice on empty results, as does `search_text` when it has hits. Rewording the notice to a purely backward-looking claim was the alternative and was rejected: the text is byte-canonical and the standing rule is to withhold rather than weaken.
+
+RED for the first lane, on the pre-fix code — the false claim, reproduced:
+
+```
+test zero_hit_search_text_never_claims_cannot_differ ... FAILED
+panicked at tests\repeat_notice.rs:1006:5:
+assertion `left == right` failed: zero-hit serve 3 must be byte-identical
+  left: ... "symforge/repeat_notice": Object {"contract_version": Number(1),
+        "evidence_generation": Number(8), "repeat_count": Number(3),
+        "request_hash": String("223495c6..."), "tool": String("search_text")} ...
+        "No matches for 'needle-zz'. ...\n\nRepeat notice: identical request served 3x
+        with no index change published in between (project evidence unchanged).
+        The result cannot differ until the index changes - change the request instead of retrying."
+ right: ... "No matches for 'needle-zz'. ..." (no notice)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out
+```
+
+RED for the second lane, on the pre-fix code:
+
+```
+test find_references_disk_fallback_never_claims_cannot_differ ... FAILED
+panicked at tests\repeat_notice.rs:1117:5:
+assertion `left == right` failed: disk-fallback serve 3 must be byte-identical
+  left: ... "symforge/repeat_notice": Object {..., "repeat_count": Number(3),
+        "tool": String("find_references")} ...
+        "degraded result (Tier 2 metadata-only) ...\nSize: 1026 bytes\n ...
+         \n\nRepeat notice: identical request served 3x ..."
+ right: (same body, no notice)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out
+```
+
+RED as a compile refusal for the unit oracle, then GREEN for all three:
+
+```
+error[E0425]: cannot find function `note_unfenced_input` in module `result_status`
+error[E0425]: cannot find function `unfenced_input_consulted` in module `result_status`
+error[E0599]: no variant, associated function, or constant named `UnfencedInput` found for
+              enum `protocol::repeat::UnobservedReason` in the current scope
+```
+
+```
+test internals::protocol::repeat::tests::unfenced_input_removes_the_run_and_never_notices ... ok
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 3308 filtered out; finished in 2.29s
+test find_references_disk_fallback_never_claims_cannot_differ ... ok
+test zero_hit_search_text_never_claims_cannot_differ ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 2.20s
+```
+
+**Why the latch cannot leak between calls**, which the review asked to be shown rather than asserted: it is a field of the per-dispatch observation struct, bound only by the scope guard that wraps each `call_tool`, constructed fresh per call and dropped with the future — there is no cross-call storage to leak from. A unit oracle runs two sequential scopes in one task and observes the second entering false. End to end, both integration oracles serve four latched calls and then a control that DOES notice in the same session and process; a leaking latch would have withheld that control.
+
+### The other findings fixed in this round
+
+| Finding | Disposition |
+|---|---|
+| An in-flight serve could bridge an incarnation change: a serve whose evidence was captured against the old daemon could be recorded after a concurrent request's clear, anchoring a run that spans the replacement | FIXED: the tracker carries an incarnation epoch, bumped on every clear; the seam stamps the key with the epoch it read before dispatch, and a serve whose epoch no longer matches is refused rather than inserted. The capacity eviction deliberately does not bump the epoch — memory pressure is not a change of the index that served those keys |
+| The accumulating lane was inferred from the ABSENCE of the HTTP marker, so a future transport that inserts nothing would silently accumulate across clients | FIXED: `Stdio` now requires a positive declaration from the entry point AND the absence of the marker; everything else is inert. Absence of a declaration is not evidence |
+| The witness compared two named fields, so a future field on the observation would be silently excluded | FIXED: whole-value comparison. RED was produced by temporarily adding a field and observing the named-field comparison still witness equality |
+| The daemon-proxy overlay's `×N` annotation was pinned by a contains-check that passed with or without it | FIXED: exact whole-line assertion plus its negative. The RED receipt first shows the OLD assertion still passing under a mutation that deletes the annotation, which is the blindness itself |
+| Contract and data-model said `canonical` was the chronologically first row; the code uses the positional first | FIXED in the docs to match the code, which is the honest reading: the positional first row is the one that really opened the run, and the span is the min/max so skew cannot invert it |
+| The receipts' US2 invariant bullets still described the pre-round-1 window rule | FIXED: marked superseded, pointing at the shipped sentinel rule |
+| Data model still described the evidence-only witness | FIXED: state machine and witness rewritten to the shipped behavior, including both rounds' new transitions |
+| Several LOW notes: unused derives, a boolean that a match subsumes, a defensive branch the server cannot produce, comment volume at the clear sites | ADJUDICATED, no change. Each was refuted by at least one verifier as violating no governing sentence, and the code is clearer with the explicit forms |
+| Lenses noted that the embed cell, the release build, verify-tools and npm had not been executed by the implementers | Resolved by the full battery below, which is the observing authority |
+
+Round-2 verification after the fixes, on the merged branch:
+
+```
+cargo test --lib -j 4 -- --test-threads=1 repeat result_status mcp_http daemon_degraded ensure_local_index degraded_dead_endpoint
+  test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 3295 filtered out; finished in 6.55s
+cargo test --lib -j 4 protocol::tools -- --test-threads=1
+  test result: ok. 501 passed; 0 failed; 0 ignored; 0 measured; 2832 filtered out; finished in 31.14s
+cargo test --test repeat_notice -j 4 -- --test-threads=1   (twice)
+  test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.04s
+  test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.95s
+cargo test --test surface_honesty --test graceful_degradation -j 4 -- --test-threads=1
+  graceful_degradation: ok. 1 passed; 0 failed        surface_honesty: ok. 14 passed; 0 failed
+cargo test --test rmcp3_protocol --test rmcp3_roots_interop --test idempotency -j 4 -- --test-threads=1
+  ok. 15 passed / ok. 1 passed / ok. 5 passed
+cargo test --no-fail-fast --test stel_status --test admin_api_v1 --test admin_render --test surface_honesty --test stel_symforge_edit -j 4 -- --test-threads=1
+  47 passed across 5 binaries, 0 failed
+clippy on lib, bins and the touched test targets: clean.   cargo fmt --check: clean.
+```
+
+The latch sits in a hot render path and changed no existing rendering: the 501 in-file protocol tests, the degraded-tier oracle, and the surface-honesty suite are all green unchanged.
+
+### Carried forward, not defects
+
+- The latch is a no-op outside a dispatch scope, so a future renderer that moves one of these reads onto another task would lose the fence. Both production callers run inline on the dispatch task today, and the two integration oracles would fail if that changed. A scope-required token threaded to the reading sites would make it structural; that is a larger refactor than this round warranted.
+- A sweep of every disk and git read reachable from the five eligible tools found no unfenced input beyond the two fixed. That was a grep-and-map exercise, not a proof; `get_repo_map` and `find_dependents` were confirmed by absence rather than by reading their render paths line by line.
+- The proxy overlay matches the annotated line by prefix, so the annotation must stay a suffix. Nothing pins that ordering inside the formatter.
