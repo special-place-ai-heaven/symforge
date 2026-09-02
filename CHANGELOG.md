@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.0.13](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.12...v11.0.13) (2026-09-02)
+
+
+### Bug Fixes
+
+* **release:** accept a release PR merged ahead of a queued push run ([#667](https://github.com/special-place-ai-heaven/symforge/issues/667)) ([e541e9a](https://github.com/special-place-ai-heaven/symforge/commit/e541e9a30a5619d33b12e9a4ac9459f0835da089))
+* **tests:** move the hook round-trip latency bound into an ignored smoke ([#668](https://github.com/special-place-ai-heaven/symforge/issues/668)) ([f7d834e](https://github.com/special-place-ai-heaven/symforge/commit/f7d834eae54b4c27394579ce643e576d75db655d))
+
 ## [11.0.12](https://github.com/special-place-ai-heaven/symforge/compare/v11.0.11...v11.0.12) (2026-08-25)
 
 
