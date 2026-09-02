@@ -9,8 +9,17 @@
 //! `tests/rmcp3_roots_interop.rs` (`call_tool_result`), plus the in-process
 //! HTTP `/mcp` harness from `tests/rmcp3_protocol.rs` for the lane-inertness
 //! pin. The stdio server runs with `SYMFORGE_NO_DAEMON=1`, the full surface,
-//! and the periodic watcher reconcile disabled, so the only thing that can
-//! move the published index between calls is a real file event.
+//! and the periodic watcher reconcile disabled, so nothing moves the
+//! published index between calls unless a test changes it.
+//!
+//! An "index change" (spec.md Scenario 2 and Assumptions: any observed
+//! re-parse, re-index, or applied edit) reaches the index here by one of two
+//! mechanisms, both real: the file watcher observing an on-disk edit and
+//! republishing (tried first), or — when the watcher has not republished
+//! within a bounded wait — an in-band `analyze_file_impact` re-parse of the
+//! edited file, which the test announces on stderr. Either way the oracle
+//! asserts the change was PUBLISHED (evidence moved and a different search
+//! serves the new symbol) before it continues.
 #![cfg(feature = "server")]
 
 use std::io::{BufRead, BufReader, Write};
@@ -378,8 +387,8 @@ fn settle(client: &mut StdioClient) -> Value {
 
 /// Append a new symbol to `src/beta.rs` and wait until the index has
 /// PUBLISHED it (evidence moved AND a different-fingerprint search finds it).
-/// Falls back to an in-band `analyze_file_impact` re-read if the watcher does
-/// not republish within 30 s, and says so on stderr.
+/// Falls back to an in-band `analyze_file_impact` re-parse if the watcher does
+/// not republish within 10 s (hard fail at 45 s), and says so on stderr.
 fn publish_index_change(client: &mut StdioClient, workspace: &Path, before: &Value) -> Value {
     let beta = workspace.join("src").join("beta.rs");
     let mut source = std::fs::read_to_string(&beta).expect("read beta.rs");
@@ -394,9 +403,9 @@ fn publish_index_change(client: &mut StdioClient, workspace: &Path, before: &Val
         if is_bound(ev) && ev != before {
             break;
         }
-        if !nudged && started.elapsed() > Duration::from_secs(30) {
+        if !nudged && started.elapsed() > Duration::from_secs(10) {
             eprintln!(
-                "repeat_notice: watcher did not republish within 30s; nudging via analyze_file_impact"
+                "repeat_notice: watcher did not republish within 10s; nudging via analyze_file_impact"
             );
             let _ = client.call_tool_result("analyze_file_impact", json!({"path": "src/beta.rs"}));
             nudged = true;
@@ -447,10 +456,18 @@ fn third_identical_eligible_call_carries_notice_and_first_two_do_not() {
     // another fingerprint, one ineligible — neither notice nor reset the run.
     let other = client.call_tool_result("search_symbols", json!({"query": "beta_anchor"}));
     assert_no_notice(&other, "interleaved different-fingerprint eligible call");
-    assert_eq!(evidence(&other), &stable, "interleaved eligible call evidence");
+    assert_eq!(
+        evidence(&other),
+        &stable,
+        "interleaved eligible call evidence"
+    );
     let status = client.call_tool_result("status", json!({}));
     assert_no_notice(&status, "interleaved ineligible call");
-    assert_eq!(evidence(&status), &stable, "interleaved ineligible call evidence");
+    assert_eq!(
+        evidence(&status),
+        &stable,
+        "interleaved ineligible call evidence"
+    );
 
     let serve3 = client.call_tool_result("search_symbols", args);
     let stripped = assert_notice_and_strip(&serve3, 3, "search_symbols", "serve 3");
