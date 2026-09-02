@@ -3,7 +3,7 @@
 use super::calibration::{
     StelCalibrationSummary, format_calibration_section, summarize_calibration,
 };
-use super::ledger::SessionLedger;
+use super::ledger::{SessionLedger, collapse_runs, ledger_event_identity};
 use super::types::{StelStatusDetail, StelStatusRequest};
 
 /// Phase 0 §12A independent GO anchor (authorization to implement `src/stel/`).
@@ -88,6 +88,17 @@ pub struct StelStatusContext<'a> {
     pub session_tokens: u64,
     pub last_ledger_decision: Option<String>,
     pub last_ledger_route: Option<String>,
+    /// The trailing run of ledger-identical session events as
+    /// `(count, first_ts_ms, last_ts_ms)` (032 US2, spec FR-007).
+    ///
+    /// Observed by [`Self::from_server`] — the only producer — by collapsing
+    /// `ledger.events()` over the in-memory lane identity
+    /// ([`crate::stel::ledger::ledger_event_identity`]) and taking the last
+    /// run; `Some` ONLY when that run has count ≥ 2. `None` (a run of one, or
+    /// an empty ledger) renders the `last_ledger_decision:` line byte-for-byte
+    /// as before, so the annotation is never a claim about a run that was not
+    /// counted.
+    pub trailing_run: Option<(u64, u64, u64)>,
     pub calibration: StelCalibrationSummary,
     /// Durable-ledger subsystem state (restart-survival, US3/T029; N-3 FR-008).
     /// `Unavailable` on stdio/embed (no store wired); `Disabled { reason }` when
@@ -133,6 +144,13 @@ impl<'a> StelStatusContext<'a> {
             .as_ref()
             .map(|event| event.decision.as_str().to_string());
         let last_ledger_route = last.and_then(|event| event.tools_called.first().cloned());
+        // 032 US2: the trailing run of ledger-identical events, observed from
+        // the SAME event snapshot the last-event lines were read from. `Some`
+        // only for a run of ≥ 2, so a run of one renders byte-identically.
+        let trailing_run = collapse_runs(&events, ledger_event_identity, |event| event.ts_ms)
+            .last()
+            .filter(|run| run.count >= 2)
+            .map(|run| (run.count, run.first_ts_ms, run.last_ts_ms));
         Self {
             surface,
             version: env!("CARGO_PKG_VERSION"),
@@ -145,6 +163,7 @@ impl<'a> StelStatusContext<'a> {
             session_tokens,
             last_ledger_decision,
             last_ledger_route,
+            trailing_run,
             calibration,
             durable_ledger: DurableLedgerState::Unavailable,
             daemon_env_surface: None,
@@ -223,12 +242,24 @@ pub fn format_durable_ledger_line(state: &DurableLedgerState) -> String {
 ///   recorded no tool),
 /// - `last_ledger_decision: none` / `last_ledger_route: none` when the ledger is
 ///   empty.
+///
+/// 032 US2: when the context carries an observed trailing run
+/// (`StelStatusContext::trailing_run`, count ≥ 2), the DECISION line — and only
+/// that line — gains the suffix ` ×{count} (first={first_ts_ms}, last={last_ts_ms})`
+/// (U+00D7, raw millisecond integers). With no trailing run the lines are
+/// byte-identical to the pre-032 format.
 pub fn format_last_ledger_lines(ctx: &StelStatusContext<'_>) -> [String; 2] {
     match (&ctx.last_ledger_decision, &ctx.last_ledger_route) {
         (Some(decision), route) => {
             let route = route.as_deref().unwrap_or("none");
+            let run_suffix = match ctx.trailing_run {
+                Some((count, first_ts_ms, last_ts_ms)) => {
+                    format!(" ×{count} (first={first_ts_ms}, last={last_ts_ms})")
+                }
+                None => String::new(),
+            };
             [
-                format!("last_ledger_decision: {decision}"),
+                format!("last_ledger_decision: {decision}{run_suffix}"),
                 format!("last_ledger_route: {route}"),
             ]
         }
@@ -431,6 +462,7 @@ mod tests {
             session_tokens: 128,
             last_ledger_decision: Some("serve".to_string()),
             last_ledger_route: Some("search_text".to_string()),
+            trailing_run: None,
             calibration: summarize_calibration(&[]),
             durable_ledger: DurableLedgerState::Unavailable,
             daemon_env_surface: None,
