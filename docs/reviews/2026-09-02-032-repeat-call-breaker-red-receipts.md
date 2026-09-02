@@ -89,12 +89,15 @@ GREEN, unit (`cargo test --lib -j 4 -- --test-threads=1 repeat observed_outcome_
 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 3296 filtered out; finished in 0.26s
 ```
 
-GREEN, integration (`cargo test --test repeat_notice -j 4 -- --test-threads=1`, three consecutive runs; the index change in oracle 2 was observed through the real watcher every time):
+GREEN, integration (`cargo test --test repeat_notice -j 4 -- --test-threads=1`; first the five original oracles over three consecutive runs, then the binary after the five-tool byte-stability pin was added; the index change in oracle 2 was observed through the real watcher every time):
 
 ```
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.45s
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.97s
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.98s
+test every_eligible_tool_is_byte_stable_and_notices_on_third_serve ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.85s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.82s
 ```
 
 Neighbours: `rmcp3_protocol` 15/15, `rmcp3_roots_interop` 1/1, `idempotency` 5/5.
@@ -230,3 +233,121 @@ Blast-radius sweep (research.md R11 inventory), all green with no assertion chan
 - `window_clipped` only when the fetch filled the window (contract updated to match).
 - One shared `STORED_RECORD_COLUMNS` constant builds both SELECTs so positional mapping cannot drift.
 - The stale module doc on `src/stel_core/ledger_store.rs` (claimed `server`-gated; the module compiles under `any(server, embed)`) was corrected.
+
+## Review round 1 (2026-09-02) — accepted findings, fixed RED-first
+
+Five of seven review lenses completed before a usage limit interrupted the round (the false-claim and cfg lenses, most refuters, and the critic re-ran in round 2). Twenty findings were raised; dispositions:
+
+| Finding | Disposition |
+|---|---|
+| state-machine-1 / security-2 (BLOCKER): a run survives a daemon replacement or local-fallback transition, and `ProjectEvidence.generation` is a per-process counter, so a replacement instance's evidence can coincide with the dead one's | FIXED: `RepeatTracker::clear()` at every observed incarnation transition (reconnect success, degraded/healthy flips, local index reload); contract gained the guarantee |
+| security-1 (BLOCKER): `search_text` renders a query-time untracked-file diagnostic that evidence does not fence, so a third serve can carry a different body under equal evidence | FIXED: the witness observes the result — a length-framed SHA-256 over the rendered text blocks (taken before the notice is appended) must equal the run's first serve; a differing body restarts the run at 1; contract gained the guarantee |
+| collapse-honesty-1 (MEDIUM): `window_clipped` was inferred from a full window rather than observed | FIXED: the view fetches one sentinel row beyond the window and labels the oldest run clipped only when the sentinel shares its identity |
+| collapse-honesty-2 (LOW): run span was positional, so insert-order skew could invert it | FIXED: min/max `ts_ms` over the run |
+| collapse-honesty-3 (LOW): totals and rows are two separate reads | DOCUMENTED on the field and in the contract; no code change |
+| collapse-honesty-4 (LOW): `from_run` destructured with `..` | FIXED: exhaustive destructure |
+| state-machine-2 (LOW): load-bearing calls spellable by any in-crate caller | FIXED: `RepeatWitness::observe`, `RepeatNotice::new`, `BodyDigest` private; `ServeObservation` built only by `from_result`; `RepeatKey::observe` requires a `LaneWitness` only `SessionDiscriminator::observe` can mint; cfg(test) doors for the oracles |
+| security-3 (LOW): admin summary now carries per-session rows on an unauthenticated loopback bind | ADJUDICATED: pre-existing admin-API posture, operator's own data, no secrets or source content; out of scope for this feature |
+| simplicity-1 (MEDIUM, refuted by both refuters): diff size vs the plan's estimate | plan.md records the measured size; one PR per quickstart |
+| simplicity-2 (refuted): watcher-nudge fallback in oracle 2 | kept; nudge threshold lowered to 10 s and the header states both mechanisms |
+| simplicity-3 (LOW): verify-tools comment narrated an unreachable scenario | FIXED: comment states the true situation (compact facade relay, insurance only) |
+| simplicity-4 (LOW): app.js timestamp idiom and dead class | FIXED: existing `toLocaleString()` idiom, `harness-table` |
+| simplicity-5, simplicity-7 (refuted) | no change |
+| simplicity-6 (LOW): embedded spaces in an assert literal | FIXED |
+| test-quality-1 (LOW): receipts GREEN block predated the sixth test | FIXED above |
+| test-quality-2 (LOW): battery unreceipted | the full battery is recorded in the PR |
+| test-quality-3 (LOW): FR-002 interleaving pinned only at unit level | FIXED: oracle 1 now interleaves a different eligible call and `status` between serves 2 and 3 |
+| test-quality-4 (LOW): CI environment dependence of the watcher waits | no code change beyond the 10 s nudge; watch the first Linux runs |
+
+### US1 receipts (round 1 fixes)
+
+F1 unit oracle `body_change_with_equal_evidence_replaces_run`, RED on the pre-fix code:
+
+```
+test internals::protocol::repeat::tests::body_change_with_equal_evidence_replaces_run ... FAILED
+panicked at src\protocol\repeat.rs:868:9:
+a changed body under equal evidence must never notice
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3316 filtered out; finished in 0.00s
+```
+
+F1 integration oracle `untracked_file_diagnostic_never_earns_a_notice`, RED on the pre-fix code (the reviewer's scenario reproduced end to end: serves 1-2 clean, serve 3 rendered the untracked-file diagnostic under unchanged evidence generation 8 and still carried the notice):
+
+```
+test untracked_file_diagnostic_never_earns_a_notice ... FAILED
+panicked at tests\repeat_notice.rs:258:5:
+serve 3 (body changed under equal evidence): must not carry the symforge/repeat_notice _meta carrier: {"_meta":{"symforge/project_evidence":{...,"generation":8,...},"symforge/repeat_notice":{"contract_version":1,"evidence_generation":8,"repeat_count":3,"request_hash":"223495c6...","tool":"search_text"},...
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 1.11s
+```
+
+F1 GREEN:
+
+```
+test internals::protocol::repeat::tests::body_change_with_equal_evidence_replaces_run ... ok
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 3296 filtered out; finished in 0.25s
+test untracked_file_diagnostic_never_earns_a_notice ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.91s
+```
+
+F2, RED as a compile refusal, then RED at runtime with `clear()` present but unwired:
+
+```
+error[E0599]: no method named `clear` found for struct `protocol::repeat::RepeatTracker` in the current scope
+   --> src\protocol\repeat.rs:853:17
+```
+
+```
+test internals::protocol::repeat::tests::clear_restarts_runs_at_one ... ok
+test internals::protocol::tests::daemon_degraded_clears_on_next_success ... FAILED
+test internals::protocol::tests::daemon_failure_transition_clears_repeat_runs ... FAILED
+test internals::protocol::tests::ensure_local_index_does_not_reload_on_repeated_same_root_calls ... ok
+test internals::protocol::tests::ensure_local_index_reloads_on_root_mismatch_without_reset ... FAILED
+panicked at src\protocol\mod.rs:3528:9: the degraded -> daemon-served transition must clear every repeat run
+panicked at src\protocol\mod.rs:3559:9: the daemon-served -> locally-served transition must clear every repeat run
+panicked at src\protocol\mod.rs:4623:9: a local index reload is a new incarnation: every repeat run must be cleared
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 3314 filtered out; finished in 2.11s
+```
+
+F2 GREEN, and the final US1 verification after the last fix commit:
+
+```
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 3292 filtered out; finished in 6.39s
+cargo test --test repeat_notice -j 4 -- --test-threads=1   test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.98s
+cargo test --test repeat_notice -j 4 -- --test-threads=1   test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.88s
+rmcp3_protocol 15/15, rmcp3_roots_interop 1/1, idempotency 5/5; cargo fmt --all -- --check clean; cargo clippy --lib --bins --test repeat_notice -j 4 -- -D warnings clean
+```
+
+The reconnect-success clear site (`proxy_tool_call`, `Ok(new_client)`) is verified by reading only: no cheap harness reconnects to a live replacement daemon. The transitions into and out of the degraded state and the local reload are exercised by tests, and the reconnect path passes through the healthy-to-degraded transition first.
+
+### US2 receipts (round 1 fixes)
+
+collapse-honesty-1 `admin_window_clipped_is_observed_from_the_sentinel_row`, RED then GREEN:
+
+```
+test admin_window_clipped_is_observed_from_the_sentinel_row ... FAILED
+panicked at tests\admin_api_v1.rs:577:5:
+  left: [(50, "admin-sentinel", "find_references", 1001, 1050, true)]
+ right: [(50, "admin-sentinel", "find_references", 1001, 1050, false)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out
+```
+
+```
+test admin_window_clipped_is_observed_from_the_sentinel_row ... ok
+test admin_window_edge_is_labeled ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+```
+
+collapse-honesty-2 `collapse_runs_span_is_min_max_over_skewed_timestamps`, RED then GREEN:
+
+```
+test internals::stel::ledger::collapse_tests::collapse_runs_span_is_min_max_over_skewed_timestamps ... FAILED
+panicked at src\stel\ledger.rs:918:9:
+  left: (1002, 1005)
+ right: (1000, 1005)
+```
+
+```
+test internals::stel::ledger::collapse_tests::collapse_runs_span_is_min_max_over_skewed_timestamps ... ok
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 3293 filtered out; finished in 0.04s
+```
+
+Final US2 sweep after the fix commits: lib filters 32/32; `stel_status` 4/4, `admin_api_v1` 10/10, `admin_render` 2/2, `surface_honesty` 14/14, `stel_l4_ledger` 5/5, `stel_ledger_persistence` 18/18, `stel_symforge_edit` 17/17; clippy on lib, bins and the three test targets clean; `cargo fmt --all -- --check` clean.
