@@ -551,3 +551,64 @@ async fn admin_window_edge_is_labeled() {
         "a fully counted run is never labeled clipped:\n{body:#}"
     );
 }
+
+#[tokio::test]
+async fn admin_window_clipped_is_observed_from_the_sentinel_row() {
+    // Review finding collapse-honesty-1: `window_clipped` must be OBSERVED,
+    // not inferred from "the fetch filled the window". The row immediately
+    // older than the window (the sentinel) decides it: the oldest in-window
+    // run is clipped only when that row shares its identity.
+    //
+    // (a) 51 rows in ONE session: row 1 (outside the window) differs in
+    // identity from rows 2..51 (50 identity-identical rows). The oldest
+    // in-window run was counted in full — it must NOT be labeled clipped.
+    let store = StelLedgerStore::open_in_memory("admin-sentinel").expect("store");
+    store.record(&serve_event(1_000, "edge", &["search_text"]));
+    for i in 1..51u64 {
+        store.record(&serve_event(
+            1_000 + i,
+            &format!("a-{i}"),
+            &["find_references"],
+        ));
+    }
+    let body = summary_for(store).await;
+    assert_eq!(body["total_events"], 51, "{body:#}");
+    assert_eq!(body["recent_runs_window"], 50, "{body:#}");
+    assert_eq!(
+        run_shapes(&body),
+        vec![(
+            50,
+            "admin-sentinel".to_string(),
+            "find_references".to_string(),
+            1_001,
+            1_050,
+            false
+        )],
+        "a run whose extent ends exactly at the window edge is not clipped:\n{body:#}"
+    );
+
+    // (b) Positive control: 51 identity-identical rows — the sentinel shares
+    // the run's identity, so the run really does continue past the edge.
+    let store = StelLedgerStore::open_in_memory("admin-sentinel-same").expect("store");
+    for i in 0..51u64 {
+        store.record(&serve_event(
+            1_000 + i,
+            &format!("b-{i}"),
+            &["find_references"],
+        ));
+    }
+    let body = summary_for(store).await;
+    assert_eq!(body["total_events"], 51, "{body:#}");
+    assert_eq!(
+        run_shapes(&body),
+        vec![(
+            50,
+            "admin-sentinel-same".to_string(),
+            "find_references".to_string(),
+            1_001,
+            1_050,
+            true
+        )],
+        "a run that continues past the edge is clipped, count window-bounded:\n{body:#}"
+    );
+}

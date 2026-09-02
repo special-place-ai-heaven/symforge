@@ -197,13 +197,13 @@ fn ledger_timestamp_ms() -> u64 {
 /// and durable, stay individually intact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Run<T> {
-    /// The chronologically first row of the run.
+    /// The positional first row of the run (the first in input order).
     pub(crate) canonical: T,
     /// Run length, always ≥ 1.
     pub(crate) count: u64,
-    /// `ts_ms` of the first row of the run.
+    /// The smallest `ts_ms` over the run's rows.
     pub(crate) first_ts_ms: u64,
-    /// `ts_ms` of the last row of the run.
+    /// The largest `ts_ms` over the run's rows.
     pub(crate) last_ts_ms: u64,
 }
 
@@ -214,9 +214,10 @@ pub(crate) struct Run<T> {
 /// Invariants, pinned by the property tests below: the counts sum to
 /// `items.len()`; flattening the runs by identity reproduces the input
 /// identity sequence; an all-distinct input yields one run per row.
-/// `first_ts_ms`/`last_ts_ms` are positional (the first and last row of the
-/// run as read through `ts_ms`), not min/max — callers pass rows in
-/// chronological order.
+/// `first_ts_ms`/`last_ts_ms` are the min/max `ts_ms` over the run's rows
+/// (robust to insert-order skew, where a later row carries an earlier
+/// clock); `canonical` stays the positional first row. Callers pass rows in
+/// chronological (insert) order so that adjacency means "consecutive".
 pub(crate) fn collapse_runs<'a, T: Clone + 'a, K: PartialEq>(
     items: &'a [T],
     identity: impl Fn(&'a T) -> K,
@@ -230,7 +231,10 @@ pub(crate) fn collapse_runs<'a, T: Clone + 'a, K: PartialEq>(
         let extends_open_run = match (&open_key, runs.last_mut()) {
             (Some(open), Some(run)) if *open == key => {
                 run.count += 1;
-                run.last_ts_ms = ts;
+                // min/max, not positional: under insert-order skew a later row
+                // can carry an earlier clock, and the span must still cover it.
+                run.first_ts_ms = run.first_ts_ms.min(ts);
+                run.last_ts_ms = run.last_ts_ms.max(ts);
                 true
             }
             _ => false,
@@ -898,5 +902,49 @@ mod collapse_tests {
                 "a difference in identity column `{column}` must NOT collapse"
             );
         }
+    }
+
+    #[test]
+    fn collapse_runs_span_is_min_max_over_skewed_timestamps() {
+        // Review finding collapse-honesty-2: under insert-order skew (two
+        // concurrent identical calls whose durable writes land out of ts_ms
+        // order — the in-memory lane can skew the same way) the span must be
+        // min/max over the run, never positional, or it understates or
+        // inverts. `canonical` stays the positional first row.
+        let skewed = [
+            record("A", 1, 1_002),
+            record("A", 2, 1_000),
+            record("A", 3, 1_005),
+        ];
+        let runs = record_runs(&skewed);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].count, 3);
+        assert_eq!(
+            (runs[0].first_ts_ms, runs[0].last_ts_ms),
+            (1_000, 1_005),
+            "span is min/max over the run:\n{runs:?}"
+        );
+        assert_eq!(
+            runs[0].canonical.id, 1,
+            "canonical stays the positional first row"
+        );
+
+        // Two-row control: an inverted pair still reports the ordered span.
+        let pair = [record("A", 1, 1_002), record("A", 2, 1_000)];
+        let runs = record_runs(&pair);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (runs[0].first_ts_ms, runs[0].last_ts_ms),
+            (1_000, 1_002),
+            "inverted pair:\n{runs:?}"
+        );
+        assert_eq!(runs[0].canonical.id, 1);
+
+        // The event lane shares the algorithm: same skew, same span.
+        let events = [event("A", 1_002), event("A", 1_000), event("A", 1_005)];
+        let runs = event_runs(&events);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].first_ts_ms, runs[0].last_ts_ms), (1_000, 1_005));
+        assert_eq!(runs[0].canonical.plan_id, "plan-1002");
     }
 }

@@ -98,7 +98,7 @@ function renderRecentRuns(container, data) {
   const runs = data.recent_runs || [];
   if (!runs.length) return;
   const table = document.createElement("table");
-  table.className = "recent-runs";
+  table.className = "harness-table";
   table.innerHTML = "<thead><tr><th>Run</th><th>Session</th><th>Decision</th><th>Intent</th><th>First</th><th>Last</th></tr></thead>";
   const tbody = document.createElement("tbody");
   runs.forEach(function (run) {
@@ -107,8 +107,8 @@ function renderRecentRuns(container, data) {
     tr.appendChild(td(run.session_id));
     tr.appendChild(td(run.decision));
     tr.appendChild(td(run.intent));
-    tr.appendChild(td(stamp(run.first_ts_ms)));
-    tr.appendChild(td(stamp(run.last_ts_ms)));
+    tr.appendChild(td(new Date(run.first_ts_ms).toLocaleString()));
+    tr.appendChild(td(new Date(run.last_ts_ms).toLocaleString()));
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
@@ -122,13 +122,6 @@ function renderRecentRuns(container, data) {
     p.textContent = "Recent runs within the newest " + data.recent_runs_window + " ledger rows; ×N counts consecutive identical events.";
     container.appendChild(p);
   }
-}
-
-// Millisecond epoch → ISO string; falls back to the raw integer when the value
-// is outside the Date range rather than throwing.
-function stamp(ms) {
-  const d = new Date(ms);
-  return isNaN(d.getTime()) ? String(ms) : d.toISOString();
 }
 
 async function loadSurface() {
