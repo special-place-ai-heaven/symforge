@@ -11,11 +11,16 @@
 //!
 //! Zero false claims dominates every trade-off here (spec SC-002): a notice is
 //! constructible ONLY from a [`RepeatWitness`], which exists only on observed
-//! full equality of two typed evidence values, and anything the seam cannot
-//! observe — an inert lane, an unavailable-evidence marker, an unbound
-//! project, an internal failure — removes the run instead of guessing.
-//! Interleaved *different* calls never reset a run (spec FR-002); evidence
-//! drift is how an index change is observed (research.md R6).
+//! full equality of two typed evidence values AND of the rendered result
+//! bytes (some eligible renderers read inputs the index never publishes —
+//! `search_text`'s zero-hit untracked-file sweep reads live `git status` —
+//! so evidence equality alone cannot witness "cannot differ"), and anything
+//! the seam cannot observe — an inert lane, an unavailable-evidence marker,
+//! an unbound project, an internal failure — removes the run instead of
+//! guessing. Interleaved *different* calls never reset a run (spec FR-002);
+//! evidence drift is how an index change is observed (research.md R6), and a
+//! body that differs under equal evidence restarts the run (a false negative,
+//! never a claim).
 
 use std::collections::HashMap;
 
@@ -141,7 +146,37 @@ impl RepeatKey {
     }
 }
 
-/// Proof that two typed evidence values were observed equal (Constitution V).
+/// SHA-256 over the response's rendered text content, taken at the seam
+/// BEFORE any notice is appended. Each `ContentBlock::Text` contributes its
+/// byte length (u64, little-endian) followed by its bytes, so block framing
+/// is part of the identity (`["ab","c"]` and `["a","bc"]` differ). Non-text
+/// blocks contribute nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyDigest([u8; 32]);
+
+impl BodyDigest {
+    pub fn of_content(content: &[ContentBlock]) -> Self {
+        let mut frame = Vec::new();
+        for block in content {
+            if let ContentBlock::Text(text) = block {
+                frame.extend_from_slice(&(text.text.len() as u64).to_le_bytes());
+                frame.extend_from_slice(text.text.as_bytes());
+            }
+        }
+        Self(crate::hash::digest(&frame))
+    }
+}
+
+/// Everything the seam positively observed about one serve: the typed
+/// evidence the response carried and the digest of the body it rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedServe {
+    pub evidence: ProjectEvidence,
+    pub body_digest: BodyDigest,
+}
+
+/// Proof that two observed serves were equal — typed evidence AND rendered
+/// body (Constitution V).
 ///
 /// The only constructor is [`RepeatWitness::observe`]; the private field makes
 /// a forged witness unspellable outside this module (the same repair shape as
@@ -152,12 +187,13 @@ pub struct RepeatWitness {
 }
 
 impl RepeatWitness {
-    /// `Some` only on FULL struct equality. Any drift — generation, index
-    /// state, file/symbol counts, root, load source, identity — is a change
-    /// the "cannot differ" claim cannot survive, so it yields `None`.
-    pub fn observe(prior: &ProjectEvidence, current: &ProjectEvidence) -> Option<Self> {
+    /// `Some` only on FULL evidence equality — any drift in generation, index
+    /// state, file/symbol counts, root, load source, or identity — AND body
+    /// digest equality. A body that differs under equal evidence is exactly
+    /// the result that just differed; the claim cannot survive it.
+    pub fn observe(prior: &ObservedServe, current: &ObservedServe) -> Option<Self> {
         (prior == current).then_some(Self {
-            generation: current.generation,
+            generation: current.evidence.generation,
         })
     }
 
@@ -268,18 +304,19 @@ pub enum UnobservedReason {
 /// What the seam observed on the OUTGOING response of one eligible call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeObservation {
-    Observed(ProjectEvidence),
+    Observed(ObservedServe),
     Unobserved(UnobservedReason),
 }
 
 impl ServeObservation {
     /// Observation: the response's own `_meta` — the evidence the seam
-    /// attached (or the statused writer attached first) and the outcome class
-    /// read leniently from `symforge/result_status`. Every outcome other than
-    /// an observed `InternalFailure` (or an unclassifiable error) ADVANCES a
-    /// run: `NotFound`, `EmptyResult`, `InvalidRequest` loops are the
-    /// motivating case (data-model.md state machine). Anything this cannot
-    /// read emits `Unobserved`, never a default.
+    /// attached (or the statused writer attached first), the outcome class
+    /// read leniently from `symforge/result_status` — and the digest of the
+    /// text content the response renders (before any notice is appended).
+    /// Every outcome other than an observed `InternalFailure` (or an
+    /// unclassifiable error) ADVANCES a run: `NotFound`, `EmptyResult`,
+    /// `InvalidRequest` loops are the motivating case (data-model.md state
+    /// machine). Anything this cannot read emits `Unobserved`, never a default.
     pub fn from_result(result: &CallToolResult) -> Self {
         let meta = result.meta.as_ref();
         let Some(evidence) = meta
@@ -291,26 +328,31 @@ impl ServeObservation {
         if evidence.project_id == UNBOUND_PROJECT_ID {
             return Self::Unobserved(UnobservedReason::ProjectUnbound);
         }
+        let observed = || ObservedServe {
+            evidence: evidence.clone(),
+            body_digest: BodyDigest::of_content(&result.content),
+        };
         match result_status::observed_outcome_class(meta) {
             Some(OutcomeClass::InternalFailure) => {
                 Self::Unobserved(UnobservedReason::InternalFailure)
             }
-            Some(_) => Self::Observed(evidence),
+            Some(_) => Self::Observed(observed()),
             None if result.is_error == Some(true) => {
                 Self::Unobserved(UnobservedReason::ErrorWithoutOutcomeClass)
             }
-            None => Self::Observed(evidence),
+            None => Self::Observed(observed()),
         }
     }
 }
 
-/// One run: serves of a key with continuously-equal evidence. The evidence is
-/// the TYPED value from the run's first serve — never raw `_meta` JSON, so two
-/// unavailable markers can never compare equal and accumulate.
+/// One run: serves of a key with continuously-equal observation. The stored
+/// value is the TYPED observation from the run's first serve — never raw
+/// `_meta` JSON, so two unavailable markers can never compare equal and
+/// accumulate.
 #[derive(Debug)]
 struct RepeatRun {
     count: u32,
-    evidence: ProjectEvidence,
+    observed: ObservedServe,
 }
 
 /// Bounded per-process map of runs (data-model.md state machine). Shared by
@@ -324,8 +366,9 @@ pub struct RepeatTracker {
 impl RepeatTracker {
     /// Apply one observed serve and return the notice when the run reaches
     /// [`NOTICE_THRESHOLD`]. Unobserved ⇒ the run is removed. Observed and
-    /// witnessed equal ⇒ `count += 1` (saturating). Observed and unequal ⇒ the
-    /// run restarts at 1 on the new evidence.
+    /// witnessed equal (evidence AND body) ⇒ `count += 1` (saturating).
+    /// Observed and unequal in either ⇒ the run restarts at 1 on the new
+    /// observation.
     pub fn record_serve(
         &mut self,
         key: RepeatKey,
@@ -339,13 +382,13 @@ impl RepeatTracker {
             }
         };
         if let Some(run) = self.runs.get_mut(&key) {
-            return match RepeatWitness::observe(&run.evidence, &current) {
+            return match RepeatWitness::observe(&run.observed, &current) {
                 Some(witness) => {
                     run.count = run.count.saturating_add(1);
                     RepeatNotice::new(witness, run.count, &key)
                 }
                 None => {
-                    run.evidence = current;
+                    run.observed = current;
                     run.count = 1;
                     None
                 }
@@ -362,7 +405,7 @@ impl RepeatTracker {
             key,
             RepeatRun {
                 count: 1,
-                evidence: current,
+                observed: current,
             },
         );
         None
@@ -448,8 +491,20 @@ mod tests {
         serde_json::to_value(ResultStatus::new(outcome)).expect("status serializes")
     }
 
+    /// The digest every synthetic serve in these tests renders ("body").
+    fn body() -> BodyDigest {
+        BodyDigest::of_content(&[ContentBlock::text("body")])
+    }
+
+    fn observed_serve(generation: u64) -> ObservedServe {
+        ObservedServe {
+            evidence: evidence(generation),
+            body_digest: body(),
+        }
+    }
+
     fn observed(generation: u64) -> ServeObservation {
-        ServeObservation::Observed(evidence(generation))
+        ServeObservation::Observed(observed_serve(generation))
     }
 
     /// Serve `key` `n` times with equal observed evidence; return the LAST
@@ -509,38 +564,48 @@ mod tests {
         assert_eq!(REPEAT_TRACKER_MAX_ENTRIES, 512);
     }
 
-    // Oracle 10 — the witness exists only on full equality.
+    // Oracle 10 — the witness exists only on full equality (evidence AND body).
     #[test]
     fn witness_requires_full_equality() {
-        let prior = evidence(7);
+        let prior = observed_serve(7);
+        let with = |evidence: ProjectEvidence| ObservedServe {
+            evidence,
+            body_digest: body(),
+        };
         assert!(
-            RepeatWitness::observe(&prior, &evidence(7)).is_some(),
-            "equal evidence must be witnessable"
+            RepeatWitness::observe(&prior, &observed_serve(7)).is_some(),
+            "equal evidence and body must be witnessable"
         );
-        assert!(RepeatWitness::observe(&prior, &evidence(8)).is_none());
+        assert!(RepeatWitness::observe(&prior, &observed_serve(8)).is_none());
         let mut files = evidence(7);
         files.index_files += 1;
-        assert!(RepeatWitness::observe(&prior, &files).is_none());
+        assert!(RepeatWitness::observe(&prior, &with(files)).is_none());
         let mut state = evidence(7);
         state.index_state = "Loading".to_string();
-        assert!(RepeatWitness::observe(&prior, &state).is_none());
+        assert!(RepeatWitness::observe(&prior, &with(state)).is_none());
         let mut root = evidence(7);
         root.canonical_root = None;
-        assert!(RepeatWitness::observe(&prior, &root).is_none());
+        assert!(RepeatWitness::observe(&prior, &with(root)).is_none());
         let mut source = evidence(7);
         source.load_source = "snapshot".to_string();
-        assert!(RepeatWitness::observe(&prior, &source).is_none());
+        assert!(RepeatWitness::observe(&prior, &with(source)).is_none());
         let mut symbols = evidence(7);
         symbols.index_symbols += 1;
-        assert!(RepeatWitness::observe(&prior, &symbols).is_none());
+        assert!(RepeatWitness::observe(&prior, &with(symbols)).is_none());
         let mut id = evidence(7);
         id.project_id.push('x');
-        assert!(RepeatWitness::observe(&prior, &id).is_none());
+        assert!(RepeatWitness::observe(&prior, &with(id)).is_none());
         let mut name = evidence(7);
         name.project_name.push('x');
-        assert!(RepeatWitness::observe(&prior, &name).is_none());
+        assert!(RepeatWitness::observe(&prior, &with(name)).is_none());
+        // F1: equal evidence, different rendered body => no witness.
+        let other_body = ObservedServe {
+            evidence: evidence(7),
+            body_digest: BodyDigest::of_content(&[ContentBlock::text("body\n\ndiagnostic")]),
+        };
+        assert!(RepeatWitness::observe(&prior, &other_body).is_none());
         assert_eq!(
-            RepeatWitness::observe(&prior, &evidence(7))
+            RepeatWitness::observe(&prior, &observed_serve(7))
                 .expect("witness")
                 .evidence_generation(),
             7
@@ -550,7 +615,8 @@ mod tests {
     // Oracle 10 — threshold boundary (2 vs 3) and saturating count.
     #[test]
     fn notice_threshold_is_three_and_count_saturates() {
-        let witness = || RepeatWitness::observe(&evidence(1), &evidence(1)).expect("witness");
+        let witness =
+            || RepeatWitness::observe(&observed_serve(1), &observed_serve(1)).expect("witness");
         let k = key("search_symbols", "anchor");
         assert!(
             RepeatNotice::new(witness(), 2, &k).is_none(),
@@ -598,7 +664,7 @@ mod tests {
         // The typed observation rule.
         assert!(matches!(
             ServeObservation::from_result(&result_with(full.clone(), None, None)),
-            ServeObservation::Observed(ref ev) if *ev == evidence(5)
+            ServeObservation::Observed(ref serve) if *serve == observed_serve(5)
         ));
         assert!(matches!(
             ServeObservation::from_result(&result_with(marker.clone(), None, None)),
@@ -835,12 +901,90 @@ mod tests {
         );
     }
 
+    // F1 — the witness observes the RESULT, not only the evidence: a serve
+    // whose rendered body changed while the evidence stayed equal (the
+    // `search_text` zero-hit untracked-file diagnostic is computed from live
+    // git status, outside the evidence fence) replaces the run at count 1 and
+    // never earns a notice.
+    #[test]
+    fn body_change_with_equal_evidence_replaces_run() {
+        let full = serde_json::to_value(evidence(3)).expect("evidence serializes");
+        let serve = |blocks: &[&str]| {
+            let mut result = result_with(full.clone(), None, None);
+            result.content = blocks
+                .iter()
+                .map(|text| ContentBlock::text(*text))
+                .collect();
+            ServeObservation::from_result(&result)
+        };
+        let k = key("search_text", "needle-zz");
+
+        let mut tracker = RepeatTracker::default();
+        assert!(
+            tracker
+                .record_serve(k.clone(), serve(&["no matches"]))
+                .is_none()
+        );
+        assert!(
+            tracker
+                .record_serve(k.clone(), serve(&["no matches"]))
+                .is_none()
+        );
+        assert_eq!(tracker.count_of(&k), Some(2));
+        assert!(
+            tracker
+                .record_serve(
+                    k.clone(),
+                    serve(&["no matches\n\nuntracked file may match: 1 untracked path(s)"]),
+                )
+                .is_none(),
+            "a changed body under equal evidence must never notice"
+        );
+        assert_eq!(
+            tracker.count_of(&k),
+            Some(1),
+            "the run restarts at 1 on the new body"
+        );
+        // Block framing is part of identity: the same bytes split differently
+        // are a different result.
+        assert!(
+            tracker
+                .record_serve(k.clone(), serve(&["ab", "c"]))
+                .is_none()
+        );
+        assert_eq!(tracker.count_of(&k), Some(1));
+        assert!(
+            tracker
+                .record_serve(k.clone(), serve(&["a", "bc"]))
+                .is_none()
+        );
+        assert_eq!(tracker.count_of(&k), Some(1), "framing differs => restart");
+
+        // Positive control: an unchanged body notices on the third serve.
+        let mut tracker = RepeatTracker::default();
+        assert!(
+            tracker
+                .record_serve(k.clone(), serve(&["no matches"]))
+                .is_none()
+        );
+        assert!(
+            tracker
+                .record_serve(k.clone(), serve(&["no matches"]))
+                .is_none()
+        );
+        let notice = tracker
+            .record_serve(k.clone(), serve(&["no matches"]))
+            .expect("an unchanged body under equal evidence notices");
+        assert_eq!(notice.repeat_count(), 3);
+    }
+
     // Delivery: both carriers, appended to the FINAL text block, prior bytes
     // and isError untouched; a text block is created when none exists.
     #[test]
     fn notice_attaches_to_final_text_block_and_meta() {
         let k = key("get_repo_map", "anchor");
-        let witness = RepeatWitness::observe(&evidence(4), &evidence(4)).expect("witness");
+        let witness =
+            RepeatWitness::observe(&observed_serve(4), &observed_serve(4)).expect("witness");
         let notice = RepeatNotice::new(witness, 3, &k).expect("notice");
 
         let mut result = CallToolResult::success(vec![

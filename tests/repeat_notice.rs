@@ -840,3 +840,103 @@ fn every_eligible_tool_is_byte_stable_and_notices_on_third_serve() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// F1 — the witness must observe the RESULT, not only the evidence. On every
+// zero-hit result `search_text` appends an "untracked file may match"
+// diagnostic computed at query time from live `git status` plus raw worktree
+// content — an input the index never publishes. An untracked `.symforge/tee/*.rs`
+// edit snapshot is exactly such a file: `.symforge/` is hard-scope-excluded from
+// the walker AND the watcher, the gitignore hygiene never creates a root
+// `.gitignore`, and the sweep classifies every untracked path as code. So the
+// body changes while the evidence compares equal — and a notice here would be
+// a false "cannot differ".
+// ---------------------------------------------------------------------------
+
+fn run_git(cwd: &Path, args: &[&str]) {
+    let out = symforge::process_util::hidden_command("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("git spawn failed for {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} in {cwd:?} failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// The untracked sweep needs a git worktree; commit the seed so the only
+/// untracked path is the one the test plants.
+fn git_init_with_initial_commit(root: &Path) {
+    run_git(root, &["init", "-b", "main"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "user.name", "repeat-notice-test"]);
+    run_git(root, &["add", "-A"]);
+    run_git(root, &["commit", "-q", "-m", "initial"]);
+}
+
+#[test]
+fn untracked_file_diagnostic_never_earns_a_notice() {
+    let workspace = Workspace::seed();
+    git_init_with_initial_commit(workspace.root());
+    let mut client = StdioClient::spawn(workspace.root());
+    let stable = stabilize(&mut client);
+
+    // Two zero-hit serves: identical, no diagnostic, no notice.
+    let args = json!({"query": "needle-zz"});
+    let serve1 = client.call_tool_result("search_text", args.clone());
+    assert_no_notice(&serve1, "serve 1");
+    assert!(
+        !text_of(&serve1).contains("untracked file may match"),
+        "serve 1 must carry no untracked diagnostic yet: {}",
+        text_of(&serve1)
+    );
+    assert_eq!(evidence(&serve1), &stable, "serve 1 evidence");
+    let serve2 = client.call_tool_result("search_text", args.clone());
+    assert_no_notice(&serve2, "serve 2");
+    assert_eq!(serve2, serve1, "serve 2 must be byte-identical to serve 1");
+
+    // An untracked file the index will never admit, containing the needle.
+    let tee = workspace.root().join(".symforge").join("tee");
+    std::fs::create_dir_all(&tee).expect("tee dir");
+    std::fs::write(
+        tee.join("snapshot.rs"),
+        "// needle-zz lives here, outside the index\n",
+    )
+    .expect("plant untracked snapshot");
+
+    // Serve 3: the body DIFFERS (the diagnostic appeared) while the evidence is
+    // still equal — the seam must not claim "cannot differ".
+    let serve3 = client.call_tool_result("search_text", args);
+    assert_eq!(
+        evidence(&serve3),
+        &stable,
+        "the planted file must not move the published evidence (it is outside the index)"
+    );
+    assert!(
+        text_of(&serve3).contains("untracked file may match"),
+        "serve 3 must render the untracked diagnostic: {}",
+        text_of(&serve3)
+    );
+    assert_ne!(
+        text_of(&serve3),
+        text_of(&serve1),
+        "serve 3 body must differ from serve 1"
+    );
+    assert_no_notice(&serve3, "serve 3 (body changed under equal evidence)");
+
+    // Positive control: a query with hits (no sweep, no untracked
+    // interference) notices on its third serve in the same session.
+    let control = json!({"query": "alpha_anchor"});
+    let c1 = client.call_tool_result("search_text", control.clone());
+    assert_no_notice(&c1, "control serve 1");
+    assert!(text_of(&c1).contains("alpha_anchor"));
+    let c2 = client.call_tool_result("search_text", control.clone());
+    assert_no_notice(&c2, "control serve 2");
+    assert_eq!(c2, c1);
+    let c3 = client.call_tool_result("search_text", control);
+    let stripped = assert_notice_and_strip(&c3, 3, "search_text", "control serve 3");
+    assert_eq!(stripped, c1);
+}
