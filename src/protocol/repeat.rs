@@ -303,11 +303,17 @@ impl RepeatWitness {
     /// the result that just differed; the claim cannot survive it. Private:
     /// only [`RepeatTracker::record_serve`] may witness.
     fn observe(prior: &ObservedServe, current: &ObservedServe) -> Option<Self> {
-        (prior.evidence == current.evidence && prior.body_digest == current.body_digest).then_some(
-            Self {
-                generation: current.evidence.generation,
-            },
-        )
+        // F4: compare the WHOLE value, not a list of named fields. A named
+        // list silently excludes any field added to `ObservedServe` later —
+        // the observation would quietly stop covering part of what it claims
+        // to have observed. This relies on `ObservedServe`'s derived
+        // `PartialEq`, which is regenerated with the struct, so a new field
+        // joins the witness by construction. (An exhaustive destructure would
+        // force a decision at the cost of failing to compile, but is strictly
+        // weaker here: it must then re-list the fields to compare them.)
+        (prior == current).then_some(Self {
+            generation: current.evidence.generation,
+        })
     }
 
     pub fn evidence_generation(&self) -> u64 {
@@ -783,6 +789,15 @@ mod tests {
     }
 
     // Oracle 10 — the witness exists only on full equality (evidence AND body).
+    //
+    // F4 (round 2): the cases below enumerate today's fields, but the witness
+    // itself compares the WHOLE `ObservedServe` and relies on that struct's
+    // DERIVED `PartialEq` — so a field added later joins the comparison
+    // without anyone remembering to name it here. Removing that derive, or
+    // hand-writing a `PartialEq` that skips a field, silently narrows what the
+    // notice claims to have observed; keep the derive. (Verified by
+    // simulation: with the old named-field comparison, an added third field
+    // differing alone still produced a witness.)
     #[test]
     fn witness_requires_full_equality() {
         let prior = observed_serve(7);
