@@ -388,6 +388,11 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
         "starting daemon-backed MCP server on stdio transport"
     );
     let shutdown_slot = server.daemon_client_slot();
+    // Feature 032 (F3): stdio serves exactly one client per process, so this
+    // server instance IS the session — the one lane the repeat tracker may
+    // attribute a run to. Declared here, at the transport, so a lane that does
+    // not say so stays inert instead of sharing a count across clients.
+    let server = server.with_stdio_transport_lane();
     let service = serve_server(server, transport::stdio()).await?;
 
     tokio::select! {
@@ -639,6 +644,10 @@ async fn run_local_mcp_server_async(
     }
 
     tracing::info!("starting MCP server on stdio transport");
+    // Feature 032 (F3): see the daemon-backed path above — stdio is the one
+    // transport whose process/client/session identity is observable, so it is
+    // the one that declares itself to the repeat tracker.
+    let server = server.with_stdio_transport_lane();
     let service = serve_server(server, transport::stdio()).await?;
 
     // Wait for either MCP server shutdown (stdin EOF) or Ctrl+C/SIGTERM.

@@ -132,50 +132,111 @@ pub fn project_evidence_matches_selector(
     }
 }
 
-tokio::task_local! {
-    /// Selected-project evidence for the tool call currently being rendered.
-    /// Scoped once per `tools/call` dispatch by [`with_project_evidence_scope`],
+/// What one dispatch OBSERVED while rendering its response.
+///
+/// Constructed fresh by [`with_project_evidence_scope`] on every `tools/call` /
+/// `resources/read` and dropped with that scope, so nothing recorded here can
+/// be read by the next call. Both slots describe the SAME response, which is
+/// why they share one scope rather than living in two independent task-locals
+/// that could be entered and cleared on different schedules.
+#[derive(Debug)]
+struct DispatchObservations {
+    /// Selected-project evidence for the tool call currently being rendered:
     /// seeded with the LOCAL bound-project evidence, and overwritten by the
     /// daemon proxy layer when the daemon answered (the daemon's receipt names
     /// the project that actually served — which may be an explicitly routed
-    /// sibling, not the local home). Same bound-to-the-future pattern as the
-    /// D23 connection-surface task-local.
-    static PROJECT_EVIDENCE: std::cell::RefCell<Option<ProjectEvidence>>;
+    /// sibling, not the local home).
+    evidence: Option<ProjectEvidence>,
+    /// Feature 032 (F1): set when a renderer consulted an input this response's
+    /// project evidence does NOT fence — live `git status`, raw worktree bytes,
+    /// `fs::metadata`. Latched (never cleared within a dispatch) because the
+    /// question is "did this response depend on anything unpublished", and one
+    /// such read is enough to make "the result cannot differ until the index
+    /// changes" a claim nobody observed.
+    unfenced_input: bool,
 }
 
-/// Run one `tools/call` dispatch with the evidence slot bound. `seed` is the
-/// local bound-project evidence (or `None` when nothing is bound yet).
+tokio::task_local! {
+    /// Per-dispatch observation slots. Scoped once per `tools/call` dispatch by
+    /// [`with_project_evidence_scope`]. Same bound-to-the-future pattern as the
+    /// D23 connection-surface task-local.
+    static DISPATCH: std::cell::RefCell<DispatchObservations>;
+}
+
+/// Run one `tools/call` dispatch with the observation slots bound. `seed` is
+/// the local bound-project evidence (or `None` when nothing is bound yet); the
+/// unfenced-input latch always starts clear.
 pub async fn with_project_evidence_scope<F, T>(seed: Option<ProjectEvidence>, future: F) -> T
 where
     F: Future<Output = T>,
 {
-    PROJECT_EVIDENCE
-        .scope(std::cell::RefCell::new(seed), future)
+    DISPATCH
+        .scope(
+            std::cell::RefCell::new(DispatchObservations {
+                evidence: seed,
+                unfenced_input: false,
+            }),
+            future,
+        )
         .await
 }
 
 /// Overwrite the in-scope evidence with the daemon's receipt for this call.
 /// No-op outside a dispatch scope (direct unit-test calls, hook paths).
 pub fn record_project_evidence(evidence: ProjectEvidence) {
-    let _ = PROJECT_EVIDENCE.try_with(|cell| *cell.borrow_mut() = Some(evidence));
+    let _ = DISPATCH.try_with(|cell| cell.borrow_mut().evidence = Some(evidence));
 }
 
 /// Clear any previously seeded or recorded evidence in the current dispatch.
 ///
 /// A routed call uses this before crossing into another project so a missing,
 /// malformed, or failed daemon receipt cannot fall back to the adapter's home
-/// evidence and mislabel the response.
+/// evidence and mislabel the response. Deliberately does NOT touch the
+/// unfenced-input latch: crossing into another project does not un-read the
+/// worktree bytes this response already rendered from.
 pub fn clear_project_evidence() {
-    let _ = PROJECT_EVIDENCE.try_with(|cell| *cell.borrow_mut() = None);
+    let _ = DISPATCH.try_with(|cell| cell.borrow_mut().evidence = None);
 }
 
 /// Evidence for the response currently being built, if a dispatch scope is
 /// active and populated.
 pub fn current_project_evidence() -> Option<ProjectEvidence> {
-    PROJECT_EVIDENCE
-        .try_with(|cell| cell.borrow().clone())
+    DISPATCH
+        .try_with(|cell| cell.borrow().evidence.clone())
         .ok()
         .flatten()
+}
+
+/// Feature 032 (F1): record that this dispatch rendered from an input the
+/// published index does not fence.
+///
+/// Observation: the CALLER's own read. A renderer that reaches outside the
+/// index — `git status`, raw worktree bytes, `fs::metadata` — calls this
+/// before doing so, and the `call_tool` seam withholds the repeat notice's
+/// "the result cannot differ until the index changes" claim for the whole
+/// response. Idempotent: the latch answers "did anything unfenced feed this
+/// response", not "how many".
+///
+/// When the observation cannot be recorded — no dispatch scope, i.e. a
+/// renderer that moved onto another task via `spawn`/`spawn_blocking` — this
+/// is a silent no-op, which would cost the fence. Both production callers
+/// (`matching_untracked_paths_for_search_text`,
+/// `admission_degradation_view_from_disk`) run inline on the dispatch task,
+/// and `tests/repeat_notice.rs` pins that end to end through a real server:
+/// a lost latch fails those oracles rather than shipping a false claim.
+pub(crate) fn note_unfenced_input() {
+    let _ = DISPATCH.try_with(|cell| cell.borrow_mut().unfenced_input = true);
+}
+
+/// Whether this dispatch consulted an input its project evidence does not
+/// fence. Outside a dispatch scope there is no response being rendered and
+/// therefore nothing that could have consulted anything, so this reads
+/// `false`; the only production reader is the `call_tool` seam, which is
+/// always inside the scope.
+pub(crate) fn unfenced_input_consulted() -> bool {
+    DISPATCH
+        .try_with(|cell| cell.borrow().unfenced_input)
+        .unwrap_or(false)
 }
 
 /// FR-319 (spec 025): central evidence attachment at the trait-boundary seam.

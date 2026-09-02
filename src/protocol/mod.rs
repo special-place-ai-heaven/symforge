@@ -260,6 +260,14 @@ pub struct SymForgeServer {
     /// locks it synchronously after the awaited dispatch and never holds it
     /// across an `.await`.
     pub(crate) repeat_tracker: Arc<Mutex<repeat::RepeatTracker>>,
+    /// Feature 032 (US1, F3): the transport this server was WIRED for,
+    /// declared at construction and never inferred from a request. Defaults to
+    /// [`repeat::TransportLane::Shared`] (inert) so a transport that reaches
+    /// `call_tool` without declaring itself single-client gets no repeat
+    /// notice, rather than silently becoming one shared accumulating bucket
+    /// for every client behind it. Only [`Self::with_stdio_transport_lane`]
+    /// moves it, and only the two stdio entry points call that.
+    pub(crate) transport_lane: repeat::TransportLane,
     /// Tracks edit-tool calls that omitted `working_directory` while the
     /// transitional worktree observability knob was on. Surfaced by the
     /// `health` tool as a rolling "last hour" signal.
@@ -428,6 +436,7 @@ impl SymForgeServer {
             ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             repeat_tracker: Arc::new(Mutex::new(repeat::RepeatTracker::default())),
+            transport_lane: repeat::TransportLane::default(),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
             #[cfg(feature = "server")]
@@ -505,6 +514,7 @@ impl SymForgeServer {
             ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             repeat_tracker: Arc::new(Mutex::new(repeat::RepeatTracker::default())),
+            transport_lane: repeat::TransportLane::default(),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
             #[cfg(feature = "server")]
@@ -527,6 +537,21 @@ impl SymForgeServer {
         store: Arc<crate::stel::ledger_store::StelLedgerStore>,
     ) -> Self {
         self.stel_ledger_store = Some(store);
+        self
+    }
+
+    /// Feature 032 (F3): declare this server's transport as single-client
+    /// stdio, the ONE condition under which the repeat tracker may attribute
+    /// a run to a session.
+    ///
+    /// Called only by the two stdio entry points (`src/cli/entry.rs`: the
+    /// local server and the daemon-proxy adapter), where one process serves
+    /// exactly one client, so the server instance IS the session. Every other
+    /// wiring leaves the lane [`repeat::TransportLane::Shared`] and never
+    /// accumulates — a lane that cannot be attributed produces no notice
+    /// instead of a count shared across clients (spec FR-002 / Scenario 5).
+    pub fn with_stdio_transport_lane(mut self) -> Self {
+        self.transport_lane = repeat::TransportLane::Stdio;
         self
     }
 
@@ -2197,8 +2222,21 @@ impl ServerHandler for SymForgeServer {
         // BEFORE `ToolCallContext::new` moves it. `None` means this call never
         // touches the tracker: an inert lane (no observable session identity),
         // an ineligible tool, or a set-valued `projects` fan-out.
+        //
+        // F2: the tracker's incarnation epoch is read HERE, before dispatch,
+        // and carried on the key. rmcp runs each request in its own task, so a
+        // concurrent request's transition `clear()` can land between this read
+        // and the post-dispatch record; a key stamped with the superseded
+        // epoch is refused there instead of anchoring a run across the change.
+        // The epoch is read under the same lock that owns the run map — one
+        // owner, so a reader can never see a bumped epoch beside stale runs.
+        // Read unconditionally rather than behind an eligibility pre-check so
+        // `RepeatKey::observe` stays the single owner of "does this call touch
+        // the tracker"; an uncontended `parking_lot` lock on a `u64` is far
+        // below the per-call budget of a handler that queries the index.
         let repeat_key = repeat::RepeatKey::observe(
-            repeat::SessionDiscriminator::observe(&context),
+            repeat::SessionDiscriminator::observe(self.transport_lane, &context),
+            self.repeat_tracker.lock().epoch(),
             request.name.as_ref(),
             request.arguments.as_ref(),
         );
@@ -3492,13 +3530,58 @@ mod tests {
         );
     }
 
+    /// Feature 032 (F3): repeat runs accumulate only on a lane an entry point
+    /// positively DECLARED single-client. Every constructor therefore leaves
+    /// the lane shared/inert; only [`SymForgeServer::with_stdio_transport_lane`]
+    /// moves it, and only the two stdio entry points in `src/cli/entry.rs`
+    /// call that. A new transport that forgets to declare itself gets no
+    /// notice rather than one shared accumulating bucket.
+    #[test]
+    fn constructed_servers_default_to_an_inert_transport_lane() {
+        let local = make_local_server(None);
+        assert_eq!(
+            local.transport_lane,
+            repeat::TransportLane::Shared,
+            "new_with_state_placement must leave the lane inert"
+        );
+        assert_eq!(
+            local.clone().transport_lane,
+            repeat::TransportLane::Shared,
+            "a clone (the HTTP factory clones per request) inherits the lane"
+        );
+
+        let proxy =
+            SymForgeServer::new_daemon_proxy(crate::daemon::DaemonSessionClient::new_for_test(
+                "http://127.0.0.1:1".to_string(),
+                "project-id".to_string(),
+                "session-id".to_string(),
+                "project-name".to_string(),
+            ));
+        assert_eq!(
+            proxy.transport_lane,
+            repeat::TransportLane::Shared,
+            "new_daemon_proxy_with_state_placement must leave the lane inert"
+        );
+
+        // Positive control: the declaration is what moves it, and it survives
+        // the clone the transports take.
+        let declared = local.with_stdio_transport_lane();
+        assert_eq!(declared.transport_lane, repeat::TransportLane::Stdio);
+        assert_eq!(
+            declared.clone().transport_lane,
+            repeat::TransportLane::Stdio
+        );
+    }
+
     /// Feature 032 (F2): seed one repeat run at count 2 on `server`, as the
     /// seam would after two identical eligible serves, and return its key.
     fn seed_repeat_run(server: &SymForgeServer) -> repeat::RepeatKey {
         let args: rmcp::model::JsonObject =
             serde_json::from_value(serde_json::json!({ "query": "anchor" })).expect("object");
+        let epoch = server.repeat_tracker.lock().epoch();
         let key = repeat::RepeatKey::observe(
             repeat::LaneWitness::assume(repeat::SessionDiscriminator::Stdio),
+            epoch,
             "search_symbols",
             Some(&args),
         )

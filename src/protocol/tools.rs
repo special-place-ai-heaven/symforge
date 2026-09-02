@@ -2589,6 +2589,13 @@ fn matching_untracked_paths_for_search_text(
     is_regex: bool,
     options: &search::TextSearchOptions,
 ) -> Vec<String> {
+    // Feature 032 (F1): this sweep renders from live `git status` and raw
+    // worktree bytes — inputs the published index does not fence — so the
+    // `call_tool` seam must withhold the repeat notice's "the result cannot
+    // differ until the index changes" claim for this whole response. Latched
+    // at the TOP, before any early return: a repo that gains a `.git` later,
+    // or an empty sweep today, says nothing about the next serve.
+    super::result_status::note_unfenced_input();
     if structural {
         return Vec::new();
     }
@@ -2653,6 +2660,12 @@ fn admission_degradation_view_from_disk(
     repo_root: &Path,
     path: &str,
 ) -> Option<AdmissionDegradationView> {
+    // Feature 032 (F1): the index has no record of this path, so the view is
+    // built from `fs::metadata` (rendered as the `Size:` line) and the file's
+    // first bytes — disk state the published index does not fence. Latched at
+    // the TOP, before any early return, so the `call_tool` seam withholds the
+    // repeat notice's "cannot differ" claim for this whole response.
+    super::result_status::note_unfenced_input();
     let canonical_root = std::fs::canonicalize(repo_root).ok()?;
     let raw_path = Path::new(path);
     let candidate = if raw_path.is_absolute() {

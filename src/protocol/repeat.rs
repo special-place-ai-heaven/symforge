@@ -9,14 +9,25 @@
 //! response — text and `_meta`, contract in
 //! `specs/032-repeat-call-breaker/contracts/repeat-notice.md`.
 //!
-//! Zero false claims dominates every trade-off here (spec SC-002): a notice is
-//! constructible ONLY from a [`RepeatWitness`], which exists only on observed
-//! full equality of two typed evidence values AND of the rendered result
-//! bytes (some eligible renderers read inputs the index never publishes —
-//! `search_text`'s zero-hit untracked-file sweep reads live `git status` —
-//! so evidence equality alone cannot witness "cannot differ"), and anything
-//! the seam cannot observe — an inert lane, an unavailable-evidence marker,
-//! an unbound project, an internal failure — removes the run instead of
+//! Zero false claims dominates every trade-off here (spec SC-002). The notice
+//! makes a claim about the FUTURE ("the result cannot differ until the index
+//! changes"), so equality of the past serves is necessary but not sufficient —
+//! it must also be true that every input to the rendered answer is fenced by
+//! the compared evidence. Two independent guards enforce that:
+//!
+//! 1. A [`RepeatNotice`] is constructible ONLY from a [`RepeatWitness`], which
+//!    exists only on observed full equality of two typed evidence values AND
+//!    of the rendered result bytes.
+//! 2. A renderer that reaches outside the index — `search_text`'s zero-hit
+//!    untracked-file sweep (live `git status` + raw worktree bytes), the
+//!    admission-tier disk fallback (`fs::metadata` + first bytes) — latches
+//!    [`result_status::note_unfenced_input`] on the dispatch scope, and the
+//!    seam reads it back as [`UnobservedReason::UnfencedInput`]: the run is
+//!    REMOVED, so such a response never notices and never accumulates.
+//!
+//! Anything else the seam cannot observe — an inert lane, an unavailable-
+//! evidence marker, an unbound project, an internal failure, a serve whose
+//! observation predates an incarnation clear — removes the run instead of
 //! guessing. Interleaved *different* calls never reset a run (spec FR-002);
 //! evidence drift is how an index change is observed (research.md R6), and a
 //! body that differs under equal evidence restarts the run (a false negative,
@@ -65,13 +76,37 @@ pub fn is_repeat_eligible(tool: &str) -> bool {
     REPEAT_ELIGIBLE_TOOLS.contains(&tool)
 }
 
+/// How the server serving this request was WIRED — declared once at
+/// construction by the entry point, never inferred from a request.
+///
+/// `Stdio` is set ONLY by [`crate::protocol::SymForgeServer::with_stdio_transport_lane`],
+/// which only the two stdio entry points in `src/cli/entry.rs` call: one
+/// process serves exactly one client there, so the server instance IS the
+/// session. Everything else — the shared HTTP `/mcp` server, the daemon
+/// worker, an in-process `serve_directly`, a future SSE or socket adapter —
+/// keeps the default `Shared` and never accumulates. Absence of a declaration
+/// is not evidence of single-client-ness (F3 / research.md R12 finding 3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransportLane {
+    Stdio,
+    #[default]
+    Shared,
+}
+
 /// The session lane the seam OBSERVED for one request (research.md R9).
 ///
-/// * `Stdio`: one client per process, so the server instance is the session.
-/// * `HttpInert`: the shared, stateless `/mcp` lane. rmcp never creates a
-///   session there (`mcp_http.rs` pins `legacy_session_mode == false`), so no
-///   per-session identity is observable and the tracker never interacts — an
-///   unattributable count would be an unobserved claim (spec FR-002).
+/// * `Stdio`: the entry point declared a single-client transport AND rmcp's
+///   HTTP marker is absent, so the server instance is the session.
+/// * `HttpInert`: everything else — the shared, stateless `/mcp` lane (rmcp
+///   never creates a session there: `mcp_http.rs` pins
+///   `legacy_session_mode == false`) and any transport that did not declare
+///   itself single-client. No per-session identity is observable, so the
+///   tracker never interacts: an unattributable count would be an unobserved
+///   claim (spec FR-002).
+///
+/// (Round 2 note: `HttpInert` now also covers undeclared non-HTTP transports.
+/// The variant name is the one data-model.md pins; the wider meaning is
+/// documented here rather than renamed under a spec this change may not edit.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionDiscriminator {
     Stdio,
@@ -79,31 +114,40 @@ pub enum SessionDiscriminator {
 }
 
 impl SessionDiscriminator {
-    /// Observation: whether rmcp's streamable-HTTP transport inserted the
-    /// inbound `http::request::Parts` into the request extensions. Only that
-    /// transport does (both of its stateless paths); the stdio transport
-    /// inserts nothing. Presence is therefore the inert lane and absence is
-    /// stdio — there is no third outcome to misreport. The result is a
-    /// [`LaneWitness`]: proof the lane was read off a real request context.
-    pub fn observe(context: &RequestContext<RoleServer>) -> LaneWitness {
-        LaneWitness(
-            if context
+    /// Observation: the lane the entry point DECLARED, plus whether rmcp's
+    /// streamable-HTTP transport inserted the inbound `http::request::Parts`
+    /// into the request extensions. The result is a [`LaneWitness`]: proof the
+    /// lane was read off a real request context and a real declaration.
+    pub fn observe(declared: TransportLane, context: &RequestContext<RoleServer>) -> LaneWitness {
+        Self::from_observations(
+            declared,
+            context
                 .extensions
                 .get::<axum::http::request::Parts>()
-                .is_some()
-            {
-                Self::HttpInert
-            } else {
-                Self::Stdio
-            },
+                .is_some(),
         )
+    }
+
+    /// The rule, separated from the un-constructible `RequestContext` so it is
+    /// directly testable (research.md R12 finding 13: no test can build one).
+    ///
+    /// `Stdio` requires BOTH a positive declaration and the absence of the
+    /// HTTP marker. Either observation failing yields the inert lane — a
+    /// missing declaration is not a `Stdio`, and a declared-stdio server that
+    /// somehow sees an HTTP request is a contradiction, not a session.
+    fn from_observations(declared: TransportLane, http_parts_present: bool) -> LaneWitness {
+        LaneWitness(match (declared, http_parts_present) {
+            (TransportLane::Stdio, false) => Self::Stdio,
+            _ => Self::HttpInert,
+        })
     }
 }
 
-/// Proof that the session lane was OBSERVED from a request context rather
-/// than asserted by a caller. The private field means only
-/// [`SessionDiscriminator::observe`] (and the in-crate test door) can mint
-/// one, so no seam can hand the tracker a `Stdio` it never observed.
+/// Proof that the session lane was OBSERVED from a request context and the
+/// server's own declaration rather than asserted by a caller. The private
+/// field means only [`SessionDiscriminator::observe`] (and the in-crate test
+/// door) can mint one, so no seam can hand the tracker a `Stdio` it never
+/// observed.
 #[derive(Debug, Clone, Copy)]
 pub struct LaneWitness(SessionDiscriminator);
 
@@ -112,15 +156,45 @@ impl LaneWitness {
     pub(crate) fn assume(lane: SessionDiscriminator) -> Self {
         Self(lane)
     }
+
+    #[cfg(test)]
+    fn lane(&self) -> SessionDiscriminator {
+        self.0
+    }
 }
 
-/// Identity of one repeatable request: the observed lane, the tool as
-/// dispatched, and the canonical-JSON fingerprint of its arguments. Two calls
-/// are "identical" iff `tool` and `request_hash` match; only `Stdio` keys are
-/// ever constructed, so `session` is a witness that the lane was observed.
+/// The tracker's incarnation counter, minted ONLY by [`RepeatTracker::epoch`]
+/// (and the in-crate test door) so no caller can assert an epoch it did not
+/// read off the tracker.
+///
+/// The seam reads it BEFORE dispatch and carries it on the [`RepeatKey`];
+/// [`RepeatTracker::record_serve`] refuses any serve whose epoch is not the
+/// current one. That is what stops an in-flight serve — observed against
+/// incarnation X, recorded after a concurrent request's transition
+/// [`RepeatTracker::clear`] — from anchoring a run that spans X and its
+/// replacement (`ProjectEvidence.generation` is a per-process counter, so a
+/// replacement index can return evidence byte-equal to the dead one's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrackerEpoch(u64);
+
+impl TrackerEpoch {
+    #[cfg(test)]
+    pub(crate) const fn assume(epoch: u64) -> Self {
+        Self(epoch)
+    }
+}
+
+/// Identity of one repeatable request: the observed lane, the tracker
+/// incarnation the seam read before dispatch, the tool as dispatched, and the
+/// canonical-JSON fingerprint of its arguments. Two calls are "identical" iff
+/// `tool` and `request_hash` match within one incarnation; only `Stdio` keys
+/// are ever constructed, so `session` is a witness that the lane was observed.
+/// `epoch` is part of the derived identity as well as an explicit guard, so a
+/// pre-clear key cannot even hash-match a post-clear run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepeatKey {
     session: SessionDiscriminator,
+    epoch: TrackerEpoch,
     tool: String,
     request_hash: RequestHash,
 }
@@ -131,7 +205,16 @@ impl RepeatKey {
     /// lane structurally withholds per-project evidence — research.md R6).
     /// `None` means no tracker interaction at all: the seam cannot key what
     /// it cannot attribute. Absent arguments fingerprint as the empty object.
-    pub fn observe(lane: LaneWitness, tool: &str, arguments: Option<&JsonObject>) -> Option<Self> {
+    ///
+    /// `epoch` must be read from the tracker BEFORE the dispatch whose result
+    /// this key will record, so an incarnation change during the dispatch is
+    /// observable at record time.
+    pub fn observe(
+        lane: LaneWitness,
+        epoch: TrackerEpoch,
+        tool: &str,
+        arguments: Option<&JsonObject>,
+    ) -> Option<Self> {
         let session = lane.0;
         if session != SessionDiscriminator::Stdio || !is_repeat_eligible(tool) {
             return None;
@@ -146,6 +229,7 @@ impl RepeatKey {
         let request_hash = RequestHash::for_tool_request(tool, &args).ok()?;
         Some(Self {
             session,
+            epoch,
             tool: tool.to_string(),
             request_hash,
         })
@@ -219,11 +303,17 @@ impl RepeatWitness {
     /// the result that just differed; the claim cannot survive it. Private:
     /// only [`RepeatTracker::record_serve`] may witness.
     fn observe(prior: &ObservedServe, current: &ObservedServe) -> Option<Self> {
-        (prior.evidence == current.evidence && prior.body_digest == current.body_digest).then_some(
-            Self {
-                generation: current.evidence.generation,
-            },
-        )
+        // F4: compare the WHOLE value, not a list of named fields. A named
+        // list silently excludes any field added to `ObservedServe` later —
+        // the observation would quietly stop covering part of what it claims
+        // to have observed. This relies on `ObservedServe`'s derived
+        // `PartialEq`, which is regenerated with the struct, so a new field
+        // joins the witness by construction. (An exhaustive destructure would
+        // force a decision at the cost of failing to compile, but is strictly
+        // weaker here: it must then re-list the fields to compare them.)
+        (prior == current).then_some(Self {
+            generation: current.evidence.generation,
+        })
     }
 
     pub fn evidence_generation(&self) -> u64 {
@@ -329,6 +419,12 @@ pub enum UnobservedReason {
     /// `OutcomeClass` unobservable on this lane (no `symforge/result_status`)
     /// and `isError == true`: cleared conservatively.
     ErrorWithoutOutcomeClass,
+    /// A renderer in this dispatch consulted an input the published index does
+    /// not fence (`result_status::note_unfenced_input`). Evidence equality
+    /// witnesses that the PAST serves matched; the notice's sentence is about
+    /// the FUTURE, and nothing here fences that input, so the claim is
+    /// withheld and the run removed.
+    UnfencedInput,
 }
 
 /// What the seam observed on the OUTGOING response of one eligible call.
@@ -366,15 +462,27 @@ impl ServeObservation {
         }
     }
 
-    /// Observation: the response's own `_meta` — the evidence the seam
-    /// attached (or the statused writer attached first), the outcome class
-    /// read leniently from `symforge/result_status` — and the digest of the
-    /// text content the response renders (before any notice is appended).
-    /// Every outcome other than an observed `InternalFailure` (or an
-    /// unclassifiable error) ADVANCES a run: `NotFound`, `EmptyResult`,
-    /// `InvalidRequest` loops are the motivating case (data-model.md state
-    /// machine). Anything this cannot read emits `Unobserved`, never a default.
+    /// Observation: the dispatch's own unfenced-input latch, then the
+    /// response's `_meta` — the evidence the seam attached (or the statused
+    /// writer attached first), the outcome class read leniently from
+    /// `symforge/result_status` — and the digest of the text content the
+    /// response renders (before any notice is appended).
+    ///
+    /// The latch is read FIRST because it is the claim-killer: no amount of
+    /// observed equality can license "the result cannot differ" for a body
+    /// built from something the index never published. Every outcome other
+    /// than that, an observed `InternalFailure`, or an unclassifiable error
+    /// ADVANCES a run: `NotFound`, `EmptyResult`, `InvalidRequest` loops are
+    /// the motivating case (data-model.md state machine). Anything this cannot
+    /// read emits `Unobserved`, never a default.
+    ///
+    /// Called at the `call_tool` seam INSIDE the dispatch's evidence scope, so
+    /// the latch it reads is the one this response's renderers set and no
+    /// other; the scope is constructed per dispatch and dropped with it.
     pub fn from_result(result: &CallToolResult) -> Self {
+        if result_status::unfenced_input_consulted() {
+            return Self(Observation::Unobserved(UnobservedReason::UnfencedInput));
+        }
         let meta = result.meta.as_ref();
         let Some(evidence) = meta
             .and_then(|meta| meta.0.get(PROJECT_EVIDENCE_META_KEY))
@@ -416,23 +524,45 @@ struct RepeatRun {
 
 /// Bounded per-process map of runs (data-model.md state machine). Shared by
 /// every clone of `SymForgeServer` behind one `Arc<Mutex<_>>`; the seam locks
-/// it synchronously after the awaited dispatch.
+/// it synchronously (before dispatch to read [`Self::epoch`], after dispatch
+/// to record) and never holds it across an `.await`.
 #[derive(Debug, Default)]
 pub struct RepeatTracker {
     runs: HashMap<RepeatKey, RepeatRun>,
+    /// Incarnation counter, bumped by [`Self::clear`]. Kept INSIDE the mutex
+    /// rather than in a sibling `AtomicU64` so the bump and the run drop are
+    /// one atomic step for every reader: with two cells a pre-dispatch reader
+    /// could observe the new epoch while the map still held the old runs (or
+    /// the reverse), which is exactly the interleaving this field exists to
+    /// rule out. The cost is one extra uncontended lock per eligible call.
+    epoch: u64,
 }
 
 impl RepeatTracker {
+    /// The current incarnation. The seam reads this BEFORE dispatch and mints
+    /// the [`RepeatKey`] with it; [`Self::record_serve`] refuses anything else.
+    pub fn epoch(&self) -> TrackerEpoch {
+        TrackerEpoch(self.epoch)
+    }
+
     /// Apply one observed serve and return the notice when the run reaches
-    /// [`NOTICE_THRESHOLD`]. Unobserved ⇒ the run is removed. Observed and
-    /// witnessed equal (evidence AND body) ⇒ `count += 1` (saturating).
-    /// Observed and unequal in either ⇒ the run restarts at 1 on the new
-    /// observation.
+    /// [`NOTICE_THRESHOLD`]. A key from a superseded incarnation is refused
+    /// outright. Unobserved ⇒ the run is removed. Observed and witnessed equal
+    /// (evidence AND body) ⇒ `count += 1` (saturating). Observed and unequal
+    /// in either ⇒ the run restarts at 1 on the new observation.
     pub fn record_serve(
         &mut self,
         key: RepeatKey,
         observation: ServeObservation,
     ) -> Option<RepeatNotice> {
+        if key.epoch != self.epoch() {
+            // F2: this serve was observed against an index incarnation the
+            // tracker has since dropped, and a replacement's evidence can be
+            // byte-equal to the dead one's. Refuse it entirely — not even as a
+            // fresh run, since the observation it carries describes the old
+            // incarnation's answer.
+            return None;
+        }
         let current = match observation.0 {
             Observation::Observed(current) => current,
             Observation::Unobserved(_) => {
@@ -458,6 +588,11 @@ impl RepeatTracker {
             // every in-flight run at once — losing only true notices, never
             // creating a false one; upgrade path is LRU eviction keyed on
             // last-serve order if a real session ever fills this map.
+            //
+            // Deliberately drops the runs WITHOUT bumping the epoch: this is
+            // memory pressure, not an incarnation change. The index that
+            // served those keys is still the one serving now, so their next
+            // serve honestly restarts at 1 instead of being refused forever.
             self.runs.clear();
         }
         self.runs.insert(
@@ -470,15 +605,22 @@ impl RepeatTracker {
         None
     }
 
-    /// Drop every run. The rule: a run must not survive a change of the index
-    /// INCARNATION it was observed against — a daemon reconnect (a replacement
-    /// daemon's evidence can be byte-equal to the dead one's: `generation` is
-    /// a per-process counter), the degrade-to-local and restore-from-local
-    /// transitions, and a local index reload. The adapter calls this at each
-    /// of those sites; a cleared run can only cost a true notice, never
-    /// create a false one.
+    /// Drop every run and advance the incarnation. The rule: a run must not
+    /// survive a change of the index INCARNATION it was observed against — a
+    /// daemon reconnect (a replacement daemon's evidence can be byte-equal to
+    /// the dead one's: `generation` is a per-process counter), the
+    /// degrade-to-local and restore-from-local transitions, and a local index
+    /// reload. The adapter calls this at each of those sites; a cleared run
+    /// can only cost a true notice, never create a false one.
+    ///
+    /// The epoch bump is what makes this safe under concurrency: dropping the
+    /// map alone would still let a serve already in flight against the old
+    /// incarnation be inserted afterwards and anchor a run that spans the
+    /// transition. `wrapping_add` because 2^64 incarnation changes in one
+    /// process is not a reachable state.
     pub(crate) fn clear(&mut self) {
         self.runs.clear();
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     #[cfg(test)]
@@ -535,9 +677,21 @@ mod tests {
         LaneWitness::assume(SessionDiscriminator::Stdio)
     }
 
+    /// The epoch of a freshly constructed [`RepeatTracker`]. Tests that never
+    /// call [`RepeatTracker::clear`] key against this; the ones that do mint
+    /// their keys from `tracker.epoch()` instead.
+    fn epoch0() -> TrackerEpoch {
+        TrackerEpoch::assume(0)
+    }
+
     fn key(tool: &str, query: &str) -> RepeatKey {
-        RepeatKey::observe(stdio(), tool, Some(&args(json!({ "query": query }))))
-            .expect("an eligible stdio call keys the tracker")
+        RepeatKey::observe(
+            stdio(),
+            epoch0(),
+            tool,
+            Some(&args(json!({ "query": query }))),
+        )
+        .expect("an eligible stdio call keys the tracker")
     }
 
     /// A result carrying `_meta` exactly as the seam would see it after
@@ -608,7 +762,7 @@ mod tests {
         for tool in REPEAT_ELIGIBLE_TOOLS {
             assert!(is_repeat_eligible(tool), "{tool} must be eligible");
             assert!(
-                RepeatKey::observe(stdio(), tool, None).is_some(),
+                RepeatKey::observe(stdio(), epoch0(), tool, None).is_some(),
                 "{tool} must key the tracker on stdio"
             );
         }
@@ -626,7 +780,7 @@ mod tests {
         ] {
             assert!(!is_repeat_eligible(tool), "{tool} must stay ineligible");
             assert!(
-                RepeatKey::observe(stdio(), tool, None).is_none(),
+                RepeatKey::observe(stdio(), epoch0(), tool, None).is_none(),
                 "{tool} must never key the tracker"
             );
         }
@@ -635,6 +789,15 @@ mod tests {
     }
 
     // Oracle 10 — the witness exists only on full equality (evidence AND body).
+    //
+    // F4 (round 2): the cases below enumerate today's fields, but the witness
+    // itself compares the WHOLE `ObservedServe` and relies on that struct's
+    // DERIVED `PartialEq` — so a field added later joins the comparison
+    // without anyone remembering to name it here. Removing that derive, or
+    // hand-writing a `PartialEq` that skips a field, silently narrows what the
+    // notice claims to have observed; keep the derive. (Verified by
+    // simulation: with the old named-field comparison, an added third field
+    // differing alone still produced a witness.)
     #[test]
     fn witness_requires_full_equality() {
         let prior = observed_serve(7);
@@ -915,8 +1078,13 @@ mod tests {
     }
 
     // F2 — an incarnation change (daemon reconnect, degrade-to-local,
-    // restore-from-local, local reload) clears every run: the next serve of
-    // any key restarts at 1 and re-accumulates honestly.
+    // restore-from-local, local reload) clears every run: a call keyed AFTER
+    // the clear restarts at 1 and re-accumulates honestly. (Round 2: the key
+    // is now re-minted after the clear because a pre-clear key is refused
+    // outright — see `serve_observed_before_a_clear_never_joins_a_run`, which
+    // owns that half. Re-serving the SAME key across a clear is exactly the
+    // in-flight bridge F2 forbids, so it can no longer be this test's model of
+    // "the next serve".)
     #[test]
     fn clear_restarts_runs_at_one() {
         let mut tracker = RepeatTracker::default();
@@ -925,6 +1093,13 @@ mod tests {
         assert_eq!(tracker.count_of(&k), Some(2));
         tracker.clear();
         assert!(tracker.is_empty(), "clear() drops every run");
+        let k = RepeatKey::observe(
+            stdio(),
+            tracker.epoch(),
+            "search_symbols",
+            Some(&args(json!({ "query": "anchor" }))),
+        )
+        .expect("the same call, keyed against the new incarnation");
         assert!(
             serve_equal(&mut tracker, &k, 1, 1).is_none(),
             "count 1 after clear"
@@ -932,6 +1107,117 @@ mod tests {
         assert_eq!(tracker.count_of(&k), Some(1));
         assert!(serve_equal(&mut tracker, &k, 1, 1).is_none(), "count 2");
         let notice = serve_equal(&mut tracker, &k, 1, 1).expect("count 3 notices again");
+        assert_eq!(notice.repeat_count(), 3);
+    }
+
+    // F2 (round 2) — the seam mints the key BEFORE dispatch and records the
+    // serve AFTER it, and rmcp runs every request in its own task, so a
+    // concurrent request's incarnation `clear()` can land in between. A serve
+    // whose observation predates that clear must never anchor or join a run
+    // that spans it: `generation` is a per-process counter, so a replacement
+    // index can hand back evidence byte-equal to the dead one's.
+    #[test]
+    fn serve_observed_before_a_clear_never_joins_a_run() {
+        let mint = |tracker: &RepeatTracker| {
+            RepeatKey::observe(
+                stdio(),
+                tracker.epoch(),
+                "search_symbols",
+                Some(&args(json!({ "query": "anchor" }))),
+            )
+            .expect("an eligible stdio call keys the tracker")
+        };
+
+        let mut tracker = RepeatTracker::default();
+        // A run already accumulating when the incarnation changes.
+        let stale = mint(&tracker);
+        assert!(serve_equal(&mut tracker, &stale, 1, 2).is_none());
+        assert_eq!(tracker.count_of(&stale), Some(2));
+        tracker.clear();
+        assert_eq!(tracker.len(), 0, "the clear dropped the run");
+
+        // Three in-flight serves keyed before the clear: no notice, and not
+        // even an insertion — a stale observation may not seed a new run.
+        for serve in 1..=3 {
+            assert!(
+                tracker.record_serve(stale.clone(), observed(1)).is_none(),
+                "serve {serve} of a pre-clear key must never notice"
+            );
+            assert_eq!(
+                tracker.len(),
+                0,
+                "serve {serve} of a pre-clear key must not be recorded at all"
+            );
+        }
+
+        // Positive control: a key minted AFTER the clear accumulates normally
+        // and notices at 3.
+        let fresh = mint(&tracker);
+        assert_ne!(
+            fresh, stale,
+            "the epoch is part of the key, so a re-minted key is a different key"
+        );
+        assert!(tracker.record_serve(fresh.clone(), observed(1)).is_none());
+        assert!(tracker.record_serve(fresh.clone(), observed(1)).is_none());
+        let notice = tracker
+            .record_serve(fresh.clone(), observed(1))
+            .expect("a post-clear key notices at 3");
+        assert_eq!(notice.repeat_count(), 3);
+        assert_eq!(tracker.len(), 1);
+
+        // The stale key stays inert even alongside the live run it shadows.
+        assert!(tracker.record_serve(stale, observed(1)).is_none());
+        assert_eq!(tracker.len(), 1, "the stale serve added nothing");
+        assert_eq!(tracker.count_of(&fresh), Some(3), "and disturbed nothing");
+    }
+
+    // F3 (round 2) — the accumulating lane must be a POSITIVE declaration, not
+    // the absence of an HTTP marker. A future transport that reaches
+    // `call_tool` without inserting rmcp's `http::request::Parts` — its SSE
+    // server, a socket adapter, an in-process `serve_directly` — would
+    // otherwise silently become ONE shared accumulating bucket, which is the
+    // cross-client false-notice shape research.md R12 finding 3 rated a
+    // BLOCKER. The `Parts` check stays as the belt.
+    #[test]
+    fn only_a_declared_stdio_transport_ever_accumulates() {
+        // The default is inert: a server whose entry point never declared its
+        // transport cannot accumulate, with or without the HTTP marker.
+        assert_eq!(TransportLane::default(), TransportLane::Shared);
+        for http_parts_present in [false, true] {
+            let witness =
+                SessionDiscriminator::from_observations(TransportLane::Shared, http_parts_present);
+            assert_eq!(
+                witness.lane(),
+                SessionDiscriminator::HttpInert,
+                "an undeclared lane is inert (http_parts_present={http_parts_present})"
+            );
+            assert!(
+                RepeatKey::observe(witness, epoch0(), "search_symbols", None).is_none(),
+                "an undeclared lane must never key the tracker \
+                 (http_parts_present={http_parts_present})"
+            );
+        }
+
+        // Belt: a declared stdio server that nonetheless sees the HTTP marker
+        // is inert too — the two observations must agree.
+        let contradicted = SessionDiscriminator::from_observations(TransportLane::Stdio, true);
+        assert_eq!(contradicted.lane(), SessionDiscriminator::HttpInert);
+        assert!(RepeatKey::observe(contradicted, epoch0(), "search_symbols", None).is_none());
+
+        // Positive control: a declared stdio lane with no HTTP marker keys the
+        // tracker and notices on the third identical serve.
+        let declared = SessionDiscriminator::from_observations(TransportLane::Stdio, false);
+        assert_eq!(declared.lane(), SessionDiscriminator::Stdio);
+        let k = RepeatKey::observe(
+            declared,
+            epoch0(),
+            "search_symbols",
+            Some(&args(json!({ "query": "anchor" }))),
+        )
+        .expect("a declared stdio lane keys the tracker");
+        let mut tracker = RepeatTracker::default();
+        assert!(serve_equal(&mut tracker, &k, 1, 2).is_none());
+        let notice = serve_equal(&mut tracker, &k, 1, 1).expect("declared stdio notices at 3");
         assert_eq!(notice.repeat_count(), 3);
     }
 
@@ -943,6 +1229,7 @@ mod tests {
         assert!(
             RepeatKey::observe(
                 LaneWitness::assume(SessionDiscriminator::HttpInert),
+                epoch0(),
                 "search_symbols",
                 Some(&single)
             )
@@ -951,19 +1238,19 @@ mod tests {
         );
         let fan_out = args(json!({ "query": "anchor", "projects": ["*"] }));
         assert!(
-            RepeatKey::observe(stdio(), "search_symbols", Some(&fan_out)).is_none(),
+            RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&fan_out)).is_none(),
             "a set-valued projects fan-out never keys"
         );
         let null_projects = args(json!({ "query": "anchor", "projects": null }));
-        let keyed = RepeatKey::observe(stdio(), "search_symbols", Some(&null_projects))
+        let keyed = RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&null_projects))
             .expect("projects:null is absence");
-        let control = RepeatKey::observe(stdio(), "search_symbols", Some(&single))
+        let control = RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&single))
             .expect("stdio single-project keys");
         assert_eq!(control.tool(), "search_symbols");
         // Fingerprint identity: same args => same key; different args => different.
         assert_eq!(
             control,
-            RepeatKey::observe(stdio(), "search_symbols", Some(&single)).expect("same")
+            RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&single)).expect("same")
         );
         assert_ne!(
             control, keyed,
@@ -972,13 +1259,13 @@ mod tests {
         let other = args(json!({ "query": "other" }));
         assert_ne!(
             control,
-            RepeatKey::observe(stdio(), "search_symbols", Some(&other)).expect("other")
+            RepeatKey::observe(stdio(), epoch0(), "search_symbols", Some(&other)).expect("other")
         );
         // Absent arguments hash as the empty object.
         let empty = args(json!({}));
         assert_eq!(
-            RepeatKey::observe(stdio(), "get_repo_map", None).expect("none"),
-            RepeatKey::observe(stdio(), "get_repo_map", Some(&empty)).expect("empty")
+            RepeatKey::observe(stdio(), epoch0(), "get_repo_map", None).expect("none"),
+            RepeatKey::observe(stdio(), epoch0(), "get_repo_map", Some(&empty)).expect("empty")
         );
     }
 
@@ -1057,6 +1344,92 @@ mod tests {
             .record_serve(k.clone(), serve(&["no matches"]))
             .expect("an unchanged body under equal evidence notices");
         assert_eq!(notice.repeat_count(), 3);
+    }
+
+    // F1 (round 2) — a response that consulted an input the index does NOT
+    // fence can never carry the forward claim, however equal the past serves
+    // were. The reading code latches the fact on the dispatch scope; the seam
+    // reads it back and REMOVES the run.
+    #[tokio::test]
+    async fn unfenced_input_removes_the_run_and_never_notices() {
+        let full = serde_json::to_value(evidence(2)).expect("evidence serializes");
+        let k = key("search_text", "needle-zz");
+        let serve = |latched: bool| {
+            let full = full.clone();
+            async move {
+                result_status::with_project_evidence_scope(None, async {
+                    if latched {
+                        result_status::note_unfenced_input();
+                    }
+                    ServeObservation::from_result(&result_with(full, None, None))
+                })
+                .await
+            }
+        };
+
+        // A run at 2, then one latched serve: removed, never noticed.
+        let mut tracker = RepeatTracker::default();
+        assert!(serve_equal(&mut tracker, &k, 2, 2).is_none());
+        assert_eq!(tracker.count_of(&k), Some(2), "the run reached 2");
+        let observation = serve(true).await;
+        assert_eq!(
+            observation.unobserved_reason(),
+            Some(UnobservedReason::UnfencedInput)
+        );
+        assert!(
+            tracker.record_serve(k.clone(), observation).is_none(),
+            "an unfenced serve never notices"
+        );
+        assert_eq!(
+            tracker.count_of(&k),
+            None,
+            "the run is removed, not merely skipped"
+        );
+
+        // And it never accumulates on that lane: three more latched serves
+        // with identical evidence and body still leave nothing behind.
+        for _ in 0..3 {
+            assert!(tracker.record_serve(k.clone(), serve(true).await).is_none());
+        }
+        assert_eq!(tracker.count_of(&k), None, "still nothing");
+
+        // Positive control: the SAME evidence and the SAME body, with no
+        // unfenced input consulted, advance to a notice at 3.
+        let mut tracker = RepeatTracker::default();
+        let mut last = None;
+        for _ in 0..3 {
+            last = tracker.record_serve(k.clone(), serve(false).await);
+        }
+        assert_eq!(last.expect("the fenced control notices").repeat_count(), 3);
+
+        // Scope discipline: the latch is idempotent within one dispatch and
+        // dies with it — a following dispatch starts clean, so one call's
+        // latch can never leak into the next.
+        result_status::with_project_evidence_scope(None, async {
+            assert!(
+                !result_status::unfenced_input_consulted(),
+                "a fresh dispatch scope starts clean"
+            );
+            result_status::note_unfenced_input();
+            assert!(result_status::unfenced_input_consulted());
+            result_status::note_unfenced_input();
+            assert!(
+                result_status::unfenced_input_consulted(),
+                "the latch is idempotent"
+            );
+            // Clearing the evidence slot must not clear the latch: they answer
+            // different questions about the same dispatch.
+            result_status::clear_project_evidence();
+            assert!(result_status::unfenced_input_consulted());
+        })
+        .await;
+        result_status::with_project_evidence_scope(None, async {
+            assert!(
+                !result_status::unfenced_input_consulted(),
+                "the next dispatch scope must not observe the previous one's latch"
+            );
+        })
+        .await;
     }
 
     // Delivery: both carriers, appended to the FINAL text block, prior bytes
