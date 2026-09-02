@@ -13711,6 +13711,38 @@ mod tests {
             !overlaid.contains("last_ledger_decision: none"),
             "the worker's blind last_ledger_decision: none must be replaced:\n{overlaid}"
         );
+        // (2b) 032 US2: the two seeded events are ledger-identical and adjacent,
+        // so the PROXY's own `format_last_ledger_lines` annotates the decision
+        // line with the trailing run — and the daemon-backed stdio topology this
+        // overlay serves is the DEFAULT operator lane, so that annotation is
+        // pinned HERE or nowhere. Asserted as an EXACT whole line, not a
+        // `contains` on a prefix: the prefix check above passes byte-identically
+        // whether the suffix survives the overlay or the worker's blind,
+        // un-annotated rendering wins, so only whole-line equality tells the two
+        // apart. The timestamps are READ from the seed (both events carry the
+        // same `ts_ms`) rather than typed, so re-seeding moves the expectation
+        // with it instead of silently unpinning it.
+        let run_ts = sample_durable_event().ts_ms;
+        let annotated_decision =
+            format!("last_ledger_decision: serve ×2 (first={run_ts}, last={run_ts})");
+        assert_eq!(
+            overlaid
+                .lines()
+                .filter(|l| l.starts_with("last_ledger_decision:"))
+                .collect::<Vec<_>>(),
+            vec![annotated_decision.as_str()],
+            "overlay must surface the proxy's run-annotated decision line, exactly once:\n{overlaid}"
+        );
+        // The negative, with the assertion above as its accepting positive
+        // control: the bare line must not appear as a WHOLE line. Line equality
+        // is required because the annotated line CONTAINS the bare one as a
+        // prefix, so a substring negative would be unsatisfiable; and the
+        // control proves exactly one decision line exists, so this cannot pass
+        // by that line being absent.
+        assert!(
+            !overlaid.lines().any(|l| l == "last_ledger_decision: serve"),
+            "the worker's blind, un-annotated decision line must not win the overlay:\n{overlaid}"
+        );
         // (3) durable_ledger: the proxy's real accumulation, NOT unavailable.
         assert!(
             overlaid.contains("durable_ledger: events="),

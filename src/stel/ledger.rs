@@ -641,7 +641,11 @@ mod collapse_tests {
         assert_eq!((runs[0].first_ts_ms, runs[0].last_ts_ms), (1_000, 1_001));
         assert_eq!((runs[1].first_ts_ms, runs[1].last_ts_ms), (1_002, 1_002));
         assert_eq!((runs[2].first_ts_ms, runs[2].last_ts_ms), (1_003, 1_003));
-        // The canonical row is the chronologically FIRST of its run.
+        // The canonical row is the POSITIONAL first of its run (input
+        // order), which is what `collapse_runs` clones and what
+        // `collapse_runs_span_is_min_max_over_skewed_timestamps` pins under
+        // insert-order skew; here the seed is in clock order too, so this
+        // row happens to also be the chronologically first.
         assert_eq!(runs[0].canonical.plan_id, "plan-1000");
 
         let records = records_from(&["A", "A", "B", "A"]);
