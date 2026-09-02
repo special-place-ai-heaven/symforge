@@ -4,12 +4,17 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use serde_json::Value;
 
 use super::controller::EconomicsBreakdown;
 use super::executor::is_pff_bypass_body;
 use super::handler::estimate_tokens;
+use super::ledger_store::StoredLedgerRecord;
 use super::planner::confidence_label;
-use super::types::{AdmissionDecision, StelDecision, StelLedgerEvent, StelPlan};
+use super::types::{
+    AdmissionDecision, CoreToolName, IntentBucket, RouteConfidence, StelDecision, StelLedgerEvent,
+    StelPlan,
+};
 
 /// In-memory append-only ledger for one MCP server session (no persistence in this slice).
 #[derive(Debug, Default)]
@@ -179,6 +184,182 @@ fn ledger_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Run-length collapse (032 US2) — presentation-only; one algorithm, two lanes
+// ---------------------------------------------------------------------------
+
+/// One maximal run of consecutive rows that share a collapse identity.
+///
+/// Rendering-only (spec FR-009): a run is computed from the rows a view is
+/// about to render and is never written back — the stored events, in-memory
+/// and durable, stay individually intact.
+#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Run<T> {
+    /// The chronologically first row of the run.
+    pub(crate) canonical: T,
+    /// Run length, always ≥ 1.
+    pub(crate) count: u64,
+    /// `ts_ms` of the first row of the run.
+    pub(crate) first_ts_ms: u64,
+    /// `ts_ms` of the last row of the run.
+    pub(crate) last_ts_ms: u64,
+}
+
+/// Collapse `items` (in chronological order) into maximal runs of STRICTLY
+/// consecutive rows whose `identity` keys are equal: `A,A,B,A` → `A×2, B, A`.
+/// Non-adjacent repeats never merge (spec FR-007 / US2 scenario 2).
+///
+/// Invariants, pinned by the property tests below: the counts sum to
+/// `items.len()`; flattening the runs by identity reproduces the input
+/// identity sequence; an all-distinct input yields one run per row.
+/// `first_ts_ms`/`last_ts_ms` are positional (the first and last row of the
+/// run as read through `ts_ms`), not min/max — callers pass rows in
+/// chronological order.
+#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
+pub(crate) fn collapse_runs<'a, T: Clone + 'a, K: PartialEq>(
+    items: &'a [T],
+    identity: impl Fn(&'a T) -> K,
+    ts_ms: impl Fn(&T) -> u64,
+) -> Vec<Run<T>> {
+    let mut runs: Vec<Run<T>> = Vec::new();
+    let mut open_key: Option<K> = None;
+    for item in items {
+        let key = identity(item);
+        let ts = ts_ms(item);
+        let extends_open_run = match (&open_key, runs.last_mut()) {
+            (Some(open), Some(run)) if *open == key => {
+                run.count += 1;
+                run.last_ts_ms = ts;
+                true
+            }
+            _ => false,
+        };
+        if !extends_open_run {
+            runs.push(Run {
+                canonical: item.clone(),
+                count: 1,
+                first_ts_ms: ts,
+                last_ts_ms: ts,
+            });
+            open_key = Some(key);
+        }
+    }
+    runs
+}
+
+/// Lane A collapse identity — the in-memory [`StelLedgerEvent`] (status view).
+///
+/// Built by [`ledger_event_identity`]'s EXHAUSTIVE destructure: the two clocks
+/// (`ts_ms`, and `plan_id`, which embeds wall-clock millis) and the four
+/// per-call measurements are bound and ignored; every other field is identity
+/// (data-model.md Lane A). A field added to the event fails compilation there
+/// and forces an identity decision instead of silently joining or skipping.
+#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EventIdentity<'a> {
+    surface: &'a str,
+    intent: IntentBucket,
+    decision: AdmissionDecision,
+    tools_called: &'a [CoreToolName],
+    equivalence: Option<&'a Value>,
+    route_confidence: RouteConfidence,
+    pff_bypass: Option<bool>,
+    cache_hit: Option<bool>,
+    degrade_flags: &'a [String],
+}
+
+/// Lane A identity extractor — see [`EventIdentity`].
+#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
+pub(crate) fn ledger_event_identity(event: &StelLedgerEvent) -> EventIdentity<'_> {
+    let StelLedgerEvent {
+        ts_ms: _,
+        plan_id: _,
+        surface,
+        intent,
+        decision,
+        tools_called,
+        predicted_response_tokens: _,
+        actual_response_tokens: _,
+        manual_baseline_tokens: _,
+        net_vs_manual: _,
+        equivalence,
+        route_confidence,
+        pff_bypass,
+        cache_hit,
+        degrade_flags,
+    } = event;
+    EventIdentity {
+        surface,
+        intent: *intent,
+        decision: *decision,
+        tools_called,
+        equivalence: equivalence.as_ref(),
+        route_confidence: *route_confidence,
+        pff_bypass: *pff_bypass,
+        cache_hit: *cache_hit,
+        degrade_flags,
+    }
+}
+
+/// Lane B collapse identity — the durable [`StoredLedgerRecord`] (admin view).
+///
+/// Built by [`stored_record_identity`]'s EXHAUSTIVE destructure: `id`,
+/// `ts_ms`, `plan_id` and the four token measurements are bound and ignored;
+/// `session_id` is identity (a run never spans sessions); the stored string
+/// forms are compared verbatim; `pff_bypass`/`cache_hit`/`degrade_flags_json`
+/// are the columns 032 widened the read-back with, so rows differing in them
+/// never merge (data-model.md Lane B). `accepted`/`eligible_h6` are excluded
+/// by construction — the row type does not read them back. `equivalence` has
+/// no column at all: a documented durable-lane coarseness.
+#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredRecordIdentity<'a> {
+    session_id: &'a str,
+    surface: &'a str,
+    intent: &'a str,
+    decision: &'a str,
+    tools_called_json: &'a str,
+    route_confidence: &'a str,
+    pff_bypass: Option<bool>,
+    cache_hit: Option<bool>,
+    degrade_flags_json: &'a str,
+}
+
+/// Lane B identity extractor — see [`StoredRecordIdentity`].
+#[allow(dead_code)] // 032 stub: consumed once the status (T016) and admin (T017) lanes land
+pub(crate) fn stored_record_identity(record: &StoredLedgerRecord) -> StoredRecordIdentity<'_> {
+    let StoredLedgerRecord {
+        id: _,
+        ts_ms: _,
+        session_id,
+        plan_id: _,
+        surface,
+        intent,
+        decision,
+        tools_called_json,
+        predicted_response_tokens: _,
+        actual_response_tokens: _,
+        manual_baseline_tokens: _,
+        net_vs_manual: _,
+        route_confidence,
+        pff_bypass,
+        cache_hit,
+        degrade_flags_json,
+    } = record;
+    StoredRecordIdentity {
+        session_id,
+        surface,
+        intent,
+        decision,
+        tools_called_json,
+        route_confidence,
+        pff_bypass: *pff_bypass,
+        cache_hit: *cache_hit,
+        degrade_flags_json,
+    }
 }
 
 #[cfg(test)]
@@ -361,5 +542,367 @@ mod tests {
         ledger.push(event);
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger.last().unwrap().plan_id, "plan-serve");
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    //! 032 US2 property oracles for [`collapse_runs`] — one algorithm, two lane
+    //! identities (data-model.md Lane A / Lane B). Every positive oracle carries
+    //! its negative control in the same function.
+    use super::{Run, collapse_runs, ledger_event_identity, stored_record_identity};
+    use crate::stel::ledger_store::StoredLedgerRecord;
+    use crate::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent};
+
+    /// Lane A fixture: `label` selects the identity (via `surface`); `ts_ms`
+    /// and `plan_id` are the clocks the identity must ignore.
+    fn event(label: &str, ts_ms: u64) -> StelLedgerEvent {
+        StelLedgerEvent {
+            ts_ms,
+            plan_id: format!("plan-{ts_ms}"),
+            surface: label.to_string(),
+            intent: IntentBucket::Trace,
+            decision: AdmissionDecision::Serve,
+            tools_called: vec!["find_references".to_string()],
+            predicted_response_tokens: 400,
+            actual_response_tokens: 380,
+            manual_baseline_tokens: 800,
+            net_vs_manual: 420,
+            equivalence: None,
+            route_confidence: RouteConfidence::Exact,
+            pff_bypass: None,
+            cache_hit: None,
+            degrade_flags: vec![],
+        }
+    }
+
+    /// Lane B fixture: `label` selects the identity (via `surface`); `id`,
+    /// `ts_ms` and `plan_id` are the row bookkeeping the identity must ignore.
+    fn record(label: &str, id: i64, ts_ms: u64) -> StoredLedgerRecord {
+        StoredLedgerRecord {
+            id,
+            ts_ms,
+            session_id: "sess".to_string(),
+            plan_id: format!("plan-{id}"),
+            surface: label.to_string(),
+            intent: "trace".to_string(),
+            decision: "serve".to_string(),
+            tools_called_json: r#"["find_references"]"#.to_string(),
+            predicted_response_tokens: 400,
+            actual_response_tokens: 380,
+            manual_baseline_tokens: 800,
+            net_vs_manual: 420,
+            route_confidence: "exact".to_string(),
+            pff_bypass: None,
+            cache_hit: None,
+            degrade_flags_json: "[]".to_string(),
+        }
+    }
+
+    fn event_runs(events: &[StelLedgerEvent]) -> Vec<Run<StelLedgerEvent>> {
+        collapse_runs(events, ledger_event_identity, |event| event.ts_ms)
+    }
+
+    fn record_runs(records: &[StoredLedgerRecord]) -> Vec<Run<StoredLedgerRecord>> {
+        collapse_runs(records, stored_record_identity, |record| record.ts_ms)
+    }
+
+    fn events_from(labels: &[&str]) -> Vec<StelLedgerEvent> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| event(label, 1_000 + i as u64))
+            .collect()
+    }
+
+    fn records_from(labels: &[&str]) -> Vec<StoredLedgerRecord> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| record(label, i as i64 + 1, 1_000 + i as u64))
+            .collect()
+    }
+
+    #[test]
+    fn collapse_runs_merges_only_strictly_consecutive_runs() {
+        // spec US2 scenario 2: A,A,B,A -> A×2, B, A (the non-adjacent A never
+        // merges into the first run).
+        let events = events_from(&["A", "A", "B", "A"]);
+        let runs = event_runs(&events);
+        assert_eq!(
+            runs.iter().map(|run| run.count).collect::<Vec<_>>(),
+            vec![2, 1, 1],
+            "event lane counts:\n{runs:?}"
+        );
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.canonical.surface.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "A"]
+        );
+        assert_eq!((runs[0].first_ts_ms, runs[0].last_ts_ms), (1_000, 1_001));
+        assert_eq!((runs[1].first_ts_ms, runs[1].last_ts_ms), (1_002, 1_002));
+        assert_eq!((runs[2].first_ts_ms, runs[2].last_ts_ms), (1_003, 1_003));
+        // The canonical row is the chronologically FIRST of its run.
+        assert_eq!(runs[0].canonical.plan_id, "plan-1000");
+
+        let records = records_from(&["A", "A", "B", "A"]);
+        let runs = record_runs(&records);
+        assert_eq!(
+            runs.iter().map(|run| run.count).collect::<Vec<_>>(),
+            vec![2, 1, 1],
+            "durable lane counts:\n{runs:?}"
+        );
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.canonical.surface.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "A"]
+        );
+        assert_eq!((runs[0].first_ts_ms, runs[0].last_ts_ms), (1_000, 1_001));
+        assert_eq!(runs[0].canonical.id, 1);
+    }
+
+    #[test]
+    fn collapse_runs_counts_sum_to_input_length() {
+        let labels = ["A", "A", "A", "B", "C", "C", "A", "D"];
+        let events = events_from(&labels);
+        let total: u64 = event_runs(&events).iter().map(|run| run.count).sum();
+        assert_eq!(total, events.len() as u64);
+
+        let records = records_from(&labels);
+        let total: u64 = record_runs(&records).iter().map(|run| run.count).sum();
+        assert_eq!(total, records.len() as u64);
+
+        // Empty input collapses to no runs (sum 0 == len 0) — the degenerate
+        // control for the invariant.
+        assert!(event_runs(&[]).is_empty());
+        assert!(record_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn collapse_runs_flattening_reproduces_identity_sequence() {
+        let labels = ["A", "A", "B", "B", "B", "A", "C"];
+        let events = events_from(&labels);
+        let runs = event_runs(&events);
+        let flattened: Vec<_> = runs
+            .iter()
+            .flat_map(|run| {
+                std::iter::repeat_n(ledger_event_identity(&run.canonical), run.count as usize)
+            })
+            .collect();
+        let original: Vec<_> = events.iter().map(ledger_event_identity).collect();
+        assert_eq!(flattened, original, "event lane flattening");
+
+        let records = records_from(&labels);
+        let runs = record_runs(&records);
+        let flattened: Vec<_> = runs
+            .iter()
+            .flat_map(|run| {
+                std::iter::repeat_n(stored_record_identity(&run.canonical), run.count as usize)
+            })
+            .collect();
+        let original: Vec<_> = records.iter().map(stored_record_identity).collect();
+        assert_eq!(flattened, original, "durable lane flattening");
+    }
+
+    #[test]
+    fn collapse_runs_all_distinct_input_keeps_every_count_one() {
+        // Negative control for the merge: nothing adjacent is identical, so the
+        // output is the input, one run per row, in order, spans of one row.
+        let labels = ["A", "B", "C", "D", "E"];
+        let events = events_from(&labels);
+        let runs = event_runs(&events);
+        assert_eq!(runs.len(), events.len());
+        for (run, source) in runs.iter().zip(&events) {
+            assert_eq!(run.count, 1);
+            assert_eq!(&run.canonical, source);
+            assert_eq!(run.first_ts_ms, source.ts_ms);
+            assert_eq!(run.last_ts_ms, source.ts_ms);
+        }
+
+        let records = records_from(&labels);
+        let runs = record_runs(&records);
+        assert_eq!(runs.len(), records.len());
+        for (run, source) in runs.iter().zip(&records) {
+            assert_eq!(run.count, 1);
+            assert_eq!(&run.canonical, source);
+            assert_eq!(run.first_ts_ms, source.ts_ms);
+            assert_eq!(run.last_ts_ms, source.ts_ms);
+        }
+    }
+
+    #[test]
+    fn collapse_runs_ten_thousand_identical_events_collapse_to_one_run() {
+        // spec SC-003 (status lane): a seeded run of 10,000 renders ×10000 —
+        // the count neither overflows nor truncates.
+        let events: Vec<_> = (0..10_000u64).map(|i| event("A", 1_000 + i)).collect();
+        let runs = event_runs(&events);
+        assert_eq!(runs.len(), 1, "one run expected, got {}", runs.len());
+        assert_eq!(runs[0].count, 10_000);
+        assert_eq!(runs[0].first_ts_ms, 1_000);
+        assert_eq!(runs[0].last_ts_ms, 10_999);
+        // Control: one distinct event at the end splits off its own run.
+        let mut with_tail = events;
+        with_tail.push(event("B", 20_000));
+        let runs = event_runs(&with_tail);
+        assert_eq!(
+            runs.iter().map(|run| run.count).collect::<Vec<_>>(),
+            vec![10_000, 1]
+        );
+    }
+
+    #[test]
+    fn event_identity_ignores_exactly_the_six_measurement_fields() {
+        // data-model.md Lane A: the six non-identity fields are the two clocks
+        // (`ts_ms`, `plan_id`) and the four per-call measurements. Two events
+        // differing in ALL six still collapse...
+        let base = event("A", 1_000);
+        let mut measured = base.clone();
+        measured.ts_ms = 9_999;
+        measured.plan_id = "plan-other".to_string();
+        measured.predicted_response_tokens = 1;
+        measured.actual_response_tokens = 2;
+        measured.manual_baseline_tokens = 3;
+        measured.net_vs_manual = 4;
+        let runs = event_runs(&[base.clone(), measured]);
+        assert_eq!(runs.len(), 1, "measurement-only difference must collapse");
+        assert_eq!(runs[0].count, 2);
+
+        // ...while a difference in ANY of the nine identity fields does not.
+        let variants: Vec<(&str, StelLedgerEvent)> = vec![
+            ("surface", {
+                let mut e = base.clone();
+                e.surface = "other".to_string();
+                e
+            }),
+            ("intent", {
+                let mut e = base.clone();
+                e.intent = IntentBucket::Read;
+                e
+            }),
+            ("decision", {
+                let mut e = base.clone();
+                e.decision = AdmissionDecision::Bypass;
+                e
+            }),
+            ("tools_called", {
+                let mut e = base.clone();
+                e.tools_called = vec!["search_text".to_string()];
+                e
+            }),
+            ("equivalence", {
+                let mut e = base.clone();
+                e.equivalence = Some(serde_json::json!({ "probe": true }));
+                e
+            }),
+            ("route_confidence", {
+                let mut e = base.clone();
+                e.route_confidence = RouteConfidence::Inferred;
+                e
+            }),
+            ("pff_bypass", {
+                let mut e = base.clone();
+                e.pff_bypass = Some(true);
+                e
+            }),
+            ("cache_hit", {
+                let mut e = base.clone();
+                e.cache_hit = Some(true);
+                e
+            }),
+            ("degrade_flags", {
+                let mut e = base.clone();
+                e.degrade_flags = vec!["outline_only".to_string()];
+                e
+            }),
+        ];
+        for (field, variant) in variants {
+            let runs = event_runs(&[base.clone(), variant]);
+            assert_eq!(
+                runs.len(),
+                2,
+                "a difference in identity field `{field}` must NOT collapse"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_record_identity_scopes_by_session_and_reads_widened_columns() {
+        // data-model.md Lane B: `id`, `ts_ms`, `plan_id` and the four token
+        // columns are excluded (`accepted`/`eligible_h6` are excluded by
+        // construction — the row type does not carry them). Two rows differing
+        // in ALL seven excluded fields still collapse...
+        let base = record("A", 1, 1_000);
+        let mut bookkeeping = base.clone();
+        bookkeeping.id = 2;
+        bookkeeping.ts_ms = 9_999;
+        bookkeeping.plan_id = "plan-other".to_string();
+        bookkeeping.predicted_response_tokens = 1;
+        bookkeeping.actual_response_tokens = 2;
+        bookkeeping.manual_baseline_tokens = 3;
+        bookkeeping.net_vs_manual = 4;
+        let runs = record_runs(&[base.clone(), bookkeeping]);
+        assert_eq!(runs.len(), 1, "bookkeeping-only difference must collapse");
+        assert_eq!(runs[0].count, 2);
+
+        // ...while a difference in ANY of the nine identity columns —
+        // `session_id` (runs never span sessions), the five stored string
+        // forms, and the three newly read-back columns — does not.
+        let variants: Vec<(&str, StoredLedgerRecord)> = vec![
+            ("session_id", {
+                let mut r = base.clone();
+                r.session_id = "other-session".to_string();
+                r
+            }),
+            ("surface", {
+                let mut r = base.clone();
+                r.surface = "other".to_string();
+                r
+            }),
+            ("intent", {
+                let mut r = base.clone();
+                r.intent = "read".to_string();
+                r
+            }),
+            ("decision", {
+                let mut r = base.clone();
+                r.decision = "bypass".to_string();
+                r
+            }),
+            ("tools_called_json", {
+                let mut r = base.clone();
+                r.tools_called_json = r#"["search_text"]"#.to_string();
+                r
+            }),
+            ("route_confidence", {
+                let mut r = base.clone();
+                r.route_confidence = "inferred".to_string();
+                r
+            }),
+            ("pff_bypass", {
+                let mut r = base.clone();
+                r.pff_bypass = Some(true);
+                r
+            }),
+            ("cache_hit", {
+                let mut r = base.clone();
+                r.cache_hit = Some(true);
+                r
+            }),
+            ("degrade_flags_json", {
+                let mut r = base.clone();
+                r.degrade_flags_json = r#"["outline_only"]"#.to_string();
+                r
+            }),
+        ];
+        for (column, variant) in variants {
+            let runs = record_runs(&[base.clone(), variant]);
+            assert_eq!(
+                runs.len(),
+                2,
+                "a difference in identity column `{column}` must NOT collapse"
+            );
+        }
     }
 }

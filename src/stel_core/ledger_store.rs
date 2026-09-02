@@ -2,7 +2,10 @@
 //!
 //! Mirrors `src/analytics/store.rs` in structure: `enum StelLedgerStore { Sqlite(...), Disabled }`,
 //! idempotent `migrate()`, `record()` + `recent()` + `summary()`. Dedicated `stel-ledger.db`
-//! in the SymForge data dir. Gated under `#[cfg(feature = "server")]` to preserve embed isolation.
+//! in the SymForge data dir. Lives in `stel_core`, which `src/internals.rs` gates under
+//! `#[cfg(any(feature = "server", feature = "embed"))]`, so this store compiles under the
+//! engine-only `embed` facade as well as the full `server` build — nothing here may import a
+//! server-only module.
 //!
 //! **Column-map deviation from `specs/004-v8-operator-serve/data-model.md`:**
 //! - Data-model column `tool` (single TEXT) does not exist as a singular field on
@@ -223,6 +226,54 @@ pub struct StoredLedgerRecord {
     pub manual_baseline_tokens: u32,
     pub net_vs_manual: i32,
     pub route_confidence: String,
+    /// The `pff_bypass` column as stored (`NULL` → `None`). Read back since 032
+    /// so the durable collapse identity never merges rows that differ in it.
+    pub pff_bypass: Option<bool>,
+    /// The `cache_hit` column as stored (`NULL` → `None`); read back since 032.
+    pub cache_hit: Option<bool>,
+    /// The `degrade_flags_json` column verbatim (`"[]"` when no flags were
+    /// recorded); read back since 032.
+    pub degrade_flags_json: String,
+}
+
+/// The positional column list shared by every [`StoredLedgerRecord`] read
+/// (`recent()` and `samples_for_estimator()`). [`stored_record_from_row`] maps
+/// by index against exactly this order — append columns, never reorder.
+const STORED_RECORD_COLUMNS: &str = "id, ts_ms, session_id, plan_id, surface, intent, decision, \
+     tools_called_json, predicted_response_tokens, actual_response_tokens, \
+     manual_baseline_tokens, net_vs_manual, route_confidence, pff_bypass, cache_hit, \
+     degrade_flags_json";
+
+/// Map one `SELECT {STORED_RECORD_COLUMNS} …` row to a [`StoredLedgerRecord`].
+/// The single mapper for both readers, so the two SELECTs cannot drift apart.
+fn stored_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredLedgerRecord> {
+    let ts_ms: i64 = row.get(1)?;
+    let predicted: i64 = row.get(8)?;
+    let actual: i64 = row.get(9)?;
+    let manual: i64 = row.get(10)?;
+    let net: i64 = row.get(11)?;
+    // `record()` stores the two flags as `1`/`0` INTEGER or NULL.
+    let pff_bypass: Option<i64> = row.get(13)?;
+    let cache_hit: Option<i64> = row.get(14)?;
+    Ok(StoredLedgerRecord {
+        id: row.get(0)?,
+        ts_ms: i64_to_u64(ts_ms),
+        session_id: row.get(2)?,
+        plan_id: row.get(3)?,
+        surface: row.get(4)?,
+        intent: row.get(5)?,
+        decision: row.get(6)?,
+        tools_called_json: row.get(7)?,
+        predicted_response_tokens: u32::try_from(predicted.max(0)).unwrap_or(u32::MAX),
+        actual_response_tokens: u32::try_from(actual.max(0)).unwrap_or(u32::MAX),
+        manual_baseline_tokens: u32::try_from(manual.max(0)).unwrap_or(u32::MAX),
+        net_vs_manual: i32::try_from(net.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
+            .unwrap_or(i32::MIN),
+        route_confidence: row.get(12)?,
+        pff_bypass: pff_bypass.map(|flag| flag != 0),
+        cache_hit: cache_hit.map(|flag| flag != 0),
+        degrade_flags_json: row.get(15)?,
+    })
 }
 
 /// The calibrated correction for the predictor's response output, plus the
@@ -728,48 +779,13 @@ impl SqliteStelLedgerStore {
         // inner guard so the ledger keeps serving instead of propagating the
         // poison as a panic on every subsequent lock.
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT
-                id,
-                ts_ms,
-                session_id,
-                plan_id,
-                surface,
-                intent,
-                decision,
-                tools_called_json,
-                predicted_response_tokens,
-                actual_response_tokens,
-                manual_baseline_tokens,
-                net_vs_manual,
-                route_confidence
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {STORED_RECORD_COLUMNS}
             FROM stel_ledger_events
             ORDER BY id DESC
-            LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![usize_to_i64(limit)], |row| {
-            let ts_ms: i64 = row.get(1)?;
-            let predicted: i64 = row.get(8)?;
-            let actual: i64 = row.get(9)?;
-            let manual: i64 = row.get(10)?;
-            let net: i64 = row.get(11)?;
-            Ok(StoredLedgerRecord {
-                id: row.get(0)?,
-                ts_ms: i64_to_u64(ts_ms),
-                session_id: row.get(2)?,
-                plan_id: row.get(3)?,
-                surface: row.get(4)?,
-                intent: row.get(5)?,
-                decision: row.get(6)?,
-                tools_called_json: row.get(7)?,
-                predicted_response_tokens: u32::try_from(predicted.max(0)).unwrap_or(u32::MAX),
-                actual_response_tokens: u32::try_from(actual.max(0)).unwrap_or(u32::MAX),
-                manual_baseline_tokens: u32::try_from(manual.max(0)).unwrap_or(u32::MAX),
-                net_vs_manual: i32::try_from(net.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
-                    .unwrap_or(i32::MIN),
-                route_confidence: row.get(12)?,
-            })
-        })?;
+            LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![usize_to_i64(limit)], stored_record_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -903,49 +919,17 @@ impl SqliteStelLedgerStore {
         limit: usize,
     ) -> Result<Vec<StoredLedgerRecord>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT
-                id,
-                ts_ms,
-                session_id,
-                plan_id,
-                surface,
-                intent,
-                decision,
-                tools_called_json,
-                predicted_response_tokens,
-                actual_response_tokens,
-                manual_baseline_tokens,
-                net_vs_manual,
-                route_confidence
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {STORED_RECORD_COLUMNS}
             FROM stel_ledger_events
             WHERE estimator_version = ?1
             ORDER BY id DESC
-            LIMIT ?2",
+            LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(
+            params![version, usize_to_i64(limit)],
+            stored_record_from_row,
         )?;
-        let rows = stmt.query_map(params![version, usize_to_i64(limit)], |row| {
-            let ts_ms: i64 = row.get(1)?;
-            let predicted: i64 = row.get(8)?;
-            let actual: i64 = row.get(9)?;
-            let manual: i64 = row.get(10)?;
-            let net: i64 = row.get(11)?;
-            Ok(StoredLedgerRecord {
-                id: row.get(0)?,
-                ts_ms: i64_to_u64(ts_ms),
-                session_id: row.get(2)?,
-                plan_id: row.get(3)?,
-                surface: row.get(4)?,
-                intent: row.get(5)?,
-                decision: row.get(6)?,
-                tools_called_json: row.get(7)?,
-                predicted_response_tokens: u32::try_from(predicted.max(0)).unwrap_or(u32::MAX),
-                actual_response_tokens: u32::try_from(actual.max(0)).unwrap_or(u32::MAX),
-                manual_baseline_tokens: u32::try_from(manual.max(0)).unwrap_or(u32::MAX),
-                net_vs_manual: i32::try_from(net.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
-                    .unwrap_or(i32::MIN),
-                route_confidence: row.get(12)?,
-            })
-        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -1294,8 +1278,9 @@ mod tests {
         ev.degrade_flags = vec!["outline_only".to_string()];
         store.record(&ev).expect("record");
 
-        // We can verify via raw recent that degrade_flags_json is stored (not in StoredLedgerRecord
-        // to keep the public type minimal, but the column is in the DB schema).
+        // Raw column read, independent of the `StoredLedgerRecord` mapper (which
+        // reads `degrade_flags_json` back since 032 — see
+        // `recent_and_samples_read_back_the_widened_columns`).
         let conn = store.conn.lock().unwrap();
         let flags: String = conn
             .query_row(
@@ -1324,5 +1309,63 @@ mod tests {
             )
             .expect("query pff_bypass");
         assert_eq!(pff, Some(1));
+    }
+
+    /// 032 US2 (T015): `pff_bypass`, `cache_hit` and `degrade_flags_json` are
+    /// READ BACK by both `StoredLedgerRecord` readers — `recent()` and the
+    /// production `samples_for_estimator()` — so the durable collapse identity
+    /// can see them. The plain-row control pins the stored-absent forms
+    /// (`None` / `None` / `"[]"`) so a mapper that fabricated them would fail
+    /// on the flagged rows, and one that hard-coded the flagged forms would
+    /// fail on the control.
+    #[test]
+    fn recent_and_samples_read_back_the_widened_columns() {
+        let store = SqliteStelLedgerStore::open_in_memory("sess-widened").expect("store");
+        let mut degrade = sample_event("plan-degrade");
+        degrade.decision = AdmissionDecision::Degrade;
+        degrade.degrade_flags = vec!["outline_only".to_string()];
+        store.record(&degrade).expect("record degrade");
+        let mut bypass = sample_event("plan-bypass");
+        bypass.decision = AdmissionDecision::Bypass;
+        bypass.pff_bypass = Some(true);
+        store.record(&bypass).expect("record bypass");
+        let mut hit = sample_event("plan-hit");
+        hit.decision = AdmissionDecision::CacheHit;
+        hit.cache_hit = Some(true);
+        store.record(&hit).expect("record cache hit");
+        store
+            .record(&sample_event("plan-plain"))
+            .expect("record plain");
+
+        let readers: [(&str, Vec<StoredLedgerRecord>); 2] = [
+            ("recent", store.recent(10).expect("recent")),
+            (
+                "samples_for_estimator",
+                store
+                    .samples_for_estimator(CURRENT_ESTIMATOR_VERSION, 10)
+                    .expect("samples"),
+            ),
+        ];
+        for (reader, rows) in readers {
+            assert_eq!(rows.len(), 4, "{reader} returns every row");
+            let by_plan = |plan: &str| {
+                rows.iter()
+                    .find(|row| row.plan_id == plan)
+                    .unwrap_or_else(|| panic!("{reader}: missing {plan}"))
+            };
+            let degrade = by_plan("plan-degrade");
+            assert_eq!(
+                degrade.degrade_flags_json, r#"["outline_only"]"#,
+                "{reader}"
+            );
+            assert_eq!(degrade.pff_bypass, None, "{reader}");
+            assert_eq!(degrade.cache_hit, None, "{reader}");
+            assert_eq!(by_plan("plan-bypass").pff_bypass, Some(true), "{reader}");
+            assert_eq!(by_plan("plan-hit").cache_hit, Some(true), "{reader}");
+            let plain = by_plan("plan-plain");
+            assert_eq!(plain.pff_bypass, None, "{reader}");
+            assert_eq!(plain.cache_hit, None, "{reader}");
+            assert_eq!(plain.degrade_flags_json, "[]", "{reader}");
+        }
     }
 }

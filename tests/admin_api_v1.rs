@@ -27,7 +27,7 @@ use symforge::server::{
     apply_bearer_auth, apply_origin_gate,
 };
 use symforge::sidecar::governor::RequestGovernor;
-use symforge::stel::ledger_store::StelLedgerStore;
+use symforge::stel::ledger_store::{SqliteStelLedgerStore, StelLedgerStore};
 use symforge::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent};
 use symforge::watcher::WatcherInfo;
 
@@ -294,4 +294,259 @@ async fn admin_html_is_served() {
     assert!(html.contains("SymForge Admin"));
 
     server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 032 US2 — collapsed `recent_runs` (contracts/admin-recent-runs.md)
+// ---------------------------------------------------------------------------
+
+/// A serve event whose collapse identity is selected by `tools`; `ts_ms` and
+/// `plan_id` are the bookkeeping the identity ignores.
+fn serve_event(ts_ms: u64, plan_id: &str, tools: &[&str]) -> StelLedgerEvent {
+    StelLedgerEvent {
+        ts_ms,
+        plan_id: plan_id.to_string(),
+        surface: "symforge".into(),
+        intent: IntentBucket::Trace,
+        decision: AdmissionDecision::Serve,
+        tools_called: tools.iter().map(|tool| tool.to_string()).collect(),
+        predicted_response_tokens: 100,
+        actual_response_tokens: 90,
+        manual_baseline_tokens: 300,
+        net_vs_manual: 210,
+        equivalence: None,
+        route_confidence: RouteConfidence::Exact,
+        pff_bypass: None,
+        cache_hit: None,
+        degrade_flags: vec![],
+    }
+}
+
+async fn summary_for(ledger: StelLedgerStore) -> serde_json::Value {
+    let rt = runtime(AuthConfig::new(None), Some(ledger));
+    let server = start(rt, AuthConfig::new(None), true).await;
+    let (status, body) = get_json(&server.url("/api/v1/summary"), None, None).await;
+    assert!(status.is_success(), "summary should be 200, got {status}");
+    server.shutdown().await;
+    body
+}
+
+/// `(count, session_id, first tool, first_ts_ms, last_ts_ms, window_clipped)`
+/// per run — the shape every ordering/scoping assertion compares.
+fn run_shapes(body: &serde_json::Value) -> Vec<(u64, String, String, u64, u64, bool)> {
+    body["recent_runs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("recent_runs must be an array in:\n{body:#}"))
+        .iter()
+        .map(|run| {
+            (
+                run["count"].as_u64().expect("count"),
+                run["session_id"].as_str().expect("session_id").to_string(),
+                run["tools_called"][0]
+                    .as_str()
+                    .expect("first tool")
+                    .to_string(),
+                run["first_ts_ms"].as_u64().expect("first_ts_ms"),
+                run["last_ts_ms"].as_u64().expect("last_ts_ms"),
+                run["window_clipped"].as_bool().expect("window_clipped"),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn admin_recent_runs_collapses_and_scopes_by_session() {
+    // (a) FR-008 control: the pre-existing seed is three identity-identical
+    // events (they differ only in ts_ms/plan_id), so it collapses to ONE run
+    // of 3 while every total stays exactly as pinned by
+    // `summary_returns_seeded_economics` — collapse is presentation-only.
+    let body = summary_for(seeded_ledger()).await;
+    assert_eq!(body["available"], true);
+    assert_eq!(body["total_events"], 3);
+    assert_eq!(body["total_net_vs_manual"], 630);
+    assert_eq!(body["recent_runs_window"], 50, "{body:#}");
+    assert_eq!(
+        body["recent_runs"],
+        serde_json::json!([{
+            "count": 3,
+            "first_ts_ms": 1000,
+            "last_ts_ms": 1002,
+            "window_clipped": false,
+            "session_id": "admin-it",
+            "surface": "symforge",
+            "intent": "trace",
+            "decision": "serve",
+            "tools_called": ["find_references"],
+            "route_confidence": "exact",
+            "pff_bypass": null,
+            "cache_hit": null,
+            "degrade_flags": []
+        }]),
+        "one collapsed run with the stored string forms verbatim:\n{body:#}"
+    );
+
+    // (b) Two sessions writing interleaved rows into ONE file-backed db (two
+    // `open` handles on the same path — `open_in_memory` binds one session per
+    // private db). Rows: s1:A s1:A s2:A s2:A s1:B. Without `session_id` in the
+    // identity the four A rows would merge into ×4 across the session
+    // boundary; with it, they are two runs of 2, rendered chronologically.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("stel-ledger.db");
+    let session_1 = SqliteStelLedgerStore::open(&db_path, "sess-1").expect("open sess-1");
+    let session_2 = SqliteStelLedgerStore::open(&db_path, "sess-2").expect("open sess-2");
+    session_1
+        .record(&serve_event(1, "p1", &["find_references"]))
+        .expect("record");
+    session_1
+        .record(&serve_event(2, "p2", &["find_references"]))
+        .expect("record");
+    session_2
+        .record(&serve_event(3, "p3", &["find_references"]))
+        .expect("record");
+    session_2
+        .record(&serve_event(4, "p4", &["find_references"]))
+        .expect("record");
+    session_1
+        .record(&serve_event(5, "p5", &["search_text"]))
+        .expect("record");
+    let body = summary_for(StelLedgerStore::Sqlite(session_1)).await;
+    assert_eq!(body["total_events"], 5, "{body:#}");
+    assert_eq!(body["session_count"], 2, "{body:#}");
+    assert_eq!(
+        run_shapes(&body),
+        vec![
+            (
+                2,
+                "sess-1".to_string(),
+                "find_references".to_string(),
+                1,
+                2,
+                false
+            ),
+            (
+                2,
+                "sess-2".to_string(),
+                "find_references".to_string(),
+                3,
+                4,
+                false
+            ),
+            (
+                1,
+                "sess-1".to_string(),
+                "search_text".to_string(),
+                5,
+                5,
+                false
+            ),
+        ],
+        "chronological runs that never merge across sessions:\n{body:#}"
+    );
+
+    // (c) Unavailable store: no rows are fabricated and no window is claimed.
+    let body = summary_for(StelLedgerStore::Disabled).await;
+    assert_eq!(body["available"], false);
+    assert_eq!(
+        body["recent_runs"],
+        serde_json::json!([]),
+        "unavailable store renders an empty run list, never null/fake rows:\n{body:#}"
+    );
+    assert!(
+        body.get("recent_runs_window").is_none(),
+        "no fetch window may be claimed for a store that was not read:\n{body:#}"
+    );
+}
+
+#[tokio::test]
+async fn admin_window_edge_is_labeled() {
+    // (a) A run longer than the fetch window: 60 identical rows, window 50.
+    // The rendered count is the rows actually inside the window (50), never
+    // the true 60, and the run is labeled clipped (spec SC-003: a view never
+    // prints ×N for an N it did not count, and never truncates silently).
+    let store = StelLedgerStore::open_in_memory("admin-window").expect("store");
+    for i in 0..60u64 {
+        store.record(&serve_event(
+            1_000 + i,
+            &format!("a-{i}"),
+            &["find_references"],
+        ));
+    }
+    let body = summary_for(store).await;
+    assert_eq!(body["total_events"], 60, "{body:#}");
+    assert_eq!(body["recent_runs_window"], 50, "{body:#}");
+    assert_eq!(
+        run_shapes(&body),
+        vec![(
+            50,
+            "admin-window".to_string(),
+            "find_references".to_string(),
+            1_010,
+            1_059,
+            true
+        )],
+        "the window-edge run counts only fetched rows and is labeled clipped:\n{body:#}"
+    );
+
+    // (b) Only the run containing the chronologically-oldest FETCHED row is
+    // clipped: 55 A then 5 B — the window holds 45 A + 5 B.
+    let store = StelLedgerStore::open_in_memory("admin-window-mixed").expect("store");
+    for i in 0..55u64 {
+        store.record(&serve_event(
+            1_000 + i,
+            &format!("a-{i}"),
+            &["find_references"],
+        ));
+    }
+    for i in 0..5u64 {
+        store.record(&serve_event(2_000 + i, &format!("b-{i}"), &["search_text"]));
+    }
+    let body = summary_for(store).await;
+    assert_eq!(body["total_events"], 60, "{body:#}");
+    assert_eq!(
+        run_shapes(&body),
+        vec![
+            (
+                45,
+                "admin-window-mixed".to_string(),
+                "find_references".to_string(),
+                1_010,
+                1_054,
+                true
+            ),
+            (
+                5,
+                "admin-window-mixed".to_string(),
+                "search_text".to_string(),
+                2_000,
+                2_004,
+                false
+            ),
+        ],
+        "only the oldest fetched run is clipped:\n{body:#}"
+    );
+
+    // (c) Control: fewer rows than the window — the oldest run was counted in
+    // full, so nothing may be labeled clipped.
+    let store = StelLedgerStore::open_in_memory("admin-window-short").expect("store");
+    for i in 0..5u64 {
+        store.record(&serve_event(
+            1_000 + i,
+            &format!("s-{i}"),
+            &["find_references"],
+        ));
+    }
+    let body = summary_for(store).await;
+    assert_eq!(body["recent_runs_window"], 50, "{body:#}");
+    assert_eq!(
+        run_shapes(&body),
+        vec![(
+            5,
+            "admin-window-short".to_string(),
+            "find_references".to_string(),
+            1_000,
+            1_004,
+            false
+        )],
+        "a fully counted run is never labeled clipped:\n{body:#}"
+    );
 }
