@@ -344,7 +344,13 @@ async function startSession(READINESS_PROBE) {
         ready = true; // no known symbol to probe; a source-bound Ready generation is the signal
       } else {
         // Confirm the index actually answers before we trust it. Empty/error → wait.
-        const probe = await callTool("search_symbols", { query: READINESS_PROBE });
+        // `limit: 50` is search_symbols' own default, so the answer set is unchanged —
+        // but the canonical-JSON fingerprint differs from every snapshot case, which
+        // pass `{ query }` alone. Feature 032's repeat notice fires on the 3rd
+        // identical (tool, arguments) serve in a session; a probe that repeated a
+        // case's exact arguments could make that case the 3rd serve and append the
+        // notice into a release-gate snapshot nondeterministically.
+        const probe = await callTool("search_symbols", { query: READINESS_PROBE, limit: 50 });
         if (!probe.isError && probe.text.includes(READINESS_PROBE)) ready = true;
       }
     }
@@ -463,7 +469,9 @@ function firstDiff(a, b) {
   }
   const cases = loadCases();
   // Readiness probe: reuse the first search_symbols case's query — a symbol we know
-  // exists in this fixture — so the poll confirms the index actually answers.
+  // exists in this fixture — so the poll confirms the index actually answers. The
+  // probe call itself carries an extra argument (see startSession) so its request
+  // fingerprint never equals that case's.
   const probe = (cases.find((c) => c.tool === "search_symbols") || {}).args?.query || "";
   const session = await startSession(probe);
   const results = [];

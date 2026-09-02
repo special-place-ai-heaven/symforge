@@ -17,6 +17,7 @@ pub mod prompts;
 // externally only through the repo-internal test door).
 pub mod read_gate;
 pub(crate) mod read_tools;
+pub(crate) mod repeat;
 pub mod resources;
 pub mod result_status;
 pub(crate) mod search_format;
@@ -253,6 +254,12 @@ pub struct SymForgeServer {
     pub(crate) ccr_store: Arc<Mutex<ccr::CcrStore>>,
     /// In-memory STEL L4 ledger for compact `symforge` invocations (no persistence yet).
     pub(crate) stel_ledger: Arc<Mutex<crate::stel::ledger::SessionLedger>>,
+    /// Feature 032 (US1): the session-scoped repeat-call tracker. Every clone
+    /// of this server (the HTTP factory clones per request, the daemon per
+    /// project) shares the ONE map behind this `Arc`; the `call_tool` seam
+    /// locks it synchronously after the awaited dispatch and never holds it
+    /// across an `.await`.
+    pub(crate) repeat_tracker: Arc<Mutex<repeat::RepeatTracker>>,
     /// Tracks edit-tool calls that omitted `working_directory` while the
     /// transitional worktree observability knob was on. Surfaced by the
     /// `health` tool as a rolling "last hour" signal.
@@ -420,6 +427,7 @@ impl SymForgeServer {
             session_context: Arc::new(session::SessionContext::new()),
             ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
+            repeat_tracker: Arc::new(Mutex::new(repeat::RepeatTracker::default())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
             #[cfg(feature = "server")]
@@ -496,6 +504,7 @@ impl SymForgeServer {
             session_context: Arc::new(session::SessionContext::new()),
             ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
+            repeat_tracker: Arc::new(Mutex::new(repeat::RepeatTracker::default())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
             #[cfg(feature = "server")]
@@ -2151,6 +2160,15 @@ impl ServerHandler for SymForgeServer {
                 })
                 .and_then(|input| Some((input.probe_legacy_tool?, input.probe_legacy_args?)))
                 .is_some_and(|(tool, args)| Self::facade_probe_is_measurement_safe(&tool, &args));
+        // Feature 032 (US1): observe the lane and fingerprint the request
+        // BEFORE `ToolCallContext::new` moves it. `None` means this call never
+        // touches the tracker: an inert lane (no observable session identity),
+        // an ineligible tool, or a set-valued `projects` fan-out.
+        let repeat_key = repeat::RepeatKey::observe(
+            repeat::SessionDiscriminator::observe(&context),
+            request.name.as_ref(),
+            request.arguments.as_ref(),
+        );
         let initial_project_evidence = self
             .initial_project_evidence_for_call(request.arguments.as_ref())
             .await;
@@ -2187,6 +2205,18 @@ impl ServerHandler for SymForgeServer {
                             .join("\n");
                         if !body.is_empty() && tools::is_error_output(&body) {
                             result.is_error = Some(true);
+                        }
+                    }
+                    // Feature 032 (US1): AFTER evidence attachment (the
+                    // tracker reads the evidence this response actually
+                    // carries) and AFTER the error reclassification (the
+                    // notice text must never reach `is_error_output`). The
+                    // lock is taken and released right here, synchronously.
+                    if let Some(key) = repeat_key {
+                        let observation = repeat::ServeObservation::from_result(&result);
+                        let notice = self.repeat_tracker.lock().record_serve(key, observation);
+                        if let Some(notice) = notice {
+                            notice.attach(&mut result);
                         }
                     }
                     rmcp::model::CallToolResponse::Complete(result)
