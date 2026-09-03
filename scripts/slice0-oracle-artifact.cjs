@@ -83,6 +83,19 @@ const SUITES = [
     ],
   },
   {
+    target: "tests/project_index_lifecycle_slice0.rs::empty_placeholder_publication_refuses_watcher_mutation",
+    expected: "green",
+    args: [
+      "test",
+      "--test",
+      "project_index_lifecycle_slice0",
+      "empty_placeholder_publication_refuses_watcher_mutation",
+      "--",
+      "--exact",
+      "--test-threads=1",
+    ],
+  },
+  {
     target: "tests/project_index_lifecycle_slice0.rs::observer_replacement_gap_is_latched_as_non_current",
     expected: "green",
     args: [
@@ -128,7 +141,6 @@ const MAX_REASON_BYTES = 512;
 const RED_CASES = [
   "capacity_refused_open_creates_no_slot_and_no_watcher",
   "configured_capacity_bounds_the_process_not_each_load",
-  "empty_placeholder_publication_refuses_watcher_mutation",
   "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
   "same_path_root_replacement_is_not_silently_adopted",
   "snapshot_seed_is_not_queryable_before_verification",
@@ -152,6 +164,15 @@ const RESOLVED_CASES = new Map([
       tasks: [],
       defect: "2.10 a failed reload loses the recovery observer",
       fix: "src/daemon.rs::ProjectSlot::reload_with starts a replacement observer before propagating the rebuild error",
+    },
+  ],
+  [
+    "empty_placeholder_publication_refuses_watcher_mutation",
+    {
+      slice: null,
+      tasks: [],
+      defect: "unrooted empty placeholder admits watcher mutations",
+      fix: "src/live_index/store.rs::LiveIndex::refuses_unpublished_empty_bootstrap_mutation gates add_file, update_file, publish_indexed_file_at_generation, and sibling mutation entry points on the cold-start EmptyBootstrap placeholder",
     },
   ],
   [

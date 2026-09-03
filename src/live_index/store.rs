@@ -2602,6 +2602,13 @@ impl SharedIndexHandle {
     pub fn update_file(&self, path: String, file: IndexedFile) {
         let _wg = self.write_mutex.lock();
         let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path = path.as_str(),
+                "refusing update_file on unpublished EmptyBootstrap placeholder"
+            );
+            return;
+        }
         let path_clone = path.clone();
         // Capture pre-update symbols so analyze_file_impact can diff correctly
         // even when the watcher re-indexes before the hook fires.
@@ -2658,6 +2665,13 @@ impl SharedIndexHandle {
         }
 
         let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path,
+                "refusing update_file_at_generation on unpublished EmptyBootstrap placeholder"
+            );
+            return false;
+        }
         // Capture pre-update symbols so analyze_file_impact can diff correctly
         // even when the watcher re-indexes before the hook fires.
         let pre_update = current.get_file(path).map(pre_update_snapshot);
@@ -2731,6 +2745,13 @@ impl SharedIndexHandle {
         }
 
         let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path,
+                "refusing indexed-file publication on unpublished EmptyBootstrap placeholder"
+            );
+            return None;
+        }
         let pre_update = current.get_file(path).map(pre_update_snapshot);
 
         let parse_status = match &file.parse_status {
@@ -2871,6 +2892,13 @@ impl SharedIndexHandle {
         }
 
         let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path,
+                "refusing hash-skip on unpublished EmptyBootstrap placeholder"
+            );
+            return None;
+        }
         let mut live = (*current).clone();
         let mut live_changed = false;
         let file = current.files.get(path)?;
@@ -2923,6 +2951,13 @@ impl SharedIndexHandle {
     pub fn add_file(&self, path: String, file: IndexedFile) {
         let _wg = self.write_mutex.lock();
         let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path = path.as_str(),
+                "refusing add_file on unpublished EmptyBootstrap placeholder"
+            );
+            return;
+        }
         let pre_update = current.get_file(&path).map(pre_update_snapshot);
         let mut live = (*current).clone();
         let path_clone = path.clone();
@@ -2956,7 +2991,15 @@ impl SharedIndexHandle {
 
     pub fn remove_file(&self, path: &str) {
         let _wg = self.write_mutex.lock();
-        let mut live = (*self.live.load_full()).clone();
+        let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path,
+                "refusing remove_file on unpublished EmptyBootstrap placeholder"
+            );
+            return;
+        }
+        let mut live = (*current).clone();
         let path_owned = path.to_string();
         let mut removed = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3136,7 +3179,16 @@ impl SharedIndexHandle {
             }
         }
 
-        let mut live = (*self.live.load_full()).clone();
+        let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path,
+                "refusing file removal on unpublished EmptyBootstrap placeholder"
+            );
+            return FencedRemoval::Rejected;
+        }
+
+        let mut live = (*current).clone();
         let path_owned = path.to_string();
         let mut removed_from_live = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3216,8 +3268,16 @@ impl SharedIndexHandle {
             );
             return None;
         }
+        let current = self.live.load_full();
+        if current.refuses_unpublished_empty_bootstrap_mutation() {
+            tracing::trace!(
+                path,
+                "refusing terminal disposition on unpublished EmptyBootstrap placeholder"
+            );
+            return None;
+        }
         let manifest_entry = catalog_entry_from_scout(&scouted, disposition.clone(), None);
-        let mut live = (*self.live.load_full()).clone();
+        let mut live = (*current).clone();
         let retains_last_valid_content = matches!(
             &disposition,
             crate::domain::FileDisposition::Unreadable { .. }
@@ -3664,6 +3724,12 @@ impl Drop for SharedIndexWriteGuard<'_> {
         if self.dirty
             && let Some(live) = self.index.take()
         {
+            if live.refuses_unpublished_empty_bootstrap_mutation() {
+                tracing::trace!(
+                    "refusing write-guard publication on unpublished EmptyBootstrap placeholder"
+                );
+                return;
+            }
             self.handle.swap_and_publish(live);
             // A generic mutable guard can alter any number of paths, so an
             // existing path-scoped snapshot can no longer be tied to the
@@ -5046,6 +5112,14 @@ impl LiveIndex {
             tier1 = self.files.len();
         }
         (tier1, tier2, tier3)
+    }
+
+    /// True for the cold-start bootstrap placeholder that awaits its first
+    /// `reload` and has no bound root yet. The no-root lane sets
+    /// `local_empty_reason` and is excluded so sidecar admission can still
+    /// populate that placeholder.
+    pub(crate) fn refuses_unpublished_empty_bootstrap_mutation(&self) -> bool {
+        self.load_source == IndexLoadSource::EmptyBootstrap && self.local_empty_reason().is_none()
     }
 
     /// Build reload data without holding any lock. Performs all file I/O and
@@ -6476,7 +6550,9 @@ mod tests {
 
     #[test]
     fn test_shared_index_handle_preserves_read_write_access() {
-        let shared = LiveIndex::empty();
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/seed.rs", "fn seed() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
         {
             let mut live = shared.write();
             live.add_file(
@@ -6495,38 +6571,36 @@ mod tests {
         let initial = shared.published_state();
         assert_eq!(initial.generation, 0);
         assert_eq!(initial.status, PublishedIndexStatus::Empty);
-        assert_eq!(initial.degraded_summary, None);
         assert_eq!(initial.file_count, 0);
-        assert_eq!(initial.parsed_count, 0);
-        assert_eq!(initial.partial_parse_count, 0);
-        assert_eq!(initial.failed_count, 0);
         assert_eq!(initial.load_source, IndexLoadSource::EmptyBootstrap);
 
         shared.add_file(
             "src/new.rs".to_string(),
             make_indexed_file_for_mutation("src/new.rs"),
         );
-        let after_add = shared.published_state();
-        assert_eq!(after_add.generation, 1);
-        // Still an EmptyBootstrap index with no bound root: mutating it does not
-        // make it Ready, it makes it a placeholder that is still loading.
-        assert_eq!(after_add.status, PublishedIndexStatus::Loading);
-        assert_eq!(after_add.degraded_summary, None);
-        assert_eq!(after_add.file_count, 1);
-        assert_eq!(after_add.parsed_count, 1);
-        assert_eq!(after_add.partial_parse_count, 0);
-        assert_eq!(after_add.failed_count, 0);
-        assert_eq!(after_add.symbol_count, 1);
+        assert_eq!(
+            shared.published_state().generation,
+            0,
+            "unpublished EmptyBootstrap placeholder must refuse add_file"
+        );
+        assert_eq!(shared.read().file_count(), 0);
 
-        shared.remove_file("src/new.rs");
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/new.rs", "fn new_fn() {}\n");
+        shared.reload(tmp.path()).expect("reload binds the root");
+        shared.add_file(
+            "src/extra.rs".to_string(),
+            make_indexed_file_for_mutation("src/extra.rs"),
+        );
+        let after_add = shared.published_state();
+        assert!(after_add.generation > initial.generation);
+        assert_eq!(after_add.status, PublishedIndexStatus::Ready);
+        assert_eq!(after_add.file_count, 2);
+
+        shared.remove_file("src/extra.rs");
         let after_remove = shared.published_state();
-        assert_eq!(after_remove.generation, 2);
-        // `remove_file` never restores `is_empty`, so the index stays a
-        // non-empty-flagged, still-unbound bootstrap.
-        assert_eq!(after_remove.status, PublishedIndexStatus::Loading);
-        assert_eq!(after_remove.degraded_summary, None);
-        assert_eq!(after_remove.file_count, 0);
-        assert_eq!(after_remove.symbol_count, 0);
+        assert!(after_remove.generation > after_add.generation);
+        assert_eq!(after_remove.file_count, 1);
     }
 
     #[test]
@@ -6557,11 +6631,9 @@ mod tests {
     #[test]
     fn test_reset_to_empty_invalidates_populated_index_and_bumps_generation() {
         // Populate a handle with a file (simulating a stale OLD-project local index).
-        let shared = LiveIndex::empty();
-        shared.add_file(
-            "src/old_project.rs".to_string(),
-            make_indexed_file_for_mutation("src/old_project.rs"),
-        );
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/old_project.rs", "fn old_project() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
         let before = shared.published_state();
         assert_eq!(before.file_count, 1, "precondition: index has stale file");
         let project_gen_before = shared.current_project_generation();
@@ -6675,43 +6747,39 @@ mod tests {
 
     #[test]
     fn test_shared_index_handle_write_guard_publishes_on_drop() {
-        let shared = LiveIndex::empty();
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/new.rs", "fn new_fn() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
 
         {
             let mut live = shared.write();
             live.add_file(
-                "src/new.rs".to_string(),
-                make_indexed_file_for_mutation("src/new.rs"),
+                "src/extra.rs".to_string(),
+                make_indexed_file_for_mutation("src/extra.rs"),
             );
         }
 
         let after_add = shared.published_state();
-        assert_eq!(after_add.generation, 1);
-        // Write-guard drop publishes, but an unbound EmptyBootstrap index that
-        // gained a file is Loading, not Ready (see index_state's guard).
-        assert_eq!(after_add.status, PublishedIndexStatus::Loading);
-        assert_eq!(after_add.degraded_summary, None);
-        assert_eq!(after_add.file_count, 1);
+        assert!(after_add.generation > 0);
+        assert_eq!(after_add.status, PublishedIndexStatus::Ready);
+        assert_eq!(after_add.file_count, 2);
 
         {
             let mut live = shared.write();
-            live.remove_file("src/new.rs");
+            live.remove_file("src/extra.rs");
         }
 
         let after_remove = shared.published_state();
-        assert_eq!(after_remove.generation, 2);
-        assert_eq!(after_remove.status, PublishedIndexStatus::Loading);
-        assert_eq!(after_remove.degraded_summary, None);
-        assert_eq!(after_remove.file_count, 0);
+        assert!(after_remove.generation > after_add.generation);
+        assert_eq!(after_remove.status, PublishedIndexStatus::Ready);
+        assert_eq!(after_remove.file_count, 1);
     }
 
     #[test]
     fn generic_write_guard_invalidates_pre_update_snapshot_tokens() {
-        let shared = LiveIndex::empty();
-        shared.add_file(
-            "src/tracked.rs".to_string(),
-            make_indexed_file_for_mutation("src/tracked.rs"),
-        );
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/tracked.rs", "fn tracked() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
         shared.update_file(
             "src/tracked.rs".to_string(),
             make_indexed_file_for_mutation("src/tracked.rs"),
@@ -6772,11 +6840,9 @@ mod tests {
 
     #[test]
     fn mtime_only_update_is_visible_in_published_root_without_advancing_content_generation() {
-        let shared = LiveIndex::empty();
-        shared.add_file(
-            "src/touched.rs".to_string(),
-            make_indexed_file_for_mutation("src/touched.rs"),
-        );
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/touched.rs", "fn touched() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
         let before = shared.published_generation();
         let before_mtime = before
             .live
@@ -6992,30 +7058,29 @@ mod tests {
 
     #[test]
     fn test_shared_index_handle_published_repo_outline_tracks_mutations() {
-        let shared = LiveIndex::empty();
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/main.rs", "fn main_fn() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
 
         let initial = shared.published_repo_outline();
-        assert_eq!(initial.total_files, 0);
-        assert_eq!(initial.total_symbols, 0);
-        assert!(initial.files.is_empty());
+        assert_eq!(initial.total_files, 1);
+        assert_eq!(initial.total_symbols, 1);
 
         shared.add_file(
-            "src/main.rs".to_string(),
-            make_indexed_file_for_mutation("src/main.rs"),
+            "src/extra.rs".to_string(),
+            make_indexed_file_for_mutation("src/extra.rs"),
         );
         let after_add = shared.published_repo_outline();
-        assert_eq!(after_add.total_files, 1);
-        assert_eq!(after_add.total_symbols, 1);
-        assert_eq!(after_add.files[0].relative_path, "src/main.rs");
+        assert_eq!(after_add.total_files, 2);
+        assert_eq!(after_add.total_symbols, 2);
 
         {
             let mut live = shared.write();
-            live.remove_file("src/main.rs");
+            live.remove_file("src/extra.rs");
         }
         let after_remove = shared.published_repo_outline();
-        assert_eq!(after_remove.total_files, 0);
-        assert_eq!(after_remove.total_symbols, 0);
-        assert!(after_remove.files.is_empty());
+        assert_eq!(after_remove.total_files, 1);
+        assert_eq!(after_remove.total_symbols, 1);
     }
 
     #[test]
@@ -7032,11 +7097,8 @@ mod tests {
         assert!(!index.is_ready(), "empty index should not be ready");
     }
 
-    /// Regression: a file admitted into the empty bootstrap placeholder before the
-    /// initial load bound a root must NOT publish as Ready. Such an index has no
-    /// `indexed_root`, so `capture_published_manifest` returns None and knowledge
-    /// publishes unbound with `source=unknown`, while the tool guards wave the
-    /// request through.
+    /// Regression: the cold-start bootstrap placeholder must refuse file mutation
+    /// until the first reload binds a root.
     #[test]
     fn bootstrap_placeholder_that_admitted_a_file_is_loading_not_ready() {
         let shared = LiveIndex::empty();
@@ -7044,7 +7106,8 @@ mod tests {
             "src/admitted_before_load.rs".to_string(),
             make_indexed_file_for_mutation("src/admitted_before_load.rs"),
         );
-        assert_eq!(shared.read().index_state(), IndexState::Loading);
+        assert_eq!(shared.read().file_count(), 0);
+        assert_eq!(shared.read().index_state(), IndexState::Empty);
     }
 
     /// F7: the embed facade's in-memory construction path must yield an index
@@ -7074,14 +7137,14 @@ mod tests {
             "a rooted in-memory index publishes a bound source identity"
         );
 
-        // The old construction is still not Ready and still unbound: this is a
-        // new route, not a weakening of the placeholder guard above.
+        // The old construction route still refuses mutation before reload.
         let placeholder = LiveIndex::empty();
         placeholder.update_file(
             "src/lib.rs".to_string(),
             make_indexed_file_for_mutation("src/lib.rs"),
         );
-        assert_eq!(placeholder.read().index_state(), IndexState::Loading);
+        assert_eq!(placeholder.read().file_count(), 0);
+        assert_eq!(placeholder.read().index_state(), IndexState::Empty);
         assert!(placeholder.published_generation().source.is_none());
 
         // A root that does not resolve is refused, not published as Ready.
@@ -7174,11 +7237,8 @@ mod tests {
     #[test]
     fn failed_reload_preserves_previous_generation() {
         let tmp = TempDir::new().unwrap();
-        let shared = LiveIndex::empty();
-        shared.add_file(
-            "src/retained.rs".to_string(),
-            make_indexed_file_for_mutation("src/retained.rs"),
-        );
+        write_file(tmp.path(), "src/retained.rs", "fn retained() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
         let before = shared.published_generation();
 
         let result = shared.reload(&tmp.path().join("missing-repository"));
@@ -7194,8 +7254,9 @@ mod tests {
     #[test]
     fn failed_observation_publishes_degraded_last_valid_wrapper() {
         let path = "src/retained.rs";
-        let shared = LiveIndex::empty();
-        shared.add_file(path.to_string(), make_indexed_file_for_mutation(path));
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), path, "fn retained() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
         let before = shared.published_generation();
         let before_file = Arc::clone(before.live.files.get(path).unwrap());
         let scouted = crate::domain::ScoutedEntry {
