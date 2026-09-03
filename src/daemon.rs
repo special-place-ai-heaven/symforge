@@ -1,6 +1,6 @@
 //! Shared local daemon for project-aware and session-aware backend state.
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
@@ -214,6 +214,62 @@ pub struct DaemonSessionClient {
     project_root: Option<PathBuf>,
 }
 
+/// Single-flight gate: concurrent first opens of one project id join one cold load.
+struct ColdLoadFlight {
+    outcome: Mutex<Option<anyhow::Result<Arc<ProjectSlot>>>>,
+    ready: Condvar,
+}
+
+impl ColdLoadFlight {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> anyhow::Result<Arc<ProjectSlot>> {
+        let mut guard = self.outcome.lock();
+        while guard.is_none() {
+            self.ready.wait(&mut guard);
+        }
+        match guard.as_ref().expect("notified with outcome") {
+            Ok(slot) => Ok(Arc::clone(slot)),
+            Err(err) => Err(anyhow::anyhow!("{err}")),
+        }
+    }
+
+    fn complete(&self, result: anyhow::Result<Arc<ProjectSlot>>) {
+        let mut guard = self.outcome.lock();
+        *guard = Some(result);
+        self.ready.notify_all();
+    }
+
+    fn complete_if_pending(&self, result: anyhow::Result<Arc<ProjectSlot>>) {
+        let mut guard = self.outcome.lock();
+        if guard.is_none() {
+            *guard = Some(result);
+            self.ready.notify_all();
+        }
+    }
+}
+
+/// Ensures a cold-load leader always publishes an outcome and evicts its flight.
+struct ColdLoadLeaderGuard<'a> {
+    flight: &'a ColdLoadFlight,
+    inflight: &'a Mutex<HashMap<String, Arc<ColdLoadFlight>>>,
+    project_id: String,
+}
+
+impl Drop for ColdLoadLeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.flight.complete_if_pending(Err(anyhow::anyhow!(
+            "cold load leader unwound before publishing a project slot"
+        )));
+        self.inflight.lock().remove(&self.project_id);
+    }
+}
+
 pub struct DaemonState {
     next_session_id: AtomicU64,
     // Registry/session guards protect only map membership and short metadata
@@ -239,6 +295,9 @@ pub struct DaemonState {
     /// distinct published bases (the D2 fence the engine asserts on).
     base_generation_seq: AtomicU64,
     projects: RwLock<HashMap<String, Arc<ProjectSlot>>>,
+    /// In-flight cold loads keyed by project id. The first opener runs
+    /// `ProjectInstance::load`; concurrent first opens wait on the same gate.
+    cold_load_flights: Mutex<HashMap<String, Arc<ColdLoadFlight>>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
     /// Boot epoch minted once per daemon process (unix seconds). Served on
@@ -853,6 +912,7 @@ impl DaemonState {
             bases: RwLock::new(HashMap::new()),
             base_generation_seq: AtomicU64::new(1),
             projects: RwLock::new(HashMap::new()),
+            cold_load_flights: Mutex::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             identity: current_daemon_identity(),
             started_at_unix_secs: now_epoch_millis() / 1000,
@@ -1112,9 +1172,8 @@ impl DaemonState {
         load_project: F,
     ) -> anyhow::Result<Arc<ProjectSlot>>
     where
-        F: FnOnce() -> anyhow::Result<ProjectInstance>,
+        F: Fn() -> anyhow::Result<ProjectInstance>,
     {
-        let mut load_project = Some(load_project);
         loop {
             let existing = self.projects.read().get(project_id).cloned();
             if let Some(slot) = existing {
@@ -1134,17 +1193,58 @@ impl DaemonState {
                 continue;
             }
 
-            let candidate = Arc::new(ProjectSlot::new(load_project
-                .take()
-                .expect("cold project loader is consumed only on the returning branch")(
-            )?));
-            let mut projects = self.projects.write();
-            let slot = Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
-            slot.metadata
-                .write()
-                .session_ids
-                .insert(session_id.to_string());
-            return Ok(slot);
+            let (flight, is_leader) = {
+                let mut inflight = self.cold_load_flights.lock();
+                match inflight.entry(project_id.to_string()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (Arc::clone(entry.get()), false)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let flight = Arc::new(ColdLoadFlight::new());
+                        entry.insert(Arc::clone(&flight));
+                        (flight, true)
+                    }
+                }
+            };
+
+            if is_leader {
+                let _leader_guard = ColdLoadLeaderGuard {
+                    flight: &flight,
+                    inflight: &self.cold_load_flights,
+                    project_id: project_id.to_string(),
+                };
+                let result = (|| -> anyhow::Result<Arc<ProjectSlot>> {
+                    let instance = load_project()?;
+                    let candidate = Arc::new(ProjectSlot::new(instance));
+                    let mut projects = self.projects.write();
+                    let slot =
+                        Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
+                    slot.metadata
+                        .write()
+                        .session_ids
+                        .insert(session_id.to_string());
+                    Ok(slot)
+                })();
+                flight.complete(result);
+            }
+
+            let _published = flight.wait()?;
+            let projects = self.projects.write();
+            match projects.get(project_id).cloned() {
+                Some(current) => {
+                    current
+                        .metadata
+                        .write()
+                        .session_ids
+                        .insert(session_id.to_string());
+                    return Ok(current);
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "session '{session_id}' closed before the opened project could be attached"
+                    ));
+                }
+            }
         }
     }
 
@@ -10294,10 +10394,9 @@ mod tests {
     /// `ensure_project_slot_for_session` supplies it — so this counts real
     /// loads, not a stand-in.
     ///
-    /// One first open must cost exactly one cold load, however many sessions
-    /// race for it.
+    /// One uncontended first open — N sessions racing a missing slot with no
+    /// concurrent detach — must cost exactly one cold load.
     #[test]
-    #[ignore = "Feature 020 Slice 0 RED control for design defect 2.4; remove this attribute in Slice 2 (T030-T040) when project admission is single-flight"]
     fn concurrent_first_open_performs_exactly_one_cold_load() {
         let project = project_dir("symforge-slot-single-flight");
         std::fs::write(

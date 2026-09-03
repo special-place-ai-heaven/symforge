@@ -59,14 +59,13 @@ const SUITES = [
   },
   {
     target: "src/daemon.rs::tests",
-    expected: "red",
+    expected: "green",
     args: [
       "test",
       "--lib",
       "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
       "--",
       "--exact",
-      "--ignored",
     ],
   },
   {
@@ -129,7 +128,6 @@ const RED_CASES = [
   "capacity_refused_open_creates_no_slot_and_no_watcher",
   "configured_capacity_bounds_the_process_not_each_load",
   "empty_placeholder_publication_refuses_watcher_mutation",
-  "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
   "same_path_root_replacement_is_not_silently_adopted",
   "snapshot_seed_is_not_queryable_before_verification",
   "watcher_mutation_during_candidate_build_is_not_discarded",
@@ -141,6 +139,15 @@ const RED_CASES = [
 // delete the regression guard and leave this artifact silent about the transition
 // it exists to evidence.
 const RESOLVED_CASES = new Map([
+  [
+    "internals::daemon::tests::concurrent_first_open_performs_exactly_one_cold_load",
+    {
+      slice: null,
+      tasks: [],
+      defect: "2.4 project loading is not single-flight",
+      fix: "src/daemon.rs::ensure_project_slot_for_session_with joins concurrent first opens on a per-project_id ColdLoadFlight gate",
+    },
+  ],
   [
     "failed_reload_retains_the_recovery_observer",
     {
