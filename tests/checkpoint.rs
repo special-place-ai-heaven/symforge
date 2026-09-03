@@ -145,10 +145,24 @@ fn checkpoint_shared_index_reports_write_failure() {
     );
 }
 
-fn assert_source_withheld(shared: &symforge::live_index::SharedIndex) {
+fn assert_manifest_withheld(shared: &symforge::live_index::SharedIndex) {
     assert!(
-        shared.published_generation().source.is_none(),
-        "refuse fixture must publish source=None before checkpoint (Grove gate key)"
+        shared.published_generation().manifest.is_none(),
+        "refuse fixture must publish manifest=None before checkpoint (Ada gate key)"
+    );
+}
+
+fn assert_allow_fixture_manifest_vouched(shared: &symforge::live_index::SharedIndex) {
+    let published = shared.published_generation();
+    if published.source.is_some() && published.manifest.is_none() {
+        panic!(
+            "NOT ESTABLISHED: allow fixture has published.source=Some but published.manifest=None; \
+             Ada's equivalence at this site does not hold and a manifest-keyed gate would invert"
+        );
+    }
+    assert!(
+        published.manifest.is_some(),
+        "ALLOW fixture must publish manifest=Some before checkpoint (Ada gate key)"
     );
 }
 
@@ -171,20 +185,20 @@ fn unvouched_empty_bootstrap_checkpoint_must_not_overwrite_genuine_artifact() {
     let genuine_bytes = read_index_bin_bytes(temp.path());
     assert_snapshot_contains_genuine_artifact(temp.path(), &placement);
 
-    // EmptyBootstrap + update_file is the setup route to source=None.
+    // EmptyBootstrap + update_file is the setup route to manifest=None.
     let unvouched = LiveIndex::empty();
     unvouched.update_file(
         "src/bootstrap_only.rs".to_string(),
         make_rust_indexed_file("src/bootstrap_only.rs", BOOTSTRAP_ONLY_RS),
     );
-    assert_source_withheld(&unvouched);
+    assert_manifest_withheld(&unvouched);
 
     let unvouched_result =
         persist::checkpoint_shared_index(&unvouched, temp.path(), &placement);
 
     assert!(
         unvouched_result.is_err(),
-        "checkpoint must refuse when published.source is None against an existing genuine artifact, got Ok({unvouched_result:?})"
+        "checkpoint must refuse when published.manifest is None against an existing genuine artifact, got Ok({unvouched_result:?})"
     );
 
     let after_bytes = read_index_bin_bytes(temp.path());
@@ -195,35 +209,37 @@ fn unvouched_empty_bootstrap_checkpoint_must_not_overwrite_genuine_artifact() {
     assert_snapshot_contains_genuine_artifact(temp.path(), &placement);
 }
 
-/// ALLOW path for the Grove gate: checkpoint must succeed when
-/// `published.source.is_some()`.
+/// ALLOW path for the Ada gate: checkpoint must succeed when
+/// `published.manifest.is_some()`.
 ///
-/// `LiveIndex::from_source_files` is `pub(crate)` only and, without an
-/// `indexed_root`, cannot publish source through public integration-test APIs —
-/// NOT ESTABLISHED for that constructor here. The public source-bound route is
-/// `from_indexed_files`.
+/// NOT ESTABLISHED from integration tests for Larry's P1
+/// `from_source_files` constructor: `LiveIndex::from_source_files` and
+/// `SharedIndexHandle::build_ref_source_generation` are `pub(crate)` and not
+/// callable from `tests/checkpoint.rs`. If that path were reachable and showed
+/// `source=Some` with `manifest=None`, the divergence check in
+/// `assert_allow_fixture_manifest_vouched` would stop the test — a
+/// manifest-keyed gate must not false-refuse that lane.
+///
+/// Nearest public manifest-vouched route: `from_indexed_files`.
 #[test]
-fn source_bound_checkpoint_is_allowed() {
+fn manifest_vouched_checkpoint_is_allowed() {
     let temp = tempfile::tempdir().expect("tempdir");
     write_file(temp.path(), "src/lib.rs", GENUINE_LIB_RS);
 
-    let source_bound = LiveIndex::from_indexed_files(
+    let manifest_vouched = LiveIndex::from_indexed_files(
         temp.path(),
         vec![(
             "src/lib.rs".to_string(),
             make_rust_indexed_file("src/lib.rs", GENUINE_LIB_RS),
         )],
     )
-    .expect("from_indexed_files should bind source at the fixture root");
+    .expect("from_indexed_files should publish a manifest at the fixture root");
 
-    assert!(
-        source_bound.published_generation().source.is_some(),
-        "ALLOW fixture must publish source=Some before checkpoint"
-    );
+    assert_allow_fixture_manifest_vouched(&manifest_vouched);
 
     let placement = state_placement(temp.path());
-    persist::checkpoint_shared_index(&source_bound, temp.path(), &placement)
-        .expect("checkpoint must allow when published.source is Some");
+    persist::checkpoint_shared_index(&manifest_vouched, temp.path(), &placement)
+        .expect("checkpoint must allow when published.manifest is Some");
 }
 
 #[test]
