@@ -3307,14 +3307,8 @@ mod tests {
         }
     }
 
-    fn make_bootstrap_placeholder_state(files: Vec<(&str, IndexedFile)>) -> SidecarState {
+    fn make_bootstrap_placeholder_state() -> SidecarState {
         let index = LiveIndex::empty();
-        {
-            let mut guard = index.write();
-            for (path, file) in files {
-                guard.add_file(path.to_string(), file);
-            }
-        }
         SidecarState {
             index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
                 index,
@@ -3748,13 +3742,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
         std::fs::write(repo.path().join("src/new.rs"), "pub fn newly_added() {}\n").unwrap();
-        let file = make_indexed_file(
-            "src/foo.rs",
-            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
-            vec![],
-            ParseStatus::Parsed,
-        );
-        let mut state = make_bootstrap_placeholder_state(vec![("src/foo.rs", file)]);
+        let mut state = make_bootstrap_placeholder_state();
         state.repo_root = Some(repo.path().to_path_buf());
         let generation_before = state.index.data_plane().current_project_generation();
         let replacement = make_indexed_file(
@@ -3763,34 +3751,27 @@ mod tests {
             vec![],
             ParseStatus::Parsed,
         );
-        assert!(state.index.data_plane().update_file_at_generation(
-            "src/foo.rs",
-            replacement,
-            generation_before,
-        ));
-        let seeded_cache = vec![SymbolSnapshot {
-            name: "cached_alpha".to_string(),
-            kind: SymbolKind::Function.to_string(),
-            line_range: (1, 5),
-            byte_range: (0, 10),
-        }];
-        store_cached_symbols_at_generation(&state, "src/foo.rs", seeded_cache, generation_before)
-            .unwrap();
-        let cache_before = state.symbol_cache.read().clone();
-        let published_before = state.index.data_plane().published_generation();
+        assert!(
+            !state.index.data_plane().update_file_at_generation(
+                "src/foo.rs",
+                replacement,
+                generation_before,
+            ),
+            "cold-start bootstrap placeholder must refuse file mutation"
+        );
         let published = state.index.data_plane().published_state();
         assert!(matches!(
             published.status,
-            crate::live_index::PublishedIndexStatus::Loading
+            crate::live_index::PublishedIndexStatus::Empty
         ));
-        assert_eq!(published.file_count, 1);
+        assert_eq!(published.file_count, 0);
         assert!(
             state
                 .index
                 .data_plane()
                 .read()
                 .get_file("src/foo.rs")
-                .is_some()
+                .is_none()
         );
         let write_fires_before = state
             .token_stats
@@ -3867,16 +3848,9 @@ mod tests {
             state.index.data_plane().current_project_generation(),
             generation_before
         );
-        let published_after = state.index.data_plane().published_generation();
-        assert_eq!(
-            published_after.publication_generation,
-            published_before.publication_generation
-        );
-        assert_eq!(
-            published_after.content_generation,
-            published_before.content_generation
-        );
-        assert_eq!(published_after.health.file_count, 1);
+        let published_after = state.index.data_plane().published_state();
+        assert_eq!(published_after.generation, published.generation);
+        assert_eq!(published_after.file_count, 0);
         assert!(
             state
                 .index
@@ -3884,18 +3858,6 @@ mod tests {
                 .read()
                 .get_file("src/new.rs")
                 .is_none()
-        );
-        assert_eq!(&*state.symbol_cache.read(), &cache_before);
-        let preserved_snapshot = state
-            .index
-            .data_plane()
-            .take_pre_update_snapshot_at_generation("src/foo.rs", generation_before)
-            .expect("loading refusal must preserve the pre-update snapshot");
-        assert!(
-            preserved_snapshot
-                .symbols
-                .iter()
-                .any(|symbol| symbol.name == "alpha")
         );
         assert_eq!(
             state

@@ -3506,6 +3506,24 @@ mod tests {
     use crate::domain::index::SymbolKind;
     use crate::live_index::qualified_usages::find_qualified_usages;
 
+    fn load_repo_index(root: &std::path::Path) -> crate::live_index::SharedIndex {
+        crate::live_index::LiveIndex::load(root).expect("load test repo")
+    }
+
+    fn index_from_fixture_files(
+        root: &std::path::Path,
+        files: Vec<(&str, IndexedFile)>,
+    ) -> crate::live_index::SharedIndex {
+        crate::live_index::LiveIndex::from_indexed_files(
+            root,
+            files
+                .into_iter()
+                .map(|(path, file)| (path.to_string(), file))
+                .collect(),
+        )
+        .expect("bind in-memory fixture index")
+    }
+
     // -- apply_splice --
 
     #[test]
@@ -3645,10 +3663,11 @@ mod tests {
     #[test]
     fn test_reindex_after_write_updates_index() {
         let dir = tempfile::tempdir().unwrap();
-        let abs_path = dir.path().join("lib.rs");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let abs_path = dir.path().join("src/lib.rs");
         let content = b"fn hello() {}\nfn world() {}\n";
         std::fs::write(&abs_path, content).unwrap();
-        let handle = crate::live_index::LiveIndex::empty();
+        let handle = load_repo_index(dir.path());
         reindex_after_write(&handle, &abs_path, "src/lib.rs", content, LanguageId::Rust);
         let guard = handle.read();
         let file = guard.get_file("src/lib.rs");
@@ -3661,11 +3680,12 @@ mod tests {
     #[test]
     fn test_reindex_after_write_replaces_existing_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let abs_path = dir.path().join("lib.rs");
-        let handle = crate::live_index::LiveIndex::empty();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let abs_path = dir.path().join("src/lib.rs");
 
         let v1 = b"fn alpha() {}\n";
         std::fs::write(&abs_path, v1).unwrap();
+        let handle = load_repo_index(dir.path());
         reindex_after_write(&handle, &abs_path, "src/lib.rs", v1, LanguageId::Rust);
 
         let v2 = b"fn beta() {}\n";
@@ -3685,10 +3705,11 @@ mod tests {
         // debug_assert would fire in debug builds, but in release builds the
         // index should reflect what is actually on disk.
         let dir = tempfile::tempdir().unwrap();
-        let abs_path = dir.path().join("lib.rs");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let abs_path = dir.path().join("src/lib.rs");
         let on_disk = b"fn disk_fn() {}\n";
         std::fs::write(&abs_path, on_disk).unwrap();
-        let handle = crate::live_index::LiveIndex::empty();
+        let handle = load_repo_index(dir.path());
         // Pass the real on-disk bytes as `written` (normal case — no divergence).
         reindex_after_write(&handle, &abs_path, "src/lib.rs", on_disk, LanguageId::Rust);
         let guard = handle.read();
@@ -3701,10 +3722,11 @@ mod tests {
     fn test_search_text_matches_disk_after_edit() {
         // Setup: write old content to disk and index it.
         let dir = tempfile::tempdir().unwrap();
-        let abs_path = dir.path().join("lib.rs");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let abs_path = dir.path().join("src/lib.rs");
         let old_content = b"fn old_content_marker() {}\n";
         std::fs::write(&abs_path, old_content).unwrap();
-        let handle = crate::live_index::LiveIndex::empty();
+        let handle = load_repo_index(dir.path());
         reindex_after_write(
             &handle,
             &abs_path,
@@ -4430,15 +4452,7 @@ mod tests {
         std::fs::write(src.join("a.rs"), b"fn alpha() { old }\n").unwrap();
         std::fs::write(src.join("b.rs"), b"fn beta() { keep }\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        for (path, content) in [
-            ("src/a.rs", b"fn alpha() { old }\n" as &[u8]),
-            ("src/b.rs", b"fn beta() { keep }\n"),
-        ] {
-            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
-            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-            handle.update_file(path.to_string(), indexed);
-        }
+        let handle = load_repo_index(dir.path());
 
         let edits = vec![
             SingleEdit {
@@ -4479,11 +4493,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), b"fn foo() {}\nfn bar() {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        let content = b"fn foo() {}\nfn bar() {}\n" as &[u8];
-        let result = crate::parsing::process_file("src/a.rs", content, LanguageId::Rust);
-        let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-        handle.update_file("src/a.rs".to_string(), indexed);
+        let handle = load_repo_index(dir.path());
 
         // Create two edits that target overlapping fake ranges won't work easily,
         // but we can test with two edits on the same symbol (same range = overlapping).
@@ -4518,11 +4528,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), b"fn foo() {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        let content = b"fn foo() {}\n" as &[u8];
-        let result = crate::parsing::process_file("src/a.rs", content, LanguageId::Rust);
-        let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-        handle.update_file("src/a.rs".to_string(), indexed);
+        let handle = load_repo_index(dir.path());
 
         // First edit targets a real symbol; second targets a nonexistent one.
         let edits = vec![
@@ -4575,15 +4581,7 @@ mod tests {
         std::fs::write(src.join("a.rs"), b"fn foo_bar() {}\n").unwrap();
         std::fs::write(src.join("b.rs"), b"fn foo() {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        for (path, content) in [
-            ("src/a.rs", b"fn foo_bar() {}\n" as &[u8]),
-            ("src/b.rs", b"fn foo() {}\n"),
-        ] {
-            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
-            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-            handle.update_file(path.to_string(), indexed);
-        }
+        let handle = load_repo_index(dir.path());
 
         let edits = vec![SingleEdit {
             path: "src/a.rs".to_string(),
@@ -4611,11 +4609,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), b"fn alpha() { old }\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        let content = b"fn alpha() { old }\n" as &[u8];
-        let result = crate::parsing::process_file("src/a.rs", content, LanguageId::Rust);
-        let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-        handle.update_file("src/a.rs".to_string(), indexed);
+        let handle = load_repo_index(dir.path());
 
         let edits = vec![SingleEdit {
             path: "src/a.rs".to_string(),
@@ -4656,11 +4650,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), b"fn foo() {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        let content = b"fn foo() {}\n" as &[u8];
-        let result = crate::parsing::process_file("src/a.rs", content, LanguageId::Rust);
-        let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-        handle.update_file("src/a.rs".to_string(), indexed);
+        let handle = load_repo_index(dir.path());
 
         let edits = vec![SingleEdit {
             path: "src/a.rs".to_string(),
@@ -4692,15 +4682,7 @@ mod tests {
         std::fs::write(src.join("a.rs"), b"fn handler_a() {}\n").unwrap();
         std::fs::write(src.join("b.rs"), b"fn handler_b() {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        for (path, content) in [
-            ("src/a.rs", b"fn handler_a() {}\n" as &[u8]),
-            ("src/b.rs", b"fn handler_b() {}\n"),
-        ] {
-            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
-            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-            handle.update_file(path.to_string(), indexed);
-        }
+        let handle = load_repo_index(dir.path());
 
         let input = BatchInsertInput {
             project: None,
@@ -4745,15 +4727,7 @@ mod tests {
         std::fs::write(src.join("a.rs"), b"fn handler_a() {}\n").unwrap();
         std::fs::write(src.join("b.rs"), b"fn handler_b() {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        for (path, content) in [
-            ("src/a.rs", b"fn handler_a() {}\n" as &[u8]),
-            ("src/b.rs", b"fn handler_b() {}\n"),
-        ] {
-            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
-            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-            handle.update_file(path.to_string(), indexed);
-        }
+        let handle = load_repo_index(dir.path());
 
         let input = BatchInsertInput {
             project: None,
@@ -4812,16 +4786,7 @@ mod tests {
         std::fs::write(sub.join("b.rs"), b"fn handler_b() {}\n").unwrap();
         std::fs::write(src.join("c.rs"), b"fn handler_c() {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        for (path, content) in [
-            ("src/a.rs", b"fn handler_a() {}\n" as &[u8]),
-            ("src/sub/b.rs", b"fn handler_b() {}\n"),
-            ("src/c.rs", b"fn handler_c() {}\n"),
-        ] {
-            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
-            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-            handle.update_file(path.to_string(), indexed);
-        }
+        let handle = load_repo_index(dir.path());
 
         // Replace the target file with a directory after indexing so path
         // containment still resolves, but atomic_write_file fails when it tries
@@ -4923,16 +4888,7 @@ mod tests {
         std::fs::write(sub.join("b.rs"), b"fn beta() { old }\n").unwrap();
         std::fs::write(src.join("c.rs"), b"fn gamma() { old }\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        for (path, content) in [
-            ("src/a.rs", b"fn alpha() { old }\n" as &[u8]),
-            ("src/sub/b.rs", b"fn beta() { old }\n"),
-            ("src/c.rs", b"fn gamma() { old }\n"),
-        ] {
-            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
-            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-            handle.update_file(path.to_string(), indexed);
-        }
+        let handle = load_repo_index(dir.path());
 
         let b_path = sub.join("b.rs");
         std::fs::remove_file(&b_path).unwrap();
@@ -5031,10 +4987,7 @@ mod tests {
         let content = b"struct OldName;\nfn use_it(x: OldName) {}\n";
         std::fs::write(src.join("a.rs"), content).unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        let result = crate::parsing::process_file("src/a.rs", content, LanguageId::Rust);
-        let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-        handle.update_file("src/a.rs".to_string(), indexed);
+        let handle = load_repo_index(dir.path());
 
         let input = crate::protocol::edit::BatchRenameInput {
             project: None,
@@ -5092,16 +5045,7 @@ mod tests {
         std::fs::write(sub.join("b.rs"), b"use crate::OldName;\n").unwrap();
         std::fs::write(src.join("c.rs"), b"fn use_it(x: OldName) {}\n").unwrap();
 
-        let handle = crate::live_index::LiveIndex::empty();
-        for (path, content) in [
-            ("src/a.rs", b"struct OldName;\n" as &[u8]),
-            ("src/sub/b.rs", b"use crate::OldName;\n"),
-            ("src/c.rs", b"fn use_it(x: OldName) {}\n"),
-        ] {
-            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
-            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
-            handle.update_file(path.to_string(), indexed);
-        }
+        let handle = load_repo_index(dir.path());
 
         let b_path = sub.join("b.rs");
         std::fs::remove_file(&b_path).unwrap();
@@ -5266,43 +5210,47 @@ mod tests {
     #[test]
     fn test_detect_stale_refs_method_filters_by_parent_type() {
         use crate::domain::index::ReferenceKind;
-        let handle = crate::live_index::LiveIndex::empty();
+        let root = tempfile::tempdir().unwrap();
+        let handle = index_from_fixture_files(
+            root.path(),
+            vec![
+                (
+                    "src/a.rs",
+                    make_ref_file(vec![
+                        crate::domain::index::ReferenceRecord {
+                            name: "display".to_string(),
+                            qualified_name: None,
+                            kind: ReferenceKind::Call,
+                            byte_range: (32, 39),
+                            line_range: (1, 1),
+                            enclosing_symbol_index: None,
+                        },
+                        crate::domain::index::ReferenceRecord {
+                            name: "Widget".to_string(),
+                            qualified_name: None,
+                            kind: ReferenceKind::TypeUsage,
+                            byte_range: (12, 18),
+                            line_range: (0, 0),
+                            enclosing_symbol_index: None,
+                        },
+                    ]),
+                ),
+                (
+                    "src/b.rs",
+                    make_ref_file(vec![crate::domain::index::ReferenceRecord {
+                        name: "display".to_string(),
+                        qualified_name: None,
+                        kind: ReferenceKind::Call,
+                        byte_range: (19, 26),
+                        line_range: (0, 0),
+                        enclosing_symbol_index: None,
+                    }]),
+                ),
+            ],
+        );
 
         // File A: has Widget type ref + display call -> should be warned
-        handle.update_file(
-            "src/a.rs".to_string(),
-            make_ref_file(vec![
-                crate::domain::index::ReferenceRecord {
-                    name: "display".to_string(),
-                    qualified_name: None,
-                    kind: ReferenceKind::Call,
-                    byte_range: (32, 39),
-                    line_range: (1, 1),
-                    enclosing_symbol_index: None,
-                },
-                crate::domain::index::ReferenceRecord {
-                    name: "Widget".to_string(),
-                    qualified_name: None,
-                    kind: ReferenceKind::TypeUsage,
-                    byte_range: (12, 18),
-                    line_range: (0, 0),
-                    enclosing_symbol_index: None,
-                },
-            ]),
-        );
-
         // File B: has display call but NO Widget ref -> should NOT be warned
-        handle.update_file(
-            "src/b.rs".to_string(),
-            make_ref_file(vec![crate::domain::index::ReferenceRecord {
-                name: "display".to_string(),
-                qualified_name: None,
-                kind: ReferenceKind::Call,
-                byte_range: (19, 26),
-                line_range: (0, 0),
-                enclosing_symbol_index: None,
-            }]),
-        );
 
         // With parent_type = Some("Widget"), only file A should be warned
         let refs = detect_stale_references(
@@ -5321,33 +5269,37 @@ mod tests {
     #[test]
     fn test_detect_stale_refs_standalone_fn_warns_all() {
         use crate::domain::index::ReferenceKind;
-        let handle = crate::live_index::LiveIndex::empty();
+        let root = tempfile::tempdir().unwrap();
+        let handle = index_from_fixture_files(
+            root.path(),
+            vec![
+                (
+                    "src/a.rs",
+                    make_ref_file(vec![crate::domain::index::ReferenceRecord {
+                        name: "display".to_string(),
+                        qualified_name: None,
+                        kind: ReferenceKind::Call,
+                        byte_range: (12, 19),
+                        line_range: (0, 0),
+                        enclosing_symbol_index: None,
+                    }]),
+                ),
+                (
+                    "src/b.rs",
+                    make_ref_file(vec![crate::domain::index::ReferenceRecord {
+                        name: "display".to_string(),
+                        qualified_name: None,
+                        kind: ReferenceKind::Call,
+                        byte_range: (15, 22),
+                        line_range: (0, 0),
+                        enclosing_symbol_index: None,
+                    }]),
+                ),
+            ],
+        );
 
         // File A: has display call
-        handle.update_file(
-            "src/a.rs".to_string(),
-            make_ref_file(vec![crate::domain::index::ReferenceRecord {
-                name: "display".to_string(),
-                qualified_name: None,
-                kind: ReferenceKind::Call,
-                byte_range: (12, 19),
-                line_range: (0, 0),
-                enclosing_symbol_index: None,
-            }]),
-        );
-
         // File B: also has display call
-        handle.update_file(
-            "src/b.rs".to_string(),
-            make_ref_file(vec![crate::domain::index::ReferenceRecord {
-                name: "display".to_string(),
-                qualified_name: None,
-                kind: ReferenceKind::Call,
-                byte_range: (15, 22),
-                line_range: (0, 0),
-                enclosing_symbol_index: None,
-            }]),
-        );
 
         // With parent_type = None (standalone fn), both files should be warned
         let refs = detect_stale_references(

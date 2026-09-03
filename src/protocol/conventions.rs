@@ -870,16 +870,18 @@ mod tests {
         }
     }
 
-    /// Assemble a `LiveIndex` from fixture files via the public shared-index
-    /// API and run `detect_conventions`.
+    /// Assemble a `LiveIndex` from fixture files via a disk load and run
+    /// `detect_conventions`.
     fn conventions_for(files: Vec<(&str, IndexedFile)>) -> ProjectConventions {
-        let shared = LiveIndex::empty();
-        {
-            let mut guard = shared.write();
-            for (path, file) in files {
-                guard.add_file(path.to_string(), file);
+        let tmp = tempfile::tempdir().expect("conventions fixture dir");
+        for (path, file) in &files {
+            let abs = tmp.path().join(path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).expect("conventions fixture parent dir");
             }
+            std::fs::write(abs, &file.content).expect("conventions fixture file");
         }
+        let shared = LiveIndex::load(tmp.path()).expect("load conventions fixture");
         let guard = shared.read();
         detect_conventions(&guard)
     }

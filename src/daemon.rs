@@ -15098,23 +15098,11 @@ mod tests {
 
         // Simulate a prior local-fallback load: the in-process index already
         // holds OLD-project (project A) state.
-        server.index.data_plane().add_file(
-            "src/old.rs".to_string(),
-            crate::live_index::store::IndexedFile {
-                relative_path: "src/old.rs".to_string(),
-                language: crate::domain::index::LanguageId::Rust,
-                classification: crate::domain::FileClassification::for_code_path("src/old.rs"),
-                content: b"fn old_fn() {}".to_vec(),
-                symbols: vec![],
-                parse_status: crate::live_index::store::ParseStatus::Parsed,
-                parse_diagnostic: None,
-                byte_len: 14,
-                content_hash: "old-hash".to_string(),
-                references: vec![],
-                alias_map: std::collections::HashMap::new(),
-                mtime_secs: 0,
-            },
-        );
+        server
+            .index
+            .data_plane()
+            .reload(project_a.path())
+            .expect("simulate stale local fallback load");
         assert_eq!(
             server.index.data_plane().published_state().file_count,
             1,
