@@ -1172,9 +1172,8 @@ impl DaemonState {
         load_project: F,
     ) -> anyhow::Result<Arc<ProjectSlot>>
     where
-        F: FnOnce() -> anyhow::Result<ProjectInstance>,
+        F: Fn() -> anyhow::Result<ProjectInstance>,
     {
-        let mut load_project = Some(load_project);
         loop {
             let existing = self.projects.read().get(project_id).cloned();
             if let Some(slot) = existing {
@@ -1215,30 +1214,36 @@ impl DaemonState {
                     project_id: project_id.to_string(),
                 };
                 let result = (|| -> anyhow::Result<Arc<ProjectSlot>> {
-                    let instance = load_project
-                        .take()
-                        .expect("cold project loader is consumed only on the leader branch")(
-                    )?;
+                    let instance = load_project()?;
                     let candidate = Arc::new(ProjectSlot::new(instance));
                     let mut projects = self.projects.write();
-                    Ok(Arc::clone(
-                        projects.entry(project_id.to_string()).or_insert(candidate),
-                    ))
+                    let slot =
+                        Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
+                    slot.metadata
+                        .write()
+                        .session_ids
+                        .insert(session_id.to_string());
+                    Ok(slot)
                 })();
                 flight.complete(result);
             }
 
-            let slot = flight.wait()?;
+            let _published = flight.wait()?;
             let projects = self.projects.write();
-            if projects
-                .get(project_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &slot))
-            {
-                slot.metadata
-                    .write()
-                    .session_ids
-                    .insert(session_id.to_string());
-                return Ok(slot);
+            match projects.get(project_id).cloned() {
+                Some(current) => {
+                    current
+                        .metadata
+                        .write()
+                        .session_ids
+                        .insert(session_id.to_string());
+                    return Ok(current);
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "session '{session_id}' closed before the opened project could be attached"
+                    ));
+                }
             }
         }
     }
@@ -10389,8 +10394,8 @@ mod tests {
     /// `ensure_project_slot_for_session` supplies it — so this counts real
     /// loads, not a stand-in.
     ///
-    /// One first open must cost exactly one cold load, however many sessions
-    /// race for it.
+    /// One uncontended first open — N sessions racing a missing slot with no
+    /// concurrent detach — must cost exactly one cold load.
     #[test]
     fn concurrent_first_open_performs_exactly_one_cold_load() {
         let project = project_dir("symforge-slot-single-flight");
