@@ -56,13 +56,21 @@ fn indexed_file(
 }
 
 fn build_index(files: Vec<(&str, IndexedFile)>) -> SharedIndex {
-    let shared = LiveIndex::empty();
-    {
-        let mut index = shared.write();
-        for (path, file) in files {
-            index.update_file(path.to_string(), file);
-        }
-    }
+    let expected_count = files.len();
+    let root = tempfile::tempdir().expect("find_dependents fixture root");
+    let shared = LiveIndex::from_indexed_files(
+        root.path(),
+        files
+            .into_iter()
+            .map(|(path, file)| (path.to_string(), file))
+            .collect(),
+    )
+    .expect("bind find_dependents fixture index");
+    assert_eq!(
+        shared.read().file_count(),
+        expected_count,
+        "fixture index must admit every input file"
+    );
     shared
 }
 
