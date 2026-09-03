@@ -145,16 +145,10 @@ fn checkpoint_shared_index_reports_write_failure() {
     );
 }
 
-fn assert_unvouched_attacker_fixture(shared: &symforge::live_index::SharedIndex) {
-    let published = shared.published_generation();
+fn assert_source_withheld(shared: &symforge::live_index::SharedIndex) {
     assert!(
-        published.source.is_none(),
-        "refuse voucher: attacker must publish source=None before checkpoint"
-    );
-    // Fixture observation on the EmptyBootstrap setup route (not the gate key).
-    assert!(
-        published.manifest.is_none(),
-        "attacker fixture observation: published.manifest is also None on this setup route"
+        shared.published_generation().source.is_none(),
+        "refuse precondition: attacker must publish source=None before checkpoint"
     );
 }
 
@@ -183,7 +177,7 @@ fn unvouched_empty_bootstrap_checkpoint_must_not_overwrite_genuine_artifact() {
         "src/bootstrap_only.rs".to_string(),
         make_rust_indexed_file("src/bootstrap_only.rs", BOOTSTRAP_ONLY_RS),
     );
-    assert_unvouched_attacker_fixture(&unvouched);
+    assert_source_withheld(&unvouched);
 
     let unvouched_result =
         persist::checkpoint_shared_index(&unvouched, temp.path(), &placement);
@@ -201,12 +195,8 @@ fn unvouched_empty_bootstrap_checkpoint_must_not_overwrite_genuine_artifact() {
     assert_snapshot_contains_genuine_artifact(temp.path(), &placement);
 }
 
-/// Optional ALLOW inversion guard: checkpoint succeeds when
-/// `published.source.is_some()`. Rooted `LiveIndex::load` already exercises
-/// this in the existing checkpoint tests and negative control.
-///
-/// Do not use `source=Some` with `manifest=None` (Complete-mint hole) as an
-/// allow fixture — that follow-on is out of scope here.
+/// Optional ALLOW inversion guard when `published.source.is_some()`.
+/// Rooted `LiveIndex::load` already covers this in existing checkpoint tests.
 #[test]
 fn source_bound_checkpoint_is_allowed() {
     let temp = tempfile::tempdir().expect("tempdir");
