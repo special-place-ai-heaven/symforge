@@ -670,6 +670,11 @@ pub fn checkpoint_shared_index(
 ) -> anyhow::Result<SnapshotWriteReport> {
     let snapshot_input = {
         let published = shared.published_generation();
+        if published.manifest.is_none() {
+            anyhow::bail!(
+                "refusing to checkpoint an unvouched published generation (no manifest); would overwrite a genuine snapshot"
+            );
+        }
         SnapshotBuildInput {
             files: published.live.files.clone(),
             manifest_entries: published.live.manifest_entries.clone(),
@@ -2814,6 +2819,48 @@ mod tests {
         let live = super::snapshot_to_live_index(snapshot, dir.path());
         assert_eq!(live.file_count(), 1);
         assert_eq!(live.load_source(), IndexLoadSource::SnapshotRestore);
+    }
+
+    #[test]
+    fn checkpoint_shared_index_refuses_unvouched_manifest_none_generation() {
+        let dir = tempfile::TempDir::new().expect("fixture root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seeded() {}\n").expect("seed file");
+
+        let placement =
+            super::project_local_state_placement(dir.path()).expect("placement resolves");
+        let shared = crate::live_index::LiveIndex::load_for_state_placement(dir.path(), &placement)
+            .expect("cold load");
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest"
+        );
+        super::checkpoint_shared_index(&shared, dir.path(), &placement).expect("rooted checkpoint");
+
+        let snapshot_path = dir.path().join(".symforge/index.bin");
+        let before_bytes = std::fs::read(&snapshot_path).expect("index.bin exists");
+        let before_hash = crate::hash::digest_hex(&before_bytes);
+
+        let placeholder = crate::live_index::LiveIndex::empty();
+        placeholder.update_file(
+            "lib.rs".to_string(),
+            make_indexed_file("lib.rs", b"pub fn seeded() {}\n"),
+        );
+        assert!(
+            placeholder.published_generation().manifest.is_none(),
+            "bootstrap placeholder must not publish a manifest"
+        );
+
+        let err = super::checkpoint_shared_index(&placeholder, dir.path(), &placement)
+            .expect_err("must refuse unvouched generation");
+        assert!(
+            err.to_string()
+                .contains("refusing to checkpoint an unvouched published generation"),
+            "unexpected error: {err}"
+        );
+
+        let after_bytes = std::fs::read(&snapshot_path).expect("index.bin still exists");
+        assert_eq!(before_hash, crate::hash::digest_hex(&after_bytes));
+        assert_eq!(before_bytes, after_bytes, "index.bin must be unchanged");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
