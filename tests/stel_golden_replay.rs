@@ -24,11 +24,46 @@ fn corpus_available(relative: &str, marker: &str) -> bool {
     corpus_path(relative).join(marker).is_file()
 }
 
-fn all_replay_corpora_available() -> bool {
-    corpus_available(stel::S4_REPLAY_CORPUS, "src/lib.rs")
-        && corpus_available("tests/fixtures/phase0-corpus/records-python", "records.py")
-        && corpus_available("tests/fixtures/phase0-corpus/is-plain-obj-ts", "index.js")
-        && corpus_available("tests/fixtures/compression_ratio/rust", "service.rs")
+const REPLAY_CORPUS_README: &str = "tests/fixtures/phase0-corpus/README.md";
+
+const REPLAY_CORPUS_CHECKS: &[(&str, &str)] = &[
+    (stel::S4_REPLAY_CORPUS, "src/lib.rs"),
+    ("tests/fixtures/phase0-corpus/records-python", "records.py"),
+    ("tests/fixtures/phase0-corpus/is-plain-obj-ts", "index.js"),
+    ("tests/fixtures/compression_ratio/rust", "service.rs"),
+];
+
+fn missing_replay_corpora() -> Vec<&'static str> {
+    REPLAY_CORPUS_CHECKS
+        .iter()
+        .filter(|(relative, marker)| !corpus_available(relative, marker))
+        .map(|(relative, _)| *relative)
+        .collect()
+}
+
+fn recognized_ci_environment() -> bool {
+    symforge::edit_safety::trust::CI_ENV_VARS
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
+/// Returns `true` when corpora are present. In CI, missing corpora panic; locally they skip.
+fn ensure_replay_corpora(test_name: &str) -> bool {
+    let missing = missing_replay_corpora();
+    if missing.is_empty() {
+        return true;
+    }
+    if recognized_ci_environment() {
+        panic!(
+            "{test_name}: golden replay corpora missing in CI (missing: {}); clone per {REPLAY_CORPUS_README}",
+            missing.join(", ")
+        );
+    }
+    eprintln!(
+        "skip {test_name}: clone phase0 corpora per {REPLAY_CORPUS_README} (missing: {})",
+        missing.join(", ")
+    );
+    false
 }
 
 fn corpus_available_for_row(row: &GoldenRouteRow) -> bool {
@@ -148,10 +183,7 @@ fn s4_exit_rows_align_with_planner_routing() {
 
 #[tokio::test]
 async fn s4_minimum_subset_replays_on_compact_symforge() {
-    if !all_replay_corpora_available() {
-        eprintln!(
-            "skip s4_minimum_subset_replays: clone phase0 corpora per tests/fixtures/phase0-corpus/README.md"
-        );
+    if !ensure_replay_corpora("s4_minimum_subset_replays_on_compact_symforge") {
         return;
     }
 
@@ -173,8 +205,7 @@ async fn s4_minimum_subset_replays_on_compact_symforge() {
 
 #[tokio::test]
 async fn supported_serve_rows_replay_with_envelope_and_ledger() {
-    if !all_replay_corpora_available() {
-        eprintln!("skip supported_serve_rows_replay: missing corpora");
+    if !ensure_replay_corpora("supported_serve_rows_replay_with_envelope_and_ledger") {
         return;
     }
 
@@ -201,8 +232,7 @@ async fn supported_serve_rows_replay_with_envelope_and_ledger() {
 
 #[tokio::test]
 async fn supported_pff_rows_bypass_without_legacy_execution() {
-    if !all_replay_corpora_available() {
-        eprintln!("skip supported_pff_rows_bypass: missing corpora");
+    if !ensure_replay_corpora("supported_pff_rows_bypass_without_legacy_execution") {
         return;
     }
 
