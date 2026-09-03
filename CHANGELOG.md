@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.1.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.1...v11.1.2) (2026-09-03)
+
+
+### Bug Fixes
+
+* **persist:** refuse checkpoint when published manifest is absent ([#680](https://github.com/special-place-ai-heaven/symforge/issues/680)) ([5936c99](https://github.com/special-place-ai-heaven/symforge/commit/5936c992e7713b339813bb7fc3962c2eaebb842c))
+
 ## [11.1.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.0...v11.1.1) (2026-09-03)
 
 
