@@ -145,10 +145,10 @@ fn checkpoint_shared_index_reports_write_failure() {
     );
 }
 
-fn assert_source_withheld(shared: &symforge::live_index::SharedIndex) {
+fn assert_manifest_withheld(shared: &symforge::live_index::SharedIndex) {
     assert!(
-        shared.published_generation().source.is_none(),
-        "refuse precondition: attacker must publish source=None before checkpoint"
+        shared.published_generation().manifest.is_none(),
+        "refuse precondition: attacker must publish manifest=None before checkpoint"
     );
 }
 
@@ -177,14 +177,14 @@ fn unvouched_empty_bootstrap_checkpoint_must_not_overwrite_genuine_artifact() {
         "src/bootstrap_only.rs".to_string(),
         make_rust_indexed_file("src/bootstrap_only.rs", BOOTSTRAP_ONLY_RS),
     );
-    assert_source_withheld(&unvouched);
+    assert_manifest_withheld(&unvouched);
 
     let unvouched_result =
         persist::checkpoint_shared_index(&unvouched, temp.path(), &placement);
 
     assert!(
         unvouched_result.is_err(),
-        "checkpoint must refuse when published.source is None against an existing genuine artifact, got Ok({unvouched_result:?})"
+        "checkpoint must refuse when published.manifest is None against an existing genuine artifact, got Ok({unvouched_result:?})"
     );
 
     let after_bytes = read_index_bin_bytes(temp.path());
@@ -195,30 +195,31 @@ fn unvouched_empty_bootstrap_checkpoint_must_not_overwrite_genuine_artifact() {
     assert_snapshot_contains_genuine_artifact(temp.path(), &placement);
 }
 
-/// Optional ALLOW inversion guard when `published.source.is_some()`.
-/// Rooted `LiveIndex::load` already covers this in existing checkpoint tests.
+/// Optional ALLOW inversion guard when `RepositoryManifest::new` succeeded
+/// (`published.manifest.is_some()`). Do not treat source-Some/manifest-None
+/// (Complete-mint hole) as allow.
 #[test]
-fn source_bound_checkpoint_is_allowed() {
+fn manifest_vouched_checkpoint_is_allowed() {
     let temp = tempfile::tempdir().expect("tempdir");
     write_file(temp.path(), "src/lib.rs", GENUINE_LIB_RS);
 
-    let source_bound = LiveIndex::from_indexed_files(
+    let manifest_vouched = LiveIndex::from_indexed_files(
         temp.path(),
         vec![(
             "src/lib.rs".to_string(),
             make_rust_indexed_file("src/lib.rs", GENUINE_LIB_RS),
         )],
     )
-    .expect("from_indexed_files should publish source at the fixture root");
+    .expect("from_indexed_files should publish a manifest at the fixture root");
 
     assert!(
-        source_bound.published_generation().source.is_some(),
-        "ALLOW fixture must publish source=Some before checkpoint"
+        manifest_vouched.published_generation().manifest.is_some(),
+        "ALLOW fixture must publish manifest=Some before checkpoint"
     );
 
     let placement = state_placement(temp.path());
-    persist::checkpoint_shared_index(&source_bound, temp.path(), &placement)
-        .expect("checkpoint must allow when published.source is Some");
+    persist::checkpoint_shared_index(&manifest_vouched, temp.path(), &placement)
+        .expect("checkpoint must allow when published.manifest is Some");
 }
 
 #[test]
