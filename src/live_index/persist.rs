@@ -670,6 +670,11 @@ pub fn checkpoint_shared_index(
 ) -> anyhow::Result<SnapshotWriteReport> {
     let snapshot_input = {
         let published = shared.published_generation();
+        if published.manifest.is_none() {
+            anyhow::bail!(
+                "refusing to checkpoint an unvouched published generation (no manifest); would overwrite a genuine snapshot"
+            );
+        }
         SnapshotBuildInput {
             files: published.live.files.clone(),
             manifest_entries: published.live.manifest_entries.clone(),
@@ -2816,6 +2821,48 @@ mod tests {
         assert_eq!(live.load_source(), IndexLoadSource::SnapshotRestore);
     }
 
+    #[test]
+    fn checkpoint_shared_index_refuses_unvouched_manifest_none_generation() {
+        let dir = tempfile::TempDir::new().expect("fixture root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seeded() {}\n").expect("seed file");
+
+        let placement =
+            super::project_local_state_placement(dir.path()).expect("placement resolves");
+        let shared = crate::live_index::LiveIndex::load_for_state_placement(dir.path(), &placement)
+            .expect("cold load");
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest"
+        );
+        super::checkpoint_shared_index(&shared, dir.path(), &placement).expect("rooted checkpoint");
+
+        let snapshot_path = dir.path().join(".symforge/index.bin");
+        let before_bytes = std::fs::read(&snapshot_path).expect("index.bin exists");
+        let before_hash = crate::hash::digest_hex(&before_bytes);
+
+        let placeholder = crate::live_index::LiveIndex::empty();
+        placeholder.update_file(
+            "lib.rs".to_string(),
+            make_indexed_file("lib.rs", b"pub fn seeded() {}\n"),
+        );
+        assert!(
+            placeholder.published_generation().manifest.is_none(),
+            "bootstrap placeholder must not publish a manifest"
+        );
+
+        let err = super::checkpoint_shared_index(&placeholder, dir.path(), &placement)
+            .expect_err("must refuse unvouched generation");
+        assert!(
+            err.to_string()
+                .contains("refusing to checkpoint an unvouched published generation"),
+            "unexpected error: {err}"
+        );
+
+        let after_bytes = std::fs::read(&snapshot_path).expect("index.bin still exists");
+        assert_eq!(before_hash, crate::hash::digest_hex(&after_bytes));
+        assert_eq!(before_bytes, after_bytes, "index.bin must be unchanged");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn project_local_placement(project_root: &Path) -> StatePlacement {
@@ -3058,10 +3105,16 @@ mod tests {
         let source_state = source.path().join(".symforge");
         std::fs::create_dir_all(&source_state).unwrap();
         std::fs::write(source_state.join("sentinel"), b"source-owned\n").unwrap();
+        std::fs::create_dir_all(source.path().join("src")).unwrap();
+        std::fs::write(source.path().join("src/lib.rs"), b"pub fn routed() {}\n").unwrap();
 
-        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
-            vec![("src/lib.rs", b"pub fn routed() {}\n")],
-        ));
+        let shared =
+            crate::live_index::LiveIndex::load_for_state_placement(source.path(), &placement)
+                .expect("rooted load");
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest before checkpoint"
+        );
         super::checkpoint_shared_index(&shared, source.path(), &placement).unwrap();
         let routed_snapshot = state_dir.join(INDEX_FILENAME);
         assert!(routed_snapshot.is_file());
@@ -4906,14 +4959,22 @@ mod tests {
     #[test]
     fn snapshot_round_trip_restores_code_signals_into_published_generation() {
         let tmp = TempDir::new().unwrap();
-        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
-            vec![("src/lib.rs", b"pub fn temporal() {}\n")],
-        ));
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"pub fn temporal() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).expect("rooted load");
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest before mutation"
+        );
         shared.remove_file("src/lib.rs");
         shared.update_git_temporal(
             crate::live_index::git_temporal::GitTemporalIndex::unavailable(
                 "fixture-history-unavailable".to_string(),
             ),
+        );
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted mutations must recapture a vouched manifest before checkpoint"
         );
         let expected = shared.published_generation().code_signals.clone();
         assert!(

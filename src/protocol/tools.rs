@@ -15352,8 +15352,11 @@ mod tests {
             "session-id".to_string(),
             "project-name".to_string(),
         );
-        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let mut server = SymForgeServer::new_daemon_proxy(daemon_client);
         let dir = tempfile::tempdir().expect("create temp repo root");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create fixture source dir");
+        std::fs::write(dir.path().join("src/lib.rs"), b"fn foo() {}\n")
+            .expect("write fixture source");
         let binding = match crate::discovery::resolve_root_candidate(
             dir.path(),
             crate::domain::RootCandidateSource::LaunchCwd,
@@ -15363,7 +15366,16 @@ mod tests {
             resolution => panic!("fixture root should bind: {resolution:?}"),
         };
         let placement = crate::discovery::resolve_state_placement(&binding);
-        server.set_bound_project_state(Some(binding.canonical_root), Some(placement));
+        server.set_bound_project_state(Some(binding.canonical_root.clone()), Some(placement));
+
+        let loaded =
+            LiveIndex::load(&binding.canonical_root).expect("rooted load for local fallback index");
+        assert!(
+            loaded.published_generation().manifest.is_some(),
+            "local fallback index must publish a vouched manifest before checkpoint"
+        );
+        server.index =
+            crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(loaded);
 
         let output = server
             .checkpoint_now(Parameters(super::CheckpointNowInput {
@@ -21032,10 +21044,20 @@ mod tests {
         let temp = TempDir::new().expect("tempdir should be created");
         fs::create_dir_all(temp.path().join("src")).expect("create fixture source dir");
         fs::write(temp.path().join("src/lib.rs"), b"fn foo() {}\n").expect("write fixture source");
-        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
-        let server = make_server_with_root(
-            make_live_index_ready(vec![(key, file)]),
+        let index = LiveIndex::load(temp.path()).expect("rooted load");
+        assert!(
+            index.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest before checkpoint"
+        );
+        use crate::watcher::WatcherInfo;
+        use parking_lot::Mutex;
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let server = SymForgeServer::new(
+            index,
+            "test_project".to_string(),
+            watcher_info,
             Some(temp.path().to_path_buf()),
+            None,
         );
 
         let result = server
@@ -21078,10 +21100,20 @@ mod tests {
         let temp = TempDir::new().expect("tempdir should be created");
         fs::create_dir_all(temp.path().join("src")).expect("create fixture source dir");
         fs::write(temp.path().join("src/lib.rs"), b"fn foo() {}\n").expect("write fixture source");
-        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
-        let server = make_server_with_root(
-            make_live_index_ready(vec![(key, file)]),
+        let index = LiveIndex::load(temp.path()).expect("rooted load");
+        assert!(
+            index.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest before checkpoint"
+        );
+        use crate::watcher::WatcherInfo;
+        use parking_lot::Mutex;
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let server = SymForgeServer::new(
+            index,
+            "test_project".to_string(),
+            watcher_info,
             Some(temp.path().to_path_buf()),
+            None,
         );
 
         let result = server
@@ -21124,10 +21156,20 @@ mod tests {
         let temp = TempDir::new().expect("tempdir should be created");
         fs::create_dir_all(temp.path().join("src")).expect("create fixture source dir");
         fs::write(temp.path().join("src/lib.rs"), b"fn foo() {}\n").expect("write fixture source");
-        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
-        let server = make_server_with_root(
-            make_live_index_ready(vec![(key, file)]),
+        let index = LiveIndex::load(temp.path()).expect("rooted load");
+        assert!(
+            index.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest before blocking persistence"
+        );
+        use crate::watcher::WatcherInfo;
+        use parking_lot::Mutex;
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let server = SymForgeServer::new(
+            index,
+            "test_project".to_string(),
+            watcher_info,
             Some(temp.path().to_path_buf()),
+            None,
         );
         fs::remove_dir_all(temp.path().join(".symforge"))
             .expect("remove resolved project state directory");
@@ -21145,6 +21187,14 @@ mod tests {
         assert!(
             !result.contains("Checkpoint complete"),
             "failure output must not contain success text: {result}"
+        );
+        assert!(
+            !result.contains("unvouched published generation"),
+            "failure must be a disk/path reason, not the manifest gate: {result}"
+        );
+        assert!(
+            result.contains("creating project state directory"),
+            "checkpoint write failure should cite the blocked state path, got: {result}"
         );
     }
 
