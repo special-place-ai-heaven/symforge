@@ -195,7 +195,16 @@ fn unvouched_empty_bootstrap_checkpoint_must_not_overwrite_genuine_artifact() {
     assert_snapshot_contains_genuine_artifact(temp.path(), &placement);
 }
 
-/// Optional ALLOW inversion guard when `RepositoryManifest::new` succeeded
+// NOT ESTABLISHED — mint-hole overwrite refuse (source=Some, manifest=None):
+// `SharedIndexHandle::build_ref_source_generation` (store.rs) is the constructor
+// that can publish source without a manifest when `RepositoryManifest::new`
+// fails; it is `pub(crate)` and not callable from `tests/checkpoint.rs`.
+// `LiveIndex::from_source_files` is also `pub(crate)`. Public integration-test
+// APIs (`empty`+`update_file`, `from_indexed_files`, `load`) do not place
+// source=Some/manifest=None on `published_generation()`. A second refuse test
+// for that lane awaits a pub test hook or in-crate unit coverage from Larry.
+
+/// ALLOW inversion guard when `RepositoryManifest::new` succeeded
 /// (`published.manifest.is_some()`). Do not treat source-Some/manifest-None
 /// (Complete-mint hole) as allow.
 #[test]
