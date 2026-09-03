@@ -1,6 +1,6 @@
 //! Shared local daemon for project-aware and session-aware backend state.
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
@@ -214,6 +214,38 @@ pub struct DaemonSessionClient {
     project_root: Option<PathBuf>,
 }
 
+/// Single-flight gate: concurrent first opens of one project id join one cold load.
+struct ColdLoadFlight {
+    outcome: Mutex<Option<anyhow::Result<Arc<ProjectSlot>>>>,
+    ready: Condvar,
+}
+
+impl ColdLoadFlight {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> anyhow::Result<Arc<ProjectSlot>> {
+        let mut guard = self.outcome.lock();
+        while guard.is_none() {
+            self.ready.wait(&mut guard);
+        }
+        match guard.as_ref().expect("notified with outcome") {
+            Ok(slot) => Ok(Arc::clone(slot)),
+            Err(err) => Err(anyhow::anyhow!("{err}")),
+        }
+    }
+
+    fn complete(&self, result: anyhow::Result<Arc<ProjectSlot>>) {
+        let mut guard = self.outcome.lock();
+        *guard = Some(result);
+        self.ready.notify_all();
+    }
+}
+
 pub struct DaemonState {
     next_session_id: AtomicU64,
     // Registry/session guards protect only map membership and short metadata
@@ -239,6 +271,9 @@ pub struct DaemonState {
     /// distinct published bases (the D2 fence the engine asserts on).
     base_generation_seq: AtomicU64,
     projects: RwLock<HashMap<String, Arc<ProjectSlot>>>,
+    /// In-flight cold loads keyed by project id. The first opener runs
+    /// `ProjectInstance::load`; concurrent first opens wait on the same gate.
+    cold_load_flights: Mutex<HashMap<String, Arc<ColdLoadFlight>>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
     /// Boot epoch minted once per daemon process (unix seconds). Served on
@@ -853,6 +888,7 @@ impl DaemonState {
             bases: RwLock::new(HashMap::new()),
             base_generation_seq: AtomicU64::new(1),
             projects: RwLock::new(HashMap::new()),
+            cold_load_flights: Mutex::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             identity: current_daemon_identity(),
             started_at_unix_secs: now_epoch_millis() / 1000,
@@ -1134,17 +1170,48 @@ impl DaemonState {
                 continue;
             }
 
-            let candidate = Arc::new(ProjectSlot::new(load_project
-                .take()
-                .expect("cold project loader is consumed only on the returning branch")(
-            )?));
-            let mut projects = self.projects.write();
-            let slot = Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
-            slot.metadata
-                .write()
-                .session_ids
-                .insert(session_id.to_string());
-            return Ok(slot);
+            let (flight, is_leader) = {
+                let mut inflight = self.cold_load_flights.lock();
+                match inflight.entry(project_id.to_string()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (Arc::clone(entry.get()), false)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let flight = Arc::new(ColdLoadFlight::new());
+                        entry.insert(Arc::clone(&flight));
+                        (flight, true)
+                    }
+                }
+            };
+
+            if is_leader {
+                let result = (|| -> anyhow::Result<Arc<ProjectSlot>> {
+                    let instance = load_project
+                        .take()
+                        .expect("cold project loader is consumed only on the leader branch")(
+                    )?;
+                    let candidate = Arc::new(ProjectSlot::new(instance));
+                    let mut projects = self.projects.write();
+                    Ok(Arc::clone(
+                        projects.entry(project_id.to_string()).or_insert(candidate),
+                    ))
+                })();
+                flight.complete(result);
+                self.cold_load_flights.lock().remove(project_id);
+            }
+
+            let slot = flight.wait()?;
+            let projects = self.projects.write();
+            if projects
+                .get(project_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                slot.metadata
+                    .write()
+                    .session_ids
+                    .insert(session_id.to_string());
+                return Ok(slot);
+            }
         }
     }
 
@@ -10297,7 +10364,6 @@ mod tests {
     /// One first open must cost exactly one cold load, however many sessions
     /// race for it.
     #[test]
-    #[ignore = "Feature 020 Slice 0 RED control for design defect 2.4; remove this attribute in Slice 2 (T030-T040) when project admission is single-flight"]
     fn concurrent_first_open_performs_exactly_one_cold_load() {
         let project = project_dir("symforge-slot-single-flight");
         std::fs::write(
