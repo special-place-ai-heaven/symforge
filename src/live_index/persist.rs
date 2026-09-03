@@ -3105,10 +3105,16 @@ mod tests {
         let source_state = source.path().join(".symforge");
         std::fs::create_dir_all(&source_state).unwrap();
         std::fs::write(source_state.join("sentinel"), b"source-owned\n").unwrap();
+        std::fs::create_dir_all(source.path().join("src")).unwrap();
+        std::fs::write(source.path().join("src/lib.rs"), b"pub fn routed() {}\n").unwrap();
 
-        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
-            vec![("src/lib.rs", b"pub fn routed() {}\n")],
-        ));
+        let shared =
+            crate::live_index::LiveIndex::load_for_state_placement(source.path(), &placement)
+                .expect("rooted load");
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest before checkpoint"
+        );
         super::checkpoint_shared_index(&shared, source.path(), &placement).unwrap();
         let routed_snapshot = state_dir.join(INDEX_FILENAME);
         assert!(routed_snapshot.is_file());
@@ -4953,14 +4959,22 @@ mod tests {
     #[test]
     fn snapshot_round_trip_restores_code_signals_into_published_generation() {
         let tmp = TempDir::new().unwrap();
-        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
-            vec![("src/lib.rs", b"pub fn temporal() {}\n")],
-        ));
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"pub fn temporal() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).expect("rooted load");
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted load must publish a vouched manifest before mutation"
+        );
         shared.remove_file("src/lib.rs");
         shared.update_git_temporal(
             crate::live_index::git_temporal::GitTemporalIndex::unavailable(
                 "fixture-history-unavailable".to_string(),
             ),
+        );
+        assert!(
+            shared.published_generation().manifest.is_some(),
+            "rooted mutations must recapture a vouched manifest before checkpoint"
         );
         let expected = shared.published_generation().code_signals.clone();
         assert!(
