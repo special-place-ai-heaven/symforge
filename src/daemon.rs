@@ -244,6 +244,30 @@ impl ColdLoadFlight {
         *guard = Some(result);
         self.ready.notify_all();
     }
+
+    fn complete_if_pending(&self, result: anyhow::Result<Arc<ProjectSlot>>) {
+        let mut guard = self.outcome.lock();
+        if guard.is_none() {
+            *guard = Some(result);
+            self.ready.notify_all();
+        }
+    }
+}
+
+/// Ensures a cold-load leader always publishes an outcome and evicts its flight.
+struct ColdLoadLeaderGuard<'a> {
+    flight: &'a ColdLoadFlight,
+    inflight: &'a Mutex<HashMap<String, Arc<ColdLoadFlight>>>,
+    project_id: String,
+}
+
+impl Drop for ColdLoadLeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.flight.complete_if_pending(Err(anyhow::anyhow!(
+            "cold load leader unwound before publishing a project slot"
+        )));
+        self.inflight.lock().remove(&self.project_id);
+    }
 }
 
 pub struct DaemonState {
@@ -1185,6 +1209,11 @@ impl DaemonState {
             };
 
             if is_leader {
+                let _leader_guard = ColdLoadLeaderGuard {
+                    flight: &flight,
+                    inflight: &self.cold_load_flights,
+                    project_id: project_id.to_string(),
+                };
                 let result = (|| -> anyhow::Result<Arc<ProjectSlot>> {
                     let instance = load_project
                         .take()
@@ -1197,7 +1226,6 @@ impl DaemonState {
                     ))
                 })();
                 flight.complete(result);
-                self.cold_load_flights.lock().remove(project_id);
             }
 
             let slot = flight.wait()?;
