@@ -144,6 +144,19 @@ const SUITES = [
       "--test-threads=1",
     ],
   },
+  {
+    target: "tests/project_index_lifecycle_slice0.rs::same_path_root_replacement_is_not_silently_adopted",
+    expected: "green",
+    args: [
+      "test",
+      "--test",
+      "project_index_lifecycle_slice0",
+      "same_path_root_replacement_is_not_silently_adopted",
+      "--",
+      "--exact",
+      "--test-threads=1",
+    ],
+  },
 ];
 
 const NEWLINE = String.fromCharCode(10);
@@ -164,7 +177,6 @@ const MAX_REASON_BYTES = 512;
 const RED_CASES = [
   "capacity_refused_open_creates_no_slot_and_no_watcher",
   "configured_capacity_bounds_the_process_not_each_load",
-  "same_path_root_replacement_is_not_silently_adopted",
   "whole_project_publication_preserves_latest_siblings",
 ];
 
@@ -255,6 +267,15 @@ const RESOLVED_CASES = new Map([
       tasks: [],
       defect: "2.11 snapshot restoration bypasses candidate isolation",
       fix: "src/live_index/query.rs::LiveIndex::get_file refuses while SnapshotVerifyState is Pending or Running on a snapshot restore; tests/project_index_lifecycle_slice0.rs::snapshot_seed_is_not_queryable_before_verification asserts !served while verify is not Completed",
+    },
+  ],
+  [
+    "same_path_root_replacement_is_not_silently_adopted",
+    {
+      slice: null,
+      tasks: ["B1"],
+      defect: "2.8 same-path physical-root replacement adopted silently; freshness Current after ABA + clean reload",
+      fix: "src/index_lifecycle/activation.rs::project_source_authority rebinding fence plus src/live_index/store.rs::reload_for_binding_with_exclusions admission-identity consultation",
     },
   ],
 ]);

@@ -51,6 +51,58 @@ impl PhysicalRootIdentity {
         let raw = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
         Self(std::num::NonZeroU64::new(raw).expect("root counter starts at 1"))
     }
+
+    /// Stable stored form for cross-handle admission comparison.
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Rehydrate from a stored admission identity. Zero means unset.
+    pub fn from_stored(raw: u64) -> Option<Self> {
+        std::num::NonZeroU64::new(raw).map(Self)
+    }
+}
+
+/// Observed physical object at one path. Detects same-path replacement (ABA)
+/// without rekeying the path convergence map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PhysicalRootAnchor {
+    dev: u64,
+    ino: u64,
+}
+
+impl PhysicalRootAnchor {
+    /// Observe the directory object currently installed at `path`.
+    pub fn observe(path: &Path) -> Option<Self> {
+        observe_physical_root_anchor(path)
+    }
+}
+
+#[cfg(unix)]
+fn observe_physical_root_anchor(path: &Path) -> Option<PhysicalRootAnchor> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(PhysicalRootAnchor {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn observe_physical_root_anchor(path: &Path) -> Option<PhysicalRootAnchor> {
+    use std::os::windows::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(PhysicalRootAnchor {
+        dev: metadata.volume_serial_number(),
+        ino: metadata.file_index(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn observe_physical_root_anchor(_path: &Path) -> Option<PhysicalRootAnchor> {
+    None
 }
 
 /// Why a path could not be resolved beneath a lease's root.

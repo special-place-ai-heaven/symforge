@@ -1060,7 +1060,6 @@ fn configured_capacity_bounds_the_process_not_each_load() {
 /// survives a subsequent clean publication: V10's freshness is a pure function
 /// of present state, so a transient non-Current proves nothing.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for same-path physical-root replacement. CODE-WRONG as of the 2026-08-21 Track A read: the registry stays path-keyed and publishes Current, so a replaced root at the same path is adopted silently. Slice 1 shipped without discharging it. Keep ignored and fail-closed until a seam owner exists"]
 fn same_path_root_replacement_is_not_silently_adopted() {
     run_daemon_test(async {
         let parent = TempDir::new().expect("parent dir");

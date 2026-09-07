@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::adapters::{AdapterRefusal, execute_plan_with_outcome, plan_admission};
@@ -48,7 +48,9 @@ use super::candidate::{
 use super::capacity::{OwnerIdentity, ProcessCapacityPool};
 use super::mutation::{PermitDrainSignal, RefreshTicket, SourceMutationPermit};
 use super::observer::{CoalescingAccumulator, ObservationCut, ObserverId, ObserverSlot};
-use super::physical_root::{PhysicalRootIdentity, PhysicalRootLease, WriteReceipt};
+use super::physical_root::{
+    PhysicalRootAnchor, PhysicalRootIdentity, PhysicalRootLease, WriteReceipt,
+};
 use super::process_runtime::{ProcessIndexRuntime, SurfaceKind};
 use super::registry::{
     LiveProjectSlot, ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection,
@@ -312,16 +314,19 @@ impl ActivationCut {
 pub struct ProjectSourceAuthority {
     root: PathBuf,
     /// The identity of this root's FIRST lease, presented for project
-    /// admission (C4b). Every open of one canonicalized root converges on
-    /// this authority and therefore presents the same physical identity —
-    /// which is what lets concurrent opens join one admission. OPEN residual
-    /// (T038 round-1 adjudication): C5 landed WITHOUT owning rebinding, so a
-    /// root physically replaced at the same path still keeps its first
-    /// admission identity (and this cached authority's lane state) across
-    /// the replacement. Owned by the post-cut follow-up recorded in
-    /// docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md — do not
-    /// treat this comment as a promise that any landed commit discharged it.
+    /// admission (C4b). Replaced only when the directory object at this
+    /// canonical path changes — same path, different physical root mints a
+    /// fresh identity via [`project_source_authority`]'s ABA fence.
     admission_root: PhysicalRootIdentity,
+    /// Observed physical object when this authority was installed. Compared
+    /// on every registry lookup to detect same-path replacement without
+    /// rekeying the path convergence map.
+    physical_anchor: Option<PhysicalRootAnchor>,
+    /// Set when the canonical path vanishes while this authority is cached.
+    /// Vanish keep-on-match (Ada A): reappeared anchor == cached → clear
+    /// vanish and keep authority. Remint only when observed dev+ino ≠ cached;
+    /// path still absent records absent without remint.
+    path_absent_pending: AtomicBool,
     inner: Mutex<AuthorityInner>,
     // Separate mutex, strict ordering: lane state is always taken and
     // RELEASED before `inner` is locked (see `reconcile_returned`), so the
@@ -419,6 +424,8 @@ impl ProjectSourceAuthority {
         Arc::new(Self {
             root: root.to_path_buf(),
             admission_root,
+            physical_anchor: PhysicalRootAnchor::observe(root),
+            path_absent_pending: AtomicBool::new(false),
             inner: Mutex::new(AuthorityInner {
                 runtime: SourceRuntime::current(publication),
                 lease,
@@ -608,12 +615,29 @@ impl ProjectSourceAuthority {
             .map(|publication| publication.publication())
     }
 
+    /// The stable admission-root identity this authority presents.
+    pub fn admission_root(&self) -> PhysicalRootIdentity {
+        self.admission_root
+    }
+
     /// The binding this authority presents for project admission: a fresh
     /// binding identity over the STABLE admission-root identity (see the
     /// field doc), so every open of one canonicalized root can join one
     /// registry occupancy.
     pub fn admission_binding(&self) -> BindingAuthority {
         BindingAuthority::bind(self.admission_root)
+    }
+
+    /// Revoke the outgoing lease when the directory object at this path was
+    /// physically replaced. Called only from the registry ABA fence.
+    fn revoke_for_replacement(&self) {
+        let inner = self.inner.lock().expect("project source authority lock");
+        inner.lease.revoke();
+    }
+
+    /// Record that the canonical path was absent on a registry lookup.
+    fn mark_path_absent(&self) {
+        self.path_absent_pending.store(true, Ordering::Release);
     }
 
     /// How many mutation grants this source has ever issued. The wiring
@@ -918,9 +942,49 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = registry.lock().expect("project authority registry lock");
+    if let Some(existing) = map.get(&key) {
+        match PhysicalRootAnchor::observe(&key) {
+            None => existing.mark_path_absent(),
+            Some(observed) if existing.physical_anchor == Some(observed) => {
+                existing.path_absent_pending.store(false, Ordering::Release);
+            }
+            Some(_) => {
+                existing.revoke_for_replacement();
+                map.remove(&key);
+            }
+        }
+    }
     map.entry(key.clone())
         .or_insert_with(|| ProjectSourceAuthority::for_root(&key))
         .clone()
+}
+
+/// Whether the registry recorded a path-vanish since the authority was installed.
+/// Read before [`project_source_authority`] clears the bit on anchor match.
+pub(crate) fn project_source_authority_path_vanish_pending(root: &Path) -> bool {
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let map = registry.lock().expect("project authority registry lock");
+    map.get(&key)
+        .is_some_and(|existing| existing.path_absent_pending.load(Ordering::Acquire))
+}
+
+/// Evict a cached authority when the physical root anchor changed. Called
+/// only from index reload so child-file writes do not false-positive.
+pub(crate) fn evict_project_source_authority_if_anchor_changed(
+    root: &Path,
+    admitted: Option<PhysicalRootAnchor>,
+) {
+    let current = PhysicalRootAnchor::observe(root);
+    if admitted.is_some() && admitted != current {
+        let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = registry.lock().expect("project authority registry lock");
+        if let Some(existing) = map.get(&key) {
+            existing.revoke_for_replacement();
+        }
+        map.remove(&key);
+    }
 }
 
 // ── The per-project runtime handle (D1, C4) ────────────────────────────────
