@@ -6967,16 +6967,35 @@ mod tests {
 
         // The real daemon bootstrap must restore FROM the artifact.
         let project = ProjectInstance::load(tmp.path()).expect("project load");
-        let guard = project.index.data_plane().read();
-        assert_eq!(
-            guard.load_source(),
-            crate::live_index::store::IndexLoadSource::SnapshotRestore,
-            "daemon bootstrap must consume the team artifact (SnapshotRestore), \
-             not fall back to a cold full scan (FreshLoad)"
+        {
+            let guard = project.index.data_plane().read();
+            assert_eq!(
+                guard.load_source(),
+                crate::live_index::store::IndexLoadSource::SnapshotRestore,
+                "daemon bootstrap must consume the team artifact (SnapshotRestore), \
+                 not fall back to a cold full scan (FreshLoad)"
+            );
+        }
+        let root = dunce::canonicalize(tmp.path()).expect("canonical root");
+        let placement = crate::domain::StatePlacement::ProjectLocal {
+            directory: crate::domain::ProjectStateDir::new(root.join(".symforge")),
+        };
+        let snapshot =
+            live_index::persist::load_snapshot(tmp.path(), &placement).expect("snapshot");
+        let snapshot_mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect();
+        live_index::persist::block_on_background_verify_for_test(
+            project.index.data_plane().clone(),
+            tmp.path(),
+            snapshot_mtimes,
         );
+        let guard = project.index.data_plane().read();
         assert!(
             guard.get_file("main.rs").is_some(),
-            "the artifact-restored index must serve the indexed files"
+            "the artifact-restored index must serve the indexed files after verify completes"
         );
     }
 
@@ -15929,12 +15948,27 @@ mod tests {
         let placement_b = crate::discovery::resolve_state_placement(&binding_b);
         let restored =
             bootstrap_project_index(&canonical_b, &placement_b).expect("restore B from snapshot");
-        let guard = restored.read();
-        assert_eq!(
-            guard.load_source(),
-            crate::live_index::store::IndexLoadSource::SnapshotRestore
+        {
+            let guard = restored.read();
+            assert_eq!(
+                guard.load_source(),
+                crate::live_index::store::IndexLoadSource::SnapshotRestore
+            );
+            assert_eq!(guard.file_count(), 1);
+        }
+        let snapshot =
+            live_index::persist::load_snapshot(&canonical_b, &placement_b).expect("snapshot");
+        let snapshot_mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect();
+        live_index::persist::block_on_background_verify_for_test(
+            restored.clone(),
+            &canonical_b,
+            snapshot_mtimes,
         );
-        assert_eq!(guard.file_count(), 1);
+        let guard = restored.read();
         assert!(guard.get_file("src/restored.rs").is_some());
     }
 
