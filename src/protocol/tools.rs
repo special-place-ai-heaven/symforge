@@ -17701,8 +17701,9 @@ mod tests {
         let snapshot_placement = crate::domain::StatePlacement::ProjectLocal {
             directory: crate::domain::ProjectStateDir::new(symforge_dir.clone()),
         };
-        crate::live_index::persist::serialize_index(
-            &make_live_index_empty(),
+        let shared = LiveIndex::load(repo.path()).expect("load fixture index");
+        crate::live_index::persist::checkpoint_shared_index(
+            &shared,
             repo.path(),
             &snapshot_placement,
         )

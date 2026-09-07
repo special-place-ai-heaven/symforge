@@ -269,21 +269,6 @@ impl SnapshotResetReport {
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
-/// Serialize `index` to `index.bin` inside the project's data directory.
-///
-/// Uses an atomic write pattern (write to tmp, then rename) so a crash during
-/// write never leaves a partially-written file.
-///
-/// Returns `Ok(())` on success. Non-fatal — caller logs and continues.
-pub fn serialize_index(
-    index: &LiveIndex,
-    project_root: &Path,
-    state_placement: &StatePlacement,
-) -> anyhow::Result<()> {
-    let snapshot_input = capture_snapshot_build_input(index);
-    serialize_captured_snapshot(snapshot_input, project_root, state_placement).map(|_| ())
-}
-
 fn capture_snapshot_build_input(index: &LiveIndex) -> SnapshotBuildInput {
     SnapshotBuildInput {
         files: index.files.clone(),
@@ -2904,8 +2889,18 @@ mod tests {
     // Existing snapshot unit cases intentionally exercise the project-local
     // variant. Keep their concise call shape test-only while production APIs
     // require an explicit typed placement.
+    fn serialize_index_with_placement(
+        index: &LiveIndex,
+        project_root: &Path,
+        state_placement: &StatePlacement,
+    ) -> anyhow::Result<()> {
+        let snapshot_input = super::capture_snapshot_build_input(index);
+        super::serialize_captured_snapshot(snapshot_input, project_root, state_placement)
+            .map(|_| ())
+    }
+
     fn serialize_index(index: &LiveIndex, project_root: &Path) -> anyhow::Result<()> {
-        super::serialize_index(index, project_root, &project_local_placement(project_root))
+        serialize_index_with_placement(index, project_root, &project_local_placement(project_root))
     }
 
     fn load_snapshot(project_root: &Path) -> Option<IndexSnapshot> {
@@ -3056,11 +3051,11 @@ mod tests {
         let index_a = make_live_index_with_files(vec![("src/a.rs", b"fn a() {}\n")]);
         let index_b = make_live_index_with_files(vec![("src/b.rs", b"fn b() {}\n")]);
 
-        super::serialize_index(&index_a, source_a.path(), &placement_a).unwrap();
+        serialize_index_with_placement(&index_a, source_a.path(), &placement_a).unwrap();
         let active_snapshot = shared_state_dir.join(INDEX_FILENAME);
         let foreign_bytes = std::fs::read(&active_snapshot).unwrap();
 
-        let overwrite = super::serialize_index(&index_b, source_b.path(), &placement_b);
+        let overwrite = serialize_index_with_placement(&index_b, source_b.path(), &placement_b);
         assert!(
             overwrite.is_err(),
             "a different source identity sharing a user-local placement must not overwrite foreign state"
