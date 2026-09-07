@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.1.4](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.3...v11.1.4) (2026-09-07)
+
+
+### Bug Fixes
+
+* **persist:** drop pub serialize_index Complete+None mint door ([#687](https://github.com/special-place-ai-heaven/symforge/issues/687)) ([d73fc67](https://github.com/special-place-ai-heaven/symforge/commit/d73fc67846f815533cf81bf2ada6339bb1684fc4))
+* **watcher:** refuse observed admission into cold EmptyBootstrap placeholder (Track A Seam 1) ([#690](https://github.com/special-place-ai-heaven/symforge/issues/690)) ([db1a563](https://github.com/special-place-ai-heaven/symforge/commit/db1a563f4d22d78a037fd676bf93efd1845e01d9))
+
 ## [11.1.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.2...v11.1.3) (2026-09-07)
 
 
