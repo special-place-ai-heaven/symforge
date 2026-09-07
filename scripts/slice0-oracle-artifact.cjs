@@ -252,7 +252,7 @@ const RESOLVED_CASES = new Map([
     "snapshot_seed_is_not_queryable_before_verification",
     {
       slice: 4,
-      tasks: ["B4"],
+      tasks: [],
       defect: "2.11 snapshot restoration bypasses candidate isolation",
       fix: "src/live_index/query.rs::LiveIndex::get_file refuses while SnapshotVerifyState is Pending or Running on a snapshot restore; tests/project_index_lifecycle_slice0.rs::snapshot_seed_is_not_queryable_before_verification asserts !served while verify is not Completed",
     },
