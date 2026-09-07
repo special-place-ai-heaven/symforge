@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.1.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.2...v11.1.3) (2026-09-07)
+
+
+### Bug Fixes
+
+* **index:** P1-04 reload commit-point carry for outside-lock admissions ([#683](https://github.com/special-place-ai-heaven/symforge/issues/683)) ([44e3230](https://github.com/special-place-ai-heaven/symforge/commit/44e3230c8be86a79c979b693f41925d81b6511cf))
+
 ## [11.1.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.1...v11.1.2) (2026-09-03)
 
 
