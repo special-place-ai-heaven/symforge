@@ -130,7 +130,6 @@ const RED_CASES = [
   "empty_placeholder_publication_refuses_watcher_mutation",
   "same_path_root_replacement_is_not_silently_adopted",
   "snapshot_seed_is_not_queryable_before_verification",
-  "watcher_mutation_during_candidate_build_is_not_discarded",
   "whole_project_publication_preserves_latest_siblings",
 ];
 
@@ -194,6 +193,15 @@ const RESOLVED_CASES = new Map([
       // Same latch: the gap is retained rather than rederived, so the promoted
       // generation cannot report Current about a window it never observed.
       fix: "src/live_index/store.rs::latch_observer_gap, retained verbatim by recompute_freshness_locked",
+    },
+  ],
+  [
+    "watcher_mutation_during_candidate_build_is_not_discarded",
+    {
+      slice: 0,
+      tasks: ["T016"],
+      defect: "2.7/2.9 observer mutation during out-of-lock reload build is destroyed by swap_and_publish",
+      fix: "src/live_index/store.rs::reload_for_binding_with_exclusions carries post-watermark live admissions into the candidate before swap, or fails closed",
     },
   ],
 ]);

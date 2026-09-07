@@ -564,22 +564,20 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 /// is building its replacement, and the swap discards those mutations.
 ///
 /// `reload_for_binding_with_exclusions` builds the replacement OUTSIDE the
-/// write lock (`src/live_index/store.rs:2385-2395`) and only then swaps. V10
-/// has no candidate isolation, so the watcher keeps mutating the live index
-/// throughout that build, and every one of those mutations is destroyed by the
-/// swap — silently, with the result still reported as a complete publication.
+/// write lock (`src/live_index/store.rs`) and only then swaps. V10 had no
+/// candidate isolation, so the watcher kept mutating the live index throughout
+/// that build, and mutations could be destroyed by the swap — silently, with
+/// the result still reported as a complete publication.
 ///
-/// A candidate must be isolated: either the watcher cannot mutate it, or the
-/// mutations survive promotion. Losing them and reporting success is the one
-/// outcome that must not happen.
+/// The reload commit-point merge carries post-watermark live admissions into
+/// the candidate before promotion, or fails closed without swapping.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.7/2.9. CODE-WRONG. The earlier claim that the precondition window was unreachable is FALSE on this tree: live_index/store.rs:2403-2436 still reaches swap_and_publish and IsolatedCandidate appears nowhere in store.rs, so the seam never routes through the candidate pipeline. Keep ignored and fail-closed until a deterministic pause exists at this seam; the official TEST-CANDIDATE case does not retire it"]
 fn watcher_mutation_during_candidate_build_is_not_discarded() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
         // Large enough that the out-of-lock build stays in flight long enough
-        // for a watcher mutation to land inside it.
-        write_project_files(project.path(), "candidate", 1_500);
+        // for a watcher mutation to land inside it on fast hosts.
+        write_project_files(project.path(), "candidate", 8_000);
         let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "3600");
 
         let index = LiveIndex::load(project.path()).expect("load project");
@@ -598,7 +596,7 @@ fn watcher_mutation_during_candidate_build_is_not_discarded() {
         let reload_root = project.path().to_path_buf();
         let reload = tokio::task::spawn_blocking(move || reload_index.reload(&reload_root));
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         std::fs::write(
             project.path().join("src").join("mutated_during_build.rs"),
             b"pub fn mutated_during_build() {}\n",
