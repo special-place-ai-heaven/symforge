@@ -2492,6 +2492,10 @@ impl SharedIndexHandle {
         let scout_plan = Arc::clone(&data.scout_plan);
         let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
         let live = LiveIndex::from_reload_data(data);
+        // Deterministic test observation point: the replacement is built but the
+        // write lock is not yet held, so the live index remains mutable.
+        #[cfg(test)]
+        reload_outside_lock::fire();
         let _wg = self.write_mutex.lock();
         self.source_exclusions.store(Arc::new(source_exclusions));
         self.scout_plan.store(Some(scout_plan));
@@ -3732,6 +3736,55 @@ mod reload_mid_commit {
 // embed build denies warnings.
 #[cfg(all(test, feature = "server"))]
 pub(crate) use reload_mid_commit::install as install_reload_mid_commit_hook;
+
+/// Test-only interleave hook for the P1-04 outside-lock reload window oracle.
+///
+/// Installed to observe the reload window that
+/// [`SharedIndexHandle::reload_for_binding_with_exclusions`] opens between
+/// building the replacement via [`LiveIndex::from_reload_data`] and acquiring
+/// the write lock for publication. It fires OUTSIDE the write lock, strictly
+/// AFTER the candidate is materialized and strictly BEFORE the lock, so a
+/// mutation admitted onto the live index at this seam is deterministic (no
+/// sleep, no extra thread). It is compiled out of release builds.
+#[cfg(test)]
+mod reload_outside_lock {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// RAII guard that uninstalls the hook on drop so tests cannot leak it
+    /// across the thread-local into a sibling test on the same thread.
+    pub(crate) struct OutsideLockGuard;
+
+    impl Drop for OutsideLockGuard {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Install a callback fired at the next reload outside-lock point.
+    ///
+    /// The hook is consumed on first fire (see [`fire`]), so a later reload on
+    /// the same thread does not re-trigger it: exactly one observation lands in
+    /// the window.
+    pub(crate) fn install(hook: impl Fn() + 'static) -> OutsideLockGuard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        OutsideLockGuard
+    }
+
+    /// Fire the installed hook if one is present, consuming it first so a
+    /// re-entrant reload does not fire it again.
+    pub(crate) fn fire() {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
 
 /// Thread-safe shared handle to the index.
 pub type SharedIndex = Arc<SharedIndexHandle>;
@@ -7659,6 +7712,51 @@ mod tests {
         assert_eq!(
             index.files_by_dir_component.get("tests"),
             Some(&vec!["tests/beta.rs".to_string()])
+        );
+    }
+
+    /// P1-04 Kent RED causal control — ordered outside-lock seam.
+    ///
+    /// `reload_for_binding_with_exclusions` builds the replacement outside the
+    /// write lock; a mutation admitted onto the live index in that window must
+    /// survive the swap or publish must fail closed (Larry's product fix).
+    /// On broken tip the wholesale `swap_and_publish(Arc::new(candidate))` eats
+    /// the mutation while reload still returns Ok.
+    ///
+    /// Slice 0 harm (watcher race): see ignored
+    /// `watcher_mutation_during_candidate_build_is_not_discarded` in
+    /// `tests/project_index_lifecycle_slice0.rs`.
+    #[test]
+    fn reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed() {
+        let dir = TempDir::new().expect("failed to create tempdir");
+        fs::create_dir_all(dir.path().join("src")).expect("failed to create src dir");
+        write_file(dir.path(), "src/initial.rs", "fn initial() {}");
+
+        let shared = LiveIndex::load(dir.path()).expect("LiveIndex::load failed");
+        let mutation_path = "src/admitted_during_outside_lock_build.rs";
+        let shared_for_hook = Arc::clone(&shared);
+
+        let _guard = reload_outside_lock::install(move || {
+            let file = make_indexed_file_for_mutation(mutation_path);
+            shared_for_hook.update_file(mutation_path.to_string(), file);
+            assert!(
+                shared_for_hook.read().get_file(mutation_path).is_some(),
+                "precondition: mutation must be present on live index at outside-lock seam"
+            );
+        });
+
+        let reload_result = shared.reload(dir.path());
+        assert!(
+            reload_result.is_ok(),
+            "precondition: reload must succeed (false-success on broken tip)"
+        );
+
+        // GREEN contract (Larry): admitted mutation survives swap OR publish fails closed.
+        assert!(
+            shared.read().get_file(mutation_path).is_some(),
+            "P1-04 GREEN contract: a mutation admitted during the outside-lock build \
+             window must survive the swap, or publish must fail closed. On broken tip \
+             the wholesale swap discards it while reload still returns Ok"
         );
     }
 
