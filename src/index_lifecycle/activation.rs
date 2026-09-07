@@ -323,8 +323,9 @@ pub struct ProjectSourceAuthority {
     /// rekeying the path convergence map.
     physical_anchor: Option<PhysicalRootAnchor>,
     /// Set when the canonical path vanishes while this authority is cached.
-    /// Cleared when the next observation matches the cached anchor; remint
-    /// happens only when the observed dev+ino differs.
+    /// Vanish keep-on-match (Ada A): reappeared anchor == cached → clear
+    /// vanish and keep authority. Remint only when observed dev+ino ≠ cached;
+    /// path still absent records absent without remint.
     path_absent_pending: AtomicBool,
     inner: Mutex<AuthorityInner>,
     // Separate mutex, strict ordering: lane state is always taken and

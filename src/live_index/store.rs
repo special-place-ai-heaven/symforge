@@ -2581,6 +2581,8 @@ impl SharedIndexHandle {
             &source_exclusions,
         )?;
         let admitted_anchor = *self.admitted_physical_anchor.lock();
+        // Ada A: physical replacement = dev+ino anchor change or path-vanish
+        // only — no mtime tripwire, no admitted-boundary refresh (reject B).
         let path_vanish_replacement =
             crate::live_index::index_lifecycle::activation::project_source_authority_path_vanish_pending(
                 root,
