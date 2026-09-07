@@ -1174,11 +1174,9 @@ fn test_persist_round_trip() {
     // Build a real LiveIndex
     let shared = LiveIndex::load(dir.path()).unwrap();
 
-    // Serialize it
-    {
-        let guard = shared.read();
-        persist::serialize_index(&guard, dir.path(), &placement).expect("serialize should succeed");
-    }
+    // Checkpoint it through the gated production path
+    persist::checkpoint_shared_index(&shared, dir.path(), &placement)
+        .expect("checkpoint should succeed");
 
     // Load snapshot
     let snapshot = persist::load_snapshot(dir.path(), &placement)
@@ -1285,8 +1283,8 @@ fn test_persist_version_mismatch() {
     // only to the version gate, not every required header field.
     write_file(dir.path(), "future.rs", "fn future() {}");
     let shared = LiveIndex::load(dir.path()).unwrap();
-    persist::serialize_index(&shared.read(), dir.path(), &placement)
-        .expect("current snapshot should serialize");
+    persist::checkpoint_shared_index(&shared, dir.path(), &placement)
+        .expect("current snapshot should checkpoint");
     let snapshot_path = dir.path().join(".symforge").join("index.bin");
     let current_bytes = fs::read(&snapshot_path).unwrap();
     let mut future_snapshot: IndexSnapshot =
