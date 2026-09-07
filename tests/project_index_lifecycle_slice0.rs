@@ -33,10 +33,22 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use symforge::daemon::{OpenProjectRequest, spawn_daemon};
-use symforge::domain::FreshnessStatus;
+use symforge::daemon::{DaemonState, OpenProjectRequest, ProjectHealth, spawn_daemon};
+use symforge::domain::{FreshnessReason, FreshnessStatus};
 use symforge::live_index::LiveIndex;
+use symforge::live_index::index_lifecycle::candidate::{
+    CandidateSource, IsolatedCandidate, ProjectArtifactRoot, PromotionRefusal, SourceContentToken,
+    SourceId, SourceObservation,
+};
+use symforge::live_index::index_lifecycle::capacity::{CapacityRefusal, ProcessCapacityPool};
+use symforge::live_index::index_lifecycle::process_runtime::{
+    ProcessIndexRuntime, RuntimeRefusal, SurfaceKind,
+};
+use symforge::live_index::index_lifecycle::supervisor::SourceSupervisor;
 use symforge::live_index::store::SnapshotVerifyState;
+use symforge::protocol::format::claim_provenance::{
+    OperationKind, OperationReceipt, PhysicalRootLease, SourceRefusalKind, acquire_claim_context,
+};
 use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
 use tempfile::TempDir;
 
@@ -95,46 +107,172 @@ fn write_project_files(root: &Path, prefix: &str, count: usize) {
     }
 }
 
-/// Design defect 2.1 — admission refusal crosses the seam as success.
+fn is_typed_catalog_capacity_refusal(freshness: &FreshnessStatus) -> bool {
+    matches!(
+        freshness,
+        FreshnessStatus::Degraded { reason_codes, .. }
+            if reason_codes.contains(&FreshnessReason::CatalogEntryCapacityExceeded)
+                || reason_codes.contains(&FreshnessReason::CatalogMetadataCapacityExceeded)
+    )
+}
+
+/// A slot has left the EmptyBootstrap/Loading placeholder when it is Ready,
+/// Degraded with typed evidence, or carries a per-load catalog-capacity refusal.
+fn slot_is_settled(health: &ProjectHealth) -> bool {
+    if is_typed_catalog_capacity_refusal(&health.freshness) {
+        return true;
+    }
+    matches!(health.index_state.as_str(), "Ready" | "Degraded")
+}
+
+async fn wait_for_settled_project_health(
+    daemon: &DaemonState,
+    project_ids: &[String],
+    timeout: std::time::Duration,
+) -> Vec<ProjectHealth> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let healths: Vec<_> = project_ids
+            .iter()
+            .filter_map(|id| daemon.project_health(id))
+            .collect();
+        if healths.len() == project_ids.len() && healths.iter().all(slot_is_settled) {
+            return healths;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "Part C residual: project slots never settled to Ready or typed refusal \
+                 (still EmptyBootstrap/Loading placeholders?): {healths:?}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Design defect 2.1 / FR-004 — typed catalog refusal and non-queryable cold start.
 ///
-/// `bootstrap_project_index` returns `Result<SharedIndex>`, but a catalog
-/// capacity refusal is converted into `Ok(LiveIndex::empty())`
-/// (`src/daemon.rs:3539-3557`). The caller cannot tell a verified index from a
-/// resource-admission refusal, so `ProjectInstance::activate` registers the
-/// project and starts its watcher and Git temporal work for an instance that
-/// was never admitted.
-///
-/// A refusal must be a refusal: no project slot, no watcher, no session.
+/// V10 converted capacity refusal into `Ok(LiveIndex::empty())` with no typed
+/// evidence. V11 registers a non-ready slot and surfaces
+/// `CatalogEntryCapacityExceeded` on health; strict acquisition is the lease.
+/// The residual under review is side effects (`activate` still starts a watcher)
+/// against a slot that was never admitted to a complete generation.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.1. CONTROL-STALE as of the 2026-08-21 Track A read: V11 answers a refused open with Ok plus a typed SourceRefusal and a non-ready slot, not the Err-plus-zero-slots this body asserts, and FR-004 strict acquisition is the lease. Retarget the body to the typed refusal; do NOT switch production to satisfy the old encoding. Unmeasured residual: activate still starts a watcher (daemon.rs:3398-3403)"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.1 / FR-004. CONTROL-STALE→retargeted-body: asserts V11 Ok+typed CatalogEntryCapacityExceeded+non-ready slot and cold-start non-queryability; still RED until activate stops side effects for refused admissions and/or EmptyBootstrap gates watcher mutation"]
 fn capacity_refused_open_creates_no_slot_and_no_watcher() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
         write_project_files(project.path(), "refused", 40);
         // One catalog entry admitted against forty on disk: the scout refuses
-        // with CatalogEntryCapacityExceeded, the exact error the conversion
-        // above swallows.
+        // with CatalogEntryCapacityExceeded before any RepositoryManifest exists.
         let _cap = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", "1");
+        let pfx = "slice0-refusal-";
+        let auth_token = [pfx, "auth", "token"].concat();
+        let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
 
         let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let opened = daemon.state.open_project_session(OpenProjectRequest {
-            project_root: project.path().display().to_string(),
-            client_name: "slice0-refusal".to_string(),
-            pid: Some(std::process::id()),
-        });
+        let opened = daemon
+            .state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "slice0-refusal".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .expect("V11 keeps the daemon responsive on typed catalog refusal");
 
+        let health = daemon
+            .state
+            .project_health(&opened.project_id)
+            .expect("non-ready slot remains registered for typed refusal evidence");
         let registered = daemon.state.list_projects().len();
-        let outcome = opened.map(|response| response.project_id);
-        let _ = daemon.shutdown_tx.send(());
 
+        assert_eq!(
+            registered, 1,
+            "V11 registers a non-ready slot so typed refusal evidence is reachable"
+        );
         assert!(
-            outcome.is_err(),
-            "a catalog-capacity refusal must not cross the project-registration \
-             seam as a successful open; it returned {outcome:?}"
+            matches!(
+                health.freshness,
+                FreshnessStatus::Degraded {
+                    last_valid_content_generation: 0,
+                    ref reason_codes,
+                } if reason_codes == &[FreshnessReason::CatalogEntryCapacityExceeded]
+            ),
+            "catalog refusal must surface typed SourceRefusal evidence, got {:?}",
+            health.freshness
+        );
+        assert_ne!(
+            health.index_state, "Ready",
+            "a catalog-capacity refusal must leave the slot non-ready"
         );
         assert_eq!(
-            registered, 0,
-            "a refused admission must leave no registered project behind"
+            health.file_count, 0,
+            "FR-004 cold start must not publish a partial manifest"
+        );
+
+        // Load-bearing residual (not the bare-lease unit mirror below):
+        // daemon get_repo_map must refuse, and the watcher window must not
+        // admit files without a complete generation.
+        let map_body = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{}/v1/sessions/{}/tools/get_repo_map",
+                daemon.port, opened.session_id
+            ))
+            .bearer_auth(&auth_token)
+            .json(&serde_json::json!({ "detail": "compact" }))
+            .send()
+            .await
+            .expect("call daemon get_repo_map")
+            .text()
+            .await
+            .expect("get_repo_map body");
+
+        // Unit mirror of claim_provenance_v11.rs — supplements, does not replace,
+        // the daemon get_repo_map + watcher checks above.
+        let lease = symforge::protocol::format::claim_provenance::ObservationLease::for_test_root(
+            PhysicalRootLease::for_test_root(&opened.canonical_root),
+        );
+        let bare = lease.context_input(&opened.project_id, &opened.canonical_root, None);
+        let transport_refusal = acquire_claim_context(
+            OperationReceipt::for_test(OperationKind::SearchText),
+            vec![bare],
+        )
+        .expect_err("strict acquisition without a Current lease must refuse");
+        assert_eq!(
+            transport_refusal.kind(),
+            SourceRefusalKind::AdmissionUnavailable,
+            "V11 query transport must refuse non-queryable cold start with AdmissionUnavailable"
+        );
+
+        assert!(
+            map_body.contains("AdmissionUnavailable"),
+            "daemon query must map catalog refusal to typed SourceRefusalKind \
+             AdmissionUnavailable, not `{map_body}`"
+        );
+
+        // Residual: if activate started a watcher against the empty placeholder,
+        // reconciliation may admit catalog entries without a complete generation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut after_watcher_window = health.file_count;
+        while std::time::Instant::now() < deadline {
+            after_watcher_window = daemon
+                .state
+                .project_health(&opened.project_id)
+                .map(|h| h.file_count)
+                .unwrap_or(after_watcher_window);
+            if after_watcher_window > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        let _ = daemon.shutdown_tx.send(());
+
+        assert_eq!(
+            after_watcher_window, 0,
+            "a typed catalog refusal must stay non-queryable: observed \
+             {after_watcher_window} admitted file(s) without a complete \
+             generation — activate likely started a watcher against the \
+             non-ready placeholder (daemon.rs:3505-3510 residual)"
         );
     });
 }
@@ -569,114 +707,141 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 // in `src/live_index/store.rs`, exercised via the ordered outside-lock seam
 // hook and tracked in `scripts/slice0-oracle-artifact.cjs` RESOLVED_CASES.
 
-/// FR-008 / FR-009 / SC-005, `INV-PUBLICATION` — one whole-project immutable
-/// root is the sole query-visible publication unit, and partial source
-/// generations are never visible.
+/// FR-008 / FR-009 / SC-005, `INV-PUBLICATION` / `TEST-PUBLICATION`
+/// (`lifecycle-acceptance-oracles-v11.md::ORACLE-PUBLICATION-WHOLE-ROOT`).
 ///
-/// The traceability contract reserves the name
-/// `whole_project_publication_preserves_latest_siblings` in
-/// `tests/project_index_lifecycle_slice0.rs` for `TEST-PUBLICATION` and owns it
-/// from T017: prepare a delta for source A, publish source B, resume A, and
-/// prove the latest of every sibling survives in exactly one whole-project
-/// root store.
+/// Frozen oracle: pause candidate A at the commit point, publish candidate B as
+/// the new whole-project root, resume A against the latest root, and prove the
+/// latest of every sibling survives in exactly one store. Candidate tokens are
+/// opaque equality capabilities — numeric epochs never authorize publication.
 ///
-/// V10 has no whole-project publication unit. A reload rebuilds the entire
-/// index from a disk snapshot taken outside the write lock
-/// (`src/live_index/store.rs:2385-2395`) and swaps it in wholesale, while the
-/// observer keeps publishing sibling updates into the live index. The swap
-/// therefore replaces the latest sibling generation with whatever the snapshot
-/// happened to contain — a partial publication that reports success.
-///
-/// Sibling B's latest must survive source A's publication.
+/// Preflight runs on `candidate.rs::IsolatedCandidate` / `ProjectArtifactRoot`.
+/// Product gap keeps RED until `runtime.rs::ProjectPublicationRoot` backs the
+/// query-visible trunk (T017/T060 activation).
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005. CONTROL-STALE as of the 2026-08-21 Track A read: the frozen oracle is pause A / publish B / rebase / tokens / one store, but this body races V10 LiveIndex::reload against 1500 files in 150ms. Retarget the body to the frozen oracle; making reload win that race is not the property"]
+#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005 / INV-PUBLICATION. CONTROL-STALE→retargeted-body: TEST-PUBLICATION pause-A/publish-B/rebase on IsolatedCandidate; still RED until ProjectPublicationRoot wires query-visible publication (T017/T060)"]
 fn whole_project_publication_preserves_latest_siblings() {
-    run_daemon_test(async {
-        let project = TempDir::new().expect("project dir");
-        // Two sibling sources under one project root. A is large enough that
-        // its rebuild stays in flight while B's latest is published.
-        write_project_files(&project.path().join("source_a"), "a", 1_500);
-        write_project_files(&project.path().join("source_b"), "b", 8);
-        let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "3600");
-
-        let index = LiveIndex::load(project.path()).expect("load project");
-        let stop = Arc::new(AtomicBool::new(false));
-        let watcher = tokio::spawn(run_watcher_with_stop(
-            project.path().to_path_buf(),
-            index.clone(),
-            Arc::new(parking_lot::Mutex::new(WatcherInfo::default())),
-            Arc::clone(&stop),
-        ));
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
-        // Prepare source A's delta and start the whole-project rebuild that
-        // will carry it.
-        std::fs::write(
-            project
-                .path()
-                .join("source_a")
-                .join("src")
-                .join("a_delta.rs"),
-            b"pub fn a_delta() {}\n",
-        )
-        .expect("write source A delta");
-        let reload_index = index.clone();
-        let reload_root = project.path().to_path_buf();
-        let reload = tokio::task::spawn_blocking(move || reload_index.reload(&reload_root));
-
-        // Publish source B's latest while A's root store is still being built.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        std::fs::write(
-            project
-                .path()
-                .join("source_b")
-                .join("src")
-                .join("b_latest.rs"),
-            b"pub fn b_latest() {}\n",
-        )
-        .expect("write source B latest");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut b_published_before_store = false;
-        while std::time::Instant::now() < deadline {
-            if reload.is_finished() {
-                break;
-            }
-            if index.read().get_file("source_b/src/b_latest.rs").is_some() {
-                b_published_before_store = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    fn content_source(id: u64, rel: &str, token: u64) -> CandidateSource {
+        use symforge::domain::index::CatalogPath;
+        CandidateSource {
+            id: SourceId(id),
+            observation: SourceObservation::Content {
+                path: CatalogPath {
+                    public_id: format!("pid-{rel}"),
+                    normalized_utf8: Some(rel.to_string()),
+                },
+                token: SourceContentToken(token),
+                bytes: 64,
+            },
         }
-        let reload_result = reload.await.expect("reload task");
+    }
 
-        let published = index.read();
-        let a_delta = published.get_file("source_a/src/a_delta.rs").is_some();
-        let b_latest = published.get_file("source_b/src/b_latest.rs").is_some();
-        drop(published);
-        stop.store(true, Ordering::Release);
-        let _ = watcher.await;
+    fn stamp_derive(source: &CandidateSource) -> u64 {
+        match &source.observation {
+            SourceObservation::Content { token, .. } => token.0.wrapping_mul(31),
+            other => panic!("derive called for a non-content observation: {other:?}"),
+        }
+    }
 
-        assert!(
-            reload_result.is_ok(),
-            "precondition: the reload must succeed"
+    run_daemon_test(async {
+        let pool = std::sync::Arc::new(ProcessCapacityPool::new());
+        let owner = pool.root(1_000_000);
+        let supervisor = SourceSupervisor::new();
+        let root = ProjectArtifactRoot::empty();
+
+        // ORACLE-PUBLICATION-WHOLE-ROOT precondition: candidate tokens are
+        // opaque — numeric epochs never authorize publication.
+        assert_eq!(
+            root.publish_claiming_epoch_only(1),
+            PromotionRefusal::EpochIsNotAuthority
+        );
+
+        // Baseline: sibling sources A and B under one whole-project root.
+        let baseline_attempt = supervisor.begin_attempt();
+        let baseline = IsolatedCandidate::prepare_full(
+            &pool,
+            owner,
+            &baseline_attempt,
+            vec![
+                content_source(1, "source_a/src/a_base.rs", 1),
+                content_source(2, "source_b/src/b_base.rs", 1),
+            ],
+            stamp_derive,
+        )
+        .expect("capacity headroom exists")
+        .commit(&root)
+        .expect("baseline publishes one whole-project root");
+
+        // Step 1 — Pause candidate A at T017's final commit point (prepared, held).
+        let delta_a_attempt = supervisor.begin_attempt();
+        let delta_a = IsolatedCandidate::prepare_delta(
+            &pool,
+            owner,
+            &delta_a_attempt,
+            content_source(1, "source_a/src/a_delta.rs", 2),
+            Some(SourceContentToken(1)),
+            stamp_derive,
+        )
+        .expect("capacity headroom exists");
+
+        // Step 2 — Publish candidate B as the new whole-project root while A pauses.
+        let delta_b_attempt = supervisor.begin_attempt();
+        let with_b_latest = IsolatedCandidate::prepare_delta(
+            &pool,
+            owner,
+            &delta_b_attempt,
+            content_source(2, "source_b/src/b_latest.rs", 2),
+            Some(SourceContentToken(1)),
+            stamp_derive,
+        )
+        .expect("capacity headroom exists")
+        .commit(&root)
+        .expect("source B publishes exactly once");
+        let b_latest_before = std::sync::Arc::clone(&with_b_latest.sources[&SourceId(2)]);
+
+        // Step 3 — Resume A, rebase against the latest root, commit once on success.
+        let patched = delta_a
+            .commit(&root)
+            .expect("source A rebases on B and commits one whole-project root");
+
+        assert_eq!(supervisor.committed_generations(), 3);
+        assert_eq!(
+            patched.sources.len(),
+            2,
+            "one whole-project root carries every sibling"
+        );
+        assert_eq!(
+            patched.sources[&SourceId(2)].token,
+            SourceContentToken(2),
+            "source B's latest token must survive source A's publication"
         );
         assert!(
-            b_published_before_store,
-            "precondition: sibling B's latest must be published while source A's \
-             root store is still building; it was not, so this run cannot \
-             distinguish a lost sibling from a late write"
+            std::sync::Arc::ptr_eq(&patched.sources[&SourceId(2)], &b_latest_before),
+            "source B's latest generation must survive as the identical Arc sibling"
+        );
+        assert_eq!(
+            patched.sources[&SourceId(1)].token,
+            SourceContentToken(2),
+            "source A's delta must land in the same store"
         );
         assert!(
-            a_delta,
-            "precondition: source A's own delta must be in the resulting store"
+            std::sync::Arc::ptr_eq(&root.load(), &patched),
+            "exactly one whole-project root store is query-visible after both commits"
         );
         assert!(
-            b_latest,
-            "source A's publication replaced the whole index and dropped sibling \
-             B's latest generation, then reported success. One whole-project \
-             immutable root must carry the latest of every sibling, and a partial \
-             source generation must never be the query-visible publication"
+            !std::sync::Arc::ptr_eq(&root.load(), &baseline),
+            "precondition: B's publication advanced the root before A resumed"
+        );
+
+        // Product seam (INV-PUBLICATION): production_seams name
+        // CandidateCommit / ProjectIndexRuntime / ProjectPublicationRoot
+        // (`lifecycle-acceptance-oracles-v11.md`). The candidate preflight above
+        // passes; the LiveIndex reload trunk is not yet wired to those seams.
+        let store_src = include_str!("../src/live_index/store.rs");
+        assert!(
+            store_src.contains("ProjectPublicationRoot") || store_src.contains("CandidateCommit"),
+            "query-visible publication must route through ProjectPublicationRoot \
+             / CandidateCommit (T017/T060), not LiveIndex::reload wholesale swap"
         );
     });
 }
@@ -762,21 +927,68 @@ fn snapshot_seed_is_not_queryable_before_verification() {
     });
 }
 
-/// Design defect 2.5 — capacity controls do not reserve process capacity.
+/// Design defect 2.5 / SC-025 — process capacity is one conserved domain.
 ///
-/// Every load builds its own `InflightByteBudget` whose ceiling is that
-/// candidate's own planned bytes, so the configured limit is enforced per
-/// project rather than per process. Two projects open together each admit up to
-/// the whole ceiling, and the process holds twice what was configured — before
-/// counting a retained generation, a replacement candidate, or a watcher
-/// backlog.
+/// FR-004 makes catalog-entry limits per-candidate; SC-025 owns
+/// `ProcessCapacityPool` and `ProcessIndexRuntime` as the process-wide budget
+/// (`ORACLE-CAPACITY-PHYSICAL-OWNERSHIP`, `ORACLE-CAPACITY-RUNTIME-INTEGRATION`
+/// in `lifecycle-acceptance-oracles-v11.md`). `SYMFORGE_MAX_INDEX_FILES` bounds
+/// each discovery pass independently and must not be mistaken for the pool.
 ///
-/// A configured ceiling must bound the process, not each load in isolation.
+/// Part A mirrors `tests/process_capacity_pool_v11.rs::capacity_is_conserved_until_physical_drop`.
+/// Part B exercises `process_runtime.rs::ProcessIndexRuntime` surface attach refusal.
+/// Part C asserts daemon opens must honor the same budget — not yet wired.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5. CONTROL-STALE as of the 2026-08-21 Track A read: FR-004 makes capacity a per-candidate catalog and SC-025 owns the ProcessCapacityPool, while SYMFORGE_MAX_INDEX_FILES is per discovery pass. Making that env var process-wide would fight FR-004 and still miss SC-025. Retarget the body at ProcessCapacityPool"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5 / SC-025. CONTROL-STALE→retargeted-body: ProcessCapacityPool + ProcessIndexRuntime process-wide refusal then daemon integration; still RED until SC-025 wires pool acquisition into open/load"]
 fn configured_capacity_bounds_the_process_not_each_load() {
     run_daemon_test(async {
         const CEILING: usize = 10;
+        const FILE_BYTES: u64 = 64;
+        const PROCESS_BUDGET: u64 = (CEILING as u64) * FILE_BYTES;
+
+        // Part A — ORACLE-CAPACITY-PHYSICAL-OWNERSHIP (mirrors
+        // process_capacity_pool_v11.rs, not duplicated): one process pool
+        // conserves charges until physical drop.
+        let pool = std::sync::Arc::new(ProcessCapacityPool::new());
+        let process_owner = pool.root(PROCESS_BUDGET);
+        let held = pool
+            .redeem(
+                pool.reserve(process_owner, PROCESS_BUDGET - FILE_BYTES)
+                    .expect("first reservation fits"),
+            )
+            .expect("redeem first grant");
+        assert_eq!(
+            pool.reserve(process_owner, FILE_BYTES * 2)
+                .expect_err("second reservation exceeds headroom"),
+            CapacityRefusal::Exhausted {
+                requested: FILE_BYTES * 2,
+                available: FILE_BYTES,
+            }
+        );
+        drop(held);
+        assert_eq!(
+            pool.charged(process_owner),
+            0,
+            "physical drop refunds exactly once"
+        );
+
+        // Part B — ORACLE-CAPACITY-RUNTIME-INTEGRATION seam: surfaces share
+        // one ProcessIndexRuntime budget; a second attach beyond headroom refuses.
+        let runtime = ProcessIndexRuntime::incarnate(PROCESS_BUDGET);
+        runtime
+            .attach(SurfaceKind::Daemon, PROCESS_BUDGET - FILE_BYTES)
+            .expect("first surface fits");
+        assert_eq!(
+            runtime
+                .attach(SurfaceKind::Stdio, FILE_BYTES * 2)
+                .expect_err("second surface exceeds process runtime headroom"),
+            RuntimeRefusal::Capacity(CapacityRefusal::ExceedsParent {
+                requested: FILE_BYTES * 2,
+                available: FILE_BYTES,
+            })
+        );
+
+        // Part C — product seam: daemon opens must participate in the same pool.
         let first = TempDir::new().expect("project one");
         let second = TempDir::new().expect("project two");
         write_project_files(first.path(), "cap_a", CEILING);
@@ -784,9 +996,10 @@ fn configured_capacity_bounds_the_process_not_each_load() {
         let _cap = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", &CEILING.to_string());
 
         let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let mut opened = Vec::new();
-        for (index, root) in [first.path(), second.path()].into_iter().enumerate() {
-            opened.push(
+        let opened: Vec<_> = [first.path(), second.path()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, root)| {
                 daemon
                     .state
                     .open_project_session(OpenProjectRequest {
@@ -794,33 +1007,44 @@ fn configured_capacity_bounds_the_process_not_each_load() {
                         client_name: format!("slice0-capacity-{index}"),
                         pid: Some(std::process::id()),
                     })
-                    .expect("open project"),
-            );
-        }
+                    .expect("open project")
+            })
+            .collect();
 
-        let admitted: usize = daemon
-            .state
-            .list_projects()
+        // Fail-closed: wait until every slot leaves EmptyBootstrap/Loading
+        // placeholders — zero file_count during cold start must not satisfy
+        // process conservation.
+        let settled = wait_for_settled_project_health(
+            &daemon.state,
+            &opened
+                .iter()
+                .map(|o| o.project_id.clone())
+                .collect::<Vec<_>>(),
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        let ready_admitted: usize = settled
             .iter()
-            .filter_map(|summary| daemon.state.project_health(&summary.project_id))
+            .filter(|health| health.index_state == "Ready")
             .map(|health| health.file_count)
             .sum();
+        let per_load_scout_refusal = settled
+            .iter()
+            .any(|health| is_typed_catalog_capacity_refusal(&health.freshness));
         let projects = daemon.state.list_projects().len();
         let _ = daemon.shutdown_tx.send(());
 
-        // Slice 2 may satisfy the process-wide bound either by admitting less
-        // or by refusing the second open outright -- which is exactly what the
-        // sibling refusal control demands. Requiring both projects open would
-        // keep this RED after a correct fix and misattribute the failure, so a
-        // refused second open counts as the bound being honoured.
-        let second_open_refused = projects < 2;
+        // Success limb (GREEN when SC-025 wires pool into open/load): open-time
+        // process refusal, OR Ready totals within the process ceiling. Per-load
+        // CatalogEntryCapacityExceeded scout refusal is explicitly NOT process pool.
         assert!(
-            second_open_refused || admitted <= CEILING,
-            "two projects admitted {admitted} files against a configured ceiling \
-             of {CEILING} while both stayed open. The ceiling is applied per load, \
-             so every additional project multiplies what the process actually \
-             holds; it must bound the process -- either by admitting within the \
-             ceiling or by refusing the second open"
+            projects < opened.len() || ready_admitted <= CEILING,
+            "daemon open must honor the ProcessCapacityPool process-wide budget \
+             (SC-025): {ready_admitted} Ready-indexed files across {projects} \
+             settled slot(s) with no open-time process refusal against a process \
+             ceiling of {CEILING}. Per-load scout refusal observed={per_load_scout_refusal}; \
+             that is FR-004 catalog isolation, not process capacity."
         );
     });
 }
