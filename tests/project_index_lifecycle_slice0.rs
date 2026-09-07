@@ -564,10 +564,13 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 /// is building its replacement, and the swap discards those mutations.
 ///
 /// `reload_for_binding_with_exclusions` builds the replacement OUTSIDE the
-/// write lock (`src/live_index/store.rs:2385-2395`) and only then swaps. V10
+/// write lock (`src/live_index/store.rs:2487-2498`) and only then swaps. V10
 /// has no candidate isolation, so the watcher keeps mutating the live index
 /// throughout that build, and every one of those mutations is destroyed by the
 /// swap — silently, with the result still reported as a complete publication.
+///
+/// Deterministic RED control (no sleep race): `reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed`
+/// in `src/live_index/store.rs` via the ordered outside-lock seam hook.
 ///
 /// A candidate must be isolated: either the watcher cannot mutate it, or the
 /// mutations survive promotion. Losing them and reporting success is the one
