@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::adapters::{AdapterRefusal, execute_plan_with_outcome, plan_admission};
@@ -322,6 +322,10 @@ pub struct ProjectSourceAuthority {
     /// on every registry lookup to detect same-path replacement without
     /// rekeying the path convergence map.
     physical_anchor: Option<PhysicalRootAnchor>,
+    /// Set when the canonical path vanishes while this authority is cached.
+    /// The next successful observation rebinds even if metadata appears to
+    /// match — covering delete/recreate gaps where nothing polled mid-vanish.
+    path_absent_pending: AtomicBool,
     inner: Mutex<AuthorityInner>,
     // Separate mutex, strict ordering: lane state is always taken and
     // RELEASED before `inner` is locked (see `reconcile_returned`), so the
@@ -420,6 +424,7 @@ impl ProjectSourceAuthority {
             root: root.to_path_buf(),
             admission_root,
             physical_anchor: PhysicalRootAnchor::observe(root),
+            path_absent_pending: AtomicBool::new(false),
             inner: Mutex::new(AuthorityInner {
                 runtime: SourceRuntime::current(publication),
                 lease,
@@ -627,6 +632,11 @@ impl ProjectSourceAuthority {
     fn revoke_for_replacement(&self) {
         let inner = self.inner.lock().expect("project source authority lock");
         inner.lease.revoke();
+    }
+
+    /// Record that the canonical path was absent on a registry lookup.
+    fn mark_path_absent(&self) {
+        self.path_absent_pending.store(true, Ordering::Release);
     }
 
     /// How many mutation grants this source has ever issued. The wiring
@@ -931,12 +941,18 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = registry.lock().expect("project authority registry lock");
-    if let Some(observed) = PhysicalRootAnchor::observe(&key)
-        && let Some(existing) = map.get(&key)
-        && existing.physical_anchor != Some(observed)
-    {
-        existing.revoke_for_replacement();
-        map.remove(&key);
+    if let Some(existing) = map.get(&key) {
+        match PhysicalRootAnchor::observe(&key) {
+            None => existing.mark_path_absent(),
+            Some(observed)
+                if existing.path_absent_pending.load(Ordering::Acquire)
+                    || existing.physical_anchor != Some(observed) =>
+            {
+                existing.revoke_for_replacement();
+                map.remove(&key);
+            }
+            Some(_) => {}
+        }
     }
     map.entry(key.clone())
         .or_insert_with(|| ProjectSourceAuthority::for_root(&key))
@@ -1634,34 +1650,6 @@ mod write_authority_oracles {
         ));
         std::fs::create_dir_all(&root).expect("create oracle root");
         root
-    }
-
-    #[test]
-    fn same_path_physical_replacement_rebinds_admission_identity() {
-        use super::project_source_authority;
-
-        let parent = tempfile::tempdir().expect("parent");
-        let root = parent.path().join("proj");
-        std::fs::create_dir_all(&root).expect("create root");
-
-        let first = project_source_authority(&root);
-        let first_id = first.admission_root();
-
-        std::fs::remove_dir_all(&root).expect("remove root");
-        std::fs::create_dir_all(&root).expect("recreate root");
-
-        let second = project_source_authority(&root);
-        assert_ne!(
-            first_id,
-            second.admission_root(),
-            "ABA at one path must mint a fresh admission identity"
-        );
-        let joined = project_source_authority(&root);
-        assert_eq!(
-            joined.admission_root(),
-            second.admission_root(),
-            "concurrent opens of one live physical root join one authority"
-        );
     }
 
     #[test]

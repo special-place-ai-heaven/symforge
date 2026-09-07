@@ -66,47 +66,57 @@ impl PhysicalRootIdentity {
 /// Observed physical object at one path. Detects same-path replacement (ABA)
 /// without rekeying the path convergence map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PhysicalRootAnchor(u128);
+pub struct PhysicalRootAnchor {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
 
 impl PhysicalRootAnchor {
     /// Observe the directory object currently installed at `path`.
     pub fn observe(path: &Path) -> Option<Self> {
-        observe_physical_root_anchor(path).map(Self)
+        observe_physical_root_anchor(path)
     }
 }
 
 #[cfg(unix)]
-fn observe_physical_root_anchor(path: &Path) -> Option<u128> {
-    use std::hash::{Hash, Hasher};
+fn observe_physical_root_anchor(path: &Path) -> Option<PhysicalRootAnchor> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = std::fs::metadata(path).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    metadata.dev().hash(&mut hasher);
-    metadata.ino().hash(&mut hasher);
-    // Inode numbers may be reused after delete+recreate at one path; ctime
-    // still moves, which is what lets the path-keyed map detect ABA.
-    metadata.ctime().hash(&mut hasher);
-    metadata.ctime_nsec().hash(&mut hasher);
-    Some(hasher.finish() as u128)
+    Some(PhysicalRootAnchor {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        // Inode numbers may be reused after delete+recreate at one path; the
+        // full timestamp tuple still moves in ordinary replacement.
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+    })
 }
 
 #[cfg(windows)]
-fn observe_physical_root_anchor(path: &Path) -> Option<u128> {
-    use std::hash::{Hash, Hasher};
+fn observe_physical_root_anchor(path: &Path) -> Option<PhysicalRootAnchor> {
     use std::os::windows::fs::MetadataExt;
 
     let canonical = dunce::canonicalize(path).ok()?;
     let metadata = std::fs::metadata(path).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    metadata.creation_time().hash(&mut hasher);
-    metadata.file_attributes().hash(&mut hasher);
-    Some(hasher.finish() as u128)
+    Some(PhysicalRootAnchor {
+        dev: canonical.to_string_lossy().len() as u64,
+        ino: metadata.creation_time(),
+        ctime: metadata.creation_time() as i64,
+        ctime_nsec: metadata.file_attributes() as i64,
+        mtime: metadata.last_write_time() as i64,
+        mtime_nsec: metadata.file_attributes() as i64,
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn observe_physical_root_anchor(_path: &Path) -> Option<u128> {
+fn observe_physical_root_anchor(_path: &Path) -> Option<PhysicalRootAnchor> {
     None
 }
 
