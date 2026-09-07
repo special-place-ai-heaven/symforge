@@ -49,7 +49,7 @@ use super::capacity::{OwnerIdentity, ProcessCapacityPool};
 use super::mutation::{PermitDrainSignal, RefreshTicket, SourceMutationPermit};
 use super::observer::{CoalescingAccumulator, ObservationCut, ObserverId, ObserverSlot};
 use super::physical_root::{
-    PhysicalRootAnchor, PhysicalRootIdentity, PhysicalRootLease, WriteReceipt,
+    PhysicalRootAnchor, PhysicalRootIdentity, PhysicalRootLease, ReloadBoundaryAnchor, WriteReceipt,
 };
 use super::process_runtime::{ProcessIndexRuntime, SurfaceKind};
 use super::registry::{
@@ -957,6 +957,24 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
     map.entry(key.clone())
         .or_insert_with(|| ProjectSourceAuthority::for_root(&key))
         .clone()
+}
+
+/// Evict a cached authority when the reload-boundary witness changed. Called
+/// only from index reload so child-file writes do not false-positive.
+pub(crate) fn evict_project_source_authority_if_boundary_changed(
+    root: &Path,
+    admitted: Option<ReloadBoundaryAnchor>,
+) {
+    let current = ReloadBoundaryAnchor::observe(root);
+    if admitted.is_some() && admitted != current {
+        let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = registry.lock().expect("project authority registry lock");
+        if let Some(existing) = map.get(&key) {
+            existing.revoke_for_replacement();
+        }
+        map.remove(&key);
+    }
 }
 
 // ── The per-project runtime handle (D1, C4) ────────────────────────────────
