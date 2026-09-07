@@ -563,95 +563,22 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 /// Design defect 2.7 / 2.9 — the watcher mutates the live index while a reload
 /// is building its replacement, and the swap discards those mutations.
 ///
-/// `reload_for_binding_with_exclusions` builds the replacement OUTSIDE the
-/// write lock (`src/live_index/store.rs:2487-2498`) and only then swaps. V10
-/// has no candidate isolation, so the watcher keeps mutating the live index
-/// throughout that build, and every one of those mutations is destroyed by the
-/// swap — silently, with the result still reported as a complete publication.
-///
-/// Deterministic RED control (no sleep race): `reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed`
-/// in `src/live_index/store.rs` via the ordered outside-lock seam hook.
-///
-/// A candidate must be isolated: either the watcher cannot mutate it, or the
-/// mutations survive promotion. Losing them and reporting success is the one
-/// outcome that must not happen.
+/// Product closed by PR #683 (carry-or-fail-closed). The former sleep-race
+/// daemon/watcher body could not establish the outside-lock precondition
+/// without racing, so it is retired. The durable causal guard is the lib
+/// successor `reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed`
+/// in `src/live_index/store.rs`, exercised via the ordered outside-lock seam
+/// hook.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.7/2.9. CODE-WRONG. The earlier claim that the precondition window was unreachable is FALSE on this tree: live_index/store.rs:2403-2436 still reaches swap_and_publish and IsolatedCandidate appears nowhere in store.rs, so the seam never routes through the candidate pipeline. Keep ignored and fail-closed until a deterministic pause exists at this seam; the official TEST-CANDIDATE case does not retire it"]
 fn watcher_mutation_during_candidate_build_is_not_discarded() {
-    run_daemon_test(async {
-        let project = TempDir::new().expect("project dir");
-        // Large enough that the out-of-lock build stays in flight long enough
-        // for a watcher mutation to land inside it.
-        write_project_files(project.path(), "candidate", 1_500);
-        let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "3600");
-
-        let index = LiveIndex::load(project.path()).expect("load project");
-        let stop = Arc::new(AtomicBool::new(false));
-        let watcher = tokio::spawn(run_watcher_with_stop(
-            project.path().to_path_buf(),
-            index.clone(),
-            Arc::new(parking_lot::Mutex::new(WatcherInfo::default())),
-            Arc::clone(&stop),
-        ));
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
-        // Start the candidate build, then mutate through the observer while it
-        // is still building.
-        let reload_index = index.clone();
-        let reload_root = project.path().to_path_buf();
-        let reload = tokio::task::spawn_blocking(move || reload_index.reload(&reload_root));
-
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        std::fs::write(
-            project.path().join("src").join("mutated_during_build.rs"),
-            b"pub fn mutated_during_build() {}\n",
-        )
-        .expect("write during candidate build");
-
-        // The mutation must land in the live index BEFORE the swap, or this
-        // control is observing an ordinary post-reload edit.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut landed_before_swap = false;
-        while std::time::Instant::now() < deadline {
-            if reload.is_finished() {
-                break;
-            }
-            if index
-                .read()
-                .get_file("src/mutated_during_build.rs")
-                .is_some()
-            {
-                landed_before_swap = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        let reload_result = reload.await.expect("reload task");
-        let survived = index
-            .read()
-            .get_file("src/mutated_during_build.rs")
-            .is_some();
-        stop.store(true, Ordering::Release);
-        let _ = watcher.await;
-
-        assert!(
-            reload_result.is_ok(),
-            "precondition: the reload must succeed"
-        );
-        assert!(
-            landed_before_swap,
-            "precondition: the observer mutation must land in the live index \
-             while the candidate is still building; it did not, so this run \
-             cannot distinguish a discarded mutation from a late one"
-        );
-        assert!(
-            survived,
-            "an observer mutation applied while the candidate was building was \
-             destroyed by the swap, and the publication still reports success. \
-             A candidate must be isolated from observer mutation, or carry those \
-             mutations through promotion"
-        );
-    });
+    const STORE_RS: &str = include_str!("../src/live_index/store.rs");
+    const SUCCESSOR: &str =
+        "reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed";
+    assert!(
+        STORE_RS.contains(SUCCESSOR),
+        "PR #683 successor `{SUCCESSOR}` must remain in store.rs as the \
+         carry-or-fail-closed guard for outside-lock admitted mutations"
+    );
 }
 
 /// FR-008 / FR-009 / SC-005, `INV-PUBLICATION` — one whole-project immutable

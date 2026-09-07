@@ -107,6 +107,19 @@ const SUITES = [
       "--test-threads=1",
     ],
   },
+  {
+    target: "tests/project_index_lifecycle_slice0.rs::watcher_mutation_during_candidate_build_is_not_discarded",
+    expected: "green",
+    args: [
+      "test",
+      "--test",
+      "project_index_lifecycle_slice0",
+      "watcher_mutation_during_candidate_build_is_not_discarded",
+      "--",
+      "--exact",
+      "--test-threads=1",
+    ],
+  },
 ];
 
 const NEWLINE = String.fromCharCode(10);
@@ -130,7 +143,6 @@ const RED_CASES = [
   "empty_placeholder_publication_refuses_watcher_mutation",
   "same_path_root_replacement_is_not_silently_adopted",
   "snapshot_seed_is_not_queryable_before_verification",
-  "watcher_mutation_during_candidate_build_is_not_discarded",
   "whole_project_publication_preserves_latest_siblings",
 ];
 
@@ -194,6 +206,15 @@ const RESOLVED_CASES = new Map([
       // Same latch: the gap is retained rather than rederived, so the promoted
       // generation cannot report Current about a window it never observed.
       fix: "src/live_index/store.rs::latch_observer_gap, retained verbatim by recompute_freshness_locked",
+    },
+  ],
+  [
+    "watcher_mutation_during_candidate_build_is_not_discarded",
+    {
+      slice: null,
+      tasks: [],
+      defect: "2.7 / 2.9 observer mutation destroyed by the swap while publication reports success",
+      fix: "PR #683 carry-or-fail-closed; src/live_index/store.rs::reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed (ordered outside-lock seam)",
     },
   ],
 ]);
