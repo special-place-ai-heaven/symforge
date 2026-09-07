@@ -36,20 +36,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use symforge::daemon::{DaemonState, OpenProjectRequest, ProjectHealth, spawn_daemon};
 use symforge::domain::{FreshnessReason, FreshnessStatus};
 use symforge::live_index::LiveIndex;
-use symforge::live_index::index_lifecycle::capacity::{CapacityRefusal, ProcessCapacityPool};
 use symforge::live_index::index_lifecycle::candidate::{
-    CandidateSource, IsolatedCandidate, ProjectArtifactRoot, PromotionRefusal,
-    SourceContentToken, SourceId, SourceObservation,
+    CandidateSource, IsolatedCandidate, ProjectArtifactRoot, PromotionRefusal, SourceContentToken,
+    SourceId, SourceObservation,
 };
+use symforge::live_index::index_lifecycle::capacity::{CapacityRefusal, ProcessCapacityPool};
 use symforge::live_index::index_lifecycle::process_runtime::{
     ProcessIndexRuntime, RuntimeRefusal, SurfaceKind,
 };
 use symforge::live_index::index_lifecycle::supervisor::SourceSupervisor;
-use symforge::protocol::format::claim_provenance::{
-    OperationKind, OperationReceipt, PhysicalRootLease, SourceRefusalKind,
-    acquire_claim_context,
-};
 use symforge::live_index::store::SnapshotVerifyState;
+use symforge::protocol::format::claim_provenance::{
+    OperationKind, OperationReceipt, PhysicalRootLease, SourceRefusalKind, acquire_claim_context,
+};
 use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
 use tempfile::TempDir;
 
@@ -960,8 +959,7 @@ fn configured_capacity_bounds_the_process_not_each_load() {
             )
             .expect("redeem first grant");
         assert_eq!(
-            pool
-                .reserve(process_owner, FILE_BYTES * 2)
+            pool.reserve(process_owner, FILE_BYTES * 2)
                 .expect_err("second reservation exceeds headroom"),
             CapacityRefusal::Exhausted {
                 requested: FILE_BYTES * 2,
@@ -969,7 +967,11 @@ fn configured_capacity_bounds_the_process_not_each_load() {
             }
         );
         drop(held);
-        assert_eq!(pool.charged(process_owner), 0, "physical drop refunds exactly once");
+        assert_eq!(
+            pool.charged(process_owner),
+            0,
+            "physical drop refunds exactly once"
+        );
 
         // Part B — ORACLE-CAPACITY-RUNTIME-INTEGRATION seam: surfaces share
         // one ProcessIndexRuntime budget; a second attach beyond headroom refuses.
@@ -1015,7 +1017,10 @@ fn configured_capacity_bounds_the_process_not_each_load() {
         // process conservation.
         let settled = wait_for_settled_project_health(
             &daemon.state,
-            &opened.iter().map(|o| o.project_id.clone()).collect::<Vec<_>>(),
+            &opened
+                .iter()
+                .map(|o| o.project_id.clone())
+                .collect::<Vec<_>>(),
             std::time::Duration::from_secs(30),
         )
         .await;
