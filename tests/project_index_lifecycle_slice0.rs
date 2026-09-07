@@ -33,7 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use symforge::daemon::{OpenProjectRequest, spawn_daemon};
+use symforge::daemon::{DaemonState, OpenProjectRequest, ProjectHealth, spawn_daemon};
 use symforge::domain::{FreshnessReason, FreshnessStatus};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::index_lifecycle::capacity::{CapacityRefusal, ProcessCapacityPool};
@@ -108,6 +108,48 @@ fn write_project_files(root: &Path, prefix: &str, count: usize) {
     }
 }
 
+fn is_typed_catalog_capacity_refusal(freshness: &FreshnessStatus) -> bool {
+    matches!(
+        freshness,
+        FreshnessStatus::Degraded { reason_codes, .. }
+            if reason_codes.contains(&FreshnessReason::CatalogEntryCapacityExceeded)
+                || reason_codes.contains(&FreshnessReason::CatalogMetadataCapacityExceeded)
+    )
+}
+
+/// A slot has left the EmptyBootstrap/Loading placeholder when it is Ready,
+/// Degraded with typed evidence, or carries a per-load catalog-capacity refusal.
+fn slot_is_settled(health: &ProjectHealth) -> bool {
+    if is_typed_catalog_capacity_refusal(&health.freshness) {
+        return true;
+    }
+    matches!(health.index_state.as_str(), "Ready" | "Degraded")
+}
+
+async fn wait_for_settled_project_health(
+    daemon: &DaemonState,
+    project_ids: &[String],
+    timeout: std::time::Duration,
+) -> Vec<ProjectHealth> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let healths: Vec<_> = project_ids
+            .iter()
+            .filter_map(|id| daemon.project_health(id))
+            .collect();
+        if healths.len() == project_ids.len() && healths.iter().all(slot_is_settled) {
+            return healths;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "Part C residual: project slots never settled to Ready or typed refusal \
+                 (still EmptyBootstrap/Loading placeholders?): {healths:?}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Design defect 2.1 / FR-004 — typed catalog refusal and non-queryable cold start.
 ///
 /// V10 converted capacity refusal into `Ok(LiveIndex::empty())` with no typed
@@ -168,6 +210,9 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
             "FR-004 cold start must not publish a partial manifest"
         );
 
+        // Load-bearing residual (not the bare-lease unit mirror below):
+        // daemon get_repo_map must refuse, and the watcher window must not
+        // admit files without a complete generation.
         let map_body = reqwest::Client::new()
             .post(format!(
                 "http://127.0.0.1:{}/v1/sessions/{}/tools/get_repo_map",
@@ -182,9 +227,8 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
             .await
             .expect("get_repo_map body");
 
-        // V11 transport contract (mirrors claim_provenance_v11.rs): a
-        // generation-backed query without a Current lease refuses
-        // `SourceRefusalKind::AdmissionUnavailable`, never a silent serve.
+        // Unit mirror of claim_provenance_v11.rs — supplements, does not replace,
+        // the daemon get_repo_map + watcher checks above.
         let lease = symforge::protocol::format::claim_provenance::ObservationLease::for_test_root(
             PhysicalRootLease::for_test_root(&opened.canonical_root),
         );
@@ -797,7 +841,7 @@ fn whole_project_publication_preserves_latest_siblings() {
         // passes; the LiveIndex reload trunk is not yet wired to those seams.
         let store_src = include_str!("../src/live_index/store.rs");
         assert!(
-            store_src.contains("ProjectPublicationRoot") || store_src.contains("IsolatedCandidate"),
+            store_src.contains("ProjectPublicationRoot") || store_src.contains("CandidateCommit"),
             "query-visible publication must route through ProjectPublicationRoot \
              / CandidateCommit (T017/T060), not LiveIndex::reload wholesale swap"
         );
@@ -937,7 +981,7 @@ fn configured_capacity_bounds_the_process_not_each_load() {
             runtime
                 .attach(SurfaceKind::Stdio, FILE_BYTES * 2)
                 .expect_err("second surface exceeds process runtime headroom"),
-            RuntimeRefusal::Capacity(CapacityRefusal::Exhausted {
+            RuntimeRefusal::Capacity(CapacityRefusal::ExceedsParent {
                 requested: FILE_BYTES * 2,
                 available: FILE_BYTES,
             })
@@ -951,9 +995,10 @@ fn configured_capacity_bounds_the_process_not_each_load() {
         let _cap = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", &CEILING.to_string());
 
         let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let mut opened = Vec::new();
-        for (index, root) in [first.path(), second.path()].into_iter().enumerate() {
-            opened.push(
+        let opened: Vec<_> = [first.path(), second.path()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, root)| {
                 daemon
                     .state
                     .open_project_session(OpenProjectRequest {
@@ -961,39 +1006,41 @@ fn configured_capacity_bounds_the_process_not_each_load() {
                         client_name: format!("slice0-capacity-{index}"),
                         pid: Some(std::process::id()),
                     })
-                    .expect("open project"),
-            );
-        }
-
-        let mut second_refused = false;
-        let admitted: usize = daemon
-            .state
-            .list_projects()
-            .iter()
-            .filter_map(|summary| daemon.state.project_health(&summary.project_id))
-            .map(|health| {
-                if matches!(
-                    health.freshness,
-                    FreshnessStatus::Degraded {
-                        ref reason_codes,
-                        ..
-                    } if reason_codes.contains(&FreshnessReason::CatalogEntryCapacityExceeded)
-                        || reason_codes.contains(&FreshnessReason::CatalogMetadataCapacityExceeded)
-                ) {
-                    second_refused = true;
-                }
-                health.file_count
+                    .expect("open project")
             })
+            .collect();
+
+        // Fail-closed: wait until every slot leaves EmptyBootstrap/Loading
+        // placeholders — zero file_count during cold start must not satisfy
+        // process conservation.
+        let settled = wait_for_settled_project_health(
+            &daemon.state,
+            &opened.iter().map(|o| o.project_id.clone()).collect::<Vec<_>>(),
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        let ready_admitted: usize = settled
+            .iter()
+            .filter(|health| health.index_state == "Ready")
+            .map(|health| health.file_count)
             .sum();
+        let per_load_scout_refusal = settled
+            .iter()
+            .any(|health| is_typed_catalog_capacity_refusal(&health.freshness));
         let projects = daemon.state.list_projects().len();
         let _ = daemon.shutdown_tx.send(());
 
+        // Success limb (GREEN when SC-025 wires pool into open/load): open-time
+        // process refusal, OR Ready totals within the process ceiling. Per-load
+        // CatalogEntryCapacityExceeded scout refusal is explicitly NOT process pool.
         assert!(
-            second_refused || projects < 2 || admitted <= CEILING,
+            projects < opened.len() || ready_admitted <= CEILING,
             "daemon open must honor the ProcessCapacityPool process-wide budget \
-             (SC-025): two projects admitted {admitted} indexed files with \
-             {projects} slots open against a process ceiling of {CEILING}. \
-             Per-load SYMFORGE_MAX_INDEX_FILES isolation is not process capacity."
+             (SC-025): {ready_admitted} Ready-indexed files across {projects} \
+             settled slot(s) with no open-time process refusal against a process \
+             ceiling of {CEILING}. Per-load scout refusal observed={per_load_scout_refusal}; \
+             that is FR-004 catalog isolation, not process capacity."
         );
     });
 }
