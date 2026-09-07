@@ -560,26 +560,15 @@ fn old_observer_delivery_after_promotion_is_not_current() {
     });
 }
 
-/// Design defect 2.7 / 2.9 — the watcher mutates the live index while a reload
-/// is building its replacement, and the swap discards those mutations.
-///
-/// Product closed by PR #683 (carry-or-fail-closed). The former sleep-race
-/// daemon/watcher body could not establish the outside-lock precondition
-/// without racing, so it is retired. The durable causal guard is the lib
-/// successor `reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed`
-/// in `src/live_index/store.rs`, exercised via the ordered outside-lock seam
-/// hook.
-#[test]
-fn watcher_mutation_during_candidate_build_is_not_discarded() {
-    const STORE_RS: &str = include_str!("../src/live_index/store.rs");
-    const SUCCESSOR: &str =
-        "reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed";
-    assert!(
-        STORE_RS.contains(SUCCESSOR),
-        "PR #683 successor `{SUCCESSOR}` must remain in store.rs as the \
-         carry-or-fail-closed guard for outside-lock admitted mutations"
-    );
-}
+// Design defect 2.7 / 2.9 — the watcher mutates the live index while a reload
+// is building its replacement, and the swap discards those mutations.
+//
+// Product closed by PR #683 (carry-or-fail-closed). The former sleep-race
+// daemon/watcher body could not establish the outside-lock precondition
+// without racing, so it is retired. The durable causal guard is the lib
+// successor `reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed`
+// in `src/live_index/store.rs`, exercised via the ordered outside-lock seam
+// hook and tracked in `scripts/slice0-oracle-artifact.cjs` RESOLVED_CASES.
 
 /// FR-008 / FR-009 / SC-005, `INV-PUBLICATION` — one whole-project immutable
 /// root is the sole query-visible publication unit, and partial source

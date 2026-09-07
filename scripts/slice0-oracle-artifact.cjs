@@ -108,16 +108,14 @@ const SUITES = [
     ],
   },
   {
-    target: "tests/project_index_lifecycle_slice0.rs::watcher_mutation_during_candidate_build_is_not_discarded",
+    target: "src/live_index/store.rs::tests",
     expected: "green",
     args: [
       "test",
-      "--test",
-      "project_index_lifecycle_slice0",
-      "watcher_mutation_during_candidate_build_is_not_discarded",
+      "--lib",
+      "internals::live_index::store::tests::reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed",
       "--",
       "--exact",
-      "--test-threads=1",
     ],
   },
 ];
@@ -209,7 +207,7 @@ const RESOLVED_CASES = new Map([
     },
   ],
   [
-    "watcher_mutation_during_candidate_build_is_not_discarded",
+    "internals::live_index::store::tests::reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed",
     {
       slice: null,
       tasks: [],
