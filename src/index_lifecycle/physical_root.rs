@@ -51,6 +51,63 @@ impl PhysicalRootIdentity {
         let raw = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
         Self(std::num::NonZeroU64::new(raw).expect("root counter starts at 1"))
     }
+
+    /// Stable stored form for cross-handle admission comparison.
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Rehydrate from a stored admission identity. Zero means unset.
+    pub fn from_stored(raw: u64) -> Option<Self> {
+        std::num::NonZeroU64::new(raw).map(Self)
+    }
+}
+
+/// Observed physical object at one path. Detects same-path replacement (ABA)
+/// without rekeying the path convergence map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PhysicalRootAnchor(u128);
+
+impl PhysicalRootAnchor {
+    /// Observe the directory object currently installed at `path`.
+    pub fn observe(path: &Path) -> Option<Self> {
+        observe_physical_root_anchor(path).map(Self)
+    }
+}
+
+#[cfg(unix)]
+fn observe_physical_root_anchor(path: &Path) -> Option<u128> {
+    use std::hash::{Hash, Hasher};
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    metadata.dev().hash(&mut hasher);
+    metadata.ino().hash(&mut hasher);
+    // Inode numbers may be reused after delete+recreate at one path; ctime
+    // still moves, which is what lets the path-keyed map detect ABA.
+    metadata.ctime().hash(&mut hasher);
+    metadata.ctime_nsec().hash(&mut hasher);
+    Some(hasher.finish() as u128)
+}
+
+#[cfg(windows)]
+fn observe_physical_root_anchor(path: &Path) -> Option<u128> {
+    use std::hash::{Hash, Hasher};
+    use std::os::windows::fs::MetadataExt;
+
+    let canonical = dunce::canonicalize(path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    metadata.creation_time().hash(&mut hasher);
+    metadata.file_attributes().hash(&mut hasher);
+    Some(hasher.finish() as u128)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn observe_physical_root_anchor(_path: &Path) -> Option<u128> {
+    None
 }
 
 /// Why a path could not be resolved beneath a lease's root.

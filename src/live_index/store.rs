@@ -1347,6 +1347,10 @@ pub struct SharedIndexHandle {
     project_generation: AtomicU64,
     /// Project generation that was last produced by an explicit index_folder reset.
     last_reset_project_generation: AtomicU64,
+    /// Admission-root identity this handle was indexed under. Reload consults
+    /// the live authority; a mismatch means same-path physical replacement
+    /// and freshness must not return to Current without explicit transition.
+    admitted_root: AtomicU64,
     /// Telemetry counter for fenced mutations rejected due to stale project generation.
     rejected_stale_mutations: AtomicU64,
     /// Git temporal intelligence — independently swapped side-table with
@@ -1486,6 +1490,12 @@ impl SharedIndexHandle {
             }
         }));
         let temporal = Arc::clone(&code_signals.temporal);
+        let admitted_root = index
+            .indexed_root
+            .as_deref()
+            .map(crate::live_index::index_lifecycle::activation::project_source_authority)
+            .map(|authority| authority.admission_root().as_u64())
+            .unwrap_or(0);
         let freshness_status = if scout_plan
             .as_deref()
             .is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded)
@@ -1590,6 +1600,7 @@ impl SharedIndexHandle {
             next_generation: AtomicU64::new(1),
             project_generation: AtomicU64::new(0),
             last_reset_project_generation: AtomicU64::new(0),
+            admitted_root: AtomicU64::new(admitted_root),
             rejected_stale_mutations: AtomicU64::new(0),
             git_temporal: ArcSwap::new(temporal),
             git_temporal_jobs: Mutex::new(super::git_temporal::GitTemporalJobQueue::default()),
@@ -2545,6 +2556,13 @@ impl SharedIndexHandle {
             project_state_dir.as_ref(),
             &source_exclusions,
         )?;
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(root);
+        let admission_identity_mismatch =
+            crate::live_index::index_lifecycle::physical_root::PhysicalRootIdentity::from_stored(
+                self.admitted_root.load(Ordering::Acquire),
+            )
+            .is_some_and(|admitted| admitted != authority.admission_root());
         let scout_plan = Arc::clone(&data.scout_plan);
         let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
         let mut live = LiveIndex::from_reload_data(data);
@@ -2572,7 +2590,9 @@ impl SharedIndexHandle {
                 if reason_codes.contains(&FreshnessReason::WatcherUnavailable)
         );
         let mut reason_codes = Vec::new();
-        if is_degraded {
+        if (is_degraded || admission_identity_mismatch)
+            && !reason_codes.contains(&FreshnessReason::ReconciliationPending)
+        {
             reason_codes.push(FreshnessReason::ReconciliationPending);
         }
         if latched_gap {

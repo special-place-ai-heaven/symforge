@@ -48,7 +48,9 @@ use super::candidate::{
 use super::capacity::{OwnerIdentity, ProcessCapacityPool};
 use super::mutation::{PermitDrainSignal, RefreshTicket, SourceMutationPermit};
 use super::observer::{CoalescingAccumulator, ObservationCut, ObserverId, ObserverSlot};
-use super::physical_root::{PhysicalRootIdentity, PhysicalRootLease, WriteReceipt};
+use super::physical_root::{
+    PhysicalRootAnchor, PhysicalRootIdentity, PhysicalRootLease, WriteReceipt,
+};
 use super::process_runtime::{ProcessIndexRuntime, SurfaceKind};
 use super::registry::{
     LiveProjectSlot, ProjectKey, ProjectRegistry, RegistryRefusal, RootProtection,
@@ -312,16 +314,14 @@ impl ActivationCut {
 pub struct ProjectSourceAuthority {
     root: PathBuf,
     /// The identity of this root's FIRST lease, presented for project
-    /// admission (C4b). Every open of one canonicalized root converges on
-    /// this authority and therefore presents the same physical identity —
-    /// which is what lets concurrent opens join one admission. OPEN residual
-    /// (T038 round-1 adjudication): C5 landed WITHOUT owning rebinding, so a
-    /// root physically replaced at the same path still keeps its first
-    /// admission identity (and this cached authority's lane state) across
-    /// the replacement. Owned by the post-cut follow-up recorded in
-    /// docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md — do not
-    /// treat this comment as a promise that any landed commit discharged it.
+    /// admission (C4b). Replaced only when the directory object at this
+    /// canonical path changes — same path, different physical root mints a
+    /// fresh identity via [`project_source_authority`]'s ABA fence.
     admission_root: PhysicalRootIdentity,
+    /// Observed physical object when this authority was installed. Compared
+    /// on every registry lookup to detect same-path replacement without
+    /// rekeying the path convergence map.
+    physical_anchor: Option<PhysicalRootAnchor>,
     inner: Mutex<AuthorityInner>,
     // Separate mutex, strict ordering: lane state is always taken and
     // RELEASED before `inner` is locked (see `reconcile_returned`), so the
@@ -419,6 +419,7 @@ impl ProjectSourceAuthority {
         Arc::new(Self {
             root: root.to_path_buf(),
             admission_root,
+            physical_anchor: PhysicalRootAnchor::observe(root),
             inner: Mutex::new(AuthorityInner {
                 runtime: SourceRuntime::current(publication),
                 lease,
@@ -608,12 +609,24 @@ impl ProjectSourceAuthority {
             .map(|publication| publication.publication())
     }
 
+    /// The stable admission-root identity this authority presents.
+    pub fn admission_root(&self) -> PhysicalRootIdentity {
+        self.admission_root
+    }
+
     /// The binding this authority presents for project admission: a fresh
     /// binding identity over the STABLE admission-root identity (see the
     /// field doc), so every open of one canonicalized root can join one
     /// registry occupancy.
     pub fn admission_binding(&self) -> BindingAuthority {
         BindingAuthority::bind(self.admission_root)
+    }
+
+    /// Revoke the outgoing lease when the directory object at this path was
+    /// physically replaced. Called only from the registry ABA fence.
+    fn revoke_for_replacement(&self) {
+        let inner = self.inner.lock().expect("project source authority lock");
+        inner.lease.revoke();
     }
 
     /// How many mutation grants this source has ever issued. The wiring
@@ -918,6 +931,13 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = registry.lock().expect("project authority registry lock");
+    if let Some(observed) = PhysicalRootAnchor::observe(&key)
+        && let Some(existing) = map.get(&key)
+        && existing.physical_anchor != Some(observed)
+    {
+        existing.revoke_for_replacement();
+        map.remove(&key);
+    }
     map.entry(key.clone())
         .or_insert_with(|| ProjectSourceAuthority::for_root(&key))
         .clone()
@@ -1614,6 +1634,34 @@ mod write_authority_oracles {
         ));
         std::fs::create_dir_all(&root).expect("create oracle root");
         root
+    }
+
+    #[test]
+    fn same_path_physical_replacement_rebinds_admission_identity() {
+        use super::project_source_authority;
+
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let first = project_source_authority(&root);
+        let first_id = first.admission_root();
+
+        std::fs::remove_dir_all(&root).expect("remove root");
+        std::fs::create_dir_all(&root).expect("recreate root");
+
+        let second = project_source_authority(&root);
+        assert_ne!(
+            first_id,
+            second.admission_root(),
+            "ABA at one path must mint a fresh admission identity"
+        );
+        let joined = project_source_authority(&root);
+        assert_eq!(
+            joined.admission_root(),
+            second.admission_root(),
+            "concurrent opens of one live physical root join one authority"
+        );
     }
 
     #[test]
