@@ -78,54 +78,6 @@ impl PhysicalRootAnchor {
     }
 }
 
-/// Reload-boundary witness for same-path replacement. Observed only when an
-/// index handle (re)binds or reloads — not on every authority lookup — so
-/// child-file mutations that leave the root inode alone do not false-positive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReloadBoundaryAnchor {
-    dev: u64,
-    ino: u64,
-    mtime: i64,
-    mtime_nsec: i64,
-}
-
-impl ReloadBoundaryAnchor {
-    pub fn observe(path: &Path) -> Option<Self> {
-        observe_reload_boundary_anchor(path)
-    }
-}
-
-#[cfg(unix)]
-fn observe_reload_boundary_anchor(path: &Path) -> Option<ReloadBoundaryAnchor> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(ReloadBoundaryAnchor {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        mtime: metadata.mtime(),
-        mtime_nsec: metadata.mtime_nsec(),
-    })
-}
-
-#[cfg(windows)]
-fn observe_reload_boundary_anchor(path: &Path) -> Option<ReloadBoundaryAnchor> {
-    use std::os::windows::fs::MetadataExt;
-
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(ReloadBoundaryAnchor {
-        dev: metadata.volume_serial_number(),
-        ino: metadata.file_index(),
-        mtime: metadata.last_write_time() as i64,
-        mtime_nsec: metadata.file_attributes() as i64,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn observe_reload_boundary_anchor(_path: &Path) -> Option<ReloadBoundaryAnchor> {
-    None
-}
-
 #[cfg(unix)]
 fn observe_physical_root_anchor(path: &Path) -> Option<PhysicalRootAnchor> {
     use std::os::unix::fs::MetadataExt;

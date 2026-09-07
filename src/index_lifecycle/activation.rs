@@ -49,7 +49,7 @@ use super::capacity::{OwnerIdentity, ProcessCapacityPool};
 use super::mutation::{PermitDrainSignal, RefreshTicket, SourceMutationPermit};
 use super::observer::{CoalescingAccumulator, ObservationCut, ObserverId, ObserverSlot};
 use super::physical_root::{
-    PhysicalRootAnchor, PhysicalRootIdentity, PhysicalRootLease, ReloadBoundaryAnchor, WriteReceipt,
+    PhysicalRootAnchor, PhysicalRootIdentity, PhysicalRootLease, WriteReceipt,
 };
 use super::process_runtime::{ProcessIndexRuntime, SurfaceKind};
 use super::registry::{
@@ -323,8 +323,8 @@ pub struct ProjectSourceAuthority {
     /// rekeying the path convergence map.
     physical_anchor: Option<PhysicalRootAnchor>,
     /// Set when the canonical path vanishes while this authority is cached.
-    /// The next successful observation rebinds even if metadata appears to
-    /// match — covering delete/recreate gaps where nothing polled mid-vanish.
+    /// Cleared when the next observation matches the cached anchor; remint
+    /// happens only when the observed dev+ino differs.
     path_absent_pending: AtomicBool,
     inner: Mutex<AuthorityInner>,
     // Separate mutex, strict ordering: lane state is always taken and
@@ -944,14 +944,13 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
     if let Some(existing) = map.get(&key) {
         match PhysicalRootAnchor::observe(&key) {
             None => existing.mark_path_absent(),
-            Some(observed)
-                if existing.path_absent_pending.load(Ordering::Acquire)
-                    || existing.physical_anchor != Some(observed) =>
-            {
+            Some(observed) if existing.physical_anchor == Some(observed) => {
+                existing.path_absent_pending.store(false, Ordering::Release);
+            }
+            Some(_) => {
                 existing.revoke_for_replacement();
                 map.remove(&key);
             }
-            Some(_) => {}
         }
     }
     map.entry(key.clone())
@@ -959,13 +958,23 @@ pub fn project_source_authority(root: &Path) -> Arc<ProjectSourceAuthority> {
         .clone()
 }
 
-/// Evict a cached authority when the reload-boundary witness changed. Called
+/// Whether the registry recorded a path-vanish since the authority was installed.
+/// Read before [`project_source_authority`] clears the bit on anchor match.
+pub(crate) fn project_source_authority_path_vanish_pending(root: &Path) -> bool {
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let map = registry.lock().expect("project authority registry lock");
+    map.get(&key)
+        .is_some_and(|existing| existing.path_absent_pending.load(Ordering::Acquire))
+}
+
+/// Evict a cached authority when the physical root anchor changed. Called
 /// only from index reload so child-file writes do not false-positive.
-pub(crate) fn evict_project_source_authority_if_boundary_changed(
+pub(crate) fn evict_project_source_authority_if_anchor_changed(
     root: &Path,
-    admitted: Option<ReloadBoundaryAnchor>,
+    admitted: Option<PhysicalRootAnchor>,
 ) {
-    let current = ReloadBoundaryAnchor::observe(root);
+    let current = PhysicalRootAnchor::observe(root);
     if admitted.is_some() && admitted != current {
         let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let registry = PROJECT_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
