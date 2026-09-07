@@ -38,10 +38,17 @@ use symforge::domain::{FreshnessReason, FreshnessStatus};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::index_lifecycle::capacity::{CapacityRefusal, ProcessCapacityPool};
 use symforge::live_index::index_lifecycle::candidate::{
-    CandidateSource, IsolatedCandidate, ProjectArtifactRoot, SourceContentToken, SourceId,
-    SourceObservation,
+    CandidateSource, IsolatedCandidate, ProjectArtifactRoot, PromotionRefusal,
+    SourceContentToken, SourceId, SourceObservation,
+};
+use symforge::live_index::index_lifecycle::process_runtime::{
+    ProcessIndexRuntime, RuntimeRefusal, SurfaceKind,
 };
 use symforge::live_index::index_lifecycle::supervisor::SourceSupervisor;
+use symforge::protocol::format::claim_provenance::{
+    OperationKind, OperationReceipt, PhysicalRootLease, SourceRefusalKind,
+    acquire_claim_context,
+};
 use symforge::live_index::store::SnapshotVerifyState;
 use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
 use tempfile::TempDir;
@@ -174,12 +181,29 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
             .text()
             .await
             .expect("get_repo_map body");
+
+        // V11 transport contract (mirrors claim_provenance_v11.rs): a
+        // generation-backed query without a Current lease refuses
+        // `SourceRefusalKind::AdmissionUnavailable`, never a silent serve.
+        let lease = symforge::protocol::format::claim_provenance::ObservationLease::for_test_root(
+            PhysicalRootLease::for_test_root(&opened.canonical_root),
+        );
+        let bare = lease.context_input(&opened.project_id, &opened.canonical_root, None);
+        let transport_refusal = acquire_claim_context(
+            OperationReceipt::for_test(OperationKind::SearchText),
+            vec![bare],
+        )
+        .expect_err("strict acquisition without a Current lease must refuse");
+        assert_eq!(
+            transport_refusal.kind(),
+            SourceRefusalKind::AdmissionUnavailable,
+            "V11 query transport must refuse non-queryable cold start with AdmissionUnavailable"
+        );
+
         assert!(
-            map_body.contains("CatalogEntryCapacityExceeded")
-                || map_body.contains("catalog-entry")
-                || map_body.contains("capacity"),
-            "strict acquisition must return typed capacity SourceRefusal on query, not \
-             `{map_body}`"
+            map_body.contains("AdmissionUnavailable"),
+            "daemon query must map catalog refusal to typed SourceRefusalKind \
+             AdmissionUnavailable, not `{map_body}`"
         );
 
         // Residual: if activate started a watcher against the empty placeholder,
@@ -641,42 +665,19 @@ fn old_observer_delivery_after_promotion_is_not_current() {
 // in `src/live_index/store.rs`, exercised via the ordered outside-lock seam
 // hook and tracked in `scripts/slice0-oracle-artifact.cjs` RESOLVED_CASES.
 
-/// FR-008 / FR-009 / SC-005, `INV-PUBLICATION` — one whole-project immutable
-/// root is the sole query-visible publication unit, and partial source
-/// generations are never visible.
+/// FR-008 / FR-009 / SC-005, `INV-PUBLICATION` / `TEST-PUBLICATION`
+/// (`lifecycle-acceptance-oracles-v11.md::ORACLE-PUBLICATION-WHOLE-ROOT`).
 ///
-/// The traceability contract reserves the name
-/// `whole_project_publication_preserves_latest_siblings` in
-/// `tests/project_index_lifecycle_slice0.rs` for `TEST-PUBLICATION` and owns it
-/// from T017: prepare a delta for source A, publish source B, resume A, and
-/// prove the latest of every sibling survives in exactly one whole-project
-/// root store.
+/// Frozen oracle: pause candidate A at the commit point, publish candidate B as
+/// the new whole-project root, resume A against the latest root, and prove the
+/// latest of every sibling survives in exactly one store. Candidate tokens are
+/// opaque equality capabilities — numeric epochs never authorize publication.
 ///
-/// V10 has no whole-project publication unit. A reload rebuilds the entire
-/// index from a disk snapshot taken outside the write lock
-/// (`src/live_index/store.rs:2385-2395`) and swaps it in wholesale, while the
-/// observer keeps publishing sibling updates into the live index. The swap
-/// therefore replaces the latest sibling generation with whatever the snapshot
-/// happened to contain — a partial publication that reports success.
-///
-/// FR-008 / FR-009 / SC-005, `INV-PUBLICATION` — one whole-project immutable
-/// root is the sole query-visible publication unit, and partial source
-/// generations are never visible.
-///
-/// The traceability contract reserves the name
-/// `whole_project_publication_preserves_latest_siblings` in
-/// `tests/project_index_lifecycle_slice0.rs` for `TEST-PUBLICATION` and owns it
-/// from T017: prepare a delta for source A, publish source B, resume A, and
-/// prove the latest of every sibling survives in exactly one whole-project
-/// root store.
-///
-/// The frozen oracle runs on the dark `IsolatedCandidate` seam first (pause A /
-/// publish B / rebase / tokens / one store). The product gap keeps this RED:
-/// `src/live_index/store.rs` still publishes via wholesale `reload` swap with
-/// zero `IsolatedCandidate` wiring — the query-visible trunk cannot yet be
-/// driven through T017's pause-at-commit hook.
+/// Preflight runs on `candidate.rs::IsolatedCandidate` / `ProjectArtifactRoot`.
+/// Product gap keeps RED until `runtime.rs::ProjectPublicationRoot` backs the
+/// query-visible trunk (T017/T060 activation).
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005 / INV-PUBLICATION. CONTROL-STALE→retargeted-body: frozen oracle on IsolatedCandidate pause-A/publish-B/rebase; still RED until store.rs wires whole-project candidate publication (T017/T060 activation)"]
+#[ignore = "Feature 020 Slice 0 RED control for FR-008/FR-009/SC-005 / INV-PUBLICATION. CONTROL-STALE→retargeted-body: TEST-PUBLICATION pause-A/publish-B/rebase on IsolatedCandidate; still RED until ProjectPublicationRoot wires query-visible publication (T017/T060)"]
 fn whole_project_publication_preserves_latest_siblings() {
     fn content_source(id: u64, rel: &str, token: u64) -> CandidateSource {
         use symforge::domain::index::CatalogPath;
@@ -706,6 +707,13 @@ fn whole_project_publication_preserves_latest_siblings() {
         let supervisor = SourceSupervisor::new();
         let root = ProjectArtifactRoot::empty();
 
+        // ORACLE-PUBLICATION-WHOLE-ROOT precondition: candidate tokens are
+        // opaque — numeric epochs never authorize publication.
+        assert_eq!(
+            root.publish_claiming_epoch_only(1),
+            PromotionRefusal::EpochIsNotAuthority
+        );
+
         // Baseline: sibling sources A and B under one whole-project root.
         let baseline_attempt = supervisor.begin_attempt();
         let baseline = IsolatedCandidate::prepare_full(
@@ -722,7 +730,7 @@ fn whole_project_publication_preserves_latest_siblings() {
         .commit(&root)
         .expect("baseline publishes one whole-project root");
 
-        // Step 1 — prepare source A's delta and hold it (pause A at commit point).
+        // Step 1 — Pause candidate A at T017's final commit point (prepared, held).
         let delta_a_attempt = supervisor.begin_attempt();
         let delta_a = IsolatedCandidate::prepare_delta(
             &pool,
@@ -734,7 +742,7 @@ fn whole_project_publication_preserves_latest_siblings() {
         )
         .expect("capacity headroom exists");
 
-        // Step 2 — publish source B's latest while A remains paused.
+        // Step 2 — Publish candidate B as the new whole-project root while A pauses.
         let delta_b_attempt = supervisor.begin_attempt();
         let with_b_latest = IsolatedCandidate::prepare_delta(
             &pool,
@@ -749,7 +757,7 @@ fn whole_project_publication_preserves_latest_siblings() {
         .expect("source B publishes exactly once");
         let b_latest_before = std::sync::Arc::clone(&with_b_latest.sources[&SourceId(2)]);
 
-        // Step 3 — resume/rebase A against the latest root.
+        // Step 3 — Resume A, rebase against the latest root, commit once on success.
         let patched = delta_a
             .commit(&root)
             .expect("source A rebases on B and commits one whole-project root");
@@ -783,13 +791,15 @@ fn whole_project_publication_preserves_latest_siblings() {
             "precondition: B's publication advanced the root before A resumed"
         );
 
-        // Product seam (INV-PUBLICATION): the LiveIndex reload trunk must adopt
-        // the same candidate commit point — not a wholesale swap race.
+        // Product seam (INV-PUBLICATION): production_seams name
+        // CandidateCommit / ProjectIndexRuntime / ProjectPublicationRoot
+        // (`lifecycle-acceptance-oracles-v11.md`). The candidate preflight above
+        // passes; the LiveIndex reload trunk is not yet wired to those seams.
         let store_src = include_str!("../src/live_index/store.rs");
         assert!(
-            store_src.contains("IsolatedCandidate") || store_src.contains("ProjectPublicationRoot"),
-            "query-visible publication must route through the whole-project \
-             candidate commit point (T017/T060), not LiveIndex::reload wholesale swap"
+            store_src.contains("ProjectPublicationRoot") || store_src.contains("IsolatedCandidate"),
+            "query-visible publication must route through ProjectPublicationRoot \
+             / CandidateCommit (T017/T060), not LiveIndex::reload wholesale swap"
         );
     });
 }
@@ -875,54 +885,65 @@ fn snapshot_seed_is_not_queryable_before_verification() {
     });
 }
 
-/// Design defect 2.5 — capacity controls do not reserve process capacity.
-///
-/// Every load builds its own `InflightByteBudget` whose ceiling is that
-/// candidate's own planned bytes, so the configured limit is enforced per
-/// project rather than per process. Two projects open together each admit up to
-/// the whole ceiling, and the process holds twice what was configured — before
-/// counting a retained generation, a replacement candidate, or a watcher
-/// backlog.
-///
 /// Design defect 2.5 / SC-025 — process capacity is one conserved domain.
 ///
 /// FR-004 makes catalog-entry limits per-candidate; SC-025 owns
-/// `ProcessCapacityPool` as the process-wide budget. `SYMFORGE_MAX_INDEX_FILES`
-/// bounds each discovery pass independently and must not be mistaken for the
-/// process pool.
+/// `ProcessCapacityPool` and `ProcessIndexRuntime` as the process-wide budget
+/// (`ORACLE-CAPACITY-PHYSICAL-OWNERSHIP`, `ORACLE-CAPACITY-RUNTIME-INTEGRATION`
+/// in `lifecycle-acceptance-oracles-v11.md`). `SYMFORGE_MAX_INDEX_FILES` bounds
+/// each discovery pass independently and must not be mistaken for the pool.
 ///
-/// Part A exercises the pool seam directly. Part B asserts daemon opens must
-/// honor the same process-wide refusal — not yet wired from `open_project_session`.
+/// Part A mirrors `tests/process_capacity_pool_v11.rs::capacity_is_conserved_until_physical_drop`.
+/// Part B exercises `process_runtime.rs::ProcessIndexRuntime` surface attach refusal.
+/// Part C asserts daemon opens must honor the same budget — not yet wired.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5 / SC-025. CONTROL-STALE→retargeted-body: asserts ProcessCapacityPool process-wide refusal then daemon integration; still RED until SC-025 wires pool acquisition into open/load"]
+#[ignore = "Feature 020 Slice 0 RED control for design defect 2.5 / SC-025. CONTROL-STALE→retargeted-body: ProcessCapacityPool + ProcessIndexRuntime process-wide refusal then daemon integration; still RED until SC-025 wires pool acquisition into open/load"]
 fn configured_capacity_bounds_the_process_not_each_load() {
     run_daemon_test(async {
         const CEILING: usize = 10;
         const FILE_BYTES: u64 = 64;
+        const PROCESS_BUDGET: u64 = (CEILING as u64) * FILE_BYTES;
 
-        // Part A — SC-025 seam: one conserved process pool refuses the second
-        // acquisition once the shared budget is exhausted.
+        // Part A — ORACLE-CAPACITY-PHYSICAL-OWNERSHIP (mirrors
+        // process_capacity_pool_v11.rs, not duplicated): one process pool
+        // conserves charges until physical drop.
         let pool = std::sync::Arc::new(ProcessCapacityPool::new());
-        let process_owner = pool.root((CEILING as u64) * FILE_BYTES);
-        let first_permit = pool
+        let process_owner = pool.root(PROCESS_BUDGET);
+        let held = pool
             .redeem(
-                pool.reserve(process_owner, (CEILING as u64) * FILE_BYTES - FILE_BYTES)
-                    .expect("first project fits in the process pool"),
+                pool.reserve(process_owner, PROCESS_BUDGET - FILE_BYTES)
+                    .expect("first reservation fits"),
             )
             .expect("redeem first grant");
         assert_eq!(
             pool
                 .reserve(process_owner, FILE_BYTES * 2)
-                .expect_err("second acquisition exceeds the process pool"),
+                .expect_err("second reservation exceeds headroom"),
             CapacityRefusal::Exhausted {
                 requested: FILE_BYTES * 2,
                 available: FILE_BYTES,
-            },
-            "ProcessCapacityPool must refuse a second acquisition against one process budget"
+            }
         );
-        drop(first_permit);
+        drop(held);
+        assert_eq!(pool.charged(process_owner), 0, "physical drop refunds exactly once");
 
-        // Part B — product seam: daemon opens must participate in the same pool.
+        // Part B — ORACLE-CAPACITY-RUNTIME-INTEGRATION seam: surfaces share
+        // one ProcessIndexRuntime budget; a second attach beyond headroom refuses.
+        let runtime = ProcessIndexRuntime::incarnate(PROCESS_BUDGET);
+        runtime
+            .attach(SurfaceKind::Daemon, PROCESS_BUDGET - FILE_BYTES)
+            .expect("first surface fits");
+        assert_eq!(
+            runtime
+                .attach(SurfaceKind::Stdio, FILE_BYTES * 2)
+                .expect_err("second surface exceeds process runtime headroom"),
+            RuntimeRefusal::Capacity(CapacityRefusal::Exhausted {
+                requested: FILE_BYTES * 2,
+                available: FILE_BYTES,
+            })
+        );
+
+        // Part C — product seam: daemon opens must participate in the same pool.
         let first = TempDir::new().expect("project one");
         let second = TempDir::new().expect("project two");
         write_project_files(first.path(), "cap_a", CEILING);
