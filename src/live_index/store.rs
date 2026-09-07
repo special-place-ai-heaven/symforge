@@ -1382,6 +1382,58 @@ pub struct SharedIndexWriteGuard<'a> {
     dirty: bool,
 }
 
+/// Whether `path` was admitted or re-indexed on the live root after
+/// `watermark` was captured at reload candidate-build start.
+fn live_path_changed_since_reload_watermark(
+    watermark: &LiveIndex,
+    file: &IndexedFile,
+    path: &str,
+) -> bool {
+    watermark
+        .files
+        .get(path)
+        .is_none_or(|before| before.content_hash != file.content_hash)
+}
+
+/// Prefer carrying post-watermark live admissions that are absent from the
+/// disk-built candidate; refuse the reload when a post-watermark live mutation
+/// would be overwritten by a stale candidate copy of the same path.
+fn merge_post_watermark_live_admissions(
+    watermark: &LiveIndex,
+    current: &LiveIndex,
+    candidate: &mut LiveIndex,
+) -> anyhow::Result<()> {
+    for (path, file) in &current.files {
+        if !live_path_changed_since_reload_watermark(watermark, file, path) {
+            continue;
+        }
+        if candidate.files.contains_key(path) {
+            if candidate
+                .files
+                .get(path)
+                .is_some_and(|existing| existing.content_hash != file.content_hash)
+            {
+                anyhow::bail!(
+                    "reload refused: live mutation for '{path}' during candidate build \
+                     conflicts with the disk-built candidate"
+                );
+            }
+            continue;
+        }
+        let path_owned = path.clone();
+        let file_clone = (**file).clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            candidate.update_file(path_owned, file_clone);
+        }));
+        if result.is_err() {
+            anyhow::bail!(
+                "reload refused: failed to carry live mutation for '{path}' into candidate"
+            );
+        }
+    }
+    Ok(())
+}
+
 impl SharedIndexHandle {
     pub fn new(index: LiveIndex) -> Self {
         Self::new_with_scout_plan(index, None)
@@ -2481,6 +2533,10 @@ impl SharedIndexHandle {
         project_state_dir: Option<ProjectStateDir>,
         source_exclusions: discovery::SourceExclusions,
     ) -> anyhow::Result<()> {
+        // Watermark the published live root before the out-of-lock candidate
+        // build so observer admissions that land during the window can be
+        // carried into the candidate or fail the reload closed.
+        let watermark_live = self.live.load_full();
         // Build new index data OUTSIDE the write lock (file I/O + parsing).
         // Only the final swap acquires the mutex, reducing block time from
         // seconds (full I/O) to milliseconds (in-memory index rebuild).
@@ -2491,12 +2547,14 @@ impl SharedIndexHandle {
         )?;
         let scout_plan = Arc::clone(&data.scout_plan);
         let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
-        let live = LiveIndex::from_reload_data(data);
+        let mut live = LiveIndex::from_reload_data(data);
         // Deterministic test observation point: the replacement is built but the
         // write lock is not yet held, so the live index remains mutable.
         #[cfg(test)]
         reload_outside_lock::fire();
         let _wg = self.write_mutex.lock();
+        let current_live = self.live.load_full();
+        merge_post_watermark_live_admissions(&watermark_live, &current_live, &mut live)?;
         self.source_exclusions.store(Arc::new(source_exclusions));
         self.scout_plan.store(Some(scout_plan));
         // A latched observer gap outlives a reload. This rebuild proves present
@@ -5770,6 +5828,95 @@ mod tests {
             fs::create_dir_all(p).unwrap();
         }
         fs::write(path, content).unwrap();
+    }
+
+    // ── Reload commit-point carry (P1-04) ───────────────────────────────────
+    mod reload_commit_carry {
+        use super::*;
+
+        fn indexed_file_with_hash(path: &str, body: &[u8], content_hash: &str) -> IndexedFile {
+            let mut file = make_indexed_file_for_mutation(path);
+            file.content = body.to_vec();
+            file.byte_len = body.len() as u64;
+            file.content_hash = content_hash.to_string();
+            file
+        }
+
+        #[test]
+        fn carries_post_watermark_admission_absent_from_candidate() {
+            let tmp = TempDir::new().unwrap();
+            write_file(tmp.path(), "src/base.rs", "fn base() {}\n");
+            let shared = LiveIndex::load(tmp.path()).unwrap();
+            let watermark = shared.read().as_ref().clone();
+            let mut candidate = {
+                let data =
+                    LiveIndex::build_reload_data(tmp.path()).expect("reload data should build");
+                LiveIndex::from_reload_data(data)
+            };
+            assert!(
+                !candidate.files.contains_key("src/watcher_admitted.rs"),
+                "precondition: candidate built from disk must not yet include the watcher file"
+            );
+
+            let mut current = watermark.clone();
+            current.update_file(
+                "src/watcher_admitted.rs".to_string(),
+                indexed_file_with_hash(
+                    "src/watcher_admitted.rs",
+                    b"fn watcher_admitted() {}\n",
+                    "watcher_hash",
+                ),
+            );
+
+            merge_post_watermark_live_admissions(&watermark, &current, &mut candidate)
+                .expect("carry should succeed for an absent post-watermark admission");
+
+            assert!(
+                candidate.get_file("src/watcher_admitted.rs").is_some(),
+                "post-watermark live admission must survive reload commit"
+            );
+        }
+
+        #[test]
+        fn fails_closed_when_candidate_would_overwrite_post_watermark_live_mutation() {
+            let tmp = TempDir::new().unwrap();
+            write_file(tmp.path(), "src/stale.rs", "fn stale_v1() {}\n");
+            let shared = LiveIndex::load(tmp.path()).unwrap();
+            let watermark = shared.read().as_ref().clone();
+            let mut candidate = {
+                let data =
+                    LiveIndex::build_reload_data(tmp.path()).expect("reload data should build");
+                LiveIndex::from_reload_data(data)
+            };
+
+            let mut current = watermark.clone();
+            current.update_file(
+                "src/stale.rs".to_string(),
+                indexed_file_with_hash("src/stale.rs", b"fn stale_v2() {}\n", "hash_v2"),
+            );
+            let candidate_hash = candidate
+                .get_file("src/stale.rs")
+                .expect("precondition: candidate contains stale.rs")
+                .content_hash
+                .clone();
+
+            let error = merge_post_watermark_live_admissions(&watermark, &current, &mut candidate)
+                .expect_err("conflicting post-watermark mutation must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("conflicts with the disk-built candidate"),
+                "unexpected error: {error:#}"
+            );
+            assert_eq!(
+                candidate
+                    .get_file("src/stale.rs")
+                    .expect("candidate file must remain present")
+                    .content_hash,
+                candidate_hash,
+                "candidate must remain unchanged on refusal"
+            );
+        }
     }
 
     // ── Reload path admission tiering (index_folder) ──────────────────────
