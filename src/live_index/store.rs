@@ -5087,6 +5087,16 @@ impl LiveIndex {
         self.local_empty_reason.read().clone()
     }
 
+    /// True when watcher-observed admission must be discarded: a cold-start
+    /// bootstrap placeholder with no bound root and a detached load still
+    /// pending. Explicit protocol mutations (`add_file`, `update_file`, sidecar
+    /// impact) are not gated here.
+    pub(crate) fn refuses_watcher_observed_admission(&self) -> bool {
+        self.load_source == IndexLoadSource::EmptyBootstrap
+            && self.indexed_root.is_none()
+            && self.local_empty_reason().is_none()
+    }
+
     pub fn coupling_store(&self) -> Option<&super::coupling::CouplingStore> {
         self.coupling_store.as_deref()
     }

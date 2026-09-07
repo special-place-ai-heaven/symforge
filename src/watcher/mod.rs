@@ -9,7 +9,7 @@ use notify::{EventKind, RecommendedWatcher as NotifyRecommendedWatcher, Recursiv
 use notify_debouncer_full::{
     DebounceEventResult, DebouncedEvent, Debouncer, NoCache, new_debouncer_opt,
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::domain::{FileDisposition, LanguageId};
 use crate::live_index::store::SharedIndex;
@@ -27,6 +27,48 @@ pub(crate) use crate::live_index::single_file::{
     ReindexOutcome as ReindexResult, admit_and_index_single_path,
     admit_and_index_single_path_with_receipt, maybe_reindex, read_and_index,
 };
+
+fn refuses_observed_admission_into_cold_bootstrap(shared: &SharedIndex) -> bool {
+    shared.read().refuses_watcher_observed_admission()
+}
+
+fn read_and_index_observed<L>(
+    relative_path: &str,
+    abs_path: &Path,
+    shared: &SharedIndex,
+    language: L,
+    expected_gen: u64,
+) -> ReindexResult
+where
+    L: Into<Option<LanguageId>>,
+{
+    if refuses_observed_admission_into_cold_bootstrap(shared) {
+        trace!(
+            "watcher: refusing observed admission into cold bootstrap placeholder: {relative_path}"
+        );
+        return ReindexResult::Skipped;
+    }
+    read_and_index(relative_path, abs_path, shared, language, expected_gen)
+}
+
+fn maybe_reindex_observed<L>(
+    relative_path: &str,
+    abs_path: &Path,
+    shared: &SharedIndex,
+    language: L,
+    expected_gen: u64,
+) -> ReindexResult
+where
+    L: Into<Option<LanguageId>>,
+{
+    if refuses_observed_admission_into_cold_bootstrap(shared) {
+        trace!(
+            "watcher: refusing observed reindex into cold bootstrap placeholder: {relative_path}"
+        );
+        return ReindexResult::Skipped;
+    }
+    maybe_reindex(relative_path, abs_path, shared, language, expected_gen)
+}
 
 /// Tracks event bursts to adaptively extend the debounce window.
 ///
@@ -216,7 +258,7 @@ pub(crate) fn freshen_file_if_stale(
     let language = supported_language(abs_path);
 
     debug!("freshness guard: stale file detected, re-indexing {relative_path}");
-    let result = maybe_reindex(relative_path, abs_path, shared, language, expected_gen);
+    let result = maybe_reindex_observed(relative_path, abs_path, shared, language, expected_gen);
     // V11 observation lane (C4c): observe on the mutation EVIDENCE (the
     // reindex outcome), before the generation re-check — a commit that landed
     // just ahead of a reload must still be observed; a spurious observation
@@ -442,8 +484,13 @@ where
             if should_stop() {
                 return stale_count.into();
             }
-            let outcome =
-                read_and_index(&relative_path, &absolute_path, shared, language, fence_gen);
+            let outcome = read_and_index_observed(
+                &relative_path,
+                &absolute_path,
+                shared,
+                language,
+                fence_gen,
+            );
             if matches!(outcome, ReindexResult::Reindexed)
                 && authority
                     .observe_admission(observer, &relative_path)
@@ -897,7 +944,7 @@ pub(crate) fn process_events(
             // Language inference is a target hint, never a scope filter. Unknown
             // extensions still reach metadata-first admission/cataloging.
             let language = supported_language(&pending.absolute_path);
-            let outcome = read_and_index(
+            let outcome = read_and_index_observed(
                 &pending.relative_path,
                 &pending.absolute_path,
                 shared,

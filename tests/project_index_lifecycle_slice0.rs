@@ -153,7 +153,6 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
 /// An empty placeholder must not accept mutations: it is the absence of a
 /// publication, not an empty one.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defects 2.2/2.3. CODE-WRONG as of the 2026-08-21 Track A read: add_file (live_index/store.rs:2820-2831) has no EmptyBootstrap gate, and the default-suite check at store.rs:6402-6412 papers over it rather than closing it. Keep ignored and fail-closed until a seam owner exists"]
 fn empty_placeholder_publication_refuses_watcher_mutation() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");
