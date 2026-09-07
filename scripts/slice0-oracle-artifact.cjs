@@ -118,6 +118,19 @@ const SUITES = [
       "--exact",
     ],
   },
+  {
+    target: "tests/project_index_lifecycle_slice0.rs::empty_placeholder_publication_refuses_watcher_mutation",
+    expected: "green",
+    args: [
+      "test",
+      "--test",
+      "project_index_lifecycle_slice0",
+      "empty_placeholder_publication_refuses_watcher_mutation",
+      "--",
+      "--exact",
+      "--test-threads=1",
+    ],
+  },
 ];
 
 const NEWLINE = String.fromCharCode(10);
@@ -138,7 +151,6 @@ const MAX_REASON_BYTES = 512;
 const RED_CASES = [
   "capacity_refused_open_creates_no_slot_and_no_watcher",
   "configured_capacity_bounds_the_process_not_each_load",
-  "empty_placeholder_publication_refuses_watcher_mutation",
   "same_path_root_replacement_is_not_silently_adopted",
   "snapshot_seed_is_not_queryable_before_verification",
   "whole_project_publication_preserves_latest_siblings",
@@ -213,6 +225,15 @@ const RESOLVED_CASES = new Map([
       tasks: [],
       defect: "2.7 / 2.9 observer mutation destroyed by the swap while publication reports success",
       fix: "PR #683 carry-or-fail-closed; src/live_index/store.rs::reload_outside_lock_admitted_mutation_survives_swap_or_publish_fails_closed (ordered outside-lock seam)",
+    },
+  ],
+  [
+    "empty_placeholder_publication_refuses_watcher_mutation",
+    {
+      slice: null,
+      tasks: [],
+      defect: "2.2 / 2.3 mutable-empty placeholder; watcher as competing loader",
+      fix: "PR #690 WRITE-OBSERVED refuse at watcher boundary (read_and_index_observed / maybe_reindex_observed via LiveIndex::refuses_watcher_observed_admission); tests/project_index_lifecycle_slice0.rs::empty_placeholder_publication_refuses_watcher_mutation",
     },
   ],
 ]);
