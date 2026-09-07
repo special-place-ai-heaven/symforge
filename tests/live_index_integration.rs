@@ -1200,6 +1200,9 @@ fn test_persist_round_trip() {
     // Convert snapshot back to LiveIndex and wrap in Arc<RwLock>
     let loaded_index = persist::snapshot_to_live_index(snapshot, dir.path());
     let shared_loaded = symforge::live_index::SharedIndexHandle::shared(loaded_index);
+    // Query equivalence covers post-verify semantics; the Pending gate is
+    // exercised separately in `verifying_snapshot_is_not_query_ready`.
+    shared_loaded.mark_snapshot_verify_completed(Vec::new());
     let loaded = shared_loaded.read();
 
     // Verify file count matches

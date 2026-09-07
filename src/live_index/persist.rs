@@ -2490,6 +2490,28 @@ pub async fn background_verify(
     background_verify_with_hook(index, root, snapshot_mtimes, observer, || {}).await;
 }
 
+/// Synchronous test harness for restore paths that skip tokio's
+/// `Handle::try_current()` spawn (unit tests, `bootstrap_project_index` callers).
+#[cfg(test)]
+pub(crate) fn block_on_background_verify_for_test(
+    index: crate::live_index::store::SharedIndex,
+    root: &Path,
+    snapshot_mtimes: HashMap<String, u64>,
+) {
+    let observer = crate::live_index::index_lifecycle::activation::project_source_authority(root)
+        .active_observer();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("background_verify test runtime")
+        .block_on(background_verify(
+            index,
+            root.to_path_buf(),
+            snapshot_mtimes,
+            observer,
+        ));
+}
+
 /// `Some(true)` — the path was actually removed (publish it, observe it).
 /// `Some(false)` — nothing held the path; already reconciled, no removal to
 /// observe or publish. `None` — a fence rejected the removal; abort the pass.
@@ -3294,6 +3316,10 @@ mod tests {
         assert!(
             !shared.read().is_ready(),
             "an unverified snapshot candidate must not be query-ready"
+        );
+        assert!(
+            shared.read().get_file("src/main.rs").is_none(),
+            "an unverified snapshot seed must not answer get_file"
         );
         assert_ne!(
             shared.published_state().status,
@@ -4380,7 +4406,10 @@ mod tests {
         );
 
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let after = snapshot_to_live_index(snapshot, tmp.path());
+        let mut after = snapshot_to_live_index(snapshot, tmp.path());
+        // Query equivalence covers post-verify semantics; the Pending gate is
+        // exercised separately in `verifying_snapshot_is_not_query_ready`.
+        after.mark_snapshot_verify_completed(Vec::new());
 
         // ── Query equivalence ────────────────────────────────────────────────
 
