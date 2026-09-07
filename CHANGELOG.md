@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.1.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.4...v11.1.5) (2026-09-07)
+
+
+### Bug Fixes
+
+* **lifecycle:** rebind admission identity on same-path physical replacement (B1 / Seam 5) ([#694](https://github.com/special-place-ai-heaven/symforge/issues/694)) ([65a866d](https://github.com/special-place-ai-heaven/symforge/commit/65a866d7289b0778531e1df34e125081b7347978))
+* **lifecycle:** refuse get_file while snapshot verify is pending (Seam 4 + B4) ([#693](https://github.com/special-place-ai-heaven/symforge/issues/693)) ([982bf41](https://github.com/special-place-ai-heaven/symforge/commit/982bf41e82cc9cac6786c33709f3a5f033d9360f))
+
 ## [11.1.4](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.3...v11.1.4) (2026-09-07)
 
 
