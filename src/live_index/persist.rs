@@ -3295,6 +3295,10 @@ mod tests {
             !shared.read().is_ready(),
             "an unverified snapshot candidate must not be query-ready"
         );
+        assert!(
+            shared.read().get_file("src/main.rs").is_none(),
+            "an unverified snapshot seed must not answer get_file"
+        );
         assert_ne!(
             shared.published_state().status,
             crate::live_index::store::PublishedIndexStatus::Ready

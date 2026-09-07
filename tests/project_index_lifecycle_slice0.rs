@@ -857,7 +857,6 @@ fn whole_project_publication_preserves_latest_siblings() {
 /// A snapshot is a seed, not a publication: nothing from it may answer a query
 /// before its identity and completeness are re-proved.
 #[test]
-#[ignore = "Feature 020 Slice 0 RED control for design defect 2.11. CODE-WRONG as of the 2026-08-21 Track A read: persist hydrates files immediately, get_file has no Pending gate, and is_ready() is status-only. The SnapshotStore per-entry verify-state wiring remains a recorded open residual. Keep ignored and fail-closed until a seam owner exists"]
 fn snapshot_seed_is_not_queryable_before_verification() {
     run_daemon_test(async {
         let project = TempDir::new().expect("project dir");

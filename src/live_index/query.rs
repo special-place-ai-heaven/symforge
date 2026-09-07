@@ -34,7 +34,7 @@ pub use super::health_view::{
     EXPECTED_VENDOR_PARTIAL_PARSE_REASON, HealthStats,
 };
 use super::search::{NoiseClass, NoisePolicy, PathScope};
-use super::store::{IndexedFile, LiveIndex};
+use super::store::{IndexLoadSource, IndexedFile, LiveIndex, SnapshotVerifyState};
 
 // ---------------------------------------------------------------------------
 // Module path resolution for find_dependents
@@ -1217,7 +1217,19 @@ fn path_within_indexed_root(relative_path: &str, root: &std::path::Path) -> bool
 
 impl LiveIndex {
     /// O(1) lookup of a file by its relative path.
+    ///
+    /// A snapshot-restored seed stays invisible until
+    /// [`SnapshotVerifyState`] reaches `Completed` — the same gate
+    /// [`super::health_view::LiveIndex::index_state`] uses for `Loading`.
     pub fn get_file(&self, relative_path: &str) -> Option<&IndexedFile> {
+        if self.load_source == IndexLoadSource::SnapshotRestore
+            && matches!(
+                self.snapshot_verify_state,
+                SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+            )
+        {
+            return None;
+        }
         self.files.get(relative_path).map(|file| file.as_ref())
     }
 
