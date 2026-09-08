@@ -22,9 +22,9 @@
 //! quarantine metadata, receipts, or diagnostics, and the FR-051 four-state
 //! disclosure with no inferred shareability — are exact.
 //!
-//! **Nothing in production calls this module.** Only the Slice 4 oracle
-//! suites and this directory do; activation (T064/T066) is the only planned
-//! production caller.
+//! **Production caller:** `src/live_index/persist.rs` wires per-entry restore
+//! proof during `snapshot_to_live_index*`. Oracle suites in this directory
+//! exercise the same semantics with injected closures.
 
 use std::collections::BTreeMap;
 

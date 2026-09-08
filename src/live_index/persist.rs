@@ -3,7 +3,7 @@
 /// Uses postcard (compact binary) for fast round-trips.
 /// Atomic write (tmp → rename) to prevent corruption on crash.
 /// Background verification corrects stale entries after loading a snapshot.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -17,6 +17,9 @@ use crate::domain::{
     HistoryLimit, LanguageId, ManifestResourceUsage, ProjectId, ProjectStateDir, ReferenceRecord,
     RepositoryFingerprint, RepositoryId, RepositoryManifest, SnapshotSourceIdentity, SourceId,
     SourceIdentity, SourceLocation, SourceVersion, StatePlacement, SymbolRecord, WorkingTreeState,
+};
+use crate::index_lifecycle::snapshot::{
+    RestoreOutcome, SnapshotRefusal, SnapshotSeed, SnapshotStore, seed_digest,
 };
 use crate::live_index::store::{
     CircuitBreakerState, CodeSignalsSnapshot, IndexLoadSource, IndexedFile, LiveIndex, ParseStatus,
@@ -2049,6 +2052,231 @@ pub fn snapshot_compatible(project_root: &Path) -> bool {
     load_snapshot_for_root(project_root).is_some()
 }
 
+fn snapshot_entry_source_id(path: &str) -> u64 {
+    path.as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| {
+            acc.wrapping_mul(0x0100_0000_01b3)
+                .wrapping_add(u64::from(*byte))
+        })
+}
+
+fn snapshot_entry_stamp(content_hash: &str) -> u64 {
+    content_hash
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| {
+            acc.wrapping_mul(0x0100_0000_01b3)
+                .wrapping_add(u64::from(*byte))
+        })
+}
+
+/// Resolve the raw snapshot wire bytes used for restore proof.
+///
+/// Prefer the live `index.bin`; when absent (team-artifact warm start with only
+/// `.symforge/index.bin.zst`), fall back to the verified artifact payload so
+/// capacity and declared_len reflect honest wire rather than a fake promote.
+fn resolve_snapshot_restore_wire(project_root: &Path) -> Option<Vec<u8>> {
+    let placement = project_local_state_placement(project_root).ok()?;
+    let (state_dir, _) = resolved_snapshot_state(project_root, &placement).ok()?;
+    let path = state_dir.as_path().join(INDEX_FILENAME);
+    if let Ok(bytes) = std::fs::read(&path) {
+        return Some(bytes);
+    }
+    let verified = read_verified_artifact(project_root)?;
+    decompress_artifact_bytes(&verified.compressed).ok()
+}
+
+fn snapshot_restore_wire_declared_len(wire_bytes: Option<&[u8]>) -> u64 {
+    wire_bytes.map(|bytes| bytes.len() as u64).unwrap_or(0)
+}
+
+fn build_snapshot_seed_from_index(
+    snapshot: &IndexSnapshot,
+    declared_len: u64,
+) -> (SnapshotSeed, BTreeMap<u64, String>) {
+    let mut paths: Vec<&String> = snapshot.files.keys().collect();
+    paths.sort();
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut source_to_path = BTreeMap::new();
+    for path in paths {
+        let file = &snapshot.files[path.as_str()];
+        let source = snapshot_entry_source_id(path);
+        let stamp = snapshot_entry_stamp(&file.content_hash);
+        source_to_path.insert(source, path.clone());
+        entries.push((source, stamp));
+    }
+    let seed = SnapshotSeed {
+        version: snapshot.version,
+        declared_len,
+        root_digest: seed_digest(&entries),
+        entries,
+        opaque_note: Vec::new(),
+    };
+    (seed, source_to_path)
+}
+
+fn try_quarantine_snapshot_restore_wire(
+    project_root: &Path,
+    wire_bytes: &[u8],
+    reason: &str,
+    detail: String,
+) {
+    let Ok(placement) = project_local_state_placement(project_root) else {
+        return;
+    };
+    let Ok((state_dir, _)) = resolved_snapshot_state(project_root, &placement) else {
+        return;
+    };
+    let index_path = state_dir.as_path().join(INDEX_FILENAME);
+    if index_path.exists() {
+        try_quarantine_bad_snapshot(state_dir, &index_path, wire_bytes, reason, detail.clone());
+        return;
+    }
+    if let Some(VerifiedArtifact {
+        artifact_path,
+        metadata_path,
+        compressed,
+        ..
+    }) = read_verified_artifact(project_root)
+    {
+        try_quarantine_bad_artifact(
+            project_root,
+            &artifact_path,
+            &metadata_path,
+            &compressed,
+            reason,
+            detail,
+        );
+    }
+}
+
+fn snapshot_restore_decode_capacity(snapshot: &IndexSnapshot, wire_len: u64) -> u64 {
+    let usage = &snapshot.manifest.usage;
+    wire_len
+        .saturating_add(usage.catalog_metadata_bytes)
+        .saturating_add(snapshot.files.len() as u64 * 16)
+        .max(wire_len)
+}
+
+fn prove_snapshot_entry_on_disk(
+    project_root: &Path,
+    source_to_path: &BTreeMap<u64, String>,
+    files: &HashMap<String, IndexedFileSnapshot>,
+    source: u64,
+    stamp: u64,
+) -> bool {
+    let Some(path) = source_to_path.get(&source) else {
+        return false;
+    };
+    let Some(file) = files.get(path.as_str()) else {
+        return false;
+    };
+    if snapshot_entry_stamp(&file.content_hash) != stamp {
+        return false;
+    }
+    let abs_path = project_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let Ok(bytes) = std::fs::read(&abs_path) else {
+        return false;
+    };
+    crate::hash::digest_hex(&bytes) == file.content_hash
+}
+
+/// Per-entry restore proof via [`SnapshotStore`]. Aggregate
+/// [`SnapshotVerifyState`] on the returned [`LiveIndex`] stays
+/// `Pending`→`Running`→`Completed`; this struct carries only the store
+/// outcome and rebuild latch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotRestoreProof {
+    pub outcome: Result<RestoreOutcome, SnapshotRefusal>,
+    pub rebuild_required: bool,
+}
+
+fn run_snapshot_store_restore_proof(
+    snapshot: &IndexSnapshot,
+    project_root: &Path,
+    wire_bytes: Option<&[u8]>,
+) -> SnapshotRestoreProof {
+    let owned_wire_bytes;
+    let wire_bytes = match wire_bytes {
+        Some(bytes) => Some(bytes),
+        None => {
+            owned_wire_bytes = resolve_snapshot_restore_wire(project_root);
+            owned_wire_bytes.as_deref()
+        }
+    };
+
+    if let Err(error) = verify_snapshot_source_identity(snapshot, project_root) {
+        warn!(
+            detail = %error,
+            "snapshot restore proof refused: source identity or indexed content integrity mismatch"
+        );
+        if let Some(wire_bytes) = wire_bytes {
+            try_quarantine_snapshot_restore_wire(
+                project_root,
+                wire_bytes,
+                "snapshot-store-integrity",
+                error.to_string(),
+            );
+        }
+        let unproven = snapshot.files.len();
+        return SnapshotRestoreProof {
+            outcome: Ok(RestoreOutcome::SeedRejected { unproven }),
+            rebuild_required: unproven > 0,
+        };
+    }
+
+    let declared_len = snapshot_restore_wire_declared_len(wire_bytes);
+    let (seed, source_to_path) = build_snapshot_seed_from_index(snapshot, declared_len);
+    let limit = snapshot_restore_decode_capacity(snapshot, declared_len);
+    let files = &snapshot.files;
+    let root = project_root.to_path_buf();
+    let mut store = SnapshotStore::new();
+    let outcome = store.restore(
+        seed,
+        limit,
+        |entry| *entry,
+        |source, stamp| prove_snapshot_entry_on_disk(&root, &source_to_path, files, source, stamp),
+    );
+    let rebuild_required = store.rebuild_required() || outcome.is_err();
+    for line in store.diagnostics() {
+        info!("snapshot restore proof: {line}");
+    }
+    if let Ok(RestoreOutcome::Quarantined { id }) = &outcome {
+        warn!(
+            quarantine_id = id,
+            "snapshot restore proof quarantined seed integrity failure"
+        );
+        if let Some(wire_bytes) = wire_bytes {
+            try_quarantine_snapshot_restore_wire(
+                project_root,
+                wire_bytes,
+                "snapshot-store-digest-mismatch",
+                format!("SnapshotStore quarantine id {id}"),
+            );
+        }
+    } else if rebuild_required {
+        warn!(
+            outcome = ?outcome,
+            promoted_sources = store.current().len(),
+            "snapshot restore proof latched rebuild fallback; hydrated seed kept for background_verify"
+        );
+    }
+    SnapshotRestoreProof {
+        outcome,
+        rebuild_required,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_store_restore_proof_for_test(
+    snapshot: &IndexSnapshot,
+    project_root: &Path,
+    wire_bytes: Option<&[u8]>,
+) -> SnapshotRestoreProof {
+    run_snapshot_store_restore_proof(snapshot, project_root, wire_bytes)
+}
+
 /// Rehydrate a `LiveIndex` from a persisted snapshot.
 ///
 /// `project_root` is the filesystem root the snapshot was taken from; it is
@@ -2064,6 +2292,24 @@ pub fn snapshot_to_live_index_with_code_signals(
     snapshot: IndexSnapshot,
     project_root: &Path,
 ) -> (LiveIndex, CodeSignalsSnapshot) {
+    let proof = run_snapshot_store_restore_proof(&snapshot, project_root, None);
+    if proof.rebuild_required {
+        debug_assert!(
+            matches!(
+                proof.outcome,
+                Ok(RestoreOutcome::SeedRejected { .. })
+                    | Ok(RestoreOutcome::Quarantined { .. })
+                    | Err(_)
+            ),
+            "rebuild_required must accompany a rejected, quarantined, or refused restore"
+        );
+    } else if let Ok(RestoreOutcome::Promoted { sources }) = &proof.outcome {
+        debug_assert!(
+            sources > &0 || snapshot.files.is_empty(),
+            "Promoted restore must prove every entry via SnapshotStore"
+        );
+    }
+
     let IndexSnapshot {
         files: snapshot_files,
         manifest,
@@ -3296,6 +3542,148 @@ mod tests {
 
         assert_eq!(loaded.load_source(), IndexLoadSource::SnapshotRestore);
         assert_eq!(loaded.snapshot_verify_state(), SnapshotVerifyState::Pending);
+    }
+
+    #[test]
+    fn snapshot_store_restore_promotes_when_disk_matches() {
+        use crate::index_lifecycle::snapshot::RestoreOutcome;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        serialize_index(&index, tmp.path()).expect("serialize");
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot");
+        let wire = std::fs::read(tmp.path().join(".symforge/index.bin")).unwrap();
+
+        let proof = snapshot_store_restore_proof_for_test(&snapshot, tmp.path(), Some(&wire));
+        assert_eq!(proof.outcome, Ok(RestoreOutcome::Promoted { sources: 1 }));
+        assert!(!proof.rebuild_required);
+    }
+
+    #[test]
+    fn snapshot_store_restore_latches_rebuild_when_disk_differs_but_hydrates() {
+        use crate::index_lifecycle::snapshot::RestoreOutcome;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        serialize_index(&index, tmp.path()).expect("serialize");
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot");
+        let wire = std::fs::read(tmp.path().join(".symforge/index.bin")).unwrap();
+
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() { 99 }\n").unwrap();
+
+        let proof = snapshot_store_restore_proof_for_test(&snapshot, tmp.path(), Some(&wire));
+        assert_eq!(
+            proof.outcome,
+            Ok(RestoreOutcome::SeedRejected { unproven: 1 })
+        );
+        assert!(proof.rebuild_required);
+
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
+        assert_eq!(
+            loaded.files.len(),
+            1,
+            "hydrated map kept for background_verify"
+        );
+        assert_eq!(
+            loaded.snapshot_verify_state(),
+            SnapshotVerifyState::Pending,
+            "aggregate verify state stays Pending until background_verify"
+        );
+        assert!(
+            loaded.files.contains_key("src/main.rs"),
+            "background_verify must see snapshot bytes in the hydrated map"
+        );
+    }
+
+    #[test]
+    fn snapshot_store_restore_proves_team_artifact_without_index_bin() {
+        use crate::index_lifecycle::snapshot::RestoreOutcome;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        export_artifact_legacy(&index, tmp.path()).expect("export artifact");
+        let index_bin = tmp.path().join(".symforge/index.bin");
+        if index_bin.exists() {
+            std::fs::remove_file(&index_bin).expect("remove index.bin for team-artifact warm start");
+        }
+        assert!(
+            tmp.path().join(".symforge/index.bin.zst").exists(),
+            "team artifact must exist without index.bin"
+        );
+
+        let snapshot = load_snapshot(tmp.path()).expect("import team artifact");
+        let proof = snapshot_store_restore_proof_for_test(&snapshot, tmp.path(), None);
+        assert_eq!(
+            proof.outcome,
+            Ok(RestoreOutcome::Promoted { sources: 1 }),
+            "Promoted requires SnapshotStore prove, not a missing-wire shortcut"
+        );
+        assert!(
+            !proof.rebuild_required,
+            "all-proven team-artifact warm start must not latch rebuild"
+        );
+    }
+
+    #[test]
+    fn snapshot_store_restore_rejects_source_identity_without_store_quarantine() {
+        use crate::index_lifecycle::snapshot::RestoreOutcome;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        serialize_index(&index, tmp.path()).expect("serialize");
+        let mut snapshot = load_snapshot(tmp.path()).expect("snapshot");
+        let wire = std::fs::read(tmp.path().join(".symforge/index.bin")).unwrap();
+        snapshot.source_identity.indexed_content_digest = "deadbeef".to_string();
+
+        let proof = snapshot_store_restore_proof_for_test(&snapshot, tmp.path(), Some(&wire));
+        assert_eq!(
+            proof.outcome,
+            Ok(RestoreOutcome::SeedRejected { unproven: 1 }),
+            "source identity mismatch must reject the seed, not costume-quarantine id 0"
+        );
+        assert!(proof.rebuild_required);
+    }
+
+    #[test]
+    fn snapshot_store_restore_quarantines_seed_digest_mismatch() {
+        use crate::index_lifecycle::snapshot::{RestoreOutcome, SnapshotStore};
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        serialize_index(&index, tmp.path()).expect("serialize");
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot");
+        let wire = std::fs::read(tmp.path().join(".symforge/index.bin")).unwrap();
+        let (mut seed, source_to_path) =
+            super::build_snapshot_seed_from_index(&snapshot, wire.len() as u64);
+        seed.root_digest ^= 1;
+        let limit = super::snapshot_restore_decode_capacity(&snapshot, wire.len() as u64);
+        let files = &snapshot.files;
+        let root = tmp.path().to_path_buf();
+        let mut store = SnapshotStore::new();
+        let outcome = store.restore(
+            seed,
+            limit,
+            |entry| *entry,
+            |source, stamp| {
+                super::prove_snapshot_entry_on_disk(&root, &source_to_path, files, source, stamp)
+            },
+        );
+        assert!(
+            matches!(outcome, Ok(RestoreOutcome::Quarantined { id: 0 })),
+            "digest mismatch must quarantine inside SnapshotStore, got {outcome:?}"
+        );
+        assert!(store.rebuild_required());
+        assert!(store.quarantine_metadata().iter().any(|meta| meta.id == 0));
     }
 
     #[test]
