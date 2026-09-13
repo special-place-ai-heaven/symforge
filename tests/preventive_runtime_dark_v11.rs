@@ -1002,16 +1002,20 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "server_api.rs",
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
+// Baseline refreshed 2026-09-13 after re-reviewing the complete src diff:
+// the stable Windows physical-root anchor rewrite (physical_root.rs only).
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "7a13192e8445721a5c0bc56d1416ea73793e3019137ba27a20624cce8f1e5e05",
+    "57bb2b2ad22b3cccde546805f99412807094b3ce1d3b146a23a118e05ebec39f",
     20,
-    408_158,
+    414_282,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
+// Baseline refreshed 2026-09-13 after re-reviewing the complete src diff:
+// the stable Windows physical-root anchor rewrite (physical_root.rs only).
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "35f69fc9ee63d6c050e66f82cb9673332b656cb9330abe7a22d6592a39c2a6d6",
+    "72e24c50192d955b02e588c0dd6f1e2e17f9e801e39cbc12f3b8980df945bd33",
     197,
-    9_528_221,
+    9_534_345,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1142,7 +1146,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "26d8df149f93dc45:14056"),
+    ("ci.yml", "d0c0a0b131f60fa4:15636"),
     ("release.yml", "60715201b01e0b43:112609"),
 ];
 
@@ -1157,6 +1161,17 @@ const CARGO_CONFIG: &str = "\
 # the checkout lived there, which went stale when it moved.
 [build]
 target-dir = \"target\"
+
+# Test runs must not touch the user's real control-state home
+# (`~/.symforge`): live daemons write session descriptors there, and test
+# processes that resolve it race with them (hook-discovery timeouts under
+# parallel runners; see .config/nextest.toml). This points every
+# cargo-spawned process — test binaries and the symforge children they spawn
+# — at a workspace-private home instead. Stale descriptors from earlier runs
+# are handled: liveness is checked before use. Removed by `cargo clean`;
+# recreated on demand.
+[env]
+SYMFORGE_HOME = { value = \"target/symforge-test-home\", relative = true }
 ";
 
 /// Every line of every CI workflow that mentions cargo OR rustdoc,
@@ -1227,7 +1242,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("run: cargo check", 1),
-    ("run: cargo clippy --all-targets -- -D warnings", 1),
+    ("run: cargo clippy --all-targets -- -D warnings", 2),
     (
         "run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings",
         1,
@@ -1236,7 +1251,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "run: cargo clippy --no-default-features --features embed,__test-internals --target x86_64-unknown-linux-musl --lib -- -D warnings",
         1,
     ),
-    ("run: cargo fmt --check", 1),
+    ("run: cargo fmt --check", 2),
     // The seven test gates, five distinct — two run in both workflows.
     // Each carries a doctest-excluding target selector before its bare
     // `--`, which is why the doctest lane stays shut; drop one and the
@@ -1269,13 +1284,20 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("run: cargo test --test serve_port -- --test-threads=1", 1),
+    // Windows-native job. No test harness: nextest never builds or runs
+    // doctests, the install line is a binary fetch, and the fmt/clippy
+    // gates cannot reach the doctest lane.
+    ("- name: Install cargo-nextest", 1),
+    ("run: cargo install cargo-nextest --locked", 1),
+    ("run: cargo check --no-default-features --features embed", 1),
+    ("run: cargo nextest run --no-fail-fast", 1),
 ];
 
 /// Exact ignore rules that justify the two source-tree skips below. This is a
 /// readable basis, not a Gitignore parser. The whole-file fingerprint catches
 /// a later negation or other semantic drift elsewhere in the file.
 const CARGO_CONFIG_SKIP_GITIGNORE_LINES: &[&str] = &["/target", "node_modules/"];
-const GITIGNORE_FINGERPRINT: &str = "b5011af9576da616:1186";
+const GITIGNORE_FINGERPRINT: &str = "9683e3a684f4a11e:1492";
 const PRODUCTION_TARGET_TOPOLOGY: &[(&str, &str)] =
     &[("lib", "src/lib.rs"), ("bin:symforge", "src/main.rs")];
 
@@ -2123,8 +2145,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (32, 27, 2),
-        "the CI workflows hold thirty-two cargo-mentioning lines, twenty-seven \
+        (38, 31, 2),
+        "the CI workflows hold thirty-eight cargo-mentioning lines, thirty-one \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

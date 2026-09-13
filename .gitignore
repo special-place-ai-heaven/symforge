@@ -9,6 +9,14 @@
 !/.cargo/config.toml
 !/.github/
 
+# Nextest profile: process-per-test isolation, bounded retry, and
+# machine-exclusive overrides for the spawn/budget binaries (see the file
+# header). Tracked so CI runners run the same profile this repo is verified
+# with; other state in .config stays local.
+!/.config/
+/.config/*
+!/.config/nextest.toml
+
 # Cursor plugin manifest (marketplace / Grok Bot). Root `/.*/` would
 # otherwise ignore this directory and the logo would never reach GitHub.
 !/.cursor-plugin/

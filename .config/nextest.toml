@@ -1,0 +1,63 @@
+# Windows-native test isolation profile. Platform-neutral: the same profile
+# applies on Linux and macOS.
+#
+# Nextest gives every test its own process, so each gets a private
+# environment block — this removes the shared-process `std::env` mutation
+# races (surface-selection flip-flops, intermittent child spawn `NotFound`)
+# that make parallel `cargo test` runs flaky here.
+#
+# Prerequisite for green runs on this machine: test processes must not touch
+# the user's real control-state home. `.cargo/config.toml` pins
+# `SYMFORGE_HOME` to a workspace-private directory for everything cargo
+# spawns, so plain `cargo nextest run` needs no extra environment. Live
+# foreign daemons keep writing descriptors into the real `~/.symforge`;
+# without the pin, hook-discovery tests find them and burn their wall-clock
+# budgets.
+#
+# Loopback-HTTP tests (in-process axum/TcpListener servers) intermittently
+# see Windows reset their connection (os error 10054) when dozens of test
+# processes churn at once; Unix queues those connections instead. Eight
+# concurrent test processes stays clear of it while keeping the full suite
+# near four minutes. The budgeted binaries below run machine-exclusive
+# regardless, so the cap does not gate them.
+
+[profile.default]
+test-threads = 8
+
+# One bounded retry, reported: nextest marks every test that needed it as
+# flaky in the output, so the signal is never lost. What it absorbs is the
+# Windows loopback-reset dice (os error 10054) that hits whichever of the
+# ~40 loopback-HTTP tests is mid-request when process churn stalls an
+# accept loop — a reset at the TCP layer before any application bytes, on
+# an idempotent GET, against a server owned by the same test. A real
+# regression fails both attempts and stays red.
+retries = 1
+
+# Spawn-heavy binaries hold wall-clock budgets around child spawn plus HTTP
+# round-trips. Under full parallelism those budgets trip purely from machine
+# contention — reproduced: hook_subprocess_integration alone at default
+# parallelism fails its 10s deadlines, at `-j 2` the same 18 tests pass in
+# 1.9s — so these run with the whole machine to themselves.
+
+[[profile.default.overrides]]
+filter = "binary(hook_subprocess_integration)"
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = "binary(sidecar_integration)"
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = "binary(api_keys_store)"
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = "binary(hook_enrichment_integration)"
+threads-required = "num-cpus"
+
+# hook_root_guard serves loopback HTTP per test (same 10054 class as
+# hook_enrichment_integration: two different tests of this binary have
+# flaked under full parallelism, both green serialized).
+[[profile.default.overrides]]
+filter = "binary(hook_root_guard)"
+threads-required = "num-cpus"
