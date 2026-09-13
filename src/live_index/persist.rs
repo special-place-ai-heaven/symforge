@@ -3610,7 +3610,8 @@ mod tests {
         export_artifact_legacy(&index, tmp.path()).expect("export artifact");
         let index_bin = tmp.path().join(".symforge/index.bin");
         if index_bin.exists() {
-            std::fs::remove_file(&index_bin).expect("remove index.bin for team-artifact warm start");
+            std::fs::remove_file(&index_bin)
+                .expect("remove index.bin for team-artifact warm start");
         }
         assert!(
             tmp.path().join(".symforge/index.bin.zst").exists(),
