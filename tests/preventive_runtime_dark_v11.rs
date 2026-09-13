@@ -1003,19 +1003,20 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
 // Baseline refreshed 2026-09-13 after re-reviewing the complete src diff:
-// the stable Windows physical-root anchor rewrite (physical_root.rs only).
+// the embed handle now binds a lifecycle-admitted SharedIndex, owns its
+// metadata observer worker, serves claims, and joins on close/runtime drop.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "57bb2b2ad22b3cccde546805f99412807094b3ce1d3b146a23a118e05ebec39f",
+    "ee28574e46d25965f668d070686be1e036e7e07b19ae6467fffc1441731b5ec4",
     20,
-    414_282,
+    439_760,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-13 after re-reviewing the complete src diff:
-// the stable Windows physical-root anchor rewrite (physical_root.rs only).
+// the embed handle activation described on the excluded-source pin above.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "72e24c50192d955b02e588c0dd6f1e2e17f9e801e39cbc12f3b8980df945bd33",
+    "28ef5eb7e464ca8d3244f11ab72740357ef41d7e1b32bea5e89d324ba796bb4d",
     197,
-    9_534_345,
+    9_559_823,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

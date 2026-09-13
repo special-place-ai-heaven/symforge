@@ -998,7 +998,8 @@ mod dark_runtime_oracles {
         // open_embedded_source: sole-handle admission is the accepting case;
         // a second open of the held source refuses as SelectionUnavailable —
         // the selection exists but is unavailable until its holder closes.
-        let root = std::path::PathBuf::from("dark-open-root");
+        let root = tempfile::tempdir().expect("temporary embedded root");
+        let root = root.path().to_path_buf();
         let held = runtime
             .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.clone()))
             .expect("the first open of a source admits");
