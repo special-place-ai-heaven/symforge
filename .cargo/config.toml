@@ -3,3 +3,14 @@
 # the checkout lived there, which went stale when it moved.
 [build]
 target-dir = "target"
+
+# Test runs must not touch the user's real control-state home
+# (`~/.symforge`): live daemons write session descriptors there, and test
+# processes that resolve it race with them (hook-discovery timeouts under
+# parallel runners; see .config/nextest.toml). This points every
+# cargo-spawned process — test binaries and the symforge children they spawn
+# — at a workspace-private home instead. Stale descriptors from earlier runs
+# are handled: liveness is checked before use. Removed by `cargo clean`;
+# recreated on demand.
+[env]
+SYMFORGE_HOME = { value = "target/symforge-test-home", relative = true }

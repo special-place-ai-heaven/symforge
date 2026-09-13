@@ -1,16 +1,10 @@
-//! Internal embedded registration and sole-handle ownership (T037).
+//! Embedded registration, sole-handle ownership, and engine-only source workers.
 //!
-//! **Production-unreachable.** Nothing in `src/` calls this module; the V10
-//! public embed lane in `crate::embed` is untouched and keeps its own semantics.
-//! "Unreachable" here means exactly that there is no production call path, which
-//! is checkable by grep and is what the spec's own Slice 2 test asserts — not a
-//! visibility trick. The types are `pub` because the contract-pinned oracles live
-//! in `tests/`, which is an external crate.
-//!
-//! **Spawns nothing.** The public embed contract promises no implicit background
-//! machinery, and `live_index` is not feature-gated, so this module compiles into
-//! an embedder's binary. A finalizer here is a value that runs on the closing
-//! thread, never a thread this module started.
+//! The embed feature deliberately excludes the server's notify-based watcher. An
+//! embedded source therefore owns a small metadata-scouting worker which builds and
+//! refreshes the same [`crate::live_index::store::SharedIndex`] used by the other
+//! surfaces. The worker enters through the process admission/runtime seams and is
+//! joined synchronously when its source or owning process runtime closes.
 //!
 //! The ownership rule is *sole handle*: one open source has exactly one handle,
 //! and that handle is the only thing that can close it. Two handles to one source
@@ -18,10 +12,16 @@
 //! the shape where a caller reads from something already torn down.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar};
+use std::time::Duration;
 
 use super::registry::ProjectKey;
+use crate::domain::{FreshnessStatus, RootBinding, StatePlacement};
+
+const EMBED_OBSERVER_POLL: Duration = Duration::from_millis(200);
+const REFRESHING_VISIBILITY_WINDOW: Duration = Duration::from_millis(25);
 
 /// Identity of one embedded open. Never reused, including across reopen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,8 +111,337 @@ thread_local! {
 /// one handle" enforceable rather than advisory.
 #[derive(Debug, Default)]
 pub struct EmbeddedSourceFactory {
-    open: std::sync::Mutex<HashMap<ProjectKey, EmbeddedIdentity>>,
+    open: std::sync::Mutex<HashMap<ProjectKey, OpenEmbeddedSource>>,
     shutdown: AtomicBool,
+}
+
+#[derive(Debug)]
+struct OpenEmbeddedSource {
+    identity: EmbeddedIdentity,
+    binding: Option<Arc<EmbeddedBinding>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum EmbeddedOpenError {
+    SourceAlreadyOpen,
+    AdmissionUnavailable,
+    WorkerUnavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EmbeddedShutdownReport {
+    pub closed_sources: u64,
+    pub joined_workers: u64,
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddedRuntimeState {
+    phase: super::public_api::SourceRuntimePhase,
+    current_publication_identity: Option<String>,
+    observer_epoch: u64,
+    source_version: u64,
+}
+
+#[derive(Debug, Default)]
+struct WorkerControl {
+    stop: bool,
+    refresh_requested: bool,
+}
+
+struct EmbeddedBinding {
+    identity: EmbeddedIdentity,
+    key: ProjectKey,
+    root: PathBuf,
+    state_placement: StatePlacement,
+    runtime: super::activation::ProjectRuntimeHandle,
+    state: std::sync::Mutex<EmbeddedRuntimeState>,
+    control: std::sync::Mutex<WorkerControl>,
+    wake: Condvar,
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    shutdown_started: AtomicBool,
+}
+
+impl std::fmt::Debug for EmbeddedBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedBinding")
+            .field("identity", &self.identity)
+            .field("root", &self.root)
+            .field("state", &self.state.lock().expect("embedded state mutex"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddedBinding {
+    fn new(
+        identity: EmbeddedIdentity,
+        key: ProjectKey,
+        root: PathBuf,
+        state_placement: StatePlacement,
+        runtime: super::activation::ProjectRuntimeHandle,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            identity,
+            key,
+            root,
+            state_placement,
+            runtime,
+            state: std::sync::Mutex::new(EmbeddedRuntimeState {
+                phase: super::public_api::SourceRuntimePhase::Loading,
+                current_publication_identity: None,
+                observer_epoch: 0,
+                source_version: 0,
+            }),
+            control: std::sync::Mutex::new(WorkerControl::default()),
+            wake: Condvar::new(),
+            worker: std::sync::Mutex::new(None),
+            shutdown_started: AtomicBool::new(false),
+        })
+    }
+
+    fn start(self: &Arc<Self>) -> std::io::Result<()> {
+        let worker_binding = Arc::clone(self);
+        let worker = std::thread::Builder::new()
+            .name(format!("symforge-embed-{}", self.identity.raw()))
+            .spawn(move || worker_binding.run())?;
+        *self.worker.lock().expect("embedded worker mutex") = Some(worker);
+        Ok(())
+    }
+
+    fn run(&self) {
+        {
+            let mut state = self.state.lock().expect("embedded state mutex");
+            state.observer_epoch = 1;
+        }
+
+        let mut observed_fingerprint = self.reload_and_publish();
+        loop {
+            let mut control = self.control.lock().expect("embedded control mutex");
+            let (next, _) = self
+                .wake
+                .wait_timeout(control, EMBED_OBSERVER_POLL)
+                .expect("embedded control mutex");
+            control = next;
+            if control.stop {
+                break;
+            }
+            let explicit_refresh = std::mem::take(&mut control.refresh_requested);
+            drop(control);
+
+            let next_fingerprint = self.observe_fingerprint();
+            let disk_changed = match (&observed_fingerprint, &next_fingerprint) {
+                (Some(previous), Some(current)) => previous != current,
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => false,
+            };
+            let blocked = self.state.lock().expect("embedded state mutex").phase
+                == super::public_api::SourceRuntimePhase::Blocked;
+            if explicit_refresh || disk_changed || blocked {
+                self.set_phase(super::public_api::SourceRuntimePhase::Refreshing);
+                if self.wait_refresh_visibility_or_stop() {
+                    break;
+                }
+                observed_fingerprint = self.reload_and_publish();
+            } else {
+                observed_fingerprint = next_fingerprint;
+            }
+        }
+        self.set_phase(super::public_api::SourceRuntimePhase::Stopped);
+    }
+
+    fn wait_refresh_visibility_or_stop(&self) -> bool {
+        let control = self.control.lock().expect("embedded control mutex");
+        let (control, _) = self
+            .wake
+            .wait_timeout(control, REFRESHING_VISIBILITY_WINDOW)
+            .expect("embedded control mutex");
+        control.stop
+    }
+
+    fn reload_and_publish(&self) -> Option<String> {
+        let exclusions = crate::discovery::SourceExclusions::for_state_placement(
+            &self.root,
+            &self.state_placement,
+        );
+        let result = self
+            .runtime
+            .data_plane()
+            .reload_for_binding_with_exclusions(
+                &self.root,
+                self.state_placement.directory().cloned(),
+                exclusions,
+            );
+        if result.is_err() {
+            self.set_blocked();
+            return None;
+        }
+
+        let Some(fingerprint) = self.observe_fingerprint() else {
+            self.set_blocked();
+            return None;
+        };
+        let published = self.runtime.data_plane().published_generation();
+        if !matches!(published.freshness.as_ref(), FreshnessStatus::Current) {
+            self.set_blocked();
+            return Some(fingerprint);
+        }
+        let mut state = self.state.lock().expect("embedded state mutex");
+        state.source_version = state.source_version.saturating_add(1).max(1);
+        state.current_publication_identity = Some(format!(
+            "embed-publication-{}-{}",
+            self.identity.raw(),
+            published.publication_generation
+        ));
+        state.phase = super::public_api::SourceRuntimePhase::Current;
+        Some(fingerprint)
+    }
+
+    fn observe_fingerprint(&self) -> Option<String> {
+        let exclusions = crate::discovery::SourceExclusions::for_state_placement(
+            &self.root,
+            &self.state_placement,
+        );
+        crate::discovery::scout_repository_with_exclusions(&self.root, &exclusions)
+            .ok()
+            .map(|plan| crate::hash::digest_hex(format!("{plan:?}").as_bytes()))
+    }
+
+    fn set_phase(&self, phase: super::public_api::SourceRuntimePhase) {
+        self.state.lock().expect("embedded state mutex").phase = phase;
+    }
+
+    fn set_blocked(&self) {
+        let mut state = self.state.lock().expect("embedded state mutex");
+        state.phase = super::public_api::SourceRuntimePhase::Blocked;
+        state.current_publication_identity = None;
+    }
+
+    fn runtime_view(&self) -> super::public_api::SourceRuntimeView {
+        let state = self.state.lock().expect("embedded state mutex").clone();
+        super::public_api::SourceRuntimeView {
+            binding_identity: format!("source-{}", self.identity.raw()),
+            current_publication_identity: state.current_publication_identity,
+            observer_epoch: state.observer_epoch,
+            phase: state.phase,
+            source_version: state.source_version,
+        }
+    }
+
+    fn current_claim(
+        &self,
+        operation: crate::lifecycle_identity::OperationKind,
+        normalized_arguments: &[u8],
+    ) -> Result<CurrentEmbedClaim, super::public_api::EmbedSourceRefusal> {
+        let state = self.state.lock().expect("embedded state mutex");
+        if state.phase != super::public_api::SourceRuntimePhase::Current {
+            let retry = match state.phase {
+                super::public_api::SourceRuntimePhase::Blocked => {
+                    crate::lifecycle_identity::RetryAdvice::Operator
+                }
+                super::public_api::SourceRuntimePhase::Stopped
+                | super::public_api::SourceRuntimePhase::Stopping => {
+                    crate::lifecycle_identity::RetryAdvice::Never
+                }
+                _ => crate::lifecycle_identity::RetryAdvice::OnEvent,
+            };
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                operation,
+                retry,
+                normalized_arguments,
+            ));
+        }
+        let publication_identity = state
+            .current_publication_identity
+            .clone()
+            .expect("Current embedded source has a publication identity");
+        Ok(CurrentEmbedClaim {
+            binding_identity: format!("source-{}", self.identity.raw()),
+            publication_identity,
+            source_version: state.source_version,
+        })
+    }
+
+    fn request_refresh(&self) -> Option<u64> {
+        let state = self.state.lock().expect("embedded state mutex");
+        if matches!(
+            state.phase,
+            super::public_api::SourceRuntimePhase::Stopped
+                | super::public_api::SourceRuntimePhase::Stopping
+        ) {
+            return None;
+        }
+        let version = state.source_version;
+        drop(state);
+        let mut control = self.control.lock().expect("embedded control mutex");
+        control.refresh_requested = true;
+        self.wake.notify_all();
+        Some(version)
+    }
+
+    fn shutdown(&self) -> (u64, u64) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            let version = self
+                .state
+                .lock()
+                .expect("embedded state mutex")
+                .source_version;
+            return (version, 0);
+        }
+        self.set_phase(super::public_api::SourceRuntimePhase::Stopping);
+        {
+            let mut control = self.control.lock().expect("embedded control mutex");
+            control.stop = true;
+            self.wake.notify_all();
+        }
+        let joined = self
+            .worker
+            .lock()
+            .expect("embedded worker mutex")
+            .take()
+            .map(|worker| {
+                let _ = worker.join();
+                1
+            })
+            .unwrap_or(0);
+        self.set_phase(super::public_api::SourceRuntimePhase::Stopped);
+        if let Err(refusal) = super::activation::process_project_registry().stop(&self.key) {
+            tracing::debug!(?refusal, "embedded admission stop refused");
+        }
+        let version = self
+            .state
+            .lock()
+            .expect("embedded state mutex")
+            .source_version;
+        (version, joined)
+    }
+}
+
+struct CurrentEmbedClaim {
+    binding_identity: String,
+    publication_identity: String,
+    source_version: u64,
+}
+
+fn normalized_path_prefix(prefix: Option<&str>) -> Option<String> {
+    prefix.map(|prefix| {
+        prefix
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_string()
+    })
+}
+
+fn bounded_preview(line: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 500;
+    let mut chars = line.chars();
+    let preview: String = chars.by_ref().take(MAX_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 impl EmbeddedSourceFactory {
@@ -121,18 +450,80 @@ impl EmbeddedSourceFactory {
         Arc::new(Self::default())
     }
 
-    /// Open `key`, yielding the sole handle for it.
+    /// Test-internal dark registration retained for the Slice-2 ownership
+    /// oracles. Production opens always use [`Self::open_bound`].
+    #[cfg(feature = "__test-internals")]
+    pub fn open(self: &Arc<Self>, key: ProjectKey) -> Result<EmbeddedSourceHandle, EmbedRefusal> {
+        let mut open = self.open.lock().expect("embedded registration mutex");
+        if let Some(held_by) = open.get(&key) {
+            return Err(EmbedRefusal::SourceAlreadyOpen {
+                held_by: held_by.identity,
+            });
+        }
+        let identity = EmbeddedIdentity::fresh();
+        open.insert(
+            key.clone(),
+            OpenEmbeddedSource {
+                identity,
+                binding: None,
+            },
+        );
+        self.shutdown.store(false, Ordering::Release);
+        Ok(EmbeddedSourceHandle {
+            identity,
+            key,
+            registration: Arc::clone(self),
+            binding: None,
+            closed: AtomicBool::new(false),
+            _not_unwind_safe: std::marker::PhantomData,
+        })
+    }
+
+    /// Open `binding`, yielding the sole handle for it and starting its worker.
     ///
     /// Refuses if a handle is already live for this key. Handing out a second
     /// handle would let one close while the other still believes it holds an
     /// open source.
-    pub fn open(self: &Arc<Self>, key: ProjectKey) -> Result<EmbeddedSourceHandle, EmbedRefusal> {
+    pub(crate) fn open_bound(
+        self: &Arc<Self>,
+        binding: RootBinding,
+        state_placement: StatePlacement,
+    ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
+        let key = ProjectKey::new(&binding.root_id.0);
         let mut open = self.open.lock().expect("embedded registration mutex");
-        if let Some(held_by) = open.get(&key) {
-            return Err(EmbedRefusal::SourceAlreadyOpen { held_by: *held_by });
+        if open.contains_key(&key) {
+            return Err(EmbeddedOpenError::SourceAlreadyOpen);
         }
         let identity = EmbeddedIdentity::fresh();
-        open.insert(key.clone(), identity);
+        let admission = super::activation::admit_project_with_outcome(
+            super::process_runtime::SurfaceKind::Embed,
+            &binding.canonical_root,
+            &binding.root_id.0,
+            binding.access_mode,
+            &state_placement,
+        )
+        .map_err(|_| EmbeddedOpenError::AdmissionUnavailable)?;
+        let index = crate::live_index::store::LiveIndex::empty();
+        let runtime =
+            super::activation::ProjectRuntimeHandle::bind_admitted(index, admission.into_slot());
+        let source = EmbeddedBinding::new(
+            identity,
+            key.clone(),
+            binding.canonical_root,
+            state_placement,
+            runtime,
+        );
+        if source.start().is_err() {
+            let _ = super::activation::process_project_registry().stop(&key);
+            return Err(EmbeddedOpenError::WorkerUnavailable);
+        }
+        open.insert(
+            key.clone(),
+            OpenEmbeddedSource {
+                identity,
+                binding: Some(Arc::clone(&source)),
+            },
+        );
         // The factory is serving again, so it is no longer shut down. The flag
         // latched before, which made `has_shut_down()` report `true` while
         // `open_count()` was 1 — a claim about a past moment presented as
@@ -143,6 +534,7 @@ impl EmbeddedSourceFactory {
             identity,
             key,
             registration: Arc::clone(self),
+            binding: Some(source),
             closed: AtomicBool::new(false),
             _not_unwind_safe: std::marker::PhantomData,
         })
@@ -160,14 +552,73 @@ impl EmbeddedSourceFactory {
     }
 
     /// Close one source. Returns whether this call performed the shutdown.
-    fn close_one(&self, key: &ProjectKey, identity: EmbeddedIdentity) -> (bool, bool) {
+    fn close_one(&self, key: &ProjectKey, identity: EmbeddedIdentity) -> (bool, bool, u64, u64) {
         let mut open = self.open.lock().expect("embedded registration mutex");
-        let performed = open.get(key) == Some(&identity) && open.remove(key).is_some();
+        let matched = open
+            .get(key)
+            .is_some_and(|source| source.identity == identity);
+        let source = open
+            .get(key)
+            .filter(|source| source.identity == identity)
+            .and_then(|source| source.binding.as_ref().map(Arc::clone));
+        let (terminal_version, joined_workers) = source
+            .as_ref()
+            .map(|source| source.shutdown())
+            .unwrap_or((0, 0));
+        let performed = matched && open.remove(key).is_some();
         let final_owner = performed && open.is_empty();
         if final_owner {
             self.shutdown.store(true, Ordering::Release);
         }
-        (performed, final_owner)
+        (performed, final_owner, terminal_version, joined_workers)
+    }
+
+    pub(crate) fn shutdown_all(&self) -> EmbeddedShutdownReport {
+        let mut open = self.open.lock().expect("embedded registration mutex");
+        let mut closed_sources = 0u64;
+        let mut joined_workers = 0u64;
+        for source in open.values() {
+            let joined = source
+                .binding
+                .as_ref()
+                .map(|binding| binding.shutdown().1)
+                .unwrap_or(0);
+            closed_sources = closed_sources.saturating_add(1);
+            joined_workers = joined_workers.saturating_add(joined);
+        }
+        open.clear();
+        self.shutdown.store(true, Ordering::Release);
+        EmbeddedShutdownReport {
+            closed_sources,
+            joined_workers,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct EmbeddedRuntimeOwner {
+    factory: Arc<EmbeddedSourceFactory>,
+}
+
+impl EmbeddedRuntimeOwner {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            factory: EmbeddedSourceFactory::new(),
+        })
+    }
+
+    pub(crate) fn factory(&self) -> &Arc<EmbeddedSourceFactory> {
+        &self.factory
+    }
+
+    pub(crate) fn shutdown(&self) -> EmbeddedShutdownReport {
+        self.factory.shutdown_all()
+    }
+}
+
+impl Drop for EmbeddedRuntimeOwner {
+    fn drop(&mut self) {
+        self.factory.shutdown_all();
     }
 }
 
@@ -180,6 +631,7 @@ pub struct EmbeddedSourceHandle {
     identity: EmbeddedIdentity,
     key: ProjectKey,
     registration: Arc<EmbeddedSourceFactory>,
+    binding: Option<Arc<EmbeddedBinding>>,
     closed: AtomicBool,
     // T049: the contract pins the handle NOT UnwindSafe/RefUnwindSafe.
     _not_unwind_safe: super::public_api::NotUnwindSafe,
@@ -199,6 +651,13 @@ impl EmbeddedSourceHandle {
     /// Whether this handle is still open.
     pub fn is_open(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
+            && self.binding.as_ref().is_none_or(|binding| {
+                !matches!(
+                    binding.runtime_view().phase,
+                    super::public_api::SourceRuntimePhase::Stopped
+                        | super::public_api::SourceRuntimePhase::Stopping
+                )
+            })
     }
 
     /// Close the source.
@@ -214,7 +673,7 @@ impl EmbeddedSourceHandle {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Err(EmbedRefusal::AlreadyClosed);
         }
-        let (performed, final_owner) = self.registration.close_one(&self.key, self.identity);
+        let (performed, final_owner, _, _) = self.registration.close_one(&self.key, self.identity);
         Ok(CloseReceipt {
             identity: self.identity,
             performed_shutdown: performed,
@@ -232,43 +691,46 @@ impl EmbeddedSourceHandle {
         let performed = if self.closed.swap(true, Ordering::AcqRel) {
             false
         } else {
-            let (performed, _final_owner) = self.registration.close_one(&self.key, self.identity);
-            performed
+            let (performed, _final_owner, terminal_version, _joined_workers) =
+                self.registration.close_one(&self.key, self.identity);
+            return SourceCloseReceipt {
+                identity: self.identity,
+                performed_shutdown: performed,
+                terminal_source_version: terminal_version,
+                _not_unwind_safe: std::marker::PhantomData,
+            };
         };
         SourceCloseReceipt {
             identity: self.identity,
             performed_shutdown: performed,
+            terminal_source_version: self
+                .binding
+                .as_ref()
+                .map(|binding| binding.runtime_view().source_version)
+                .unwrap_or(0),
             _not_unwind_safe: std::marker::PhantomData,
         }
     }
 
-    /// V11 (E1): the public view of this source's runtime state, contract
-    /// field-for-field. A dark handle has NO publication and NO observer, and
-    /// the view says so rather than inventing either. The phase comes from
-    /// the flag this handle OWNS (C4 ruling): a closed source reports
-    /// `Stopped` — the dark close performs synchronously, so nothing is ever
-    /// observably `Stopping` — and reporting `Loading` for it would be a
-    /// claim about a source that no longer exists.
+    /// Capture the source's lifecycle state atomically.
     pub fn runtime_view(&self) -> super::public_api::SourceRuntimeView {
-        let phase = if self.closed.load(Ordering::Acquire) {
-            super::public_api::SourceRuntimePhase::Stopped
-        } else {
-            super::public_api::SourceRuntimePhase::Loading
-        };
-        super::public_api::SourceRuntimeView {
-            binding_identity: format!("source-{}", self.identity.raw()),
-            current_publication_identity: None,
-            observer_epoch: 0,
-            phase,
-            source_version: 0,
-        }
+        self.binding.as_ref().map_or_else(
+            || super::public_api::SourceRuntimeView {
+                binding_identity: format!("source-{}", self.identity.raw()),
+                current_publication_identity: None,
+                observer_epoch: 0,
+                phase: if self.closed.load(Ordering::Acquire) {
+                    super::public_api::SourceRuntimePhase::Stopped
+                } else {
+                    super::public_api::SourceRuntimePhase::Loading
+                },
+                source_version: 0,
+            },
+            |binding| binding.runtime_view(),
+        )
     }
 
-    /// V11 (E1): symbol search under the contract shape. No generation is
-    /// bound to a dark handle, so this REFUSES honestly — an empty result
-    /// would be a claim about content that does not exist. The Ok arm is the
-    /// contract's `Claim<SymbolSearchResult>` (T049): a result that carries
-    /// how it was produced, which nothing dark can mint.
+    /// Search one pinned current generation and return its claim provenance.
     pub fn search_symbols(
         &self,
         request: &super::public_api::SymbolSearchRequest,
@@ -276,17 +738,91 @@ impl EmbeddedSourceHandle {
         super::public_api::EmbedClaim<super::public_api::SymbolSearchResult>,
         super::public_api::EmbedSourceRefusal,
     > {
-        // The dark lane does not read the request — consistent with the C5
-        // ruling that argument identity is not claimed by these refusals —
-        // but the parameter keeps its contract-normative name.
-        let _ = request;
-        Err(super::public_api::dark_unbound_refusal(
+        let normalized = format!(
+            "query={:?};path_prefix={:?};limit={}",
+            request.query, request.path_prefix, request.limit
+        );
+        if self.closed.load(Ordering::Acquire) {
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::SearchSymbols,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            ));
+        }
+        let Some(binding) = self.binding.as_ref() else {
+            return Err(super::public_api::dark_unbound_refusal(
+                crate::lifecycle_identity::OperationKind::SearchSymbols,
+            ));
+        };
+        let claim = binding.current_claim(
             crate::lifecycle_identity::OperationKind::SearchSymbols,
+            normalized.as_bytes(),
+        )?;
+        let index = binding.runtime.acquire().map_err(|_| {
+            super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::SearchSymbols,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            )
+        })?;
+        let live = index.read();
+        let query = request.query.as_deref().map(str::to_lowercase);
+        let path_prefix = normalized_path_prefix(request.path_prefix.as_deref());
+        let mut matches = Vec::new();
+        for (path, file) in live.all_files() {
+            if path_prefix
+                .as_deref()
+                .is_some_and(|prefix| !path.starts_with(prefix))
+            {
+                continue;
+            }
+            for symbol in &file.symbols {
+                if query
+                    .as_deref()
+                    .is_some_and(|query| !symbol.name.to_lowercase().contains(query))
+                {
+                    continue;
+                }
+                matches.push((
+                    symbol.sort_order,
+                    super::public_api::SymbolMatch {
+                        name: symbol.name.clone(),
+                        kind: symbol.kind.to_string(),
+                        path: path.clone(),
+                        start_line: symbol.line_range.0.saturating_add(1),
+                        end_line: symbol.line_range.1.saturating_add(1),
+                    },
+                ));
+            }
+        }
+        matches.sort_by(|(left_order, left), (right_order, right)| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.start_line.cmp(&right.start_line))
+                .then_with(|| left_order.cmp(right_order))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        let limit = request.limit as usize;
+        let truncated = matches.len() > limit;
+        let matches = matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, value)| value)
+            .collect();
+        Ok(super::public_api::live_claim(
+            super::public_api::SymbolSearchResult { matches, truncated },
+            crate::lifecycle_identity::OperationKind::SearchSymbols,
+            normalized.as_bytes(),
+            &claim.binding_identity,
+            &claim.publication_identity,
+            claim.source_version,
         ))
     }
 
-    /// V11 (E1): text search under the contract shape; same honest refusal,
-    /// same claim-carrying Ok arm (T049).
+    /// Search stored byte-exact file content from one pinned current generation.
     pub fn search_text(
         &self,
         request: &super::public_api::TextSearchRequest,
@@ -294,20 +830,129 @@ impl EmbeddedSourceHandle {
         super::public_api::EmbedClaim<super::public_api::TextSearchResult>,
         super::public_api::EmbedSourceRefusal,
     > {
-        let _ = request;
-        Err(super::public_api::dark_unbound_refusal(
+        let normalized = format!(
+            "query={:?};path_prefix={:?};limit={};case_sensitive={}",
+            request.query, request.path_prefix, request.limit, request.case_sensitive
+        );
+        if request.query.is_empty() {
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::InvalidSelection,
+                crate::lifecycle_identity::OperationKind::SearchText,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            ));
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::SearchText,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            ));
+        }
+        let Some(binding) = self.binding.as_ref() else {
+            return Err(super::public_api::dark_unbound_refusal(
+                crate::lifecycle_identity::OperationKind::SearchText,
+            ));
+        };
+        let claim = binding.current_claim(
             crate::lifecycle_identity::OperationKind::SearchText,
+            normalized.as_bytes(),
+        )?;
+        let matcher = regex::RegexBuilder::new(&regex::escape(&request.query))
+            .case_insensitive(!request.case_sensitive)
+            .build()
+            .map_err(|_| {
+                super::public_api::bound_source_refusal(
+                    crate::lifecycle_identity::SourceRefusalKind::InvalidSelection,
+                    crate::lifecycle_identity::OperationKind::SearchText,
+                    crate::lifecycle_identity::RetryAdvice::Never,
+                    normalized.as_bytes(),
+                )
+            })?;
+        let index = binding.runtime.acquire().map_err(|_| {
+            super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::SearchText,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            )
+        })?;
+        let live = index.read();
+        let path_prefix = normalized_path_prefix(request.path_prefix.as_deref());
+        let limit = request.limit as usize;
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        'files: for (path, file) in live.all_files() {
+            if path_prefix
+                .as_deref()
+                .is_some_and(|prefix| !path.starts_with(prefix))
+            {
+                continue;
+            }
+            let Ok(content) = std::str::from_utf8(&file.content) else {
+                continue;
+            };
+            let mut line_start = 0usize;
+            for (line_index, line) in content.split_inclusive('\n').enumerate() {
+                let searchable = line.strip_suffix('\n').unwrap_or(line);
+                for found in matcher.find_iter(searchable) {
+                    if matches.len() == limit {
+                        truncated = true;
+                        break 'files;
+                    }
+                    let byte_start = line_start.saturating_add(found.start());
+                    let byte_end = line_start.saturating_add(found.end());
+                    matches.push(super::public_api::TextMatch {
+                        path: path.clone(),
+                        line: u32::try_from(line_index.saturating_add(1)).unwrap_or(u32::MAX),
+                        byte_start: byte_start as u64,
+                        byte_end: byte_end as u64,
+                        preview: bounded_preview(searchable.trim_end_matches('\r')),
+                    });
+                }
+                line_start = line_start.saturating_add(line.len());
+            }
+        }
+        Ok(super::public_api::live_claim(
+            super::public_api::TextSearchResult { matches, truncated },
+            crate::lifecycle_identity::OperationKind::SearchText,
+            normalized.as_bytes(),
+            &claim.binding_identity,
+            &claim.publication_identity,
+            claim.source_version,
         ))
     }
 
-    /// V11 (E1): request a refresh. A dark refresh cannot run — there is no
-    /// generation, no observer, and no candidate lane — so the ticket is
-    /// refused rather than minted for work nothing will perform.
+    /// Queue a refresh on this source's worker.
     pub fn request_refresh(
         &self,
     ) -> Result<super::public_api::EmbedRefreshTicket, super::public_api::EmbedSourceRefusal> {
-        Err(super::public_api::dark_unbound_refusal(
-            crate::lifecycle_identity::OperationKind::RefreshSource,
+        let normalized = b"refresh-current-worktree";
+        if self.closed.load(Ordering::Acquire) {
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::RefreshSource,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized,
+            ));
+        }
+        let Some(binding) = self.binding.as_ref() else {
+            return Err(super::public_api::dark_unbound_refusal(
+                crate::lifecycle_identity::OperationKind::RefreshSource,
+            ));
+        };
+        let Some(source_version) = binding.request_refresh() else {
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::RefreshSource,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized,
+            ));
+        };
+        Ok(super::public_api::refresh_ticket(
+            normalized,
+            source_version,
         ))
     }
 
@@ -374,24 +1019,19 @@ impl std::fmt::Display for ReceiptWaitError {
 
 impl std::error::Error for ReceiptWaitError {}
 
-/// Receipt for a V11 `begin_close`. Nothing is spawned in the dark modules,
-/// so the wait completes immediately — but it still owns the self-wait guard.
+/// Receipt for a completed V11 `begin_close`.
 #[derive(Debug)]
 pub struct SourceCloseReceipt {
     identity: EmbeddedIdentity,
     performed_shutdown: bool,
+    terminal_source_version: u64,
     // T049: the contract pins the receipt NOT UnwindSafe/RefUnwindSafe.
     _not_unwind_safe: super::public_api::NotUnwindSafe,
 }
 
 impl SourceCloseReceipt {
-    /// The contract wait (T049): refuses a self-wait, completes immediately
-    /// otherwise — the close performed synchronously and nothing is spawned
-    /// in the dark modules, so the deadline can never be reached and is
-    /// deliberately unused. `already_terminal` reports whether this close
-    /// JOINED an already-terminal source rather than performing the
-    /// shutdown; the dark source version is 0, same truth the runtime view
-    /// reports.
+    /// The contract wait (T049): refuses a self-wait and otherwise returns the
+    /// teardown result already observed by synchronous close.
     pub fn wait(
         &self,
         deadline: std::time::Instant,
@@ -402,7 +1042,7 @@ impl SourceCloseReceipt {
         }
         Ok(super::public_api::SourceCloseReport {
             already_terminal: !self.performed_shutdown,
-            terminal_source_version: 0,
+            terminal_source_version: self.terminal_source_version,
         })
     }
 
@@ -454,7 +1094,7 @@ impl Drop for EmbeddedSourceHandle {
         // paths, which is how it read before: `a.finalize(|| drop(b))` was
         // permitted while `a.finalize(|| b.close())` was refused.
         if !self.closed.swap(true, Ordering::AcqRel) {
-            self.registration.close_one(&self.key, self.identity);
+            let _ = self.registration.close_one(&self.key, self.identity);
         }
     }
 }

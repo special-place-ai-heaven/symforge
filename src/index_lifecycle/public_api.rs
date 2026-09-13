@@ -208,9 +208,7 @@ pub struct TextSearchResult {
     pub truncated: bool,
 }
 
-/// The contract-shaped refresh ticket. Dark handles can never mint one — the
-/// type exists so the refusal-returning signature is contract-true and the
-/// Slice 4 wiring changes evidence, not shape.
+/// The contract-shaped ticket for work queued on an embedded source worker.
 #[derive(Debug)]
 pub struct EmbedRefreshTicket {
     ticket_identity: String,
@@ -235,11 +233,8 @@ impl EmbedRefreshTicket {
 
 // ── The claim family, contract-shaped (T049 wrap list) ─────────────────────
 //
-// Dark handles refuse every operation, so nothing in Slice 3 can mint a
-// claim, an authority, or an evaluation — these types exist so the
-// `Result<Claim<..>, ..>` signatures are contract-true and the Slice 4
-// wiring changes evidence, not shape. No constructor is public; none is
-// needed until something can honestly observe what these types report.
+// Constructors remain private to the lifecycle boundary. A successful query
+// mints these values only after capturing a current embedded publication.
 
 /// The contract-shaped atomic authority: `&str` identity over a string
 /// rendered at wrap time, plus the stable kind name.
@@ -362,24 +357,20 @@ pub struct SourceCloseReport {
     pub terminal_source_version: u64,
 }
 
-/// The contract-shaped shutdown receipt. The DARK runtime spawns nothing and
-/// closes no holder's source, so the wait completes immediately and reports
-/// the counts it observed — zeros, honestly, not a claim of teardown work
-/// nothing performed. Slice 4 wires the real lifecycle behind this shape.
+/// The contract-shaped shutdown receipt with observed close/join counts.
 #[derive(Debug)]
 pub struct EmbedShutdownReceipt {
+    report: ShutdownReport,
     _not_unwind_safe: NotUnwindSafe,
 }
 
 impl EmbedShutdownReceipt {
-    /// The contract wait. Nothing is spawned in the dark modules, so the
-    /// deadline can never be reached; the parameter keeps its contract name
-    /// and the dark lane records that it does not read it.
+    /// Return the teardown result already observed by synchronous shutdown.
     pub fn wait(&self, deadline: std::time::Instant) -> Result<ShutdownReport, ReceiptWaitError> {
         let _ = deadline;
         Ok(ShutdownReport {
-            closed_sources: 0,
-            joined_workers: 0,
+            closed_sources: self.report.closed_sources,
+            joined_workers: self.report.joined_workers,
         })
     }
 }
@@ -419,6 +410,74 @@ pub(crate) fn dark_unbound_refusal(kind: OperationKind) -> EmbedSourceRefusal {
     ))
 }
 
+pub(crate) fn bound_source_refusal(
+    kind: SourceRefusalKind,
+    operation: OperationKind,
+    retry: RetryAdvice,
+    normalized_arguments: &[u8],
+) -> EmbedSourceRefusal {
+    EmbedSourceRefusal::wrap(&SourceRefusal::for_runtime(
+        kind,
+        OperationReceipt::normalized(operation, normalized_arguments),
+        retry,
+        None,
+    ))
+}
+
+pub(crate) fn live_claim<T>(
+    value: T,
+    operation_kind: OperationKind,
+    normalized_arguments: &[u8],
+    binding_identity: &str,
+    publication_identity: &str,
+    source_version: u64,
+) -> EmbedClaim<T> {
+    let operation = EmbedOperationReceipt::wrap(&OperationReceipt::normalized(
+        operation_kind,
+        normalized_arguments,
+    ));
+    EmbedClaim {
+        value,
+        provenance: EmbedClaimProvenance {
+            authorities: vec![
+                EmbedAtomicAuthority {
+                    identity: binding_identity.to_string(),
+                    kind_name: "source-binding",
+                },
+                EmbedAtomicAuthority {
+                    identity: publication_identity.to_string(),
+                    kind_name: "verified-publication",
+                },
+            ],
+            identity: format!(
+                "embed-provenance-{binding_identity}-{publication_identity}-v{source_version}"
+            ),
+            kind_name: "live-index-query",
+        },
+        operation,
+        evaluation: Some(EmbedEvaluationProvenance {
+            identity: format!("embed-evaluation-{publication_identity}"),
+        }),
+        producing_runtime_identity: binding_identity.to_string(),
+    }
+}
+
+pub(crate) fn refresh_ticket(
+    normalized_arguments: &[u8],
+    requested_source_version: u64,
+) -> EmbedRefreshTicket {
+    let operation = EmbedOperationReceipt::wrap(&OperationReceipt::normalized(
+        OperationKind::RefreshSource,
+        normalized_arguments,
+    ));
+    EmbedRefreshTicket {
+        ticket_identity: format!("refresh-{}", operation.identity()),
+        operation,
+        requested_source_version,
+        _not_unwind_safe: std::marker::PhantomData,
+    }
+}
+
 // ── The runtime wrapper ────────────────────────────────────────────────────
 
 /// The contract-shaped process runtime: zero-argument `acquire` delegating to
@@ -430,15 +489,15 @@ pub(crate) fn dark_unbound_refusal(kind: OperationKind) -> EmbedSourceRefusal {
 #[derive(Debug, Clone)]
 pub struct ProcessRuntimeApi {
     _inner: std::sync::Arc<ProcessIndexRuntime>,
-    factory: std::sync::Arc<super::embedded::EmbeddedSourceFactory>,
+    owner: std::sync::Arc<super::embedded::EmbeddedRuntimeOwner>,
     _not_unwind_safe: NotUnwindSafe,
 }
 
 impl Drop for ProcessRuntimeApi {
     fn drop(&mut self) {
-        // The contract pins a literal `Drop` on this atom. The dark runtime
-        // owns no workers, so there is nothing to join yet; Slice 4 gives
-        // this body its real teardown.
+        // The contract pins a literal `Drop` on this atom. `owner` is shared
+        // by clones; dropping its final runtime wrapper synchronously closes
+        // every source and joins every embedded worker.
     }
 }
 
@@ -455,46 +514,68 @@ impl ProcessRuntimeApi {
         super::activation::activate_surface(super::process_runtime::SurfaceKind::Embed);
         Ok(Self {
             _inner: super::activation::process_index_runtime(),
-            factory: super::embedded::EmbeddedSourceFactory::new(),
+            owner: super::embedded::EmbeddedRuntimeOwner::new(),
             _not_unwind_safe: std::marker::PhantomData,
         })
     }
 
-    /// Open the sole handle for the source `spec` names (T049). Dark behavior
-    /// is the registration-level truth: sole-handle admission works, and a
-    /// second open of a source already held refuses — the selected source is
-    /// unavailable until its holder closes, hence `SelectionUnavailable` with
-    /// `OnEvent` retry. No authority is examined at registration level, so
-    /// the evidence renders the closed sentinel.
+    /// Resolve, admit, and asynchronously index the source named by `spec`.
+    /// A second open of the same canonical source refuses until its sole
+    /// handle closes.
     pub fn open_embedded_source(
         &self,
         spec: EmbeddedSourceSpec,
     ) -> Result<super::embedded::EmbeddedSourceHandle, EmbedSourceRefusal> {
-        let key = super::registry::ProjectKey::new(spec.root.to_string_lossy());
-        self.factory.open(key).map_err(|refusal| {
-            // D18, ratified and NARROWED: open() refuses only SourceAlreadyOpen
-            // (M14 pinned that), so the two arms that mapped refusals open()
-            // cannot produce are deleted rather than given dead kind mappings.
-            // The held_by identity is an EmbeddedIdentity, not an
-            // AuthorityIdentity — surfacing it as refusal evidence would MINT,
-            // so the sentinel stands.
-            let super::embedded::EmbedRefusal::SourceAlreadyOpen { .. } = refusal else {
-                unreachable!("EmbeddedSourceFactory::open refuses only SourceAlreadyOpen")
-            };
-            EmbedSourceRefusal::wrap(&SourceRefusal::for_runtime(
-                SourceRefusalKind::SelectionUnavailable,
-                OperationReceipt::for_dark_refusal(OperationKind::OpenEmbeddedSource),
-                RetryAdvice::OnEvent,
-                None,
-            ))
-        })
+        let normalized = format!("current_worktree={:?}", spec.root);
+        let binding = match crate::discovery::resolve_root_candidate(
+            &spec.root,
+            crate::domain::RootCandidateSource::McpClientRoot,
+            crate::domain::RootRequestMode::Automatic,
+        ) {
+            crate::domain::RootResolution::Bound(binding) => binding,
+            crate::domain::RootResolution::Unbound { .. } => {
+                return Err(bound_source_refusal(
+                    SourceRefusalKind::InvalidSelection,
+                    OperationKind::OpenEmbeddedSource,
+                    RetryAdvice::Operator,
+                    normalized.as_bytes(),
+                ));
+            }
+        };
+        let state_placement = crate::discovery::resolve_state_placement(&binding);
+        self.owner
+            .factory()
+            .open_bound(binding, state_placement)
+            .map_err(|refusal| match refusal {
+                super::embedded::EmbeddedOpenError::SourceAlreadyOpen => bound_source_refusal(
+                    SourceRefusalKind::SelectionUnavailable,
+                    OperationKind::OpenEmbeddedSource,
+                    RetryAdvice::OnEvent,
+                    normalized.as_bytes(),
+                ),
+                super::embedded::EmbeddedOpenError::AdmissionUnavailable => bound_source_refusal(
+                    SourceRefusalKind::AdmissionUnavailable,
+                    OperationKind::OpenEmbeddedSource,
+                    RetryAdvice::Automatic,
+                    normalized.as_bytes(),
+                ),
+                super::embedded::EmbeddedOpenError::WorkerUnavailable => bound_source_refusal(
+                    SourceRefusalKind::SourceUnavailable,
+                    OperationKind::OpenEmbeddedSource,
+                    RetryAdvice::Automatic,
+                    normalized.as_bytes(),
+                ),
+            })
     }
 
-    /// Begin process shutdown (T049). The dark runtime closes no holder's
-    /// source and joins no workers — the receipt's wait reports the observed
-    /// zeros rather than teardown work nothing performed.
+    /// Close every source owned by this runtime and join its workers.
     pub fn begin_shutdown(&self) -> EmbedShutdownReceipt {
+        let report = self.owner.shutdown();
         EmbedShutdownReceipt {
+            report: ShutdownReport {
+                closed_sources: report.closed_sources,
+                joined_workers: report.joined_workers,
+            },
             _not_unwind_safe: std::marker::PhantomData,
         }
     }

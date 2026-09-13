@@ -89,14 +89,47 @@ fn observe_physical_root_anchor(path: &Path) -> Option<PhysicalRootAnchor> {
     })
 }
 
+/// Stable Windows identity via `GetFileInformationByHandle`: the same
+/// volume-serial/file-index pair std's unstable `windows_by_handle` methods
+/// would expose. The path is opened as a DIRECTORY-capable handle with
+/// attribute-only access, so observation never conflicts with concurrent
+/// watchers, editors, or indexers.
+///
+/// `unsafe` here is FFI-only; the crate-level `unsafe_code = "deny"` is opted
+/// out per-item, matching `cli/update.rs`'s native-Win32 precedent. Each call
+/// carries its own SAFETY justification.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn observe_physical_root_anchor(path: &Path) -> Option<PhysicalRootAnchor> {
-    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
 
-    let metadata = std::fs::metadata(path).ok()?;
+    // Attribute-only access (`FILE_READ_ATTRIBUTES`), fully shared, and
+    // `FILE_FLAG_BACKUP_SEMANTICS` because a directory cannot be opened
+    // without it. The handle stays owned by `opened`: closing it here as well
+    // would double-close a handle value the kernel may already have handed to
+    // another object.
+    let opened = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .attributes(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .ok()?;
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `opened` owns a live kernel handle for the duration of the call
+    // and `info` is the correctly sized out-buffer the API fills.
+    let queried = unsafe { GetFileInformationByHandle(HANDLE(opened.as_raw_handle()), &mut info) };
+    queried.ok()?;
+
     Some(PhysicalRootAnchor {
-        dev: metadata.volume_serial_number(),
-        ino: metadata.file_index(),
+        dev: u64::from(info.dwVolumeSerialNumber),
+        ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     })
 }
 
@@ -627,5 +660,118 @@ impl Drop for StagedReplacement {
         if !self.temp_relative.as_os_str().is_empty() {
             let _ = self.dir.remove_file(&self.temp_relative);
         }
+    }
+}
+
+/// Behavior tests for [`PhysicalRootAnchor::observe`], written against the
+/// real filesystem: every assertion here pins an observable property of
+/// object identity, and each is expected to go red under the mutation that
+/// removes the property it defends.
+#[cfg(all(test, any(unix, windows)))]
+mod anchor_tests {
+    use super::PhysicalRootAnchor;
+    use std::fs;
+
+    fn temp_root() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temporary root directory")
+    }
+
+    /// Two distinct directory objects at two distinct paths must never share
+    /// an identity. (Same volume here, so this exercises the index half as
+    /// the discriminator, exactly as same-path replacement would.)
+    #[test]
+    fn distinct_directories_yield_distinct_anchors() {
+        let root = temp_root();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+
+        let anchor_a = PhysicalRootAnchor::observe(&a).expect("anchor for a");
+        let anchor_b = PhysicalRootAnchor::observe(&b).expect("anchor for b");
+
+        assert_ne!(
+            anchor_a, anchor_b,
+            "distinct directories at distinct paths must not share an anchor"
+        );
+    }
+
+    /// The same directory observed twice must yield the same anchor, or every
+    /// re-observation would look like a replacement.
+    #[test]
+    fn same_directory_observed_twice_yields_same_anchor() {
+        let root = temp_root();
+        let a = root.path().join("a");
+        fs::create_dir(&a).unwrap();
+
+        let first = PhysicalRootAnchor::observe(&a).expect("first observation");
+        let second = PhysicalRootAnchor::observe(&a).expect("second observation");
+
+        assert_eq!(
+            first, second,
+            "a stable directory must not change identity between observations"
+        );
+    }
+
+    /// THE property the anchor type exists for: a directory replaced by a
+    /// different directory at the same path must be noticed. This is exactly
+    /// the test that goes red if a platform implementation degrades to
+    /// `None` — the compile-clean shortcut that would silently drop ABA
+    /// detection.
+    #[test]
+    fn directory_replaced_at_same_path_yields_new_anchor() {
+        let root = temp_root();
+        let a = root.path().join("a");
+        // Non-empty, so nothing can quietly rename over it; replacement goes
+        // through an explicit remove.
+        fs::create_dir_all(a.join("occupied")).unwrap();
+        let b = root.path().join("b");
+        fs::create_dir(&b).unwrap();
+
+        let before = PhysicalRootAnchor::observe(&a).expect("anchor before replacement");
+
+        fs::remove_dir_all(&a).unwrap();
+        fs::rename(&b, &a).unwrap();
+
+        let after = PhysicalRootAnchor::observe(&a).expect("anchor after replacement");
+
+        assert_ne!(
+            before, after,
+            "a different directory installed at the same path must change the anchor (ABA)"
+        );
+    }
+
+    /// An absent path observes to `None` — no error, no panic. The
+    /// `Option`-returning contract every caller already handles.
+    #[test]
+    fn missing_path_yields_none() {
+        let root = temp_root();
+        let missing = root.path().join("does-not-exist");
+
+        assert_eq!(
+            PhysicalRootAnchor::observe(&missing),
+            None,
+            "a nonexistent path must observe to None, not error or panic"
+        );
+    }
+
+    /// A plain FILE at the observed path yields `Some`: the kernel identity
+    /// (volume serial + file index) is well defined for files, and the unix
+    /// branch already returns `Some` for a file via `fs::metadata` dev/ino.
+    /// Decided for cross-platform consistency: only an ABSENT object is
+    /// `None`; `observe` merely happens to be called on directory roots.
+    #[test]
+    fn file_yields_some_stable_anchor() {
+        let root = temp_root();
+        let f = root.path().join("file.txt");
+        fs::write(&f, b"payload").unwrap();
+
+        let first = PhysicalRootAnchor::observe(&f).expect("file must observe to Some");
+        let second = PhysicalRootAnchor::observe(&f).expect("re-observation of file");
+
+        assert_eq!(
+            first, second,
+            "file identity must be stable across observations"
+        );
     }
 }

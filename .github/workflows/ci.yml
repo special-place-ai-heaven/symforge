@@ -319,3 +319,42 @@ jobs:
       - name: Test npm package
         working-directory: npm
         run: npm test
+
+  windows-native:
+    needs: release-version
+    runs-on: windows-latest
+    env:
+      # Keep test runs off the runner's real control-state home; live daemons
+      # and other processes must never share coordination state with them
+      # (see .config/nextest.toml). `prepare_control_state_dir` creates the
+      # directory on first use.
+      SYMFORGE_HOME: ${{ runner.temp }}/symforge-test-home
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      # stel_golden_replay needs gitignored phase0 corpora (see the rust job).
+      - name: Clone phase0 golden-replay corpora
+        run: bash execution/clone_phase0_corpora.sh
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The build Fathom compiles as a path dependency. It failed with four
+      # errors on every toolchain before the stable GetFileInformationByHandle
+      # physical-root anchor; this step keeps it permanently green.
+      - name: Check the embed engine build
+        run: cargo check --no-default-features --features embed
+
+      - name: Run Rust tests (process-per-test)
+        run: cargo nextest run --no-fail-fast
