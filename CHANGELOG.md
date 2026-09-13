@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [11.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.5...v11.2.0) (2026-09-13)
+
+
+### Features
+
+* **embed:** activate live embedded indexing ([56ea56a](https://github.com/special-place-ai-heaven/symforge/commit/56ea56a1a89a35215013fd13aed8f339aa653230))
+
+
+### Bug Fixes
+
+* **protocol:** close admission metadata and snapshot races ([9cb391d](https://github.com/special-place-ai-heaven/symforge/commit/9cb391ddf801ad0873277440c7e4da23bc5fa4b1))
+* **protocol:** withhold demoted paths and bind the untracked sweep to one publication ([5a8e7cb](https://github.com/special-place-ai-heaven/symforge/commit/5a8e7cb9a5392ed40b94569bd75391a3d1443ce9))
+* **protocol:** withhold demoted paths and bind the untracked sweep to… ([d07c43f](https://github.com/special-place-ai-heaven/symforge/commit/d07c43f1bbff8f6f4f62ea3c5b6388c5f44b6e00))
+* **windows:** stable physical-root anchor and native test/CI coverage ([8d910a2](https://github.com/special-place-ai-heaven/symforge/commit/8d910a2c17e59a8f0ca9c7e5c9116cbaff6cde70))
+
 ## [11.1.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.4...v11.1.5) (2026-09-07)
 
 
