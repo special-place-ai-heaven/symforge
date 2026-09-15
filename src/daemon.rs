@@ -5882,7 +5882,14 @@ fn format_cross_project_text(
 ) -> String {
     let total: usize = results.iter().map(|ph| ph.hit.total_matches).sum();
     if total == 0 {
-        return "No text matches in the targeted project(s).".to_string();
+        let excluded: usize = results
+            .iter()
+            .map(|ph| ph.hit.excluded_knowledge_files)
+            .sum();
+        return crate::protocol::format::append_excluded_knowledge_note(
+            "No text matches in the targeted project(s).".to_string(),
+            excluded,
+        );
     }
 
     // Render into a body first while counting emitted match lines, so the header
@@ -11947,6 +11954,54 @@ mod tests {
         assert!(
             !full.contains("truncated"),
             "no truncation notice when under cap: {full}"
+        );
+    }
+
+    #[test]
+    fn cross_project_search_text_zero_hit_reports_exact_excluded_knowledge_count() {
+        use crate::live_index::search::TextSearchResult;
+        use crate::live_index::view::ProjectHit;
+
+        fn zero_hit(excluded: usize) -> TextSearchResult {
+            TextSearchResult {
+                label: "'knowledge-needle-xyz'".to_string(),
+                total_matches: 0,
+                files: vec![],
+                suppressed_by_noise: 0,
+                overflow_count: 0,
+                excluded_knowledge_files: excluded,
+            }
+        }
+
+        // Two targeted projects, each already path-scoped: 1 + 2 = 3. A
+        // formatter that prints only the first project's count cannot match 3.
+        let results = vec![
+            ProjectHit {
+                project_id: "alpha".to_string(),
+                hit: zero_hit(1),
+            },
+            ProjectHit {
+                project_id: "beta".to_string(),
+                hit: zero_hit(2),
+            },
+        ];
+        let rendered = format_cross_project_text(&results, true, 50);
+        assert!(
+            rendered.starts_with("No text matches in the targeted project(s)."),
+            "zero-hit header must stay; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("3 in-scope knowledge-only files"),
+            "must sum in-scope excluded knowledge across projects; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("search_knowledge"),
+            "zero-hit must point at search_knowledge; got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("1 in-scope knowledge-only file\n")
+                && !rendered.contains("2 in-scope knowledge-only files"),
+            "must not print a per-project count instead of the sum; got: {rendered}"
         );
     }
 

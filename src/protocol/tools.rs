@@ -5705,6 +5705,7 @@ impl SymForgeServer {
                     files: vec![],
                     suppressed_by_noise: 0,
                     overflow_count: 0,
+                    excluded_knowledge_files: 0,
                 })
             };
             let symbol_paths: std::collections::HashSet<&str> =
@@ -19029,6 +19030,7 @@ mod tests {
             files: vec![],
             suppressed_by_noise: 0,
             overflow_count: 0,
+            excluded_knowledge_files: 0,
         }
     }
 
