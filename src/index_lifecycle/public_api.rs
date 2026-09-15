@@ -208,6 +208,60 @@ pub struct TextSearchResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IndexCensus {
+    pub total_files: u64,
+    pub total_symbols: u64,
+    pub files: Vec<CensusFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CensusFile {
+    pub path: String,
+    pub language: String,
+    pub symbol_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IndexProgress {
+    pub files_discovered: u64,
+    pub files_parsed: u64,
+    pub symbols_found: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KnowledgeSearchRequest {
+    pub query: String,
+    pub path_prefix: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KnowledgeMatch {
+    pub path: String,
+    pub heading_path: Vec<String>,
+    pub preview: String,
+    pub content_hash: String,
+    pub provenance_ids: Vec<String>,
+    pub relationship_evidence: Vec<String>,
+    pub authority: String,
+    pub coverage: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KnowledgeSearchResult {
+    pub matches: Vec<KnowledgeMatch>,
+    pub truncated: bool,
+    pub withheld_count: u64,
+    pub withheld_reasons: Vec<String>,
+}
+
 /// The contract-shaped ticket for work queued on an embedded source worker.
 #[derive(Debug)]
 pub struct EmbedRefreshTicket {
@@ -630,6 +684,10 @@ pub fn wrap_table() -> &'static [WrapEntry] {
             obligation: "wrapped-here",
         },
         WrapEntry {
+            atom: "symforge::embed::CensusFile",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
             atom: "symforge::embed::Claim",
             obligation: "wrapped-here",
         },
@@ -647,6 +705,26 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::EvaluationProvenance",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::IndexCensus",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::IndexProgress",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::KnowledgeMatch",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::KnowledgeSearchRequest",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::KnowledgeSearchResult",
             obligation: "wrapped-here",
         },
         WrapEntry {

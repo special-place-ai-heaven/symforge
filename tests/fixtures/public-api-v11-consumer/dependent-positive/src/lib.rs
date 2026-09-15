@@ -12,8 +12,9 @@ mod embed_consumer {
     use std::time::Instant;
 
     use symforge::embed::{
-        engine_info, AtomicAuthority, Claim, ClaimProvenance, EmbeddedSourceHandle,
-        EmbeddedSourceSpec, EngineInfo, EvaluationProvenance, OperationKind,
+        engine_info, AtomicAuthority, CensusFile, Claim, ClaimProvenance, EmbeddedSourceHandle,
+        EmbeddedSourceSpec, EngineInfo, EvaluationProvenance, IndexCensus, IndexProgress,
+        KnowledgeMatch, KnowledgeSearchRequest, KnowledgeSearchResult, OperationKind,
         OperationReceipt, ProcessIndexRuntime, ReceiptWaitError, RefreshTicket, RetryAdvice,
         ShutdownReceipt, ShutdownReport, SourceCloseReceipt, SourceCloseReport, SourceRefusal,
         SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch,
@@ -24,12 +25,18 @@ mod embed_consumer {
 
     pub fn name_every_export() {
         let _ = std::any::type_name::<AtomicAuthority>();
+        let _ = std::any::type_name::<CensusFile>();
         let _ = std::any::type_name::<Claim<()>>();
         let _ = std::any::type_name::<ClaimProvenance>();
         let _ = std::any::type_name::<EmbeddedSourceHandle>();
         let _ = std::any::type_name::<EmbeddedSourceSpec>();
         let _ = std::any::type_name::<EngineInfo>();
         let _ = std::any::type_name::<EvaluationProvenance>();
+        let _ = std::any::type_name::<IndexCensus>();
+        let _ = std::any::type_name::<IndexProgress>();
+        let _ = std::any::type_name::<KnowledgeMatch>();
+        let _ = std::any::type_name::<KnowledgeSearchRequest>();
+        let _ = std::any::type_name::<KnowledgeSearchResult>();
         let _ = std::any::type_name::<OperationKind>();
         let _ = std::any::type_name::<OperationReceipt>();
         let _ = std::any::type_name::<ProcessIndexRuntime>();
@@ -182,7 +189,7 @@ mod embed_consumer {
     }
 
     pub fn name_every_enum_variant() {
-        let _: [OperationKind; 7] = [
+        let _: [OperationKind; 9] = [
             OperationKind::AcquireRuntime,
             OperationKind::CloseSource,
             OperationKind::OpenEmbeddedSource,
@@ -190,6 +197,8 @@ mod embed_consumer {
             OperationKind::SearchSymbols,
             OperationKind::SearchText,
             OperationKind::ShutdownRuntime,
+            OperationKind::IndexCensus,
+            OperationKind::SearchKnowledge,
         ];
         let _: [ReceiptWaitError; 2] = [
             ReceiptWaitError::DeadlineElapsed,
@@ -307,11 +316,17 @@ mod embed_consumer {
 
     pub fn assert_positive_auto_traits() {
         require_auto_traits::<AtomicAuthority>();
+        require_auto_traits::<CensusFile>();
         require_auto_traits::<Claim<()>>();
         require_auto_traits::<ClaimProvenance>();
         require_auto_traits::<EmbeddedSourceSpec>();
         require_auto_traits::<EngineInfo>();
         require_auto_traits::<EvaluationProvenance>();
+        require_auto_traits::<IndexCensus>();
+        require_auto_traits::<IndexProgress>();
+        require_auto_traits::<KnowledgeMatch>();
+        require_auto_traits::<KnowledgeSearchRequest>();
+        require_auto_traits::<KnowledgeSearchResult>();
         require_auto_traits::<OperationKind>();
         require_auto_traits::<OperationReceipt>();
         require_auto_traits::<ReceiptWaitError>();

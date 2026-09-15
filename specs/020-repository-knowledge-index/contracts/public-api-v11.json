@@ -571,7 +571,13 @@
             "std::panic::UnwindSafe": "positive"
           },
           "subjects": [
+            "symforge::embed::CensusFile",
             "symforge::embed::EngineInfo",
+            "symforge::embed::IndexCensus",
+            "symforge::embed::IndexProgress",
+            "symforge::embed::KnowledgeMatch",
+            "symforge::embed::KnowledgeSearchRequest",
+            "symforge::embed::KnowledgeSearchResult",
             "symforge::embed::ReceiptWaitError",
             "symforge::embed::RetryAdvice",
             "symforge::embed::ShutdownReport",
@@ -653,6 +659,12 @@
       },
       {
         "availability": "feature=embed",
+        "item": "type:embed:CensusFile",
+        "namespace": "type",
+        "path": "symforge::embed::CensusFile"
+      },
+      {
+        "availability": "feature=embed",
         "item": "type:embed:Claim",
         "namespace": "type",
         "path": "symforge::embed::Claim"
@@ -686,6 +698,36 @@
         "item": "type:embed:EvaluationProvenance",
         "namespace": "type",
         "path": "symforge::embed::EvaluationProvenance"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:IndexCensus",
+        "namespace": "type",
+        "path": "symforge::embed::IndexCensus"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:IndexProgress",
+        "namespace": "type",
+        "path": "symforge::embed::IndexProgress"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:KnowledgeMatch",
+        "namespace": "type",
+        "path": "symforge::embed::KnowledgeMatch"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:KnowledgeSearchRequest",
+        "namespace": "type",
+        "path": "symforge::embed::KnowledgeSearchRequest"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:KnowledgeSearchResult",
+        "namespace": "type",
+        "path": "symforge::embed::KnowledgeSearchResult"
       },
       {
         "availability": "feature=embed",
@@ -2068,6 +2110,42 @@
       {
         "availability": "feature=embed",
         "definition": {
+          "fields": [
+            {
+              "name": "language",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "path",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "symbol_count",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:CensusFile",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
           "fields": [],
           "has_nonpublic_fields": true,
           "shape": "struct"
@@ -2193,6 +2271,276 @@
       {
         "availability": "feature=embed",
         "definition": {
+          "fields": [
+            {
+              "name": "files",
+              "type": {
+                "arguments": [
+                  {
+                    "id": "type:embed:CensusFile",
+                    "kind": "api"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "total_files",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "total_symbols",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:IndexCensus",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "files_discovered",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "files_parsed",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "symbols_found",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:IndexProgress",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "authority",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "content_hash",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "coverage",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "heading_path",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "path",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "preview",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "provenance_ids",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "relationship_evidence",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:KnowledgeMatch",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "limit",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "path_prefix",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "core::option::Option"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "query",
+              "type": {
+                "kind": "path",
+                "path": "std::string::String"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:KnowledgeSearchRequest",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "fields": [
+            {
+              "name": "matches",
+              "type": {
+                "arguments": [
+                  {
+                    "id": "type:embed:KnowledgeMatch",
+                    "kind": "api"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "truncated",
+              "type": {
+                "kind": "primitive",
+                "name": "bool"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "withheld_count",
+              "type": {
+                "kind": "primitive",
+                "name": "u64"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "withheld_reasons",
+              "type": {
+                "arguments": [
+                  {
+                    "kind": "path",
+                    "path": "std::string::String"
+                  }
+                ],
+                "kind": "generic",
+                "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            }
+          ],
+          "has_nonpublic_fields": false,
+          "shape": "struct"
+        },
+        "generics": [],
+        "id": "type:embed:KnowledgeSearchResult",
+        "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
           "variants": [
             "AcquireRuntime",
             "CloseSource",
@@ -2200,7 +2548,9 @@
             "RefreshSource",
             "SearchSymbols",
             "SearchText",
-            "ShutdownRuntime"
+            "ShutdownRuntime",
+            "IndexCensus",
+            "SearchKnowledge"
           ]
         },
         "generics": [],
@@ -3330,6 +3680,7 @@
       "symforge::embed::AtomicAuthority",
       "symforge::embed::AtomicAuthority::identity",
       "symforge::embed::AtomicAuthority::kind_name",
+      "symforge::embed::CensusFile",
       "symforge::embed::Claim",
       "symforge::embed::Claim::evaluation",
       "symforge::embed::Claim::operation",
@@ -3351,6 +3702,11 @@
       "symforge::embed::EmbeddedSourceSpec::current_worktree",
       "symforge::embed::EvaluationProvenance",
       "symforge::embed::EvaluationProvenance::identity",
+      "symforge::embed::IndexCensus",
+      "symforge::embed::IndexProgress",
+      "symforge::embed::KnowledgeMatch",
+      "symforge::embed::KnowledgeSearchRequest",
+      "symforge::embed::KnowledgeSearchResult",
       "symforge::embed::OperationKind",
       "symforge::embed::OperationReceipt",
       "symforge::embed::OperationReceipt::canonical_argument_hash",

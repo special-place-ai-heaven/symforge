@@ -40,7 +40,7 @@ fn export_delta_matches_frozen_contract_atoms() {
         .iter()
         .map(|a| a.as_str().expect("atom string").to_string())
         .collect();
-    assert_eq!(atoms.len(), 64, "the frozen atom count");
+    assert_eq!(atoms.len(), 70, "the frozen atom count");
 
     // Recompute leg 2: the LIVE census, by the same rule the checker uses —
     // pub mod lines in lib.rs. Post-C5 the census holds exactly the kept +
