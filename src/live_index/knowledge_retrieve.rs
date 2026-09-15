@@ -128,7 +128,7 @@ impl KnowledgeRetrieveRequest {
 /// One labeled published generation. Caller owns source-scope selection and
 /// label assignment (`current` / `worktree:<id>` / `ref:<name>`). Lane order
 /// is source precedence.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct KnowledgeRetrieveLane<'a> {
     pub generation: &'a PublishedGeneration,
     pub label: &'a str,
@@ -986,6 +986,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::live_index::LiveIndex;
 
     fn request(query: &str) -> KnowledgeRetrieveRequest {
         KnowledgeRetrieveRequest::parse(

@@ -4139,6 +4139,7 @@ mod tests {
                 |_path| -> io::Result<std::fs::Metadata> { unreachable!("no discovered entries") },
                 |_path, _limit| -> io::Result<Vec<u8>> { unreachable!("no discovered entries") },
                 vec![issue],
+                None,
             )
             .expect("walk issue must remain a bounded degraded scout result");
 
@@ -4334,6 +4335,7 @@ mod tests {
                 |path| std::fs::metadata(path),
                 |_path, _max_bytes| Ok(Vec::new()),
                 Vec::new(),
+                None,
             )
             .expect("case-fold pair must remain scoutable");
             let ordered_paths = complete
@@ -4377,6 +4379,7 @@ mod tests {
                 },
                 |_path, _max_bytes| Ok(Vec::new()),
                 Vec::new(),
+                None,
             )
             .expect("one failed case-fold peer must not abort the other");
 
@@ -4461,6 +4464,7 @@ mod tests {
                     Ok(Vec::new())
                 },
                 Vec::new(),
+                None,
             )
             .expect("opaque paths must remain catalogable");
 
@@ -4517,6 +4521,7 @@ mod tests {
                     Ok(Vec::new())
                 },
                 Vec::new(),
+                None,
             )
             .expect("unsafe path metadata must remain catalogable by opaque ID");
 
