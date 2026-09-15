@@ -616,25 +616,28 @@ fn enlarge_fixture_until_reload_floor(
     runtime: &ProcessIndexRuntime,
     checkout: &std::path::Path,
     floor: Duration,
-) -> (std::path::PathBuf, Option<tempfile::TempDir>, Duration) {
-    let checkout_reload = measure_full_reload(runtime, checkout);
-    if checkout_reload >= floor {
-        return (checkout.to_path_buf(), None, checkout_reload);
-    }
-
-    let mut extra_files = 250usize;
+) -> (std::path::PathBuf, tempfile::TempDir, Duration) {
+    // Never open CARGO_MANIFEST_DIR: embed create_dir_all would write .symforge
+    // into the live checkout.
+    let fixture = tempfile::tempdir().expect("G16 fixture");
+    git2::Repository::init(fixture.path()).expect("initialize G16 fixture");
+    copy_tree(checkout, fixture.path());
+    let mut extra_files = 0usize;
     loop {
-        let fixture = tempfile::tempdir().expect("enlarged fixture");
-        git2::Repository::init(fixture.path()).expect("initialize enlarged fixture");
-        copy_tree(checkout, fixture.path());
-        write_extra_parse_files(fixture.path(), extra_files);
+        if extra_files > 0 {
+            write_extra_parse_files(fixture.path(), extra_files);
+        }
         let reload = measure_full_reload(runtime, fixture.path());
         if reload >= floor {
-            return (fixture.path().to_path_buf(), Some(fixture), reload);
+            return (fixture.path().to_path_buf(), fixture, reload);
         }
-        extra_files = extra_files
-            .checked_mul(2)
-            .expect("extra payload count overflow");
+        extra_files = if extra_files == 0 {
+            250
+        } else {
+            extra_files
+                .checked_mul(2)
+                .expect("extra payload count overflow")
+        };
         assert!(
             extra_files <= 8_000,
             "could not enlarge this checkout to a {floor:?} debug reload (last={reload:?})"
