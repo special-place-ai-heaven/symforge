@@ -118,7 +118,98 @@ pub struct EmbeddedSourceFactory {
 #[derive(Debug)]
 struct OpenEmbeddedSource {
     identity: EmbeddedIdentity,
+    owner: Option<EmbeddedIdentity>,
+    opening: bool,
     binding: Option<Arc<EmbeddedBinding>>,
+}
+
+#[cfg(feature = "__test-internals")]
+static PANIC_AFTER_START_ROOT: std::sync::Mutex<Option<ProjectKey>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "__test-internals")]
+pub fn panic_after_start_for_test(root: &std::path::Path) {
+    let crate::domain::RootResolution::Bound(binding) = crate::discovery::resolve_root_candidate(
+        root,
+        crate::domain::RootCandidateSource::McpClientRoot,
+        crate::domain::RootRequestMode::Automatic,
+    ) else {
+        panic!("test root must resolve to an embedded binding");
+    };
+    *PANIC_AFTER_START_ROOT
+        .lock()
+        .expect("embedded panic hook mutex") = Some(ProjectKey::new(&binding.root_id.0));
+}
+
+#[cfg(feature = "__test-internals")]
+fn take_panic_after_start_for_test(key: &ProjectKey) -> bool {
+    let mut configured = PANIC_AFTER_START_ROOT
+        .lock()
+        .expect("embedded panic hook mutex");
+    if configured.as_ref() == Some(key) {
+        configured.take();
+        true
+    } else {
+        false
+    }
+}
+
+struct OpenRollback {
+    factory: Arc<EmbeddedSourceFactory>,
+    key: ProjectKey,
+    identity: EmbeddedIdentity,
+    binding: Option<Arc<EmbeddedBinding>>,
+    committed: bool,
+}
+
+impl OpenRollback {
+    fn reserve(
+        factory: Arc<EmbeddedSourceFactory>,
+        key: ProjectKey,
+        identity: EmbeddedIdentity,
+    ) -> Self {
+        Self {
+            factory,
+            key,
+            identity,
+            binding: None,
+            committed: false,
+        }
+    }
+
+    fn bind(&mut self, binding: Arc<EmbeddedBinding>) {
+        self.binding = Some(binding);
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for OpenRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(binding) = &self.binding {
+            binding.shutdown();
+        }
+        let mut open = self
+            .factory
+            .open
+            .lock()
+            .expect("embedded registration mutex");
+        if open
+            .get(&self.key)
+            .is_some_and(|source| source.identity == self.identity && source.opening)
+        {
+            open.remove(&self.key);
+        }
+        self.factory
+            .shutdown
+            .store(open.is_empty(), Ordering::Release);
+        drop(open);
+        let _ = super::activation::process_project_registry().stop(&self.key);
+    }
 }
 
 #[derive(Debug)]
@@ -219,7 +310,9 @@ impl EmbeddedBinding {
             let mut control = self.control.lock().expect("embedded control mutex");
             let (next, _) = self
                 .wake
-                .wait_timeout(control, EMBED_OBSERVER_POLL)
+                .wait_timeout_while(control, EMBED_OBSERVER_POLL, |control| {
+                    !control.stop && !control.refresh_requested
+                })
                 .expect("embedded control mutex");
             control = next;
             if control.stop {
@@ -229,6 +322,9 @@ impl EmbeddedBinding {
             drop(control);
 
             let next_fingerprint = self.observe_fingerprint();
+            if self.shutdown_started.load(Ordering::Acquire) {
+                break;
+            }
             let disk_changed = match (&observed_fingerprint, &next_fingerprint) {
                 (Some(previous), Some(current)) => previous != current,
                 (None, Some(_)) | (Some(_), None) => true,
@@ -242,6 +338,9 @@ impl EmbeddedBinding {
                     break;
                 }
                 observed_fingerprint = self.reload_and_publish();
+                if self.shutdown_started.load(Ordering::Acquire) {
+                    break;
+                }
             } else {
                 observed_fingerprint = next_fingerprint;
             }
@@ -253,7 +352,9 @@ impl EmbeddedBinding {
         let control = self.control.lock().expect("embedded control mutex");
         let (control, _) = self
             .wake
-            .wait_timeout(control, REFRESHING_VISIBILITY_WINDOW)
+            .wait_timeout_while(control, REFRESHING_VISIBILITY_WINDOW, |control| {
+                !control.stop
+            })
             .expect("embedded control mutex");
         control.stop
     }
@@ -266,17 +367,30 @@ impl EmbeddedBinding {
         let result = self
             .runtime
             .data_plane()
-            .reload_for_binding_with_exclusions(
+            .reload_for_binding_with_exclusions_cancellable(
                 &self.root,
                 self.state_placement.directory().cloned(),
                 exclusions,
+                &self.shutdown_started,
             );
-        if result.is_err() {
+        if let Err(error) = result {
+            if self.shutdown_started.load(Ordering::Acquire)
+                || crate::live_index::store::reload_was_cancelled(&error)
+            {
+                return None;
+            }
             self.set_blocked();
             return None;
         }
 
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return None;
+        }
+
         let Some(fingerprint) = self.observe_fingerprint() else {
+            if self.shutdown_started.load(Ordering::Acquire) {
+                return None;
+            }
             self.set_blocked();
             return None;
         };
@@ -286,6 +400,9 @@ impl EmbeddedBinding {
             return Some(fingerprint);
         }
         let mut state = self.state.lock().expect("embedded state mutex");
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return None;
+        }
         state.source_version = state.source_version.saturating_add(1).max(1);
         state.current_publication_identity = Some(format!(
             "embed-publication-{}-{}",
@@ -297,21 +414,44 @@ impl EmbeddedBinding {
     }
 
     fn observe_fingerprint(&self) -> Option<String> {
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return None;
+        }
         let exclusions = crate::discovery::SourceExclusions::for_state_placement(
             &self.root,
             &self.state_placement,
         );
-        crate::discovery::scout_repository_with_exclusions(&self.root, &exclusions)
-            .ok()
-            .map(|plan| crate::hash::digest_hex(format!("{plan:?}").as_bytes()))
+        let plan = crate::discovery::scout_repository_with_exclusions_cancellable(
+            &self.root,
+            &exclusions,
+            &self.shutdown_started,
+        )
+        .ok()?;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(crate::hash::digest_hex(format!("{plan:?}").as_bytes()))
     }
 
     fn set_phase(&self, phase: super::public_api::SourceRuntimePhase) {
-        self.state.lock().expect("embedded state mutex").phase = phase;
+        let mut state = self.state.lock().expect("embedded state mutex");
+        if self.shutdown_started.load(Ordering::Acquire)
+            && !matches!(
+                phase,
+                super::public_api::SourceRuntimePhase::Stopping
+                    | super::public_api::SourceRuntimePhase::Stopped
+            )
+        {
+            return;
+        }
+        state.phase = phase;
     }
 
     fn set_blocked(&self) {
         let mut state = self.state.lock().expect("embedded state mutex");
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return;
+        }
         state.phase = super::public_api::SourceRuntimePhase::Blocked;
         state.current_publication_identity = None;
     }
@@ -465,6 +605,8 @@ impl EmbeddedSourceFactory {
             key.clone(),
             OpenEmbeddedSource {
                 identity,
+                owner: None,
+                opening: false,
                 binding: None,
             },
         );
@@ -488,13 +630,28 @@ impl EmbeddedSourceFactory {
         self: &Arc<Self>,
         binding: RootBinding,
         state_placement: StatePlacement,
+        owner: EmbeddedIdentity,
     ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
         let key = ProjectKey::new(&binding.root_id.0);
-        let mut open = self.open.lock().expect("embedded registration mutex");
-        if open.contains_key(&key) {
-            return Err(EmbeddedOpenError::SourceAlreadyOpen);
-        }
         let identity = EmbeddedIdentity::fresh();
+        {
+            let mut open = self.open.lock().expect("embedded registration mutex");
+            if open.contains_key(&key) {
+                return Err(EmbeddedOpenError::SourceAlreadyOpen);
+            }
+            open.insert(
+                key.clone(),
+                OpenEmbeddedSource {
+                    identity,
+                    owner: Some(owner),
+                    opening: true,
+                    binding: None,
+                },
+            );
+            self.shutdown.store(false, Ordering::Release);
+        }
+
+        let mut rollback = OpenRollback::reserve(Arc::clone(self), key.clone(), identity);
         let admission = super::activation::admit_project_with_outcome(
             super::process_runtime::SurfaceKind::Embed,
             &binding.canonical_root,
@@ -513,23 +670,31 @@ impl EmbeddedSourceFactory {
             state_placement,
             runtime,
         );
+        rollback.bind(Arc::clone(&source));
         if source.start().is_err() {
-            let _ = super::activation::process_project_registry().stop(&key);
             return Err(EmbeddedOpenError::WorkerUnavailable);
         }
-        open.insert(
-            key.clone(),
-            OpenEmbeddedSource {
-                identity,
-                binding: Some(Arc::clone(&source)),
-            },
-        );
-        // The factory is serving again, so it is no longer shut down. The flag
-        // latched before, which made `has_shut_down()` report `true` while
-        // `open_count()` was 1 — a claim about a past moment presented as
-        // present state. Cleared under the same lock that records the open, so
-        // the two can never disagree.
-        self.shutdown.store(false, Ordering::Release);
+        #[cfg(feature = "__test-internals")]
+        if take_panic_after_start_for_test(&key) {
+            panic!("embedded open panic injected after worker start");
+        }
+
+        let promoted = {
+            let mut open = self.open.lock().expect("embedded registration mutex");
+            match open.get_mut(&key) {
+                Some(reservation) if reservation.identity == identity && reservation.opening => {
+                    reservation.opening = false;
+                    reservation.binding = Some(Arc::clone(&source));
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !promoted {
+            return Err(EmbeddedOpenError::WorkerUnavailable);
+        }
+        rollback.commit();
+
         Ok(EmbeddedSourceHandle {
             identity,
             key,
@@ -552,42 +717,75 @@ impl EmbeddedSourceFactory {
     }
 
     /// Close one source. Returns whether this call performed the shutdown.
+    ///
+    /// The registration entry stays until join finishes so a same-root reopen
+    /// still refuses, but the mutex is not held across `join` — an unrelated
+    /// root must be able to open while this worker is still unwinding.
     fn close_one(&self, key: &ProjectKey, identity: EmbeddedIdentity) -> (bool, bool, u64, u64) {
-        let mut open = self.open.lock().expect("embedded registration mutex");
-        let matched = open
-            .get(key)
-            .is_some_and(|source| source.identity == identity);
-        let source = open
-            .get(key)
-            .filter(|source| source.identity == identity)
-            .and_then(|source| source.binding.as_ref().map(Arc::clone));
+        let (matched, source) = {
+            let open = self.open.lock().expect("embedded registration mutex");
+            let matched = open
+                .get(key)
+                .is_some_and(|source| source.identity == identity);
+            let source = open
+                .get(key)
+                .filter(|source| source.identity == identity)
+                .and_then(|source| source.binding.as_ref().map(Arc::clone));
+            (matched, source)
+        };
         let (terminal_version, joined_workers) = source
             .as_ref()
             .map(|source| source.shutdown())
             .unwrap_or((0, 0));
-        let performed = matched && open.remove(key).is_some();
-        let final_owner = performed && open.is_empty();
-        if final_owner {
-            self.shutdown.store(true, Ordering::Release);
-        }
+        let (performed, final_owner) = if matched {
+            let mut open = self.open.lock().expect("embedded registration mutex");
+            if open
+                .get(key)
+                .is_some_and(|source| source.identity == identity)
+            {
+                open.remove(key);
+                let final_owner = open.is_empty();
+                if final_owner {
+                    self.shutdown.store(true, Ordering::Release);
+                }
+                (true, final_owner)
+            } else {
+                (false, false)
+            }
+        } else {
+            (false, false)
+        };
         (performed, final_owner, terminal_version, joined_workers)
     }
 
-    pub(crate) fn shutdown_all(&self) -> EmbeddedShutdownReport {
-        let mut open = self.open.lock().expect("embedded registration mutex");
+    pub(crate) fn shutdown_owner(&self, owner: EmbeddedIdentity) -> EmbeddedShutdownReport {
+        let closing: Vec<(ProjectKey, Option<Arc<EmbeddedBinding>>)> = {
+            let open = self.open.lock().expect("embedded registration mutex");
+            open.iter()
+                .filter(|(_, source)| source.owner == Some(owner))
+                .map(|(key, source)| (key.clone(), source.binding.clone()))
+                .collect()
+        };
         let mut closed_sources = 0u64;
         let mut joined_workers = 0u64;
-        for source in open.values() {
-            let joined = source
-                .binding
+        for (_, binding) in &closing {
+            let joined = binding
                 .as_ref()
                 .map(|binding| binding.shutdown().1)
                 .unwrap_or(0);
             closed_sources = closed_sources.saturating_add(1);
             joined_workers = joined_workers.saturating_add(joined);
         }
-        open.clear();
-        self.shutdown.store(true, Ordering::Release);
+        let mut open = self.open.lock().expect("embedded registration mutex");
+        for (key, _) in &closing {
+            if open
+                .get(key)
+                .is_some_and(|source| source.owner == Some(owner))
+            {
+                open.remove(key);
+            }
+        }
+        self.shutdown.store(open.is_empty(), Ordering::Release);
         EmbeddedShutdownReport {
             closed_sources,
             joined_workers,
@@ -597,13 +795,15 @@ impl EmbeddedSourceFactory {
 
 #[derive(Debug)]
 pub(crate) struct EmbeddedRuntimeOwner {
+    identity: EmbeddedIdentity,
     factory: Arc<EmbeddedSourceFactory>,
 }
 
 impl EmbeddedRuntimeOwner {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(factory: Arc<EmbeddedSourceFactory>) -> Arc<Self> {
         Arc::new(Self {
-            factory: EmbeddedSourceFactory::new(),
+            identity: EmbeddedIdentity::fresh(),
+            factory,
         })
     }
 
@@ -611,14 +811,18 @@ impl EmbeddedRuntimeOwner {
         &self.factory
     }
 
+    pub(crate) fn identity(&self) -> EmbeddedIdentity {
+        self.identity
+    }
+
     pub(crate) fn shutdown(&self) -> EmbeddedShutdownReport {
-        self.factory.shutdown_all()
+        self.factory.shutdown_owner(self.identity)
     }
 }
 
 impl Drop for EmbeddedRuntimeOwner {
     fn drop(&mut self) {
-        self.factory.shutdown_all();
+        self.shutdown();
     }
 }
 

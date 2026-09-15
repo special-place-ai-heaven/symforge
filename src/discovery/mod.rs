@@ -1,6 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
+
+fn check_scout_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        anyhow::bail!("embedded reload cancelled during scout");
+    }
+    Ok(())
+}
 
 use crate::domain::{
     AccessErrorKind, AccessStage, CatalogPath, CoverageStatus, FileClassification, FileStamp,
@@ -533,6 +541,14 @@ fn discover_all_files_with_exclusions_and_issues(
     root: &Path,
     exclusions: &SourceExclusions,
 ) -> Result<(Vec<DiscoveredEntry>, Vec<ScoutIssue>)> {
+    discover_all_files_with_exclusions_and_issues_cancellable(root, exclusions, None)
+}
+
+fn discover_all_files_with_exclusions_and_issues_cancellable(
+    root: &Path,
+    exclusions: &SourceExclusions,
+    cancel: Option<&AtomicBool>,
+) -> Result<(Vec<DiscoveredEntry>, Vec<ScoutIssue>)> {
     // Canonicalize root so that strip_prefix succeeds even when the walker
     // resolves symlinks to their canonical targets.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -557,6 +573,7 @@ fn discover_all_files_with_exclusions_and_issues(
     // "no git / unreadable index" (fail open: heuristic decides alone, as before).
     let mut tracked_for_build_dirs: Option<Option<std::collections::HashSet<String>>> = None;
     for entry_result in repository_walk(&root, exclusions) {
+        check_scout_cancelled(cancel)?;
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
@@ -603,6 +620,7 @@ fn discover_all_files_with_exclusions_and_issues(
             // git is unavailable the set is `None` and the heuristic decides alone.
             let tracked = tracked_for_build_dirs
                 .get_or_insert_with(|| tracked_path_set_for_build_dir_rescue(&root));
+            check_scout_cancelled(cancel)?;
             let rescued = tracked
                 .as_ref()
                 .is_some_and(|set| set.contains(relative_path.as_str()));
@@ -678,6 +696,22 @@ pub fn scout_repository_with_exclusions(
     )
 }
 
+/// Embedded reload variant. The public scout contract stays non-cancellable;
+/// close only abandons work owned by the embedding worker.
+pub(crate) fn scout_repository_with_exclusions_cancellable(
+    root: &Path,
+    exclusions: &SourceExclusions,
+    cancel: &AtomicBool,
+) -> Result<ScoutPlan> {
+    scout_repository_with_io_and_exclusions_cancellable(
+        root,
+        exclusions,
+        |path| std::fs::metadata(path),
+        read_binary_probe,
+        Some(cancel),
+    )
+}
+
 fn scout_repository_with_metadata<F>(root: &Path, metadata_reader: F) -> Result<ScoutPlan>
 where
     F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
@@ -724,7 +758,13 @@ where
         language,
         classification: FileClassification::for_indexed_path(relative_path, targets),
     };
-    let plan = scout_entries_with_io(vec![discovered], metadata_reader, probe_reader, Vec::new())?;
+    let plan = scout_entries_with_io(
+        vec![discovered],
+        metadata_reader,
+        probe_reader,
+        Vec::new(),
+        None,
+    )?;
     plan.entries
         .into_iter()
         .next()
@@ -750,9 +790,36 @@ where
     F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
     P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
 {
+    scout_repository_with_io_and_exclusions_cancellable(
+        root,
+        exclusions,
+        metadata_reader,
+        probe_reader,
+        None,
+    )
+}
+
+fn scout_repository_with_io_and_exclusions_cancellable<F, P>(
+    root: &Path,
+    exclusions: &SourceExclusions,
+    metadata_reader: F,
+    probe_reader: P,
+    cancel: Option<&AtomicBool>,
+) -> Result<ScoutPlan>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+{
     let (discovered, walk_issues) =
-        discover_all_files_with_exclusions_and_issues(root, exclusions)?;
-    scout_entries_with_io(discovered, metadata_reader, probe_reader, walk_issues)
+        discover_all_files_with_exclusions_and_issues_cancellable(root, exclusions, cancel)?;
+    check_scout_cancelled(cancel)?;
+    scout_entries_with_io(
+        discovered,
+        metadata_reader,
+        probe_reader,
+        walk_issues,
+        cancel,
+    )
 }
 
 fn scout_entries_with_io<F, P>(
@@ -760,6 +827,7 @@ fn scout_entries_with_io<F, P>(
     metadata_reader: F,
     mut probe_reader: P,
     mut issues: Vec<ScoutIssue>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ScoutPlan>
 where
     F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
@@ -784,6 +852,7 @@ where
     }
 
     for mut entry in discovered {
+        check_scout_cancelled(cancel)?;
         let (catalog_path, path_reason) = catalog_path_projection(&entry.relative_os_path);
         let public_id = catalog_path.public_id.clone();
         let metadata = match metadata_reader(&entry.absolute_path) {
@@ -863,6 +932,7 @@ where
                 terminal => terminal,
             }
         };
+        check_scout_cancelled(cancel)?;
         if matches!(decision, ScoutDecision::Ingest { .. }) {
             admitted_content_bytes = admitted_content_bytes.saturating_add(entry.file_size);
         }

@@ -1,0 +1,55 @@
+# Gates: leaf 1.1, plan Task 1, align the release baseline
+
+OWNS: docs/research/fathom-embed-ledger-plan-aligned/baselines/*.json
+
+Scope: the working branch `feature/fathom-embed-contract` is built on v11.2.0 (b549aa7), that revision is the cited worker-backed source at version 11.2.0, the verification suites were measured green at exactly that revision, and nothing outside the plan's tasks rides along
+
+Plan: docs/plans/2026-09-15-fathom-embed-alignment.md, Task 1. At drafting time
+(2026-09-15) the branch's HEAD was b549aa7 with uncommitted work for Tasks 2
+and 3 already present, so the "aligned source" moment of Task 1 Step 3 is
+measured on a detached temporary worktree at b549aa7 (PROMPT.md step 3) rather
+than on the branch.
+
+- [ ] G0: this ledger states outcomes that can fail
+  CHECK: node C:/Users/rakovnik/.claude/skills/unlazy/scripts/gate-lint.mjs docs/research/fathom-embed-ledger-plan-aligned/gates/leaf-1.1.md
+  EXPECT: LINT OK
+  EVIDENCE: pending
+
+- [ ] G1: the checked-out branch descends from v11.2.0 commit b549aa7
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label descends-from-v11.2.0 -- git merge-base --is-ancestor b549aa7db59dcc10aff3f3493f12ed6509f2e2e1 HEAD
+  EXPECT: LEDGER-ORACLE RUN GREEN label=descends-from-v11.2.0;
+  EVIDENCE: pending
+
+- [ ] G2: the local tag v11.2.0 names commit b549aa7
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label tag-is-b549aa7 --require b549aa7db59dcc10aff3f3493f12ed6509f2e2e1 -- git rev-list -n 1 v11.2.0
+  EXPECT: LEDGER-ORACLE RUN GREEN label=tag-is-b549aa7;
+  EVIDENCE: pending
+
+- [ ] G3: the Cargo.toml at b549aa7 declares version 11.2.0
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label base-version --require "version = " --require 11.2.0 -- git show b549aa7:Cargo.toml
+  EXPECT: LEDGER-ORACLE RUN GREEN label=base-version;
+  EVIDENCE: pending
+
+- [ ] G4: the embedded.rs at b549aa7 is the worker-backed shape the brief cites
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label worker-backed-embedded --require symforge-embed- --require reload_and_publish --require wait_refresh_visibility_or_stop -- git show b549aa7:src/index_lifecycle/embedded.rs
+  EXPECT: LEDGER-ORACLE RUN GREEN label=worker-backed-embedded;
+  EVIDENCE: pending
+
+- [ ] G5: the default suite baseline was recorded at b549aa7 with no failing test
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs baseline-head --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-default.json --expect b549aa7
+  EXPECT: /LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=\d+ failed=0;/
+  EVIDENCE: pending
+
+- [ ] G6: the embed lib suite baseline, which is plan Task 1's embed gate on the aligned source, was recorded at b549aa7 with no failing test
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs baseline-head --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-lib.json --expect b549aa7
+  EXPECT: /LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=\d+ failed=0;/
+  EVIDENCE: pending
+
+- [ ] G7: the embed integration target baseline was recorded at b549aa7 with no failing test
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs baseline-head --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-integration.json --expect b549aa7
+  EXPECT: /LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=\d+ failed=0;/
+  EVIDENCE: pending
+
+- [ ] G8: every path changed since the release baseline belongs to a named C3 row, with the reason recorded
+  RECORD: the output of `git diff --stat v11.2.0` mapped path by path. Owner revision 2: `.github/workflows/ci.yml` and `tests/preventive_runtime_dark_v11.rs` belong to Task 3 Step 5 (embed integration CI step plus its workflow fingerprint and cargo-line pins). `src/protocol/tools.rs`, `src/protocol/edit_tools.rs`, `tests/conformance.rs` and `src/stel/surface_list.rs` are the named 200-character harness companion: keep them, isolate as their own commit, do not treat as unlabeled extras. Any other unlisted path is a defect.
+  EVIDENCE: pending

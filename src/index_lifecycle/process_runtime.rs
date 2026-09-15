@@ -96,6 +96,7 @@ pub struct ProcessIndexRuntime {
     ledger: Arc<ProcessCapacityPool>,
     root: OwnerIdentity,
     surfaces: std::sync::Mutex<HashMap<SurfaceKind, OwnerIdentity>>,
+    embedded_factory: Arc<super::embedded::EmbeddedSourceFactory>,
 }
 
 impl ProcessIndexRuntime {
@@ -108,6 +109,7 @@ impl ProcessIndexRuntime {
             ledger,
             root,
             surfaces: std::sync::Mutex::new(HashMap::new()),
+            embedded_factory: super::embedded::EmbeddedSourceFactory::new(),
         })
     }
 
@@ -128,6 +130,11 @@ impl ProcessIndexRuntime {
     /// The root owner backing the whole process.
     pub fn root_owner(&self) -> OwnerIdentity {
         self.root
+    }
+
+    /// The one embedded-source registry shared by every acquired embed runtime.
+    pub(crate) fn embedded_factory(&self) -> Arc<super::embedded::EmbeddedSourceFactory> {
+        Arc::clone(&self.embedded_factory)
     }
 
     /// Attach a surface, giving it a capacity owner beneath the process root.

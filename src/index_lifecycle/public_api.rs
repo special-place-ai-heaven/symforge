@@ -502,19 +502,15 @@ impl Drop for ProcessRuntimeApi {
 }
 
 impl ProcessRuntimeApi {
-    /// The atom's shape: no receiver, no arguments. Since C5 the embed
-    /// surface ATTACHES: acquisition runs the process activation ceremony
-    /// (idempotent) and joins the ONE process capacity runtime every other
-    /// surface attaches to — the C4b daemon/stdio/serve pattern — instead
-    /// of minting a private incarnation with a provisional budget. The
-    /// `Result` shape is the contract's; the current admission cannot
-    /// refuse, and the refusing evidence arrives with the measured budgets
-    /// (C7/C8).
+    /// Attach this API to the one process runtime and allocate an independent
+    /// runtime owner over its shared embedded-source registry.
     pub fn acquire() -> Result<Self, EmbedSourceRefusal> {
         super::activation::activate_surface(super::process_runtime::SurfaceKind::Embed);
+        let inner = super::activation::process_index_runtime();
+        let owner = super::embedded::EmbeddedRuntimeOwner::new(inner.embedded_factory());
         Ok(Self {
-            _inner: super::activation::process_index_runtime(),
-            owner: super::embedded::EmbeddedRuntimeOwner::new(),
+            _inner: inner,
+            owner,
             _not_unwind_safe: std::marker::PhantomData,
         })
     }
@@ -545,7 +541,7 @@ impl ProcessRuntimeApi {
         let state_placement = crate::discovery::resolve_state_placement(&binding);
         self.owner
             .factory()
-            .open_bound(binding, state_placement)
+            .open_bound(binding, state_placement, self.owner.identity())
             .map_err(|refusal| match refusal {
                 super::embedded::EmbeddedOpenError::SourceAlreadyOpen => bound_source_refusal(
                     SourceRefusalKind::SelectionUnavailable,
