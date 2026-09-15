@@ -217,6 +217,9 @@ jobs:
       - name: Run embed-feature lib tests
         run: cargo test --no-default-features --features embed --lib -- --test-threads=1
 
+      - name: Run embed-feature integration contract
+        run: cargo test --no-default-features --features embed --test embed_bound_index -- --test-threads=1
+
   embed-musl:
     needs: release-version
     runs-on: ubuntu-latest

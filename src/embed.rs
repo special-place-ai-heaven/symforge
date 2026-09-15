@@ -77,11 +77,12 @@ pub fn engine_info() -> EngineInfo {
 pub use crate::index_lifecycle::embedded::SourceCloseReceipt;
 pub use crate::index_lifecycle::embedded::{EmbeddedSourceHandle, ReceiptWaitError};
 pub use crate::index_lifecycle::public_api::{
-    EmbedAtomicAuthority as AtomicAuthority, EmbedClaim as Claim,
+    CensusFile, EmbedAtomicAuthority as AtomicAuthority, EmbedClaim as Claim,
     EmbedClaimProvenance as ClaimProvenance, EmbedEvaluationProvenance as EvaluationProvenance,
     EmbedOperationReceipt as OperationReceipt, EmbedRefreshTicket as RefreshTicket,
     EmbedShutdownReceipt as ShutdownReceipt, EmbedSourceRefusal as SourceRefusal,
-    EmbeddedSourceSpec, OperationKind, ProcessRuntimeApi as ProcessIndexRuntime, RetryAdvice,
+    EmbeddedSourceSpec, IndexCensus, IndexProgress, KnowledgeMatch, KnowledgeSearchRequest,
+    KnowledgeSearchResult, OperationKind, ProcessRuntimeApi as ProcessIndexRuntime, RetryAdvice,
     ShutdownReport, SourceCloseReport, SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView,
     SymbolMatch, SymbolSearchRequest, SymbolSearchResult, TextMatch, TextSearchRequest,
     TextSearchResult,
@@ -97,23 +98,31 @@ mod contract {
     //! in the activation-cut oracles (`tests/activation_cut_v11.rs`).
     #[allow(unused_imports)]
     use crate::embed::{
-        AtomicAuthority, Claim, ClaimProvenance, EmbeddedSourceHandle, EmbeddedSourceSpec,
-        EngineInfo, EvaluationProvenance, OperationKind, OperationReceipt, ProcessIndexRuntime,
-        ReceiptWaitError, RefreshTicket, RetryAdvice, ShutdownReceipt, ShutdownReport,
-        SourceCloseReceipt, SourceCloseReport, SourceRefusal, SourceRefusalKind,
-        SourceRuntimePhase, SourceRuntimeView, SymbolMatch, SymbolSearchRequest,
-        SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult, engine_info,
+        AtomicAuthority, CensusFile, Claim, ClaimProvenance, EmbeddedSourceHandle,
+        EmbeddedSourceSpec, EngineInfo, EvaluationProvenance, IndexCensus, IndexProgress,
+        KnowledgeMatch, KnowledgeSearchRequest, KnowledgeSearchResult, OperationKind,
+        OperationReceipt, ProcessIndexRuntime, ReceiptWaitError, RefreshTicket, RetryAdvice,
+        ShutdownReceipt, ShutdownReport, SourceCloseReceipt, SourceCloseReport, SourceRefusal,
+        SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch,
+        SymbolSearchRequest, SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult,
+        engine_info,
     };
 
     #[test]
     fn facade_contract_is_stable() {
         fn _assert_named<T>() {}
         _assert_named::<AtomicAuthority>();
+        _assert_named::<CensusFile>();
         _assert_named::<Claim<u64>>();
         _assert_named::<ClaimProvenance>();
         _assert_named::<EmbeddedSourceHandle>();
         _assert_named::<EmbeddedSourceSpec>();
         _assert_named::<EvaluationProvenance>();
+        _assert_named::<IndexCensus>();
+        _assert_named::<IndexProgress>();
+        _assert_named::<KnowledgeMatch>();
+        _assert_named::<KnowledgeSearchRequest>();
+        _assert_named::<KnowledgeSearchResult>();
         _assert_named::<OperationKind>();
         _assert_named::<OperationReceipt>();
         _assert_named::<ProcessIndexRuntime>();

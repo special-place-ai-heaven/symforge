@@ -1,6 +1,125 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
+
+fn check_scout_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        anyhow::bail!("embedded reload cancelled during scout");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "__test-internals")]
+struct ScoutGateState {
+    pause_after_files: usize,
+    seen: std::sync::atomic::AtomicUsize,
+    blocked: std::sync::Mutex<bool>,
+    reached: std::sync::Condvar,
+    released: AtomicBool,
+}
+
+#[cfg(feature = "__test-internals")]
+static SCOUT_GATES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<ScoutGateState>>>,
+> = std::sync::OnceLock::new();
+
+/// Root-scoped hold in the scout walk so close-during-scout tests can park
+/// part-way through the walk without a sleep.
+#[cfg(feature = "__test-internals")]
+pub struct ScoutGateForTest {
+    root: PathBuf,
+    state: std::sync::Arc<ScoutGateState>,
+}
+
+#[cfg(feature = "__test-internals")]
+pub fn hold_scout_after_files_for_test(root: &Path, pause_after_files: usize) -> ScoutGateForTest {
+    assert!(
+        pause_after_files > 0,
+        "scout gate needs a positive file count"
+    );
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let state = std::sync::Arc::new(ScoutGateState {
+        pause_after_files,
+        seen: std::sync::atomic::AtomicUsize::new(0),
+        blocked: std::sync::Mutex::new(false),
+        reached: std::sync::Condvar::new(),
+        released: AtomicBool::new(false),
+    });
+    let gates = SCOUT_GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let previous = gates
+        .lock()
+        .expect("scout gate registry")
+        .insert(root.clone(), std::sync::Arc::clone(&state));
+    assert!(previous.is_none(), "a root can hold only one scout gate");
+    ScoutGateForTest { root, state }
+}
+
+#[cfg(feature = "__test-internals")]
+impl ScoutGateForTest {
+    pub fn wait_until_blocked(&self, timeout: std::time::Duration) -> bool {
+        let blocked = self.state.blocked.lock().expect("scout gate state");
+        let (blocked, _) = self
+            .state
+            .reached
+            .wait_timeout_while(blocked, timeout, |blocked| !*blocked)
+            .expect("scout gate state");
+        *blocked
+    }
+
+    pub fn files_seen(&self) -> usize {
+        self.state.seen.load(Ordering::Acquire)
+    }
+
+    pub fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+        self.state.reached.notify_all();
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for ScoutGateForTest {
+    fn drop(&mut self) {
+        self.release();
+        let gates =
+            SCOUT_GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut gates = gates.lock().expect("scout gate registry");
+        if gates
+            .get(&self.root)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.state))
+        {
+            gates.remove(&self.root);
+        }
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+fn pause_scout_after_files_for_test(root: &Path, cancel: Option<&AtomicBool>) {
+    let Some(state) = SCOUT_GATES
+        .get()
+        .and_then(|gates| gates.lock().ok()?.get(root).cloned())
+    else {
+        return;
+    };
+    if state.seen.fetch_add(1, Ordering::AcqRel) + 1 != state.pause_after_files {
+        return;
+    }
+    let mut blocked = state.blocked.lock().expect("scout gate state");
+    *blocked = true;
+    state.reached.notify_all();
+    while !state.released.load(Ordering::Acquire)
+        && !cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        let (next, _) = state
+            .reached
+            .wait_timeout(blocked, std::time::Duration::from_millis(5))
+            .expect("scout gate state");
+        blocked = next;
+    }
+}
+
+#[cfg(not(feature = "__test-internals"))]
+fn pause_scout_after_files_for_test(_root: &Path, _cancel: Option<&AtomicBool>) {}
 
 use crate::domain::{
     AccessErrorKind, AccessStage, CatalogPath, CoverageStatus, FileClassification, FileStamp,
@@ -533,6 +652,14 @@ fn discover_all_files_with_exclusions_and_issues(
     root: &Path,
     exclusions: &SourceExclusions,
 ) -> Result<(Vec<DiscoveredEntry>, Vec<ScoutIssue>)> {
+    discover_all_files_with_exclusions_and_issues_cancellable(root, exclusions, None)
+}
+
+fn discover_all_files_with_exclusions_and_issues_cancellable(
+    root: &Path,
+    exclusions: &SourceExclusions,
+    cancel: Option<&AtomicBool>,
+) -> Result<(Vec<DiscoveredEntry>, Vec<ScoutIssue>)> {
     // Canonicalize root so that strip_prefix succeeds even when the walker
     // resolves symlinks to their canonical targets.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -557,6 +684,7 @@ fn discover_all_files_with_exclusions_and_issues(
     // "no git / unreadable index" (fail open: heuristic decides alone, as before).
     let mut tracked_for_build_dirs: Option<Option<std::collections::HashSet<String>>> = None;
     for entry_result in repository_walk(&root, exclusions) {
+        check_scout_cancelled(cancel)?;
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
@@ -574,6 +702,8 @@ fn discover_all_files_with_exclusions_and_issues(
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
         }
+        pause_scout_after_files_for_test(&root, cancel);
+        check_scout_cancelled(cancel)?;
 
         // Get file size from the walk metadata (DirEntry has it on most platforms).
         // Fall back to a stat call only when metadata is unavailable.
@@ -603,6 +733,7 @@ fn discover_all_files_with_exclusions_and_issues(
             // git is unavailable the set is `None` and the heuristic decides alone.
             let tracked = tracked_for_build_dirs
                 .get_or_insert_with(|| tracked_path_set_for_build_dir_rescue(&root));
+            check_scout_cancelled(cancel)?;
             let rescued = tracked
                 .as_ref()
                 .is_some_and(|set| set.contains(relative_path.as_str()));
@@ -678,6 +809,22 @@ pub fn scout_repository_with_exclusions(
     )
 }
 
+/// Embedded reload variant. The public scout contract stays non-cancellable;
+/// close only abandons work owned by the embedding worker.
+pub(crate) fn scout_repository_with_exclusions_cancellable(
+    root: &Path,
+    exclusions: &SourceExclusions,
+    cancel: &AtomicBool,
+) -> Result<ScoutPlan> {
+    scout_repository_with_io_and_exclusions_cancellable(
+        root,
+        exclusions,
+        |path| std::fs::metadata(path),
+        read_binary_probe,
+        Some(cancel),
+    )
+}
+
 fn scout_repository_with_metadata<F>(root: &Path, metadata_reader: F) -> Result<ScoutPlan>
 where
     F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
@@ -724,7 +871,13 @@ where
         language,
         classification: FileClassification::for_indexed_path(relative_path, targets),
     };
-    let plan = scout_entries_with_io(vec![discovered], metadata_reader, probe_reader, Vec::new())?;
+    let plan = scout_entries_with_io(
+        vec![discovered],
+        metadata_reader,
+        probe_reader,
+        Vec::new(),
+        None,
+    )?;
     plan.entries
         .into_iter()
         .next()
@@ -750,9 +903,36 @@ where
     F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
     P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
 {
+    scout_repository_with_io_and_exclusions_cancellable(
+        root,
+        exclusions,
+        metadata_reader,
+        probe_reader,
+        None,
+    )
+}
+
+fn scout_repository_with_io_and_exclusions_cancellable<F, P>(
+    root: &Path,
+    exclusions: &SourceExclusions,
+    metadata_reader: F,
+    probe_reader: P,
+    cancel: Option<&AtomicBool>,
+) -> Result<ScoutPlan>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+{
     let (discovered, walk_issues) =
-        discover_all_files_with_exclusions_and_issues(root, exclusions)?;
-    scout_entries_with_io(discovered, metadata_reader, probe_reader, walk_issues)
+        discover_all_files_with_exclusions_and_issues_cancellable(root, exclusions, cancel)?;
+    check_scout_cancelled(cancel)?;
+    scout_entries_with_io(
+        discovered,
+        metadata_reader,
+        probe_reader,
+        walk_issues,
+        cancel,
+    )
 }
 
 fn scout_entries_with_io<F, P>(
@@ -760,6 +940,7 @@ fn scout_entries_with_io<F, P>(
     metadata_reader: F,
     mut probe_reader: P,
     mut issues: Vec<ScoutIssue>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ScoutPlan>
 where
     F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
@@ -784,6 +965,7 @@ where
     }
 
     for mut entry in discovered {
+        check_scout_cancelled(cancel)?;
         let (catalog_path, path_reason) = catalog_path_projection(&entry.relative_os_path);
         let public_id = catalog_path.public_id.clone();
         let metadata = match metadata_reader(&entry.absolute_path) {
@@ -863,6 +1045,7 @@ where
                 terminal => terminal,
             }
         };
+        check_scout_cancelled(cancel)?;
         if matches!(decision, ScoutDecision::Ingest { .. }) {
             admitted_content_bytes = admitted_content_bytes.saturating_add(entry.file_size);
         }
@@ -3956,6 +4139,7 @@ mod tests {
                 |_path| -> io::Result<std::fs::Metadata> { unreachable!("no discovered entries") },
                 |_path, _limit| -> io::Result<Vec<u8>> { unreachable!("no discovered entries") },
                 vec![issue],
+                None,
             )
             .expect("walk issue must remain a bounded degraded scout result");
 
@@ -4151,6 +4335,7 @@ mod tests {
                 |path| std::fs::metadata(path),
                 |_path, _max_bytes| Ok(Vec::new()),
                 Vec::new(),
+                None,
             )
             .expect("case-fold pair must remain scoutable");
             let ordered_paths = complete
@@ -4194,6 +4379,7 @@ mod tests {
                 },
                 |_path, _max_bytes| Ok(Vec::new()),
                 Vec::new(),
+                None,
             )
             .expect("one failed case-fold peer must not abort the other");
 
@@ -4278,6 +4464,7 @@ mod tests {
                     Ok(Vec::new())
                 },
                 Vec::new(),
+                None,
             )
             .expect("opaque paths must remain catalogable");
 
@@ -4334,6 +4521,7 @@ mod tests {
                     Ok(Vec::new())
                 },
                 Vec::new(),
+                None,
             )
             .expect("unsafe path metadata must remain catalogable by opaque ID");
 

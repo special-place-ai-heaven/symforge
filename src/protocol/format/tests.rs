@@ -565,6 +565,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
             }],
             suppressed_by_noise: 0,
             overflow_count: 0,
+            excluded_knowledge_files: 0,
         }),
         Some("symbol"),
         None,
@@ -593,6 +594,7 @@ fn empty_text_search_result(
         files: vec![],
         suppressed_by_noise: 0,
         overflow_count: 0,
+        excluded_knowledge_files: 0,
     })
 }
 
@@ -681,6 +683,134 @@ fn test_search_text_zero_hit_drops_include_tests_when_already_included() {
     assert!(
         !rendered.contains("include_tests=true"),
         "must not suggest include_tests=true when tests already included; got: {rendered}"
+    );
+}
+
+fn make_knowledge_file(path: &str, content: &[u8]) -> (String, IndexedFile) {
+    let targets = crate::domain::IndexTargets::Knowledge;
+    (
+        path.to_string(),
+        IndexedFile {
+            relative_path: path.to_string(),
+            language: LanguageId::Markdown,
+            classification: crate::domain::FileClassification::for_indexed_path(path, targets),
+            content: content.to_vec(),
+            symbols: vec![],
+            parse_status: ParseStatus::Parsed,
+            parse_diagnostic: None,
+            byte_len: content.len() as u64,
+            content_hash: "test".to_string(),
+            references: vec![],
+            alias_map: HashMap::new(),
+            mtime_secs: 0,
+        },
+    )
+}
+
+fn catalog_indexed(
+    path: &str,
+    targets: crate::domain::IndexTargets,
+    language: LanguageId,
+) -> crate::domain::CatalogEntry {
+    crate::domain::CatalogEntry {
+        path: crate::domain::CatalogPath {
+            public_id: path.to_string(),
+            normalized_utf8: Some(path.to_string()),
+        },
+        size: 10,
+        language: Some(language),
+        classification: crate::domain::FileClassification::for_indexed_path(path, targets),
+        disposition: crate::domain::FileDisposition::Indexed {
+            targets,
+            parse_status: crate::domain::index::ParseStatus::Parsed,
+        },
+        content_hash: Some("test".to_string()),
+    }
+}
+
+/// Code under `src/code/`, one knowledge file under `src/`, two more outside
+/// `src/` so a path-scoped zero-hit must report 1, not 3.
+fn knowledge_scope_fixture() -> LiveIndex {
+    let mut index = make_index(vec![
+        make_file("src/code/lib.rs", b"fn main() {}\n", vec![]),
+        make_knowledge_file("src/notes.md", b"# Notes\n\nknowledge-needle-xyz\n"),
+        make_knowledge_file("docs/guide.md", b"# Guide\n\nknowledge-needle-xyz\n"),
+        make_knowledge_file("README.md", b"# Readme\n\nknowledge-needle-xyz\n"),
+    ]);
+    index.manifest_entries = vec![
+        catalog_indexed(
+            "src/code/lib.rs",
+            crate::domain::IndexTargets::Code,
+            LanguageId::Rust,
+        ),
+        catalog_indexed(
+            "src/notes.md",
+            crate::domain::IndexTargets::Knowledge,
+            LanguageId::Markdown,
+        ),
+        catalog_indexed(
+            "docs/guide.md",
+            crate::domain::IndexTargets::Knowledge,
+            LanguageId::Markdown,
+        ),
+        catalog_indexed(
+            "README.md",
+            crate::domain::IndexTargets::Knowledge,
+            LanguageId::Markdown,
+        ),
+    ];
+    index
+}
+
+fn render_code_search_zero_hit(index: &LiveIndex, path_prefix: &str, query: &str) -> String {
+    let mut options = search::TextSearchOptions::for_current_code_search();
+    options.path_scope = search::PathScope::prefix(path_prefix);
+    search_text_result_view(
+        search::search_text_with_options(index, Some(query), None, false, &options),
+        None,
+        None,
+        None,
+        SearchSuggestionContext::default(),
+    )
+}
+
+#[test]
+fn search_text_zero_hit_reports_exact_excluded_knowledge_count() {
+    let index = knowledge_scope_fixture();
+    let rendered = render_code_search_zero_hit(&index, "src", "knowledge-needle-xyz");
+    assert!(
+        rendered.starts_with("No matches for 'knowledge-needle-xyz'"),
+        "code-scoped search must not scan knowledge files; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("1 in-scope knowledge-only file"),
+        "must report the in-scope knowledge file only; got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("3 in-scope knowledge-only"),
+        "must not count knowledge files outside the path scope; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("search_knowledge"),
+        "zero-hit must point at search_knowledge; got: {rendered}"
+    );
+}
+
+#[test]
+fn search_text_zero_hit_without_excluded_knowledge_adds_no_note() {
+    let index = knowledge_scope_fixture();
+    let rendered = render_code_search_zero_hit(&index, "src/code", "knowledge-needle-xyz");
+    assert!(
+        rendered.starts_with("No matches for 'knowledge-needle-xyz'"),
+        "zero-hit should still render the no-match line; got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("knowledge-only"),
+        "scope with no knowledge-only files must not add a note; got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("search_knowledge"),
+        "scope with no knowledge-only files must not point at search_knowledge; got: {rendered}"
     );
 }
 

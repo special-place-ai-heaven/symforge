@@ -65,7 +65,7 @@ fn surface_tool(
 pub fn compact_surface_tools() -> Vec<Tool> {
     let mut symforge = surface_tool(
         CompactSurfaceTool::Symforge.as_str(),
-        "STEL read/explore facade — natural-language code intelligence with token economics.",
+        "STEL read/explore facade - natural-language code intelligence with token economics.",
         schema_object::<StelRequest>(),
     );
     let mut annotations = rmcp::model::ToolAnnotations::default();
@@ -77,7 +77,7 @@ pub fn compact_surface_tools() -> Vec<Tool> {
         symforge,
         surface_tool(
             CompactSurfaceTool::SymforgeEdit.as_str(),
-            "STEL structural edit facade — symbol-aware edits with economics gate.",
+            "STEL structural edit facade - symbol-aware edits with economics gate.",
             schema_object::<StelEditRequest>(),
         ),
         surface_tool(

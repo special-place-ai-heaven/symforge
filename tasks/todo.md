@@ -1,3 +1,32 @@
+# Fathom Embed Alignment — 2026-09-15
+
+## Plan
+
+- [x] Reindex SymForge, read the Fathom evidence brief, and verify the local embed API shape.
+- [x] Establish CR-0 root cause: `ProcessRuntimeApi::acquire()` makes one factory per runtime, not one process-wide factory.
+- [x] Establish release-source discrepancy: this checkout is `11.1.0`, has no local `v11.2.0` tag, and lacks the worker-backed CR-1 architecture cited by Fathom.
+- [x] Branch from Fathom's exact `v11.2.0` source before changing the cited embed lifecycle.
+- [ ] Add RED/GREEN regressions and implement CR-0 through CR-3: process-wide ownership, cooperative close, census, and live progress.
+- [ ] Make code and knowledge search scope/withholding, selectors, receipts, and path-prefix behavior explicit and truthful.
+- [ ] Verify the appropriate embed/server gates, document release evidence, and tag the delivered CRs.
+
+## Evidence Log
+
+- Fathom needs document retrieval through `search_knowledge`; code search must not silently claim exhaustive prose coverage.
+- CR-0 is directly reproducible from current source ownership. CR-1 is not safely actionable until the cited release source is available.
+- The release source was fetched from `v11.2.0` (`b549aa7`) and implementation now runs on `feature/fathom-embed-contract`.
+- CR-0 RED: a second `ProcessRuntimeApi::acquire()` opened the same root, proving its factory was runtime-local. GREEN: the focused cross-runtime regression passes after moving registry ownership to `ProcessIndexRuntime` and giving each acquired runtime a distinct shutdown owner.
+- CR-0 unwind RED: an injected post-worker-start panic poisoned the factory mutex and aborted the test process. GREEN: a process-wide root reservation plus `OpenRollback` clears admission and stops the binding on unwinding; the panic regression and the 8-test activation gate pass.
+- The current shared-factory CR-0 gate was rerun after the reservation refactor: `cargo test --test activation_cut_v11 -- --test-threads=1` passed all 8 named tests on 2026-09-15.
+- Embed CI now runs the named `embed_bound_index` integration contract under `--no-default-features --features embed`; library-only tests did not compile that target.
+- CR-1 first close gate: `drop_while_loading_returns_within_one_second` uses a root-scoped in-crate parse gate and passed in `cargo test --no-default-features --features embed --test embed_bound_index -- --test-threads=1` (2 named tests, 2026-09-15). The gate releases on the binding's close flag, so it tests cooperative cancellation rather than delaying shutdown artificially.
+
+## Review
+
+Plan recorded; implementation awaits confirmation of the source baseline.
+
+---
+
 # SymForge v11.0.5 Blind Stress Evaluation — 2026-08-24
 
 ## Plan

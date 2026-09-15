@@ -732,6 +732,7 @@ mod tests {
             }],
             suppressed_by_noise: 0,
             overflow_count: 0,
+            excluded_knowledge_files: 0,
         };
         compact_text_search_result(&mut result, "disk");
         let lines: Vec<_> = result.files[0]

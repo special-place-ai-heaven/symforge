@@ -1164,6 +1164,20 @@ fn no_match_suggestions(ctx: SearchSuggestionContext) -> String {
     suggestions.join(", ")
 }
 
+/// Zero-hit suffix when code-scoped search skipped in-scope knowledge-only files.
+///
+/// Returns `message` unchanged when `excluded` is 0 so a scope with no
+/// knowledge-only files never grows a `search_knowledge` note.
+pub(crate) fn append_excluded_knowledge_note(message: String, excluded: usize) -> String {
+    if excluded == 0 {
+        return message;
+    }
+    let noun = if excluded == 1 { "file" } else { "files" };
+    format!(
+        "{message}\nThis search did not scan {excluded} in-scope knowledge-only {noun}; use search_knowledge."
+    )
+}
+
 pub fn search_text_result_view(
     result: Result<search::TextSearchResult, search::TextSearchError>,
     group_by: Option<&str>,
@@ -1231,36 +1245,37 @@ pub fn search_text_result_view(
     };
 
     if result.files.is_empty() {
-        if result.suppressed_by_noise > 0 {
-            return format!(
+        let message = if result.suppressed_by_noise > 0 {
+            format!(
                 "No matches for {} in source code. {} match(es) found in test modules — set include_tests=true to include them.",
                 result.label, result.suppressed_by_noise
-            );
-        }
-        // Structural searches can reach this branch three ways:
-        //   1. pattern compiled for at least one candidate, matched nothing
-        //   2. the index held no source-language candidates at all
-        //   3. candidates existed but were all filtered out by globs / noise
-        // The specific message can't distinguish them without an extra
-        // counter, so avoid the earlier "Pattern parsed OK" overclaim and
-        // just point at the levers that widen the search.
-        if result.label.starts_with("structural ") {
+            )
+        } else if result.label.starts_with("structural ") {
+            // Structural searches can reach this branch three ways:
+            //   1. pattern compiled for at least one candidate, matched nothing
+            //   2. the index held no source-language candidates at all
+            //   3. candidates existed but were all filtered out by globs / noise
+            // The specific message can't distinguish them without an extra
+            // counter, so avoid the earlier "Pattern parsed OK" overclaim and
+            // just point at the levers that widen the search.
             let widen = if suggestion_ctx.include_tests {
                 "include_generated=true / broader path_prefix"
             } else {
                 "include_tests=true / include_generated=true / broader path_prefix"
             };
-            return format!(
+            format!(
                 "No AST matches for {}. Consider widening the search \
                  ({widen}) or simplifying the pattern.",
                 result.label
-            );
-        }
-        return format!(
-            "No matches for {}. Suggestions: {}.",
-            result.label,
-            no_match_suggestions(suggestion_ctx)
-        );
+            )
+        } else {
+            format!(
+                "No matches for {}. Suggestions: {}.",
+                result.label,
+                no_match_suggestions(suggestion_ctx)
+            )
+        };
+        return append_excluded_knowledge_note(message, result.excluded_knowledge_files);
     }
 
     let mut lines = vec![if let Some(confidence) = match_confidence {

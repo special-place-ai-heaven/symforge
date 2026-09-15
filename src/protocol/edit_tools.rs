@@ -903,7 +903,7 @@ impl SymForgeServer {
     /// NOT for removing a symbol entirely (use delete_symbol).
     #[tool(
         name = "replace_symbol_body",
-        description = "Replace a symbol's entire definition with new source code. The index resolves the symbol's byte range server-side — no need to read the file first. Content is auto-indented to match the original symbol's indentation level. Use symbol_line to disambiguate overloaded names. NOT for small edits within a symbol (use edit_within_symbol). NOT for removing a symbol entirely (use delete_symbol).",
+        description = "Replace a symbol's entire definition; the index resolves the range (no prior read). Not a small inner edit (edit_within_symbol) or a deletion (delete_symbol).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1212,7 +1212,7 @@ impl SymForgeServer {
     /// NOT for replacing existing code (use replace_symbol_body or edit_within_symbol).
     #[tool(
         name = "insert_symbol",
-        description = "Insert code before or after a named symbol. Set position='before' or 'after' (default 'after'). Content is auto-indented to match the target symbol's indentation level — provide unindented code. Use symbol_line to disambiguate overloaded names. NOT for replacing existing code (use replace_symbol_body or edit_within_symbol).",
+        description = "Insert code before or after one named symbol (position=before|after). Pass unindented code; not a replace (replace_symbol_body) or inner edit (edit_within_symbol).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1438,7 +1438,7 @@ impl SymForgeServer {
     /// NOT for replacing a symbol (use replace_symbol_body).
     #[tool(
         name = "delete_symbol",
-        description = "Remove a symbol's entire definition and clean up surrounding blank lines. Use symbol_line to disambiguate overloaded names. NOT for replacing a symbol (use replace_symbol_body).",
+        description = "Delete a symbol's entire definition and nearby blank lines. Not a body replace (replace_symbol_body) or a scoped find-replace (edit_within_symbol).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1657,7 +1657,7 @@ impl SymForgeServer {
     /// NOT for adding new symbols (use insert_before/after_symbol).
     #[tool(
         name = "edit_within_symbol",
-        description = "Find-and-replace scoped to a symbol's byte range — won't affect code outside it. The LLM never needs to read the symbol body — just provide the old and new text. Set replace_all=true for every occurrence within the symbol. NOT for replacing the entire symbol (use replace_symbol_body). NOT for adding new symbols (use insert_before/after_symbol).",
+        description = "Find-and-replace inside one symbol's byte range only (replace_all=true for every hit). Not a whole-definition rewrite (replace_symbol_body) or a new symbol (insert_symbol).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2068,7 +2068,7 @@ impl SymForgeServer {
     /// Set dry_run=true for a read-only preview that makes no file changes.
     #[tool(
         name = "batch_edit",
-        description = "Apply multiple symbol-addressed edits atomically across files. Each edit specifies a file, symbol, and operation (replace/insert_before/insert_after/delete/edit_within). Accepts either structured edits or shorthand strings like `src/lib.rs::helper => edit_within old >>> new`. All symbols are validated before any writes — if any resolution fails, no files are modified. Set dry_run=true for a READ-ONLY preview that shows what would change without writing (safe, no confirmation needed). Edits within the same file must target non-overlapping symbols. NOT for single-symbol edits (use replace_symbol_body, insert_symbol, etc.).",
+        description = "Apply many symbol-addressed edits atomically across files (all resolve or none write); dry_run=true previews. Not a single-symbol edit (replace_symbol_body / insert_symbol).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2205,7 +2205,7 @@ impl SymForgeServer {
     /// Set dry_run=true for a read-only preview that makes no file changes.
     #[tool(
         name = "batch_rename",
-        description = "Rename a symbol and update all references across the project. Finds the definition and all usage sites via the index's reverse reference map. Set dry_run=true for a READ-ONLY preview that lists affected files without writing any changes (safe, no confirmation needed). Applies confident matches transactionally across files; uncertain matches are surfaced for manual review instead of being modified. Common names (e.g. `new`, `get`) can still produce false positives — verify with what_changed afterward. NOT for replacing a symbol's body (use replace_symbol_body).",
+        description = "Rename a symbol and update confident references project-wide; dry_run=true previews. Uncertain matches stay for review; not a body rewrite (replace_symbol_body).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2312,7 +2312,7 @@ impl SymForgeServer {
     /// Insert the same code at multiple symbol locations across files.
     #[tool(
         name = "batch_insert",
-        description = "Insert the same code before or after multiple symbols across the project. Useful for adding logging, instrumentation, or boilerplate to many locations at once. Accepts either structured targets or shorthand strings like `src/lib.rs::helper`. Code is auto-indented to match each target symbol. All targets are validated before any writes, and live execution applies transactionally across files with rollback on failure. Set dry_run=true for a READ-ONLY preview. NOT for inserting at a single location (use insert_symbol).",
+        description = "Insert the same snippet before or after many symbols (logging, boilerplate); dry_run=true previews. Not a single-location insert (insert_symbol).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

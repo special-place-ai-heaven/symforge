@@ -2178,7 +2178,8 @@ fn embedded_source_has_one_handle_and_no_raw_bypass() {
     let root = tempfile::tempdir().expect("root");
     // Acquisition IS the embed surface's bootstrap (C5): it runs the
     // ceremony and joins the one process capacity runtime.
-    let runtime = ProcessRuntimeApi::acquire().expect("acquisition admits");
+    let runtime = ProcessRuntimeApi::acquire().expect("first acquisition admits");
+    let second_runtime = ProcessRuntimeApi::acquire().expect("second acquisition admits");
     assert_eq!(
         ActivationCut::process().mode(),
         ActivationMode::PreventiveV1Open,
@@ -2194,7 +2195,7 @@ fn embedded_source_has_one_handle_and_no_raw_bypass() {
 
     // The one raw-bypass shape still spellable: a SECOND handle to the held
     // source. It refuses with the typed selection refusal, not a clone.
-    let bypass = runtime
+    let bypass = second_runtime
         .open_embedded_source(EmbeddedSourceSpec::current_worktree(
             root.path().to_path_buf(),
         ))
@@ -2223,6 +2224,32 @@ fn embedded_source_has_one_handle_and_no_raw_bypass() {
             root.path().to_path_buf(),
         ))
         .expect("a closed source admits a fresh sole handle");
+}
+
+#[test]
+fn panicking_open_releases_its_process_wide_root_reservation() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use symforge::live_index::index_lifecycle::embedded::panic_after_start_for_test;
+    use symforge::live_index::index_lifecycle::public_api::{
+        EmbeddedSourceSpec, ProcessRuntimeApi,
+    };
+
+    let root = tempfile::tempdir().expect("root");
+    let runtime = ProcessRuntimeApi::acquire().expect("acquisition admits");
+    panic_after_start_for_test(root.path());
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        runtime.open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
+    }));
+    assert!(result.is_err(), "the scoped test hook must inject a panic");
+
+    runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
+        .expect("the rollback guard releases the root after a panic");
 }
 
 /// TEST-MUTATION (T058, Slice 4 — C6, observing body): a live ingress

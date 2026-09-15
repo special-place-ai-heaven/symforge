@@ -415,15 +415,22 @@ fn minimal_payloads_deserialize_for_all_tools() {
     }
 }
 
+fn assert_advertised_tool_description(name: &str, desc: Option<&str>) {
+    let desc = desc.unwrap_or("");
+    let len = desc.chars().count();
+    assert!(
+        !desc.is_empty() && len <= 200 && desc.is_ascii(),
+        "tool '{name}' description is {len} chars (must be nonempty ASCII and <= 200)"
+    );
+}
+
 #[test]
 fn tool_descriptions_are_nonempty() {
     for tool in SymForgeServer::tool_definitions() {
-        let desc = tool.description.as_deref().unwrap_or("");
-        assert!(
-            !desc.is_empty(),
-            "tool '{}' has an empty description",
-            tool.name
-        );
+        assert_advertised_tool_description(tool.name.as_ref(), tool.description.as_deref());
+    }
+    for tool in symforge::stel::compact_surface_tools() {
+        assert_advertised_tool_description(tool.name.as_ref(), tool.description.as_deref());
     }
 }
 

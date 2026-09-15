@@ -208,6 +208,60 @@ pub struct TextSearchResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IndexCensus {
+    pub total_files: u64,
+    pub total_symbols: u64,
+    pub files: Vec<CensusFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CensusFile {
+    pub path: String,
+    pub language: String,
+    pub symbol_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IndexProgress {
+    pub files_discovered: u64,
+    pub files_parsed: u64,
+    pub symbols_found: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KnowledgeSearchRequest {
+    pub query: String,
+    pub path_prefix: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KnowledgeMatch {
+    pub path: String,
+    pub heading_path: Vec<String>,
+    pub preview: String,
+    pub content_hash: String,
+    pub provenance_ids: Vec<String>,
+    pub relationship_evidence: Vec<String>,
+    pub authority: String,
+    pub coverage: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KnowledgeSearchResult {
+    pub matches: Vec<KnowledgeMatch>,
+    pub truncated: bool,
+    pub withheld_count: u64,
+    pub withheld_reasons: Vec<String>,
+}
+
 /// The contract-shaped ticket for work queued on an embedded source worker.
 #[derive(Debug)]
 pub struct EmbedRefreshTicket {
@@ -502,19 +556,15 @@ impl Drop for ProcessRuntimeApi {
 }
 
 impl ProcessRuntimeApi {
-    /// The atom's shape: no receiver, no arguments. Since C5 the embed
-    /// surface ATTACHES: acquisition runs the process activation ceremony
-    /// (idempotent) and joins the ONE process capacity runtime every other
-    /// surface attaches to — the C4b daemon/stdio/serve pattern — instead
-    /// of minting a private incarnation with a provisional budget. The
-    /// `Result` shape is the contract's; the current admission cannot
-    /// refuse, and the refusing evidence arrives with the measured budgets
-    /// (C7/C8).
+    /// Attach this API to the one process runtime and allocate an independent
+    /// runtime owner over its shared embedded-source registry.
     pub fn acquire() -> Result<Self, EmbedSourceRefusal> {
         super::activation::activate_surface(super::process_runtime::SurfaceKind::Embed);
+        let inner = super::activation::process_index_runtime();
+        let owner = super::embedded::EmbeddedRuntimeOwner::new(inner.embedded_factory());
         Ok(Self {
-            _inner: super::activation::process_index_runtime(),
-            owner: super::embedded::EmbeddedRuntimeOwner::new(),
+            _inner: inner,
+            owner,
             _not_unwind_safe: std::marker::PhantomData,
         })
     }
@@ -545,7 +595,7 @@ impl ProcessRuntimeApi {
         let state_placement = crate::discovery::resolve_state_placement(&binding);
         self.owner
             .factory()
-            .open_bound(binding, state_placement)
+            .open_bound(binding, state_placement, self.owner.identity())
             .map_err(|refusal| match refusal {
                 super::embedded::EmbeddedOpenError::SourceAlreadyOpen => bound_source_refusal(
                     SourceRefusalKind::SelectionUnavailable,
@@ -634,6 +684,10 @@ pub fn wrap_table() -> &'static [WrapEntry] {
             obligation: "wrapped-here",
         },
         WrapEntry {
+            atom: "symforge::embed::CensusFile",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
             atom: "symforge::embed::Claim",
             obligation: "wrapped-here",
         },
@@ -651,6 +705,26 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::EvaluationProvenance",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::IndexCensus",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::IndexProgress",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::KnowledgeMatch",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::KnowledgeSearchRequest",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::KnowledgeSearchResult",
             obligation: "wrapped-here",
         },
         WrapEntry {

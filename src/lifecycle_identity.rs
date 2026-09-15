@@ -127,7 +127,7 @@ identity_newtype!(
 
 /// The closed operation vocabulary, VERBATIM from the frozen contract:
 /// `contracts/public-api-v11.json` `type:embed:OperationKind` fixes exactly
-/// these seven variants. An earlier draft invented four provenance-shape
+/// these nine variants. An earlier draft invented four provenance-shape
 /// variants under this name; that both diverged from the contract this module's
 /// own header declares authoritative AND squatted the name T047's runtime
 /// vocabulary owns. Provenance SHAPES are named by
@@ -141,12 +141,14 @@ pub enum OperationKind {
     SearchSymbols,
     SearchText,
     ShutdownRuntime,
+    IndexCensus,
+    SearchKnowledge,
 }
 
 impl OperationKind {
     /// Every variant, once. The Cartesian oracle iterates this so a new
     /// operation cannot be added without entering the matrix.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::AcquireRuntime,
         Self::CloseSource,
         Self::OpenEmbeddedSource,
@@ -154,6 +156,8 @@ impl OperationKind {
         Self::SearchSymbols,
         Self::SearchText,
         Self::ShutdownRuntime,
+        Self::IndexCensus,
+        Self::SearchKnowledge,
     ];
 
     /// Stable display name. Part of the closed contract, not a debug string.
@@ -166,6 +170,8 @@ impl OperationKind {
             Self::SearchSymbols => "SearchSymbols",
             Self::SearchText => "SearchText",
             Self::ShutdownRuntime => "ShutdownRuntime",
+            Self::IndexCensus => "IndexCensus",
+            Self::SearchKnowledge => "SearchKnowledge",
         }
     }
 }

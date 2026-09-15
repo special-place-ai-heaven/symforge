@@ -1,6 +1,6 @@
 {
   "computed_as": "introduced_v11_atoms listed verbatim; introduced_minus_live is that list with every atom that already appears verbatim in the live pub-mod census of src/lib.rs subtracted",
-  "contract_sha256": "5e5b47b110b27f57f5cb83506130131be772047b03a0f4cacc3412e60718f5a9",
+  "contract_sha256": "576dffe38b047499effb77bb7d98aceb56c9aae2941bf4013ec2efb25b16755e",
   "forbidden_at_activation": [
     {
       "citizen": "symforge::protocol::format::claim_provenance",
@@ -15,6 +15,7 @@
     "symforge::embed::AtomicAuthority",
     "symforge::embed::AtomicAuthority::identity",
     "symforge::embed::AtomicAuthority::kind_name",
+    "symforge::embed::CensusFile",
     "symforge::embed::Claim",
     "symforge::embed::Claim::evaluation",
     "symforge::embed::Claim::operation",
@@ -36,6 +37,11 @@
     "symforge::embed::EmbeddedSourceSpec::current_worktree",
     "symforge::embed::EvaluationProvenance",
     "symforge::embed::EvaluationProvenance::identity",
+    "symforge::embed::IndexCensus",
+    "symforge::embed::IndexProgress",
+    "symforge::embed::KnowledgeMatch",
+    "symforge::embed::KnowledgeSearchRequest",
+    "symforge::embed::KnowledgeSearchResult",
     "symforge::embed::OperationKind",
     "symforge::embed::OperationReceipt",
     "symforge::embed::OperationReceipt::canonical_argument_hash",
@@ -81,6 +87,7 @@
     "symforge::embed::AtomicAuthority",
     "symforge::embed::AtomicAuthority::identity",
     "symforge::embed::AtomicAuthority::kind_name",
+    "symforge::embed::CensusFile",
     "symforge::embed::Claim",
     "symforge::embed::Claim::evaluation",
     "symforge::embed::Claim::operation",
@@ -102,6 +109,11 @@
     "symforge::embed::EmbeddedSourceSpec::current_worktree",
     "symforge::embed::EvaluationProvenance",
     "symforge::embed::EvaluationProvenance::identity",
+    "symforge::embed::IndexCensus",
+    "symforge::embed::IndexProgress",
+    "symforge::embed::KnowledgeMatch",
+    "symforge::embed::KnowledgeSearchRequest",
+    "symforge::embed::KnowledgeSearchResult",
     "symforge::embed::OperationKind",
     "symforge::embed::OperationReceipt",
     "symforge::embed::OperationReceipt::canonical_argument_hash",
@@ -153,6 +165,10 @@
       "obligation": "wrapped-here"
     },
     {
+      "atom": "symforge::embed::CensusFile",
+      "obligation": "wrapped-here"
+    },
+    {
       "atom": "symforge::embed::Claim",
       "obligation": "wrapped-here"
     },
@@ -170,6 +186,26 @@
     },
     {
       "atom": "symforge::embed::EvaluationProvenance",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::IndexCensus",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::IndexProgress",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::KnowledgeMatch",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::KnowledgeSearchRequest",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::KnowledgeSearchResult",
       "obligation": "wrapped-here"
     },
     {

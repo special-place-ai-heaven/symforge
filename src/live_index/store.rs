@@ -48,6 +48,169 @@ pub(crate) fn normalize_root(root: &Path) -> PathBuf {
     dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
+/// A candidate reload was abandoned before it reached the publish boundary.
+///
+/// This is deliberately crate-private: cancellation is the close path's
+/// implementation detail, not a second public source state.
+#[derive(Debug)]
+pub(crate) struct ReloadCancelled;
+
+impl std::fmt::Display for ReloadCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("embedded reload cancelled during close")
+    }
+}
+
+impl std::error::Error for ReloadCancelled {}
+
+pub(crate) fn reload_cancelled() -> anyhow::Error {
+    anyhow::Error::new(ReloadCancelled)
+}
+
+pub(crate) fn reload_was_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReloadCancelled>().is_some()
+}
+
+fn check_reload_cancelled(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        Err(reload_cancelled())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+struct ReloadGateState {
+    pause_after_parses: usize,
+    parsed: AtomicUsize,
+    blocked: std::sync::Mutex<bool>,
+    reached: std::sync::Condvar,
+    released: AtomicBool,
+    release_on_cancel: bool,
+}
+
+#[cfg(feature = "__test-internals")]
+static RELOAD_GATES: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<ReloadGateState>>>> =
+    OnceLock::new();
+
+/// Root-scoped deterministic observation gate for embed integration tests.
+/// It is behind the repository-only test door. The default installer
+/// releases when the close flag is set so it cannot manufacture a shutdown
+/// delay; [`hold_reload_through_cancel_for_test`] keeps the worker parked
+/// so an unrelated open can be timed against the factory lock.
+#[cfg(feature = "__test-internals")]
+pub struct ReloadGateForTest {
+    root: PathBuf,
+    state: Arc<ReloadGateState>,
+}
+
+#[cfg(feature = "__test-internals")]
+pub fn hold_reload_after_parses_for_test(
+    root: &Path,
+    pause_after_parses: usize,
+) -> ReloadGateForTest {
+    install_reload_gate(root, pause_after_parses, true)
+}
+
+/// Same parse hold as [`hold_reload_after_parses_for_test`], but cancel does
+/// not release it. Drop still releases, so a leaked gate cannot hang the suite.
+#[cfg(feature = "__test-internals")]
+pub fn hold_reload_through_cancel_for_test(
+    root: &Path,
+    pause_after_parses: usize,
+) -> ReloadGateForTest {
+    install_reload_gate(root, pause_after_parses, false)
+}
+
+#[cfg(feature = "__test-internals")]
+fn install_reload_gate(
+    root: &Path,
+    pause_after_parses: usize,
+    release_on_cancel: bool,
+) -> ReloadGateForTest {
+    assert!(
+        pause_after_parses > 0,
+        "reload gate needs a positive parse count"
+    );
+    let root = normalize_root(root);
+    let state = Arc::new(ReloadGateState {
+        pause_after_parses,
+        parsed: AtomicUsize::new(0),
+        blocked: std::sync::Mutex::new(false),
+        reached: std::sync::Condvar::new(),
+        released: AtomicBool::new(false),
+        release_on_cancel,
+    });
+    let gates = RELOAD_GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let previous = gates
+        .lock()
+        .expect("reload gate registry")
+        .insert(root.clone(), Arc::clone(&state));
+    assert!(previous.is_none(), "a root can hold only one reload gate");
+    ReloadGateForTest { root, state }
+}
+
+#[cfg(feature = "__test-internals")]
+impl ReloadGateForTest {
+    pub fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        let blocked = self.state.blocked.lock().expect("reload gate state");
+        let (blocked, _) = self
+            .state
+            .reached
+            .wait_timeout_while(blocked, timeout, |blocked| !*blocked)
+            .expect("reload gate state");
+        *blocked
+    }
+
+    pub fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+        self.state.reached.notify_all();
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for ReloadGateForTest {
+    fn drop(&mut self) {
+        self.release();
+        let gates = RELOAD_GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut gates = gates.lock().expect("reload gate registry");
+        if gates
+            .get(&self.root)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.state))
+        {
+            gates.remove(&self.root);
+        }
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) {
+    let Some(state) = RELOAD_GATES
+        .get()
+        .and_then(|gates| gates.lock().ok()?.get(source_scope).cloned())
+    else {
+        return;
+    };
+    if state.parsed.fetch_add(1, Ordering::AcqRel) + 1 != state.pause_after_parses {
+        return;
+    }
+    let mut blocked = state.blocked.lock().expect("reload gate state");
+    *blocked = true;
+    state.reached.notify_all();
+    while !state.released.load(Ordering::Acquire)
+        && !(state.release_on_cancel && cancel.is_some_and(|flag| flag.load(Ordering::Acquire)))
+    {
+        let (next, _) = state
+            .reached
+            .wait_timeout(blocked, Duration::from_millis(5))
+            .expect("reload gate state");
+        blocked = next;
+    }
+}
+
+#[cfg(not(feature = "__test-internals"))]
+fn pause_after_parse_for_test(_source_scope: &Path, _cancel: Option<&AtomicBool>) {}
+
 #[cfg(windows)]
 const INDEXING_THREAD_STACK_SIZE_ENV: &str = "SYMFORGE_INDEXING_THREAD_STACK_BYTES";
 #[cfg(windows)]
@@ -2568,6 +2731,40 @@ impl SharedIndexHandle {
         project_state_dir: Option<ProjectStateDir>,
         source_exclusions: discovery::SourceExclusions,
     ) -> anyhow::Result<()> {
+        self.reload_for_binding_with_exclusions_cancellation(
+            root,
+            project_state_dir,
+            source_exclusions,
+            None,
+        )
+    }
+
+    /// Reload for an embedded source while allowing its close path to abandon
+    /// the unpublished candidate. Other callers retain the non-cancellable
+    /// wrapper above so daemon and watcher semantics are unchanged.
+    pub(crate) fn reload_for_binding_with_exclusions_cancellable(
+        &self,
+        root: &Path,
+        project_state_dir: Option<ProjectStateDir>,
+        source_exclusions: discovery::SourceExclusions,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        self.reload_for_binding_with_exclusions_cancellation(
+            root,
+            project_state_dir,
+            source_exclusions,
+            Some(cancel),
+        )
+    }
+
+    fn reload_for_binding_with_exclusions_cancellation(
+        &self,
+        root: &Path,
+        project_state_dir: Option<ProjectStateDir>,
+        source_exclusions: discovery::SourceExclusions,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<()> {
+        check_reload_cancelled(cancel)?;
         // Watermark the published live root before the out-of-lock candidate
         // build so observer admissions that land during the window can be
         // carried into the candidate or fail the reload closed.
@@ -2575,11 +2772,13 @@ impl SharedIndexHandle {
         // Build new index data OUTSIDE the write lock (file I/O + parsing).
         // Only the final swap acquires the mutex, reducing block time from
         // seconds (full I/O) to milliseconds (in-memory index rebuild).
-        let data = LiveIndex::build_reload_data_for_binding_with_exclusions(
+        let data = LiveIndex::build_reload_data_for_binding_with_exclusions_cancellable(
             root,
             project_state_dir.as_ref(),
             &source_exclusions,
+            cancel,
         )?;
+        check_reload_cancelled(cancel)?;
         let admitted_anchor = *self.admitted_physical_anchor.lock();
         // Ada A: physical replacement = dev+ino anchor change or path-vanish
         // only — no mtime tripwire, no admitted-boundary refresh (reject B).
@@ -2619,6 +2818,7 @@ impl SharedIndexHandle {
         #[cfg(test)]
         reload_outside_lock::fire();
         let _wg = self.write_mutex.lock();
+        check_reload_cancelled(cancel)?;
         let current_live = self.live.load_full();
         merge_post_watermark_live_admissions(&watermark_live, &current_live, &mut live)?;
         self.source_exclusions.store(Arc::new(source_exclusions));
@@ -4035,16 +4235,23 @@ pub(crate) struct DerivedIndices {
 }
 
 impl DerivedIndices {
-    /// Build all derived indices from a file map. Pure function — no side effects,
-    /// no locks, safe to call from any thread.
-    pub(crate) fn build_from_files(files: &HashMap<String, Arc<IndexedFile>>) -> Self {
+    fn build_from_files_cancellable(
+        files: &HashMap<String, Arc<IndexedFile>>,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<Self> {
+        check_reload_cancelled(cancel)?;
+        let trigram_index = super::trigram::TrigramIndex::build_from_files(files);
+        check_reload_cancelled(cancel)?;
+        let reverse_index = build_reverse_index_from_files(files);
+        check_reload_cancelled(cancel)?;
         let (files_by_basename, files_by_dir_component) = build_path_indices_from_files(files);
-        Self {
-            trigram_index: super::trigram::TrigramIndex::build_from_files(files),
-            reverse_index: build_reverse_index_from_files(files),
+        check_reload_cancelled(cancel)?;
+        Ok(Self {
+            trigram_index,
+            reverse_index,
             files_by_basename,
             files_by_dir_component,
-        }
+        })
     }
 }
 
@@ -4583,8 +4790,12 @@ fn admit_and_parse_entries(
     exclude_untracked_set: &Option<std::collections::HashSet<String>>,
     generated_output_demotions: &std::collections::HashSet<String>,
     source_scope: PathBuf,
-) -> AdmitParseResult {
+    cancel: Option<&AtomicBool>,
+) -> anyhow::Result<AdmitParseResult> {
     use crate::discovery::classify_admission;
+
+    check_reload_cancelled(cancel)?;
+    let cancelled_during_parse = AtomicBool::new(false);
 
     // Transient bytes and staged resident bytes are governed independently.
     // The immutable scout plan fixes both the per-entry stamp and the maximum
@@ -4599,6 +4810,20 @@ fn admit_and_parse_entries(
         entries
             .par_iter()
             .map(|entry| {
+                if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    cancelled_during_parse.store(true, Ordering::Release);
+                    return terminal_admission_outcome(
+                        entry,
+                        AdmissionDecision::skip(
+                            AdmissionTier::MetadataOnly,
+                            SkipReason::UnsupportedLanguage,
+                        ),
+                        crate::domain::FileDisposition::Unreadable {
+                            stage: crate::domain::AccessStage::Metadata,
+                            kind: crate::domain::AccessErrorKind::Other,
+                        },
+                    );
+                }
                 let Some(planned) = ingest_plans.get(&entry.relative_path) else {
                     return terminal_admission_outcome(
                         entry,
@@ -4655,6 +4880,20 @@ fn admit_and_parse_entries(
                 }
 
                 let permit = Some(inflight_budget.acquire(planned.stamp.size));
+                if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    cancelled_during_parse.store(true, Ordering::Release);
+                    return terminal_admission_outcome(
+                        entry,
+                        AdmissionDecision::skip(
+                            AdmissionTier::MetadataOnly,
+                            SkipReason::UnsupportedLanguage,
+                        ),
+                        crate::domain::FileDisposition::Unreadable {
+                            stage: crate::domain::AccessStage::Metadata,
+                            kind: crate::domain::AccessErrorKind::Other,
+                        },
+                    );
+                }
                 let stable = stable_read_with_retries(
                     &entry.absolute_path,
                     &planned.stamp,
@@ -4743,6 +4982,21 @@ fn admit_and_parse_entries(
                     language,
                     classification,
                 );
+                pause_after_parse_for_test(&source_scope, cancel);
+                if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    cancelled_during_parse.store(true, Ordering::Release);
+                    return terminal_admission_outcome(
+                        entry,
+                        AdmissionDecision::skip(
+                            AdmissionTier::MetadataOnly,
+                            SkipReason::UnsupportedLanguage,
+                        ),
+                        crate::domain::FileDisposition::Unreadable {
+                            stage: crate::domain::AccessStage::Metadata,
+                            kind: crate::domain::AccessErrorKind::Other,
+                        },
+                    );
+                }
                 let indexed = IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
                 debug_assert_eq!(crate::hash::digest(&indexed.content), accepted_hash);
                 let resident_bytes = u64::try_from(indexed.content.len()).unwrap_or(u64::MAX);
@@ -4761,6 +5015,12 @@ fn admit_and_parse_entries(
             })
             .collect()
     });
+
+    if cancelled_during_parse.load(Ordering::Acquire)
+        || cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(reload_cancelled());
+    }
 
     let mut code_results: Vec<(String, IndexedFile)> = Vec::new();
     let mut knowledge_results: Vec<(String, IndexedFile)> = Vec::new();
@@ -4850,12 +5110,12 @@ fn admit_and_parse_entries(
         crate::domain::CoverageStatus::Complete
     };
 
-    AdmitParseResult {
+    Ok(AdmitParseResult {
         files,
         terminal_dispositions,
         coverage,
         cb_state: cb_state.unwrap_or_else(CircuitBreakerState::from_env),
-    }
+    })
 }
 
 impl LiveIndex {
@@ -4940,7 +5200,8 @@ impl LiveIndex {
             &exclude_untracked_set,
             &generated_output_demotions,
             normalize_root(root),
-        );
+            None,
+        )?;
         if matches!(coverage, crate::domain::CoverageStatus::Degraded) {
             scout_plan.coverage = crate::domain::CoverageStatus::Degraded;
         }
@@ -5261,7 +5522,23 @@ impl LiveIndex {
         project_state_dir: Option<&ProjectStateDir>,
         source_exclusions: &discovery::SourceExclusions,
     ) -> anyhow::Result<ReloadData> {
+        Self::build_reload_data_for_binding_with_exclusions_cancellable(
+            root,
+            project_state_dir,
+            source_exclusions,
+            None,
+        )
+    }
+
+    fn build_reload_data_for_binding_with_exclusions_cancellable(
+        root: &Path,
+        project_state_dir: Option<&ProjectStateDir>,
+        source_exclusions: &discovery::SourceExclusions,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<ReloadData> {
         let start = Instant::now();
+
+        check_reload_cancelled(cancel)?;
 
         info!("LiveIndex::build_reload_data starting at {:?}", root);
 
@@ -5274,7 +5551,15 @@ impl LiveIndex {
 
         // 1. Build the same authoritative metadata-first catalog used by cold
         //    load. Reload performs no independent compatibility walk.
-        let mut scout_plan = discovery::scout_repository_with_exclusions(root, source_exclusions)?;
+        let mut scout_plan = match cancel {
+            Some(cancel) => discovery::scout_repository_with_exclusions_cancellable(
+                root,
+                source_exclusions,
+                cancel,
+            )?,
+            None => discovery::scout_repository_with_exclusions(root, source_exclusions)?,
+        };
+        check_reload_cancelled(cancel)?;
         let projection = project_scout_for_legacy_execution(&scout_plan);
         info!(
             "scouted {} catalog entries ({} executable by the legacy index)",
@@ -5290,11 +5575,13 @@ impl LiveIndex {
         // was silently dropped before), so compatibility health projections
         // agree across both discovery paths.
         let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
+        check_reload_cancelled(cancel)?;
 
         // F5: same untracked generated-output demotion as `load`, so initial
         // load and reload report identical tiering.
         let generated_output_demotions =
             discovery::untracked_generated_output_demotions(root, &projection.entries);
+        check_reload_cancelled(cancel)?;
         let LegacyExecutionProjection {
             entries: all_entries,
             ingest_plans,
@@ -5316,7 +5603,9 @@ impl LiveIndex {
             &exclude_untracked_set,
             &generated_output_demotions,
             normalize_root(root),
-        );
+            cancel,
+        )?;
+        check_reload_cancelled(cancel)?;
         if matches!(coverage, crate::domain::CoverageStatus::Degraded) {
             scout_plan.coverage = crate::domain::CoverageStatus::Degraded;
         }
@@ -5330,11 +5619,13 @@ impl LiveIndex {
         // reported duration: same honesty rule as the fresh-load path, where
         // this tail measured 60-65% of real startup.
         let phase = Instant::now();
-        let derived = DerivedIndices::build_from_files(&new_files);
+        let derived = DerivedIndices::build_from_files_cancellable(&new_files, cancel)?;
         let derived_elapsed = phase.elapsed();
+        check_reload_cancelled(cancel)?;
         let gitignore = discovery::load_gitignore(root);
         let coupling_store = project_state_dir
             .and_then(|state_dir| super::coupling::init_coupling_store(root, state_dir));
+        check_reload_cancelled(cancel)?;
 
         let load_duration = start.elapsed();
         info!(

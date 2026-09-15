@@ -588,7 +588,9 @@ impl OperationRelationshipContract {
     pub fn for_operation(kind: OperationKind) -> Self {
         let search = matches!(
             kind,
-            OperationKind::SearchSymbols | OperationKind::SearchText
+            OperationKind::SearchSymbols
+                | OperationKind::SearchText
+                | OperationKind::SearchKnowledge
         );
         Self {
             cross_source_permitted: search,

@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
 
-use crate::domain::{FileClass, FileClassification, IndexTargets, LanguageId, SymbolKind};
+use crate::domain::{
+    FileClass, FileClassification, FileDisposition, IndexTargets, LanguageId, SymbolKind,
+};
 use crate::live_index::LiveIndex;
 use crate::live_index::query::{SearchFilesHit, SearchFilesTier};
 
@@ -109,7 +111,7 @@ fn indexed_targets_by_path(index: &LiveIndex) -> HashMap<&str, IndexTargets> {
         .manifest_entries
         .iter()
         .filter_map(|entry| {
-            let crate::domain::FileDisposition::Indexed { targets, .. } = &entry.disposition else {
+            let FileDisposition::Indexed { targets, .. } = &entry.disposition else {
                 return None;
             };
             entry
@@ -119,6 +121,48 @@ fn indexed_targets_by_path(index: &LiveIndex) -> HashMap<&str, IndexTargets> {
                 .map(|path| (path, *targets))
         })
         .collect()
+}
+
+/// Catalog-only count of knowledge-only files inside `path_scope`.
+///
+/// Code-scoped `search_text` does not scan these; the formatter reports the
+/// number on a zero-hit answer. Dual-target config (`CodeAndKnowledge`) is
+/// scanned as code and is not counted. Isolated indexes with an empty catalog
+/// report 0 — the published source set is the authority (no body reread).
+fn count_in_scope_knowledge_only_files(
+    index: &LiveIndex,
+    path_scope: &PathScope,
+    search_scope: SearchScope,
+) -> usize {
+    if search_scope != SearchScope::Code {
+        return 0;
+    }
+    index
+        .manifest_entries
+        .iter()
+        .filter(|entry| {
+            let Some(path) = entry.path.normalized_utf8.as_deref() else {
+                return false;
+            };
+            matches!(
+                entry.disposition,
+                FileDisposition::Indexed {
+                    targets: IndexTargets::Knowledge,
+                    ..
+                }
+            ) && path_scope.matches(path)
+        })
+        .count()
+}
+
+fn with_excluded_knowledge_count(
+    mut result: TextSearchResult,
+    index: &LiveIndex,
+    options: &TextSearchOptions,
+) -> TextSearchResult {
+    result.excluded_knowledge_files =
+        count_in_scope_knowledge_only_files(index, &options.path_scope, options.search_scope);
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,6 +749,9 @@ pub struct TextSearchResult {
     /// Matches that were found but suppressed by noise policy (e.g., inside test modules).
     pub suppressed_by_noise: usize,
     pub overflow_count: usize,
+    /// In-scope knowledge-only catalog files a code-scoped search did not scan.
+    /// Zero when the search was not code-scoped or the scope holds no such files.
+    pub excluded_knowledge_files: usize,
 }
 
 pub const SUPPRESSED_TEXT_MATCH_DISPLAY_CAP: usize = 100;
@@ -1550,13 +1597,18 @@ fn search_structural_with_compiler(
         }
     }
 
-    Ok(TextSearchResult {
-        label: format!("structural '{pattern}'"),
-        total_matches,
-        files,
-        suppressed_by_noise,
-        overflow_count: 0,
-    })
+    Ok(with_excluded_knowledge_count(
+        TextSearchResult {
+            label: format!("structural '{pattern}'"),
+            total_matches,
+            files,
+            suppressed_by_noise,
+            overflow_count: 0,
+            excluded_knowledge_files: 0,
+        },
+        index,
+        options,
+    ))
 }
 
 fn compile_text_glob_filters(
@@ -1874,6 +1926,11 @@ where
         files,
         suppressed_by_noise,
         overflow_count: all_visible_matches.saturating_sub(total_matches),
+        excluded_knowledge_files: count_in_scope_knowledge_only_files(
+            index,
+            &options.path_scope,
+            options.search_scope,
+        ),
     }
 }
 

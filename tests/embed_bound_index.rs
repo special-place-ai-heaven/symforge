@@ -161,3 +161,576 @@ fn public_embed_handle_indexes_refreshes_queries_and_joins() {
     drop(runtime);
     assert_eq!(reopened.runtime_view().phase, SourceRuntimePhase::Stopped);
 }
+
+#[test]
+fn drop_while_loading_returns_within_one_second() {
+    use std::sync::mpsc;
+
+    let repository = tempfile::tempdir().expect("temporary repository");
+    git2::Repository::init(repository.path()).expect("initialize git repository");
+    fs::create_dir_all(repository.path().join("src")).expect("create source directory");
+    for index in 0..32 {
+        fs::write(
+            repository.path().join(format!("src/file_{index}.rs")),
+            format!("pub fn function_{index}() -> usize {{ {index} }}\n"),
+        )
+        .expect("write source fixture");
+    }
+
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            repository.path().to_path_buf(),
+        ))
+        .expect("open embedded source");
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "initial reload did not reach the root-scoped parse gate"
+    );
+
+    let (finished, received) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(handle);
+        finished
+            .send(started.elapsed())
+            .expect("report close duration");
+    });
+    let elapsed = received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("dropping while loading must not wait for the held reload");
+    closer.join().expect("close thread completes");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "close exceeded the one-second contract: {elapsed:?}"
+    );
+}
+
+#[test]
+fn unrelated_open_completes_while_another_root_closes() {
+    use std::sync::mpsc;
+
+    let closing = tempfile::tempdir().expect("closing repository");
+    git2::Repository::init(closing.path()).expect("initialize git repository");
+    fs::create_dir_all(closing.path().join("src")).expect("create source directory");
+    for index in 0..32 {
+        fs::write(
+            closing.path().join(format!("src/file_{index}.rs")),
+            format!("pub fn function_{index}() -> usize {{ {index} }}\n"),
+        )
+        .expect("write source fixture");
+    }
+
+    let opening = tempfile::tempdir().expect("unrelated repository");
+    git2::Repository::init(opening.path()).expect("initialize git repository");
+    fs::create_dir_all(opening.path().join("src")).expect("create source directory");
+    fs::write(
+        opening.path().join("src/lib.rs"),
+        b"pub fn ready() -> u32 { 1 }\n",
+    )
+    .expect("write unrelated source");
+
+    let gate = symforge::live_index::store::hold_reload_through_cancel_for_test(closing.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            closing.path().to_path_buf(),
+        ))
+        .expect("open closing source");
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "closing reload did not reach the parse gate"
+    );
+
+    let join = symforge::live_index::index_lifecycle::embedded::watch_join_entered_for_test(
+        closing.path(),
+    );
+    let (close_done, close_rx) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        drop(handle);
+        close_done.send(()).expect("report close");
+    });
+    assert!(
+        join.wait_until_entered(Duration::from_secs(5)),
+        "close did not reach worker.join() after dropping the factory mutex"
+    );
+
+    let runtime_for_open = runtime.clone();
+    let unrelated_root = opening.path().to_path_buf();
+    let (open_done, open_rx) = mpsc::channel();
+    let opener = std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = runtime_for_open
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(unrelated_root))
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        open_done
+            .send((started.elapsed(), result))
+            .expect("report unrelated open");
+    });
+
+    let (elapsed, opened) = open_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("unrelated open must not queue behind the closing root's worker join");
+    opener.join().expect("open thread completes");
+    opened.unwrap_or_else(|error| panic!("unrelated open refused: {error}"));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "unrelated open exceeded the one-second contract: {elapsed:?}"
+    );
+
+    drop(gate);
+    close_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("closing root must finish after the hold releases");
+    closer.join().expect("close thread completes");
+}
+
+fn rust_repo_with_files(file_count: usize) -> tempfile::TempDir {
+    let repository = tempfile::tempdir().expect("temporary repository");
+    git2::Repository::init(repository.path()).expect("initialize git repository");
+    fs::create_dir_all(repository.path().join("src")).expect("create source directory");
+    for index in 0..file_count {
+        fs::write(
+            repository.path().join(format!("src/file_{index}.rs")),
+            format!("pub fn function_{index}() -> usize {{ {index} }}\n"),
+        )
+        .expect("write source fixture");
+    }
+    repository
+}
+
+fn open_current_worktree(
+    runtime: &ProcessIndexRuntime,
+    root: &std::path::Path,
+) -> symforge::embed::EmbeddedSourceHandle {
+    runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.to_path_buf()))
+        .expect("open embedded source")
+}
+
+#[test]
+fn reload_hold_on_one_root_leaves_other_roots_running() {
+    let held = rust_repo_with_files(32);
+    let other = rust_repo_with_files(4);
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(held.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let held_handle = open_current_worktree(&runtime, held.path());
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "held root did not reach the parse gate"
+    );
+
+    let other_handle = open_current_worktree(&runtime, other.path());
+    let other_view = wait_for_view(
+        &other_handle,
+        Instant::now() + Duration::from_secs(15),
+        |view| view.phase == SourceRuntimePhase::Current,
+    );
+    assert!(other_view.source_version > 0);
+    assert_eq!(
+        held_handle.runtime_view().phase,
+        SourceRuntimePhase::Loading,
+        "the held root must stay Loading while the other root reaches Current"
+    );
+    drop(held_handle);
+    drop(other_handle);
+}
+
+#[test]
+fn close_during_refresh_returns_before_gate_release() {
+    use std::sync::mpsc;
+
+    let repository = rust_repo_with_files(32);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(15), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    handle.request_refresh().expect("queue refresh");
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "refresh reload did not reach the parse gate"
+    );
+
+    let (finished, received) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let started = Instant::now();
+        handle.close().expect("close during refresh");
+        finished
+            .send(started.elapsed())
+            .expect("report close duration");
+    });
+    let elapsed = received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("closing during refresh must not wait for the held reload");
+    closer.join().expect("close thread completes");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "close exceeded the one-second contract: {elapsed:?}"
+    );
+}
+
+#[test]
+fn cancelled_first_load_publishes_nothing() {
+    let repository = rust_repo_with_files(32);
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = open_current_worktree(&runtime, repository.path());
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "initial reload did not reach the parse gate"
+    );
+
+    handle.close().expect("close cancelled first load");
+    let view = handle.runtime_view();
+    assert_eq!(view.phase, SourceRuntimePhase::Stopped);
+    assert_eq!(view.source_version, 0);
+    assert!(view.current_publication_identity.is_none());
+}
+
+#[test]
+fn cancelled_refresh_keeps_last_current_publication() {
+    let repository = rust_repo_with_files(32);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = open_current_worktree(&runtime, repository.path());
+    let current = wait_for_view(&handle, Instant::now() + Duration::from_secs(15), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    assert!(current.source_version > 0);
+    let identity = current
+        .current_publication_identity
+        .clone()
+        .expect("Current source has a publication identity");
+
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    handle.request_refresh().expect("queue refresh");
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "refresh reload did not reach the parse gate"
+    );
+
+    handle.close().expect("close cancelled refresh");
+    let view = handle.runtime_view();
+    assert_eq!(view.phase, SourceRuntimePhase::Stopped);
+    assert_eq!(view.source_version, current.source_version);
+    assert_eq!(
+        view.current_publication_identity.as_deref(),
+        Some(identity.as_str())
+    );
+}
+
+#[test]
+fn stopping_is_never_overwritten_by_blocked_or_current() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let repository = rust_repo_with_files(32);
+    let gate =
+        symforge::live_index::store::hold_reload_through_cancel_for_test(repository.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = open_current_worktree(&runtime, repository.path());
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "initial reload did not reach the parse gate"
+    );
+
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let stop_poll = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop_poll.load(Ordering::Acquire) {
+                phases
+                    .lock()
+                    .expect("phase log")
+                    .push(handle.runtime_view().phase);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let closer = scope.spawn(|| handle.close().expect("close while Stopping is observable"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let phase = handle.runtime_view().phase;
+            if matches!(
+                phase,
+                SourceRuntimePhase::Stopping | SourceRuntimePhase::Stopped
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "close never reached Stopping: {phase:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        gate.release();
+        closer.join().expect("close thread completes");
+        stop_poll.store(true, Ordering::Release);
+    });
+
+    let recorded = phases.lock().expect("phase log");
+    let mut saw_stopping = false;
+    for phase in recorded.iter() {
+        if *phase == SourceRuntimePhase::Stopping {
+            saw_stopping = true;
+        }
+        if saw_stopping {
+            assert!(
+                *phase != SourceRuntimePhase::Blocked && *phase != SourceRuntimePhase::Current,
+                "Stopping was overwritten by {phase:?}"
+            );
+        }
+    }
+    assert!(saw_stopping, "close never exposed Stopping");
+    let view = handle.runtime_view();
+    assert_eq!(view.phase, SourceRuntimePhase::Stopped);
+    assert_eq!(view.source_version, 0);
+    assert!(view.current_publication_identity.is_none());
+}
+
+#[test]
+fn close_during_scout_returns_before_scout_completes() {
+    use std::sync::mpsc;
+
+    let repository = rust_repo_with_files(32);
+    let gate = symforge::discovery::hold_scout_after_files_for_test(repository.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = open_current_worktree(&runtime, repository.path());
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "scout walk did not reach the hold"
+    );
+
+    let (finished, received) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(handle);
+        finished
+            .send(started.elapsed())
+            .expect("report close duration");
+    });
+    let elapsed = received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("closing during scout must not wait for the rest of the walk");
+    closer.join().expect("close thread completes");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "close exceeded the one-second contract: {elapsed:?}"
+    );
+    assert!(
+        gate.files_seen() < 32,
+        "scout completed the whole walk before close returned: seen={}",
+        gate.files_seen()
+    );
+}
+
+#[test]
+fn close_after_cancelled_reload_does_not_wait_a_poll() {
+    use std::sync::mpsc;
+
+    let repository = rust_repo_with_files(32);
+    let gate =
+        symforge::live_index::store::hold_reload_through_cancel_for_test(repository.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = open_current_worktree(&runtime, repository.path());
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "initial reload did not reach the parse gate"
+    );
+
+    let join = symforge::live_index::index_lifecycle::embedded::watch_join_entered_for_test(
+        repository.path(),
+    );
+    let (finished, received) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        handle.close().expect("close after cancelled reload");
+        finished.send(()).expect("report close");
+    });
+    assert!(
+        join.wait_until_entered(Duration::from_secs(5)),
+        "close did not enter join while the reload was held"
+    );
+    let released = Instant::now();
+    drop(gate);
+    received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close must return after the cancelled reload without a poll sleep");
+    closer.join().expect("close thread completes");
+    let elapsed = released.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "close slept a poll after cancel: {elapsed:?}"
+    );
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).expect("create copy destination");
+    for entry in fs::read_dir(from).expect("read copy source") {
+        let entry = entry.expect("copy source entry");
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some("target" | ".git" | ".symforge" | "node_modules" | ".worktrees")
+        ) {
+            continue;
+        }
+        let from_path = entry.path();
+        let to_path = to.join(&name);
+        if from_path.is_dir() {
+            copy_tree(&from_path, &to_path);
+        } else {
+            let _ = fs::copy(&from_path, &to_path);
+        }
+    }
+}
+
+fn write_extra_parse_files(root: &std::path::Path, file_count: usize) {
+    let extra = root.join("extra_payload");
+    fs::create_dir_all(&extra).expect("create extra payload directory");
+    for index in 0..file_count {
+        let mut body = String::from("pub struct ExtraPayload;\n");
+        for function in 0..80 {
+            body.push_str(&format!(
+                "pub fn extra_{index}_{function}() -> usize {{ {index} + {function} }}\n"
+            ));
+        }
+        fs::write(extra.join(format!("file_{index}.rs")), body).expect("write extra payload");
+    }
+}
+
+fn measure_full_reload(runtime: &ProcessIndexRuntime, root: &std::path::Path) -> Duration {
+    let handle = open_current_worktree(runtime, root);
+    let started = Instant::now();
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(600), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let elapsed = started.elapsed();
+    handle.close().expect("close full-reload measurement");
+    elapsed
+}
+
+fn enlarge_fixture_until_reload_floor(
+    runtime: &ProcessIndexRuntime,
+    checkout: &std::path::Path,
+    floor: Duration,
+) -> (std::path::PathBuf, tempfile::TempDir, Duration) {
+    // Never open CARGO_MANIFEST_DIR: embed create_dir_all would write .symforge
+    // into the live checkout.
+    let fixture = tempfile::tempdir().expect("G16 fixture");
+    git2::Repository::init(fixture.path()).expect("initialize G16 fixture");
+    copy_tree(checkout, fixture.path());
+    let mut extra_files = 0usize;
+    loop {
+        if extra_files > 0 {
+            write_extra_parse_files(fixture.path(), extra_files);
+        }
+        let reload = measure_full_reload(runtime, fixture.path());
+        if reload >= floor {
+            return (fixture.path().to_path_buf(), fixture, reload);
+        }
+        extra_files = if extra_files == 0 {
+            250
+        } else {
+            extra_files
+                .checked_mul(2)
+                .expect("extra payload count overflow")
+        };
+        assert!(
+            extra_files <= 8_000,
+            "could not enlarge this checkout to a {floor:?} debug reload (last={reload:?})"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn close_latency_bound_on_this_checkout() {
+    use std::sync::mpsc;
+
+    let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let floor = Duration::from_secs(10);
+    let (fixture, _keep, full_reload) =
+        enlarge_fixture_until_reload_floor(&runtime, &checkout, floor);
+    assert!(
+        full_reload >= floor,
+        "full reload must stay at or above ten seconds: {full_reload:?}"
+    );
+
+    let unrelated = rust_repo_with_files(1);
+    let mut close_durations = Vec::new();
+    let mut unrelated_durations = Vec::new();
+    for attempt in 0..40 {
+        if close_durations.len() >= 20 {
+            break;
+        }
+        let handle = open_current_worktree(&runtime, &fixture);
+        let spread = Duration::from_millis((attempt as u64).saturating_mul(20));
+        let wait_until = Instant::now() + spread;
+        while Instant::now() < wait_until
+            && handle.runtime_view().phase == SourceRuntimePhase::Loading
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if handle.runtime_view().phase != SourceRuntimePhase::Loading {
+            handle.close().expect("close trial that left Loading");
+            continue;
+        }
+
+        let join =
+            symforge::live_index::index_lifecycle::embedded::watch_join_entered_for_test(&fixture);
+        let (finished, received) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let started = Instant::now();
+            drop(handle);
+            finished
+                .send(started.elapsed())
+                .expect("report close duration");
+        });
+        assert!(
+            join.wait_until_entered(Duration::from_secs(5)),
+            "close did not enter join during Loading"
+        );
+        let open_started = Instant::now();
+        let opened = open_current_worktree(&runtime, unrelated.path());
+        let unrelated_elapsed = open_started.elapsed();
+        opened.close().expect("close unrelated root");
+        let close_elapsed = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed close must return");
+        closer.join().expect("close thread completes");
+        assert!(
+            close_elapsed <= Duration::from_secs(1),
+            "close exceeded one second during Loading: {close_elapsed:?}"
+        );
+        assert!(
+            unrelated_elapsed <= Duration::from_secs(1),
+            "unrelated open exceeded one second: {unrelated_elapsed:?}"
+        );
+        close_durations.push(close_elapsed);
+        unrelated_durations.push(unrelated_elapsed);
+    }
+
+    assert!(
+        close_durations.len() >= 20,
+        "only {} closes landed during Loading",
+        close_durations.len()
+    );
+    let mut close_ms: Vec<u128> = close_durations.iter().map(Duration::as_millis).collect();
+    close_ms.sort_unstable();
+    let max_ms = *close_ms.last().expect("close samples");
+    let median_ms = close_ms[close_ms.len() / 2];
+    let unrelated_open_max_ms = unrelated_durations
+        .iter()
+        .map(Duration::as_millis)
+        .max()
+        .expect("unrelated open samples");
+    println!(
+        "CLOSE-LATENCY bound_ms=1000 closes={} max_ms={max_ms} median_ms={median_ms} unrelated_open_max_ms={unrelated_open_max_ms} full_reload_ms={}",
+        close_ms.len(),
+        full_reload.as_millis()
+    );
+}
