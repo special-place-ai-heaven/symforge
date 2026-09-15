@@ -153,6 +153,83 @@ fn take_panic_after_start_for_test(key: &ProjectKey) -> bool {
     }
 }
 
+#[cfg(feature = "__test-internals")]
+struct JoinEnteredState {
+    entered: std::sync::Mutex<bool>,
+    reached: Condvar,
+}
+
+#[cfg(feature = "__test-internals")]
+static JOIN_ENTERED: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, Arc<JoinEnteredState>>>,
+> = std::sync::OnceLock::new();
+
+/// Wait until `shutdown` has dropped the factory mutex and is at `worker.join()`.
+#[cfg(feature = "__test-internals")]
+pub struct JoinEnteredForTest {
+    root: PathBuf,
+    state: Arc<JoinEnteredState>,
+}
+
+#[cfg(feature = "__test-internals")]
+pub fn watch_join_entered_for_test(root: &std::path::Path) -> JoinEnteredForTest {
+    let root = crate::live_index::store::normalize_root(root);
+    let state = Arc::new(JoinEnteredState {
+        entered: std::sync::Mutex::new(false),
+        reached: Condvar::new(),
+    });
+    let watches = JOIN_ENTERED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let previous = watches
+        .lock()
+        .expect("join-entered watch registry")
+        .insert(root.clone(), Arc::clone(&state));
+    assert!(
+        previous.is_none(),
+        "a root can hold only one join-entered watch"
+    );
+    JoinEnteredForTest { root, state }
+}
+
+#[cfg(feature = "__test-internals")]
+impl JoinEnteredForTest {
+    pub fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let entered = self.state.entered.lock().expect("join-entered watch");
+        let (entered, _) = self
+            .state
+            .reached
+            .wait_timeout_while(entered, timeout, |entered| !*entered)
+            .expect("join-entered watch");
+        *entered
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for JoinEnteredForTest {
+    fn drop(&mut self) {
+        let watches = JOIN_ENTERED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut watches = watches.lock().expect("join-entered watch registry");
+        if watches
+            .get(&self.root)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.state))
+        {
+            watches.remove(&self.root);
+        }
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+fn notify_join_entered(root: &std::path::Path) {
+    let root = crate::live_index::store::normalize_root(root);
+    let Some(state) = JOIN_ENTERED
+        .get()
+        .and_then(|watches| watches.lock().ok()?.get(&root).cloned())
+    else {
+        return;
+    };
+    *state.entered.lock().expect("join-entered watch") = true;
+    state.reached.notify_all();
+}
+
 struct OpenRollback {
     factory: Arc<EmbeddedSourceFactory>,
     key: ProjectKey,
@@ -534,11 +611,12 @@ impl EmbeddedBinding {
             control.stop = true;
             self.wake.notify_all();
         }
-        let joined = self
-            .worker
-            .lock()
-            .expect("embedded worker mutex")
-            .take()
+        let worker = self.worker.lock().expect("embedded worker mutex").take();
+        // Factory mutex is already dropped by close_one/shutdown_owner.
+        // Signal before join so an unrelated open can race the parked worker.
+        #[cfg(feature = "__test-internals")]
+        notify_join_entered(&self.root);
+        let joined = worker
             .map(|worker| {
                 let _ = worker.join();
                 1
