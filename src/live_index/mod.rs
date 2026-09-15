@@ -24,6 +24,7 @@ pub(crate) use crate::index_lifecycle;
 pub use crate::index_lifecycle;
 pub mod knowledge_authority;
 pub mod knowledge_bridge;
+pub mod knowledge_retrieve;
 pub mod local_ref_scout;
 pub mod persist;
 pub(crate) mod qualified_usages;

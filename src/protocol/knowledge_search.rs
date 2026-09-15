@@ -1,105 +1,29 @@
-//! Frozen Gate I `search_knowledge` extraction, ranking, safety, and formatting.
+//! Frozen Gate I `search_knowledge` MCP formatting over the typed retrieval seam.
 //!
-//! Every response is derived from one caller-captured [`PublishedGeneration`].
-//! This module never reloads the live index while formatting a result.
+//! Extraction, ranking, and withheld accounting live in
+//! [`crate::live_index::knowledge_retrieve`]. This module never reloads the live
+//! index while formatting a result, and never treats rendered MCP text as a
+//! retrieval source.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::Range;
 use std::sync::Arc;
 
-use crate::domain::{CoverageStatus, FreshnessStatus, LanguageId, SourceLocation};
-use crate::knowledge::{guard_hit, guard_query, project_markdown_sections};
-use crate::live_index::knowledge_authority::{KnowledgeAuthorityRecord, KnowledgeVoice};
-use crate::live_index::knowledge_bridge::{
-    BridgeEvidenceKind, BridgeResolution, CodeAnchorId, DerivedCoverage, KnowledgeAnchor,
+use crate::domain::{CoverageStatus, FreshnessStatus, SourceLocation};
+use crate::knowledge::guard_query;
+use crate::live_index::knowledge_bridge::DerivedCoverage;
+use crate::live_index::knowledge_retrieve::{
+    KnowledgeLaneReadiness, KnowledgeRetrieveAuthorityScope, KnowledgeRetrieveHit,
+    KnowledgeRetrieveLane, KnowledgeRetrieveRequest, KnowledgeRetrieveResult,
+    KnowledgeRetrieveSource, normalize_knowledge_path_prefix, retrieve_knowledge, significant_terms,
 };
-use crate::live_index::{PublishedGeneration, PublishedIndexStatus, PublishedSourceSet};
+use crate::live_index::{PublishedGeneration, PublishedSourceSet};
 
 use super::search_tools::{KnowledgeAuthorityScope, KnowledgeSourceScope, SearchKnowledgeInput};
 
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 100;
 const MIN_PROVENANCE_TOKENS: u64 = 64;
-const MAX_IDS_PER_HIT: usize = 8;
-const MAX_BRIDGE_PREVIEWS_PER_HIT: usize = 4;
-/// Excerpt bound in Unicode CHARACTERS, not bytes (SIFT-WS1).
-const EXCERPT_MAX_CHARS: usize = 240;
 /// Shortest digest prefix ever displayed; extended on collision.
 const DIGEST_PREFIX_MIN: usize = 12;
-
-/// Bound a matched line to a readable window around the match.
-///
-/// SIFT-WS1 (T024). The excerpt used to be the whole matched line with no cap:
-/// dogfood captured a 1.5 KB Markdown table row as one hit's excerpt.
-///
-/// Operates on `char_indices` of the ORIGINAL line. The tempting
-/// implementation — lowercase the line, `find()` the match, slice the original
-/// at that byte offset — is wrong twice: `to_lowercase()` is not
-/// length-preserving for all Unicode, and a byte offset can land inside a
-/// multi-byte character and panic. Match location is therefore resolved in
-/// CHARACTER space and every cut lands on a character boundary.
-fn window_excerpt(line: &str, phrase: &str, terms: &[String]) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() <= EXCERPT_MAX_CHARS {
-        return line.to_string();
-    }
-
-    // Locate the match in character space via a lowercased char vector, so the
-    // index maps back onto `chars` one-for-one.
-    let lower: Vec<char> = line.chars().flat_map(|c| c.to_lowercase()).collect();
-    let lower_str: String = lower.iter().collect();
-    let find_chars = |needle: &str| -> Option<usize> {
-        if needle.is_empty() {
-            return None;
-        }
-        lower_str
-            .find(needle)
-            .map(|byte| lower_str[..byte].chars().count())
-    };
-    // `to_lowercase` can change char count (e.g. 'İ'), so a char index derived
-    // from the lowered string is only a hint. Clamp it into range.
-    let hint = find_chars(phrase)
-        .or_else(|| terms.iter().find_map(|term| find_chars(term)))
-        .unwrap_or(0)
-        .min(chars.len().saturating_sub(1));
-
-    let match_len = phrase.chars().count().max(1);
-    // Center the window on the match, then clamp to the line.
-    let half = EXCERPT_MAX_CHARS.saturating_sub(match_len) / 2;
-    let mut start = hint.saturating_sub(half);
-    let mut end = (start + EXCERPT_MAX_CHARS).min(chars.len());
-    start = end.saturating_sub(EXCERPT_MAX_CHARS);
-
-    // Snap outward-in to whitespace so a cut never splits a word.
-    if start > 0 {
-        let limit = (start + 32).min(end);
-        if let Some(offset) = (start..limit).find(|index| chars[*index].is_whitespace()) {
-            // Never snap past the match itself.
-            if offset < hint {
-                start = offset + 1;
-            }
-        }
-    }
-    if end < chars.len() {
-        let floor = end.saturating_sub(32).max(hint + match_len);
-        if let Some(offset) = (floor..end)
-            .rev()
-            .find(|index| chars[*index].is_whitespace())
-        {
-            end = offset;
-        }
-    }
-
-    let mut out = String::new();
-    if start > 0 {
-        out.push('…');
-    }
-    out.extend(chars[start..end].iter());
-    if end < chars.len() {
-        out.push('…');
-    }
-    out
-}
 
 /// Per-response identifier abbreviation table (SIFT-WS1, T025).
 ///
@@ -152,66 +76,9 @@ impl DisplayIds {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NormalizedQuery {
-    phrase: String,
-    terms: Vec<String>,
-    path_prefix: Option<String>,
-    authority_scope: KnowledgeAuthorityScope,
-    limit: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AuthorityDisplay {
-    lifecycle: String,
-    authority_domain: String,
-    code_evidence: String,
-    voice: String,
-    finding_ids: Vec<String>,
-    finding_ids_omitted: usize,
-    provenance_ids: Vec<String>,
-    provenance_ids_omitted: usize,
-    coverage: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct KnowledgeHit {
-    /// Owning source's real label (`current` / `worktree:<id>` / `ref:<name>`).
-    /// Carried on the hit so global sorting cannot separate a hit from its
-    /// provenance; the hit line previously hardcoded `source=current`.
-    source_label: String,
-    /// Position of the owning source in `select_scoped_sources` order — the
-    /// current lane is 0. Ranking tuple position 4 (SIFT-WS0).
-    source_precedence: usize,
-    path: String,
-    line: u32,
-    line_range: Range<u32>,
-    heading_path: Vec<String>,
-    excerpt: String,
-    content_hash: String,
-    publication_generation: u64,
-    content_generation: u64,
-    authority: AuthorityDisplay,
-    bridge_previews: Vec<String>,
-    bridge_previews_omitted: usize,
-    exact_phrase: bool,
-    heading_match: bool,
-    distinct_term_count: usize,
-    unit_start: u32,
-    unit_len: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct FilteredCounts {
-    current: usize,
-    intent: usize,
-    history_only: usize,
-    suppressed: usize,
-    review_required: usize,
-    unknown: usize,
-}
-
-pub(crate) fn validate_input(input: &SearchKnowledgeInput) -> Result<NormalizedQuery, String> {
+pub(crate) fn validate_input(
+    input: &SearchKnowledgeInput,
+) -> Result<KnowledgeRetrieveRequest, String> {
     // Security must run before tokenization, path routing, proxying, analytics,
     // cache lookup, or CCR creation. The rejection never echoes the query.
     guard_query(&input.query)
@@ -249,7 +116,10 @@ pub(crate) fn validate_input(input: &SearchKnowledgeInput) -> Result<NormalizedQ
     {
         return Err("Error: projects wildcard must be the sole selector.".to_string());
     }
-    let path_prefix = normalize_path_prefix(input.path_prefix.as_deref())?;
+    let path_prefix = normalize_knowledge_path_prefix(input.path_prefix.as_deref()).map_err(|_| {
+        "Error: invalid path_prefix; expected a normalized repository-relative path without traversal."
+            .to_string()
+    })?;
     let terms = significant_terms(phrase);
     let authority_scope = input
         .authority_scope
@@ -258,13 +128,23 @@ pub(crate) fn validate_input(input: &SearchKnowledgeInput) -> Result<NormalizedQ
         .unwrap_or(MAX_LIMIT)
         .clamp(1, MAX_LIMIT);
 
-    Ok(NormalizedQuery {
+    Ok(KnowledgeRetrieveRequest {
         phrase: phrase.to_lowercase(),
         terms,
         path_prefix,
-        authority_scope,
+        authority_scope: retrieve_authority_scope(authority_scope),
         limit,
     })
+}
+
+fn retrieve_authority_scope(scope: KnowledgeAuthorityScope) -> KnowledgeRetrieveAuthorityScope {
+    match scope {
+        KnowledgeAuthorityScope::Default => KnowledgeRetrieveAuthorityScope::Default,
+        KnowledgeAuthorityScope::Current => KnowledgeRetrieveAuthorityScope::Current,
+        KnowledgeAuthorityScope::Intent => KnowledgeRetrieveAuthorityScope::Intent,
+        KnowledgeAuthorityScope::History => KnowledgeRetrieveAuthorityScope::History,
+        KnowledgeAuthorityScope::All => KnowledgeRetrieveAuthorityScope::All,
+    }
 }
 
 /// Select the published generations a source scope addresses, deterministically.
@@ -348,55 +228,6 @@ pub(crate) fn worst_source_coverage(selected: &[Arc<PublishedGeneration>]) -> Co
         CoverageStatus::Degraded
     } else {
         CoverageStatus::Complete
-    }
-}
-
-/// One source's structured contribution to a composed response (SIFT-WS0).
-///
-/// The frozen contract ranks and limits across every selected source. This
-/// carries a source's UNTRUNCATED hits plus its own counts so
-/// [`compose_and_render`] can apply `limit` exactly once, globally. Extraction
-/// must never truncate, and composition must never parse rendered text to
-/// recover hit boundaries.
-struct SourceHits {
-    label: String,
-    envelope: Option<crate::domain::SourceResponseEnvelope>,
-    hits: Vec<KnowledgeHit>,
-    withheld_sensitive: usize,
-    filtered: FilteredCounts,
-    /// Set when this source could not be searched at all. It still appears in
-    /// the per-source list and still degrades overall coverage, so a composed
-    /// response never silently omits a source it failed to read.
-    readiness: Option<String>,
-    degraded: bool,
-    derived: SourceDerived,
-    /// Kept separately from `envelope` so a withheld source still reports its
-    /// generations (which are not sensitive) without echoing guarded identity.
-    publication_generation: u64,
-    content_generation: u64,
-}
-
-/// Derived-state versions and coverage captured from one source at extraction
-/// time. Held on [`SourceHits`] so formatting reads nothing but already-captured
-/// state — the one-capture rule forbids reloading while rendering.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SourceDerived {
-    authority_rule_version: u32,
-    policy_version: u32,
-    secret_policy_version: u32,
-    bridge_coverage: &'static str,
-    authority_coverage: &'static str,
-}
-
-impl SourceDerived {
-    fn capture(generation: &PublishedGeneration) -> Self {
-        Self {
-            authority_rule_version: generation.authority.versions.authority_rule_version,
-            policy_version: generation.authority.versions.policy_version,
-            secret_policy_version: generation.authority.versions.secret_policy_version,
-            bridge_coverage: derived_coverage_label(&generation.bridge.coverage),
-            authority_coverage: derived_coverage_label(&generation.authority.coverage),
-        }
     }
 }
 
@@ -500,8 +331,8 @@ fn budget_summary(rendered: &str, max_tokens: Option<u64>) -> String {
 }
 
 fn search_scoped_rendered(source_set: &PublishedSourceSet, input: &SearchKnowledgeInput) -> String {
-    let query = match validate_input(input) {
-        Ok(query) => query,
+    let request = match validate_input(input) {
+        Ok(request) => request,
         Err(error) => return error,
     };
     let scope = input.source_scope.unwrap_or(KnowledgeSourceScope::Current);
@@ -514,316 +345,26 @@ fn search_scoped_rendered(source_set: &PublishedSourceSet, input: &SearchKnowled
     }
 
     let current_id = &source_set.current_source_id;
-    let sources: Vec<SourceHits> = selected
+    let labels: Vec<String> = selected
         .iter()
         .map(|generation| {
             let is_current = generation
                 .source
                 .as_deref()
                 .is_some_and(|source| &source.source_id == current_id);
-            extract_source(generation, source_label(generation, is_current), &query)
+            source_label(generation, is_current)
         })
         .collect();
-
-    compose_and_render(sources, input, &query, scope)
-}
-
-/// Extract one source's complete, untruncated contribution.
-///
-/// Readiness, missing-envelope, and withheld-envelope states become
-/// [`SourceHits::readiness`] instead of an early-return `String`, so they
-/// survive composition instead of being lost to string concatenation.
-fn extract_source(
-    generation: &PublishedGeneration,
-    label: String,
-    query: &NormalizedQuery,
-) -> SourceHits {
-    let derived = SourceDerived::capture(generation);
-    let degraded = response_is_degraded(generation);
-    // A source that could not be searched always degrades the composed
-    // envelope: its absence must never read as complete coverage.
-    let empty = |readiness: Option<String>, envelope, withheld| {
-        let unreadable = readiness.is_some();
-        SourceHits {
-            label: label.clone(),
-            envelope,
-            hits: Vec::new(),
-            withheld_sensitive: withheld,
-            filtered: FilteredCounts::default(),
-            readiness,
-            degraded: degraded || unreadable,
-            derived: derived.clone(),
-            publication_generation: generation.publication_generation,
-            content_generation: generation.content_generation,
-        }
-    };
-
-    match generation.health.status {
-        PublishedIndexStatus::Loading => {
-            return empty(
-                Some(
-                    "index_scouting_or_verifying; retry after the current publication completes"
-                        .to_string(),
-                ),
-                None,
-                0,
-            );
-        }
-        PublishedIndexStatus::Empty if generation.manifest.is_none() => {
-            return empty(
-                Some(
-                    "no_valid_source; run index_folder to rebuild from repository source"
-                        .to_string(),
-                ),
-                None,
-                0,
-            );
-        }
-        _ => {}
-    }
-
-    let Some(envelope) = generation.source_response_envelope() else {
-        return empty(
-            Some(
-                "no_valid_source; source envelope is unavailable and no evidence was served"
-                    .to_string(),
-            ),
-            None,
-            0,
-        );
-    };
-    if !source_envelope_is_safe(&envelope) {
-        // The source identity itself is sensitive: contribute a withheld count
-        // and no envelope, never the guarded values.
-        return empty(Some("evidence_withheld".to_string()), None, 1);
-    }
-    if query.terms.is_empty() {
-        return empty(None, Some(envelope), 0);
-    }
-
-    let headings = heading_paths(generation);
-    let mut deduplicated: BTreeMap<(String, u32, String), KnowledgeHit> = BTreeMap::new();
-    let mut withheld_sensitive = 0usize;
-    let mut filtered = FilteredCounts::default();
-
-    for (record_index, record) in generation.authority.records.iter().enumerate() {
-        if !path_in_scope(&record.unit.path, query.path_prefix.as_deref()) {
-            continue;
-        }
-        let Some(file) = generation.live.files.get(&record.unit.path) else {
-            continue;
-        };
-        let Some(unit_bytes) = bounded_slice(
-            &file.content,
-            record.unit.byte_range.start,
-            record.unit.byte_range.end,
-        ) else {
-            continue;
-        };
-        let Ok(unit_text) = std::str::from_utf8(unit_bytes) else {
-            continue;
-        };
-        let heading_path = headings
-            .get(&(
-                record.unit.path.clone(),
-                record.unit.byte_range.start,
-                record.unit.byte_range.end,
-            ))
-            .cloned()
-            .unwrap_or_default();
-        let Some(matched) = match_unit(
-            &file.content,
-            record.unit.byte_range.start,
-            unit_text,
-            &heading_path,
-            query,
-        ) else {
-            continue;
-        };
-
-        if !voice_allowed(record.voice, query.authority_scope) {
-            note_filtered_voice(&mut filtered, record.voice);
-            continue;
-        }
-
-        let authority = authority_display(generation, record_index, record);
-        let (bridge_previews, bridge_previews_omitted) = bridge_previews(generation, &record.unit);
-        let candidate = KnowledgeHit {
-            source_label: label.clone(),
-            // Assigned by `compose_and_render`, which owns source ordering.
-            source_precedence: 0,
-            path: record.unit.path.clone(),
-            line: matched.line,
-            line_range: matched.line_range,
-            heading_path,
-            excerpt: matched.excerpt,
-            content_hash: record.unit.content_hash.clone(),
-            publication_generation: generation.publication_generation,
-            content_generation: generation.content_generation,
-            authority,
-            bridge_previews,
-            bridge_previews_omitted,
-            exact_phrase: matched.exact_phrase,
-            heading_match: matched.heading_match,
-            distinct_term_count: matched.distinct_term_count,
-            unit_start: record.unit.byte_range.start,
-            unit_len: record
-                .unit
-                .byte_range
-                .end
-                .saturating_sub(record.unit.byte_range.start),
-        };
-
-        let heading = candidate.heading_path.join(" > ");
-        let bridge = candidate.bridge_previews.join(" | ");
-        let finding_ids = candidate.authority.finding_ids.join(",");
-        let provenance_ids = candidate.authority.provenance_ids.join(",");
-        let visible_fields = [
-            candidate.path.as_str(),
-            heading.as_str(),
-            candidate.excerpt.as_str(),
-            candidate.content_hash.as_str(),
-            finding_ids.as_str(),
-            provenance_ids.as_str(),
-            bridge.as_str(),
-        ];
-        if guard_hit(&candidate, &visible_fields).is_err() {
-            withheld_sensitive = withheld_sensitive.saturating_add(1);
-            continue;
-        }
-
-        let key = (
-            candidate.path.clone(),
-            candidate.line,
-            candidate.excerpt.clone(),
-        );
-        match deduplicated.get(&key) {
-            Some(existing)
-                if existing.unit_len < candidate.unit_len
-                    || (existing.unit_len == candidate.unit_len
-                        && existing.heading_path.len() >= candidate.heading_path.len()) => {}
-            _ => {
-                deduplicated.insert(key, candidate);
-            }
-        }
-    }
-
-    // Locally ordered only so extraction is deterministic; `limit` is NOT
-    // applied here. Composition re-sorts across every selected source and
-    // truncates exactly once (SIFT-WS0).
-    let mut hits: Vec<KnowledgeHit> = deduplicated.into_values().collect();
-    hits.sort_by(rank_hits);
-
-    SourceHits {
-        label,
-        envelope: Some(envelope),
-        hits,
-        withheld_sensitive,
-        filtered,
-        readiness: None,
-        degraded,
-        derived,
-        publication_generation: generation.publication_generation,
-        content_generation: generation.content_generation,
-    }
-}
-
-/// The frozen ranking tuple: exact phrase, heading/title, distinct-term
-/// coverage, source precedence, then canonical path/line tie-break.
-///
-/// SIFT-WS0 lifts this out of extraction so the per-source and global orders
-/// cannot disagree. `source_precedence` sits in position 4 exactly as the
-/// contract specifies — after match quality, before the path tie-break — so a
-/// better match in a lower-precedence source still outranks a weaker match in
-/// the current lane (contract test 9: current ranks ahead of a divergent ref
-/// but never hides it).
-fn rank_hits(left: &KnowledgeHit, right: &KnowledgeHit) -> std::cmp::Ordering {
-    right
-        .exact_phrase
-        .cmp(&left.exact_phrase)
-        .then_with(|| right.heading_match.cmp(&left.heading_match))
-        .then_with(|| right.distinct_term_count.cmp(&left.distinct_term_count))
-        .then_with(|| left.source_precedence.cmp(&right.source_precedence))
-        .then_with(|| left.path.cmp(&right.path))
-        .then_with(|| left.line.cmp(&right.line))
-        .then_with(|| left.unit_start.cmp(&right.unit_start))
-}
-
-/// Compose every selected source into ONE response: global rank, ONE `limit`,
-/// ONE aggregate count set, worst-source coverage (SIFT-WS0).
-fn compose_and_render(
-    sources: Vec<SourceHits>,
-    input: &SearchKnowledgeInput,
-    query: &NormalizedQuery,
-    scope: KnowledgeSourceScope,
-) -> String {
-    // Flatten structurally. Rendered text is never parsed to recover hits.
-    let mut hits: Vec<KnowledgeHit> = Vec::new();
-    let mut withheld_sensitive = 0usize;
-    let mut filtered = FilteredCounts::default();
-    for (precedence, source) in sources.iter().enumerate() {
-        withheld_sensitive = withheld_sensitive.saturating_add(source.withheld_sensitive);
-        filtered.current = filtered.current.saturating_add(source.filtered.current);
-        filtered.intent = filtered.intent.saturating_add(source.filtered.intent);
-        filtered.history_only = filtered
-            .history_only
-            .saturating_add(source.filtered.history_only);
-        filtered.suppressed = filtered
-            .suppressed
-            .saturating_add(source.filtered.suppressed);
-        filtered.review_required = filtered
-            .review_required
-            .saturating_add(source.filtered.review_required);
-        filtered.unknown = filtered.unknown.saturating_add(source.filtered.unknown);
-        hits.extend(source.hits.iter().cloned().map(|mut hit| {
-            hit.source_precedence = precedence;
-            hit
-        }));
-    }
-
-    // ONE global sort, then ONE truncation. `overflow` counts everything the
-    // limit withheld across all sources, not per source.
-    hits.sort_by(rank_hits);
-    let overflow = hits.len().saturating_sub(query.limit);
-    hits.truncate(query.limit);
-
-    // Worst included source wins: one degraded source degrades the envelope.
-    let degraded = sources.iter().any(|source| source.degraded);
-
-    let no_match = if hits.is_empty() {
-        Some(if query.terms.is_empty() {
-            "query_too_weak"
-        } else if withheld_sensitive > 0 {
-            "evidence_withheld"
-        } else if filtered.current > 0
-            || filtered.intent > 0
-            || filtered.history_only > 0
-            || filtered.suppressed > 0
-            || filtered.review_required > 0
-            || filtered.unknown > 0
-        {
-            "evidence_noncurrent"
-        } else if degraded {
-            "no_evidence_degraded"
-        } else {
-            "no_evidence_complete"
+    let lanes: Vec<KnowledgeRetrieveLane<'_>> = selected
+        .iter()
+        .zip(labels.iter())
+        .map(|(generation, label)| KnowledgeRetrieveLane {
+            generation,
+            label,
         })
-    } else {
-        None
-    };
-
-    render_response(
-        &sources,
-        input,
-        query,
-        scope,
-        &hits,
-        no_match,
-        overflow,
-        withheld_sensitive,
-        filtered,
-        degraded,
-    )
+        .collect();
+    let retrieved = retrieve_knowledge(&lanes, &request);
+    render_response(&retrieved, input, scope)
 }
 
 /// Single-source convenience over the same pipeline (SIFT-WS0: there is no
@@ -835,244 +376,31 @@ pub(crate) fn search_current(
     generation: &PublishedGeneration,
     input: &SearchKnowledgeInput,
 ) -> String {
-    let query = match validate_input(input) {
-        Ok(query) => query,
+    let request = match validate_input(input) {
+        Ok(request) => request,
         Err(error) => return error,
     };
-    let source = extract_source(generation, "current".to_string(), &query);
-    compose_and_render(vec![source], input, &query, KnowledgeSourceScope::Current)
-}
-
-fn source_envelope_is_safe(envelope: &crate::domain::SourceResponseEnvelope) -> bool {
-    let branch = envelope.source_version.branch.as_deref().unwrap_or("");
-    let commit = envelope.source_version.commit.as_deref().unwrap_or("");
-    guard_hit(
-        envelope,
-        &[envelope.source.source_id.as_str(), branch, commit],
-    )
-    .is_ok()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct UnitMatch {
-    line: u32,
-    line_range: Range<u32>,
-    excerpt: String,
-    exact_phrase: bool,
-    heading_match: bool,
-    distinct_term_count: usize,
-}
-
-fn match_unit(
-    file_bytes: &[u8],
-    unit_start: u32,
-    unit_text: &str,
-    heading_path: &[String],
-    query: &NormalizedQuery,
-) -> Option<UnitMatch> {
-    let unit_lower = unit_text.to_lowercase();
-    let exact_phrase = unit_lower.contains(&query.phrase);
-    let distinct_term_count = query
-        .terms
-        .iter()
-        .filter(|term| unit_lower.contains(term.as_str()))
-        .count();
-    if !exact_phrase && distinct_term_count == 0 {
-        return None;
-    }
-
-    let heading_lower = heading_path.join(" ").to_lowercase();
-    let heading_match = heading_lower.contains(&query.phrase)
-        || query.terms.iter().any(|term| heading_lower.contains(term));
-    let base_line = 1u32.saturating_add(
-        file_bytes
-            .get(..usize::try_from(unit_start).ok()?)?
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count() as u32,
+    let retrieved = retrieve_knowledge(
+        &[KnowledgeRetrieveLane {
+            generation,
+            label: "current",
+        }],
+        &request,
     );
-    let mut best: Option<(bool, usize, usize, String)> = None;
-    for (offset, raw_line) in unit_text.lines().enumerate() {
-        let line = raw_line.trim_end_matches('\r');
-        let lower = line.to_lowercase();
-        let phrase_here = lower.contains(&query.phrase);
-        let terms_here = query
-            .terms
-            .iter()
-            .filter(|term| lower.contains(term.as_str()))
-            .count();
-        if !phrase_here && terms_here == 0 {
-            continue;
-        }
-        let replace = best.as_ref().is_none_or(|current| {
-            (phrase_here, terms_here, std::cmp::Reverse(offset))
-                > (current.0, current.1, std::cmp::Reverse(current.2))
-        });
-        if replace {
-            best = Some((phrase_here, terms_here, offset, line.to_string()));
-        }
-    }
-    let (_, _, offset, excerpt) = best?;
-    let line = base_line.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
-    let unit_line_count = u32::try_from(unit_text.lines().count().max(1)).unwrap_or(u32::MAX);
-    Some(UnitMatch {
-        line,
-        line_range: base_line..base_line.saturating_add(unit_line_count),
-        // SIFT-WS1 (T024): bound the raw matched line to a readable window.
-        // Dogfood captured a 1.5 KB Markdown table row as one hit's excerpt.
-        excerpt: window_excerpt(&excerpt, &query.phrase, &query.terms),
-        exact_phrase,
-        heading_match,
-        distinct_term_count,
-    })
-}
-
-fn heading_paths(generation: &PublishedGeneration) -> HashMap<(String, u32, u32), Vec<String>> {
-    let mut headings = HashMap::new();
-    let Some(source) = generation.source.as_deref() else {
-        return headings;
-    };
-    for (path, file) in &generation.live.files {
-        if file.language != LanguageId::Markdown {
-            continue;
-        }
-        for unit in project_markdown_sections(source, path, &file.content_hash, &file.symbols) {
-            headings.insert(
-                (path.clone(), unit.byte_range.start, unit.byte_range.end),
-                unit.heading_path,
-            );
-        }
-    }
-    headings
-}
-
-fn authority_display(
-    generation: &PublishedGeneration,
-    record_index: usize,
-    record: &KnowledgeAuthorityRecord,
-) -> AuthorityDisplay {
-    let mut finding_ids: Vec<String> = generation
-        .authority
-        .finding_index
-        .iter()
-        .filter(|(_, index)| usize::try_from(**index).ok() == Some(record_index))
-        .map(|(id, _)| id.clone())
-        .collect();
-    finding_ids.sort();
-    finding_ids.dedup();
-    let finding_ids_omitted = finding_ids.len().saturating_sub(MAX_IDS_PER_HIT);
-    finding_ids.truncate(MAX_IDS_PER_HIT);
-
-    let mut provenance_ids = BTreeSet::new();
-    provenance_ids.extend(record.code_evidence.consistent_rule_ids.iter().cloned());
-    provenance_ids.extend(
-        record
-            .code_evidence
-            .deterministic_conflict_ids
-            .iter()
-            .cloned(),
-    );
-    provenance_ids.extend(record.code_evidence.suspected_conflict_ids.iter().cloned());
-    provenance_ids.extend(record.code_evidence.implementation_gap_ids.iter().cloned());
-    provenance_ids.extend(record.code_evidence.review_signal_ids.iter().cloned());
-    let mut provenance_ids: Vec<String> = provenance_ids.into_iter().collect();
-    let provenance_ids_omitted = provenance_ids.len().saturating_sub(MAX_IDS_PER_HIT);
-    provenance_ids.truncate(MAX_IDS_PER_HIT);
-
-    AuthorityDisplay {
-        lifecycle: snake_debug(record.lifecycle),
-        authority_domain: snake_debug(record.authority_domain),
-        code_evidence: snake_debug(record.code_evidence.display),
-        voice: snake_debug(record.voice),
-        finding_ids,
-        finding_ids_omitted,
-        provenance_ids,
-        provenance_ids_omitted,
-        coverage: derived_coverage_label(&record.code_evidence.coverage).to_string(),
-    }
-}
-
-fn bridge_previews(
-    generation: &PublishedGeneration,
-    unit: &KnowledgeAnchor,
-) -> (Vec<String>, usize) {
-    let mut previews: Vec<String> = generation
-        .bridge
-        .forward
-        .iter()
-        .filter(|link| {
-            link.evidence.source == unit.source
-                && link.evidence.path == unit.path
-                && link.evidence.content_hash == unit.content_hash
-                && unit.byte_range.start <= link.evidence.byte_range.start
-                && link.evidence.byte_range.end <= unit.byte_range.end
-        })
-        .map(|link| {
-            format!(
-                "{}:{}:{}",
-                link.id.0,
-                bridge_evidence_kind_label(&link.evidence_kind),
-                bridge_resolution_preview(&link.resolution)
-            )
-        })
-        .collect();
-    previews.sort();
-    previews.dedup();
-
-    // SIFT-WS1 (T026): pack by resolution class, reserving at least one slot
-    // for every class that is PRESENT, then fill the remaining global cap in
-    // class order. A flat `truncate` could drop an entire class -- and the
-    // frozen contract (§Successful response, test 18) requires bounded
-    // exact/declared-set/ambiguous/missing previews "when present". Missing and
-    // ambiguous anchors are a trust signal (a document's code links are
-    // broken), not noise to hide.
-    let class_of = |preview: &str| -> usize {
-        if preview.contains(":exact:") {
-            0
-        } else if preview.contains(":declared_set:") {
-            1
-        } else if preview.contains(":ambiguous:") {
-            2
-        } else {
-            3
-        }
-    };
-    let total = previews.len();
-    let mut by_class: [Vec<String>; 4] = Default::default();
-    for preview in previews {
-        by_class[class_of(&preview)].push(preview);
-    }
-    let present = by_class.iter().filter(|class| !class.is_empty()).count();
-    let mut selected: Vec<String> = Vec::new();
-    if present > 0 {
-        // Pass 1: one reserved slot per present class.
-        for class in by_class.iter_mut() {
-            if !class.is_empty() && selected.len() < MAX_BRIDGE_PREVIEWS_PER_HIT {
-                selected.push(class.remove(0));
-            }
-        }
-        // Pass 2: fill remaining capacity in class order.
-        for class in by_class.iter_mut() {
-            while !class.is_empty() && selected.len() < MAX_BRIDGE_PREVIEWS_PER_HIT {
-                selected.push(class.remove(0));
-            }
-        }
-    }
-    let omitted = total.saturating_sub(selected.len());
-    (selected, omitted)
+    render_response(&retrieved, input, KnowledgeSourceScope::Current)
 }
 
 /// One per-source identity line. A source whose envelope was withheld or that
 /// could not be read still gets a line — its absence must be visible, never
 /// silent — but never echoes guarded identity.
 fn render_source_line(
-    source: &SourceHits,
+    source: &KnowledgeRetrieveSource,
     prefix: &str,
     overall_coverage: &str,
     ids: &DisplayIds,
 ) -> String {
     let Some(envelope) = source.envelope.as_ref() else {
-        let state = source.readiness.as_deref().unwrap_or("unavailable");
+        let state = lane_readiness_text(source.readiness);
         return format!(
             "{prefix}: source=withheld source_id=withheld source_version=withheld \
              publication={} content={} freshness=withheld coverage={overall_coverage} \
@@ -1112,23 +440,29 @@ fn render_source_line(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+fn lane_readiness_text(readiness: Option<KnowledgeLaneReadiness>) -> &'static str {
+    match readiness {
+        Some(KnowledgeLaneReadiness::IndexScoutingOrVerifying) => {
+            "index_scouting_or_verifying; retry after the current publication completes"
+        }
+        Some(KnowledgeLaneReadiness::NoValidSource) => {
+            "no_valid_source; run index_folder to rebuild from repository source"
+        }
+        Some(KnowledgeLaneReadiness::EnvelopeUnavailable) => {
+            "no_valid_source; source envelope is unavailable and no evidence was served"
+        }
+        Some(KnowledgeLaneReadiness::EvidenceWithheld) => "evidence_withheld",
+        None => "unavailable",
+    }
+}
+
 fn render_response(
-    sources: &[SourceHits],
+    retrieved: &KnowledgeRetrieveResult,
     input: &SearchKnowledgeInput,
-    query: &NormalizedQuery,
     scope: KnowledgeSourceScope,
-    hits: &[KnowledgeHit],
-    no_match: Option<&str>,
-    overflow: usize,
-    withheld_sensitive: usize,
-    filtered: FilteredCounts,
-    degraded: bool,
 ) -> String {
-    let _ = query;
-    // SIFT-WS1 (T025): one abbreviation table for the WHOLE response, computed
-    // from every digest it will display, so a digest never renders two ways in
-    // one answer and colliding prefixes extend together.
+    let sources = &retrieved.sources;
+    let hits = &retrieved.hits;
     let mut all_ids: Vec<&str> = Vec::new();
     for source in sources {
         if let Some(envelope) = source.envelope.as_ref() {
@@ -1141,22 +475,23 @@ fn render_response(
         all_ids.extend(hit.authority.finding_ids.iter().map(String::as_str));
         all_ids.extend(hit.authority.provenance_ids.iter().map(String::as_str));
         all_ids.extend(
-            hit.bridge_previews
+            hit.relationship_evidence
                 .iter()
-                .filter_map(|preview| preview.split_once(':').map(|(id, _)| id)),
+                .map(|evidence| evidence.link_id.as_str()),
         );
     }
     let ids = &DisplayIds::for_ids(all_ids);
 
-    let overall_coverage = if degraded { "degraded" } else { "complete" };
+    let overall_coverage = if retrieved.degraded {
+        "degraded"
+    } else {
+        "complete"
+    };
     let path_scope = input.path_prefix.as_deref().unwrap_or("repository");
     let scope_label = source_scope_label(scope);
     let multi = sources.len() > 1;
-    // The current lane is always first in `select_scoped_sources` order.
     let primary = sources.first();
 
-    // Trust/Derived report the primary lane's captured versions; coverage is
-    // the worst included source (contract: overall coverage equals the worst).
     let (publication, content) = primary
         .map(|source| (source.publication_generation, source.content_generation))
         .unwrap_or((0, 0));
@@ -1179,7 +514,6 @@ fn render_response(
 
     let mut output = String::new();
     if multi || !matches!(scope, KnowledgeSourceScope::Current) {
-        // Preserved verbatim: `local_ref_scout` pins this line.
         output.push_str(&format!("Source scope searched: {scope_label}\n"));
     }
     output.push_str(&format!(
@@ -1202,26 +536,26 @@ fn render_response(
     output.push_str(&format!(
         "Derived: authority_rule_version={} policy_version={} secret_policy_version={} \
          bridge_coverage={} authority_coverage={} overall_coverage={overall_coverage}\n\
-         Counts: overflow={overflow} withheld_sensitive={withheld_sensitive} \
+         Counts: overflow={} withheld_sensitive={} \
          filtered_current={} filtered_intent={} filtered_history_only={} \
          filtered_suppressed={} filtered_review_required={} filtered_unknown={}",
         derived.authority_rule_version,
         derived.policy_version,
         derived.secret_policy_version,
-        derived.bridge_coverage,
-        derived.authority_coverage,
-        filtered.current,
-        filtered.intent,
-        filtered.history_only,
-        filtered.suppressed,
-        filtered.review_required,
-        filtered.unknown,
+        derived_coverage_label(&derived.bridge_coverage),
+        derived_coverage_label(&derived.authority_coverage),
+        retrieved.overflow,
+        retrieved.withheld_count,
+        retrieved.filtered.current,
+        retrieved.filtered.intent,
+        retrieved.filtered.history_only,
+        retrieved.filtered.suppressed,
+        retrieved.filtered.review_required,
+        retrieved.filtered.unknown,
     ));
 
-    if let Some(no_match) = no_match {
-        // Exact prefix and position: `classify_search_knowledge_output` keys on
-        // "\nNo match:" to emit OutcomeClass::EmptyResult.
-        output.push_str(&format!("\nNo match: {no_match}"));
+    if let Some(no_match) = retrieved.absence {
+        output.push_str(&format!("\nNo match: {}", no_match.as_str()));
         return output;
     }
 
@@ -1245,7 +579,7 @@ fn render_response(
 /// frozen surface for no readability gain.
 ///
 /// Budgeting treats this whole block as atomic -- see `budget_summary`.
-fn render_hit_block(ordinal: usize, hit: &KnowledgeHit, ids: &DisplayIds) -> String {
+fn render_hit_block(ordinal: usize, hit: &KnowledgeRetrieveHit, ids: &DisplayIds) -> String {
     let heading = if hit.heading_path.is_empty() {
         "(no heading)".to_string()
     } else {
@@ -1263,28 +597,28 @@ fn render_hit_block(ordinal: usize, hit: &KnowledgeHit, ids: &DisplayIds) -> Str
         hit.source_label,
         hit.path,
         hit.line,
-        hit.excerpt,
+        hit.preview,
         hit.source_label,
         ids.render(&hit.content_hash),
         hit.publication_generation,
         hit.content_generation,
         hit.line_range.start,
         hit.line_range.end,
-        hit.authority.lifecycle,
-        hit.authority.authority_domain,
-        hit.authority.code_evidence,
-        hit.authority.voice,
-        hit.authority.coverage,
+        snake_debug(hit.authority.lifecycle),
+        snake_debug(hit.authority.authority_domain),
+        snake_debug(hit.authority.code_evidence),
+        snake_debug(hit.authority.voice),
+        derived_coverage_label(&hit.authority.coverage),
         render_list(&hit.authority.finding_ids),
         hit.authority.finding_ids_omitted,
         render_list(&hit.authority.provenance_ids),
         hit.authority.provenance_ids_omitted,
-        hit.bridge_previews
+        hit.relationship_evidence
             .iter()
-            .map(|preview| abbreviate_preview_ids(preview, ids))
+            .map(|evidence| abbreviate_preview_ids(&evidence.preview_token(), ids))
             .collect::<Vec<_>>()
             .join(" | "),
-        hit.bridge_previews_omitted,
+        hit.relationship_evidence_omitted,
     )
 }
 
@@ -1296,148 +630,6 @@ fn abbreviate_preview_ids(preview: &str, ids: &DisplayIds) -> String {
         Some((id, rest)) => format!("{}:{rest}", ids.render(id)),
         None => preview.to_string(),
     }
-}
-
-fn significant_terms(query: &str) -> Vec<String> {
-    let mut terms = BTreeSet::new();
-    for token in query
-        .split(|character: char| !character.is_alphanumeric() && character != '_')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        let token = token.to_lowercase();
-        if token.len() < 2 || is_stopword(&token) {
-            continue;
-        }
-        terms.insert(token);
-        if terms.len() == 32 {
-            break;
-        }
-    }
-    terms.into_iter().collect()
-}
-
-fn is_stopword(term: &str) -> bool {
-    matches!(
-        term,
-        "a" | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "by"
-            | "for"
-            | "from"
-            | "how"
-            | "in"
-            | "is"
-            | "it"
-            | "not"
-            | "of"
-            | "on"
-            | "or"
-            | "that"
-            | "the"
-            | "this"
-            | "to"
-            | "was"
-            | "what"
-            | "when"
-            | "where"
-            | "which"
-            | "why"
-            | "with"
-    )
-}
-
-fn normalize_path_prefix(input: Option<&str>) -> Result<Option<String>, String> {
-    let Some(raw) = input.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(None);
-    };
-    let replaced = raw.replace('\\', "/");
-    if replaced.starts_with('/')
-        || replaced.starts_with("//")
-        || replaced.as_bytes().get(1) == Some(&b':')
-    {
-        return Err("Error: invalid path_prefix; expected a normalized repository-relative path without traversal."
-            .to_string());
-    }
-    let mut components = Vec::new();
-    for component in replaced.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                return Err("Error: invalid path_prefix; expected a normalized repository-relative path without traversal."
-                    .to_string());
-            }
-            component => components.push(component),
-        }
-    }
-    Ok((!components.is_empty()).then(|| components.join("/")))
-}
-
-fn path_in_scope(path: &str, prefix: Option<&str>) -> bool {
-    let Some(prefix) = prefix else {
-        return true;
-    };
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn voice_allowed(voice: KnowledgeVoice, scope: KnowledgeAuthorityScope) -> bool {
-    match scope {
-        KnowledgeAuthorityScope::Default => matches!(
-            voice,
-            KnowledgeVoice::Current
-                | KnowledgeVoice::Intent
-                | KnowledgeVoice::NeedsReview
-                | KnowledgeVoice::Unknown
-        ),
-        KnowledgeAuthorityScope::Current => matches!(
-            voice,
-            KnowledgeVoice::Current | KnowledgeVoice::NeedsReview | KnowledgeVoice::Unknown
-        ),
-        KnowledgeAuthorityScope::Intent => voice == KnowledgeVoice::Intent,
-        KnowledgeAuthorityScope::History => {
-            matches!(
-                voice,
-                KnowledgeVoice::HistoryOnly | KnowledgeVoice::Suppressed
-            )
-        }
-        KnowledgeAuthorityScope::All => true,
-    }
-}
-
-fn note_filtered_voice(counts: &mut FilteredCounts, voice: KnowledgeVoice) {
-    match voice {
-        KnowledgeVoice::Current => counts.current = counts.current.saturating_add(1),
-        KnowledgeVoice::Intent => counts.intent = counts.intent.saturating_add(1),
-        KnowledgeVoice::HistoryOnly => counts.history_only = counts.history_only.saturating_add(1),
-        KnowledgeVoice::Suppressed => counts.suppressed = counts.suppressed.saturating_add(1),
-        KnowledgeVoice::NeedsReview => {
-            counts.review_required = counts.review_required.saturating_add(1)
-        }
-        KnowledgeVoice::Unknown => counts.unknown = counts.unknown.saturating_add(1),
-    }
-}
-
-fn bounded_slice(bytes: &[u8], start: u32, end: u32) -> Option<&[u8]> {
-    let start = usize::try_from(start).ok()?;
-    let end = usize::try_from(end).ok()?;
-    (start <= end && end <= bytes.len()).then(|| &bytes[start..end])
-}
-
-fn response_is_degraded(generation: &PublishedGeneration) -> bool {
-    generation
-        .manifest
-        .as_ref()
-        .is_some_and(|manifest| manifest.coverage == CoverageStatus::Degraded)
-        || !matches!(generation.freshness.as_ref(), FreshnessStatus::Current)
-        || !matches!(generation.bridge.coverage, DerivedCoverage::Complete)
-        || !matches!(generation.authority.coverage, DerivedCoverage::Complete)
 }
 
 pub(crate) fn source_scope_label(scope: KnowledgeSourceScope) -> &'static str {
@@ -1471,42 +663,6 @@ fn derived_coverage_label(coverage: &DerivedCoverage) -> &'static str {
     }
 }
 
-fn bridge_evidence_kind_label(kind: &BridgeEvidenceKind) -> &'static str {
-    match kind {
-        BridgeEvidenceKind::RepositoryLink => "repository_link",
-        BridgeEvidenceKind::ExactPathToken => "exact_path",
-        BridgeEvidenceKind::ExactCodeSpanSymbol => "exact_code_span",
-        BridgeEvidenceKind::DeclaredOwnershipSelector => "declared_set",
-        BridgeEvidenceKind::SupportedStructuredValue { .. } => "structured_value",
-    }
-}
-
-fn bridge_resolution_preview(resolution: &BridgeResolution) -> String {
-    match resolution {
-        BridgeResolution::ResolvedExact(anchor) => {
-            format!("exact:{}", code_anchor_label(&anchor.id))
-        }
-        BridgeResolution::ResolvedDeclaredSet { matched_count, .. } => {
-            format!("declared_set:{matched_count}")
-        }
-        BridgeResolution::Ambiguous {
-            candidate_count,
-            bounded_samples,
-        } => format!(
-            "ambiguous:{candidate_count}:samples={}",
-            bounded_samples.len()
-        ),
-        BridgeResolution::Missing => "missing".to_string(),
-    }
-}
-
-fn code_anchor_label(anchor: &CodeAnchorId) -> String {
-    // SIFT-WS1 (T005): one shared rendering, defined next to the type. This
-    // previously used `{symbol:?}` and leaked Rust debug syntax into a frozen
-    // protocol surface.
-    anchor.label()
-}
-
 fn snake_debug(value: impl std::fmt::Debug) -> String {
     let debug = format!("{value:?}");
     let mut output = String::with_capacity(debug.len() + 4);
@@ -1531,7 +687,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::live_index::LiveIndex;
+    use crate::live_index::knowledge_retrieve::{EXCERPT_MAX_CHARS, window_excerpt};
+    use crate::live_index::{LiveIndex, PublishedIndexStatus};
 
     fn input(query: &str) -> SearchKnowledgeInput {
         SearchKnowledgeInput {
