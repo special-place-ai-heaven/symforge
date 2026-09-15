@@ -5,7 +5,7 @@
   "source_contract": {
     "path": "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
     "schema_version": 1,
-    "sha256": "5e5b47b110b27f57f5cb83506130131be772047b03a0f4cacc3412e60718f5a9"
+    "sha256": "576dffe38b047499effb77bb7d98aceb56c9aae2941bf4013ec2efb25b16755e"
   },
   "coverage": {
     "supported_cells": 26,
@@ -13,8 +13,8 @@
     "supported_feature_vectors": 6,
     "graph_projections": 3,
     "public_modules": 3,
-    "public_exports": 31,
-    "public_items": 29,
+            "public_exports": 37,
+            "public_items": 35,
     "inherent_associated_items": 34,
     "direct_trait_impls": 17,
     "negative_assertions": 12,

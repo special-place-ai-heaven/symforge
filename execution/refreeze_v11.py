@@ -43,7 +43,7 @@ ATTESTATION_END = "<!-- SYMFORGE FEATURE020 ATTESTATION V11 JSON END -->"
 
 AMENDMENT_DOMAIN = b"symforge.feature-020.amendment-set.v11\0"
 API_SCHEMA_SHAPE_DOMAIN = b"symforge.public-api-v11.schema-shape.v1\0"
-API_SCHEMA_SHAPE_SHA256 = "07358647b547b05e5f28c51768b51740f0941f83d6b81d37c39397e9ca054516"
+API_SCHEMA_SHAPE_SHA256 = "07057241e2dc94b151c3773e0dcfe6502f22086756d4dddc67a4a1d3633bf023"
 SIGNATURE_NAMESPACE = "symforge-feature-020-refreeze-v11"
 APPROVAL_PURPOSE = "implementation_start"
 CANONICAL_REPOSITORY = "special-place-ai-heaven/symforge"
@@ -280,7 +280,13 @@ EXPECTED_AUTO_TRAITS = {
                 "std::panic::UnwindSafe": "positive",
             },
             "subjects": (
+                "symforge::embed::CensusFile",
                 "symforge::embed::EngineInfo",
+                "symforge::embed::IndexCensus",
+                "symforge::embed::IndexProgress",
+                "symforge::embed::KnowledgeMatch",
+                "symforge::embed::KnowledgeSearchRequest",
+                "symforge::embed::KnowledgeSearchResult",
                 "symforge::embed::ReceiptWaitError",
                 "symforge::embed::RetryAdvice",
                 "symforge::embed::ShutdownReport",

@@ -298,9 +298,9 @@
           "sha256": "5f1fd6831a0ab75984148a84914856184506c31d59b11e143c8d31569a72d570"
         },
         {
-          "path": "tests/fixtures/public-api-v11-consumer/dependent-positive/src/lib.rs",
-          "role": "dependent-positive-source",
-          "sha256": "c0ca3d48968a797994e83795a6c141f3ee879aa83f8b7c3b80e1ea4f5cd7e4b2"
+        "path": "tests/fixtures/public-api-v11-consumer/dependent-positive/src/lib.rs",
+        "role": "dependent-positive-source",
+        "sha256": "36fbb7b980ea2dce59091c95bbf84f54aaf16371208a78fa90fa06ba0be043c6"
         },
         {
           "path": "tests/fixtures/public-api-v11-consumer/graph-cover.json",
