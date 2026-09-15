@@ -10,6 +10,117 @@ fn check_scout_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "__test-internals")]
+struct ScoutGateState {
+    pause_after_files: usize,
+    seen: std::sync::atomic::AtomicUsize,
+    blocked: std::sync::Mutex<bool>,
+    reached: std::sync::Condvar,
+    released: AtomicBool,
+}
+
+#[cfg(feature = "__test-internals")]
+static SCOUT_GATES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<ScoutGateState>>>,
+> = std::sync::OnceLock::new();
+
+/// Root-scoped hold in the scout walk so close-during-scout tests can park
+/// part-way through the walk without a sleep.
+#[cfg(feature = "__test-internals")]
+pub struct ScoutGateForTest {
+    root: PathBuf,
+    state: std::sync::Arc<ScoutGateState>,
+}
+
+#[cfg(feature = "__test-internals")]
+pub fn hold_scout_after_files_for_test(root: &Path, pause_after_files: usize) -> ScoutGateForTest {
+    assert!(
+        pause_after_files > 0,
+        "scout gate needs a positive file count"
+    );
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let state = std::sync::Arc::new(ScoutGateState {
+        pause_after_files,
+        seen: std::sync::atomic::AtomicUsize::new(0),
+        blocked: std::sync::Mutex::new(false),
+        reached: std::sync::Condvar::new(),
+        released: AtomicBool::new(false),
+    });
+    let gates = SCOUT_GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let previous = gates
+        .lock()
+        .expect("scout gate registry")
+        .insert(root.clone(), std::sync::Arc::clone(&state));
+    assert!(previous.is_none(), "a root can hold only one scout gate");
+    ScoutGateForTest { root, state }
+}
+
+#[cfg(feature = "__test-internals")]
+impl ScoutGateForTest {
+    pub fn wait_until_blocked(&self, timeout: std::time::Duration) -> bool {
+        let blocked = self.state.blocked.lock().expect("scout gate state");
+        let (blocked, _) = self
+            .state
+            .reached
+            .wait_timeout_while(blocked, timeout, |blocked| !*blocked)
+            .expect("scout gate state");
+        *blocked
+    }
+
+    pub fn files_seen(&self) -> usize {
+        self.state.seen.load(Ordering::Acquire)
+    }
+
+    pub fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+        self.state.reached.notify_all();
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for ScoutGateForTest {
+    fn drop(&mut self) {
+        self.release();
+        let gates =
+            SCOUT_GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut gates = gates.lock().expect("scout gate registry");
+        if gates
+            .get(&self.root)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.state))
+        {
+            gates.remove(&self.root);
+        }
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+fn pause_scout_after_files_for_test(root: &Path, cancel: Option<&AtomicBool>) {
+    let Some(state) = SCOUT_GATES
+        .get()
+        .and_then(|gates| gates.lock().ok()?.get(root).cloned())
+    else {
+        return;
+    };
+    if state.seen.fetch_add(1, Ordering::AcqRel) + 1 != state.pause_after_files {
+        return;
+    }
+    let mut blocked = state.blocked.lock().expect("scout gate state");
+    *blocked = true;
+    state.reached.notify_all();
+    while !state.released.load(Ordering::Acquire)
+        && !cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        let (next, _) = state
+            .reached
+            .wait_timeout(blocked, std::time::Duration::from_millis(5))
+            .expect("scout gate state");
+        blocked = next;
+    }
+}
+
+#[cfg(not(feature = "__test-internals"))]
+fn pause_scout_after_files_for_test(_root: &Path, _cancel: Option<&AtomicBool>) {}
+
 use crate::domain::{
     AccessErrorKind, AccessStage, CatalogPath, CoverageStatus, FileClassification, FileStamp,
     FreshnessReason, HardSkipReason, IndexTargets, LanguageId, ManifestResourceUsage,
@@ -591,6 +702,8 @@ fn discover_all_files_with_exclusions_and_issues_cancellable(
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
         }
+        pause_scout_after_files_for_test(&root, cancel);
+        check_scout_cancelled(cancel)?;
 
         // Get file size from the walk metadata (DirEntry has it on most platforms).
         // Fall back to a stat call only when metadata is unavailable.
