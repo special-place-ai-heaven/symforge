@@ -1,25 +1,12 @@
 diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
-index 430226d4..e0d5bf8b 100644
+index 430226d4..e91c0aa2 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
-@@ -617,6 +617,7 @@ impl EmbeddedBinding {
-         if self.shutdown_started.load(Ordering::Acquire) {
-             return None;
+@@ -524,6 +524,7 @@ impl EmbeddedBinding {
+                     break;
+                 }
+             } else {
++                self.progress.reset();
+                 observed_fingerprint = next_fingerprint;
+             }
          }
-+        crate::live_index::store::note_reload_discovered(&self.root, plan.entries.len() as u64);
-         Some(crate::hash::digest_hex(format!("{plan:?}").as_bytes()))
-     }
- 
-diff --git a/src/live_index/store.rs b/src/live_index/store.rs
-index 779c32f5..51e6e38b 100644
---- a/src/live_index/store.rs
-+++ b/src/live_index/store.rs
-@@ -276,7 +276,7 @@ fn reload_progress_for(root: &Path) -> Option<Arc<ReloadProgressSink>> {
-         .and_then(|map| map.lock().ok()?.get(&root).cloned())
- }
- 
--fn note_reload_discovered(root: &Path, count: u64) {
-+pub(crate) fn note_reload_discovered(root: &Path, count: u64) {
-     if let Some(sink) = reload_progress_for(root) {
-         sink.files_discovered.store(count, Ordering::Release);
-     }

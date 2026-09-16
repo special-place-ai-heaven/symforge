@@ -1054,7 +1054,7 @@ fn index_progress_resets_before_each_reload() {
 fn index_progress_keeps_last_values_after_cancel() {
     let repository = rust_repo_with_files(1);
     let runtime = ProcessIndexRuntime::acquire().expect("acquire");
-    let held = ThroughCancelHold {
+    let mut held = ThroughCancelHold {
         gate: Some(
             symforge::live_index::store::hold_reload_through_cancel_for_test(repository.path(), 1),
         ),
@@ -1070,6 +1070,12 @@ fn index_progress_keeps_last_values_after_cancel() {
     let progress = held.handles[0].index_progress();
     assert_eq!(progress.files_parsed, 1);
     held.handles[0].cancel_reload_for_test();
+    drop(held.gate.take());
+    wait_for_view(
+        &held.handles[0],
+        Instant::now() + Duration::from_secs(5),
+        |view| view.phase == SourceRuntimePhase::Stopped,
+    );
     assert_eq!(
         held.handles[0].index_progress(),
         progress,
