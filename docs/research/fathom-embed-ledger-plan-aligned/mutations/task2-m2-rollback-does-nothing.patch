@@ -2,7 +2,7 @@ diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
 index 430226d4..fbbea5e3 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
-@@ -370,25 +370,6 @@ impl Drop for OpenRollback {
+@@ -370,25 +370,7 @@ impl Drop for OpenRollback {
          if self.committed {
              return;
          }
@@ -25,6 +25,7 @@ index 430226d4..fbbea5e3 100644
 -            .store(open.is_empty(), Ordering::Release);
 -        drop(open);
 -        let _ = super::activation::process_project_registry().stop(&self.key);
++        let _ = (&self.factory, &self.key, &self.identity, &self.binding);
      }
  }
  

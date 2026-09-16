@@ -2245,6 +2245,23 @@ fn panicking_open_releases_its_process_wide_root_reservation() {
     }));
     assert!(result.is_err(), "the scoped test hook must inject a panic");
 
+    let symforge::domain::RootResolution::Bound(binding) =
+        symforge::discovery::resolve_root_candidate(
+            root.path(),
+            symforge::domain::RootCandidateSource::McpClientRoot,
+            symforge::domain::RootRequestMode::Automatic,
+        )
+    else {
+        panic!("test root must resolve to an embedded binding");
+    };
+    let key = symforge::live_index::index_lifecycle::registry::ProjectKey::new(&binding.root_id.0);
+    assert!(
+        symforge::live_index::index_lifecycle::activation::process_project_registry()
+            .live(&key)
+            .is_err(),
+        "rollback must stop the process admission before a reopen can join it"
+    );
+
     runtime
         .open_embedded_source(EmbeddedSourceSpec::current_worktree(
             root.path().to_path_buf(),
@@ -2330,6 +2347,12 @@ fn stale_open_rollback_keeps_a_newer_reservation() {
             handle_b.is_open(),
             "the newer reservation must survive the stale rollback"
         );
+        let runtime_c = ProcessRuntimeApi::acquire().expect("runtime c admits");
+        runtime_c
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .expect_err("the newer reservation must still refuse a third open");
         handle_b.begin_close();
     });
 }

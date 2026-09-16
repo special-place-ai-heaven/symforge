@@ -1,8 +1,8 @@
 diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
-index 430226d4..3a0f8101 100644
+index 430226d4..2db72c19 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
-@@ -985,10 +985,10 @@ impl EmbeddedSourceFactory {
+@@ -985,11 +985,14 @@ impl EmbeddedSourceFactory {
      }
  
      pub(crate) fn shutdown_owner(&self, owner: EmbeddedIdentity) -> EmbeddedShutdownReport {
@@ -11,10 +11,15 @@ index 430226d4..3a0f8101 100644
              let open = self.open.lock().expect("embedded registration mutex");
              open.iter()
 -                .filter(|(_, source)| source.owner == Some(owner))
-                 .map(|(key, source)| (key.clone(), source.binding.clone()))
+-                .map(|(key, source)| (key.clone(), source.binding.clone()))
++                .map(|(key, source)| {
++                    let _ = source.owner;
++                    (key.clone(), source.binding.clone())
++                })
                  .collect()
          };
-@@ -1004,12 +1004,7 @@ impl EmbeddedSourceFactory {
+         let mut closed_sources = 0u64;
+@@ -1004,12 +1007,7 @@ impl EmbeddedSourceFactory {
          }
          let mut open = self.open.lock().expect("embedded registration mutex");
          for (key, _) in &closing {
