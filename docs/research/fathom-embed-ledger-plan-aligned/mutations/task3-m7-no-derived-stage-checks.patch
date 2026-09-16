@@ -1,10 +1,10 @@
 diff --git a/src/live_index/store.rs b/src/live_index/store.rs
-index 7699ba61..711d64f9 100644
+index 02def4ec..dda5e79d 100644
 --- a/src/live_index/store.rs
 +++ b/src/live_index/store.rs
-@@ -235,7 +235,7 @@ fn pause_between_derived_stages(cancel: Option<&AtomicBool>) -> anyhow::Result<(
-     #[cfg(feature = "__test-internals")]
+@@ -253,7 +253,7 @@ fn pause_between_derived_stages(cancel: Option<&AtomicBool>) -> anyhow::Result<(
      if DERIVED_STAGE_HOLD.load(Ordering::Acquire) {
+         DERIVED_STAGE_REACHED.store(true, Ordering::Release);
          loop {
 -            check_reload_cancelled(cancel)?;
 +            let _ = cancel;
