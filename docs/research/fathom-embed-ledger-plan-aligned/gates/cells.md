@@ -64,4 +64,4 @@ C9 is the `embed_bound_index` step the plan's session added to
 - [x] C9: the embed-only integration contract target keeps every v11.2.0 pass and adds no failure
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs suite --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-integration.json -- test -j 8 --no-fail-fast --no-default-features --features embed --test embed_bound_index -- --test-threads=1
   EXPECT: /LEDGER-ORACLE SUITE GREEN [^\n]*preexisting_failures=0;/
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=11e4be14d3b9a7360c763a6507ea42c31ccaa4a9fb5790f9cbd967fa2c5cbe52; output-bytes=78
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=044f3dfe697bfbd412883f861b0e4eb1f654791b678b6def4eb0fb28b14ee9e1; output-bytes=78
