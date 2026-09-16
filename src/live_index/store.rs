@@ -211,6 +211,38 @@ fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) 
 #[cfg(not(feature = "__test-internals"))]
 fn pause_after_parse_for_test(_source_scope: &Path, _cancel: Option<&AtomicBool>) {}
 
+#[cfg(feature = "__test-internals")]
+static DERIVED_STAGE_HOLD: AtomicBool = AtomicBool::new(false);
+
+/// Hold every derived-index rebuild after the trigram pass until cancel or drop.
+#[cfg(feature = "__test-internals")]
+pub struct DerivedStageHoldForTest;
+
+#[cfg(feature = "__test-internals")]
+pub fn hold_derived_stage_for_test() -> DerivedStageHoldForTest {
+    DERIVED_STAGE_HOLD.store(true, Ordering::Release);
+    DerivedStageHoldForTest
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for DerivedStageHoldForTest {
+    fn drop(&mut self) {
+        DERIVED_STAGE_HOLD.store(false, Ordering::Release);
+    }
+}
+
+fn pause_between_derived_stages(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
+    #[cfg(feature = "__test-internals")]
+    if DERIVED_STAGE_HOLD.load(Ordering::Acquire) {
+        loop {
+            check_reload_cancelled(cancel)?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let _ = cancel;
+    Ok(())
+}
+
 pub(crate) struct ReloadProgressSink {
     files_discovered: AtomicU64,
     files_parsed: AtomicU64,
@@ -4419,6 +4451,7 @@ impl DerivedIndices {
         check_reload_cancelled(cancel)?;
         let trigram_index = super::trigram::TrigramIndex::build_from_files(files);
         check_reload_cancelled(cancel)?;
+        pause_between_derived_stages(cancel)?;
         let reverse_index = build_reverse_index_from_files(files);
         check_reload_cancelled(cancel)?;
         let (files_by_basename, files_by_dir_component) = build_path_indices_from_files(files);

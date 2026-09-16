@@ -466,17 +466,18 @@ fn stopping_is_never_overwritten_by_blocked_or_current() {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let phase = handle.runtime_view().phase;
-            if matches!(
+            assert_ne!(
                 phase,
-                SourceRuntimePhase::Stopping | SourceRuntimePhase::Stopped
-            ) {
+                SourceRuntimePhase::Stopped,
+                "close reached Stopped before Stopping was observed"
+            );
+            if phase == SourceRuntimePhase::Stopping {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
                 "close never reached Stopping: {phase:?}"
             );
-            std::thread::sleep(Duration::from_millis(1));
         }
         gate.release();
         closer.join().expect("close thread completes");
@@ -536,6 +537,36 @@ fn close_during_scout_returns_before_scout_completes() {
         gate.files_seen() < 32,
         "scout completed the whole walk before close returned: seen={}",
         gate.files_seen()
+    );
+}
+
+#[test]
+#[test]
+fn close_during_derived_stage_returns_before_release() {
+    use std::sync::mpsc;
+
+    let repository = rust_repo_with_files(4);
+    let _hold = symforge::live_index::store::hold_derived_stage_for_test();
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(5), |view| {
+        view.phase == SourceRuntimePhase::Loading
+    });
+    let (finished, received) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let started = Instant::now();
+        handle.close().expect("close during derived-index hold");
+        finished
+            .send(started.elapsed())
+            .expect("report close duration");
+    });
+    let elapsed = received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("closing during a derived-index hold must not wait for the rebuild");
+    closer.join().expect("close thread completes");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "close exceeded the one-second contract: {elapsed:?}"
     );
 }
 
