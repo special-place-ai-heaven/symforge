@@ -197,8 +197,8 @@ fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) 
     let mut blocked = state.blocked.lock().expect("reload gate state");
     *blocked = true;
     state.reached.notify_all();
-    while !state.released.load(Ordering::Acquire)
-        && !(state.release_on_cancel && cancel.is_some_and(|flag| flag.load(Ordering::Acquire)))
+    while !(state.released.load(Ordering::Acquire)
+        || (state.release_on_cancel && cancel.is_some_and(|flag| flag.load(Ordering::Acquire))))
     {
         let (next, _) = state
             .reached

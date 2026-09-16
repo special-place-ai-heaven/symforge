@@ -881,7 +881,7 @@ fn relationship_evidence(
             resolution: link.resolution.clone(),
         })
         .collect();
-    items.sort_by(|left, right| left.preview_token().cmp(&right.preview_token()));
+    items.sort_by_key(|item| item.preview_token());
     items.dedup_by(|left, right| left.preview_token() == right.preview_token());
 
     let class_of = |preview: &str| -> usize {
@@ -1054,10 +1054,7 @@ mod tests {
         scoped.path_prefix = Some("src".to_string());
         let result = retrieve_one(&generation, &scoped);
         let paths: Vec<&str> = result.hits.iter().map(|hit| hit.path.as_str()).collect();
-        assert!(
-            paths.iter().any(|path| *path == "src/note.md"),
-            "src/ must match: {paths:?}"
-        );
+        assert!(paths.contains(&"src/note.md"), "src/ must match: {paths:?}");
         assert!(
             paths.iter().all(|path| *path != "srcx/note.md"),
             "src/ must not match srcx/: {paths:?}"

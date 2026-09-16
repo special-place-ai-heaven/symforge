@@ -3,8 +3,10 @@
 //! Covers, over the REAL `/mcp` Streamable HTTP path (`build_mcp_router` +
 //! `apply_bearer_auth`, the same construction `serve::run` uses):
 //!
-//! * **SC-310** — `initialize` negotiation: 2026-07-28 negotiates 2026-07-28
-//!   and 2025-06-18 still negotiates 2025-06-18.
+//! * **SC-310** — `initialize` negotiation: 2026-07-28 is not a handshake
+//!   revision in rmcp 3.3 (discover-first / per-request `_meta` only), so
+//!   initialize falls back to the newest legacy version (2025-11-25);
+//!   2025-06-18 still negotiates 2025-06-18.
 //! * **SC-311** — discover-FIRST lifecycle: an authenticated, version-headered
 //!   `server/discover` as literally the first request, then the full service
 //!   surface (`tools/list`, `tools/call`, `prompts/list`, `resources/list`,
@@ -234,23 +236,37 @@ async fn negotiation_modern_and_legacy_versions() {
     let server = start_server(test_runtime()).await;
     let mut client = McpHttpClient::new(server.mcp_url());
 
-    for version in [MODERN_VERSION, "2025-06-18"] {
-        let result = client
-            .call(
-                "initialize",
-                json!({
-                    "protocolVersion": version,
-                    "capabilities": {},
-                    "clientInfo": {"name": "sc310", "version": "0.0.0"},
-                }),
-                &[],
-            )
-            .await;
-        assert_eq!(
-            result["protocolVersion"], *version,
-            "requested {version} must negotiate {version}"
-        );
-    }
+    let modern = client
+        .call(
+            "initialize",
+            json!({
+                "protocolVersion": MODERN_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "sc310", "version": "0.0.0"},
+            }),
+            &[],
+        )
+        .await;
+    assert_eq!(
+        modern["protocolVersion"], "2025-11-25",
+        "2026-07-28 has no initialize handshake; rmcp 3.3 falls back to the newest legacy version"
+    );
+
+    let legacy = client
+        .call(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "sc310", "version": "0.0.0"},
+            }),
+            &[],
+        )
+        .await;
+    assert_eq!(
+        legacy["protocolVersion"], "2025-06-18",
+        "requested 2025-06-18 must negotiate 2025-06-18"
+    );
 
     server.shutdown().await;
 }

@@ -440,7 +440,7 @@ fn operation_contract_cartesian_matrix() {
 
     assert_eq!(
         seen,
-        7 * 4 * 4,
+        9 * 4 * 4,
         "control: the full operations x kinds x advices Cartesian was exercised"
     );
 }

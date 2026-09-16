@@ -1002,21 +1002,24 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "server_api.rs",
 ];
 const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
-// Baseline refreshed 2026-09-13 after re-reviewing the complete src diff:
-// the embed handle now binds a lifecycle-admitted SharedIndex, owns its
-// metadata observer worker, serves claims, and joins on close/runtime drop.
+// Baseline refreshed 2026-09-16 after re-reviewing the complete src diff:
+// process-wide embed factory, cooperative close, index_census,
+// index_progress, and search_knowledge on the handle. Same 20 excluded
+// paths; contents of embedded.rs / public_api.rs / process_runtime.rs /
+// registry.rs / snapshot.rs / activation.rs grew.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ee28574e46d25965f668d070686be1e036e7e07b19ae6467fffc1441731b5ec4",
+    "39b3fc66fe0d49a1cf70ac82b58b966491f5cbf000c1b08e5c4232c1fd40dfcc",
     20,
-    439_760,
+    465_068,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
-// Baseline refreshed 2026-09-13 after re-reviewing the complete src diff:
-// the embed handle activation described on the excluded-source pin above.
+// Baseline refreshed 2026-09-16 with the excluded-source pin above.
+// File count 197 -> 198: added src/live_index/knowledge_retrieve.rs
+// (typed retrieval seam; not an excluded-runtime path).
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8a64286b87f5368feb5421a93fff8fee1efc143223fcb0bcb632981f8aa068d9",
-    197,
-    9_577_814,
+    "8b48035e1ad794aa20b082133621f36fc9b122348ed88afcd83de01cdda9a80a",
+    198,
+    9_657_759,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

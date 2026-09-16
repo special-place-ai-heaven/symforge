@@ -16,20 +16,20 @@ C9 is the `embed_bound_index` step the plan's session added to
 `.github/workflows/ci.yml`. The three baselines are recorded once at v11.2.0
 (b549aa7) in a detached temporary worktree, by the commands in PROMPT.md step 3.
 
-- [ ] C0: the ledger oracle rejects vacuous, failing, surviving-mutant, non-additive and partial-release inputs
+- [x] C0: the ledger oracle rejects vacuous, failing, surviving-mutant, non-additive and partial-release inputs
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs self-test
   EXPECT: LEDGER-ORACLE SELF-TEST GREEN
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=bb5b8fdc332f13cfaa8aaf81be9b382d4a2fbaae1cd238f11de448f2e06089f1; output-bytes=41
 
-- [ ] C1: the tree is rustfmt-clean
+- [x] C1: the tree is rustfmt-clean
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label fmt -- cargo fmt --check
   EXPECT: LEDGER-ORACLE RUN GREEN label=fmt;
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=cdd5e3bee7692ff2744e883d94775d504e833095a9f8196f2f7ee4b2f059dbb8; output-bytes=35
 
-- [ ] C2: the default feature set type-checks
+- [x] C2: the default feature set type-checks
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label check -- cargo check -j 8
   EXPECT: LEDGER-ORACLE RUN GREEN label=check;
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=6582f2b3e2185ed03de7818091db315e99f8873d37ff94d5a8bb22b103a58b6f; output-bytes=37
 
 - [ ] C3: every default-feature target is clippy-clean with warnings denied
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label clippy-default -- cargo clippy -j 8 --all-targets -- -D warnings
@@ -41,27 +41,27 @@ C9 is the `embed_bound_index` step the plan's session added to
   EXPECT: /LEDGER-ORACLE SUITE GREEN [^\n]*preexisting_failures=0;/
   EVIDENCE: pending
 
-- [ ] C5: the observed refresh gate bench runs clean in criterion test mode
+- [x] C5: the observed refresh gate bench runs clean in criterion test mode
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label bench-smoke -- cargo bench -j 8 --bench observed_refresh_gate_v1 -- --test
   EXPECT: LEDGER-ORACLE RUN GREEN label=bench-smoke;
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=ca9bbf9ce946271f567a20d20e2eee5189edfb5c658b17d61ef23363de002b6a; output-bytes=43
 
-- [ ] C6: the release binary builds
+- [x] C6: the release binary builds
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label release-build -- cargo build -j 8 --release
   EXPECT: LEDGER-ORACLE RUN GREEN label=release-build;
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=aec15e7c87fd2a42713ebf0caa6ad564dce25010416c97b41e547135033424a1; output-bytes=45
 
 - [ ] C7: the engine-only embed lib is clippy-clean with warnings denied
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label clippy-embed -- cargo clippy -j 8 --no-default-features --features embed,__test-internals --lib -- -D warnings
   EXPECT: LEDGER-ORACLE RUN GREEN label=clippy-embed;
   EVIDENCE: pending
 
-- [ ] C8: the embed-only lib test suite keeps every v11.2.0 pass and adds no failure
+- [x] C8: the embed-only lib test suite keeps every v11.2.0 pass and adds no failure
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs suite --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-lib.json -- test -j 8 --no-fail-fast --no-default-features --features embed --lib -- --test-threads=1
   EXPECT: /LEDGER-ORACLE SUITE GREEN [^\n]*preexisting_failures=0;/
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=f9fd4078a521656d239cf57a044d7f7b582bd4d4685e2c3c1d3141cb3b5b62ec; output-bytes=83
 
-- [ ] C9: the embed-only integration contract target keeps every v11.2.0 pass and adds no failure
+- [x] C9: the embed-only integration contract target keeps every v11.2.0 pass and adds no failure
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs suite --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-integration.json -- test -j 8 --no-fail-fast --no-default-features --features embed --test embed_bound_index -- --test-threads=1
   EXPECT: /LEDGER-ORACLE SUITE GREEN [^\n]*preexisting_failures=0;/
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=11e4be14d3b9a7360c763a6507ea42c31ccaa4a9fb5790f9cbd967fa2c5cbe52; output-bytes=78
