@@ -211,6 +211,183 @@ fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) 
 #[cfg(not(feature = "__test-internals"))]
 fn pause_after_parse_for_test(_source_scope: &Path, _cancel: Option<&AtomicBool>) {}
 
+pub(crate) struct ReloadProgressSink {
+    files_discovered: AtomicU64,
+    files_parsed: AtomicU64,
+    symbols_found: AtomicU64,
+}
+
+impl ReloadProgressSink {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            files_discovered: AtomicU64::new(0),
+            files_parsed: AtomicU64::new(0),
+            symbols_found: AtomicU64::new(0),
+        })
+    }
+
+    pub(crate) fn reset(&self) {
+        self.files_discovered.store(0, Ordering::Release);
+        self.files_parsed.store(0, Ordering::Release);
+        self.symbols_found.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.files_discovered.load(Ordering::Acquire),
+            self.files_parsed.load(Ordering::Acquire),
+            self.symbols_found.load(Ordering::Acquire),
+        )
+    }
+}
+
+static RELOAD_PROGRESS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<ReloadProgressSink>>>> =
+    OnceLock::new();
+
+pub(crate) struct ReloadProgressGuard {
+    root: PathBuf,
+}
+
+impl Drop for ReloadProgressGuard {
+    fn drop(&mut self) {
+        if let Some(map) = RELOAD_PROGRESS.get() {
+            map.lock().expect("reload progress").remove(&self.root);
+        }
+    }
+}
+
+pub(crate) fn register_reload_progress(
+    root: &Path,
+    sink: Arc<ReloadProgressSink>,
+) -> ReloadProgressGuard {
+    let root = normalize_root(root);
+    RELOAD_PROGRESS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("reload progress")
+        .insert(root.clone(), sink);
+    ReloadProgressGuard { root }
+}
+
+fn reload_progress_for(root: &Path) -> Option<Arc<ReloadProgressSink>> {
+    let root = normalize_root(root);
+    RELOAD_PROGRESS
+        .get()
+        .and_then(|map| map.lock().ok()?.get(&root).cloned())
+}
+
+fn note_reload_discovered(root: &Path, count: u64) {
+    if let Some(sink) = reload_progress_for(root) {
+        sink.files_discovered.store(count, Ordering::Release);
+    }
+}
+
+fn note_reload_parsed(root: &Path) {
+    if let Some(sink) = reload_progress_for(root) {
+        sink.files_parsed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn note_reload_symbols(root: &Path, count: u64) {
+    if let Some(sink) = reload_progress_for(root) {
+        sink.symbols_found.fetch_add(count, Ordering::AcqRel);
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+struct CensusHoldState {
+    blocked: std::sync::Mutex<bool>,
+    reached: std::sync::Condvar,
+    released: AtomicBool,
+}
+
+#[cfg(feature = "__test-internals")]
+static CENSUS_HOLDS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<CensusHoldState>>>> =
+    OnceLock::new();
+
+#[cfg(feature = "__test-internals")]
+pub struct CensusHoldForTest {
+    root: PathBuf,
+    state: Arc<CensusHoldState>,
+}
+
+#[cfg(feature = "__test-internals")]
+pub fn hold_census_after_first_read_for_test(root: &Path) -> CensusHoldForTest {
+    let root = normalize_root(root);
+    let state = Arc::new(CensusHoldState {
+        blocked: std::sync::Mutex::new(false),
+        reached: std::sync::Condvar::new(),
+        released: AtomicBool::new(false),
+    });
+    let previous = CENSUS_HOLDS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("census hold registry")
+        .insert(root.clone(), Arc::clone(&state));
+    assert!(previous.is_none(), "a root can hold only one census gate");
+    CensusHoldForTest { root, state }
+}
+
+#[cfg(feature = "__test-internals")]
+impl CensusHoldForTest {
+    pub fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        let blocked = self.state.blocked.lock().expect("census hold state");
+        let (blocked, _) = self
+            .state
+            .reached
+            .wait_timeout_while(blocked, timeout, |blocked| !*blocked)
+            .expect("census hold state");
+        *blocked
+    }
+
+    pub fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+        self.state.reached.notify_all();
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for CensusHoldForTest {
+    fn drop(&mut self) {
+        self.release();
+        let holds = CENSUS_HOLDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut holds = holds.lock().expect("census hold registry");
+        if holds
+            .get(&self.root)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.state))
+        {
+            holds.remove(&self.root);
+        }
+    }
+}
+
+pub(crate) fn pause_census_after_first_read_for_test(root: &Path) {
+    #[cfg(feature = "__test-internals")]
+    {
+        let root = normalize_root(root);
+        let Some(state) = CENSUS_HOLDS
+            .get()
+            .and_then(|holds| holds.lock().ok()?.get(&root).cloned())
+        else {
+            return;
+        };
+        let mut blocked = state.blocked.lock().expect("census hold state");
+        *blocked = true;
+        state.reached.notify_all();
+        while !state.released.load(Ordering::Acquire) {
+            let (next, _) = state
+                .reached
+                .wait_timeout(blocked, Duration::from_millis(5))
+                .expect("census hold state");
+            blocked = next;
+        }
+    }
+    #[cfg(not(feature = "__test-internals"))]
+    {
+        let _ = root;
+    }
+}
+
 #[cfg(windows)]
 const INDEXING_THREAD_STACK_SIZE_ENV: &str = "SYMFORGE_INDEXING_THREAD_STACK_BYTES";
 #[cfg(windows)]
@@ -4982,6 +5159,7 @@ fn admit_and_parse_entries(
                     language,
                     classification,
                 );
+                note_reload_parsed(&source_scope);
                 pause_after_parse_for_test(&source_scope, cancel);
                 if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                     cancelled_during_parse.store(true, Ordering::Release);
@@ -4998,6 +5176,7 @@ fn admit_and_parse_entries(
                     );
                 }
                 let indexed = IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
+                note_reload_symbols(&source_scope, indexed.symbols.len() as u64);
                 debug_assert_eq!(crate::hash::digest(&indexed.content), accepted_hash);
                 let resident_bytes = u64::try_from(indexed.content.len()).unwrap_or(u64::MAX);
                 if !staged_accounting.handoff(resident_bytes, permit) {
@@ -5561,6 +5740,7 @@ impl LiveIndex {
         };
         check_reload_cancelled(cancel)?;
         let projection = project_scout_for_legacy_execution(&scout_plan);
+        note_reload_discovered(root, projection.entries.len() as u64);
         info!(
             "scouted {} catalog entries ({} executable by the legacy index)",
             scout_plan.entries.len(),

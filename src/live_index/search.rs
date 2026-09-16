@@ -155,6 +155,34 @@ fn count_in_scope_knowledge_only_files(
         .count()
 }
 
+fn count_in_scope_withheld_files(index: &LiveIndex, path_scope: &PathScope) -> (usize, usize) {
+    let mut policy = 0usize;
+    let mut size = 0usize;
+    for entry in &index.manifest_entries {
+        let Some(path) = entry.path.normalized_utf8.as_deref() else {
+            continue;
+        };
+        if !path_scope.matches(path) {
+            continue;
+        }
+        match &entry.disposition {
+            FileDisposition::MetadataOnly {
+                reason:
+                    crate::domain::MetadataOnlyReason::SensitivePath { .. }
+                    | crate::domain::MetadataOnlyReason::SensitiveContent { .. },
+            } => policy += 1,
+            FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::OversizedData,
+            }
+            | FileDisposition::HardSkip {
+                reason: crate::domain::HardSkipReason::PerFileCeiling,
+            } => size += 1,
+            _ => {}
+        }
+    }
+    (policy, size)
+}
+
 fn with_excluded_knowledge_count(
     mut result: TextSearchResult,
     index: &LiveIndex,
@@ -162,6 +190,9 @@ fn with_excluded_knowledge_count(
 ) -> TextSearchResult {
     result.excluded_knowledge_files =
         count_in_scope_knowledge_only_files(index, &options.path_scope, options.search_scope);
+    let (policy, size) = count_in_scope_withheld_files(index, &options.path_scope);
+    result.withheld_policy_files = policy;
+    result.withheld_size_files = size;
     result
 }
 
@@ -752,6 +783,10 @@ pub struct TextSearchResult {
     /// In-scope knowledge-only catalog files a code-scoped search did not scan.
     /// Zero when the search was not code-scoped or the scope holds no such files.
     pub excluded_knowledge_files: usize,
+    /// In-scope files admission withheld by policy (path or content). Neutral.
+    pub withheld_policy_files: usize,
+    /// In-scope files withheld for size (oversized data or per-file ceiling).
+    pub withheld_size_files: usize,
 }
 
 pub const SUPPRESSED_TEXT_MATCH_DISPLAY_CAP: usize = 100;
@@ -1605,6 +1640,8 @@ fn search_structural_with_compiler(
             suppressed_by_noise,
             overflow_count: 0,
             excluded_knowledge_files: 0,
+            withheld_policy_files: 0,
+            withheld_size_files: 0,
         },
         index,
         options,
@@ -1920,7 +1957,7 @@ where
         }
     }
 
-    TextSearchResult {
+    let mut result = TextSearchResult {
         label,
         total_matches,
         files,
@@ -1931,7 +1968,13 @@ where
             &options.path_scope,
             options.search_scope,
         ),
-    }
+        withheld_policy_files: 0,
+        withheld_size_files: 0,
+    };
+    let (policy, size) = count_in_scope_withheld_files(index, &options.path_scope);
+    result.withheld_policy_files = policy;
+    result.withheld_size_files = size;
+    result
 }
 
 fn build_context_rendered_lines(

@@ -566,6 +566,8 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
             suppressed_by_noise: 0,
             overflow_count: 0,
             excluded_knowledge_files: 0,
+            withheld_policy_files: 0,
+            withheld_size_files: 0,
         }),
         Some("symbol"),
         None,
@@ -595,6 +597,8 @@ fn empty_text_search_result(
         suppressed_by_noise: 0,
         overflow_count: 0,
         excluded_knowledge_files: 0,
+        withheld_policy_files: 0,
+        withheld_size_files: 0,
     })
 }
 
@@ -793,6 +797,116 @@ fn search_text_zero_hit_reports_exact_excluded_knowledge_count() {
     assert!(
         rendered.contains("search_knowledge"),
         "zero-hit must point at search_knowledge; got: {rendered}"
+    );
+}
+
+fn catalog_metadata_only(
+    path: &str,
+    reason: crate::domain::MetadataOnlyReason,
+) -> crate::domain::CatalogEntry {
+    crate::domain::CatalogEntry {
+        path: crate::domain::CatalogPath {
+            public_id: path.to_string(),
+            normalized_utf8: Some(path.to_string()),
+        },
+        size: 10,
+        language: Some(LanguageId::Text),
+        classification: crate::domain::FileClassification::for_indexed_path(
+            path,
+            crate::domain::IndexTargets::Knowledge,
+        ),
+        disposition: crate::domain::FileDisposition::MetadataOnly { reason },
+        content_hash: None,
+    }
+}
+
+fn withheld_partial_fixture(policy_reason: crate::domain::MetadataOnlyReason) -> LiveIndex {
+    let mut index = make_index(vec![make_file(
+        "src/code/lib.rs",
+        b"fn needle() {}\n",
+        vec![make_symbol("needle", SymbolKind::Function, 0, 0, 1)],
+    )]);
+    index.manifest_entries = vec![
+        catalog_indexed(
+            "src/code/lib.rs",
+            crate::domain::IndexTargets::Code,
+            LanguageId::Rust,
+        ),
+        catalog_metadata_only("src/.env", policy_reason),
+        catalog_metadata_only(
+            "src/big.csv",
+            crate::domain::MetadataOnlyReason::OversizedData,
+        ),
+    ];
+    index
+}
+
+fn render_code_search_partial(index: &LiveIndex, path_prefix: &str, query: &str) -> String {
+    let mut options = search::TextSearchOptions::for_current_code_search();
+    options.path_scope = search::PathScope::prefix(path_prefix);
+    search_text_result_view(
+        search::search_text_with_options(index, Some(query), None, false, &options),
+        None,
+        None,
+        None,
+        SearchSuggestionContext::default(),
+    )
+}
+
+#[test]
+fn search_text_partial_result_reports_policy_withheld_files_and_reasons() {
+    let index = withheld_partial_fixture(crate::domain::MetadataOnlyReason::SensitivePath {
+        rule_id: "path-rule".to_string(),
+    });
+    let rendered = render_code_search_partial(&index, "src", "needle");
+    assert!(
+        rendered.contains("1 match") || rendered.contains("needle"),
+        "partial result must still show the code hit; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("1 in-scope file withheld by admission policy"),
+        "must name the policy class with the neutral wording; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("1 in-scope file over the size threshold"),
+        "must name the size class separately; got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("path-rule") && !rendered.contains("SensitivePath"),
+        "must not disclose the detector; got: {rendered}"
+    );
+}
+
+#[test]
+fn withheld_report_wording_is_identical_for_path_rule_and_content_rule() {
+    let path_rule = render_code_search_partial(
+        &withheld_partial_fixture(crate::domain::MetadataOnlyReason::SensitivePath {
+            rule_id: "path-rule".to_string(),
+        }),
+        "src",
+        "needle",
+    );
+    let content_rule = render_code_search_partial(
+        &withheld_partial_fixture(crate::domain::MetadataOnlyReason::SensitiveContent {
+            rule_ids: vec!["content-rule".to_string()],
+            finding_count: 1,
+        }),
+        "src",
+        "needle",
+    );
+    let note = |rendered: &str| {
+        rendered
+            .lines()
+            .filter(|line| {
+                line.contains("withheld by admission policy") || line.contains("size threshold")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        note(&path_rule),
+        note(&content_rule),
+        "path vs content withholding must render identically\npath:\n{path_rule}\ncontent:\n{content_rule}"
     );
 }
 

@@ -327,6 +327,7 @@ struct EmbeddedBinding {
     wake: Condvar,
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
+    progress: Arc<crate::live_index::store::ReloadProgressSink>,
 }
 
 impl std::fmt::Debug for EmbeddedBinding {
@@ -364,6 +365,7 @@ impl EmbeddedBinding {
             wake: Condvar::new(),
             worker: std::sync::Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
+            progress: crate::live_index::store::ReloadProgressSink::new(),
         })
     }
 
@@ -437,6 +439,11 @@ impl EmbeddedBinding {
     }
 
     fn reload_and_publish(&self) -> Option<String> {
+        self.progress.reset();
+        let _progress = crate::live_index::store::register_reload_progress(
+            &self.root,
+            Arc::clone(&self.progress),
+        );
         let exclusions = crate::discovery::SourceExclusions::for_state_placement(
             &self.root,
             &self.state_placement,
@@ -649,6 +656,41 @@ fn normalized_path_prefix(prefix: Option<&str>) -> Option<String> {
             .trim_end_matches('/')
             .to_string()
     })
+}
+
+fn path_matches_prefix(path: &str, prefix: Option<&str>) -> bool {
+    match normalized_path_prefix(prefix) {
+        None => true,
+        Some(prefix) if prefix.is_empty() => true,
+        Some(prefix) => crate::live_index::search::PathScope::prefix(prefix).matches(path),
+    }
+}
+
+fn knowledge_lifecycle_label(
+    lifecycle: crate::live_index::knowledge_authority::KnowledgeLifecycle,
+) -> String {
+    format!("{lifecycle:?}").to_ascii_lowercase()
+}
+
+fn knowledge_coverage_label(
+    coverage: &crate::live_index::knowledge_bridge::DerivedCoverage,
+) -> String {
+    match coverage {
+        crate::live_index::knowledge_bridge::DerivedCoverage::Complete => "complete".to_string(),
+        crate::live_index::knowledge_bridge::DerivedCoverage::Truncated { .. } => {
+            "truncated".to_string()
+        }
+    }
+}
+
+fn knowledge_withheld_label(
+    reason: crate::live_index::knowledge_retrieve::KnowledgeWithheldReason,
+) -> String {
+    match reason {
+        crate::live_index::knowledge_retrieve::KnowledgeWithheldReason::PolicyWithheld => {
+            "policy_withheld".to_string()
+        }
+    }
 }
 
 fn bounded_preview(line: &str) -> String {
@@ -1051,13 +1093,9 @@ impl EmbeddedSourceHandle {
         })?;
         let live = index.read();
         let query = request.query.as_deref().map(str::to_lowercase);
-        let path_prefix = normalized_path_prefix(request.path_prefix.as_deref());
         let mut matches = Vec::new();
         for (path, file) in live.all_files() {
-            if path_prefix
-                .as_deref()
-                .is_some_and(|prefix| !path.starts_with(prefix))
-            {
+            if !path_matches_prefix(path, request.path_prefix.as_deref()) {
                 continue;
             }
             for symbol in &file.symbols {
@@ -1161,15 +1199,11 @@ impl EmbeddedSourceHandle {
             )
         })?;
         let live = index.read();
-        let path_prefix = normalized_path_prefix(request.path_prefix.as_deref());
         let limit = request.limit as usize;
         let mut matches = Vec::new();
         let mut truncated = false;
         'files: for (path, file) in live.all_files() {
-            if path_prefix
-                .as_deref()
-                .is_some_and(|prefix| !path.starts_with(prefix))
-            {
+            if !path_matches_prefix(path, request.path_prefix.as_deref()) {
                 continue;
             }
             let Ok(content) = std::str::from_utf8(&file.content) else {
@@ -1204,6 +1238,210 @@ impl EmbeddedSourceHandle {
             &claim.publication_identity,
             claim.source_version,
         ))
+    }
+
+    /// Census one pinned current generation's parsed files, including zeros.
+    pub fn index_census(
+        &self,
+    ) -> Result<
+        super::public_api::EmbedClaim<super::public_api::IndexCensus>,
+        super::public_api::EmbedSourceRefusal,
+    > {
+        let normalized = b"index-census";
+        if self.closed.load(Ordering::Acquire) {
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::IndexCensus,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized,
+            ));
+        }
+        let Some(binding) = self.binding.as_ref() else {
+            return Err(super::public_api::dark_unbound_refusal(
+                crate::lifecycle_identity::OperationKind::IndexCensus,
+            ));
+        };
+        let claim = binding.current_claim(
+            crate::lifecycle_identity::OperationKind::IndexCensus,
+            normalized,
+        )?;
+        let index = binding.runtime.acquire().map_err(|_| {
+            super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::IndexCensus,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized,
+            )
+        })?;
+        let generation = index.published_generation();
+        let parsed: std::collections::BTreeSet<String> = generation
+            .live
+            .all_files()
+            .filter(|(_, file)| {
+                matches!(
+                    file.parse_status,
+                    crate::live_index::store::ParseStatus::Parsed
+                        | crate::live_index::store::ParseStatus::PartialParse { .. }
+                )
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        crate::live_index::store::pause_census_after_first_read_for_test(&binding.root);
+        let files: Vec<super::public_api::CensusFile> = generation
+            .outline
+            .files
+            .iter()
+            .filter(|file| parsed.contains(&file.relative_path))
+            .map(|file| super::public_api::CensusFile {
+                path: file.relative_path.clone(),
+                language: file.language.name().to_string(),
+                symbol_count: u32::try_from(file.symbol_count).unwrap_or(u32::MAX),
+            })
+            .collect();
+        let total_files = files.len() as u64;
+        let total_symbols = files.iter().map(|file| u64::from(file.symbol_count)).sum();
+        Ok(super::public_api::live_claim(
+            super::public_api::IndexCensus {
+                total_files,
+                total_symbols,
+                files,
+            },
+            crate::lifecycle_identity::OperationKind::IndexCensus,
+            normalized,
+            &claim.binding_identity,
+            &claim.publication_identity,
+            claim.source_version,
+        ))
+    }
+
+    /// Binding-owned reload counters. Always succeeds; zeros if unbound.
+    pub fn index_progress(&self) -> super::public_api::IndexProgress {
+        self.binding
+            .as_ref()
+            .map_or_else(super::public_api::IndexProgress::default, |binding| {
+                let (files_discovered, files_parsed, symbols_found) = binding.progress.snapshot();
+                super::public_api::IndexProgress {
+                    files_discovered,
+                    files_parsed,
+                    symbols_found,
+                }
+            })
+    }
+
+    /// Search admitted knowledge from one pinned current generation.
+    pub fn search_knowledge(
+        &self,
+        request: &super::public_api::KnowledgeSearchRequest,
+    ) -> Result<
+        super::public_api::EmbedClaim<super::public_api::KnowledgeSearchResult>,
+        super::public_api::EmbedSourceRefusal,
+    > {
+        let normalized = format!(
+            "query={:?};path_prefix={:?};limit={}",
+            request.query, request.path_prefix, request.limit
+        );
+        if self.closed.load(Ordering::Acquire) {
+            return Err(super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::SearchKnowledge,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            ));
+        }
+        let Some(binding) = self.binding.as_ref() else {
+            return Err(super::public_api::dark_unbound_refusal(
+                crate::lifecycle_identity::OperationKind::SearchKnowledge,
+            ));
+        };
+        let parsed = crate::live_index::knowledge_retrieve::KnowledgeRetrieveRequest::parse(
+            &request.query,
+            request.path_prefix.as_deref(),
+            crate::live_index::knowledge_retrieve::KnowledgeRetrieveAuthorityScope::Default,
+            request.limit as usize,
+        )
+        .map_err(|_| {
+            super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::InvalidSelection,
+                crate::lifecycle_identity::OperationKind::SearchKnowledge,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            )
+        })?;
+        let claim = binding.current_claim(
+            crate::lifecycle_identity::OperationKind::SearchKnowledge,
+            normalized.as_bytes(),
+        )?;
+        let index = binding.runtime.acquire().map_err(|_| {
+            super::public_api::bound_source_refusal(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::OperationKind::SearchKnowledge,
+                crate::lifecycle_identity::RetryAdvice::Never,
+                normalized.as_bytes(),
+            )
+        })?;
+        let generation = index.published_generation();
+        let retrieved = crate::live_index::knowledge_retrieve::retrieve_knowledge(
+            &[
+                crate::live_index::knowledge_retrieve::KnowledgeRetrieveLane {
+                    generation: &generation,
+                    label: "current",
+                },
+            ],
+            &parsed,
+        );
+        let matches = retrieved
+            .hits
+            .into_iter()
+            .map(|hit| super::public_api::KnowledgeMatch {
+                path: hit.path,
+                heading_path: hit.heading_path,
+                preview: hit.preview,
+                content_hash: hit.content_hash,
+                provenance_ids: hit.authority.provenance_ids,
+                relationship_evidence: hit
+                    .relationship_evidence
+                    .iter()
+                    .map(|evidence| evidence.preview_token())
+                    .collect(),
+                authority: knowledge_lifecycle_label(hit.authority.lifecycle),
+                coverage: knowledge_coverage_label(&hit.authority.coverage),
+            })
+            .collect();
+        Ok(super::public_api::live_claim(
+            super::public_api::KnowledgeSearchResult {
+                matches,
+                truncated: retrieved.truncated,
+                withheld_count: retrieved.withheld_count as u64,
+                withheld_reasons: retrieved
+                    .withheld_reasons
+                    .into_iter()
+                    .map(knowledge_withheld_label)
+                    .collect(),
+            },
+            crate::lifecycle_identity::OperationKind::SearchKnowledge,
+            normalized.as_bytes(),
+            &claim.binding_identity,
+            &claim.publication_identity,
+            claim.source_version,
+        ))
+    }
+
+    #[cfg(feature = "__test-internals")]
+    pub fn revoke_admission_for_test(&self) {
+        if let Some(binding) = &self.binding {
+            binding.runtime.revoke_admission_for_test();
+        }
+    }
+
+    /// Signal reload cancel without joining the worker. Close still joins.
+    #[cfg(feature = "__test-internals")]
+    pub fn cancel_reload_for_test(&self) {
+        if let Some(binding) = &self.binding {
+            binding.shutdown_started.store(true, Ordering::Release);
+            let mut control = binding.control.lock().expect("embedded control mutex");
+            control.stop = true;
+            binding.wake.notify_all();
+        }
     }
 
     /// Queue a refresh on this source's worker.

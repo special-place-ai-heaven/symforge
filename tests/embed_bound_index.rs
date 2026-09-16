@@ -4,8 +4,8 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use symforge::embed::{
-    EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase, SymbolSearchRequest,
-    TextSearchRequest,
+    EmbeddedSourceSpec, KnowledgeSearchRequest, OperationKind, ProcessIndexRuntime, RetryAdvice,
+    SourceRefusalKind, SourceRuntimePhase, SymbolSearchRequest, TextSearchRequest,
 };
 
 fn wait_for_view(
@@ -308,6 +308,18 @@ fn open_current_worktree(
     runtime
         .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.to_path_buf()))
         .expect("open embedded source")
+}
+
+/// Drop the parse hold before the handle so a failed assert cannot join a parked worker.
+struct ThroughCancelHold {
+    gate: Option<symforge::live_index::store::ReloadGateForTest>,
+    handle: symforge::embed::EmbeddedSourceHandle,
+}
+
+impl Drop for ThroughCancelHold {
+    fn drop(&mut self) {
+        self.gate.take();
+    }
 }
 
 #[test]
@@ -732,5 +744,482 @@ fn close_latency_bound_on_this_checkout() {
         "CLOSE-LATENCY bound_ms=1000 closes={} max_ms={max_ms} median_ms={median_ms} unrelated_open_max_ms={unrelated_open_max_ms} full_reload_ms={}",
         close_ms.len(),
         full_reload.as_millis()
+    );
+}
+
+fn census_repo() -> tempfile::TempDir {
+    let repository = tempfile::tempdir().expect("temporary repository");
+    git2::Repository::init(repository.path()).expect("initialize git repository");
+    fs::create_dir_all(repository.path().join("src")).expect("create source directory");
+    fs::write(
+        repository.path().join("src/zeta.rs"),
+        b"pub fn zeta() -> u32 { 1 }\n",
+    )
+    .expect("write zeta");
+    fs::write(repository.path().join("src/empty.rs"), b"// no symbols\n")
+        .expect("write empty parsed file");
+    fs::write(
+        repository.path().join("src/alpha.rs"),
+        b"pub struct Alpha;\npub fn beta() -> u32 { 2 }\n",
+    )
+    .expect("write alpha");
+    repository
+}
+
+#[test]
+fn index_census_lists_sorted_zero_symbol_parsed_files() {
+    let repository = census_repo();
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let census = handle.index_census().expect("census current source");
+    let paths: Vec<&str> = census
+        .value()
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert!(
+        paths.windows(2).all(|pair| pair[0] <= pair[1]),
+        "census files must be sorted by path: {paths:?}"
+    );
+    let empty = census
+        .value()
+        .files
+        .iter()
+        .find(|file| file.path == "src/empty.rs")
+        .expect("zero-symbol parsed file must appear");
+    assert_eq!(empty.symbol_count, 0);
+    assert!(census.value().total_files >= 3);
+}
+
+#[test]
+fn index_census_path_counts_match_the_captured_publication() {
+    let repository = census_repo();
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let census = handle.index_census().expect("census");
+    let symbols = handle
+        .search_symbols(&SymbolSearchRequest {
+            query: None,
+            path_prefix: None,
+            limit: u32::MAX,
+        })
+        .expect("symbols from the same publication");
+    for file in &census.value().files {
+        let counted = symbols
+            .value()
+            .matches
+            .iter()
+            .filter(|item| item.path == file.path)
+            .count();
+        assert_eq!(
+            counted, file.symbol_count as usize,
+            "{} census count must match captured symbol matches",
+            file.path
+        );
+    }
+    assert_eq!(
+        census.value().total_symbols,
+        census
+            .value()
+            .files
+            .iter()
+            .map(|file| u64::from(file.symbol_count))
+            .sum::<u64>()
+    );
+}
+
+#[test]
+fn index_census_reads_one_generation_across_a_publish() {
+    let repository = census_repo();
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let before = handle.index_census().expect("baseline census");
+    let empty_before = before
+        .value()
+        .files
+        .iter()
+        .find(|file| file.path == "src/empty.rs")
+        .expect("empty file")
+        .symbol_count;
+    assert_eq!(empty_before, 0);
+    let initial_version = handle.runtime_view().source_version;
+
+    let gate =
+        symforge::live_index::store::hold_census_after_first_read_for_test(repository.path());
+    std::thread::scope(|scope| {
+        let census_thread =
+            scope.spawn(|| handle.index_census().expect("held census").value().clone());
+        assert!(
+            gate.wait_until_blocked(Duration::from_secs(5)),
+            "census did not reach the first-read hold"
+        );
+        fs::write(
+            repository.path().join("src/empty.rs"),
+            b"pub fn now_a_symbol() -> u32 { 0 }\n",
+        )
+        .expect("publish a new symbol on the held path");
+        handle.request_refresh().expect("queue publish during hold");
+        wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+            view.phase == SourceRuntimePhase::Current && view.source_version > initial_version
+        });
+        drop(gate);
+        let held = census_thread.join().expect("census thread");
+        let empty_held = held
+            .files
+            .iter()
+            .find(|file| file.path == "src/empty.rs")
+            .expect("empty file still present")
+            .symbol_count;
+        assert_eq!(
+            empty_held, 0,
+            "census must keep the generation captured before the publish"
+        );
+    });
+}
+
+#[test]
+fn index_census_refuses_before_current() {
+    let repository = rust_repo_with_files(8);
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "reload did not reach the parse hold"
+    );
+    let refusal = handle
+        .index_census()
+        .expect_err("census before Current must refuse");
+    assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
+    assert_eq!(refusal.retry(), RetryAdvice::OnEvent);
+    assert_eq!(
+        refusal.operation().operation_kind(),
+        OperationKind::IndexCensus
+    );
+    drop(gate);
+}
+
+#[test]
+fn index_census_refuses_after_admission_revocation() {
+    let repository = census_repo();
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    handle.revoke_admission_for_test();
+    let refusal = handle
+        .index_census()
+        .expect_err("revoked admission must refuse census");
+    assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
+}
+
+#[test]
+fn index_progress_rises_only_during_a_reload() {
+    let repository = rust_repo_with_files(1);
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "reload did not reach parse 1"
+    );
+    let held = handle.index_progress();
+    assert_eq!(held.files_parsed, 1);
+    assert!(held.files_discovered >= 1);
+    drop(gate);
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let current = handle.index_progress();
+    assert!(current.files_parsed >= 1);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        handle.index_progress(),
+        current,
+        "progress must not move once Current"
+    );
+}
+
+#[test]
+fn index_progress_resets_before_each_reload() {
+    let repository = rust_repo_with_files(6);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let first = handle.index_progress();
+    assert!(first.files_parsed >= 6);
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    fs::write(
+        repository.path().join("src/file_extra.rs"),
+        b"pub fn extra() -> u32 { 9 }\n",
+    )
+    .expect("force a second reload");
+    handle.request_refresh().expect("refresh");
+    assert!(
+        gate.wait_until_blocked(Duration::from_secs(5)),
+        "second reload did not hold"
+    );
+    let second = handle.index_progress();
+    assert!(
+        second.files_parsed < first.files_parsed && second.files_parsed >= 1,
+        "a new reload must reset parsed before it rises again, got {second:?} after first {first:?}"
+    );
+    drop(gate);
+}
+
+#[test]
+fn index_progress_keeps_last_values_after_cancel() {
+    let repository = rust_repo_with_files(1);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let held = ThroughCancelHold {
+        gate: Some(
+            symforge::live_index::store::hold_reload_through_cancel_for_test(repository.path(), 1),
+        ),
+        handle: open_current_worktree(&runtime, repository.path()),
+    };
+    assert!(
+        held.gate
+            .as_ref()
+            .expect("gate")
+            .wait_until_blocked(Duration::from_secs(5)),
+        "reload did not reach parse 1"
+    );
+    let progress = held.handle.index_progress();
+    assert_eq!(progress.files_parsed, 1);
+    held.handle.cancel_reload_for_test();
+    assert_eq!(
+        held.handle.index_progress(),
+        progress,
+        "cancel must keep the last observed progress values"
+    );
+}
+
+#[test]
+fn idle_tick_scout_leaves_progress_untouched() {
+    let repository = rust_repo_with_files(3);
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let baseline = handle.index_progress();
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        handle.index_progress(),
+        baseline,
+        "idle tick scouts must not move progress"
+    );
+}
+
+#[test]
+fn embed_path_prefix_src_excludes_srcx() {
+    let repository = tempfile::tempdir().expect("temporary repository");
+    git2::Repository::init(repository.path()).expect("initialize git repository");
+    fs::create_dir_all(repository.path().join("src")).expect("src");
+    fs::create_dir_all(repository.path().join("srcx")).expect("srcx");
+    fs::write(
+        repository.path().join("src/lib.rs"),
+        b"pub fn inside() {}\n",
+    )
+    .expect("src file");
+    fs::write(
+        repository.path().join("srcx/lib.rs"),
+        b"pub fn outside() {}\n",
+    )
+    .expect("srcx file");
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let symbols = handle
+        .search_symbols(&SymbolSearchRequest {
+            query: None,
+            path_prefix: Some("src/".to_string()),
+            limit: u32::MAX,
+        })
+        .expect("prefix symbols");
+    assert!(
+        symbols
+            .value()
+            .matches
+            .iter()
+            .any(|item| item.path == "src/lib.rs" && item.name == "inside")
+    );
+    assert!(
+        symbols
+            .value()
+            .matches
+            .iter()
+            .all(|item| !item.path.starts_with("srcx/")),
+        "src/ must not match srcx/: {:?}",
+        symbols.value().matches
+    );
+    let text = handle
+        .search_text(&TextSearchRequest {
+            query: "fn".to_string(),
+            path_prefix: Some("src/".to_string()),
+            limit: u32::MAX,
+            case_sensitive: true,
+        })
+        .expect("prefix text");
+    assert!(
+        text.value()
+            .matches
+            .iter()
+            .all(|item| !item.path.starts_with("srcx/")),
+        "src/ text must not match srcx/: {:?}",
+        text.value().matches
+    );
+}
+
+fn knowledge_repo() -> tempfile::TempDir {
+    let repository = tempfile::tempdir().expect("temporary repository");
+    git2::Repository::init(repository.path()).expect("initialize git repository");
+    fs::create_dir_all(repository.path().join("src")).expect("src");
+    fs::write(
+        repository.path().join("src/lib.rs"),
+        b"pub struct NeedleType;\n",
+    )
+    .expect("code");
+    fs::write(
+        repository.path().join("guide.md"),
+        b"# NeedleType\n\n`NeedleType` is the documented type. See [lib](src/lib.rs).\n",
+    )
+    .expect("markdown");
+    fs::write(
+        repository.path().join("notes.txt"),
+        b"NeedleType appears in plain text notes.\n",
+    )
+    .expect("text");
+    fs::write(
+        repository.path().join("config.toml"),
+        b"name = \"NeedleType\"\n",
+    )
+    .expect("config");
+    repository
+}
+
+#[test]
+fn embedded_search_knowledge_returns_markdown_text_and_config_with_provenance() {
+    let repository = knowledge_repo();
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let result = handle
+        .search_knowledge(&KnowledgeSearchRequest {
+            query: "NeedleType".to_string(),
+            path_prefix: None,
+            limit: 32,
+        })
+        .expect("embedded knowledge search");
+    let paths: Vec<&str> = result
+        .value()
+        .matches
+        .iter()
+        .map(|item| item.path.as_str())
+        .collect();
+    assert!(
+        paths.iter().any(|path| path.ends_with("guide.md")),
+        "markdown hit missing: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path.ends_with("notes.txt")),
+        "text hit missing: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path.ends_with("config.toml")),
+        "config hit missing: {paths:?}"
+    );
+    for item in &result.value().matches {
+        assert!(
+            !item.content_hash.is_empty(),
+            "{} missing content hash",
+            item.path
+        );
+        assert!(
+            !item.provenance_ids.is_empty(),
+            "{} missing provenance ids",
+            item.path
+        );
+    }
+}
+
+#[test]
+fn embedded_search_knowledge_reports_relationships_authority_and_coverage() {
+    let repository = knowledge_repo();
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let result = handle
+        .search_knowledge(&KnowledgeSearchRequest {
+            query: "NeedleType".to_string(),
+            path_prefix: None,
+            limit: 32,
+        })
+        .expect("embedded knowledge search");
+    let markdown = result
+        .value()
+        .matches
+        .iter()
+        .find(|item| item.path.ends_with("guide.md"))
+        .expect("markdown hit");
+    assert!(
+        !markdown.relationship_evidence.is_empty(),
+        "document that names code must carry relationship evidence"
+    );
+    assert!(!markdown.authority.is_empty());
+    assert!(!markdown.coverage.is_empty());
+}
+
+#[test]
+fn embedded_search_knowledge_reports_withheld_evidence() {
+    let repository = knowledge_repo();
+    fs::write(
+        repository.path().join(".env"),
+        b"SECRET_KEY=NeedleType-should-be-withheld\n",
+    )
+    .expect("policy-withheld knowledge file");
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire");
+    let handle = open_current_worktree(&runtime, repository.path());
+    wait_for_view(&handle, Instant::now() + Duration::from_secs(20), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    let result = handle
+        .search_knowledge(&KnowledgeSearchRequest {
+            query: "NeedleType".to_string(),
+            path_prefix: None,
+            limit: 32,
+        })
+        .expect("embedded knowledge search");
+    assert!(
+        result.value().withheld_count > 0,
+        "withheld files in scope must be reported"
+    );
+    assert!(
+        result
+            .value()
+            .withheld_reasons
+            .iter()
+            .all(|reason| reason == "policy_withheld"),
+        "reasons must stay neutral: {:?}",
+        result.value().withheld_reasons
     );
 }

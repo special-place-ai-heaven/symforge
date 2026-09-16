@@ -607,6 +607,24 @@ fn extract_lane(
         }
     }
 
+    for entry in &generation.live.manifest_entries {
+        let Some(path) = entry.path.normalized_utf8.as_deref() else {
+            continue;
+        };
+        if !path_scope.matches(path) {
+            continue;
+        }
+        if matches!(
+            &entry.disposition,
+            crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::SensitivePath { .. }
+                    | crate::domain::MetadataOnlyReason::SensitiveContent { .. },
+            }
+        ) {
+            withheld_count = withheld_count.saturating_add(1);
+        }
+    }
+
     let mut hits: Vec<KnowledgeRetrieveHit> = deduplicated.into_values().collect();
     hits.sort_by(rank_hits);
 
@@ -989,13 +1007,8 @@ mod tests {
     use crate::live_index::LiveIndex;
 
     fn request(query: &str) -> KnowledgeRetrieveRequest {
-        KnowledgeRetrieveRequest::parse(
-            query,
-            None,
-            KnowledgeRetrieveAuthorityScope::Default,
-            10,
-        )
-        .expect("valid request")
+        KnowledgeRetrieveRequest::parse(query, None, KnowledgeRetrieveAuthorityScope::Default, 10)
+            .expect("valid request")
     }
 
     fn load(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<PublishedGeneration>) {
@@ -1097,6 +1110,27 @@ mod tests {
         assert_eq!(
             result.sources[0].readiness,
             Some(KnowledgeLaneReadiness::EvidenceWithheld)
+        );
+    }
+
+    #[test]
+    fn in_scope_catalog_sensitive_files_count_as_policy_withheld() {
+        let (_dir, generation) = load(&[
+            ("docs/ok.md", "# Ok\ncheckpoint evidence is safe.\n"),
+            (".env", "SECRET_KEY=checkpoint-evidence-must-not-leak\n"),
+        ]);
+        let result = retrieve_one(&generation, &request("checkpoint evidence"));
+        assert!(
+            result.hits.iter().any(|hit| hit.path == "docs/ok.md"),
+            "admitted knowledge must still hit"
+        );
+        assert!(
+            result.withheld_count > 0,
+            "in-scope policy-withheld catalog files must be counted"
+        );
+        assert_eq!(
+            result.withheld_reasons,
+            vec![KnowledgeWithheldReason::PolicyWithheld]
         );
     }
 

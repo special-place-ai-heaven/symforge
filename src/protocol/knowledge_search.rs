@@ -13,7 +13,8 @@ use crate::live_index::knowledge_bridge::DerivedCoverage;
 use crate::live_index::knowledge_retrieve::{
     KnowledgeLaneReadiness, KnowledgeRetrieveAuthorityScope, KnowledgeRetrieveHit,
     KnowledgeRetrieveLane, KnowledgeRetrieveRequest, KnowledgeRetrieveResult,
-    KnowledgeRetrieveSource, normalize_knowledge_path_prefix, retrieve_knowledge, significant_terms,
+    KnowledgeRetrieveSource, normalize_knowledge_path_prefix, retrieve_knowledge,
+    significant_terms,
 };
 use crate::live_index::{PublishedGeneration, PublishedSourceSet};
 
@@ -358,10 +359,7 @@ fn search_scoped_rendered(source_set: &PublishedSourceSet, input: &SearchKnowled
     let lanes: Vec<KnowledgeRetrieveLane<'_>> = selected
         .iter()
         .zip(labels.iter())
-        .map(|(generation, label)| KnowledgeRetrieveLane {
-            generation,
-            label,
-        })
+        .map(|(generation, label)| KnowledgeRetrieveLane { generation, label })
         .collect();
     let retrieved = retrieve_knowledge(&lanes, &request);
     render_response(&retrieved, input, scope)
@@ -810,6 +808,65 @@ mod tests {
             limit: Some(limit),
             ..input(query)
         }
+    }
+
+    fn rendered_hit_paths(output: &str) -> Vec<String> {
+        output
+            .lines()
+            .filter_map(|line| {
+                let rest = line.split_once(". ")?;
+                rest.0.parse::<usize>().ok()?;
+                let path_and_line = rest.1.split_once(" · ")?.1;
+                Some(path_and_line.split_once(':')?.0.to_string())
+            })
+            .collect()
+    }
+
+    /// Same fixture and query: typed seam hit order equals the server tool.
+    #[test]
+    fn typed_knowledge_seam_matches_server_search_knowledge_hits() {
+        let (_dir, generation) = corpus(&[
+            (
+                "alpha.md",
+                "# Alpha\nalpha appears here once without the rest of the phrase.\n",
+            ),
+            (
+                "beta.md",
+                "# alpha heading match\nalpha beta terms but not the full phrase.\n",
+            ),
+            (
+                "gamma.md",
+                "# Gamma\nalpha beta gamma exact phrase lives here.\n",
+            ),
+        ]);
+        let query = "alpha beta gamma";
+        let request = KnowledgeRetrieveRequest::parse(
+            query,
+            None,
+            KnowledgeRetrieveAuthorityScope::Default,
+            10,
+        )
+        .expect("parse request");
+        let retrieved = retrieve_knowledge(
+            &[KnowledgeRetrieveLane {
+                generation: generation.as_ref(),
+                label: "current",
+            }],
+            &request,
+        );
+        let seam_paths: Vec<&str> = retrieved.hits.iter().map(|hit| hit.path.as_str()).collect();
+        let rendered = search_current(generation.as_ref(), &input(query));
+        let server_paths = rendered_hit_paths(&rendered);
+        assert_eq!(
+            seam_paths,
+            server_paths.iter().map(String::as_str).collect::<Vec<_>>(),
+            "typed seam must preserve server hit order:\n{rendered}"
+        );
+        assert_eq!(
+            seam_paths,
+            ["docs/gamma.md", "docs/beta.md", "docs/alpha.md"],
+            "frozen rank tuple: exact phrase, then heading-plus-terms, then path"
+        );
     }
 
     // ── SIFT-WS1 excerpt windowing ──────────────────────────────────────────

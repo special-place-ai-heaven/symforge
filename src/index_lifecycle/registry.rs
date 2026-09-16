@@ -275,6 +275,11 @@ impl LiveProjectSlot {
         self.binding.revoke();
         self.revoked.store(true, Ordering::Release);
     }
+
+    #[cfg(feature = "__test-internals")]
+    pub fn revoke_for_test(&self) {
+        self.revoke();
+    }
 }
 
 /// What a key currently is.

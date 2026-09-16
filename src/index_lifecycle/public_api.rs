@@ -208,6 +208,10 @@ pub struct TextSearchResult {
     pub truncated: bool,
 }
 
+/// One published generation's parsed-file census.
+///
+/// `files` is sorted by path and includes zero-symbol parsed files. Totals
+/// match that same captured publication, not a later live view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IndexCensus {
@@ -224,6 +228,14 @@ pub struct CensusFile {
     pub symbol_count: u32,
 }
 
+/// Monotonic counters for the in-flight or last completed reload.
+///
+/// `files_discovered` is this reload's executable scout work-set, stored when
+/// that scout finishes. `files_parsed` increments when a file parse completes,
+/// at the same lifecycle point as the reload hold; a later staged-bytes hard
+/// skip or circuit-breaker fold can still drop that file. `symbols_found`
+/// increments from symbols extracted on those parsed files. Idle tick scouts
+/// do not move any counter. Current progress need not equal census totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IndexProgress {
@@ -233,7 +245,6 @@ pub struct IndexProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct KnowledgeSearchRequest {
     pub query: String,
     pub path_prefix: Option<String>,
@@ -253,6 +264,9 @@ pub struct KnowledgeMatch {
     pub coverage: String,
 }
 
+/// Evidence-complete knowledge result. Not a `TextSearchResult` clone: hits
+/// carry heading path, content hash, provenance, relationship evidence,
+/// authority, coverage, and withholding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KnowledgeSearchResult {

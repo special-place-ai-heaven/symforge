@@ -1071,6 +1071,13 @@ impl ProjectRuntimeHandle {
         Arc::clone(&self.data_plane)
     }
 
+    #[cfg(feature = "__test-internals")]
+    pub fn revoke_admission_for_test(&self) {
+        if let Some(slot) = &self.admission {
+            slot.revoke_for_test();
+        }
+    }
+
     /// The source authority for the handle's currently bound root, when one
     /// is bound — the same per-root instance every writer and observation
     /// lane converges on through the canonicalized registry.
