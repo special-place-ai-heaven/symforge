@@ -1,5 +1,5 @@
 diff --git a/src/live_index/search.rs b/src/live_index/search.rs
-index fedb780e..d49e8ec2 100644
+index fedb780e..b372412c 100644
 --- a/src/live_index/search.rs
 +++ b/src/live_index/search.rs
 @@ -150,7 +150,10 @@ fn count_in_scope_knowledge_only_files(
@@ -8,7 +8,7 @@ index fedb780e..d49e8ec2 100644
                  }
 -            ) && path_scope.matches(path)
 +            ) && {
-+                let _ = path;
++                let _ = (path, path_scope);
 +                true
 +            }
          })
