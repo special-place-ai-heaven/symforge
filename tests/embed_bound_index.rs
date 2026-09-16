@@ -333,20 +333,23 @@ fn reload_hold_on_one_root_leaves_other_roots_running() {
         gate.wait_until_blocked(Duration::from_secs(5)),
         "held root did not reach the parse gate"
     );
+    let held = ThroughCancelHold {
+        gate: Some(gate),
+        handle: held_handle,
+    };
 
     let other_handle = open_current_worktree(&runtime, other.path());
     let other_view = wait_for_view(
         &other_handle,
-        Instant::now() + Duration::from_secs(15),
+        Instant::now() + Duration::from_secs(3),
         |view| view.phase == SourceRuntimePhase::Current,
     );
     assert!(other_view.source_version > 0);
     assert_eq!(
-        held_handle.runtime_view().phase,
+        held.handle.runtime_view().phase,
         SourceRuntimePhase::Loading,
         "the held root must stay Loading while the other root reaches Current"
     );
-    drop(held_handle);
     drop(other_handle);
 }
 
@@ -540,7 +543,6 @@ fn close_during_scout_returns_before_scout_completes() {
     );
 }
 
-#[test]
 #[test]
 fn close_during_derived_stage_returns_before_release() {
     use std::sync::mpsc;

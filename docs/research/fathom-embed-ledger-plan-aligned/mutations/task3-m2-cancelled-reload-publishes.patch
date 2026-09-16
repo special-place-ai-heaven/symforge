@@ -1,25 +1,36 @@
 diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
-index 430226d4..056dae2a 100644
+index 430226d4..6dd27497 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
-@@ -570,10 +570,6 @@ impl EmbeddedBinding {
-             return None;
-         }
- 
--        if self.shutdown_started.load(Ordering::Acquire) {
+@@ -560,18 +560,10 @@ impl EmbeddedBinding {
+                 exclusions,
+                 &self.shutdown_started,
+             );
+-        if let Err(error) = result {
+-            if self.shutdown_started.load(Ordering::Acquire)
+-                || crate::live_index::store::reload_was_cancelled(&error)
+-            {
+-                return None;
+-            }
+-            self.set_blocked();
 -            return None;
 -        }
--
++        let _ = result;
+ 
+         if self.shutdown_started.load(Ordering::Acquire) {
+-            return None;
++            // Keep going so a cancelled reload can still publish.
+         }
+ 
          let Some(fingerprint) = self.observe_fingerprint() else {
-             if self.shutdown_started.load(Ordering::Acquire) {
-                 return None;
-@@ -587,9 +583,6 @@ impl EmbeddedBinding {
+@@ -587,9 +579,7 @@ impl EmbeddedBinding {
              return Some(fingerprint);
          }
          let mut state = self.state.lock().expect("embedded state mutex");
 -        if self.shutdown_started.load(Ordering::Acquire) {
 -            return None;
 -        }
++        let _ = self.shutdown_started.load(Ordering::Acquire);
          state.source_version = state.source_version.saturating_add(1).max(1);
          state.current_publication_identity = Some(format!(
              "embed-publication-{}-{}",

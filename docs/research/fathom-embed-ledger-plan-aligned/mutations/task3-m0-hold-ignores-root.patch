@@ -1,8 +1,8 @@
 diff --git a/src/live_index/store.rs b/src/live_index/store.rs
-index 9d974c7a..218dc998 100644
+index 7699ba61..d70697ca 100644
 --- a/src/live_index/store.rs
 +++ b/src/live_index/store.rs
-@@ -184,10 +184,10 @@ impl Drop for ReloadGateForTest {
+@@ -184,16 +184,14 @@ impl Drop for ReloadGateForTest {
  }
  
  #[cfg(feature = "__test-internals")]
@@ -15,3 +15,10 @@ index 9d974c7a..218dc998 100644
      else {
          return;
      };
+-    if state.parsed.fetch_add(1, Ordering::AcqRel) + 1 != state.pause_after_parses {
+-        return;
+-    }
++    let _ = cancel;
+     let mut blocked = state.blocked.lock().expect("reload gate state");
+     *blocked = true;
+     state.reached.notify_all();

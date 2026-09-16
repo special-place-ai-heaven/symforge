@@ -1,21 +1,13 @@
 diff --git a/src/live_index/store.rs b/src/live_index/store.rs
-index 9d974c7a..2630bd21 100644
+index 7699ba61..711d64f9 100644
 --- a/src/live_index/store.rs
 +++ b/src/live_index/store.rs
-@@ -4414,15 +4414,11 @@ pub(crate) struct DerivedIndices {
- impl DerivedIndices {
-     fn build_from_files_cancellable(
-         files: &HashMap<String, Arc<IndexedFile>>,
--        cancel: Option<&AtomicBool>,
-+        _cancel: Option<&AtomicBool>,
-     ) -> anyhow::Result<Self> {
--        check_reload_cancelled(cancel)?;
-         let trigram_index = super::trigram::TrigramIndex::build_from_files(files);
--        check_reload_cancelled(cancel)?;
-         let reverse_index = build_reverse_index_from_files(files);
--        check_reload_cancelled(cancel)?;
-         let (files_by_basename, files_by_dir_component) = build_path_indices_from_files(files);
--        check_reload_cancelled(cancel)?;
-         Ok(Self {
-             trigram_index,
-             reverse_index,
+@@ -235,7 +235,7 @@ fn pause_between_derived_stages(cancel: Option<&AtomicBool>) -> anyhow::Result<(
+     #[cfg(feature = "__test-internals")]
+     if DERIVED_STAGE_HOLD.load(Ordering::Acquire) {
+         loop {
+-            check_reload_cancelled(cancel)?;
++            let _ = cancel;
+             std::thread::sleep(Duration::from_millis(1));
+         }
+     }
