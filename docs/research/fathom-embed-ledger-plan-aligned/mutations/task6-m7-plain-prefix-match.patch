@@ -1,5 +1,5 @@
 diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
-index 430226d4..dcddce35 100644
+index 430226d4..7ea5b3bc 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
 @@ -765,7 +765,7 @@ fn path_matches_prefix(path: &str, prefix: Option<&str>) -> bool {
@@ -7,7 +7,7 @@ index 430226d4..dcddce35 100644
          None => true,
          Some(prefix) if prefix.is_empty() => true,
 -        Some(prefix) => crate::live_index::search::PathScope::prefix(prefix).matches(path),
-+        Some(prefix) => path.starts_with(prefix),
++        Some(prefix) => path.starts_with(prefix.as_str()),
      }
  }
  
