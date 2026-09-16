@@ -39,10 +39,10 @@ ledger's.
   RED: guard for plan Task 3 Step 1 ("process-wide, root-scoped test gate"); its teeth are G3.
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=2a2c6a70a7e0224cbb7e507f0e194790ff0e644d573329d568a35d9d02618570; output-bytes=92
 
-- [ ] G3: a hold that ignores its root lets the G2 test fail
+- [x] G3: a hold that ignores its root lets the G2 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task3-m0-hold-ignores-root.patch --name reload_hold_on_one_root_leaves_other_roots_running -- test -j 8 --no-default-features --features embed --test embed_bound_index -- reload_hold_on_one_root_leaves_other_roots_running --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task3-m0-hold-ignores-root.patch
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=a10a26f0347f07fabaaddf14a6049f88853fe6f49738a3c454a27f9440c1835e; output-bytes=125
 
 - [x] G4: dropping a handle during its first load, and closing during a refresh reload, each return within one second while the reload is held
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 2 --name drop_while_loading_returns_within_one_second --name close_during_refresh_returns_before_gate_release -- test -j 8 --no-default-features --features embed --test embed_bound_index -- drop_while_loading_returns_within_one_second close_during_refresh_returns_before_gate_release --test-threads=1
@@ -50,10 +50,10 @@ ledger's.
   RED: failing-first; at v11.2.0 close waits for the whole reload.
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=83e19c54b3ed2002ca87163884678652a43bc125d24159fc7d4a4191dcc317dc; output-bytes=135
 
-- [ ] G5: removing the reload, admission-wait and parse cancel checks lets both G4 tests fail
+- [x] G5: removing the reload, admission-wait and parse cancel checks lets both G4 tests fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task3-m1-no-reload-cancel-checks.patch --name drop_while_loading_returns_within_one_second --name close_during_refresh_returns_before_gate_release -- test -j 8 --no-default-features --features embed --test embed_bound_index -- drop_while_loading_returns_within_one_second close_during_refresh_returns_before_gate_release --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task3-m1-no-reload-cancel-checks.patch
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=eaddb23d0abe7ed2a83492cef11ad6ae3497bd9d811d582bcd84e6f157c7c56d; output-bytes=174
 
 - [x] G6: a first load cancelled by close publishes nothing and ends Stopped with source_version 0 and no publication identity
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name cancelled_first_load_publishes_nothing -- test -j 8 --no-default-features --features embed --test embed_bound_index -- cancelled_first_load_publishes_nothing --test-threads=1
@@ -61,10 +61,10 @@ ledger's.
   RED: failing-first.
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=d1425a6b1c3106060f0b118e60fb3d9e77aa577c0070f9f33bce508277f574c0; output-bytes=80
 
-- [ ] G7: a cancelled reload that still reaches the publish step lets the G6 test fail
+- [x] G7: a cancelled reload that still reaches the publish step lets the G6 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task3-m2-cancelled-reload-publishes.patch --name cancelled_first_load_publishes_nothing -- test -j 8 --no-default-features --features embed --test embed_bound_index -- cancelled_first_load_publishes_nothing --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task3-m2-cancelled-reload-publishes.patch
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=5fecb55c539bc06611b48b612abce6122fda9d93ae6aabb0a366384687002dcd; output-bytes=122
 
 - [x] G8: a refresh cancelled by close keeps the last Current source_version and publication identity
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name cancelled_refresh_keeps_last_current_publication -- test -j 8 --no-default-features --features embed --test embed_bound_index -- cancelled_refresh_keeps_last_current_publication --test-threads=1
@@ -72,22 +72,22 @@ ledger's.
   RED: failing-first.
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=73cb99ea6ec4edf58c77ab4b793aaf6f6017f980d16e44e157535e9de9848352; output-bytes=90
 
-- [ ] G9: a cancel path that clears the publication identity lets the G8 test fail
+- [x] G9: a cancel path that clears the publication identity lets the G8 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task3-m3-cancel-clears-publication.patch --name cancelled_refresh_keeps_last_current_publication -- test -j 8 --no-default-features --features embed --test embed_bound_index -- cancelled_refresh_keeps_last_current_publication --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task3-m3-cancel-clears-publication.patch
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=ee33d60adc22bc2cd607d20f9b14224e399a2d76d5e9dc29ed8d6c395c503ee7; output-bytes=131
 
-- [ ] G10: a reader polling runtime_view across a close never sees Blocked or Current after Stopping
+- [x] G10: a reader polling runtime_view across a close never sees Blocked or Current after Stopping
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name stopping_is_never_overwritten_by_blocked_or_current -- test -j 8 --no-default-features --features embed --test embed_bound_index -- stopping_is_never_overwritten_by_blocked_or_current --test-threads=1
   EXPECT: LEDGER-ORACLE TESTS GREEN tests=1; names=stopping_is_never_overwritten_by_blocked_or_current
   TEST: force the window between the shutdown flag being set and `Stopping` being written with a hold point, so the test is deterministic.
   RED: failing-first.
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=2918bfe345a5a533f925b5499d10b1e9f8e4dced1cc98ea0ee57af53caa7a458; output-bytes=93
 
-- [ ] G11: worker phase writes that ignore shutdown under the state mutex let the G10 test fail
+- [x] G11: worker phase writes that ignore shutdown under the state mutex let the G10 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task3-m4-unconditional-phase-writes.patch --name stopping_is_never_overwritten_by_blocked_or_current -- test -j 8 --no-default-features --features embed --test embed_bound_index -- stopping_is_never_overwritten_by_blocked_or_current --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task3-m4-unconditional-phase-writes.patch
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=933b1f942c8cfd3e3be69419c2974c22aa4f3ac7ff4380a23efdc81a0d0bcb79; output-bytes=135
 
 - [x] G12: after a held reload is released into a pending stop, close returns well under one worker poll interval
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name close_after_cancelled_reload_does_not_wait_a_poll -- test -j 8 --no-default-features --features embed --test embed_bound_index -- close_after_cancelled_reload_does_not_wait_a_poll --test-threads=1
@@ -117,11 +117,11 @@ ledger's.
   TEST: plan Task 3 Step 5 ("Enforce and measure a one-second close bound against the agreed large-repository fixture. In the same gate, prove that opening an unrelated root completes within that bound while another root closes."). An `#[ignore]` test opens the fixture, measures one uncancelled full reload, then opens and closes at spread points during Loading while timing an open of a small unrelated temporary root started inside each close, and prints exactly one line `CLOSE-LATENCY bound_ms=1000 closes=<k> max_ms=<m> median_ms=<m> unrelated_open_max_ms=<u> full_reload_ms=<f>`. EXPECT re-checks the numbers independently of the test's asserts; a debug build is the conservative measurement. Owner revision 2: the agreed fixture is this checkout (`env!("CARGO_MANIFEST_DIR")`), real Loading, not the 32-file hold. If a debug reload is under 10 s, enlarge the fixture until the floor is real; do not lower this gate. Unrelated-open timing starts after a join-entered signal, not after a sleep.
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=8823a8aac7b5376668aa5ecef8e0b360ffcf089d5ef6f578ebebe6e7e001dc00; output-bytes=182
 
-- [ ] G17: removing the checks between derived-index stages lets the derived-stage close test fail
+- [x] G17: removing the checks between derived-index stages lets the derived-stage close test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task3-m7-no-derived-stage-checks.patch --name close_during_derived_stage_returns_before_release -- test -j 8 --no-default-features --features embed --test embed_bound_index -- close_during_derived_stage_returns_before_release --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task3-m7-no-derived-stage-checks.patch
   NOTE: G16's ignored checkout measurement stayed green under the old timing mutant. The derived-stage hold plus `close_during_derived_stage_returns_before_release` is the deterministic tooth.
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=234c2326c034a8147b4f1f3681c9040374224fc337e7a858ddb463c267265aaf; output-bytes=130
 
 - [x] G18: each failing-first test of this task was observed red before its fix, with command and failure recorded
   RECORD: for the G4, G6, G8, G10, G12 and G14 tests, the commit or working state with the hold points and tests but without the fix, the exact command and each failure line; tasks/todo.md entries count only where they name both; G2 is a declared guard
