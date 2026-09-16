@@ -31,15 +31,15 @@ C9 is the `embed_bound_index` step the plan's session added to
   EXPECT: LEDGER-ORACLE RUN GREEN label=check;
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=6582f2b3e2185ed03de7818091db315e99f8873d37ff94d5a8bb22b103a58b6f; output-bytes=37
 
-- [ ] C3: every default-feature target is clippy-clean with warnings denied
+- [x] C3: every default-feature target is clippy-clean with warnings denied
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label clippy-default -- cargo clippy -j 8 --all-targets -- -D warnings
   EXPECT: LEDGER-ORACLE RUN GREEN label=clippy-default;
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=a0e1b84c5b640a9eff9fcf3a86877f97490a865a55426993d4c237331adc3ea8; output-bytes=46
 
-- [ ] C4: the default lib, bins and tests suite keeps every v11.2.0 pass and adds no failure
+- [x] C4: the default lib, bins and tests suite keeps every v11.2.0 pass and adds no failure
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs suite --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-default.json -- test -j 8 --no-fail-fast --lib --bins --tests -- --test-threads=1
   EXPECT: /LEDGER-ORACLE SUITE GREEN [^\n]*preexisting_failures=0;/
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=d0327a803d3aa5fd92a3f422e478ae35a52e34a83b6f3636a4b328687024c18d; output-bytes=83
 
 - [x] C5: the observed refresh gate bench runs clean in criterion test mode
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label bench-smoke -- cargo bench -j 8 --bench observed_refresh_gate_v1 -- --test
@@ -51,10 +51,10 @@ C9 is the `embed_bound_index` step the plan's session added to
   EXPECT: LEDGER-ORACLE RUN GREEN label=release-build;
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=aec15e7c87fd2a42713ebf0caa6ad564dce25010416c97b41e547135033424a1; output-bytes=45
 
-- [ ] C7: the engine-only embed lib is clippy-clean with warnings denied
+- [x] C7: the engine-only embed lib is clippy-clean with warnings denied
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label clippy-embed -- cargo clippy -j 8 --no-default-features --features embed,__test-internals --lib -- -D warnings
   EXPECT: LEDGER-ORACLE RUN GREEN label=clippy-embed;
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=e17b1848c6b47315dfa953e30db80bc5988dfeb1447e27207b19a9bc48323335; output-bytes=44
 
 - [x] C8: the embed-only lib test suite keeps every v11.2.0 pass and adds no failure
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs suite --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-lib.json -- test -j 8 --no-fail-fast --no-default-features --features embed --lib -- --test-threads=1
