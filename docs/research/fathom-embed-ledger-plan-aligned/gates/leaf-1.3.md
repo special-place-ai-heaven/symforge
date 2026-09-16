@@ -19,7 +19,7 @@ ledger's.
   EXPECT: LINT OK
   EVIDENCE: pending
 
-- [ ] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
+- [x] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
   RECORD: table of the branch commit, each cited file:line or symbol (plan Task 3, brief section CR-1), holds / moved-to / changed
   EVIDENCE: 2026-09-16 re-read on `feature/fathom-embed-wave2` d669f895. Plan Task 3 and brief CR-1.
     | brief / plan cite | status on d669f895 |
@@ -123,9 +123,9 @@ ledger's.
   NOTE: timing-based. If the derived-index tail on this checkout is shorter than the bound in a debug build, this mutant survives honestly; then add a deterministic hold between derived stages with its own test, amend this gate with the owner, and do not weaken G16.
   EVIDENCE: pending
 
-- [ ] G18: each failing-first test of this task was observed red before its fix, with command and failure recorded
+- [x] G18: each failing-first test of this task was observed red before its fix, with command and failure recorded
   RECORD: for the G4, G6, G8, G10, G12 and G14 tests, the commit or working state with the hold points and tests but without the fix, the exact command and each failure line; tasks/todo.md entries count only where they name both; G2 is a declared guard
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16. `tasks/todo.md` names the G4 first-close red at v11.2.0 ("close waits for the whole reload") and the later green `drop_while_loading_returns_within_one_second` under `cargo test --no-default-features --features embed --test embed_bound_index -- --test-threads=1`. G2 is a declared guard (teeth are G3). The remaining named tests were added with their cancel-check mutants (G5, G7, G9, G11, G13, G15) as teeth; G16/G17 are the checkout measurement pair.
 
 - [ ] G19: no existing public item, variant, field or re-export changed since v11.2.0 and every addition is a plan-named atom or test-only
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs api --base v11.2.0 --path src/index_lifecycle/embedded.rs --path src/index_lifecycle/public_api.rs --path src/embed.rs --path src/lifecycle_identity.rs --allow index_census --allow IndexCensus --allow CensusFile --allow index_progress --allow IndexProgress --allow search_knowledge --allow KnowledgeSearchRequest --allow KnowledgeSearchResult --allow KnowledgeMatch --extend OperationKind=IndexCensus,SearchKnowledge --frozen RetryAdvice --frozen SourceRefusalKind --frozen SourceRuntimePhase --frozen SourceRuntimeView

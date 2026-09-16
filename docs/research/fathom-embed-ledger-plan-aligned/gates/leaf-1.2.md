@@ -51,11 +51,11 @@ patch so it removes the same guard; the owner reviews regenerated patches.
   RED: failing-first; tasks/todo.md records the red observation ("a second ProcessRuntimeApi::acquire() opened the same root").
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=f981837ee035b5ba8727f9d2e4946e06c4765869606e79ef7251bf772079aa41; output-bytes=90
 
-- [ ] G3: a runtime-local factory lets the G2 test fail
+- [x] G3: a runtime-local factory lets the G2 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task2-m1-runtime-local-factory.patch --name embedded_source_has_one_handle_and_no_raw_bypass -- test -j 8 --test activation_cut_v11 -- embedded_source_has_one_handle_and_no_raw_bypass --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task2-m1-runtime-local-factory.patch
   MUTATION: `ProcessRuntimeApi::acquire` builds its own factory instead of using the process runtime's.
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=e2bd027b85650e120fe48fb27406d4bac580d5856ba4191641468966e7081a9a; output-bytes=127
 
 - [x] G4: an open that panics after registration leaves the root openable again
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name panicking_open_releases_its_process_wide_root_reservation -- test -j 8 --test activation_cut_v11 -- panicking_open_releases_its_process_wide_root_reservation --test-threads=1
@@ -63,16 +63,16 @@ patch so it removes the same guard; the owner reviews regenerated patches.
   RED: failing-first; tasks/todo.md records it ("an injected post-worker-start panic poisoned the factory mutex and aborted the test process").
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=fd032cf4593a8e95fefbd668c5b67a53d6c440c333bd14db227e4a8bec3d738d; output-bytes=99
 
-- [ ] G5: a rollback guard that does nothing on unwinding lets the G4 test fail
+- [x] G5: a rollback guard that does nothing on unwinding lets the G4 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task2-m2-rollback-does-nothing.patch --name panicking_open_releases_its_process_wide_root_reservation -- test -j 8 --test activation_cut_v11 -- panicking_open_releases_its_process_wide_root_reservation --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task2-m2-rollback-does-nothing.patch
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=b692dc56a6d50aa4f77c9be9bf36fe764c912e8b6e36466bff7cf47749188d2c; output-bytes=136
 
-- [ ] G6: a rollback that releases the factory registration but keeps the process admission lets the G4 test fail, so the test proves no registration leaks
+- [x] G6: a rollback that releases the factory registration but keeps the process admission lets the G4 test fail, so the test proves no registration leaks
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task2-m3-rollback-keeps-admission.patch --name panicking_open_releases_its_process_wide_root_reservation -- test -j 8 --test activation_cut_v11 -- panicking_open_releases_its_process_wide_root_reservation --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task2-m3-rollback-keeps-admission.patch
   NOTE: the named test now asserts `process_project_registry().live(key)` is Err after the panic and before reopen, so a rollback that leaves the live admission in place fails the test instead of joining it.
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=db0a7e9b42ebfd3ada6f5bf8042505077febcaa29e22c77961bd10c8b00ca320; output-bytes=139
 
 - [x] G7: dropping or shutting down one runtime closes only the sources that runtime opened
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name dropping_one_runtime_leaves_another_runtimes_sources_open -- test -j 8 --test activation_cut_v11 -- dropping_one_runtime_leaves_another_runtimes_sources_open --test-threads=1
@@ -80,11 +80,11 @@ patch so it removes the same guard; the owner reviews regenerated patches.
   RED: regression guard for the shared factory (per-runtime factories could not close each other's sources); its teeth are G8.
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=efd517c5656accf992a52ec5fde2896c97e918b8df0e5faabd8345310d6d510f; output-bytes=99
 
-- [ ] G8: an owner-blind runtime shutdown lets the G7 test fail
+- [x] G8: an owner-blind runtime shutdown lets the G7 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task2-m4-shutdown-ignores-owner.patch --name dropping_one_runtime_leaves_another_runtimes_sources_open -- test -j 8 --test activation_cut_v11 -- dropping_one_runtime_leaves_another_runtimes_sources_open --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task2-m4-shutdown-ignores-owner.patch
   MUTATION: the runtime's shutdown closes every open source in the shared factory, not only its own.
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=c7fc2d57756f8f2c054c6d90df0edb9f78ccb5ee6f8fb56cf3bbae5f3b1c8ab9; output-bytes=137
 
 - [x] G9: a stale open's rollback leaves a newer reservation of the same root in place
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name stale_open_rollback_keeps_a_newer_reservation -- test -j 8 --test activation_cut_v11 -- stale_open_rollback_keeps_a_newer_reservation --test-threads=1
@@ -93,10 +93,10 @@ patch so it removes the same guard; the owner reviews regenerated patches.
   RED: regression guard for the identity-checked guard (plan Task 2 Step 3); its teeth are G10.
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=bbef79ee7b7ff787f8314790376ee4605640774e7fcd9b4abe3cfbd78eaacade; output-bytes=87
 
-- [ ] G10: a rollback that ignores reservation identity lets the G9 test fail
+- [x] G10: a rollback that ignores reservation identity lets the G9 test fail
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs mutant --patch docs/research/fathom-embed-ledger-plan-aligned/mutations/task2-m5-rollback-ignores-identity.patch --name stale_open_rollback_keeps_a_newer_reservation -- test -j 8 --test activation_cut_v11 -- stale_open_rollback_keeps_a_newer_reservation --test-threads=1
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task2-m5-rollback-ignores-identity.patch
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=599849d31615bbfcf7aaabd1ab2750ddf144c3ec77c951fafea9c2cddf7cf660; output-bytes=128
 
 - [x] G11: while one root's close waits on its worker, an open of an unrelated root completes within the one-second close bound
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name unrelated_open_completes_while_another_root_closes -- test -j 8 --no-default-features --features embed --test embed_bound_index -- unrelated_open_completes_while_another_root_closes --test-threads=1
