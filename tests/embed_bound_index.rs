@@ -449,14 +449,22 @@ fn stopping_is_never_overwritten_by_blocked_or_current() {
     use std::sync::{Arc, Mutex};
 
     let repository = rust_repo_with_files(32);
-    let gate =
-        symforge::live_index::store::hold_reload_through_cancel_for_test(repository.path(), 1);
     let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
-    let handle = open_current_worktree(&runtime, repository.path());
+    let session = ThroughCancelHold {
+        gate: Some(
+            symforge::live_index::store::hold_reload_through_cancel_for_test(repository.path(), 1),
+        ),
+        handles: vec![open_current_worktree(&runtime, repository.path())],
+    };
     assert!(
-        gate.wait_until_blocked(Duration::from_secs(5)),
+        session
+            .gate
+            .as_ref()
+            .expect("reload gate")
+            .wait_until_blocked(Duration::from_secs(5)),
         "initial reload did not reach the parse gate"
     );
+    let handle = &session.handles[0];
 
     let phases = Arc::new(Mutex::new(Vec::new()));
     let stop_poll = AtomicBool::new(false);
@@ -473,21 +481,30 @@ fn stopping_is_never_overwritten_by_blocked_or_current() {
         let closer = scope.spawn(|| handle.close().expect("close while Stopping is observable"));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let phase = handle.runtime_view().phase;
-            assert_ne!(
-                phase,
-                SourceRuntimePhase::Stopped,
-                "close reached Stopped before Stopping was observed"
-            );
-            if phase == SourceRuntimePhase::Stopping {
+            let recorded = phases.lock().expect("phase log").clone();
+            if recorded
+                .iter()
+                .any(|phase| *phase == SourceRuntimePhase::Stopped)
+                && !recorded
+                    .iter()
+                    .any(|phase| *phase == SourceRuntimePhase::Stopping)
+            {
+                panic!("close reached Stopped before Stopping was observed");
+            }
+            if recorded
+                .iter()
+                .any(|phase| *phase == SourceRuntimePhase::Stopping)
+            {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "close never reached Stopping: {phase:?}"
+                "close never reached Stopping: last={:?}",
+                recorded.last()
             );
+            std::thread::sleep(Duration::from_millis(1));
         }
-        gate.release();
+        session.gate.as_ref().expect("reload gate").release();
         closer.join().expect("close thread completes");
         stop_poll.store(true, Ordering::Release);
     });
