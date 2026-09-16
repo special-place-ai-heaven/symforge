@@ -479,6 +479,13 @@ fn stopping_is_never_overwritten_by_blocked_or_current() {
             }
         });
         let closer = scope.spawn(|| handle.close().expect("close while Stopping is observable"));
+        struct ReleaseOnUnwind<'a>(&'a symforge::live_index::store::ReloadGateForTest);
+        impl Drop for ReleaseOnUnwind<'_> {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let _release_before_join = ReleaseOnUnwind(session.gate.as_ref().expect("reload gate"));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let recorded = phases.lock().expect("phase log").clone();
