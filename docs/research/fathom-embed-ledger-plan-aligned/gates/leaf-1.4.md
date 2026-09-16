@@ -121,7 +121,7 @@ Reusing `SearchSymbols` is forbidden (it mislabels the receipt). That is a major
   EXPECT: /^ALL MET \(/m
   EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=7f2d7cdbd6284c9dbb1106f833cea3c6e5d99f8b70e1a47e62bfea5426d485e1; output-bytes=11139
 
-- [ ] G19: the delivered state is committed, with no uncommitted tracked change
+- [x] G19: the delivered state is committed, with no uncommitted tracked change
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs run --label committed -- git diff --quiet HEAD
   EXPECT: LEDGER-ORACLE RUN GREEN label=committed;
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=c0b92c7e8f2232d84908fd862489de264811d67a0cbc66dc91d6db8319210ee4; output-bytes=41
