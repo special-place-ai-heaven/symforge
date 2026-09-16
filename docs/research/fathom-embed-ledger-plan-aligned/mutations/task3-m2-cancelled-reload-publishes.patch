@@ -1,0 +1,25 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..056dae2a 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -570,10 +570,6 @@ impl EmbeddedBinding {
+             return None;
+         }
+ 
+-        if self.shutdown_started.load(Ordering::Acquire) {
+-            return None;
+-        }
+-
+         let Some(fingerprint) = self.observe_fingerprint() else {
+             if self.shutdown_started.load(Ordering::Acquire) {
+                 return None;
+@@ -587,9 +583,6 @@ impl EmbeddedBinding {
+             return Some(fingerprint);
+         }
+         let mut state = self.state.lock().expect("embedded state mutex");
+-        if self.shutdown_started.load(Ordering::Acquire) {
+-            return None;
+-        }
+         state.source_version = state.source_version.saturating_add(1).max(1);
+         state.current_publication_identity = Some(format!(
+             "embed-publication-{}-{}",

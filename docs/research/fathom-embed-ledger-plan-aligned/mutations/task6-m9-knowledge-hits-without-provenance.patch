@@ -1,0 +1,13 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..ea2583b7 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -1503,7 +1503,7 @@ impl EmbeddedSourceHandle {
+                 heading_path: hit.heading_path,
+                 preview: hit.preview,
+                 content_hash: hit.content_hash,
+-                provenance_ids: hit.authority.provenance_ids,
++                provenance_ids: Vec::new(),
+                 relationship_evidence: hit
+                     .relationship_evidence
+                     .iter()

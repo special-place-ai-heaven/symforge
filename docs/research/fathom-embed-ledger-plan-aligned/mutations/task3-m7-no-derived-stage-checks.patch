@@ -1,0 +1,18 @@
+diff --git a/src/live_index/store.rs b/src/live_index/store.rs
+index 779c32f5..057f2133 100644
+--- a/src/live_index/store.rs
++++ b/src/live_index/store.rs
+@@ -4416,13 +4416,9 @@ impl DerivedIndices {
+         files: &HashMap<String, Arc<IndexedFile>>,
+         cancel: Option<&AtomicBool>,
+     ) -> anyhow::Result<Self> {
+-        check_reload_cancelled(cancel)?;
+         let trigram_index = super::trigram::TrigramIndex::build_from_files(files);
+-        check_reload_cancelled(cancel)?;
+         let reverse_index = build_reverse_index_from_files(files);
+-        check_reload_cancelled(cancel)?;
+         let (files_by_basename, files_by_dir_component) = build_path_indices_from_files(files);
+-        check_reload_cancelled(cancel)?;
+         Ok(Self {
+             trigram_index,
+             reverse_index,

@@ -1,0 +1,13 @@
+diff --git a/src/index_lifecycle/public_api.rs b/src/index_lifecycle/public_api.rs
+index 99f1697a..ee96b951 100644
+--- a/src/index_lifecycle/public_api.rs
++++ b/src/index_lifecycle/public_api.rs
+@@ -575,7 +575,7 @@ impl ProcessRuntimeApi {
+     pub fn acquire() -> Result<Self, EmbedSourceRefusal> {
+         super::activation::activate_surface(super::process_runtime::SurfaceKind::Embed);
+         let inner = super::activation::process_index_runtime();
+-        let owner = super::embedded::EmbeddedRuntimeOwner::new(inner.embedded_factory());
++        let owner = super::embedded::EmbeddedRuntimeOwner::new(super::embedded::EmbeddedSourceFactory::new());
+         Ok(Self {
+             _inner: inner,
+             owner,

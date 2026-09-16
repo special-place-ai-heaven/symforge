@@ -1,0 +1,13 @@
+diff --git a/src/live_index/search.rs b/src/live_index/search.rs
+index fedb780e..430cea23 100644
+--- a/src/live_index/search.rs
++++ b/src/live_index/search.rs
+@@ -150,7 +150,7 @@ fn count_in_scope_knowledge_only_files(
+                     targets: IndexTargets::Knowledge,
+                     ..
+                 }
+-            ) && path_scope.matches(path)
++            )
+         })
+         .count()
+ }

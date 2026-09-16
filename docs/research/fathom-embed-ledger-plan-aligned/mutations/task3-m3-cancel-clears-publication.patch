@@ -1,0 +1,12 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..f34b9ad0 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -588,6 +588,7 @@ impl EmbeddedBinding {
+         }
+         let mut state = self.state.lock().expect("embedded state mutex");
+         if self.shutdown_started.load(Ordering::Acquire) {
++            state.current_publication_identity = None;
+             return None;
+         }
+         state.source_version = state.source_version.saturating_add(1).max(1);

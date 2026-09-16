@@ -1,0 +1,13 @@
+diff --git a/src/live_index/store.rs b/src/live_index/store.rs
+index 779c32f5..2d8b16c0 100644
+--- a/src/live_index/store.rs
++++ b/src/live_index/store.rs
+@@ -187,7 +187,7 @@ impl Drop for ReloadGateForTest {
+ fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) {
+     let Some(state) = RELOAD_GATES
+         .get()
+-        .and_then(|gates| gates.lock().ok()?.get(source_scope).cloned())
++        .and_then(|gates| gates.lock().ok()?.values().next().cloned())
+     else {
+         return;
+     };

@@ -1,0 +1,19 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..082fe4cb 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -1517,12 +1517,8 @@ impl EmbeddedSourceHandle {
+             super::public_api::KnowledgeSearchResult {
+                 matches,
+                 truncated: retrieved.truncated,
+-                withheld_count: retrieved.withheld_count as u64,
+-                withheld_reasons: retrieved
+-                    .withheld_reasons
+-                    .into_iter()
+-                    .map(knowledge_withheld_label)
+-                    .collect(),
++                withheld_count: 0,
++                withheld_reasons: Vec::new(),
+             },
+             crate::lifecycle_identity::OperationKind::SearchKnowledge,
+             normalized.as_bytes(),

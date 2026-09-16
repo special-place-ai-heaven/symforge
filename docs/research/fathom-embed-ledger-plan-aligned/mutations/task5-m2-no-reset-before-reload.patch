@@ -1,0 +1,12 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..1dd00ced 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -542,7 +542,6 @@ impl EmbeddedBinding {
+     }
+ 
+     fn reload_and_publish(&self) -> Option<String> {
+-        self.progress.reset();
+         let _progress = crate::live_index::store::register_reload_progress(
+             &self.root,
+             Arc::clone(&self.progress),

@@ -1,0 +1,28 @@
+diff --git a/src/live_index/store.rs b/src/live_index/store.rs
+index 779c32f5..aef45e22 100644
+--- a/src/live_index/store.rs
++++ b/src/live_index/store.rs
+@@ -71,12 +71,8 @@ pub(crate) fn reload_was_cancelled(error: &anyhow::Error) -> bool {
+     error.downcast_ref::<ReloadCancelled>().is_some()
+ }
+ 
+-fn check_reload_cancelled(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
+-    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+-        Err(reload_cancelled())
+-    } else {
+-        Ok(())
+-    }
++fn check_reload_cancelled(_cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
++    Ok(())
+ }
+ 
+ #[cfg(feature = "__test-internals")]
+@@ -198,7 +194,7 @@ fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>)
+     *blocked = true;
+     state.reached.notify_all();
+     while !state.released.load(Ordering::Acquire)
+-        && !(state.release_on_cancel && cancel.is_some_and(|flag| flag.load(Ordering::Acquire)))
++
+     {
+         let (next, _) = state
+             .reached

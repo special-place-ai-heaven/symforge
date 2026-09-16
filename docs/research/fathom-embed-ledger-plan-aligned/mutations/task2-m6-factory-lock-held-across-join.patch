@@ -1,0 +1,36 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..7add14bb 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -948,23 +948,19 @@ impl EmbeddedSourceFactory {
+     /// still refuses, but the mutex is not held across `join` — an unrelated
+     /// root must be able to open while this worker is still unwinding.
+     fn close_one(&self, key: &ProjectKey, identity: EmbeddedIdentity) -> (bool, bool, u64, u64) {
+-        let (matched, source) = {
+-            let open = self.open.lock().expect("embedded registration mutex");
+-            let matched = open
+-                .get(key)
+-                .is_some_and(|source| source.identity == identity);
+-            let source = open
+-                .get(key)
+-                .filter(|source| source.identity == identity)
+-                .and_then(|source| source.binding.as_ref().map(Arc::clone));
+-            (matched, source)
+-        };
++        let mut open = self.open.lock().expect("embedded registration mutex");
++        let matched = open
++            .get(key)
++            .is_some_and(|source| source.identity == identity);
++        let source = open
++            .get(key)
++            .filter(|source| source.identity == identity)
++            .and_then(|source| source.binding.as_ref().map(Arc::clone));
+         let (terminal_version, joined_workers) = source
+             .as_ref()
+             .map(|source| source.shutdown())
+             .unwrap_or((0, 0));
+         let (performed, final_owner) = if matched {
+-            let mut open = self.open.lock().expect("embedded registration mutex");
+             if open
+                 .get(key)
+                 .is_some_and(|source| source.identity == identity)

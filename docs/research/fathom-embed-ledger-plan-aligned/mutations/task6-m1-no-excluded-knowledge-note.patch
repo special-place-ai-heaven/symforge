@@ -1,0 +1,15 @@
+diff --git a/src/protocol/format.rs b/src/protocol/format.rs
+index 723c503d..e6493d24 100644
+--- a/src/protocol/format.rs
++++ b/src/protocol/format.rs
+@@ -1168,8 +1168,8 @@ fn no_match_suggestions(ctx: SearchSuggestionContext) -> String {
+ ///
+ /// Returns `message` unchanged when `excluded` is 0 so a scope with no
+ /// knowledge-only files never grows a `search_knowledge` note.
+-pub(crate) fn append_excluded_knowledge_note(message: String, excluded: usize) -> String {
+-    if excluded == 0 {
++pub(crate) fn append_excluded_knowledge_note(message: String, _excluded: usize) -> String {
++    if true {
+         return message;
+     }
+     let noun = if excluded == 1 { "file" } else { "files" };
