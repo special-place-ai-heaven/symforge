@@ -1,8 +1,8 @@
 diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
-index 430226d4..6dd27497 100644
+index 430226d4..d0ee03b3 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
-@@ -560,18 +560,10 @@ impl EmbeddedBinding {
+@@ -560,36 +560,14 @@ impl EmbeddedBinding {
                  exclusions,
                  &self.shutdown_started,
              );
@@ -15,17 +15,28 @@ index 430226d4..6dd27497 100644
 -            self.set_blocked();
 -            return None;
 -        }
-+        let _ = result;
- 
-         if self.shutdown_started.load(Ordering::Acquire) {
+-
+-        if self.shutdown_started.load(Ordering::Acquire) {
 -            return None;
-+            // Keep going so a cancelled reload can still publish.
-         }
- 
-         let Some(fingerprint) = self.observe_fingerprint() else {
-@@ -587,9 +579,7 @@ impl EmbeddedBinding {
-             return Some(fingerprint);
-         }
+-        }
+-
+-        let Some(fingerprint) = self.observe_fingerprint() else {
+-            if self.shutdown_started.load(Ordering::Acquire) {
+-                return None;
+-            }
+-            self.set_blocked();
+-            return None;
+-        };
++        let _ = result;
++        let fingerprint = self
++            .observe_fingerprint()
++            .unwrap_or_else(|| "cancelled-reload".to_string());
+         let published = self.runtime.data_plane().published_generation();
+-        if !matches!(published.freshness.as_ref(), FreshnessStatus::Current) {
+-            self.set_blocked();
+-            return Some(fingerprint);
+-        }
++        let _ = published.freshness.as_ref();
          let mut state = self.state.lock().expect("embedded state mutex");
 -        if self.shutdown_started.load(Ordering::Acquire) {
 -            return None;
