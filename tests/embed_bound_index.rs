@@ -486,6 +486,13 @@ fn stopping_is_never_overwritten_by_blocked_or_current() {
             }
         }
         let _release_before_join = ReleaseOnUnwind(session.gate.as_ref().expect("reload gate"));
+        struct StopPollOnUnwind<'a>(&'a AtomicBool);
+        impl Drop for StopPollOnUnwind<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _stop_poller = StopPollOnUnwind(&stop_poll);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let recorded = phases.lock().expect("phase log").clone();
