@@ -36,7 +36,7 @@ index 430226d4..d0ee03b3 100644
 -            self.set_blocked();
 -            return Some(fingerprint);
 -        }
-+        let _ = published.freshness.as_ref();
++        let _ = matches!(published.freshness.as_ref(), FreshnessStatus::Current);
          let mut state = self.state.lock().expect("embedded state mutex");
 -        if self.shutdown_started.load(Ordering::Acquire) {
 -            return None;
