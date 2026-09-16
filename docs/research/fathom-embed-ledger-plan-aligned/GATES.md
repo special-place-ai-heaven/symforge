@@ -35,8 +35,8 @@ template's lease-release gate is dropped.
   EXPECT: LEDGER-ORACLE ATOMS ADDITIVE base=v11.2.0
   EVIDENCE: pending
 
-- [ ] N5: the release adds no crate and changes no dependency or patch table
-  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs deps --base v11.2.0
+- [ ] N5: the release adds no crate and changes no Cargo.toml dependency or patch table
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs deps --base v11.2.0 --allow-lock reqwest@0.13.5 --allow-lock rmcp@3.3.0 --allow-lock rmcp-macros@3.3.0 --allow-lock toml_edit@0.25.15+spec-1.1.0 --allow-lock toml_parser@1.1.3+spec-1.1.0
   EXPECT: LEDGER-ORACLE DEPS UNCHANGED base=v11.2.0
   EVIDENCE: pending
 

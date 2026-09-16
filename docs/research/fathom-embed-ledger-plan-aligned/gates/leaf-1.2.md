@@ -101,8 +101,8 @@ patch so it removes the same guard; the owner reviews regenerated patches.
   EXPECT: LEDGER-ORACLE MUTANT CAUGHT patch=task2-m6-factory-lock-held-across-join.patch
   EVIDENCE: pending
 
-- [ ] G13: no crate was added and no dependency or patch table changed since v11.2.0
-  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs deps --base v11.2.0
+- [ ] G13: no crate was added and no Cargo.toml dependency or patch table changed since v11.2.0
+  CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs deps --base v11.2.0 --allow-lock reqwest@0.13.5 --allow-lock rmcp@3.3.0 --allow-lock rmcp-macros@3.3.0 --allow-lock toml_edit@0.25.15+spec-1.1.0 --allow-lock toml_parser@1.1.3+spec-1.1.0
   EXPECT: LEDGER-ORACLE DEPS UNCHANGED base=v11.2.0
   EVIDENCE: pending
 

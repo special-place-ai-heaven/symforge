@@ -1,0 +1,21 @@
+{
+ "schema": 1,
+ "head": "b549aa7db59dcc10aff3f3493f12ed6509f2e2e1",
+ "args": [
+  "test",
+  "-j",
+  "8",
+  "--no-fail-fast",
+  "--no-default-features",
+  "--features",
+  "embed",
+  "--test",
+  "embed_bound_index",
+  "--",
+  "--test-threads=1"
+ ],
+ "passed": [
+  "tests/embed_bound_index.rs :: public_embed_handle_indexes_refreshes_queries_and_joins"
+ ],
+ "failed": []
+}

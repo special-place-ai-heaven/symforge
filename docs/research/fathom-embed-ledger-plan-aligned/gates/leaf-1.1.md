@@ -38,18 +38,25 @@ than on the branch.
 - [ ] G5: the default suite baseline was recorded at b549aa7 with no failing test
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs baseline-head --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-default.json --expect b549aa7
   EXPECT: /LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=\d+ failed=0;/
-  EVIDENCE: pending
+  EVIDENCE: inspect 2026-09-16, detached worktree E:/project/symforge-baseline-v11.2.0 at b549aa7 (removed after). Oracle baseline-head: LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=4337 failed=0; File written to docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-default.json. Box stays unchecked until owner-approved --reverify.
 
 - [ ] G6: the embed lib suite baseline, which is plan Task 1's embed gate on the aligned source, was recorded at b549aa7 with no failing test
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs baseline-head --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-lib.json --expect b549aa7
   EXPECT: /LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=\d+ failed=0;/
-  EVIDENCE: pending
+  EVIDENCE: inspect 2026-09-16. Oracle baseline-head: LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=1354 failed=0; File written to docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-lib.json. Box stays unchecked until owner-approved --reverify.
 
 - [ ] G7: the embed integration target baseline was recorded at b549aa7 with no failing test
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs baseline-head --baseline docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-integration.json --expect b549aa7
   EXPECT: /LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=\d+ failed=0;/
-  EVIDENCE: pending
+  EVIDENCE: inspect 2026-09-16. Oracle baseline-head: LEDGER-ORACLE BASELINE GREEN at=b549aa7 passed=1 failed=0; (v11.2.0 had only public_embed_handle_indexes_refreshes_queries_and_joins). File written to docs/research/fathom-embed-ledger-plan-aligned/baselines/suite-embed-integration.json. Box stays unchecked until owner-approved --reverify.
 
 - [ ] G8: every path changed since the release baseline belongs to a named C3 row, with the reason recorded
-  RECORD: the output of `git diff --stat v11.2.0` mapped path by path. Owner revision 2: `.github/workflows/ci.yml` and `tests/preventive_runtime_dark_v11.rs` belong to Task 3 Step 5 (embed integration CI step plus its workflow fingerprint and cargo-line pins). `src/protocol/tools.rs`, `src/protocol/edit_tools.rs`, `tests/conformance.rs` and `src/stel/surface_list.rs` are the named 200-character harness companion: keep them, isolate as their own commit, do not treat as unlabeled extras. Any other unlisted path is a defect.
-  EVIDENCE: pending
+  RECORD: the output of `git diff --stat v11.2.0` mapped path by path. Owner revision 2: `.github/workflows/ci.yml` and `tests/preventive_runtime_dark_v11.rs` belong to Task 3 Step 5 (embed integration CI step plus its workflow fingerprint and cargo-line pins). `src/protocol/tools.rs`, `src/protocol/edit_tools.rs`, `tests/conformance.rs` and `src/stel/surface_list.rs` are the named 200-character harness companion: keep them, isolate as their own commit, do not treat as unlabeled extras. Owner revision 3 (2026-09-16): #695 SnapshotStore restore and #701 lock-only version bumps of already-present crates are named C3 companions. Any other unlisted path is a defect.
+  EVIDENCE: 2026-09-16 from `feature/fathom-embed-wave2`. `git diff --stat v11.2.0` mapped below. Owner named #695 and #701 as C3. Inspect api GREEN; atoms GREEN added=9. Deps CHECK now lists the five #701 --allow-lock rows.
+    C3 / Task 3 Step 5: .github/workflows/ci.yml; tests/preventive_runtime_dark_v11.rs
+    C3 / 200-char companion: src/protocol/tools.rs; src/protocol/edit_tools.rs; tests/conformance.rs; src/stel/surface_list.rs
+    C3 / #695 SnapshotStore restore: src/index_lifecycle/snapshot.rs; src/live_index/persist.rs
+    C3 / #701 lock-only bumps: Cargo.lock (reqwest@0.13.5, rmcp@3.3.0, rmcp-macros@3.3.0, toml_edit@0.25.15+spec-1.1.0, toml_parser@1.1.3+spec-1.1.0)
+    Task 1 (plan, brief, ledger): docs/plans/2026-09-15-fathom-embed-alignment.md; docs/research/fathom-embed-change-brief.md; docs/research/fathom-embed-ledger-plan-aligned/{GATES.md,PLAN.md,PROMPT.md,PROMPT-TO-FATHOM.md,PROMPT-TO-SYMFORGE.md,oracles/ledger-oracle.mjs,gates/cells.md,gates/leaf-1.1.md,gates/leaf-1.2.md,gates/leaf-1.3.md,gates/leaf-1.4.md,gates/leaf-1.5.md,gates/leaf-1.6.md,gates/leaf-1.7.md}
+    Tasks 2–6 (CR-0/1/2/3, F-1/F-2, atoms): CHANGELOG.md; src/daemon.rs; src/discovery/mod.rs; src/embed.rs; src/index_lifecycle/{activation.rs,embedded.rs,process_runtime.rs,public_api.rs,registry.rs}; src/lifecycle_identity.rs; src/live_index/{knowledge_retrieve.rs,mod.rs,search.rs,store.rs}; src/protocol/{ccr.rs,claim_provenance.rs,format.rs,format/tests.rs,knowledge_search.rs}; specs/020-repository-knowledge-index/{REFREEZE-MANIFEST-v11.md,contracts/public-api-v11.json}; docs/reviews/{FEATURE-020-EXPORT-DELTA-v11.json,FEATURE-020-REFREEZE-ATTESTATION-v11.md}; execution/refreeze_v11.py; tests/{activation_cut_v11.rs,embed_bound_index.rs,public_api_delta_v11.rs,fixtures/public-api-v11-consumer/dependent-positive/src/lib.rs,fixtures/public-api-v11-consumer/fixture-manifest.json}
+    Task 7 handoff (not yet the tag): tasks/todo.md; tasks/lessons.md

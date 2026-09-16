@@ -230,6 +230,109 @@ fn notify_join_entered(root: &std::path::Path) {
     state.reached.notify_all();
 }
 
+#[cfg(feature = "__test-internals")]
+struct OpenAfterReserveState {
+    holding: std::sync::Mutex<bool>,
+    entered: std::sync::Mutex<bool>,
+    reached: Condvar,
+}
+
+#[cfg(feature = "__test-internals")]
+static OPEN_AFTER_RESERVE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<ProjectKey, Arc<OpenAfterReserveState>>>,
+> = std::sync::OnceLock::new();
+
+/// Parks `open_bound` after it has reserved the root and before it admits.
+#[cfg(feature = "__test-internals")]
+pub struct OpenAfterReserveHoldForTest {
+    key: ProjectKey,
+    state: Arc<OpenAfterReserveState>,
+}
+
+#[cfg(feature = "__test-internals")]
+pub fn hold_open_after_reserve_for_test(root: &std::path::Path) -> OpenAfterReserveHoldForTest {
+    let crate::domain::RootResolution::Bound(binding) = crate::discovery::resolve_root_candidate(
+        root,
+        crate::domain::RootCandidateSource::McpClientRoot,
+        crate::domain::RootRequestMode::Automatic,
+    ) else {
+        panic!("test root must resolve to an embedded binding");
+    };
+    let key = ProjectKey::new(&binding.root_id.0);
+    let state = Arc::new(OpenAfterReserveState {
+        holding: std::sync::Mutex::new(true),
+        entered: std::sync::Mutex::new(false),
+        reached: Condvar::new(),
+    });
+    let holds = OPEN_AFTER_RESERVE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let previous = holds
+        .lock()
+        .expect("open-after-reserve hold registry")
+        .insert(key.clone(), Arc::clone(&state));
+    assert!(
+        previous.is_none(),
+        "a root can hold only one open-after-reserve gate"
+    );
+    OpenAfterReserveHoldForTest { key, state }
+}
+
+#[cfg(feature = "__test-internals")]
+impl OpenAfterReserveHoldForTest {
+    pub fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let entered = self.state.entered.lock().expect("open-after-reserve hold");
+        let (entered, _) = self
+            .state
+            .reached
+            .wait_timeout_while(entered, timeout, |entered| !*entered)
+            .expect("open-after-reserve hold");
+        *entered
+    }
+
+    pub fn release(&self) {
+        *self.state.holding.lock().expect("open-after-reserve hold") = false;
+        self.state.reached.notify_all();
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for OpenAfterReserveHoldForTest {
+    fn drop(&mut self) {
+        self.release();
+        let holds = OPEN_AFTER_RESERVE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut holds = holds.lock().expect("open-after-reserve hold registry");
+        if holds
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.state))
+        {
+            holds.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+fn pause_open_after_reserve_for_test(key: &ProjectKey) {
+    let Some(state) = OPEN_AFTER_RESERVE
+        .get()
+        .and_then(|holds| holds.lock().ok()?.get(key).cloned())
+    else {
+        return;
+    };
+    let mut entered = state.entered.lock().expect("open-after-reserve hold");
+    if *entered {
+        return;
+    }
+    *entered = true;
+    drop(entered);
+    state.reached.notify_all();
+    let holding = state.holding.lock().expect("open-after-reserve hold");
+    drop(
+        state
+            .reached
+            .wait_while(holding, |holding| *holding)
+            .expect("open-after-reserve hold"),
+    );
+}
+
 struct OpenRollback {
     factory: Arc<EmbeddedSourceFactory>,
     key: ProjectKey,
@@ -770,6 +873,9 @@ impl EmbeddedSourceFactory {
             );
             self.shutdown.store(false, Ordering::Release);
         }
+
+        #[cfg(feature = "__test-internals")]
+        pause_open_after_reserve_for_test(&key);
 
         let mut rollback = OpenRollback::reserve(Arc::clone(self), key.clone(), identity);
         let admission = super::activation::admit_project_with_outcome(

@@ -29,8 +29,10 @@
 //   atoms    --base REF --contract FILE [--allow-prefix ATOM ...] [--require-atom ATOM ...]
 //            every atom in migration_v10.introduced_v11_atoms at REF is still
 //            present; every new atom equals or extends an --allow-prefix.
-//   deps     --base REF      no Cargo.lock package (other than the root crate)
-//            outside REF's set; dependency and patch tables of Cargo.toml unchanged.
+//   deps     --base REF [--allow-lock name@version ...]
+//            no Cargo.lock package (other than the root crate) outside REF's set
+//            except named --allow-lock rows; dependency and patch tables of
+//            Cargo.toml unchanged. An --allow-lock row already at REF is RED.
 //   doc-has  --file F --section HEADING --token T [--token T ...]
 //   release  --since TAG --cr LABEL ... [--together yes] [--head-is-tag yes]
 //            [--remote origin] [--handoff FILE [--handoff-section HEADING] --token T ...]
@@ -482,6 +484,7 @@ export function dependencyTables(tomlText) {
 
 function depsCheck(cwd, opts) {
   const base = one(opts, "base");
+  const allowLock = new Set(opts["allow-lock"] || []);
   const baseToml = git(["show", base + ":Cargo.toml"], cwd).stdout;
   const headToml = readFileSync(resolve(cwd, "Cargo.toml"), "utf8");
   const root = (baseToml.match(/^\[package\][\s\S]*?^name\s*=\s*"([^"]+)"/m) || red("no [package] name in Cargo.toml"))[1];
@@ -489,7 +492,10 @@ function depsCheck(cwd, opts) {
   if (dependencyTables(baseToml) !== dependencyTables(headToml)) violations.push("Cargo.toml dependency or patch tables changed");
   const baseLock = lockPackages(git(["show", base + ":Cargo.lock"], cwd).stdout, root);
   if (!baseLock.size) red("no packages parsed from Cargo.lock at " + base);
-  for (const pkg of lockPackages(readFileSync(resolve(cwd, "Cargo.lock"), "utf8"), root)) if (!baseLock.has(pkg)) violations.push("Cargo.lock package not present at " + base + ": " + pkg);
+  for (const pkg of lockPackages(readFileSync(resolve(cwd, "Cargo.lock"), "utf8"), root)) {
+    if (!baseLock.has(pkg) && !allowLock.has(pkg)) violations.push("Cargo.lock package not present at " + base + ": " + pkg);
+  }
+  for (const pkg of allowLock) if (baseLock.has(pkg)) red("--allow-lock " + pkg + " is already present at " + base);
   if (violations.length) red("dependency set changed:\n  " + violations.join("\n  "));
   return { base, packages: baseLock.size };
 }
@@ -689,6 +695,15 @@ async function selfTest() {
     writeFileSync(join(repo, "kind.rs"), "pub enum Kind {\n    One,\n    Two,\n    Four,\n}\n");
     expectRed(() => apiCheck(repo, { base: ["HEAD"], path: ["kind.rs"], extend: ["Kind=Three"] }), "a wrong extend variant", "variants must be");
     git(["checkout", "--", "api.rs", "kind.rs"], repo);
+    writeFileSync(join(repo, "Cargo.toml"), "[package]\nname = \"symforge\"\nversion = \"1\"\n[dependencies]\nanyhow = \"1\"\n");
+    writeFileSync(join(repo, "Cargo.lock"), lockA);
+    git(["add", "Cargo.toml", "Cargo.lock"], repo);
+    git(["commit", "-qm", "lock"], repo);
+    writeFileSync(join(repo, "Cargo.lock"), lockA + "\n[[package]]\nname = \"reqwest\"\nversion = \"0.13.5\"\n");
+    ok(() => depsCheck(repo, { base: ["HEAD"], "allow-lock": ["reqwest@0.13.5"] }));
+    expectRed(() => depsCheck(repo, { base: ["HEAD"] }), "an unapproved lock bump", "reqwest@0.13.5");
+    expectRed(() => depsCheck(repo, { base: ["HEAD"], "allow-lock": ["anyhow@1.0.1"] }), "allow-lock of a base package", "already present");
+    git(["checkout", "--", "Cargo.lock"], repo);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
