@@ -1013,13 +1013,13 @@ const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
     465_068,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
-// Baseline refreshed 2026-09-16 with the excluded-source pin above.
-// File count 197 -> 198: added src/live_index/knowledge_retrieve.rs
-// (typed retrieval seam; not an excluded-runtime path).
+// Baseline refreshed 2026-09-16 with the excluded-source pin above, then
+// again after the derived-stage hold grew a reached-wait so CR-1 G17 can
+// observe the pause. File count stays 198.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8b48035e1ad794aa20b082133621f36fc9b122348ed88afcd83de01cdda9a80a",
+    "d2686e4d1a8b18a76522ddd94021bdd019e30d7b59b2eaffe15883009ed9f125",
     198,
-    9_657_759,
+    9_659_457,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

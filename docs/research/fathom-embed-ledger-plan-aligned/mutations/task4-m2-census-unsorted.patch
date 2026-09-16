@@ -14,7 +14,7 @@ index 430226d4..d9cf900f 100644
 -                path: file.relative_path.clone(),
 +            .live
 +            .all_files()
-+            .filter(|(path, _)| parsed.contains(path))
++            .filter(|(path, _)| parsed.contains(path.as_str()))
 +            .map(|(path, file)| super::public_api::CensusFile {
 +                path: path.clone(),
                  language: file.language.name().to_string(),

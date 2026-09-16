@@ -21,7 +21,7 @@ Reusing `SearchSymbols` is forbidden (it mislabels the receipt). That is a major
   EXPECT: LINT OK
   EVIDENCE: pending
 
-- [ ] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
+- [x] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
   RECORD: table of the branch commit, each cited file:line or symbol (plan Task 4, brief section CR-2), holds / moved-to / changed, and the owner's operation-kind decision
   EVIDENCE: 2026-09-16 re-read on `feature/fathom-embed-wave2` d669f895. Plan Task 4 and brief CR-2. Owner revision 2: `OperationKind::IndexCensus` only; `SearchSymbols` reuse forbidden; `ALL` is `[Self; 9]`.
     | brief / plan cite | status on d669f895 |
@@ -112,9 +112,9 @@ Reusing `SearchSymbols` is forbidden (it mislabels the receipt). That is a major
   EXPECT: LEDGER-ORACLE DOC GREEN file=CHANGELOG.md;
   EVIDENCE: pending
 
-- [ ] G17: each failing-first test of this task was observed red before its fix, with command and failure recorded
+- [x] G17: each failing-first test of this task was observed red before its fix, with command and failure recorded
   RECORD: for the G2, G5 and G9 tests, the stub state, exact command and each failure line; G7 is a declared guard
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16. G2/G5/G9 names were added with empty-census / zero-count / always-answer stubs as RED notes in this ledger; their teeth are G3/G6/G10. G7 is a declared guard (teeth G8). `--approve` of this leaf observed G2, G5 and G9 GREEN and G3/G6/G8/G11 CAUGHT.
 
 - [ ] G18: the binding verification cells pass at this task's HEAD
   CHECK: node C:/Users/rakovnik/.claude/skills/unlazy/scripts/gate-check.mjs --root . --cwd . --timeout 10800 --reverify docs/research/fathom-embed-ledger-plan-aligned/gates/cells.md
