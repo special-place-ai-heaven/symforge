@@ -310,15 +310,16 @@ fn open_current_worktree(
         .expect("open embedded source")
 }
 
-/// Drop the parse hold before the handle so a failed assert cannot join a parked worker.
+/// Release the parse hold before any handle close so a failed assert cannot join a parked worker.
 struct ThroughCancelHold {
     gate: Option<symforge::live_index::store::ReloadGateForTest>,
-    handle: symforge::embed::EmbeddedSourceHandle,
+    handles: Vec<symforge::embed::EmbeddedSourceHandle>,
 }
 
 impl Drop for ThroughCancelHold {
     fn drop(&mut self) {
         self.gate.take();
+        self.handles.clear();
     }
 }
 
@@ -328,29 +329,33 @@ fn reload_hold_on_one_root_leaves_other_roots_running() {
     let other = rust_repo_with_files(4);
     let gate = symforge::live_index::store::hold_reload_after_parses_for_test(held.path(), 1);
     let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
-    let held_handle = open_current_worktree(&runtime, held.path());
+    let mut session = ThroughCancelHold {
+        gate: Some(gate),
+        handles: vec![open_current_worktree(&runtime, held.path())],
+    };
     assert!(
-        gate.wait_until_blocked(Duration::from_secs(5)),
+        session
+            .gate
+            .as_ref()
+            .expect("reload gate")
+            .wait_until_blocked(Duration::from_secs(5)),
         "held root did not reach the parse gate"
     );
-    let held = ThroughCancelHold {
-        gate: Some(gate),
-        handle: held_handle,
-    };
 
-    let other_handle = open_current_worktree(&runtime, other.path());
+    session
+        .handles
+        .push(open_current_worktree(&runtime, other.path()));
     let other_view = wait_for_view(
-        &other_handle,
+        &session.handles[1],
         Instant::now() + Duration::from_secs(3),
         |view| view.phase == SourceRuntimePhase::Current,
     );
     assert!(other_view.source_version > 0);
     assert_eq!(
-        held.handle.runtime_view().phase,
+        session.handles[0].runtime_view().phase,
         SourceRuntimePhase::Loading,
         "the held root must stay Loading while the other root reaches Current"
     );
-    drop(other_handle);
 }
 
 #[test]
@@ -1021,7 +1026,7 @@ fn index_progress_keeps_last_values_after_cancel() {
         gate: Some(
             symforge::live_index::store::hold_reload_through_cancel_for_test(repository.path(), 1),
         ),
-        handle: open_current_worktree(&runtime, repository.path()),
+        handles: vec![open_current_worktree(&runtime, repository.path())],
     };
     assert!(
         held.gate
@@ -1030,11 +1035,11 @@ fn index_progress_keeps_last_values_after_cancel() {
             .wait_until_blocked(Duration::from_secs(5)),
         "reload did not reach parse 1"
     );
-    let progress = held.handle.index_progress();
+    let progress = held.handles[0].index_progress();
     assert_eq!(progress.files_parsed, 1);
-    held.handle.cancel_reload_for_test();
+    held.handles[0].cancel_reload_for_test();
     assert_eq!(
-        held.handle.index_progress(),
+        held.handles[0].index_progress(),
         progress,
         "cancel must keep the last observed progress values"
     );
