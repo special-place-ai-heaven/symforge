@@ -1,5 +1,5 @@
 diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
-index 430226d4..a5f5c240 100644
+index 430226d4..25be402e 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
 @@ -660,7 +660,9 @@ impl EmbeddedBinding {
@@ -13,3 +13,12 @@ index 430226d4..a5f5c240 100644
              let retry = match state.phase {
                  super::public_api::SourceRuntimePhase::Blocked => {
                      crate::lifecycle_identity::RetryAdvice::Operator
+@@ -681,7 +683,7 @@ impl EmbeddedBinding {
+         let publication_identity = state
+             .current_publication_identity
+             .clone()
+-            .expect("Current embedded source has a publication identity");
++            .unwrap_or_else(|| "skipped-readiness".to_string());
+         Ok(CurrentEmbedClaim {
+             binding_identity: format!("source-{}", self.identity.raw()),
+             publication_identity,
