@@ -584,12 +584,13 @@ fn close_during_derived_stage_returns_before_release() {
     use std::sync::mpsc;
 
     let repository = rust_repo_with_files(4);
-    let _hold = symforge::live_index::store::hold_derived_stage_for_test();
+    let hold = symforge::live_index::store::hold_derived_stage_for_test();
     let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
     let handle = open_current_worktree(&runtime, repository.path());
-    wait_for_view(&handle, Instant::now() + Duration::from_secs(5), |view| {
-        view.phase == SourceRuntimePhase::Loading
-    });
+    assert!(
+        hold.wait_until_blocked(Duration::from_secs(5)),
+        "derived-index rebuild did not reach the hold"
+    );
     let (finished, received) = mpsc::channel();
     let closer = std::thread::spawn(move || {
         let started = Instant::now();

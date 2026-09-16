@@ -213,6 +213,8 @@ fn pause_after_parse_for_test(_source_scope: &Path, _cancel: Option<&AtomicBool>
 
 #[cfg(feature = "__test-internals")]
 static DERIVED_STAGE_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "__test-internals")]
+static DERIVED_STAGE_REACHED: AtomicBool = AtomicBool::new(false);
 
 /// Hold every derived-index rebuild after the trigram pass until cancel or drop.
 #[cfg(feature = "__test-internals")]
@@ -220,8 +222,23 @@ pub struct DerivedStageHoldForTest;
 
 #[cfg(feature = "__test-internals")]
 pub fn hold_derived_stage_for_test() -> DerivedStageHoldForTest {
+    DERIVED_STAGE_REACHED.store(false, Ordering::Release);
     DERIVED_STAGE_HOLD.store(true, Ordering::Release);
     DerivedStageHoldForTest
+}
+
+#[cfg(feature = "__test-internals")]
+impl DerivedStageHoldForTest {
+    pub fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if DERIVED_STAGE_REACHED.load(Ordering::Acquire) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        DERIVED_STAGE_REACHED.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(feature = "__test-internals")]
@@ -234,6 +251,7 @@ impl Drop for DerivedStageHoldForTest {
 fn pause_between_derived_stages(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
     #[cfg(feature = "__test-internals")]
     if DERIVED_STAGE_HOLD.load(Ordering::Acquire) {
+        DERIVED_STAGE_REACHED.store(true, Ordering::Release);
         loop {
             check_reload_cancelled(cancel)?;
             std::thread::sleep(Duration::from_millis(1));
