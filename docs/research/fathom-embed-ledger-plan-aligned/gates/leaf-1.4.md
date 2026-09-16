@@ -23,7 +23,14 @@ Reusing `SearchSymbols` is forbidden (it mislabels the receipt). That is a major
 
 - [ ] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
   RECORD: table of the branch commit, each cited file:line or symbol (plan Task 4, brief section CR-2), holds / moved-to / changed, and the owner's operation-kind decision
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16 re-read on `feature/fathom-embed-wave2` d669f895. Plan Task 4 and brief CR-2. Owner revision 2: `OperationKind::IndexCensus` only; `SearchSymbols` reuse forbidden; `ALL` is `[Self; 9]`.
+    | brief / plan cite | status on d669f895 |
+    |---|---|
+    | proposed `IndexCensus` / `CensusFile` | HOLDS: `public_api.rs:217` and `:225`; re-exported from `embed.rs:84`. |
+    | proposed `index_census` on the handle | HOLDS: `embedded.rs:1350`; claims use `OperationKind::IndexCensus` (`:1360`, `:1367`, `:1371`, `:1377`). |
+    | `OperationKind::ALL` | HOLDS: `lifecycle_identity.rs:151` is `[Self; 9]`; `IndexCensus` is `:144`, after the original seven, before `SearchKnowledge`. |
+    | census via runtime acquire, not data-plane bypass | HOLDS: method goes through `current_claim` + `acquire()`, not `data_plane()`. |
+    | `SourceRuntimeView` must stay unchanged | HOLDS fields: `public_api.rs:462-468` still the five v11.2.0 fields (line moved from brief `:392`). |
 
 - [ ] G2: a Current source's census lists every parsed file sorted by path, including files with zero symbols
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name index_census_lists_sorted_zero_symbol_parsed_files -- test -j 8 --no-default-features --features embed --test embed_bound_index -- index_census_lists_sorted_zero_symbol_parsed_files --test-threads=1

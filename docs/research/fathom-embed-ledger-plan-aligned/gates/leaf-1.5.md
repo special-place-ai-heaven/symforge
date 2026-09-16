@@ -21,7 +21,15 @@ names are this ledger's.
 
 - [ ] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
   RECORD: table of the branch commit, each cited file:line or symbol (plan Task 5, brief section CR-3), holds / moved-to / changed
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16 re-read on `feature/fathom-embed-wave2` d669f895. Plan Task 5 and brief CR-3. Owner: no `OperationKind` for progress; method stays infallible.
+    | brief / plan cite | status on d669f895 |
+    |---|---|
+    | `SourceRuntimeView` fields (`public_api.rs:392-400`); not `#[non_exhaustive]` | HOLDS fields, line MOVED: `public_api.rs:462-468`. No progress fields added. |
+    | proposed `index_progress` / `IndexProgress` | HOLDS: type `public_api.rs:241`; method `embedded.rs:1424` returns `IndexProgress` (infallible). |
+    | counters on `EmbeddedBinding` next to `state` (`embedded.rs:157`) | CHANGED: `ReloadProgressSink` atomics live in `store.rs:214`; binding registers via `register_reload_progress` (`store.rs:259`). |
+    | reset at start of each reload | HOLDS: `reload_and_publish` calls `self.progress.reset()` at `embedded.rs:545`. |
+    | tick scout must not touch counters (`embedded.rs:299-307`) | HOLDS: `note_reload_discovered` is only at real-reload scout finish (`store.rs:5743`). |
+    | after cancel, keep last values | HOLDS: cancel path does not call `reset()`. |
 
 - [ ] G2: with a reload held after a known number of parses, parsed progress equals that number, and it does not change once the source is Current
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name index_progress_rises_only_during_a_reload -- test -j 8 --no-default-features --features embed --test embed_bound_index -- index_progress_rises_only_during_a_reload --test-threads=1
@@ -74,7 +82,12 @@ names are this ledger's.
 
 - [ ] G11: each counter's documented meaning names the exact lifecycle point where it increments, and the code increments it there and nowhere else
   RECORD: for each counter, the rustdoc sentence, the one increment site (file:line on the branch) and whether a staged-bytes hard skip or circuit-breaker fold can still change a counted file (brief CR-3, "Define the counts precisely"); reviewed by the owner
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16 on d669f895. Rustdoc is `public_api.rs:231-238`. Owner review of meanings is C28 / this table; boxes stay unchecked until that review is recorded as accepted.
+    | counter | rustdoc | increment site | fold / staged-bytes can still drop the file? |
+    |---|---|---|---|
+    | `files_discovered` | "this reload's executable scout work-set, stored when that scout finishes" | `store.rs:5743` `note_reload_discovered(root, projection.entries.len())` after `project_scout_for_legacy_execution` (`:279` stores, does not increment) | No. This is the scout work-set size, not a per-file parse outcome. |
+    | `files_parsed` | "increments when a file parse completes, at the same lifecycle point as the reload hold; a later staged-bytes hard skip or circuit-breaker fold can still drop that file" | `store.rs:5162` `note_reload_parsed` immediately after `process_file_with_classification` (`:285`) | Yes. Staged-bytes handoff at `:5182` can still `HardSkip` after the increment. |
+    | `symbols_found` | "increments from symbols extracted on those parsed files" | `store.rs:5179` `note_reload_symbols(..., indexed.symbols.len())` (`:291`) | Yes. Same handoff follows at `:5182`. |
 
 - [ ] G12: no existing public item, variant, field or re-export changed since v11.2.0 and every addition is a plan-named atom or test-only
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs api --base v11.2.0 --path src/index_lifecycle/embedded.rs --path src/index_lifecycle/public_api.rs --path src/embed.rs --path src/lifecycle_identity.rs --allow index_census --allow IndexCensus --allow CensusFile --allow index_progress --allow IndexProgress --allow search_knowledge --allow KnowledgeSearchRequest --allow KnowledgeSearchResult --allow KnowledgeMatch --extend OperationKind=IndexCensus,SearchKnowledge --frozen RetryAdvice --frozen SourceRefusalKind --frozen SourceRuntimePhase --frozen SourceRuntimeView

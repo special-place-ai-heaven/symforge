@@ -21,7 +21,17 @@ ledger's.
 
 - [ ] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
   RECORD: table of the branch commit, each cited file:line or symbol (plan Task 3, brief section CR-1), holds / moved-to / changed
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16 re-read on `feature/fathom-embed-wave2` d669f895. Plan Task 3 and brief CR-1.
+    | brief / plan cite | status on d669f895 |
+    |---|---|
+    | `reload_and_publish()` first (`embedded.rs:217`) before `control.stop` | MOVED: `reload_and_publish` is `embedded.rs:544`. Worker loop reads `shutdown_started` at `:507`, `:523`, `:564`. |
+    | `wait_refresh_visibility_or_stop` (`embedded.rs:252-259`) | MOVED: `embedded.rs:533`. |
+    | `EMBED_OBSERVER_POLL` 200 ms (`embedded.rs:23`) | HOLDS: `:23`. Wait is now `wait_timeout_while` at `:495` (predicate includes stop). |
+    | `close_one` / `shutdown_all` hold the open mutex across `join` (`embedded.rs:555-567`) | CHANGED: `close_one` (`:950-965`) drops the mutex before `shutdown()`/`join`. |
+    | `shutdown_started` (`embedded.rs:161`) unused on the index path | CHANGED: field at `:432`; passed into reload as cancel (`:561`) and checked around publish/phase. |
+    | `reload_for_binding_with_exclusions` has no cancel (`store.rs:2565`) | CHANGED: `check_reload_cancelled` at `store.rs:74`; scout uses `scout_repository_with_exclusions_cancellable`. |
+    | `hold_reload_after_parses_for_test` / `hold_reload_through_cancel_for_test` | HOLDS: `store.rs:108` and `:118`, root-scoped, `__test-internals`. |
+    | `set_phase` / `set_blocked` overwrite `Stopping` | CHANGED: `set_phase` `:623`, `set_blocked` `:637`; both ignore writes after shutdown. |
 
 - [ ] G2: a reload hold on one root never holds a reload of another root
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name reload_hold_on_one_root_leaves_other_roots_running -- test -j 8 --no-default-features --features embed --test embed_bound_index -- reload_hold_on_one_root_leaves_other_roots_running --test-threads=1

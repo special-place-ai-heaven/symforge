@@ -34,7 +34,16 @@ patch so it removes the same guard; the owner reviews regenerated patches.
 
 - [ ] G1: every plan and brief citation this task relies on is re-read on the branch before its next edit, with its status recorded
   RECORD: table of the branch commit, each cited file:line or symbol (plan Task 2, brief section CR-0), holds / moved-to / changed
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16 re-read on `feature/fathom-embed-wave2` d669f895. Plan Task 2 (shared factory) and brief CR-0 (process-wide sole-owner).
+    | brief / plan cite | status on d669f895 |
+    |---|---|
+    | `ProcessRuntimeApi::acquire` builds a factory (`public_api.rs:513-520`, factory at `:517`) | CHANGED: `acquire` is `public_api.rs:575-584`. It clones the process factory via `EmbeddedRuntimeOwner::new(inner.embedded_factory())` (`:578`). |
+    | factory construction | MOVED: one `EmbeddedSourceFactory::new()` lives on `ProcessIndexRuntime` (`process_runtime.rs:112`); accessor `embedded_factory()` at `:136`. |
+    | per-factory map check `embedded.rs:492-496` | CHANGED: `SourceAlreadyOpen` is process-wide. Reservation refuse at `embedded.rs:822`; `open_bound` refuse at `:863`. |
+    | insert before `admit_project_with_outcome` (`embedded.rs:498`) | CHANGED: reservation + `OpenRollback` (`embedded.rs:336`) land before admit. |
+    | `stop(&key)` on close (`embedded.rs:408`) | HOLDS intent: `registry.rs:498` `stop` still ends the admission; `close_one` (`embedded.rs:950`) no longer holds the open mutex across `join`. |
+    | join-live `registry.rs:382-398`; do not change it | HOLDS: `admit_with_outcome` still `registry.rs:337`; embed sole-owner is the reservation, not this arm. |
+    | `SelectionUnavailable` / `OnEvent` mapping (`public_api.rs:550-555`) | MOVED: `SourceAlreadyOpen` maps at `public_api.rs:614`. |
 
 - [ ] G2: an open through a second ProcessRuntimeApi of a root already open through the first is refused with SelectionUnavailable, and a fresh sole handle is admitted after the first closes
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 1 --name embedded_source_has_one_handle_and_no_raw_bypass -- test -j 8 --test activation_cut_v11 -- embedded_source_has_one_handle_and_no_raw_bypass --test-threads=1
@@ -128,7 +137,10 @@ patch so it removes the same guard; the owner reviews regenerated patches.
 
 - [ ] G18: each failing-first test of this task was observed red before its fix, with command and failure recorded
   RECORD: for the G2, G4 and G11 tests, the commit or working state, exact command and the failure line; the existing tasks/todo.md entries count only where they name the command and the failure; G7 and G9 are declared regression guards
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16. `tasks/todo.md` names the G2 and G4 reds; it does not name the exact cargo invocation for G11. G7 and G9 are declared guards (teeth are G8 and G10).
+    - G2 RED (todo.md): "a second `ProcessRuntimeApi::acquire()` opened the same root, proving its factory was runtime-local." Named test `embedded_source_has_one_handle_and_no_raw_bypass`. GREEN after shared factory + distinct shutdown owner.
+    - G4 RED (todo.md): "an injected post-worker-start panic poisoned the factory mutex and aborted the test process." Named test `panicking_open_releases_its_process_wide_root_reservation`. GREEN after process-wide reservation + `OpenRollback`.
+    - G11: `unrelated_open_completes_while_another_root_closes` was already on the branch at drafting; no separate failing-first line in todo.md. Guarded by G12 (factory-lock-held-across-join).
 
 - [ ] G19: the binding verification cells pass at this task's HEAD
   CHECK: node C:/Users/rakovnik/.claude/skills/unlazy/scripts/gate-check.mjs --root . --cwd . --timeout 10800 --reverify docs/research/fathom-embed-ledger-plan-aligned/gates/cells.md

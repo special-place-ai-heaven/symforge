@@ -51,7 +51,20 @@ existing selector test.
 
 - [ ] G1: the search scope, withholding, knowledge retrieval, selector and path-prefix facts above are re-read on the branch, with their status recorded
   RECORD: table of the branch commit, each cited symbol and file:line, holds / moved-to / changed, and the owner's confirmation of the knowledge type names
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16 re-read on `feature/fathom-embed-wave2` d669f895. Owner revision 2 keeps `KnowledgeSearchRequest` / `KnowledgeSearchResult` / `KnowledgeMatch` and `OperationKind::SearchKnowledge`; result is not a `TextSearchResult` clone (C29).
+    | leaf / brief cite | status on d669f895 |
+    |---|---|
+    | `search_text_options_from_input` sets `SearchScope::Code` (`search_tools.rs:635`) | HOLDS: `:635`. |
+    | `SearchScope::allows_targets` keeps `targets.includes_code()` (`search.rs:92-105`) | HOLDS: `:94-105`. |
+    | `IndexTargets::for_path` classes Markdown as Knowledge (`domain/index.rs:824-837`) | HOLDS: `:824`. |
+    | single-project zero-hit (`format.rs:1233-1262`) | CHANGED: empty-files branch is now `:1272-1308`; notes via `append_excluded_knowledge_note` `:1171` and `append_withheld_admission_note` `:1181`. |
+    | cross-project "No text matches…" (`daemon.rs:5878-5886`) | CHANGED: still `:5878`; now sums `excluded_knowledge_files` and appends the note (`:5885-5892`). |
+    | `SensitivePath \| SensitiveContent` → `PolicyWithheld` (`store.rs:4245-4246`) | MOVED: `store.rs:4629-4630`. |
+    | `METADATA_ONLY_BYTES` 1 MiB / `METADATA_ONLY_CODE_BYTES` 4 MiB (`domain/index.rs:1602, 1609`) | HOLDS: `:1602` and `:1609`. |
+    | `search_scoped` (`knowledge_search.rs:429`) / `KnowledgeHit` (`:178`) | CHANGED: `search_scoped` is `:261` and formats only. Extraction is `retrieve_knowledge` (`knowledge_retrieve.rs:279`); hits are `KnowledgeRetrieveHit`. |
+    | `runtime_for_target` (`daemon.rs:2013`); test `:8077` | HOLDS fn `:2013`; test MOVED to `:8084`. |
+    | `PathScope::matches` boundary (`search.rs:54-66`) | HOLDS: `:56-67`. |
+    | embed `starts_with` after trim (`embedded.rs:772-778`, `:882-889`) | CHANGED: `path_matches_prefix` `:764-768` uses `PathScope::prefix(...).matches`. |
 
 - [ ] G2: a zero-hit search_text answer, single-project and cross-project, states the exact count of in-scope knowledge-only files not scanned and names search_knowledge
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs tests --tests 2 --name search_text_zero_hit_reports_exact_excluded_knowledge_count --name cross_project_search_text_zero_hit_reports_exact_excluded_knowledge_count -- test -j 8 --lib -- search_text_zero_hit_reports_exact_excluded_knowledge_count cross_project_search_text_zero_hit_reports_exact_excluded_knowledge_count --test-threads=1
@@ -177,7 +190,10 @@ existing selector test.
 
 - [ ] G24: the excluded count and the embedded knowledge retrieval read the published source set without indexing Markdown bodies a second time
   RECORD: the code paths (symbol and file:line) showing the count reads manifest or coverage data only and the seam reads the existing published knowledge units, with no new body read or second index; reviewed by the owner (plan Task 6 Step 2)
-  EVIDENCE: pending
+  EVIDENCE: 2026-09-16 on d669f895. Owner review of the seam is still required before this box can be checked.
+    - Excluded count: `count_in_scope_knowledge_only_files` (`search.rs:132-156`) walks `index.manifest_entries` only. It filters `FileDisposition::Indexed { targets: IndexTargets::Knowledge }` plus `path_scope.matches`. No file body is opened. Wired through `with_excluded_knowledge_count` (`search.rs:186-197`).
+    - Withheld counts: `count_in_scope_withheld_files` (`search.rs:158`) also walks `manifest_entries` dispositions only (`SensitivePath`/`SensitiveContent` vs size).
+    - Embed retrieve: `EmbeddedSourceHandle::search_knowledge` (`embedded.rs:1438`) calls `retrieve_knowledge` (`knowledge_retrieve.rs:279`). `extract_lane` iterates `generation.authority.records` and slices `generation.live.files` already in the published generation (`:503-516`). No disk reopen, no second index. `knowledge_search.rs` formats that result only (`:261`).
 
 - [ ] G25: no existing public item, variant, field or re-export changed since v11.2.0 and every addition is a plan-named atom or test-only
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs api --base v11.2.0 --path src/index_lifecycle/embedded.rs --path src/index_lifecycle/public_api.rs --path src/embed.rs --path src/lifecycle_identity.rs --allow index_census --allow IndexCensus --allow CensusFile --allow index_progress --allow IndexProgress --allow search_knowledge --allow KnowledgeSearchRequest --allow KnowledgeSearchResult --allow KnowledgeMatch --extend OperationKind=IndexCensus,SearchKnowledge --frozen RetryAdvice --frozen SourceRefusalKind --frozen SourceRuntimePhase --frozen SourceRuntimeView
