@@ -1,25 +1,21 @@
 diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
-index 430226d4..d9cf900f 100644
+index 430226d4..e6008c26 100644
 --- a/src/index_lifecycle/embedded.rs
 +++ b/src/index_lifecycle/embedded.rs
-@@ -1394,14 +1394,13 @@ impl EmbeddedSourceHandle {
+@@ -1393,7 +1393,7 @@ impl EmbeddedSourceHandle {
+             .map(|(path, _)| path.clone())
              .collect();
          crate::live_index::store::pause_census_after_first_read_for_test(&binding.root);
-         let files: Vec<super::public_api::CensusFile> = generation
--            .outline
--            .files
--            .iter()
--            .filter(|file| parsed.contains(&file.relative_path))
--            .map(|file| super::public_api::CensusFile {
--                path: file.relative_path.clone(),
-+            .live
-+            .all_files()
-+            .filter(|(path, _)| parsed.contains(path.as_str()))
-+            .map(|(path, file)| super::public_api::CensusFile {
-+                path: path.clone(),
-                 language: file.language.name().to_string(),
--                symbol_count: u32::try_from(file.symbol_count).unwrap_or(u32::MAX),
-+                symbol_count: u32::try_from(file.symbols.len()).unwrap_or(u32::MAX),
+-        let files: Vec<super::public_api::CensusFile> = generation
++        let mut files: Vec<super::public_api::CensusFile> = generation
+             .outline
+             .files
+             .iter()
+@@ -1404,6 +1404,7 @@ impl EmbeddedSourceHandle {
+                 symbol_count: u32::try_from(file.symbol_count).unwrap_or(u32::MAX),
              })
              .collect();
++        files.reverse();
          let total_files = files.len() as u64;
+         let total_symbols = files.iter().map(|file| u64::from(file.symbol_count)).sum();
+         Ok(super::public_api::live_claim(
