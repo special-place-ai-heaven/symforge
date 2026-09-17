@@ -1,0 +1,31 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..fbbea5e3 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -370,25 +370,7 @@ impl Drop for OpenRollback {
+         if self.committed {
+             return;
+         }
+-        if let Some(binding) = &self.binding {
+-            binding.shutdown();
+-        }
+-        let mut open = self
+-            .factory
+-            .open
+-            .lock()
+-            .expect("embedded registration mutex");
+-        if open
+-            .get(&self.key)
+-            .is_some_and(|source| source.identity == self.identity && source.opening)
+-        {
+-            open.remove(&self.key);
+-        }
+-        self.factory
+-            .shutdown
+-            .store(open.is_empty(), Ordering::Release);
+-        drop(open);
+-        let _ = super::activation::process_project_registry().stop(&self.key);
++        let _ = (&self.factory, &self.key, &self.identity, &self.binding);
+     }
+ }
+ 

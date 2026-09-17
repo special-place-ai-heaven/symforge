@@ -1,0 +1,25 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..d7b9e1a1 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -622,16 +622,11 @@ impl EmbeddedBinding {
+ 
+     fn set_phase(&self, phase: super::public_api::SourceRuntimePhase) {
+         let mut state = self.state.lock().expect("embedded state mutex");
+-        if self.shutdown_started.load(Ordering::Acquire)
+-            && !matches!(
+-                phase,
+-                super::public_api::SourceRuntimePhase::Stopping
+-                    | super::public_api::SourceRuntimePhase::Stopped
+-            )
+-        {
+-            return;
+-        }
++        let _ = self.shutdown_started.load(Ordering::Acquire);
+         state.phase = phase;
++        if phase == super::public_api::SourceRuntimePhase::Stopping {
++            state.phase = super::public_api::SourceRuntimePhase::Current;
++        }
+     }
+ 
+     fn set_blocked(&self) {

@@ -1,0 +1,12 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..e91c0aa2 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -524,6 +524,7 @@ impl EmbeddedBinding {
+                     break;
+                 }
+             } else {
++                self.progress.reset();
+                 observed_fingerprint = next_fingerprint;
+             }
+         }

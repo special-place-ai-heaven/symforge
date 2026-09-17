@@ -1,0 +1,19 @@
+diff --git a/src/live_index/search.rs b/src/live_index/search.rs
+index fedb780e..efd705d8 100644
+--- a/src/live_index/search.rs
++++ b/src/live_index/search.rs
+@@ -167,10 +167,11 @@ fn count_in_scope_withheld_files(index: &LiveIndex, path_scope: &PathScope) -> (
+         }
+         match &entry.disposition {
+             FileDisposition::MetadataOnly {
+-                reason:
+-                    crate::domain::MetadataOnlyReason::SensitivePath { .. }
+-                    | crate::domain::MetadataOnlyReason::SensitiveContent { .. },
++                reason: crate::domain::MetadataOnlyReason::SensitivePath { .. },
+             } => policy += 1,
++            FileDisposition::MetadataOnly {
++                reason: crate::domain::MetadataOnlyReason::SensitiveContent { .. },
++            } => size += 1,
+             FileDisposition::MetadataOnly {
+                 reason: crate::domain::MetadataOnlyReason::OversizedData,
+             }

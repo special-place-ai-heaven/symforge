@@ -1,0 +1,12 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..ba77dade 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -1498,6 +1498,7 @@ impl EmbeddedSourceHandle {
+         let matches = retrieved
+             .hits
+             .into_iter()
++            .filter(|hit| hit.path.ends_with(".md"))
+             .map(|hit| super::public_api::KnowledgeMatch {
+                 path: hit.path,
+                 heading_path: hit.heading_path,

@@ -1178,6 +1178,31 @@ pub(crate) fn append_excluded_knowledge_note(message: String, excluded: usize) -
     )
 }
 
+pub(crate) fn append_withheld_admission_note(
+    message: String,
+    policy: usize,
+    size: usize,
+) -> String {
+    if policy == 0 && size == 0 {
+        return message;
+    }
+    let mut parts = Vec::new();
+    if policy > 0 {
+        let noun = if policy == 1 { "file" } else { "files" };
+        parts.push(format!(
+            "{policy} in-scope {noun} withheld by admission policy"
+        ));
+    }
+    if size > 0 {
+        let noun = if size == 1 { "file" } else { "files" };
+        parts.push(format!("{size} in-scope {noun} over the size threshold"));
+    }
+    format!(
+        "{message}\nThis search did not include {}.",
+        parts.join(" and ")
+    )
+}
+
 pub fn search_text_result_view(
     result: Result<search::TextSearchResult, search::TextSearchError>,
     group_by: Option<&str>,
@@ -1275,7 +1300,11 @@ pub fn search_text_result_view(
                 no_match_suggestions(suggestion_ctx)
             )
         };
-        return append_excluded_knowledge_note(message, result.excluded_knowledge_files);
+        return append_withheld_admission_note(
+            append_excluded_knowledge_note(message, result.excluded_knowledge_files),
+            result.withheld_policy_files,
+            result.withheld_size_files,
+        );
     }
 
     let mut lines = vec![if let Some(confidence) = match_confidence {
@@ -1310,7 +1339,11 @@ pub fn search_text_result_view(
                 lines.push(format!("  {name}"));
             }
         }
-        return lines.join("\n");
+        return append_withheld_admission_note(
+            lines.join("\n"),
+            result.withheld_policy_files,
+            result.withheld_size_files,
+        );
     }
     for file in &result.files {
         lines.push(file.path.clone());
@@ -1450,7 +1483,11 @@ pub fn search_text_result_view(
                 .to_string(),
         );
     }
-    lines.join("\n")
+    append_withheld_admission_note(
+        lines.join("\n"),
+        result.withheld_policy_files,
+        result.withheld_size_files,
+    )
 }
 
 /// Generate a depth-limited source file tree with symbol counts per file and directory.

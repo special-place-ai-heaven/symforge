@@ -1,0 +1,17 @@
+diff --git a/src/live_index/store.rs b/src/live_index/store.rs
+index 779c32f5..ca78ad16 100644
+--- a/src/live_index/store.rs
++++ b/src/live_index/store.rs
+@@ -282,11 +282,7 @@ fn note_reload_discovered(root: &Path, count: u64) {
+     }
+ }
+ 
+-fn note_reload_parsed(root: &Path) {
+-    if let Some(sink) = reload_progress_for(root) {
+-        sink.files_parsed.fetch_add(1, Ordering::AcqRel);
+-    }
+-}
++fn note_reload_parsed(_root: &Path) {}
+ 
+ fn note_reload_symbols(root: &Path, count: u64) {
+     if let Some(sink) = reload_progress_for(root) {

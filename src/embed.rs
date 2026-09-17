@@ -103,9 +103,8 @@ mod contract {
         KnowledgeMatch, KnowledgeSearchRequest, KnowledgeSearchResult, OperationKind,
         OperationReceipt, ProcessIndexRuntime, ReceiptWaitError, RefreshTicket, RetryAdvice,
         ShutdownReceipt, ShutdownReport, SourceCloseReceipt, SourceCloseReport, SourceRefusal,
-        SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch,
-        SymbolSearchRequest, SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult,
-        engine_info,
+        SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch, SymbolSearchRequest,
+        SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult, engine_info,
     };
 
     #[test]
@@ -156,7 +155,24 @@ mod contract {
         let _spec: fn(std::path::PathBuf) -> EmbeddedSourceSpec =
             EmbeddedSourceSpec::current_worktree;
         let _engine_info: fn() -> EngineInfo = engine_info;
-        let _ = (_acquire, _open, _spec, _engine_info);
+        let _census: fn(&EmbeddedSourceHandle) -> Result<Claim<IndexCensus>, SourceRefusal> =
+            EmbeddedSourceHandle::index_census;
+        let _progress: fn(&EmbeddedSourceHandle) -> IndexProgress =
+            EmbeddedSourceHandle::index_progress;
+        let _knowledge: fn(
+            &EmbeddedSourceHandle,
+            &KnowledgeSearchRequest,
+        ) -> Result<Claim<KnowledgeSearchResult>, SourceRefusal> =
+            EmbeddedSourceHandle::search_knowledge;
+        let _ = (
+            _acquire,
+            _open,
+            _spec,
+            _engine_info,
+            _census,
+            _progress,
+            _knowledge,
+        );
 
         // Engine identity is real data, not just a signature.
         let info = crate::embed::engine_info();

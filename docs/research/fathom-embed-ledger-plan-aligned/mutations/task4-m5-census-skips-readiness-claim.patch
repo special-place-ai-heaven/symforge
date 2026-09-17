@@ -1,0 +1,24 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..25be402e 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -660,7 +660,9 @@ impl EmbeddedBinding {
+         normalized_arguments: &[u8],
+     ) -> Result<CurrentEmbedClaim, super::public_api::EmbedSourceRefusal> {
+         let state = self.state.lock().expect("embedded state mutex");
+-        if state.phase != super::public_api::SourceRuntimePhase::Current {
++        if state.phase != super::public_api::SourceRuntimePhase::Current
++            && operation != crate::lifecycle_identity::OperationKind::IndexCensus
++        {
+             let retry = match state.phase {
+                 super::public_api::SourceRuntimePhase::Blocked => {
+                     crate::lifecycle_identity::RetryAdvice::Operator
+@@ -681,7 +683,7 @@ impl EmbeddedBinding {
+         let publication_identity = state
+             .current_publication_identity
+             .clone()
+-            .expect("Current embedded source has a publication identity");
++            .unwrap_or_else(|| "skipped-readiness".to_string());
+         Ok(CurrentEmbedClaim {
+             binding_identity: format!("source-{}", self.identity.raw()),
+             publication_identity,

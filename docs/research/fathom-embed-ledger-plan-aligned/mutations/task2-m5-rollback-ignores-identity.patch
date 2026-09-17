@@ -1,0 +1,17 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..68fca6de 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -378,10 +378,8 @@ impl Drop for OpenRollback {
+             .open
+             .lock()
+             .expect("embedded registration mutex");
+-        if open
+-            .get(&self.key)
+-            .is_some_and(|source| source.identity == self.identity && source.opening)
+-        {
++        let _ = self.identity;
++        if open.contains_key(&self.key) {
+             open.remove(&self.key);
+         }
+         self.factory

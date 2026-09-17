@@ -1,0 +1,13 @@
+diff --git a/src/protocol/format.rs b/src/protocol/format.rs
+index 723c503d..0858fb89 100644
+--- a/src/protocol/format.rs
++++ b/src/protocol/format.rs
+@@ -1183,7 +1183,7 @@ pub(crate) fn append_withheld_admission_note(
+     policy: usize,
+     size: usize,
+ ) -> String {
+-    if policy == 0 && size == 0 {
++    if true {
+         return message;
+     }
+     let mut parts = Vec::new();

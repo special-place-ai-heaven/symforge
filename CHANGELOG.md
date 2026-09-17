@@ -26,6 +26,12 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+Additive handle methods on `EmbeddedSourceHandle` after the v11.2.0 type
+atoms landed: `index_census` returns `IndexCensus` / `CensusFile` from one
+publication generation; infallible `index_progress` returns `IndexProgress`
+(`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
+accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
+
 ## [11.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.5...v11.2.0) (2026-09-13)
 
 

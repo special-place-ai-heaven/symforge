@@ -1,0 +1,13 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..c7cad19a 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -1397,7 +1397,7 @@ impl EmbeddedSourceHandle {
+             .outline
+             .files
+             .iter()
+-            .filter(|file| parsed.contains(&file.relative_path))
++            .filter(|file| parsed.contains(&file.relative_path) && file.symbol_count > 0)
+             .map(|file| super::public_api::CensusFile {
+                 path: file.relative_path.clone(),
+                 language: file.language.name().to_string(),

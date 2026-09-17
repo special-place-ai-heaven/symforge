@@ -2245,11 +2245,116 @@ fn panicking_open_releases_its_process_wide_root_reservation() {
     }));
     assert!(result.is_err(), "the scoped test hook must inject a panic");
 
+    let symforge::domain::RootResolution::Bound(binding) =
+        symforge::discovery::resolve_root_candidate(
+            root.path(),
+            symforge::domain::RootCandidateSource::McpClientRoot,
+            symforge::domain::RootRequestMode::Automatic,
+        )
+    else {
+        panic!("test root must resolve to an embedded binding");
+    };
+    let key = symforge::live_index::index_lifecycle::registry::ProjectKey::new(&binding.root_id.0);
+    assert!(
+        symforge::live_index::index_lifecycle::activation::process_project_registry()
+            .live(&key)
+            .is_err(),
+        "rollback must stop the process admission before a reopen can join it"
+    );
+
     runtime
         .open_embedded_source(EmbeddedSourceSpec::current_worktree(
             root.path().to_path_buf(),
         ))
         .expect("the rollback guard releases the root after a panic");
+}
+
+#[test]
+fn dropping_one_runtime_leaves_another_runtimes_sources_open() {
+    use symforge::live_index::index_lifecycle::public_api::{
+        EmbeddedSourceSpec, ProcessRuntimeApi,
+    };
+
+    let root_a = tempfile::tempdir().expect("root a");
+    let root_b = tempfile::tempdir().expect("root b");
+    let runtime_a = ProcessRuntimeApi::acquire().expect("runtime a admits");
+    let runtime_b = ProcessRuntimeApi::acquire().expect("runtime b admits");
+    let handle_a = runtime_a
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root_a.path().to_path_buf(),
+        ))
+        .expect("runtime a opens its root");
+    let handle_b = runtime_b
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root_b.path().to_path_buf(),
+        ))
+        .expect("runtime b opens its root");
+    assert!(handle_a.is_open());
+    assert!(handle_b.is_open());
+
+    let _ = runtime_a.begin_shutdown();
+    assert!(
+        !handle_a.is_open(),
+        "shutting down one runtime closes only the sources it opened"
+    );
+    assert!(
+        handle_b.is_open(),
+        "the other runtime's source must survive that shutdown"
+    );
+    handle_b.begin_close();
+    runtime_b
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root_b.path().to_path_buf(),
+        ))
+        .expect("the surviving runtime still admits a fresh handle on its root");
+}
+
+#[test]
+fn stale_open_rollback_keeps_a_newer_reservation() {
+    use std::time::Duration;
+    use symforge::live_index::index_lifecycle::embedded::hold_open_after_reserve_for_test;
+    use symforge::live_index::index_lifecycle::public_api::{
+        EmbeddedSourceSpec, ProcessRuntimeApi,
+    };
+
+    let root = tempfile::tempdir().expect("root");
+    let runtime_a = ProcessRuntimeApi::acquire().expect("runtime a admits");
+    let runtime_b = ProcessRuntimeApi::acquire().expect("runtime b admits");
+    let hold = hold_open_after_reserve_for_test(root.path());
+
+    std::thread::scope(|scope| {
+        let opener = scope.spawn(|| {
+            runtime_a.open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+        });
+        assert!(
+            hold.wait_until_entered(Duration::from_secs(5)),
+            "runtime a must park after reserving the root"
+        );
+        let _ = runtime_a.begin_shutdown();
+        let handle_b = runtime_b
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .expect("runtime b reserves the root after a released its reservation");
+        hold.release();
+        assert!(
+            opener.join().expect("opener thread").is_err(),
+            "the stale open must roll back instead of taking the newer reservation"
+        );
+        assert!(
+            handle_b.is_open(),
+            "the newer reservation must survive the stale rollback"
+        );
+        let runtime_c = ProcessRuntimeApi::acquire().expect("runtime c admits");
+        runtime_c
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .expect_err("the newer reservation must still refuse a third open");
+        handle_b.begin_close();
+    });
 }
 
 /// TEST-MUTATION (T058, Slice 4 — C6, observing body): a live ingress

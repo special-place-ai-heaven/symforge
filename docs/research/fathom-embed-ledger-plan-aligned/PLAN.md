@@ -54,6 +54,15 @@ Mode: orchestrated, sequential fallback
 
 ## Current contract inventory
 
+Contract revision: 3 (2026-09-16: owner named already-merged companions so the
+release tag on `main` can stay honest. (5) #695 SnapshotStore restore
+(`src/index_lifecycle/snapshot.rs`, `src/live_index/persist.rs`) and #701
+lock-only version bumps of crates already at v11.2.0 — `reqwest@0.13.5`,
+`rmcp@3.3.0`, `rmcp-macros@3.3.0`, `toml_edit@0.25.15+spec-1.1.0`,
+`toml_parser@1.1.3+spec-1.1.0` — ride as named C3 companions. Cargo.toml
+dependency and patch tables stay unchanged. N5 / leaf-1.2:G13 pass those five
+`--allow-lock` rows and no others.
+
 Contract revision: 2 (2026-09-15: owner chose only the stronger options.
 (1) `OperationKind` gains `IndexCensus` and `SearchKnowledge`; major accepted.
 (2) Close fixture is this checkout, real Loading, G16 as written.
@@ -67,7 +76,7 @@ Revision 1 (2026-09-15): in-flight plan as written; CR-2 and CR-3 in scope;
 |---|---|---|---|---|---|
 | C1 | Branch built on v11.2.0 (b549aa7), cited worker-backed source at version 11.2.0 | leaf-1.1 | leaf-1.1:G1-G4 | ACTIVE | 1 |
 | C2 | Suites measured green at the aligned source (plan Task 1 Step 3) | leaf-1.1 | leaf-1.1:G5-G7 | ACTIVE | 1 |
-| C3 | Only named work rides along: plan Tasks 1-7, Task 3 CI pins, and the 200-character harness companion | leaf-1.1 | leaf-1.1:G8 | ACTIVE | 2 |
+| C3 | Only named work rides along: plan Tasks 1-7, Task 3 CI pins, the 200-character harness companion, #695 SnapshotStore restore, and #701 lock-only version bumps of already-present crates | leaf-1.1 | leaf-1.1:G8 | ACTIVE | 3 |
 | C4 | Second ProcessRuntimeApi on the same root gets SelectionUnavailable | leaf-1.2 | leaf-1.2:G2, G3 | ACTIVE | 1 |
 | C5 | Panic after registration leaks nothing; root reopens | leaf-1.2 | leaf-1.2:G4-G6 | ACTIVE | 1 |
 | C6 | Identity-checked guards: runtime shutdown and open rollback act only on their own identity | leaf-1.2 | leaf-1.2:G7-G10 | ACTIVE | 1 |
@@ -107,7 +116,7 @@ Branch state is exactly one of OPEN, VERIFIED, ABANDONED.
 ## Tree
 
 - 1 Fathom embed alignment release .... GATES.md ................. State: OPEN
-  - 1.1 Task 1 baseline ............... gates/leaf-1.1.md ........ Needs: - .................... State: READY
+  - 1.1 Task 1 baseline ............... gates/leaf-1.1.md ........ Needs: - .................... State: IN-FLIGHT
   - 1.2 Task 2 CR-0 ownership ......... gates/leaf-1.2.md ........ Needs: 1.1 .................. State: WAITING
   - 1.3 Task 3 CR-1 cooperative close . gates/leaf-1.3.md ........ Needs: 1.2 .................. State: WAITING
   - 1.4 Task 4 CR-2 census ............ gates/leaf-1.4.md ........ Needs: 1.3 .................. State: WAITING

@@ -1,0 +1,12 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..96927551 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -564,6 +564,7 @@ impl EmbeddedBinding {
+             if self.shutdown_started.load(Ordering::Acquire)
+                 || crate::live_index::store::reload_was_cancelled(&error)
+             {
++                self.progress.reset();
+                 return None;
+             }
+             self.set_blocked();

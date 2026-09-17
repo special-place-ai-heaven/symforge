@@ -5,7 +5,7 @@
   "source_contract": {
     "path": "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
     "schema_version": 1,
-    "sha256": "576dffe38b047499effb77bb7d98aceb56c9aae2941bf4013ec2efb25b16755e"
+    "sha256": "a6e9895f89c41534655d52216ce9cda293b24c1dcdacd5a09b4c9422a62d726a"
   },
   "coverage": {
     "supported_cells": 26,

@@ -1,0 +1,21 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..3f54a96a 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -1371,15 +1371,7 @@ impl EmbeddedSourceHandle {
+             crate::lifecycle_identity::OperationKind::IndexCensus,
+             normalized,
+         )?;
+-        let index = binding.runtime.acquire().map_err(|_| {
+-            super::public_api::bound_source_refusal(
+-                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+-                crate::lifecycle_identity::OperationKind::IndexCensus,
+-                crate::lifecycle_identity::RetryAdvice::Never,
+-                normalized,
+-            )
+-        })?;
+-        let generation = index.published_generation();
++        let generation = binding.runtime.data_plane().published_generation();
+         let parsed: std::collections::BTreeSet<String> = generation
+             .live
+             .all_files()

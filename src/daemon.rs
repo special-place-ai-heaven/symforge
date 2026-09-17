@@ -11970,6 +11970,8 @@ mod tests {
                 suppressed_by_noise: 0,
                 overflow_count: 0,
                 excluded_knowledge_files: excluded,
+                withheld_policy_files: 0,
+                withheld_size_files: 0,
             }
         }
 

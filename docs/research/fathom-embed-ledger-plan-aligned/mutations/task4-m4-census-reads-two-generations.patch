@@ -1,0 +1,12 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..7225f01d 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -1393,6 +1393,7 @@ impl EmbeddedSourceHandle {
+             .map(|(path, _)| path.clone())
+             .collect();
+         crate::live_index::store::pause_census_after_first_read_for_test(&binding.root);
++        let generation = index.published_generation();
+         let files: Vec<super::public_api::CensusFile> = generation
+             .outline
+             .files

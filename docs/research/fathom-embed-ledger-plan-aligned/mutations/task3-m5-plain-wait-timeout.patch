@@ -1,0 +1,15 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..e5c30c80 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -492,9 +492,7 @@ impl EmbeddedBinding {
+             let mut control = self.control.lock().expect("embedded control mutex");
+             let (next, _) = self
+                 .wake
+-                .wait_timeout_while(control, EMBED_OBSERVER_POLL, |control| {
+-                    !control.stop && !control.refresh_requested
+-                })
++                .wait_timeout(control, EMBED_OBSERVER_POLL)
+                 .expect("embedded control mutex");
+             control = next;
+             if control.stop {

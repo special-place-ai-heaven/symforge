@@ -1,0 +1,35 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..2db72c19 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -985,11 +985,14 @@ impl EmbeddedSourceFactory {
+     }
+ 
+     pub(crate) fn shutdown_owner(&self, owner: EmbeddedIdentity) -> EmbeddedShutdownReport {
++        let _ = owner;
+         let closing: Vec<(ProjectKey, Option<Arc<EmbeddedBinding>>)> = {
+             let open = self.open.lock().expect("embedded registration mutex");
+             open.iter()
+-                .filter(|(_, source)| source.owner == Some(owner))
+-                .map(|(key, source)| (key.clone(), source.binding.clone()))
++                .map(|(key, source)| {
++                    let _ = source.owner;
++                    (key.clone(), source.binding.clone())
++                })
+                 .collect()
+         };
+         let mut closed_sources = 0u64;
+@@ -1004,12 +1007,7 @@ impl EmbeddedSourceFactory {
+         }
+         let mut open = self.open.lock().expect("embedded registration mutex");
+         for (key, _) in &closing {
+-            if open
+-                .get(key)
+-                .is_some_and(|source| source.owner == Some(owner))
+-            {
+-                open.remove(key);
+-            }
++            open.remove(key);
+         }
+         self.shutdown.store(open.is_empty(), Ordering::Release);
+         EmbeddedShutdownReport {

@@ -1,0 +1,47 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..d0ee03b3 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -560,36 +560,14 @@ impl EmbeddedBinding {
+                 exclusions,
+                 &self.shutdown_started,
+             );
+-        if let Err(error) = result {
+-            if self.shutdown_started.load(Ordering::Acquire)
+-                || crate::live_index::store::reload_was_cancelled(&error)
+-            {
+-                return None;
+-            }
+-            self.set_blocked();
+-            return None;
+-        }
+-
+-        if self.shutdown_started.load(Ordering::Acquire) {
+-            return None;
+-        }
+-
+-        let Some(fingerprint) = self.observe_fingerprint() else {
+-            if self.shutdown_started.load(Ordering::Acquire) {
+-                return None;
+-            }
+-            self.set_blocked();
+-            return None;
+-        };
++        let _ = result;
++        let fingerprint = self
++            .observe_fingerprint()
++            .unwrap_or_else(|| "cancelled-reload".to_string());
+         let published = self.runtime.data_plane().published_generation();
+-        if !matches!(published.freshness.as_ref(), FreshnessStatus::Current) {
+-            self.set_blocked();
+-            return Some(fingerprint);
+-        }
++        let _ = matches!(published.freshness.as_ref(), FreshnessStatus::Current);
+         let mut state = self.state.lock().expect("embedded state mutex");
+-        if self.shutdown_started.load(Ordering::Acquire) {
+-            return None;
+-        }
++        let _ = self.shutdown_started.load(Ordering::Acquire);
+         state.source_version = state.source_version.saturating_add(1).max(1);
+         state.current_publication_identity = Some(format!(
+             "embed-publication-{}-{}",

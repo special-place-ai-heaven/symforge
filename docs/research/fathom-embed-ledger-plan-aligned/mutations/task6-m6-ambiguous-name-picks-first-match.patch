@@ -1,0 +1,27 @@
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 7d6aa1c5..ae780641 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -2052,7 +2052,6 @@ impl DaemonState {
+                     }
+                     candidates.sort();
+                     match matches.len() {
+-                        1 => matches.remove(0),
+                         0 => {
+                             return Err(format!(
+                                 "project '{selector}' is not open in this session. Open \
+@@ -2060,13 +2059,7 @@ impl DaemonState {
+                                 candidates.join(", ")
+                             ));
+                         }
+-                        _ => {
+-                            return Err(format!(
+-                                "project selector '{selector}' is ambiguous among open \
+-                                 projects: [{}]. Use the project id.",
+-                                candidates.join(", ")
+-                            ));
+-                        }
++                        _ => matches.remove(0),
+                     }
+                 }
+             }

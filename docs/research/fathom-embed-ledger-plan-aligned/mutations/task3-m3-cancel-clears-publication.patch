@@ -1,0 +1,14 @@
+diff --git a/src/index_lifecycle/embedded.rs b/src/index_lifecycle/embedded.rs
+index 430226d4..94371afa 100644
+--- a/src/index_lifecycle/embedded.rs
++++ b/src/index_lifecycle/embedded.rs
+@@ -632,6 +632,9 @@ impl EmbeddedBinding {
+             return;
+         }
+         state.phase = phase;
++        if phase == super::public_api::SourceRuntimePhase::Stopped {
++            state.current_publication_identity = None;
++        }
+     }
+ 
+     fn set_blocked(&self) {

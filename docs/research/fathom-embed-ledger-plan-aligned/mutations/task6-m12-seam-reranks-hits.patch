@@ -1,0 +1,12 @@
+diff --git a/src/live_index/knowledge_retrieve.rs b/src/live_index/knowledge_retrieve.rs
+index 6ea47dee..af8d597a 100644
+--- a/src/live_index/knowledge_retrieve.rs
++++ b/src/live_index/knowledge_retrieve.rs
+@@ -660,6 +660,7 @@ fn compose(lanes: Vec<LaneHits>, request: &KnowledgeRetrieveRequest) -> Knowledg
+     }
+ 
+     hits.sort_by(rank_hits);
++    hits.reverse();
+     let overflow = hits.len().saturating_sub(request.limit);
+     hits.truncate(request.limit);
+     let truncated = overflow > 0;

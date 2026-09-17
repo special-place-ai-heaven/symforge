@@ -1,0 +1,16 @@
+diff --git a/src/discovery/mod.rs b/src/discovery/mod.rs
+index a7affc21..41b71fe8 100644
+--- a/src/discovery/mod.rs
++++ b/src/discovery/mod.rs
+@@ -3,10 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use anyhow::Result;
+ 
+-fn check_scout_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
+-    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+-        anyhow::bail!("embedded reload cancelled during scout");
+-    }
++fn check_scout_cancelled(_cancel: Option<&AtomicBool>) -> Result<()> {
+     Ok(())
+ }
+ 
