@@ -1347,6 +1347,70 @@
               "unsafe": false,
               "where_predicates": []
             },
+            "id": "method:EmbeddedSourceHandle:index_census",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "index_census",
+            "output": {
+              "arguments": [
+                {
+                  "arguments": [
+                    {
+                      "id": "type:embed:IndexCensus",
+                      "kind": "api"
+                    }
+                  ],
+                  "kind": "generic",
+                  "path": "symforge::embed::Claim"
+                },
+                {
+                  "id": "type:embed:SourceRefusal",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceHandle:index_progress",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              }
+            ],
+            "name": "index_progress",
+            "output": {
+              "id": "type:embed:IndexProgress",
+              "kind": "api"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
             "id": "method:EmbeddedSourceHandle:request_refresh",
             "inputs": [
               {
@@ -1392,6 +1456,58 @@
             "output": {
               "id": "type:embed:SourceRuntimeView",
               "kind": "api"
+            }
+          },
+          {
+            "effective_signature": {
+              "abi": "Rust",
+              "async": false,
+              "availability": "inherited_from_owning_export",
+              "cfg": "inherited_from_owning_export",
+              "const": false,
+              "generics": [],
+              "unsafe": false,
+              "where_predicates": []
+            },
+            "id": "method:EmbeddedSourceHandle:search_knowledge",
+            "inputs": [
+              {
+                "kind": "receiver",
+                "mode": "shared-reference"
+              },
+              {
+                "name": "request",
+                "type": {
+                  "kind": "reference",
+                  "lifetime": "elided",
+                  "mutable": false,
+                  "target": {
+                    "id": "type:embed:KnowledgeSearchRequest",
+                    "kind": "api"
+                  }
+                }
+              }
+            ],
+            "name": "search_knowledge",
+            "output": {
+              "arguments": [
+                {
+                  "arguments": [
+                    {
+                      "id": "type:embed:KnowledgeSearchResult",
+                      "kind": "api"
+                    }
+                  ],
+                  "kind": "generic",
+                  "path": "symforge::embed::Claim"
+                },
+                {
+                  "id": "type:embed:SourceRefusal",
+                  "kind": "api"
+                }
+              ],
+              "kind": "generic",
+              "path": "core::result::Result"
             }
           },
           {
