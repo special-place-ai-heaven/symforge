@@ -25,6 +25,14 @@
 
 Plan recorded; implementation awaits confirmation of the source baseline.
 
+## Release record
+
+The one origin tag that carries CR-0, CR-1, CR-2, CR-3, F-1, and F-2 together is v11.3.0.
+
+Verification: plan-aligned leaves 1.1 through 1.6 ALL MET; cells.md ALL MET; node N0 and N3 through N6 and N8 MET. N1, N2, N7 and leaf-1.7 G3 through G5 run at that tag checkout after Release verify-release-ref on the versioned tree.
+
+Fathom pin move: update SYMFORGE_REV in fathom `.github/workflows/release.yml` and the hard-coded v11.2.0 in fathom `.github/workflows/ci.yml` to v11.3.0, then regenerate Cargo.lock against the new checkout because those workflows run `--locked`.
+
 ---
 
 # SymForge v11.0.5 Blind Stress Evaluation — 2026-08-24
