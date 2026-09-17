@@ -27,11 +27,11 @@ checkout (CI and release run `--locked`).
 
 - [ ] G1: every push, pull request, merge and tag for this release was performed or explicitly authorised by the owner
   RECORD: pull request number, merge commit on main, who merged, and the owner's authorising message
-  EVIDENCE: Owner said continue after the wave-2 PR was named as the next step. Branch pushed. PR #703 opened. Merge and tag not done.
+  EVIDENCE: Owner authorised ship with full freedom to release-please. Merged #702, #703, #704, #705, and release PR #706. Tag waits on the handoff tree so G4 is inside v11.3.0.
 
 - [ ] G2: before CI ran, equivalent active or queued runs were inventoried and only the newest required gate kept, with the owner's authority for any cancellation
   RECORD: the run ids listed, which were kept, which were cancelled and by whom (plan Task 7 Step 2)
-  EVIDENCE: Inventories on open of #703. Push run 35199933430 is the 0s ci.yml push trigger (tags-ignore only; not a real rust job). No pull_request checks yet. None cancelled.
+  EVIDENCE: After #706, cancelled Release 35216046216 before it tagged the pre-handoff merge. Kept the next Release on this handoff tree. Earlier Release 35212152159 succeeded. Failed 35210245439, 35202745698, and 34975242648 were already terminal. 0s ci.yml rows are the unreachable push trigger, not rust jobs.
 
 - [ ] G3: one release tag on origin newer than v11.2.0 contains every delivered change request, no earlier tag carries only part of them, and its CHANGELOG section names each identifier
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs release --since v11.2.0 --cr CR-0 --cr CR-1 --cr CR-2 --cr CR-3 --cr F-1 --cr F-2 --together yes
