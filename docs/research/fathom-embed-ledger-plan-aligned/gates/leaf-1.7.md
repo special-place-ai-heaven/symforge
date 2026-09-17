@@ -20,18 +20,18 @@ results; and the embedder pin move for Fathom: update `SYMFORGE_REV` in
 `fathom: .github/workflows/ci.yml`, then regenerate `Cargo.lock` against the new
 checkout (CI and release run `--locked`).
 
-- [ ] G0: this ledger states outcomes that can fail
+- [x] G0: this ledger states outcomes that can fail
   CHECK: node C:/Users/rakovnik/.claude/skills/unlazy/scripts/gate-lint.mjs docs/research/fathom-embed-ledger-plan-aligned/gates/leaf-1.7.md
   EXPECT: LINT OK
-  EVIDENCE: pending
+  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=E:\project\symforge\.worktrees\embed-wave2; path=23da3f8cdc81/97 entries; EXPECT=matched; output-sha256=80b9d2928177c1d5e6700ca04d93af7c05aef3461123e450dd44e8f615b2e120; output-bytes=442
 
 - [ ] G1: every push, pull request, merge and tag for this release was performed or explicitly authorised by the owner
   RECORD: pull request number, merge commit on main, who merged, and the owner's authorising message
-  EVIDENCE: pending
+  EVIDENCE: Owner said continue after the wave-2 PR was named as the next step. Branch pushed. PR #703 opened. Merge and tag not done.
 
 - [ ] G2: before CI ran, equivalent active or queued runs were inventoried and only the newest required gate kept, with the owner's authority for any cancellation
   RECORD: the run ids listed, which were kept, which were cancelled and by whom (plan Task 7 Step 2)
-  EVIDENCE: pending
+  EVIDENCE: Inventories on open of #703. Push run 35199933430 is the 0s ci.yml push trigger (tags-ignore only; not a real rust job). No pull_request checks yet. None cancelled.
 
 - [ ] G3: one release tag on origin newer than v11.2.0 contains every delivered change request, no earlier tag carries only part of them, and its CHANGELOG section names each identifier
   CHECK: node docs/research/fathom-embed-ledger-plan-aligned/oracles/ledger-oracle.mjs release --since v11.2.0 --cr CR-0 --cr CR-1 --cr CR-2 --cr CR-3 --cr F-1 --cr F-2 --together yes
