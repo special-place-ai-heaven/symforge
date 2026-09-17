@@ -2045,7 +2045,7 @@ class RefreezeV11Tests(unittest.TestCase):
     def test_verify_internal_rejects_deeply_nested_dangling_api_type_id(self) -> None:
         fixture = RefreezeFixture()
         api = deepcopy(fixture.api)
-        api["expected_graph"]["impls"][3]["associated_items"][3]["output"][
+        api["expected_graph"]["impls"][3]["associated_items"][6]["output"][
             "arguments"
         ][0]["arguments"][0]["id"] = "type:embed:DefinitelyMissing"
         target = fixture.replace_public_api(api)
@@ -2059,7 +2059,7 @@ class RefreezeV11Tests(unittest.TestCase):
     def test_verify_internal_rejects_type_ast_discriminator_shape_swap(self) -> None:
         fixture = RefreezeFixture()
         api = deepcopy(fixture.api)
-        api["expected_graph"]["impls"][3]["associated_items"][3]["output"][
+        api["expected_graph"]["impls"][3]["associated_items"][6]["output"][
             "arguments"
         ][0]["arguments"][0]["kind"] = "path"
         target = fixture.replace_public_api(api)
@@ -2224,7 +2224,7 @@ class RefreezeV11Tests(unittest.TestCase):
     ) -> None:
         fixture = RefreezeFixture()
         api = deepcopy(fixture.api)
-        api["expected_graph"]["impls"][3]["associated_items"][3]["output"][
+        api["expected_graph"]["impls"][3]["associated_items"][6]["output"][
             "arguments"
         ][0]["path"] = "symforge::embed::AtomicAuthority"
         target = fixture.replace_public_api(api)
@@ -2317,7 +2317,7 @@ class RefreezeV11Tests(unittest.TestCase):
     def test_verify_internal_rejects_local_value_encoded_as_generic_type(self) -> None:
         fixture = RefreezeFixture()
         api = deepcopy(fixture.api)
-        api["expected_graph"]["impls"][3]["associated_items"][3]["output"][
+        api["expected_graph"]["impls"][3]["associated_items"][6]["output"][
             "arguments"
         ][0]["path"] = "symforge::server_api::run"
         target = fixture.replace_public_api(api)
@@ -2336,7 +2336,7 @@ class RefreezeV11Tests(unittest.TestCase):
             with self.subTest(local_root=local_root):
                 fixture = RefreezeFixture()
                 api = deepcopy(fixture.api)
-                api["expected_graph"]["impls"][3]["associated_items"][3][
+                api["expected_graph"]["impls"][3]["associated_items"][6][
                     "output"
                 ]["arguments"][0]["path"] = f"{local_root}::embed::Claim"
                 target = fixture.replace_public_api(api)
