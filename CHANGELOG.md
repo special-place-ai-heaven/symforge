@@ -32,6 +32,21 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.2.0...v11.3.0) (2026-09-17)
+
+
+### Features
+
+* **embed:** add sole-owner close, census types, and knowledge retrieval seam ([#702](https://github.com/special-place-ai-heaven/symforge/issues/702)) ([2027a8b](https://github.com/special-place-ai-heaven/symforge/commit/2027a8b5ea0965ec0955874e7c44a7dbdba9bb89))
+* **embed:** process-wide ownership, cooperative close, census, progress and honest search scope (CR-0, CR-1, CR-2, CR-3, F-1, F-2) ([#703](https://github.com/special-place-ai-heaven/symforge/issues/703)) ([8b1c8b4](https://github.com/special-place-ai-heaven/symforge/commit/8b1c8b409f3653cfef1906231c51a7fd29ee9b6e))
+
+
+### Bug Fixes
+
+* **embed:** pin export-delta hash to the [#704](https://github.com/special-place-ai-heaven/symforge/issues/704) contract ([#705](https://github.com/special-place-ai-heaven/symforge/issues/705)) ([bc3cba5](https://github.com/special-place-ai-heaven/symforge/commit/bc3cba57ea250eda11547f8f4925a3e5f786835d))
+* **embed:** record census, progress, and knowledge methods on the handle impl ([#704](https://github.com/special-place-ai-heaven/symforge/issues/704)) ([c14d6f3](https://github.com/special-place-ai-heaven/symforge/commit/c14d6f301a620fbd22ab4d96e12f5ba438b5e53a))
+* **lifecycle:** wire SnapshotStore into the snapshot restore path ([#695](https://github.com/special-place-ai-heaven/symforge/issues/695)) ([6f53ca1](https://github.com/special-place-ai-heaven/symforge/commit/6f53ca10c60b4e601e82d8350921831f465a6e0f))
+
 ## [11.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.1.5...v11.2.0) (2026-09-13)
 
 
