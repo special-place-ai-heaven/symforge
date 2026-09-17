@@ -1,6 +1,6 @@
 {
   "computed_as": "introduced_v11_atoms listed verbatim; introduced_minus_live is that list with every atom that already appears verbatim in the live pub-mod census of src/lib.rs subtracted",
-  "contract_sha256": "a6e9895f89c41534655d52216ce9cda293b24c1dcdacd5a09b4c9422a62d726a",
+  "contract_sha256": "a3d2fb4fabe932e988a195ec9c8736876a891f09f01ed580e4eee4e42793b0a2",
   "forbidden_at_activation": [
     {
       "citizen": "symforge::protocol::format::claim_provenance",
