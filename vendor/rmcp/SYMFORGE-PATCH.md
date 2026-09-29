@@ -2,7 +2,7 @@
 
 This directory is the crates.io `rmcp` 3.5.0 package, copied verbatim (minus
 cargo's `.cargo-ok` marker) and wired in through `[patch.crates-io]` in the
-root `Cargo.toml`. Exactly two files differ from upstream; the full diff is
+root `Cargo.toml`. Exactly three files differ from upstream; the full diff is
 below. Nothing else in this directory may be edited.
 
 ## What and why
@@ -27,6 +27,13 @@ below. Nothing else in this directory may be edited.
    version, mirroring the pre-init path. It is done in the dispatch arm,
    not the default `initialize`, so a server overriding `initialize` is
    covered too.
+3. **`build.rs` neutered.** Upstream's build script runs
+   `git config core.hooksPath .githooks` on the directory two levels above
+   the crate whenever it holds `.githooks/` and `.git`. For this vendored
+   copy that is the symforge repo root, and in a worktree `.git` is a file,
+   so the guard does not tell a dependency build from rmcp's own workspace.
+   A dependency must not rewrite its host repo's git config, so `main` is
+   empty. The script emitted no cargo directives, so nothing else changes.
 
 Acceptance: `tests/protocol_lifecycle_matrix.rs` (54 rows). Unpatched
 3.5.0 fails 16 rows, all discover-then-initialize.
@@ -36,7 +43,8 @@ Acceptance: `tests/protocol_lifecycle_matrix.rs` (54 rows). Unpatched
 1. If upstream fixed both bugs (replay the matrix test without the patch),
    delete this directory and the `rmcp` line under `[patch.crates-io]`.
 2. Otherwise copy the new crate here, re-apply the diff below, update the
-   version in this file, and run the matrix test.
+   version in this file, and run the matrix test. Keep `build.rs` empty
+   unless upstream's script has gained real build work.
 
 Upstream: modelcontextprotocol/rust-sdk. Issue not yet filed at the time of
 writing; a draft exists with the replay steps.
@@ -47,15 +55,41 @@ writing; a draft exists with the replay steps.
   (`cargo install symforge`). That path keeps both bugs until upstream ships
   a fix. The npm and GitHub release binaries are built from this tree and
   carry the patch.
-- `build.rs` runs `git config core.hooksPath .githooks` on the directory two
-  levels up when it holds both `.githooks/` and `.git`. For this vendored
-  copy that is the symforge repo root, which has no `.githooks/` today, so it
-  is a no-op. Adding a root `.githooks/` would make every build rewrite the
-  repo's hooks path.
 
 ## Diff against crates.io rmcp 3.5.0
 
 ```diff
+--- a/build.rs
++++ b/build.rs
+@@ -1,23 +1,5 @@
+-// Install git hooks on build
+-fn main() {
+-    // Only run in the workspace root (not when building as a dependency)
+-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+-    let workspace_root = std::path::Path::new(&manifest_dir)
+-        .parent()
+-        .and_then(|p| p.parent());
+-
+-    if let Some(root) = workspace_root {
+-        let githooks_dir = root.join(".githooks");
+-        let git_dir = root.join(".git");
+-
+-        // Only configure if we're in the actual workspace (not a dependency)
+-        // and git directory exists
+-        if githooks_dir.exists() && git_dir.exists() {
+-            // Configure git to use our hooks directory
+-            let _ = std::process::Command::new("git")
+-                .args(["config", "core.hooksPath", ".githooks"])
+-                .current_dir(root)
+-                .output();
+-        }
+-    }
+-}
++// SYMFORGE-PATCH: upstream's build script ran `git config core.hooksPath .githooks`
++// on the directory two levels up, which for this vendored copy is the symforge
++// repo root. A dependency must not rewrite its host repo's git config, so the
++// script is a no-op here. It emitted no cargo directives, so nothing else changes.
++fn main() {}
 --- a/src/service.rs
 +++ b/src/service.rs
 @@ -1045,6 +1045,13 @@

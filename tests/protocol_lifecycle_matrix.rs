@@ -31,6 +31,9 @@ const CI: &str = "io.modelcontextprotocol/clientInfo";
 const METHODS: [&str; 4] = ["tools/list", "resources/list", "prompts/list", "ping"];
 const INIT_VERSIONS: [&str; 4] = ["2024-11-05", "2025-06-18", "2025-11-25", "2026-07-28"];
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// JSON-RPC invalid params carrying rmcp's missing-metadata message.
+const MISSING_META: &str = "ERR -32602 request _meta is missing";
+const METHOD_NOT_FOUND: &str = "ERR -32601";
 
 fn full_modern() -> Value {
     json!({ PV: "2026-07-28", CC: {}, CI: { "name": "matrix", "version": "1" } })
@@ -55,20 +58,31 @@ fn metas() -> Vec<(&'static str, Option<Value>)> {
 ///   is required;
 /// - a discover-only session demands version + capabilities on every request;
 /// - `ping` exists only on the legacy lifecycle.
+///
+/// Returned values are prefixes of [`Session::call`] outcomes, so an ERR cell
+/// pins the JSON-RPC code and, for missing metadata, the message.
 fn expected(lifecycle: &str, meta: &str, method: &str) -> &'static str {
     let inline_request =
         lifecycle == "discover_only" || matches!(meta, "pv_modern" | "full_modern");
-    if method == "ping" {
-        return if inline_request { "ERR" } else { "OK" };
+    let complete_meta = matches!(meta, "full_modern" | "full_legacy");
+    if inline_request && !complete_meta {
+        return MISSING_META;
     }
-    if lifecycle == "discover_only" {
-        return if matches!(meta, "full_modern" | "full_legacy") {
-            "OK"
-        } else {
-            "ERR"
-        };
+    if method == "ping" && inline_request {
+        return METHOD_NOT_FOUND;
     }
-    if meta == "pv_modern" { "ERR" } else { "OK" }
+    "OK"
+}
+
+/// `initialize` echoes a version that has the handshake; 2026-07-28 has none,
+/// so it negotiates down to the newest one that does.
+fn expected_init(requested: &str) -> String {
+    let negotiated = if requested == "2026-07-28" {
+        "2025-11-25"
+    } else {
+        requested
+    };
+    format!("OK pv={negotiated}")
 }
 
 struct Session {
@@ -121,7 +135,7 @@ impl Session {
             && self.stdin.flush().is_ok()
     }
 
-    /// One-line outcome: `OK ...`, `ERR <message>`, `TIMEOUT`, or `DEAD`.
+    /// One-line outcome: `OK ...`, `ERR <code> <message>`, `TIMEOUT`, or `DEAD`.
     fn call(&mut self, method: &str, params: Value) -> String {
         let id = self.next_id;
         self.next_id += 1;
@@ -147,7 +161,8 @@ impl Session {
             }
             if let Some(error) = message.get("error") {
                 return format!(
-                    "ERR {}",
+                    "ERR {} {}",
+                    error.get("code").and_then(Value::as_i64).unwrap_or(0),
                     error.get("message").and_then(Value::as_str).unwrap_or("")
                 );
             }
@@ -187,9 +202,14 @@ fn lifecycle_and_request_meta_matrix_matches_contract() {
                 rows += 1;
                 let mut session = Session::spawn(&repo, &home);
                 let mut steps = Vec::new();
+                // A failed step must turn the row red: otherwise a broken
+                // discover makes discover_then_init rows silently behave like
+                // init rows and pass.
+                let mut steps_ok = true;
                 if lifecycle.starts_with("discover") {
                     let outcome =
                         session.call("server/discover", json!({ "_meta": full_modern() }));
+                    steps_ok &= outcome.starts_with("OK");
                     steps.push(format!("discover:{outcome}"));
                 }
                 if lifecycle != "discover_only" {
@@ -201,6 +221,7 @@ fn lifecycle_and_request_meta_matrix_matches_contract() {
                             "clientInfo": { "name": "matrix", "version": "1" }
                         }),
                     );
+                    steps_ok &= outcome == expected_init(init_version);
                     steps.push(format!("init:{outcome}"));
                     session
                         .send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
@@ -212,9 +233,10 @@ fn lifecycle_and_request_meta_matrix_matches_contract() {
                     .iter()
                     .map(|method| session.call(method, params.clone()))
                     .collect();
-                let row_red = METHODS.iter().zip(&got).any(|(method, outcome)| {
-                    !outcome.starts_with(expected(lifecycle, meta_name, method))
-                });
+                let row_red = !steps_ok
+                    || METHODS.iter().zip(&got).any(|(method, outcome)| {
+                        !outcome.starts_with(expected(lifecycle, meta_name, method))
+                    });
                 if row_red {
                     red.push(format!(
                         "{lifecycle} init={init_version} meta={meta_name} [{}] -> {}",
