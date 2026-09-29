@@ -581,6 +581,7 @@ pub struct SourceResponseEnvelope {
 pub enum RootCandidateSource {
     WorkspaceEnvironment,
     McpClientRoot,
+    ClaudeProjectDir,
     GitAncestor,
     LaunchCwd,
     ExplicitIndexFolder,
