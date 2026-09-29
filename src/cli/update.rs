@@ -1,36 +1,55 @@
 //! Explicit npm-managed self-update command.
 //!
-//! Beyond shelling `npm install -g symforge@latest`, this orchestrates a complete
-//! update so the user is never left with a half-updated mix of versions:
-//!  1. stops the running daemon before the swap (a live daemon holds the old
-//!     binary — a Windows file-lock — and keeps serving stale behavior) and clears
-//!     a demonstrably-dead sidecar record;
-//!  2. forces the OS-native platform package (`symforge-<os>-<arch>`) to the same
-//!     version, because `npm install -g symforge@latest` alone can retain a stale
-//!     nested platform package and leave `symforge --version` behind the wrapper;
-//!  3. VERIFIES the resolved `symforge --version` reached the latest published
+//! `symforge update` must be safe to run while MCP harness sessions are open,
+//! so it never terminates a stdio server and never lets npm write the path the
+//! harnesses spawn. It orchestrates:
+//!  1. a short circuit: when the binary at the install path already reports the
+//!     latest published version the swap is skipped (verification still runs);
+//!  2. a STAGED install: npm installs the new wrapper + OS-native platform
+//!     package (`symforge-<os>-<arch>`) into a staging prefix beside the live
+//!     install, and the staged binary must report the latest version before the
+//!     live tree is touched;
+//!  3. the swap: each staged file is renamed over its live counterpart. A
+//!     running Windows image refuses replacement but allows a rename, so there
+//!     the old binary is moved aside and the new one follows immediately. Live
+//!     sessions keep executing from the moved file (Unix keeps the old inode);
+//!  4. VERIFIES the resolved `symforge --version` reached the latest published
 //!     version — and FAILS LOUDLY (stale nested package, a PATH-shadowing install,
 //!     or a WSL Windows-prefix bleed) instead of a hollow success, even when the
 //!     npm registry is unreachable (it floors against the running binary's version
 //!     and surfaces a launcher that ran but could not resolve a binary);
-//!  4. re-registers every MCP client onto the freshly-installed binary; and
-//!  5. only AFTER a confirmed re-registration, clears the retired `~/.symforge/bin`
-//!     durable-install leftovers and prunes dead version-registry entries.
+//!  5. stops ONLY the daemon, right before the swap, and starts it again after it
+//!     through the stdio client's own spawn path so the next session finds it warm,
+//!     then replays a harness `initialize` against the new binary and fails loudly
+//!     if it does not answer;
+//!  6. re-registers ONLY the harnesses that already carry a SymForge entry,
+//!     running the new binary's `init` from the home directory, never the
+//!     caller's cwd; and
+//!  7. only AFTER a confirmed re-registration, clears the retired `~/.symforge/bin`
+//!     durable-install leftovers. Dead version-registry entries are pruned first.
 
 use anyhow::{Context, bail};
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState, HarnessStatus};
 use crate::domain::ControlStateDir;
 
-/// Hard ceiling on the npm swap so a locked-file retry can NEVER hang the
-/// terminal (the original Windows failure). Layer 2 (staging the running binary
-/// aside) normally frees npm's target path so the install finishes in seconds;
-/// this is the safety floor for when it does not. A plain const, not config: it
-/// only needs to be "longer than a healthy install, shorter than human patience".
+/// Hard ceiling on the staging `npm install` so a hung registry fetch can NEVER
+/// hang the terminal. The live install is untouched while it runs. A plain
+/// const, not config: it only needs to be "longer than a healthy install,
+/// shorter than human patience".
 const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 /// Poll cadence while waiting on the npm child.
 const NPM_INSTALL_POLL: Duration = Duration::from_millis(200);
+/// How long the new binary gets to answer a replayed harness `initialize`.
+const INITIALIZE_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The first request every MCP harness sends. It names a protocol revision
+/// every SymForge release still serves, so the replay does not depend on the
+/// newest one.
+const INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"symforge-update-verify","version":"1"}}}"#;
 
 /// Map `(os, arch)` to the npm platform package that ships the native binary.
 /// Mirrors `SUPPORTED_TARGETS` in `npm/lib/resolve-binary.js`. `os` is
@@ -59,7 +78,7 @@ fn symforge_launcher() -> &'static str {
     }
 }
 
-/// Build the `npm install -g` package specs. Always installs the `symforge`
+/// Build the `npm install` package specs. Always installs the `symforge`
 /// wrapper at `@latest`; when the OS/arch is known, also names the platform
 /// package explicitly so npm materializes the new nested binary instead of
 /// silently reusing a stale one.
@@ -69,6 +88,55 @@ fn install_specs(os: &str, arch: &str) -> Vec<String> {
         specs.push(format!("{pkg}@latest"));
     }
     specs
+}
+
+/// Arguments for the staging install. It is a LOCAL install rooted at
+/// `staging` (not `-g`), so the layout is `<staging>/node_modules/<pkg>` on
+/// every OS and the live global tree is never written by npm.
+fn staging_install_args(staging: &Path, specs: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "install".to_string(),
+        "--prefix".to_string(),
+        staging.display().to_string(),
+        "--no-save".to_string(),
+    ];
+    args.extend(specs.iter().cloned());
+    args
+}
+
+/// File name of the native binary inside a platform package.
+fn native_binary_name(os: &str) -> &'static str {
+    if os == "windows" {
+        "symforge.exe"
+    } else {
+        "symforge"
+    }
+}
+
+/// Where npm keeps GLOBAL packages under `prefix`: `<prefix>/node_modules` on
+/// Windows, `<prefix>/lib/node_modules` elsewhere.
+fn global_modules_dir(prefix: &Path, os: &str) -> PathBuf {
+    if os == "windows" {
+        prefix.join("node_modules")
+    } else {
+        prefix.join("lib").join("node_modules")
+    }
+}
+
+/// The native binary inside `<modules>/<platform package>` — for the live
+/// tree, the exact path `symforge init` registers with every harness.
+fn native_binary_in(modules: &Path, platform_package: &str, os: &str) -> PathBuf {
+    modules
+        .join(platform_package)
+        .join("bin")
+        .join(native_binary_name(os))
+}
+
+/// Scratch prefix the new packages install into before the swap: a sibling of
+/// the global `node_modules`, so it is on the live install's volume (the swap is
+/// a rename, never a copy) and outside every package dir npm manages.
+fn update_staging_dir(npm_prefix: &Path) -> PathBuf {
+    npm_prefix.join(".symforge-update-staging")
 }
 
 /// Parse a `symforge --version` semver out of arbitrary launcher output. Scans
@@ -83,7 +151,7 @@ fn parse_symforge_version(text: &str) -> Option<String> {
     })
 }
 
-/// Outcome of probing the freshly-installed `symforge --version`.
+/// Outcome of probing a `symforge --version`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InstalledProbe {
     /// The launcher ran and reported this version.
@@ -96,11 +164,39 @@ pub(crate) enum InstalledProbe {
     Unprobeable,
 }
 
+/// Run `<program> --version` and classify the result. Inspects BOTH stdout and
+/// the exit status: the npm launcher prints resolve errors to stderr and exits
+/// non-zero with empty stdout, which must surface as a loud failure, not a
+/// silent "could not probe".
+fn probe_version(program: impl AsRef<std::ffi::OsStr>) -> InstalledProbe {
+    let output = match crate::process_util::hidden_command(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return InstalledProbe::Unprobeable,
+    };
+    if let Some(version) = parse_symforge_version(&String::from_utf8_lossy(&output.stdout)) {
+        return InstalledProbe::Version(version);
+    }
+    // Ran but produced no version: surface its own diagnostic.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("launcher produced no version output")
+        .to_string();
+    InstalledProbe::LauncherFailed(detail)
+}
+
 /// Clear a demonstrably-dead sidecar record for the current project (CWD
 /// `.symforge`). The sidecar is NOT killed: its pid is the in-process MCP server
 /// (killing it would drop the user's editor connection), and a TCP-alive probe
 /// does not prove the recorded pid owns the port (recycled-pid hazard). Only a
-/// `Dead` record is cleaned so the next launch starts clean.
+/// `Dead` record is cleaned, and "cleared" is reported only when a re-read
+/// confirms it.
 fn clear_dead_sidecar_record() -> Option<String> {
     use crate::sidecar::port_file::{
         SidecarLiveness, cleanup_files, cleanup_stale_descriptors, read_sidecar_status,
@@ -111,11 +207,18 @@ fn clear_dead_sidecar_record() -> Option<String> {
     let status = read_sidecar_status(&control_state_dir, "127.0.0.1", project_root.as_deref());
     // Task 8: purge stale per-adapter descriptors alongside the legacy files.
     cleanup_stale_descriptors(&control_state_dir, "127.0.0.1");
-    if matches!(status.liveness, SidecarLiveness::Dead) {
-        cleanup_files(&control_state_dir);
+    if !matches!(status.liveness, SidecarLiveness::Dead) {
+        return None;
+    }
+    cleanup_files(&control_state_dir);
+    let after = read_sidecar_status(&control_state_dir, "127.0.0.1", project_root.as_deref());
+    if matches!(after.liveness, SidecarLiveness::NoSidecar) {
         Some("cleared a stale sidecar record".to_string())
     } else {
-        None
+        Some(format!(
+            "skipped: clearing a stale sidecar record (it still reads as {})",
+            after.liveness.as_str()
+        ))
     }
 }
 
@@ -128,8 +231,7 @@ fn clear_dead_sidecar_record() -> Option<String> {
 /// directory (`$SYMFORGE_HOME/bin` when set, else `~/.symforge/bin`) — the only
 /// place the retired durable mechanism ever wrote. The real safety invariant is
 /// the self-exe guard: it never deletes the binary backing the current process.
-/// Best-effort; callers must only invoke this AFTER clients are re-registered off
-/// the orphan.
+/// Callers must only invoke this AFTER clients are re-registered off the orphan.
 fn remove_orphan_durable_bin() -> Vec<String> {
     let Some(control_state_dir) = crate::version_registry::resolve_home() else {
         return Vec::new();
@@ -144,6 +246,7 @@ fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateD
         .and_then(|p| std::fs::canonicalize(p).ok());
 
     let mut removed = Vec::new();
+    let mut failed = Vec::new();
     for name in [
         "symforge.exe",
         "symforge",
@@ -160,46 +263,167 @@ fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateD
         {
             continue;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            removed.push(name.to_string());
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(name.to_string()),
+            Err(error) => failed.push(format!(
+                "skipped: removing retired durable-install leftover {}: {error}",
+                path.display()
+            )),
         }
     }
-    if removed.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
+    let mut lines = Vec::new();
+    if !removed.is_empty() {
+        lines.push(format!(
             "removed retired durable-install leftover(s) from {}: {}",
             bin.display(),
             removed.join(", ")
-        )]
+        ));
+    }
+    lines.extend(failed);
+    lines
+}
+
+/// What the harness scan found: every registry target's state, plus whether a
+/// Grok config exists (Grok is registrable by `init` but not covered by the
+/// harness registry).
+#[derive(Debug, Clone)]
+pub(crate) struct HarnessScan {
+    statuses: Vec<HarnessStatus>,
+    grok_config_present: bool,
+}
+
+/// Decide which harnesses `update` re-registers. Only a harness that ALREADY
+/// carries a `symforge` entry is touched, so update never creates config for a
+/// client the user does not run. Kilo Code is excluded: its config is
+/// project-local, and update never writes project-local files. Returns the
+/// targets plus the `skipped:` lines to print.
+fn plan_reregistration(scan: &HarnessScan) -> (Vec<HarnessId>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for status in &scan.statuses {
+        match &status.state {
+            HarnessState::PresentCurrent | HarnessState::PresentStale(_)
+                if status.id == HarnessId::KiloCode =>
+            {
+                skipped.push(format!(
+                    "skipped: {} (its config is project-local; run `symforge init --client kilo-code` inside that project)",
+                    status.id.display_name()
+                ));
+            }
+            HarnessState::PresentCurrent | HarnessState::PresentStale(_) => {
+                targets.push(status.id);
+            }
+            // The parse error text is deliberately not echoed: a TOML error
+            // quotes the offending line, which can carry a bearer token.
+            HarnessState::Malformed(_) => skipped.push(format!(
+                "skipped: {} (its config {} does not parse; left untouched)",
+                status.id.display_name(),
+                status.config_path.display()
+            )),
+            HarnessState::NotInstalled | HarnessState::Absent => {}
+        }
+    }
+    if scan.grok_config_present {
+        skipped.push(
+            "skipped: Grok (the harness scan does not cover it; run `symforge init --client grok` if Grok uses SymForge)"
+                .to_string(),
+        );
+    }
+    (targets, skipped)
+}
+
+/// What `symforge update` did, printed at the end (and before a post-swap
+/// failure) so every step's outcome is visible — including every step it
+/// skipped or could not complete.
+#[derive(Debug, Default)]
+struct UpdateSummary {
+    old_version: String,
+    new_version: String,
+    /// The live binary already reported the latest version.
+    up_to_date: bool,
+    swapped: bool,
+    reregistered: Vec<&'static str>,
+    daemon: Option<Result<u16, String>>,
+    initialize: Option<Result<(), String>>,
+    notes: Vec<String>,
+}
+
+impl UpdateSummary {
+    fn render(&self) -> String {
+        let version = if self.swapped {
+            format!("{} -> {}", self.old_version, self.new_version)
+        } else if self.up_to_date {
+            format!("{} (already the latest; swap skipped)", self.old_version)
+        } else {
+            format!("{} (unchanged)", self.old_version)
+        };
+        let reregistered = if self.reregistered.is_empty() {
+            "none".to_string()
+        } else {
+            self.reregistered.join(", ")
+        };
+        let daemon = match (&self.daemon, self.swapped) {
+            (Some(Ok(port)), true) => format!("yes (port {port})"),
+            (Some(Ok(port)), false) => format!("no, not needed (running on port {port})"),
+            (Some(Err(error)), _) => format!("no ({error})"),
+            (None, _) => "no (not attempted)".to_string(),
+        };
+        let initialize = match &self.initialize {
+            Some(Ok(())) => "yes".to_string(),
+            Some(Err(error)) => format!("no ({error})"),
+            None => "no (not attempted)".to_string(),
+        };
+        let mut out = format!(
+            "symforge update summary:\n  version: {version}\n  re-registered: {reregistered}\n  daemon restarted: {daemon}\n  initialize verified: {initialize}"
+        );
+        for note in &self.notes {
+            out.push_str("\n  ");
+            out.push_str(note);
+        }
+        out
+    }
+}
+
+fn probe_label(probe: &InstalledProbe) -> String {
+    match probe {
+        InstalledProbe::Version(version) => version.clone(),
+        InstalledProbe::LauncherFailed(_) | InstalledProbe::Unprobeable => "unknown".to_string(),
     }
 }
 
 /// Side effects of an update, injected so the orchestration is unit-testable
 /// without touching npm, the network, the daemon, or the filesystem.
 pub(crate) trait UpdateOps {
-    /// Sweep leftover `.old-*` staged binaries from a PRIOR Windows update (which
-    /// moves the running binary aside before the swap). A still-locked leftover
-    /// from a live old process is skipped and cleaned on a later run. Runs at the
-    /// START of update, best-effort. No-op on Unix. Returns summary lines.
+    /// Sweep leftover `.old-*` files a PRIOR swap moved aside. One still held
+    /// by a live session is reported as skipped and cleaned on a later run.
+    /// Runs at the START of update. Returns summary lines.
     fn sweep_stale_staging(&mut self) -> Vec<String>;
-    /// Stop the running daemon before the binary swap + clear a dead sidecar
-    /// record. Returns a human-readable summary of what was stopped.
-    fn stop_processes(&mut self) -> String;
-    /// Run `<program> <args...>`; return `true` on success.
-    fn npm_install(&mut self, program: &str, args: &[&str]) -> anyhow::Result<bool>;
+    /// Stop the recorded daemon right before the swap: its records are what the
+    /// new binary replaces, and the ownership gate that protects the stop can
+    /// still identify it while its binary is in place. Returns a summary line.
+    fn stop_daemon(&mut self) -> anyhow::Result<String>;
+    /// Install `specs` into the staging prefix with `program` (npm). The live
+    /// install is not touched. Returns `true` on success.
+    fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<bool>;
+    /// `--version` of the staged binary.
+    fn staged_version(&mut self) -> InstalledProbe;
+    /// Rename the staged packages' files over the live ones. Returns summary
+    /// lines.
+    fn swap_staged_into_place(&mut self) -> anyhow::Result<Vec<String>>;
     /// Probe the resolved `symforge --version` after install.
     fn installed_version(&mut self) -> InstalledProbe;
     /// Latest version published to the npm registry, or `None` when offline.
     fn latest_version(&mut self) -> Option<String>;
     /// Prune dead version-registry entries (paths whose binary was deleted while
-    /// the drive is online). Runs UNCONDITIONALLY and early — even when the npm
-    /// swap is blocked (Windows `EBUSY`) — so a blocked update still cleans cruft.
+    /// the drive is online) and clear a demonstrably-dead sidecar record. Runs
+    /// UNCONDITIONALLY and early, so a failed update still cleans cruft.
     /// Returns summary lines (empty when nothing was pruned).
     fn prune_registry(&mut self) -> Vec<String>;
-    /// Re-register every MCP client onto the freshly-installed binary by spawning
-    /// the NEW launcher's `init`. Returns `true` on success.
-    fn reregister_clients(&mut self) -> anyhow::Result<bool>;
+    /// Scan the known harness configs.
+    fn harness_scan(&mut self) -> HarnessScan;
+    /// Re-register one harness onto the freshly-installed binary by spawning
+    /// the NEW binary's `init`.
+    fn reregister(&mut self, harness: HarnessId) -> anyhow::Result<()>;
     /// Remove the retired durable-install leftovers ONLY when `reregistered` is
     /// true (otherwise clients still point at the orphan and deleting it would
     /// break them). Registry pruning is handled separately by [`UpdateOps::prune_registry`].
@@ -212,127 +436,130 @@ pub(crate) trait UpdateOps {
     /// reactive stale-version bail: it also fires when the shadow is the SAME
     /// version (which the stale-version check cannot see).
     fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport>;
+    /// `--version` of the binary at the live install path (the one harnesses
+    /// spawn), probed directly rather than through the PATH launcher.
+    fn live_version(&mut self) -> InstalledProbe;
+    /// Make sure a daemon of `version`, running from the live install path, owns
+    /// the daemon records; replaces an older recorded daemon. Returns its port.
+    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<u16>;
+    /// Replay a harness `initialize` against the live binary over stdio.
+    fn verify_initialize(&mut self) -> anyhow::Result<()>;
 }
 
-struct RealUpdateOps;
+struct RealUpdateOps {
+    npm_prefix: PathBuf,
+    live_modules: PathBuf,
+    staging: PathBuf,
+    platform_package: &'static str,
+    /// The binary every harness registration points at.
+    live_binary: PathBuf,
+    staged_binary: PathBuf,
+    home: PathBuf,
+}
+
+impl RealUpdateOps {
+    fn new(os: &str, platform_package: &'static str, npm_prefix: PathBuf, home: PathBuf) -> Self {
+        let live_modules = global_modules_dir(&npm_prefix, os);
+        let staging = update_staging_dir(&npm_prefix);
+        Self {
+            live_binary: native_binary_in(&live_modules, platform_package, os),
+            staged_binary: native_binary_in(&staging.join("node_modules"), platform_package, os),
+            npm_prefix,
+            live_modules,
+            staging,
+            platform_package,
+            home,
+        }
+    }
+}
 
 impl UpdateOps for RealUpdateOps {
     fn sweep_stale_staging(&mut self) -> Vec<String> {
-        run_stale_sweep()
+        sweep_stale_dir(&stale_staging_dir(&self.npm_prefix))
     }
 
-    fn stop_processes(&mut self) -> String {
-        let mut stopped = Vec::new();
-
-        // Daemon (global). `main()` is synchronous, so a short-lived runtime is
-        // safe (no nested-runtime panic).
-        let daemon = tokio::runtime::Builder::new_current_thread()
+    fn stop_daemon(&mut self) -> anyhow::Result<String> {
+        use crate::daemon::DaemonStopOutcome;
+        // `main()` is synchronous, so a short-lived runtime is safe (no
+        // nested-runtime panic).
+        let outcome = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
-            .ok()
-            .and_then(|rt| {
-                rt.block_on(crate::daemon::stop_running_daemon_for_update())
-                    .ok()
-            });
-        match daemon {
-            Some(crate::daemon::DaemonStopOutcome::Stopped { pid }) => {
-                stopped.push(format!("daemon (pid {pid})"));
-            }
-            Some(crate::daemon::DaemonStopOutcome::StopTimedOut { pid }) => {
-                stopped.push(format!(
-                    "daemon (pid {pid}) did NOT stop in time — left discoverable; rerun update or stop it manually"
-                ));
-            }
-            Some(crate::daemon::DaemonStopOutcome::SkippedSafety) => {
-                stopped.push("daemon left running (failed ownership safety check)".to_string());
-            }
-            _ => {}
-        }
-
-        if let Some(sidecar) = clear_dead_sidecar_record() {
-            stopped.push(sidecar);
-        }
-
-        // Stop every OTHER symforge process running from the SAME executable path
-        // as this one — the binary npm is about to overwrite. On Windows a live
-        // holder keeps an exclusive image handle and blocks the swap (EBUSY), so
-        // clearing the holders BEFORE npm runs is what lets the swap proceed. The
-        // set is scoped by ExecutablePath (never by image name) and excludes THIS
-        // process, so unrelated installs at other paths are never touched
-        // (SELF_UPDATE_PROCEDURE.md, Invariant 1).
-        for line in stop_other_inscope_holders() {
-            stopped.push(line);
-        }
-
-        if stopped.is_empty() {
-            "no running daemon found".to_string()
-        } else {
-            format!("stopped {}", stopped.join(", "))
-        }
+            .context("building a runtime for the daemon stop")?
+            .block_on(crate::daemon::stop_running_daemon_for_update())?;
+        Ok(match outcome {
+            DaemonStopOutcome::NotRunning => "no running daemon to stop".to_string(),
+            DaemonStopOutcome::Stopped { pid } => format!("stopped the daemon (pid {pid})"),
+            DaemonStopOutcome::StopTimedOut { pid } => format!(
+                "skipped: stopping the daemon (pid {pid} did not exit in time; the restart replaces it)"
+            ),
+            DaemonStopOutcome::SkippedSafety => "skipped: stopping the daemon (its record failed \
+                 the ownership check and it was left running)"
+                .to_string(),
+        })
     }
 
-    fn npm_install(&mut self, program: &str, args: &[&str]) -> anyhow::Result<bool> {
-        // Layer 2 (Windows): a running `.exe` cannot be OVERWRITTEN but CAN be
-        // moved aside — a rename needs only DELETE access (the rustup
-        // `self_replace` technique). Move THIS process's own binary out of npm's
-        // target path so npm installs a fresh binary into a now-FREE path; the
-        // running process keeps executing from the moved file (its image handle
-        // follows the file object). No-op on Unix, which overwrites in place.
-        //
-        // The returned RAII guard rolls the binary back on drop UNLESS a binary
-        // landed at the path. The pivot is "did a binary land?", never "did npm
-        // return 0?" — so the spawn error and the `wait_or_kill` error below (both
-        // early `?` returns), a timeout, an npm-exit-0 that did NOT re-extract the
-        // binary (an already-current re-install), and a panic ALL leave the
-        // install path populated rather than empty.
-        let _restore = stage_running_binary_aside();
-
-        // Layer 1: bounded wait. The blocking `.status()` this replaces spun
-        // forever when npm retried the locked file; spawn + poll `try_wait`
-        // against a deadline and kill the child on timeout, returning Ok(false)
-        // so the EXISTING graceful bail fires instead of hanging.
+    fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<bool> {
+        // A leftover from an interrupted run would be overlaid onto the live
+        // install along with the fresh files, so start from an empty staging dir.
+        match std::fs::remove_dir_all(&self.staging) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("clearing the staging directory {}", self.staging.display())
+                });
+            }
+        }
+        let args = staging_install_args(&self.staging, specs);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Bounded wait: spawn + poll `try_wait` against a deadline and kill the
+        // child on timeout, returning Ok(false) so the caller bails instead of
+        // hanging.
         let mut child = crate::process_util::hidden_command(program)
-            .args(args)
+            .args(&args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("failed to start `{}`", invocation_text(program, args)))?;
+            .with_context(|| format!("failed to start `{}`", invocation_text(program, &args)))?;
         wait_or_kill(
             &mut child,
             Instant::now() + NPM_INSTALL_TIMEOUT,
             NPM_INSTALL_POLL,
         )
-        // `_restore` drops here (and on either early `?` return above), restoring
-        // the staged binary iff the install path was not repopulated.
+    }
+
+    fn staged_version(&mut self) -> InstalledProbe {
+        probe_version(&self.staged_binary)
+    }
+
+    fn swap_staged_into_place(&mut self) -> anyhow::Result<Vec<String>> {
+        let staged_modules = self.staging.join("node_modules");
+        let aside = stale_staging_dir(&self.npm_prefix);
+        // The platform package first: it holds the binary harnesses spawn.
+        for package in [self.platform_package, "symforge"] {
+            overlay_package(
+                &staged_modules.join(package),
+                &self.live_modules.join(package),
+                &aside,
+            )
+            .with_context(|| format!("swapping the staged `{package}` package into place"))?;
+        }
+        Ok(match std::fs::remove_dir_all(&self.staging) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![format!(
+                "skipped: removing the staging directory {}: {error}",
+                self.staging.display()
+            )],
+        })
     }
 
     fn installed_version(&mut self) -> InstalledProbe {
-        // Spawn the freshly-resolved launcher (this update process is still the
-        // OLD binary, so we ask the launcher what it now resolves to). Inspect
-        // BOTH stdout and the exit status: the npm launcher prints resolve errors
-        // to stderr and exits non-zero with empty stdout, which must surface as a
-        // loud failure, not a silent "could not probe".
-        let output = match crate::process_util::hidden_command(symforge_launcher())
-            .arg("--version")
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => return InstalledProbe::Unprobeable,
-        };
-        if let Some(version) = parse_symforge_version(&String::from_utf8_lossy(&output.stdout)) {
-            return InstalledProbe::Version(version);
-        }
-        // Ran but produced no version: surface the launcher's own diagnostic.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("launcher produced no version output")
-            .to_string();
-        InstalledProbe::LauncherFailed(detail)
+        // This update process is still the OLD binary, so ask the launcher what
+        // it now resolves to.
+        probe_version(symforge_launcher())
     }
 
     fn latest_version(&mut self) -> Option<String> {
@@ -340,31 +567,58 @@ impl UpdateOps for RealUpdateOps {
     }
 
     fn prune_registry(&mut self) -> Vec<String> {
+        let mut lines: Vec<String> = clear_dead_sidecar_record().into_iter().collect();
         let Some(home) = crate::version_registry::resolve_home() else {
-            return Vec::new();
+            return lines;
         };
         let pruned = crate::version_registry::prune_missing_entries(&home);
         if pruned > 0 {
-            vec![format!(
+            lines.push(format!(
                 "pruned {pruned} stale version-registry entr{}",
                 if pruned == 1 { "y" } else { "ies" }
-            )]
-        } else {
-            Vec::new()
+            ));
+        }
+        lines
+    }
+
+    fn harness_scan(&mut self) -> HarnessScan {
+        // The working dir only feeds the project-local Kilo Code target, which
+        // `plan_reregistration` never re-registers; home keeps the caller's cwd
+        // out of it. Only presence matters here, so the desired attach entry is
+        // a placeholder: a stdio entry reads as present-stale.
+        let registry = HarnessRegistry::known_with(&self.home, &self.home);
+        HarnessScan {
+            statuses: registry.scan(&AttachEntry::new("", None)),
+            grok_config_present: self.home.join(".grok").join("config.toml").exists(),
         }
     }
 
-    fn reregister_clients(&mut self) -> anyhow::Result<bool> {
-        // Spawn the NEW launcher's init so clients are registered at the freshly
-        // installed binary (this update process is still the OLD binary, so an
-        // in-process `run_init` would re-register the OLD path).
-        let status = crate::process_util::hidden_command(symforge_launcher())
-            .args(["init", "--client", "all"])
+    fn reregister(&mut self, harness: HarnessId) -> anyhow::Result<()> {
+        // The NEW binary writes the registration (this process is still the old
+        // one). It runs from the home directory with no workspace override, so
+        // no project-local file is written and the caller's cwd is never
+        // captured as a workspace root.
+        let status = crate::process_util::hidden_command(&self.live_binary)
+            .args(["init", "--client", harness.slug()])
+            .current_dir(&self.home)
+            .env_remove(crate::discovery::WORKSPACE_ROOT_ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .status();
-        Ok(matches!(status, Ok(s) if s.success()))
+            .status()
+            .with_context(|| {
+                format!(
+                    "starting `{} init --client {}`",
+                    self.live_binary.display(),
+                    harness.slug()
+                )
+            })?;
+        anyhow::ensure!(
+            status.success(),
+            "`symforge init --client {}` exited with {status}",
+            harness.slug()
+        );
+        Ok(())
     }
 
     fn reconcile_durable(&mut self, reregistered: bool) -> Vec<String> {
@@ -379,6 +633,97 @@ impl UpdateOps for RealUpdateOps {
         let installed = npm_installed_launcher_path()?;
         crate::path_shadow::detect_shadow(&installed)
     }
+
+    fn live_version(&mut self) -> InstalledProbe {
+        probe_version(&self.live_binary)
+    }
+
+    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<u16> {
+        // `main()` is synchronous, so a short-lived runtime is safe (no
+        // nested-runtime panic).
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .context("building a runtime for the daemon restart")?
+            .block_on(crate::daemon::ensure_installed_daemon_running(
+                &self.live_binary,
+                version,
+            ))
+    }
+
+    fn verify_initialize(&mut self) -> anyhow::Result<()> {
+        verify_initialize_at(&self.live_binary, &self.home, INITIALIZE_VERIFY_TIMEOUT)
+    }
+}
+
+/// Replay a harness's first exchange against `binary` over stdio: send
+/// `initialize` and require a JSON-RPC result for it within `timeout`. Runs from
+/// `cwd` with no workspace override, so the probe binds no project.
+fn verify_initialize_at(binary: &Path, cwd: &Path, timeout: Duration) -> anyhow::Result<()> {
+    let mut child = crate::process_util::hidden_command(binary)
+        .current_dir(cwd)
+        .env_remove(crate::discovery::WORKSPACE_ROOT_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting {} as a stdio MCP server", binary.display()))?;
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        child
+            .kill()
+            .context("stopping the `initialize` probe server")?;
+        bail!("stdio pipes were not attached to the probe server");
+    };
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    // The reader ends when the child's stdout closes (the kill below).
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let answered = writeln!(stdin, "{INITIALIZE_REQUEST}")
+        .and_then(|()| stdin.flush())
+        .context("writing `initialize` to the probe server")
+        .and_then(|()| {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match lines_rx.recv_timeout(remaining) {
+                    Ok(line) if is_initialize_result(&line) => break Ok(()),
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        break Err(anyhow::anyhow!(
+                            "no `initialize` result within {}s",
+                            timeout.as_secs()
+                        ));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(anyhow::anyhow!(
+                            "the server closed stdout before answering `initialize`"
+                        ));
+                    }
+                }
+            }
+        });
+    drop(stdin);
+    child
+        .kill()
+        .context("stopping the `initialize` probe server")?;
+    child
+        .wait()
+        .context("reaping the `initialize` probe server")?;
+    answered
+}
+
+/// A JSON-RPC success response to the replayed `initialize` (id 1).
+fn is_initialize_result(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .is_ok_and(|message| message["id"] == 1 && message["result"]["protocolVersion"].is_string())
 }
 
 /// A child process we can poll for completion and force-kill. The seam exists so
@@ -412,8 +757,8 @@ fn wait_or_kill<C: Waitable>(
             return Ok(status.success());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.try_wait(); // best-effort reap
+            child.kill().context("killing the timed-out npm install")?;
+            child.try_wait().context("reaping the killed npm install")?;
             return Ok(false);
         }
         std::thread::sleep(poll);
@@ -430,112 +775,113 @@ fn wait_or_kill<C: Waitable>(
 /// rimraf `node_modules/*` on reinstall, so a still-locked `.old` must not live
 /// inside it) and, in the normal install, on the same volume as the binary (so
 /// the move is a rename, not a cross-volume copy).
-#[cfg(any(windows, test))]
 fn stale_staging_dir(npm_prefix: &std::path::Path) -> std::path::PathBuf {
     npm_prefix.join(".symforge-update-stale")
 }
 
-/// Best-effort delete of every staged leftover in `dir` (a prior update's
-/// moved-aside binaries). Uses `remove_file` only: a file still locked by a live
-/// old process errors and is silently skipped (cleaned on a later run once that
-/// process exits), and a stray subdirectory is left alone. A nonexistent `dir`
-/// is a no-op. Returns a summary line when anything was removed.
-#[cfg(any(windows, test))]
+/// Best-effort delete of every staged leftover in `dir` (files a prior swap
+/// moved aside). Uses `remove_file` only: a file still held by a live old
+/// session errors and is reported as skipped (cleaned on a later run once that
+/// session exits). A nonexistent `dir` is a no-op.
 fn sweep_stale_dir(dir: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => return vec![format!("skipped: sweeping {}: {error}", dir.display())],
     };
     let mut removed = 0usize;
-    for entry in entries.flatten() {
-        if std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
+    let mut kept = 0usize;
+    for entry in entries {
+        match entry.map(|entry| std::fs::remove_file(entry.path())) {
+            Ok(Ok(())) => removed += 1,
+            Ok(Err(_)) | Err(_) => kept += 1,
         }
     }
+    let mut lines = Vec::new();
     if removed > 0 {
-        vec![format!(
+        lines.push(format!(
             "swept {removed} stale staged binar{} from {}",
             if removed == 1 { "y" } else { "ies" },
             dir.display()
-        )]
-    } else {
-        Vec::new()
+        ));
     }
+    if kept > 0 {
+        lines.push(format!(
+            "skipped: {kept} leftover(s) in {} could not be removed (likely still running from an open session; a later update removes them)",
+            dir.display()
+        ));
+    }
+    lines
 }
 
-/// RAII rollback for the moved-aside binary. On drop, if the install path was
-/// NOT repopulated by npm, move the staged binary back so a failed OR no-op
-/// update never leaves the path empty. The pivot is "did a binary land at the
-/// path?", NEVER "did npm return 0?": an already-current re-install exits 0
-/// without re-extracting the binary, and a failed spawn, a `try_wait` error, a
-/// timeout, and a panic all bypass any exit-code check entirely. When a binary
-/// DID land, the guard disarms and the staged `.old` is left for the next sweep.
-///
-/// Cross-platform so the signature and the guard tests are uniform, but only ever
-/// CONSTRUCTED on Windows (staging is a Windows-only concern) — hence the
-/// non-Windows `dead_code` allow: it is genuinely never built there.
-#[cfg_attr(not(windows), allow(dead_code))]
-struct StagedRestore {
-    staged: std::path::PathBuf,
-    original: std::path::PathBuf,
-}
-
-impl Drop for StagedRestore {
-    fn drop(&mut self) {
-        if !self.original.exists() {
-            let _ = move_path_aside(&self.staged, &self.original);
+/// Rename every file under `staged` over its counterpart under `live`, creating
+/// directories as needed. Files present only in `live` are left in place.
+// ponytail: overlay, not a mirror; delete live-only files if a release ever
+// drops a file that must not linger.
+fn overlay_package(staged: &Path, live: &Path, aside_dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(live).with_context(|| format!("creating {}", live.display()))?;
+    for entry in
+        std::fs::read_dir(staged).with_context(|| format!("reading {}", staged.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", staged.display()))?;
+        let from = entry.path();
+        let to = live.join(entry.file_name());
+        if entry
+            .file_type()
+            .with_context(|| format!("inspecting {}", from.display()))?
+            .is_dir()
+        {
+            overlay_package(&from, &to, aside_dir)?;
+        } else {
+            replace_file(&from, &to, aside_dir, |src, dst| std::fs::rename(src, dst))
+                .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
         }
     }
+    Ok(())
 }
 
-/// Windows: move THIS process's running binary out of npm's target path to the
-/// stale-staging dir under the npm GLOBAL prefix, so npm installs a fresh binary
-/// into a now-free path. The running process keeps executing from the moved file.
-/// Returns a [`StagedRestore`] guard that rolls the move back on drop unless a
-/// binary landed. `None` (staging skipped — the timeout floor still prevents a
-/// hang) when the current exe or the npm prefix cannot be resolved, or the move
-/// fails (e.g. a divergent prefix that would make it a cross-volume move).
-#[cfg(windows)]
-fn stage_running_binary_aside() -> Option<StagedRestore> {
-    let exe = std::env::current_exe().ok()?;
-    let stale_dir = stale_staging_dir(&npm_global_prefix()?);
-    std::fs::create_dir_all(&stale_dir).ok()?;
-    let staged = stale_dir.join(format!("symforge.exe.old-{}", stage_suffix()));
-    move_path_aside(&exe, &staged).ok()?;
-    Some(StagedRestore {
-        staged,
-        original: exe,
-    })
-}
-
-/// Unix replaces a running binary in place (the open image keeps the old inode
-/// while the path takes the new file — same reason `stop_other_inscope_holders`
-/// is a no-op), so there is no locked path to free. Always `None`.
-#[cfg(not(windows))]
-fn stage_running_binary_aside() -> Option<StagedRestore> {
-    None
-}
-
-/// Sweep leftover staged binaries from a PRIOR update, from the npm global
-/// prefix's stale dir (same derivation as staging). Runs at the start of update,
-/// best-effort; `None` prefix → nothing to sweep.
-#[cfg(windows)]
-fn run_stale_sweep() -> Vec<String> {
-    match npm_global_prefix() {
-        Some(prefix) => sweep_stale_dir(&stale_staging_dir(&prefix)),
-        None => Vec::new(),
+/// Move `src` over `dst` so that `dst` holds either the old or the new file at
+/// every step except, on Windows, between two back-to-back renames. A plain
+/// rename replaces atomically everywhere except over a running Windows image,
+/// which refuses replacement (`PermissionDenied`) yet allows being renamed:
+/// there `dst` goes aside into `aside_dir` and `src` follows immediately. If
+/// that second rename fails, the old file is moved back. `rename` is injected
+/// so the move-back path is testable.
+fn replace_file(
+    src: &Path,
+    dst: &Path,
+    aside_dir: &Path,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let refused = match rename(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if refused.kind() != std::io::ErrorKind::PermissionDenied || !dst.exists() {
+        return Err(refused);
     }
-}
-
-/// Unix never stages, so there is nothing to sweep.
-#[cfg(not(windows))]
-fn run_stale_sweep() -> Vec<String> {
-    Vec::new()
+    std::fs::create_dir_all(aside_dir)?;
+    let name = dst
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let aside = aside_dir.join(format!("{name}.old-{}", stage_suffix()));
+    move_path_aside(dst, &aside)?;
+    if let Err(error) = rename(src, dst) {
+        return match move_path_aside(&aside, dst) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(std::io::Error::other(format!(
+                "{error}; moving the previous file back also failed ({restore}), it is at {}",
+                aside.display()
+            ))),
+        };
+    }
+    Ok(())
 }
 
 /// A random-enough suffix for a staged `.old-*` filename: pid + wall-clock nanos
 /// (no `rand` dependency needed — collisions only need avoiding across a rare
 /// concurrent or repeated update, and the sweep tolerates leftovers anyway).
-#[cfg(windows)]
 fn stage_suffix() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -556,9 +902,8 @@ fn move_path_aside(src: &std::path::Path, dst: &std::path::Path) -> std::io::Res
     }
 }
 
-/// Unix never stages a running binary; this exists only because
-/// [`StagedRestore`]'s drop references it on every platform (the guard is never
-/// constructed on Unix, so it is never actually called).
+/// Unix renames over a running binary directly, so [`replace_file`] only moves
+/// a file aside on the Windows refusal path; a plain rename suffices here.
 #[cfg(not(windows))]
 fn move_path_aside(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::rename(src, dst)
@@ -568,7 +913,8 @@ fn move_path_aside(src: &std::path::Path, dst: &std::path::Path) -> std::io::Res
 /// install root (the parent of the GLOBAL `node_modules`); staging and sweep
 /// derive their directory from it, and shadow detection derives the launcher
 /// path from it. Returns `None` when `npm` is unavailable or the prefix cannot
-/// be parsed.
+/// be parsed, or when it names no existing directory (npm masks UUID-shaped
+/// path segments as `***` in its output).
 fn npm_global_prefix() -> Option<std::path::PathBuf> {
     let program = npm_executable_for_os(std::env::consts::OS);
     let output = crate::process_util::hidden_command(program)
@@ -584,7 +930,8 @@ fn npm_global_prefix() -> Option<std::path::PathBuf> {
     if prefix.is_empty() {
         return None;
     }
-    Some(std::path::PathBuf::from(prefix))
+    let prefix = std::path::PathBuf::from(prefix);
+    prefix.is_dir().then_some(prefix)
 }
 
 /// Derive the path of the `symforge` launcher npm installs at the global prefix.
@@ -610,11 +957,18 @@ fn launcher_path_in_prefix(prefix: &std::path::Path, os: &str) -> std::path::Pat
 }
 
 pub fn run_update() -> anyhow::Result<()> {
-    orchestrate_update(
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        &mut RealUpdateOps,
-    )
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let platform_package = platform_package_for(os, arch).with_context(|| {
+        format!("symforge update: no npm platform package ships a binary for {os}-{arch}")
+    })?;
+    let npm_prefix = npm_global_prefix().context(
+        "symforge update: could not resolve the npm global prefix (`npm prefix -g` failed or \
+         named no existing directory); is npm on PATH?",
+    )?;
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let mut ops = RealUpdateOps::new(os, platform_package, npm_prefix, home);
+    orchestrate_update(os, arch, &mut ops)
 }
 
 pub(crate) fn orchestrate_update(
@@ -622,71 +976,105 @@ pub(crate) fn orchestrate_update(
     arch: &str,
     ops: &mut impl UpdateOps,
 ) -> anyhow::Result<()> {
-    // Sweep leftover staged binaries from a prior Windows update before anything
-    // else (best-effort; a still-locked `.old` from a live old process is skipped
-    // and cleaned once that process exits). No-op on Unix.
-    for line in ops.sweep_stale_staging() {
-        eprintln!("symforge update: {line}");
+    let mut summary = UpdateSummary::default();
+    let result = update_steps(os, arch, ops, &mut summary);
+    // Printed on success AND failure, so no skipped step goes unreported.
+    eprintln!("{}", summary.render());
+    result
+}
+
+fn update_steps(
+    os: &str,
+    arch: &str,
+    ops: &mut impl UpdateOps,
+    summary: &mut UpdateSummary,
+) -> anyhow::Result<()> {
+    // Clean cruft from prior runs first, whatever happens to the swap below.
+    summary.notes.extend(ops.sweep_stale_staging());
+    summary.notes.extend(ops.prune_registry());
+
+    let latest = ops.latest_version();
+    if latest.is_none() {
+        summary.notes.push(
+            "skipped: confirming the latest published version (the npm registry was unreachable)"
+                .to_string(),
+        );
     }
+    let before = ops.live_version();
+    summary.old_version = probe_label(&before);
+    let already_latest =
+        matches!((&before, &latest), (InstalledProbe::Version(v), Some(l)) if v == l);
 
-    // Stop first: a live daemon holds the old binary (Windows file-lock) and
-    // would keep serving stale behavior. It respawns lazily on next use.
-    let stop_summary = ops.stop_processes();
-    eprintln!("symforge update: {stop_summary}.");
-
-    // Prune dead version-registry entries UNCONDITIONALLY and BEFORE the npm swap.
-    // The swap can be blocked (Windows `EBUSY`: a running MCP client still holds
-    // the `.exe`) and bail below — but registry cruft (e.g. removed git-worktree
-    // dev builds) should be cleaned regardless of whether the swap succeeds.
-    for line in ops.prune_registry() {
-        eprintln!("symforge update: {line}");
-    }
-
-    let program = npm_executable_for_os(os);
-    let specs = install_specs(os, arch);
-    let args: Vec<&str> = ["install", "-g"]
-        .into_iter()
-        .chain(specs.iter().map(String::as_str))
-        .collect();
-
-    if !ops.npm_install(program, &args)? {
-        // Any OTHER in-scope holders were already stopped in `stop_processes`
-        // (their count, if any were found, was printed above). The message stays
-        // honest when enumeration found/stopped nothing: it does NOT assert "all
-        // holders were stopped", and the closing hint covers an un-enumerable
-        // holder. The remediation runs from a PLAIN shell — not the `symforge`
-        // binary that self-locks on Windows.
+    summary.up_to_date = already_latest;
+    if already_latest {
+        eprintln!(
+            "symforge update: {} is already the latest published version; skipping the swap.",
+            summary.old_version
+        );
+    } else {
+        let program = npm_executable_for_os(os);
+        let specs = install_specs(os, arch);
         let plain_cmd = format!("npm install -g {}", specs.join(" "));
-        let init_cmd = format!("{} init --client all", symforge_launcher());
-        if os == "windows" {
+        eprintln!(
+            "symforge update: installing {} into a staging directory; running sessions are not touched.",
+            specs.join(" ")
+        );
+        if !ops.stage_install(program, &specs)? {
             bail!(
-                "symforge update failed: `{}` exited unsuccessfully.\n\
-                 On Windows the `symforge update` process runs from the very binary npm \
-                 replaces and cannot overwrite a running .exe. Any OTHER in-scope holders \
-                 were stopped above (if any were found), so finish the swap from a PLAIN \
-                 shell (NOT via `symforge`):\n  {}\n\
-                 then re-point your MCP clients onto the new binary:\n  {}\n\
-                 If it STILL fails, an MCP client (Cursor, Claude) or another symforge \
-                 process is holding the binary — close them and rerun the command above.\n\
+                "symforge update failed: the staging install (`{program} install ... {}`) exited \
+                 unsuccessfully or timed out. The live install was NOT touched and running sessions \
+                 are unaffected. Retry, or install from a plain shell:\n  {plain_cmd}\n\
                  (The version registry was already pruned.)",
-                invocation_text(program, &args),
-                plain_cmd,
-                init_cmd
-            );
-        } else {
-            bail!(
-                "symforge update failed: `{}` exited unsuccessfully.\n\
-                 Ensure no running symforge process is holding the binary, then rerun, or \
-                 install directly from a plain shell:\n  {}\n\
-                 (The version registry was already pruned.)",
-                invocation_text(program, &args),
-                plain_cmd
+                specs.join(" ")
             );
         }
+        let untouched = "The live install was NOT touched.";
+        match ops.staged_version() {
+            InstalledProbe::Version(staged) => {
+                if let Some(latest) = &latest
+                    && &staged != latest
+                {
+                    bail!(
+                        "symforge update failed: the staged binary reports {staged}, not the latest \
+                         published {latest}. {untouched}"
+                    );
+                }
+            }
+            InstalledProbe::LauncherFailed(detail) => bail!(
+                "symforge update failed: the staged binary did not report a version:\n  {detail}\n{untouched}"
+            ),
+            InstalledProbe::Unprobeable => {
+                bail!("symforge update failed: the staged binary could not be run. {untouched}")
+            }
+        }
+        // Only the daemon is stopped; stdio sessions keep running from the old
+        // binary. A failed stop is not fatal: the restart below replaces an
+        // older daemon it finds.
+        summary.notes.push(match ops.stop_daemon() {
+            Ok(line) => line,
+            Err(error) => format!("skipped: stopping the daemon: {error:#}"),
+        });
+        summary.notes.extend(ops.swap_staged_into_place().context(
+            "symforge update failed while swapping the staged files into place; the binary path \
+             holds either the old or the new binary, rerun `symforge update` to finish",
+        )?);
+        summary.swapped = true;
     }
 
-    // Verify the install actually took effect. npm can report success while the
-    // resolved binary stays behind, so this is the load-bearing safety net.
+    // What harnesses will spawn from now on.
+    let new_version = match ops.live_version() {
+        InstalledProbe::Version(version) => version,
+        InstalledProbe::LauncherFailed(detail) => bail!(
+            "symforge update incomplete: the binary at the install path did not report a version:\n  {detail}"
+        ),
+        InstalledProbe::Unprobeable => {
+            bail!("symforge update incomplete: the binary at the install path could not be run")
+        }
+    };
+    summary.new_version = new_version.clone();
+
+    // Verify the install actually took effect for the PATH launcher too. npm can
+    // leave the resolved binary behind, so this is the load-bearing safety net.
     let running = env!("CARGO_PKG_VERSION");
     let pkg = platform_package_for(os, arch).unwrap_or("symforge-<os>-<arch>");
     match ops.installed_version() {
@@ -700,13 +1088,13 @@ pub(crate) fn orchestrate_update(
             );
         }
         InstalledProbe::Unprobeable => {
-            eprintln!(
-                "symforge update: WARNING — could not run `symforge --version` to verify the result \
-                 (the npm prefix bin may not be on PATH). The install ran; confirm with `symforge --version`."
+            summary.notes.push(
+                "skipped: verifying `symforge --version` through the launcher on PATH (it could not \
+                 be run; the npm prefix bin may not be on PATH)"
+                    .to_string(),
             );
         }
         InstalledProbe::Version(installed) => {
-            let latest = ops.latest_version();
             // When the registry is reachable, require the resolved binary to be
             // at the latest; otherwise floor against the version of the binary
             // running this update — the swap must produce something at least as
@@ -723,64 +1111,65 @@ pub(crate) fn orchestrate_update(
             };
             if stale {
                 bail!(
-                    "symforge update incomplete: npm reported success but `symforge --version` still \
-                     reports {installed}, behind {target}. The resolved `symforge` is not the one just \
-                     installed. Likely causes:\n  \
+                    "symforge update incomplete: `symforge --version` still reports {installed}, \
+                     behind {target}. The resolved `symforge` is not the one just installed. Likely causes:\n  \
                      - stale nested platform package — retry: npm install -g symforge@latest {pkg}@latest --force\n  \
                      - a PATH-shadowing install — run `which -a symforge`; a root /usr/local copy can win over your npm prefix\n  \
-                     - on WSL, a Windows npm prefix bleeding in via /mnt — put your Linux npm prefix bin ahead of /usr/local and /mnt on PATH\n  \
-                     - on Windows, a running symforge can lock its own .exe — run the npm install from a separate shell"
-                );
-            }
-            if latest.is_none() {
-                eprintln!(
-                    "symforge update: `symforge --version` reports {installed} (could not reach the npm \
-                     registry to confirm it is the very latest)."
-                );
-            } else {
-                eprintln!(
-                    "symforge update complete — `symforge --version` now reports {installed}."
+                     - on WSL, a Windows npm prefix bleeding in via /mnt — put your Linux npm prefix bin ahead of /usr/local and /mnt on PATH"
                 );
             }
         }
     }
 
-    // Proactive PATH-shadow check. The version-verification above bails only when
-    // the resolved binary is BEHIND the target; it cannot see a same-version
-    // shadow (a stale install that happens to match) or name the exact offending
-    // path and fix. Compare the binary npm just installed to the PATH-first
-    // `symforge` and, when a different install wins, print the precise remediation.
+    // Proactive PATH-shadow check: the version check above cannot see a
+    // same-version shadow or name the exact offending path and fix.
     if let Some(report) = ops.shadow_report() {
         eprintln!("{}", crate::path_shadow::format_shadow_warning(&report));
     }
 
-    // Re-point all clients at the freshly-installed binary. Only AFTER a confirmed
-    // re-registration do we clear the retired durable-install artifacts — deleting
-    // the orphan while a client still references it would break that client.
-    let reregistered = match ops.reregister_clients() {
-        Ok(true) => {
-            eprintln!("symforge update: re-registered all MCP clients onto the new binary.");
-            true
-        }
-        Ok(false) => {
-            eprintln!(
-                "symforge update: client re-registration did not complete — run `symforge init \
-                 --client all` manually. Leaving the durable-install leftovers in place until then."
-            );
-            false
-        }
-        Err(error) => {
-            eprintln!(
-                "symforge update: client re-registration error ({error}) — run `symforge init \
-                 --client all` manually. Leaving the durable-install leftovers in place until then."
-            );
-            false
-        }
-    };
-    for line in ops.reconcile_durable(reregistered) {
-        eprintln!("symforge update: {line}");
+    summary.daemon = Some(
+        ops.restart_daemon(&new_version)
+            .map_err(|error| format!("{error:#}")),
+    );
+    if let Err(error) = ops.verify_initialize() {
+        summary.initialize = Some(Err(format!("{error:#}")));
+        summary.notes.push(
+            "skipped: harness re-registration (the new binary failed verification)".to_string(),
+        );
+        return Err(error.context(
+            "symforge update failed: the binary at the install path did not answer a harness \
+             `initialize`; new sessions will fail until this is fixed",
+        ));
     }
+    summary.initialize = Some(Ok(()));
 
+    // Re-point the harnesses that already use SymForge. Only after every one of
+    // them succeeded are the retired durable-install artifacts cleared —
+    // deleting the orphan while a client still references it would break it.
+    let (targets, skipped) = plan_reregistration(&ops.harness_scan());
+    summary.notes.extend(skipped);
+    let mut all_reregistered = true;
+    for harness in targets {
+        match ops.reregister(harness) {
+            Ok(()) => summary.reregistered.push(harness.display_name()),
+            Err(error) => {
+                all_reregistered = false;
+                summary.notes.push(format!(
+                    "skipped: re-registering {}: {error:#}",
+                    harness.display_name()
+                ));
+            }
+        }
+    }
+    if !all_reregistered {
+        summary.notes.push(
+            "skipped: removing retired durable-install leftovers (a re-registration failed)"
+                .to_string(),
+        );
+    }
+    summary
+        .notes
+        .extend(ops.reconcile_durable(all_reregistered));
     Ok(())
 }
 
@@ -791,259 +1180,11 @@ fn invocation_text(program: &str, args: &[&str]) -> String {
     parts.join(" ")
 }
 
-/// Normalize a Windows executable path for identity comparison: strip the
-/// extended-length verbatim prefix (`\\?\`), unify slashes, and lowercase. This
-/// path is Windows-only (a case-insensitive filesystem), so always lowercasing is
-/// correct AND keeps the comparison deterministic under cross-platform test
-/// builds. Mirrors the slash+lowercase normalization `daemon::stable_path_identity`
-/// applies, plus a verbatim-prefix strip so a `\\?\C:\..` `current_exe()` lines up
-/// with WMI's plain `C:\..` `ExecutablePath`.
-#[cfg(any(windows, test))]
-fn normalize_exe_path(path: &str) -> String {
-    let trimmed = path.trim();
-    let stripped = trimmed.strip_prefix(r"\\?\").unwrap_or(trimmed);
-    stripped.replace('\\', "/").to_ascii_lowercase()
-}
-
-/// Pure selection of the in-scope holder PIDs to stop before the npm swap. Given
-/// a snapshot of running symforge processes as `(pid, executable_path)`, returns
-/// the PIDs whose executable path identifies the SAME binary as `self_exe` (the
-/// binary npm will overwrite) EXCLUDING `self_pid` (this process). Paths are
-/// compared after [`normalize_exe_path`] (verbatim-strip + slash-unify +
-/// lowercase) so a divergent path FORM (extended-length prefix, slash style,
-/// casing) cannot silently skip a genuine holder. Scoping by executable PATH —
-/// never by image name — is Invariant 1 of `SELF_UPDATE_PROCEDURE.md`: an
-/// unrelated symforge install at a different path is never stopped.
-#[cfg(any(windows, test))]
-fn select_inscope_holder_pids(
-    processes: &[(u32, String)],
-    self_exe: &str,
-    self_pid: u32,
-) -> Vec<u32> {
-    let target = normalize_exe_path(self_exe);
-    processes
-        .iter()
-        .filter(|(pid, path)| *pid != self_pid && normalize_exe_path(path) == target)
-        .map(|(pid, _)| *pid)
-        .collect()
-}
-
-/// Stop every OTHER symforge process running from this process's own executable
-/// path (the binary npm will overwrite), identity-gated native terminate, so
-/// the Windows image lock is released before the npm swap. Excludes this
-/// process. Returns a summary line when any holder was stopped.
-#[cfg(windows)]
-fn stop_other_inscope_holders() -> Vec<String> {
-    let Ok(self_exe) = std::env::current_exe() else {
-        return Vec::new();
-    };
-    let self_exe = self_exe.to_string_lossy().to_string();
-    let self_pid = std::process::id();
-
-    let snapshot = enumerate_symforge_processes();
-    let pids = select_inscope_holder_pids(&snapshot, &self_exe, self_pid);
-    if pids.is_empty() {
-        return Vec::new();
-    }
-    for pid in &pids {
-        terminate_inscope_holder(*pid, &self_exe);
-    }
-    vec![format!(
-        "{} other in-scope symforge holder(s) (pid {})",
-        pids.len(),
-        pids.iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )]
-}
-
-/// Unix can replace a running binary's file (the open binary keeps the old inode
-/// while the path takes the new file), so there is no EBUSY holder lock to clear
-/// before the swap — the daemon stop in `stop_processes` is sufficient.
-#[cfg(not(windows))]
-fn stop_other_inscope_holders() -> Vec<String> {
-    Vec::new()
-}
-
-/// Enumerate every running `symforge.exe` as `(pid, full_image_path)` natively
-/// via a ToolHelp snapshot + `QueryFullProcessImageNameW` — spawning NO external
-/// process (pattern ported from Terminal Commander's supervisor). The full image
-/// path is required to scope by install path per Invariant 1. Returns an empty
-/// list when the snapshot cannot be taken — a safe no-op that degrades to the
-/// staged-guidance bail rather than killing anything on uncertainty.
-#[cfg(windows)]
-fn enumerate_symforge_processes() -> Vec<(u32, String)> {
-    windows_native::enumerate_by_image_name("symforge.exe")
-}
-
-/// Identity-gated forced terminate of one in-scope holder. Re-verifies via the
-/// OS — immediately before the kill — that `pid`'s image path is THIS install's
-/// binary, then terminates natively.
-///
-/// There is deliberately NO graceful leg on Windows: `taskkill` without `/F`
-/// is REFUSED by console processes ("can only be terminated forcefully"),
-/// which is what the daemon/sidecar/MCP server are — the old graceful-then-
-/// forced dance either mistook that refusal for "nothing to stop" (leaving
-/// holders alive and the npm swap blocked) or added a wait that protected
-/// nothing. The graceful path is the IPC daemon stop in `stop_processes`;
-/// whatever still holds the binary after it is terminated here.
-///
-/// A pid that cannot be queried or whose image path no longer matches is left
-/// alone (recycled-pid defense: never kill on uncertainty).
-#[cfg(windows)]
-fn terminate_inscope_holder(pid: u32, expected_exe: &str) {
-    let expected = normalize_exe_path(expected_exe);
-    let still_ours = windows_native::pid_image_full_path(pid)
-        .is_some_and(|path| normalize_exe_path(&path) == expected);
-    if still_ours {
-        let _ = windows_native::terminate_process(pid);
-    }
-}
-
-/// Native Win32 process control for the update swap, ported from Terminal
-/// Commander's supervisor: ToolHelp enumeration, image-path identity, and
-/// `TerminateProcess`. Spawns NO external process — no powershell/CIM, no
-/// taskkill, no tasklist (corporate EDR flags spawned kill tools, and the
-/// tools themselves were the source of the refused-graceful bug).
-///
-/// `unsafe` here is FFI-only, each call justified by a SAFETY comment; the
-/// crate-level `unsafe_code = "deny"` is opted out per-item, matching the
-/// repo's test-env precedent.
+/// Native Win32 fallback for moving a file aside. `unsafe` here is FFI-only,
+/// justified by a SAFETY comment; the crate-level `unsafe_code = "deny"` is
+/// opted out per-item, matching the repo's test-env precedent.
 #[cfg(windows)]
 mod windows_native {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-        QueryFullProcessImageNameW, TerminateProcess,
-    };
-
-    /// RAII guard so a process/snapshot handle is closed on every return path.
-    /// `CloseHandle` failure on drop is ignored: the handle is being discarded
-    /// regardless.
-    struct OwnedHandle(HANDLE);
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            // SAFETY: `self.0` is a handle we opened (OpenProcess /
-            // CreateToolhelp32Snapshot) and have not closed yet. Closing it
-            // exactly once here is the paired release for that open.
-            #[allow(unsafe_code)]
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-
-    /// Read `pid`'s FULL image path via the OS, or `None` if the process
-    /// cannot be opened/queried (it exited, the pid is invalid, or access was
-    /// denied). Callers treat `None` as "not ours" — never kill on uncertainty.
-    #[allow(unsafe_code)]
-    pub(super) fn pid_image_full_path(pid: u32) -> Option<String> {
-        // SAFETY: OpenProcess takes a desired-access mask, an inherit BOOL,
-        // and a pid; it returns a valid handle on success or an Err we map to
-        // None. PROCESS_QUERY_LIMITED_INFORMATION is the least privilege that
-        // permits QueryFullProcessImageNameW.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
-        let proc = OwnedHandle(handle);
-
-        let mut buf = [0u16; 1024];
-        let mut len = u32::try_from(buf.len()).expect("image-path buffer length fits in u32");
-        // SAFETY: `proc.0` is a live handle (just opened) valid for this call.
-        // PROCESS_NAME_FORMAT(0) requests the win32 path form. `buf`/`len`
-        // describe a properly sized, owned u16 buffer; the call writes at most
-        // `len` code units and updates `len` to the count written. We check
-        // the BOOL result and a non-zero length before reading the buffer.
-        let ok = unsafe {
-            QueryFullProcessImageNameW(
-                proc.0,
-                PROCESS_NAME_FORMAT(0),
-                windows::core::PWSTR(buf.as_mut_ptr()),
-                &raw mut len,
-            )
-            .is_ok()
-        };
-        if !ok || len == 0 {
-            return None;
-        }
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
-    }
-
-    /// Force-terminate `pid` natively. Caller has already identity-gated the
-    /// pid. Returns an IO error if the process cannot be opened for
-    /// termination or the terminate call fails.
-    #[allow(unsafe_code)]
-    pub(super) fn terminate_process(pid: u32) -> std::io::Result<()> {
-        let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
-        // SAFETY: OpenProcess as above; PROCESS_TERMINATE is the access right
-        // TerminateProcess requires. The Err arm maps the Win32 error into an
-        // io::Error without dereferencing anything.
-        let handle = unsafe { OpenProcess(access, false, pid) }
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let proc = OwnedHandle(handle);
-        // SAFETY: `proc.0` is a live handle opened with PROCESS_TERMINATE.
-        // TerminateProcess posts the exit and returns a BOOL we propagate as
-        // an io::Error on failure. Exit code 1 mirrors the prior `taskkill /F`.
-        unsafe { TerminateProcess(proc.0, 1) }.map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Enumerate all processes whose image FILE NAME matches `image_name`
-    /// (case-insensitive) as `(pid, full_image_path)`. The full path comes
-    /// from the authoritative per-pid query, not the snapshot's base name, so
-    /// callers can scope by install path. Self-exclusion is the caller's job
-    /// (`select_inscope_holder_pids` excludes `self_pid`).
-    #[allow(unsafe_code)]
-    pub(super) fn enumerate_by_image_name(image_name: &str) -> Vec<(u32, String)> {
-        // SAFETY: CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) returns a
-        // valid snapshot handle or an Err we map to an empty list. The handle
-        // is owned by `OwnedHandle` and released on every return path.
-        let Ok(snapshot_handle) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
-        else {
-            return Vec::new();
-        };
-        let snapshot = OwnedHandle(snapshot_handle);
-
-        let mut entry = PROCESSENTRY32W {
-            dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
-                .expect("PROCESSENTRY32W size fits in u32"),
-            ..Default::default()
-        };
-
-        let mut found = Vec::new();
-        // SAFETY: `snapshot.0` is a valid snapshot handle and `entry` is a
-        // properly initialized PROCESSENTRY32W with `dwSize` set, as the API
-        // requires. Process32FirstW fills `entry` and returns Ok/Err.
-        let mut has_entry = unsafe { Process32FirstW(snapshot.0, &raw mut entry).is_ok() };
-        while has_entry {
-            let pid = entry.th32ProcessID;
-            if exe_name_from_entry(&entry).eq_ignore_ascii_case(image_name)
-                && let Some(path) = pid_image_full_path(pid)
-            {
-                found.push((pid, path));
-            }
-            // SAFETY: same invariants as Process32FirstW; advances `entry` to
-            // the next process or returns Err at the end of the snapshot.
-            has_entry = unsafe { Process32NextW(snapshot.0, &raw mut entry).is_ok() };
-        }
-        found
-    }
-
-    /// Decode the NUL-terminated UTF-16 `szExeFile` base name from a snapshot
-    /// entry into a Rust string.
-    fn exe_name_from_entry(entry: &PROCESSENTRY32W) -> String {
-        let end = entry
-            .szExeFile
-            .iter()
-            .position(|c| *c == 0)
-            .unwrap_or(entry.szExeFile.len());
-        String::from_utf16_lossy(&entry.szExeFile[..end])
-    }
-
     /// Build a NUL-terminated UTF-16 buffer for a Win32 wide-string path arg.
     fn to_wide(path: &std::path::Path) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
@@ -1085,56 +1226,82 @@ mod windows_native {
 mod tests {
     use super::*;
 
+    /// Records every side effect in order so tests can assert sequencing.
     struct FakeOps {
-        install_calls: Vec<(String, Vec<String>)>,
-        install_result: bool,
-        installed: InstalledProbe,
+        events: Vec<String>,
         latest: Option<String>,
-        reregister_result: anyhow::Result<bool>,
-        prune_lines: Vec<String>,
-        stopped_before_install: bool,
-        reregistered_after_install: bool,
+        /// Successive `live_version` answers: before the swap, then after.
+        live: Vec<InstalledProbe>,
+        stage_result: bool,
+        staged: InstalledProbe,
+        stop: Result<String, String>,
+        installed: InstalledProbe,
+        daemon: Result<u16, String>,
+        initialize: Result<(), String>,
+        scan: Vec<(HarnessId, HarnessState)>,
+        reregister_fails: Vec<HarnessId>,
         reconciled_with: Option<bool>,
-        pruned_before_install: Option<bool>,
-        prune_calls: usize,
         shadow: Option<crate::path_shadow::ShadowReport>,
-        shadow_checked_after_install: Option<bool>,
     }
 
     impl Default for FakeOps {
         fn default() -> Self {
             Self {
-                install_calls: Vec::new(),
-                install_result: false,
-                installed: InstalledProbe::Unprobeable,
-                latest: None,
-                reregister_result: Ok(true),
-                prune_lines: Vec::new(),
-                stopped_before_install: false,
-                reregistered_after_install: false,
+                events: Vec::new(),
+                latest: Some("7.15.4".to_string()),
+                live: vec![
+                    InstalledProbe::Version("7.15.3".to_string()),
+                    InstalledProbe::Version("7.15.4".to_string()),
+                ],
+                stage_result: true,
+                staged: InstalledProbe::Version("7.15.4".to_string()),
+                stop: Ok("stopped the daemon (pid 7)".to_string()),
+                installed: InstalledProbe::Version("7.15.4".to_string()),
+                daemon: Ok(4242),
+                initialize: Ok(()),
+                scan: vec![
+                    (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
+                    (HarnessId::Cursor, HarnessState::NotInstalled),
+                ],
+                reregister_fails: Vec::new(),
                 reconciled_with: None,
-                pruned_before_install: None,
-                prune_calls: 0,
                 shadow: None,
-                shadow_checked_after_install: None,
             }
+        }
+    }
+
+    impl FakeOps {
+        fn happened(&self, event: &str) -> bool {
+            self.events.iter().any(|e| e == event)
+        }
+        fn position(&self, event: &str) -> usize {
+            self.events
+                .iter()
+                .position(|e| e == event)
+                .unwrap_or_else(|| panic!("{event} never happened: {:?}", self.events))
         }
     }
 
     impl UpdateOps for FakeOps {
         fn sweep_stale_staging(&mut self) -> Vec<String> {
+            self.events.push("sweep".into());
             Vec::new()
         }
-        fn stop_processes(&mut self) -> String {
-            self.stopped_before_install = self.install_calls.is_empty();
-            "no running daemon found".to_string()
+        fn stop_daemon(&mut self) -> anyhow::Result<String> {
+            self.events.push("stop-daemon".into());
+            self.stop.clone().map_err(|e| anyhow::anyhow!(e))
         }
-        fn npm_install(&mut self, program: &str, args: &[&str]) -> anyhow::Result<bool> {
-            self.install_calls.push((
-                program.to_string(),
-                args.iter().map(|a| a.to_string()).collect(),
-            ));
-            Ok(self.install_result)
+        fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<bool> {
+            self.events
+                .push(format!("stage {program} {}", specs.join(" ")));
+            Ok(self.stage_result)
+        }
+        fn staged_version(&mut self) -> InstalledProbe {
+            self.staged.clone()
+        }
+        fn swap_staged_into_place(&mut self) -> anyhow::Result<Vec<String>> {
+            self.events.push("swap".into());
+            Ok(Vec::new())
         }
         fn installed_version(&mut self) -> InstalledProbe {
             self.installed.clone()
@@ -1143,37 +1310,57 @@ mod tests {
             self.latest.clone()
         }
         fn prune_registry(&mut self) -> Vec<String> {
-            // Record that the prune ran before any npm install was attempted, so
-            // tests can assert the prune is unconditional and precedes the swap.
-            self.prune_calls += 1;
-            self.pruned_before_install = Some(self.install_calls.is_empty());
-            self.prune_lines.clone()
+            self.events.push("prune".into());
+            Vec::new()
         }
-        fn reregister_clients(&mut self) -> anyhow::Result<bool> {
-            self.reregistered_after_install = !self.install_calls.is_empty();
-            match &self.reregister_result {
-                Ok(value) => Ok(*value),
-                Err(error) => Err(anyhow::anyhow!("{error}")),
+        fn harness_scan(&mut self) -> HarnessScan {
+            scan_of(&self.scan)
+        }
+        fn reregister(&mut self, harness: HarnessId) -> anyhow::Result<()> {
+            self.events.push(format!("reregister {}", harness.slug()));
+            if self.reregister_fails.contains(&harness) {
+                bail!("init exited with 1");
             }
+            Ok(())
         }
         fn reconcile_durable(&mut self, reregistered: bool) -> Vec<String> {
             self.reconciled_with = Some(reregistered);
             Vec::new()
         }
         fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport> {
-            // Record that the shadow check runs only AFTER a successful install,
-            // so tests can assert ordering relative to the npm swap.
-            self.shadow_checked_after_install = Some(!self.install_calls.is_empty());
+            self.events.push("shadow".into());
             self.shadow.clone()
+        }
+        fn live_version(&mut self) -> InstalledProbe {
+            self.events.push("live-probe".into());
+            if self.live.len() > 1 {
+                self.live.remove(0)
+            } else {
+                self.live[0].clone()
+            }
+        }
+        fn restart_daemon(&mut self, version: &str) -> anyhow::Result<u16> {
+            self.events.push(format!("daemon {version}"));
+            self.daemon.clone().map_err(|e| anyhow::anyhow!(e))
+        }
+        fn verify_initialize(&mut self) -> anyhow::Result<()> {
+            self.events.push("initialize".into());
+            self.initialize.clone().map_err(|e| anyhow::anyhow!(e))
         }
     }
 
-    fn ok_ops() -> FakeOps {
-        FakeOps {
-            install_result: true,
-            installed: InstalledProbe::Version("7.15.4".to_string()),
-            latest: Some("7.15.4".to_string()),
-            ..Default::default()
+    fn scan_of(states: &[(HarnessId, HarnessState)]) -> HarnessScan {
+        HarnessScan {
+            statuses: states
+                .iter()
+                .map(|(id, state)| HarnessStatus {
+                    id: *id,
+                    config_path: PathBuf::from(format!("/home/you/{}.json", id.slug())),
+                    format: crate::cli::harness::HarnessFormat::Json,
+                    state: state.clone(),
+                })
+                .collect(),
+            grok_config_present: false,
         }
     }
 
@@ -1223,65 +1410,48 @@ mod tests {
 
     #[test]
     fn orchestrate_update_runs_full_sequence_on_success() {
-        let mut ops = ok_ops();
+        let mut ops = FakeOps::default();
         orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
 
-        assert!(ops.stopped_before_install, "stop must precede install");
-        assert_eq!(
-            ops.install_calls,
-            vec![(
-                "npm".to_string(),
-                vec![
-                    "install".to_string(),
-                    "-g".to_string(),
-                    "symforge@latest".to_string(),
-                    "symforge-linux-x64@latest".to_string(),
-                ]
-            )]
-        );
+        let stage = ops.position("stage npm symforge@latest symforge-linux-x64@latest");
+        let stop = ops.position("stop-daemon");
+        let swap = ops.position("swap");
+        let daemon = ops.position("daemon 7.15.4");
+        let initialize = ops.position("initialize");
+        let reregister = ops.position("reregister claude");
+        assert!(ops.position("prune") < stage, "cruft is pruned first");
         assert!(
-            ops.reregistered_after_install,
-            "clients re-registered after install"
+            stage < stop && stop + 1 == swap,
+            "the daemon stops only once the staged binary is verified, right before the swap: {:?}",
+            ops.events
         );
-        assert_eq!(
-            ops.reconciled_with,
-            Some(true),
-            "orphan reconcile must run with reregistered=true on success"
-        );
-        assert_eq!(
-            ops.shadow_checked_after_install,
-            Some(true),
-            "PATH-shadow check must run, and only after a successful install"
-        );
+        assert!(swap < daemon && daemon < initialize && initialize < reregister);
+        assert_eq!(ops.reconciled_with, Some(true));
+        // The daemon is the only process update stops.
+        let stops: Vec<_> = ops
+            .events
+            .iter()
+            .filter(|e| e.contains("stop") || e.contains("kill"))
+            .collect();
+        assert_eq!(stops, vec!["stop-daemon"], "{:?}", ops.events);
     }
 
     #[test]
     fn orchestrate_update_warns_but_succeeds_when_a_same_version_shadow_wins() {
-        // The shadow reports the SAME version the install resolved to (7.15.4),
-        // which the reactive stale-version bail cannot detect. The proactive
-        // shadow check must still fire; the update must still SUCCEED (the
-        // warning is advisory, not a failure).
-        let mut ops = ok_ops();
-        ops.shadow = Some(crate::path_shadow::ShadowReport {
-            our_path: std::path::PathBuf::from("/home/you/.npm-global/bin/symforge"),
-            our_version: Some("7.15.4".to_string()),
-            shadow_path: std::path::PathBuf::from("/usr/local/bin/symforge"),
-            shadow_version: Some("7.15.4".to_string()),
-            kind: crate::path_shadow::ShadowKind::RootSystem,
-        });
-
+        let mut ops = FakeOps {
+            shadow: Some(crate::path_shadow::ShadowReport {
+                our_path: PathBuf::from("/home/you/.npm-global/bin/symforge"),
+                our_version: Some("7.15.4".to_string()),
+                shadow_path: PathBuf::from("/usr/local/bin/symforge"),
+                shadow_version: Some("7.15.4".to_string()),
+                kind: crate::path_shadow::ShadowKind::RootSystem,
+            }),
+            ..Default::default()
+        };
         orchestrate_update("linux", "x86_64", &mut ops)
             .expect("a same-version shadow is advisory, not fatal");
-
-        assert_eq!(
-            ops.shadow_checked_after_install,
-            Some(true),
-            "shadow check ran after the install even on the same-version case"
-        );
-        assert!(
-            ops.reregistered_after_install,
-            "the advisory shadow warning must not short-circuit re-registration"
-        );
+        assert!(ops.position("swap") < ops.position("shadow"));
+        assert!(ops.happened("reregister claude"));
     }
 
     #[test]
@@ -1300,250 +1470,44 @@ mod tests {
 
     #[test]
     fn orchestrate_update_uses_npm_cmd_and_windows_package_on_windows() {
-        let mut ops = ok_ops();
+        let mut ops = FakeOps::default();
         orchestrate_update("windows", "x86_64", &mut ops).expect("update should succeed");
 
-        let (program, args) = &ops.install_calls[0];
-        assert_eq!(program, "npm.cmd");
-        assert!(args.contains(&"symforge-windows-x64@latest".to_string()));
+        assert!(ops.happened("stage npm.cmd symforge@latest symforge-windows-x64@latest"));
     }
 
     #[test]
     fn orchestrate_update_reports_failed_npm_without_reregistering() {
         let mut ops = FakeOps {
-            install_result: false,
-            prune_lines: vec!["pruned 1 stale version-registry entry".to_string()],
+            stage_result: false,
             ..Default::default()
         };
-
-        let err = orchestrate_update("linux", "x86_64", &mut ops)
-            .expect_err("failed npm install should be reported");
-
-        let msg = err.to_string();
-        assert!(msg.contains("exited unsuccessfully"), "{msg}");
-        // The actionable hint: clear any holder, then the exact one-step install.
-        assert!(
-            msg.contains("Ensure no running symforge process is holding the binary"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("npm install -g symforge@latest symforge-linux-x64@latest"),
-            "{msg}"
-        );
-        // The registry prune must run UNCONDITIONALLY and BEFORE the (blocked) swap,
-        // so a blocked update still cleans cruft.
-        assert_eq!(
-            ops.prune_calls, 1,
-            "prune must run even on a blocked update"
-        );
-        assert_eq!(
-            ops.pruned_before_install,
-            Some(true),
-            "prune must run before the npm swap is attempted"
-        );
-        assert!(!ops.reregistered_after_install);
-        assert_eq!(ops.reconciled_with, None, "no reconcile on failed install");
-    }
-
-    #[test]
-    fn orchestrate_update_windows_failure_gives_staged_self_lock_guidance() {
-        // On Windows the remaining lock after stopping other holders is normally
-        // the update process's OWN binary. The failure must name that self-lock and
-        // give the exact one-step remediation for a plain shell — while staying
-        // HONEST about other holders (it must not claim it stopped all of them).
-        let mut ops = FakeOps {
-            install_result: false,
-            ..Default::default()
-        };
-
         let err = orchestrate_update("windows", "x86_64", &mut ops)
-            .expect_err("a blocked Windows swap must fail with staged guidance");
-
+            .expect_err("a failed staging install is reported");
         let msg = err.to_string();
-        assert!(msg.contains("exited unsuccessfully"), "{msg}");
-        assert!(
-            msg.contains("running .exe") && msg.contains("PLAIN shell"),
-            "must name the self-lock + a plain-shell remediation: {msg}"
-        );
+        assert!(msg.contains("NOT touched"), "{msg}");
         assert!(
             msg.contains("npm install -g symforge@latest symforge-windows-x64@latest"),
-            "must print the exact install command: {msg}"
+            "{msg}"
         );
-        assert!(
-            msg.contains("init --client all"),
-            "must print the client re-registration step: {msg}"
-        );
-        // Honesty (M2): never claim ALL holders were stopped (enumeration may find
-        // or stop none), and always cover an un-enumerable holder (an MCP client).
-        assert!(
-            !msg.contains("All OTHER"),
-            "must not over-claim that all holders were stopped: {msg}"
-        );
-        assert!(
-            msg.contains("close them and rerun"),
-            "must cover an un-enumerated holder (MCP client) case: {msg}"
-        );
-        assert!(
-            !ops.reregistered_after_install,
-            "a blocked swap must not re-register clients"
-        );
-    }
-
-    #[test]
-    fn select_inscope_holder_pids_matches_same_path_excludes_self_and_other_installs() {
-        let procs = vec![
-            (100u32, r"C:\npm\symforge.exe".to_string()), // in scope
-            (200u32, r"C:\NPM\SYMFORGE.EXE".to_string()), // same path, case-insensitive -> in scope
-            (300u32, r"D:\other\symforge.exe".to_string()), // different install -> OUT of scope (Invariant 1)
-            (999u32, r"C:\npm\symforge.exe".to_string()),   // self -> excluded
-        ];
-        let pids = select_inscope_holder_pids(&procs, r"C:\npm\symforge.exe", 999);
-        assert_eq!(
-            pids,
-            vec![100, 200],
-            "only OTHER processes at the same executable path are in scope"
-        );
-    }
-
-    #[test]
-    fn select_inscope_holder_pids_empty_when_only_self_runs() {
-        let procs = vec![(999u32, r"C:\npm\symforge.exe".to_string())];
-        assert!(
-            select_inscope_holder_pids(&procs, r"C:\npm\symforge.exe", 999).is_empty(),
-            "nothing to stop when this process is the only holder"
-        );
-    }
-
-    #[test]
-    fn select_inscope_holder_pids_normalizes_slash_and_verbatim_path_forms() {
-        // M1: a genuine holder must be matched even when its path FORM differs from
-        // current_exe() — forward vs back slash, or the extended-length verbatim
-        // (\\?\) prefix that current_exe() can return on Windows.
-        let procs = vec![
-            (100u32, r"C:\npm\symforge.exe".to_string()), // back slashes
-            (200u32, "C:/npm/symforge.exe".to_string()),  // forward slashes
-            (300u32, r"\\?\C:\npm\symforge.exe".to_string()), // verbatim prefix
-            (400u32, r"C:\other\symforge.exe".to_string()), // different install -> excluded
-        ];
-        // self_exe given in the verbatim + upper-case form; all three same-binary
-        // rows (100/200/300) must still be selected, the different install excluded.
-        let pids = select_inscope_holder_pids(&procs, r"\\?\C:\NPM\symforge.exe", 999);
-        assert_eq!(
-            pids,
-            vec![100, 200, 300],
-            "path-form variants of the same binary are all in scope (M1)"
-        );
-    }
-
-    /// Copy a benign long-lived system exe to `<tmp>/symforge.exe` and spawn
-    /// it so the process's image FILE NAME is the symforge binary name (the
-    /// pattern Terminal Commander's supervisor tests use). The returned
-    /// `TempDir` keeps the copied exe alive for the test's duration.
-    #[cfg(windows)]
-    fn spawn_fake_symforge() -> (tempfile::TempDir, std::process::Child) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fake = dir.path().join("symforge.exe");
-        let ping = std::path::Path::new(r"C:\Windows\System32\PING.EXE");
-        std::fs::copy(ping, &fake).expect("copy ping.exe to symforge.exe");
-        // `ping -n 30 127.0.0.1` stays alive ~30s; far longer than the test.
-        let child = crate::process_util::hidden_command(&fake)
-            .args(["-n", "30", "127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn fake symforge");
-        (dir, child)
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn enumerate_symforge_processes_finds_spawned_symforge_image_with_full_path() {
-        let (dir, mut child) = spawn_fake_symforge();
-        let pid = child.id();
-        let procs = enumerate_symforge_processes();
-        let _ = child.kill();
-        let _ = child.wait();
-        let found = procs.iter().find(|(p, _)| *p == pid);
-        let (_, path) = found.expect("native enumeration must list the spawned symforge.exe");
-        assert_eq!(
-            normalize_exe_path(path),
-            normalize_exe_path(&dir.path().join("symforge.exe").to_string_lossy()),
-            "the enumerated entry must carry the FULL image path for install scoping"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn terminate_inscope_holder_kills_matching_path_and_spares_mismatch() {
-        // Mismatched expected path -> the holder must be left alive
-        // (Invariant 1: never touch another install; recycled-pid defense).
-        let (dir, mut child) = spawn_fake_symforge();
-        let pid = child.id();
-        terminate_inscope_holder(pid, r"C:\some\other\install\symforge.exe");
-        assert!(
-            child.try_wait().expect("try_wait").is_none(),
-            "a path-mismatched pid must NOT be terminated"
-        );
-
-        // Matching expected path -> terminated (this is the bug the taskkill
-        // graceful leg used to mask: console processes refused the graceful
-        // close and never reached the forced kill).
-        let expected = dir
-            .path()
-            .join("symforge.exe")
-            .to_string_lossy()
-            .to_string();
-        terminate_inscope_holder(pid, &expected);
-        let status = child.wait().expect("wait on terminated child");
-        assert!(
-            !status.success(),
-            "TerminateProcess(exit=1) must make the holder exit non-zero"
-        );
-
-        // A second terminate of the now-dead pid must be a no-op (identity
-        // gate: the pid no longer resolves to this image path).
-        terminate_inscope_holder(pid, &expected);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn terminate_inscope_holder_never_kills_the_test_runner() {
-        // The test runner is alive but its image is the test binary, not the
-        // expected symforge path -> must be refused (this failing would kill
-        // the test host, exactly TC's guard).
-        terminate_inscope_holder(std::process::id(), r"C:\npm\symforge.exe");
-    }
-
-    #[test]
-    fn select_inscope_rejects_other_install_and_absent_rows() {
-        let procs = vec![
-            (100u32, r"C:\npm\symforge.exe".to_string()),
-            (200u32, r"D:\other\symforge.exe".to_string()),
-            (300u32, r"\\?\C:\NPM\symforge.exe".to_string()),
-        ];
-        assert_eq!(
-            select_inscope_holder_pids(&procs, r"C:\NPM\symforge.exe", 999),
-            vec![100, 300],
-            "same-path rows (any form) are in scope; the other install is not"
-        );
-        assert_eq!(
-            select_inscope_holder_pids(&procs, r"C:\npm\symforge.exe", 100),
-            vec![300],
-            "the self pid must never be selected, even at the same path"
-        );
+        assert!(ops.happened("prune"), "prune runs even when staging fails");
+        assert!(!ops.happened("swap") && !ops.happened("stop-daemon"));
+        assert!(!ops.events.iter().any(|e| e.starts_with("daemon")));
+        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
+        assert_eq!(ops.reconciled_with, None);
     }
 
     #[test]
     fn orchestrate_update_prunes_registry_before_install_on_success() {
-        let mut ops = ok_ops();
-        ops.prune_lines = vec!["pruned 2 stale version-registry entries".to_string()];
+        let mut ops = FakeOps::default();
 
         orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
 
-        assert_eq!(ops.prune_calls, 1, "prune runs exactly once");
-        assert_eq!(
-            ops.pruned_before_install,
-            Some(true),
+        let prunes = ops.events.iter().filter(|e| *e == "prune").count();
+        assert_eq!(prunes, 1, "prune runs exactly once");
+        assert!(
+            ops.position("prune")
+                < ops.position("stage npm symforge@latest symforge-linux-x64@latest"),
             "prune precedes the npm swap"
         );
     }
@@ -1551,91 +1515,64 @@ mod tests {
     #[test]
     fn orchestrate_update_fails_loudly_when_resolved_version_stays_stale() {
         let mut ops = FakeOps {
-            install_result: true,
             installed: InstalledProbe::Version("7.15.2".to_string()),
-            latest: Some("7.15.4".to_string()),
             ..Default::default()
         };
-
         let err = orchestrate_update("linux", "x86_64", &mut ops)
             .expect_err("stale resolved version must fail loudly");
-
         let msg = err.to_string();
         assert!(msg.contains("incomplete"), "{msg}");
         assert!(msg.contains("7.15.2") && msg.contains("7.15.4"), "{msg}");
         assert!(msg.contains("PATH-shadowing"), "{msg}");
-        assert!(
-            !ops.reregistered_after_install,
-            "no re-register on a drifted install"
-        );
+        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
     }
 
     #[test]
     fn orchestrate_update_bails_on_launcher_failure_surfacing_stderr() {
-        // The marquee WSL/launcher case: install "succeeds" but the launcher
-        // cannot resolve a binary. Must bail loudly, not report "skipped".
         let mut ops = FakeOps {
-            install_result: true,
             installed: InstalledProbe::LauncherFailed(
                 "symforge: platform package symforge-linux-x64 not found".to_string(),
             ),
-            latest: Some("7.15.4".to_string()),
             ..Default::default()
         };
-
         let err = orchestrate_update("linux", "x86_64", &mut ops)
             .expect_err("a launcher that cannot resolve a binary must fail loudly");
-
         let msg = err.to_string();
         assert!(msg.contains("could not resolve a native binary"), "{msg}");
         assert!(msg.contains("symforge-linux-x64 not found"), "{msg}");
-        assert!(!ops.reregistered_after_install);
+        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
     }
 
     #[test]
     fn orchestrate_update_floors_against_running_version_when_registry_offline() {
-        // Registry unreachable (latest=None) AND the resolved binary is older than
-        // the binary running the update — the swap demonstrably failed, so bail
-        // even without a registry answer.
         let mut ops = FakeOps {
-            install_result: true,
-            installed: InstalledProbe::Version("0.0.1".to_string()),
             latest: None,
+            staged: InstalledProbe::Version("0.0.1".to_string()),
+            installed: InstalledProbe::Version("0.0.1".to_string()),
             ..Default::default()
         };
-
         let err = orchestrate_update("linux", "x86_64", &mut ops)
             .expect_err("a binary older than the running update binary must fail even offline");
-
         assert!(err.to_string().contains("incomplete"), "{err:?}");
-        assert!(!ops.reregistered_after_install);
+        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
     }
 
     #[test]
     fn orchestrate_update_warns_but_succeeds_when_probe_is_unavailable() {
-        // Launcher genuinely not spawnable: install ran, so don't fail; still
-        // re-register + reconcile.
         let mut ops = FakeOps {
-            install_result: true,
             installed: InstalledProbe::Unprobeable,
-            latest: Some("7.15.4".to_string()),
             ..Default::default()
         };
         orchestrate_update("linux", "x86_64", &mut ops)
-            .expect("unprobeable launcher must not fail an otherwise-successful update");
-        assert!(ops.reregistered_after_install);
+            .expect("an unprobeable launcher must not fail an otherwise-verified update");
+        assert!(ops.happened("reregister claude"));
         assert_eq!(ops.reconciled_with, Some(true));
     }
 
     #[test]
     fn orchestrate_update_does_not_remove_orphan_when_reregistration_fails() {
-        // reconcile must be told reregistered=false so the orphan (still
-        // referenced by clients) is NOT deleted.
         let mut ops = FakeOps {
-            install_result: true,
-            installed: InstalledProbe::Version("7.15.4".to_string()),
-            latest: Some("7.15.4".to_string()),
-            reregister_result: Ok(false),
+            reregister_fails: vec![HarnessId::ClaudeCode],
             ..Default::default()
         };
         orchestrate_update("linux", "x86_64", &mut ops).expect("update should still succeed");
@@ -1648,18 +1585,276 @@ mod tests {
 
     #[test]
     fn install_invocation_uses_no_shell_wrappers() {
-        let mut ops = ok_ops();
-        orchestrate_update("windows", "x86_64", &mut ops).unwrap();
-
-        let (program, args) = &ops.install_calls[0];
+        let args = staging_install_args(
+            Path::new("C:/npm/.symforge-update-staging"),
+            &install_specs("windows", "x86_64"),
+        );
         let text = invocation_text(
-            program,
+            npm_executable_for_os("windows"),
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )
         .to_ascii_lowercase();
         assert!(!text.contains("powershell"));
         assert!(!text.contains("cmd /c"));
         assert!(!text.contains("executionpolicy"));
+    }
+
+    #[test]
+    fn a_failed_daemon_stop_is_reported_and_the_restart_still_runs() {
+        let mut ops = FakeOps {
+            stop: Err("reading daemon port file: access denied".to_string()),
+            ..Default::default()
+        };
+        orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
+        assert!(ops.position("swap") < ops.position("daemon 7.15.4"));
+    }
+
+    #[test]
+    fn orchestrate_update_skips_the_swap_when_the_live_binary_is_latest_but_still_verifies() {
+        let mut ops = FakeOps {
+            live: vec![InstalledProbe::Version("7.15.4".to_string())],
+            ..Default::default()
+        };
+        orchestrate_update("windows", "x86_64", &mut ops).expect("an up-to-date update succeeds");
+
+        assert!(
+            !ops.events.iter().any(|e| e.starts_with("stage")),
+            "{:?}",
+            ops.events
+        );
+        assert!(!ops.happened("swap"));
+        assert!(
+            !ops.happened("stop-daemon"),
+            "nothing is stopped when nothing is swapped"
+        );
+        assert!(
+            ops.happened("daemon 7.15.4"),
+            "post-verify still restarts/ensures the daemon"
+        );
+        assert!(
+            ops.happened("initialize"),
+            "post-verify still replays initialize"
+        );
+    }
+
+    #[test]
+    fn orchestrate_update_never_short_circuits_without_a_registry_answer() {
+        let mut ops = FakeOps {
+            latest: None,
+            live: vec![InstalledProbe::Version(
+                env!("CARGO_PKG_VERSION").to_string(),
+            )],
+            installed: InstalledProbe::Version(env!("CARGO_PKG_VERSION").to_string()),
+            ..Default::default()
+        };
+        orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
+        assert!(ops.happened("swap"), "equal-to-unknown is not up to date");
+    }
+
+    #[test]
+    fn a_staged_binary_behind_the_registry_aborts_before_the_swap() {
+        let mut ops = FakeOps {
+            staged: InstalledProbe::Version("7.15.2".to_string()),
+            ..Default::default()
+        };
+        let err = orchestrate_update("linux", "x86_64", &mut ops)
+            .expect_err("a stale staged binary must not be swapped in");
+        assert!(err.to_string().contains("7.15.2"), "{err}");
+        assert!(!ops.happened("swap") && !ops.happened("stop-daemon"));
+    }
+
+    #[test]
+    fn a_silent_new_binary_fails_the_update_loudly_and_skips_reregistration() {
+        let mut ops = FakeOps {
+            initialize: Err("no `initialize` result within 10s".to_string()),
+            ..Default::default()
+        };
+        let err = orchestrate_update("linux", "x86_64", &mut ops)
+            .expect_err("an unanswered initialize must fail the update");
+        assert!(format!("{err:#}").contains("initialize"), "{err:#}");
+        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
+        assert_eq!(ops.reconciled_with, None);
+    }
+
+    #[test]
+    fn a_daemon_restart_failure_is_reported_not_swallowed() {
+        let mut ops = FakeOps {
+            daemon: Err("auto-spawn disabled".to_string()),
+            ..Default::default()
+        };
+        // The machine still works (clients spawn the daemon on demand), so the
+        // update succeeds; the summary carries the failure.
+        orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
+        assert!(ops.happened("initialize"));
+    }
+
+    #[test]
+    fn plan_reregistration_touches_only_harnesses_that_already_use_symforge() {
+        let mut scan = scan_of(&[
+            (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
+            (
+                HarnessId::Codex,
+                HarnessState::PresentStale(crate::cli::harness::StaleFields::Url),
+            ),
+            (HarnessId::Gemini, HarnessState::NotInstalled),
+            (HarnessId::Cursor, HarnessState::Absent),
+            (
+                HarnessId::ClaudeDesktop,
+                HarnessState::Malformed("expected `=`, found `sk-secret`".to_string()),
+            ),
+            (HarnessId::KiloCode, HarnessState::PresentCurrent),
+        ]);
+        scan.grok_config_present = true;
+
+        let (targets, skipped) = plan_reregistration(&scan);
+
+        assert_eq!(targets, vec![HarnessId::ClaudeCode, HarnessId::Codex]);
+        let text = skipped.join("\n");
+        assert!(
+            text.contains("Claude Desktop") && text.contains("does not parse"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("sk-secret"),
+            "a parse error can quote a credential and must not be echoed: {text}"
+        );
+        assert!(
+            text.contains("Kilo Code") && text.contains("project-local"),
+            "{text}"
+        );
+        assert!(text.contains("Grok"), "{text}");
+        assert!(
+            !text.contains("Gemini") && !text.contains("Cursor"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn summary_renders_versions_harnesses_daemon_initialize_and_skips() {
+        let summary = UpdateSummary {
+            old_version: "11.2.0".to_string(),
+            new_version: "11.3.0".to_string(),
+            up_to_date: false,
+            swapped: true,
+            reregistered: vec!["Claude Code", "Codex"],
+            daemon: Some(Ok(51234)),
+            initialize: Some(Ok(())),
+            notes: vec!["skipped: re-registering Cursor: init exited with 1".to_string()],
+        };
+        assert_eq!(
+            summary.render(),
+            "symforge update summary:\n  version: 11.2.0 -> 11.3.0\n  re-registered: Claude Code, Codex\n  \
+             daemon restarted: yes (port 51234)\n  initialize verified: yes\n  \
+             skipped: re-registering Cursor: init exited with 1"
+        );
+
+        let up_to_date = UpdateSummary {
+            old_version: "11.3.0".to_string(),
+            new_version: "11.3.0".to_string(),
+            up_to_date: true,
+            daemon: Some(Err("auto-spawn disabled".to_string())),
+            ..Default::default()
+        };
+        let text = up_to_date.render();
+        assert!(
+            text.contains("11.3.0 (already the latest; swap skipped)"),
+            "{text}"
+        );
+        assert!(text.contains("re-registered: none"), "{text}");
+        assert!(
+            text.contains("daemon restarted: no (auto-spawn disabled)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("initialize verified: no (not attempted)"),
+            "{text}"
+        );
+
+        // A failure before the swap: the version did not move and nothing
+        // after the failure ran.
+        let failed = UpdateSummary {
+            old_version: "11.2.0".to_string(),
+            notes: vec!["skipped: 1 leftover(s) in C:/npm/.symforge-update-stale".to_string()],
+            ..Default::default()
+        };
+        let text = failed.render();
+        assert!(text.contains("version: 11.2.0 (unchanged)"), "{text}");
+        assert!(
+            text.contains("daemon restarted: no (not attempted)"),
+            "{text}"
+        );
+        assert!(text.contains("skipped: 1 leftover(s)"), "{text}");
+    }
+
+    #[test]
+    fn initialize_result_requires_the_replayed_id_and_a_protocol_version() {
+        assert!(is_initialize_result(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#
+        ));
+        assert!(!is_initialize_result(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"bad"}}"#
+        ));
+        assert!(!is_initialize_result(
+            r#"{"jsonrpc":"2.0","method":"notifications/message"}"#
+        ));
+        assert!(!is_initialize_result("not json"));
+    }
+
+    #[test]
+    fn verify_initialize_fails_fast_when_the_binary_cannot_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = verify_initialize_at(
+            &tmp.path().join("missing-symforge"),
+            tmp.path(),
+            Duration::from_secs(1),
+        )
+        .expect_err("a missing binary cannot answer");
+        assert!(format!("{err:#}").contains("stdio MCP server"), "{err:#}");
+    }
+
+    #[test]
+    fn staging_install_is_local_to_the_staging_prefix_and_never_global() {
+        let staging = Path::new("/npm/.symforge-update-staging");
+        let args = staging_install_args(staging, &install_specs("linux", "x86_64"));
+        assert_eq!(
+            args,
+            vec![
+                "install",
+                "--prefix",
+                &staging.display().to_string(),
+                "--no-save",
+                "symforge@latest",
+                "symforge-linux-x64@latest",
+            ]
+        );
+        assert!(
+            !args.iter().any(|a| a == "-g" || a == "--global"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn install_layout_maps_the_live_and_staged_binary_per_os() {
+        let prefix = Path::new("/p");
+        assert_eq!(
+            native_binary_in(
+                &global_modules_dir(prefix, "windows"),
+                "symforge-windows-x64",
+                "windows"
+            ),
+            prefix.join("node_modules/symforge-windows-x64/bin/symforge.exe")
+        );
+        assert_eq!(
+            native_binary_in(
+                &global_modules_dir(prefix, "linux"),
+                "symforge-linux-x64",
+                "linux"
+            ),
+            prefix.join("lib/node_modules/symforge-linux-x64/bin/symforge")
+        );
+        let staging = update_staging_dir(prefix);
+        assert_eq!(staging, prefix.join(".symforge-update-staging"));
+        assert!(!staging.starts_with(global_modules_dir(prefix, "windows")));
     }
 
     // ── Windows self-update robustness: timeout floor, move-aside staging, sweep ──
@@ -1716,99 +1911,155 @@ mod tests {
     }
 
     #[test]
-    fn staged_restore_repopulates_the_path_when_no_binary_landed() {
-        // Closes ALL THREE brick paths at once — a failed spawn, a `try_wait`
-        // error, a timeout, AND the npm-exit-0-but-no-re-extract re-run: the guard
-        // drops with the install path still EMPTY and must move the staged binary
-        // back so the install is never bricked.
-        let tmp = tempfile::tempdir().unwrap();
-        let original = tmp.path().join("symforge.exe"); // npm's target — left empty
-        let staged = tmp
-            .path()
-            .join(".symforge-update-stale")
-            .join("symforge.exe.old-1");
-        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, b"the-old-binary").unwrap();
-        assert!(!original.exists(), "precondition: npm landed no binary");
-
-        drop(StagedRestore {
-            staged: staged.clone(),
-            original: original.clone(),
-        });
-
-        assert!(
-            original.exists(),
-            "the guard must restore the binary to the empty install path"
-        );
-        assert_eq!(std::fs::read(&original).unwrap(), b"the-old-binary");
-        assert!(
-            !staged.exists(),
-            "the staged copy moved back, not left behind"
-        );
-    }
-
-    #[test]
-    fn staged_restore_disarms_when_a_binary_landed() {
-        // npm re-extracted a fresh binary at the path (npm returned 0 OR not — the
-        // guard never looks at the exit code, only at the path) → it must NOT
-        // clobber the fresh binary; the staged `.old` is left for the next sweep.
-        let tmp = tempfile::tempdir().unwrap();
-        let original = tmp.path().join("symforge.exe");
-        std::fs::write(&original, b"fresh-binary").unwrap(); // npm's fresh install landed
-        let staged = tmp
-            .path()
-            .join(".symforge-update-stale")
-            .join("symforge.exe.old-1");
-        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, b"the-old-binary").unwrap();
-
-        drop(StagedRestore {
-            staged: staged.clone(),
-            original: original.clone(),
-        });
-
-        assert_eq!(
-            std::fs::read(&original).unwrap(),
-            b"fresh-binary",
-            "a landed binary must survive the guard drop"
-        );
-        assert!(
-            staged.exists(),
-            "the staged .old is left for the sweep when a binary landed"
-        );
-    }
-
-    #[test]
     fn sweep_stale_dir_removes_leftovers_skips_unremovable_and_tolerates_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("symforge.exe.old-1"), b"a").unwrap();
         std::fs::write(dir.join("symforge.exe.old-2"), b"b").unwrap();
         // A subdirectory stands in for a still-locked entry: remove_file refuses a
-        // directory on every platform, so the sweep must SKIP it, not fail.
+        // directory on every platform.
         std::fs::create_dir(dir.join("locked-like-subdir")).unwrap();
 
         let lines = sweep_stale_dir(dir);
         assert!(!dir.join("symforge.exe.old-1").exists());
         assert!(!dir.join("symforge.exe.old-2").exists());
-        assert!(
-            dir.join("locked-like-subdir").exists(),
-            "an unremovable entry must be skipped, not fail the sweep"
-        );
-        assert_eq!(lines.len(), 1, "one summary line: {lines:?}");
+        assert!(dir.join("locked-like-subdir").exists());
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("swept 2"), "{lines:?}");
+        assert!(lines[1].starts_with("skipped: 1 leftover"), "{lines:?}");
 
-        // A nonexistent directory (no prior staging) is a silent no-op.
         assert!(sweep_stale_dir(&dir.join("nope")).is_empty());
     }
 
+    /// Copy a benign long-lived system binary to `path` and run it, standing in
+    /// for a live harness session executing the installed symforge binary.
+    fn spawn_holder_at(path: &Path) -> std::process::Child {
+        #[cfg(windows)]
+        let (source, args): (&str, &[&str]) =
+            (r"C:\Windows\System32\PING.EXE", &["-n", "60", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let (source, args): (&str, &[&str]) = ("/bin/sleep", &["60"]);
+        std::fs::copy(source, path).expect("copy holder binary");
+        crate::process_util::hidden_command(path)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn holder")
+    }
+
     #[test]
-    #[cfg(not(windows))]
-    fn staging_and_sweep_are_noops_on_unix() {
-        // Unix overwrites a running binary in place, so there is nothing to stage
-        // or sweep — both entry points are a no-op (and no guard is ever created).
-        assert!(stage_running_binary_aside().is_none());
-        assert!(run_stale_sweep().is_empty());
+    fn the_swap_replaces_a_running_binary_without_stopping_its_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staging/node_modules/pkg");
+        let live = tmp.path().join("node_modules/pkg");
+        let aside = tmp.path().join(".symforge-update-stale");
+        std::fs::create_dir_all(staged.join("bin")).unwrap();
+        std::fs::create_dir_all(live.join("bin")).unwrap();
+        let live_binary = live
+            .join("bin")
+            .join(native_binary_name(std::env::consts::OS));
+        std::fs::write(
+            staged
+                .join("bin")
+                .join(native_binary_name(std::env::consts::OS)),
+            b"new-binary",
+        )
+        .unwrap();
+        std::fs::write(staged.join("package.json"), b"{\"version\":\"2\"}").unwrap();
+        std::fs::write(live.join("package.json"), b"{\"version\":\"1\"}").unwrap();
+        std::fs::write(live.join("only-in-old.txt"), b"kept").unwrap();
+        let mut holder = spawn_holder_at(&live_binary);
+        let old_bytes = std::fs::read(&live_binary).unwrap();
+
+        // Probe the path the whole time the swap runs.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prober = {
+            let stop = std::sync::Arc::clone(&stop);
+            let path = live_binary.clone();
+            std::thread::spawn(move || {
+                let (mut checks, mut misses) = (0u64, 0u64);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    checks += 1;
+                    if std::fs::metadata(&path).is_err() {
+                        misses += 1;
+                    }
+                }
+                (checks, misses)
+            })
+        };
+        let swapped = overlay_package(&staged, &live, &aside);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (checks, misses) = prober.join().unwrap();
+        let still_running = holder.try_wait().unwrap().is_none();
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+
+        swapped.expect("the overlay succeeds over a running binary");
+        assert!(still_running, "the running session must survive the swap");
+        assert_eq!(std::fs::read(&live_binary).unwrap(), b"new-binary");
+        assert_eq!(
+            std::fs::read(live.join("package.json")).unwrap(),
+            b"{\"version\":\"2\"}"
+        );
+        assert!(live.join("only-in-old.txt").exists());
+        assert!(checks > 0);
+        if cfg!(windows) {
+            // The running image was refused as a rename target, so it went aside.
+            let moved: Vec<_> = std::fs::read_dir(&aside).unwrap().flatten().collect();
+            assert_eq!(moved.len(), 1, "{moved:?}");
+            assert_eq!(std::fs::read(moved[0].path()).unwrap(), old_bytes);
+        } else {
+            // rename(2) replaces a running binary atomically: never absent.
+            assert_eq!(misses, 0, "the path was absent in {misses}/{checks} probes");
+        }
+    }
+
+    #[test]
+    fn replace_file_moves_the_old_file_back_when_the_new_one_cannot_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("staged.bin");
+        let dst = tmp.path().join("symforge.bin");
+        let aside = tmp.path().join("aside");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+
+        // Every rename of the staged file is refused the way Windows refuses a
+        // running image; the aside and move-back renames are real.
+        let err = replace_file(&src, &dst, &aside, |from, to| {
+            if from == src.as_path() {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                std::fs::rename(from, to)
+            }
+        })
+        .expect_err("the staged file never landed");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"old",
+            "the old file is back in place"
+        );
+        assert_eq!(std::fs::read_dir(&aside).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&src).unwrap(), b"new");
+    }
+
+    #[test]
+    fn replace_file_does_not_touch_the_target_for_other_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("symforge.bin");
+        std::fs::write(&dst, b"old").unwrap();
+        let err = replace_file(
+            &tmp.path().join("missing"),
+            &dst,
+            &tmp.path().join("aside"),
+            |a, b| std::fs::rename(a, b),
+        )
+        .expect_err("a missing staged file is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"old");
+        assert!(!tmp.path().join("aside").exists());
     }
 
     #[test]

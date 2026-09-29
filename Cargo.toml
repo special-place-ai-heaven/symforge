@@ -151,16 +151,12 @@ zstd = "0.14"
 cap-std = "4.0.3"
 
 [target.'cfg(windows)'.dependencies]
-# Native process control for the self-update binary swap (cli/update.rs):
-# ToolHelp enumeration + image-path identity + TerminateProcess instead of
-# spawned powershell/taskkill/tasklist (taskkill's graceful mode is refused
-# by console daemons, and corporate EDR flags spawned kill tools). Pattern
-# ported from Terminal Commander's supervisor.
+# Native Win32 calls: the self-update move-aside fallback (cli/update.rs),
+# sidecar process waits, and filesystem identity queries.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
-    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [dev-dependencies]

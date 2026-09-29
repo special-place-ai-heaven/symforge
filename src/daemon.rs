@@ -2772,10 +2772,47 @@ async fn connect_or_spawn_session_at(
 }
 
 async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow::Result<u16> {
-    let identity = current_daemon_identity();
-    if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
+    ensure_daemon_running_as(control_state_dir, &current_daemon_identity(), None).await
+}
+
+/// `symforge update`: make sure a daemon of `version`, running from the freshly
+/// installed `executable`, owns the daemon records. This is the stdio client's
+/// own spawn path with the NEW binary's identity, so an older recorded daemon is
+/// replaced exactly as a new session would replace it.
+pub(crate) async fn ensure_installed_daemon_running(
+    executable: &Path,
+    version: &str,
+) -> anyhow::Result<u16> {
+    let control_state_dir = process_control_state_dir()?;
+    let identity = DaemonIdentity {
+        version: version.to_string(),
+        executable_path: normalized_path_string(executable),
+    };
+    ensure_daemon_running_as(control_state_dir, &identity, Some(executable)).await
+}
+
+/// Ensure a daemon matching `identity` is running, spawning `executable`
+/// (this process's own binary when `None`) if not.
+async fn ensure_daemon_running_as(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+    executable: Option<&Path>,
+) -> anyhow::Result<u16> {
+    if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
         tracing::debug!("daemon already running on port {port}");
         return Ok(port);
+    }
+
+    // `symforge update` leaves sessions of the previous release running. When
+    // one of them loses its daemon connection it lands here with an OLDER
+    // identity; replacing the newer daemon would knock every new session off it,
+    // and the replacement it spawns from its own path is the new binary, which
+    // never matches the old identity. Serve locally instead.
+    if let Some(newer) = newer_recorded_daemon_version_at(control_state_dir, identity).await {
+        anyhow::bail!(
+            "a newer symforge daemon ({newer}) owns this SymForge home; this {} process will not replace it",
+            identity.version
+        );
     }
 
     // INCIDENT GUARD (2026-07-11): when auto-spawn cannot happen (test
@@ -2789,23 +2826,23 @@ async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow
     }
 
     if let Some(lock) = try_acquire_start_lock_at(control_state_dir)? {
-        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
+        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
             tracing::debug!("daemon became ready while acquiring lock, port {port}");
             return Ok(port);
         }
         tracing::info!("acquired start lock, spawning new daemon");
-        stop_incompatible_recorded_daemon_at(control_state_dir, &identity).await?;
-        spawn_daemon_process()?;
+        stop_incompatible_recorded_daemon_at(control_state_dir, identity).await?;
+        spawn_daemon_process(executable)?;
         // Task 9: release the lock as soon as the child is spawned — the
         // child's `guarded_daemon_start` acquires the SAME lock before
         // binding, so holding it through `wait_for_daemon_ready` would
         // deadlock parent (waiting for the child's port file) against child
         // (waiting for the lock).
         drop(lock);
-        wait_for_daemon_ready_at(control_state_dir, &identity).await
+        wait_for_daemon_ready_at(control_state_dir, identity).await
     } else {
         tracing::info!("start lock held by another process, waiting for daemon");
-        wait_for_daemon_ready_at(control_state_dir, &identity).await
+        wait_for_daemon_ready_at(control_state_dir, identity).await
     }
 }
 
@@ -2893,6 +2930,18 @@ async fn daemon_port_if_compatible_at(
         }
         None => Ok(None),
     }
+}
+
+/// The version of the live recorded daemon when it is NEWER than `identity`.
+/// An unreadable record or an unreachable daemon is not newer.
+async fn newer_recorded_daemon_version_at(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+) -> Option<String> {
+    let port = read_daemon_port_file_at(control_state_dir).ok()?;
+    let health = daemon_health(port).await?;
+    crate::cli::version::is_newer_version(&health.daemon_version, &identity.version)
+        .then_some(health.daemon_version)
 }
 
 async fn wait_for_daemon_ready_at(
@@ -3227,8 +3276,12 @@ fn daemon_autospawn_disabled() -> bool {
         .unwrap_or(false)
 }
 
-fn spawn_daemon_process() -> anyhow::Result<()> {
-    let current_exe = std::env::current_exe().context("locating current symforge executable")?;
+/// Spawn `executable daemon` detached; `None` spawns this process's own binary.
+fn spawn_daemon_process(executable: Option<&Path>) -> anyhow::Result<()> {
+    let current_exe = match executable {
+        Some(executable) => executable.to_path_buf(),
+        None => std::env::current_exe().context("locating current symforge executable")?,
+    };
     // INCIDENT GUARD (2026-07-11): under `cargo test`, `current_exe` is the
     // libtest binary and the `daemon` argument below is interpreted as a TEST
     // FILTER — spawning it recursively re-runs the daemon test subset, which
@@ -3278,12 +3331,48 @@ fn spawn_daemon_process() -> anyhow::Result<()> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        stop_std_handle_inheritance();
     }
 
     command
         .spawn()
         .context("spawning detached symforge daemon")?;
     Ok(())
+}
+
+/// A Windows child inherits EVERY inheritable handle of its parent, not just
+/// the three it is given, so the detached daemon would otherwise hold this
+/// process's own stdio: a harness pipe when a stdio session spawns it, or the
+/// caller's pipe when `symforge update | tee` restarts it. A daemon holding a
+/// write end keeps that reader from ever seeing EOF (measured: a piped
+/// `symforge update` hung until the daemon exited). Clearing the inherit flag
+/// is safe for later children: `Stdio::inherit` duplicates the std handles
+/// into a fresh inheritable copy.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn stop_std_handle_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{
+        HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+    };
+
+    for (name, raw) in [
+        ("stdin", std::io::stdin().as_raw_handle()),
+        ("stdout", std::io::stdout().as_raw_handle()),
+        ("stderr", std::io::stderr().as_raw_handle()),
+    ] {
+        if raw.is_null() {
+            continue; // no such handle, nothing to inherit
+        }
+        // SAFETY: `raw` is this process's live std handle, borrowed for the
+        // call only; SetHandleInformation changes its inherit flag and touches
+        // no memory we own.
+        if let Err(error) =
+            unsafe { SetHandleInformation(HANDLE(raw), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }
+        {
+            tracing::warn!("could not stop the daemon inheriting {name}: {error}");
+        }
+    }
 }
 
 fn current_daemon_identity() -> DaemonIdentity {
@@ -14025,7 +14114,7 @@ mod tests {
     /// flood). This pins the refusal at both seams.
     #[tokio::test]
     async fn test_test_builds_never_auto_spawn_daemon_processes() {
-        let error = spawn_daemon_process().expect_err("test build must refuse to spawn");
+        let error = spawn_daemon_process(None).expect_err("test build must refuse to spawn");
         assert!(
             error.to_string().contains("test build"),
             "refusal must name the test-build guard: {error}"
@@ -14043,6 +14132,36 @@ mod tests {
             error.to_string().contains("auto-spawn is disabled"),
             "ensure_daemon_running must fail fast without spawning: {error}"
         );
+    }
+
+    /// `symforge update` leaves sessions of the previous release running; one
+    /// that loses its daemon connection must not replace the newer daemon.
+    #[tokio::test]
+    async fn an_older_session_never_replaces_a_newer_daemon() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let older = DaemonIdentity {
+            version: "0.0.1".to_string(),
+            executable_path: current_daemon_identity().executable_path,
+        };
+
+        let error = ensure_daemon_running_as(&test_control_state(daemon_home.path()), &older, None)
+            .await
+            .expect_err("an older identity must not take over");
+
+        assert!(
+            error.to_string().contains("newer symforge daemon"),
+            "{error}"
+        );
+        assert!(
+            daemon_health_ok(handle.port).await,
+            "the newer daemon must still be serving"
+        );
+        let _ = handle.shutdown_tx.send(());
     }
 
     /// Task 8: after the daemon dies and a replacement comes up, the proxy
