@@ -175,6 +175,10 @@ criterion = "0.8.2"
 # Upstream build.rs uses `-Wno-unused-parameter` which MSVC rejects.
 # Patched copy uses `flag_if_supported` so the flag is silently skipped on MSVC.
 tree-sitter-scss = { path = "vendor/tree-sitter-scss" }
+# rmcp 3.5.0 with two lifecycle fixes: clear the discover-latched request-metadata
+# requirement after a successful initialize, and record the negotiated protocol
+# version as peer info. See vendor/rmcp/SYMFORGE-PATCH.md; drop on upstream fix.
+rmcp = { path = "vendor/rmcp" }
 
 [profile.release]
 lto = true
