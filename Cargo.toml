@@ -147,7 +147,7 @@ dunce = "1"
 socket2 = { version = "0.6", optional = true }
 # Team artifact compression (R-11/D-015-009): backs the always-on
 # `index.bin.zst` export/import (contracts/team-artifact.md, C-S1A-005).
-zstd = "0.13"
+zstd = "0.14"
 cap-std = "4.0.3"
 
 [target.'cfg(windows)'.dependencies]
