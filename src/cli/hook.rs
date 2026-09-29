@@ -556,6 +556,7 @@ pub fn run_hook_with_input_at(
                         Some(&daemon_session_id),
                         "index_not_ready",
                         verbose,
+                        &repo_root,
                     );
                     return Ok(());
                 }
@@ -566,6 +567,7 @@ pub fn run_hook_with_input_at(
                         Some(&daemon_session_id),
                         "root_conflict",
                         verbose,
+                        &repo_root,
                     );
                     return Ok(());
                 }
@@ -576,6 +578,7 @@ pub fn run_hook_with_input_at(
                         Some(&daemon_session_id),
                         "http_failure",
                         verbose,
+                        &repo_root,
                     );
                     return Ok(());
                 }
@@ -586,6 +589,7 @@ pub fn run_hook_with_input_at(
                         effective_session_id.as_deref(),
                         "index_not_ready",
                         verbose,
+                        &repo_root,
                     );
                     return Ok(());
                 }
@@ -596,6 +600,7 @@ pub fn run_hook_with_input_at(
                         effective_session_id.as_deref(),
                         "root_conflict",
                         verbose,
+                        &repo_root,
                     );
                     return Ok(());
                 }
@@ -606,6 +611,7 @@ pub fn run_hook_with_input_at(
                         effective_session_id.as_deref(),
                         "http_failure",
                         verbose,
+                        &repo_root,
                     );
                     return Ok(());
                 }
@@ -653,11 +659,27 @@ fn emit_live_refusal_fail_open(
     session_id: Option<&str>,
     reason: &str,
     verbose: bool,
+    repo_root: &std::path::Path,
 ) {
     if verbose {
         eprintln!("[symforge-hook] outcome=SidecarError reason={reason}");
     }
     record_hook_outcome(workflow, HookOutcome::SidecarError, session_id);
+    // A session that starts while the index is still loading is told so in
+    // one line instead of silently getting no context. Only on an observed
+    // index-not-ready answer: nothing else here proves indexing is under way.
+    if event_name == "SessionStart" && reason == "index_not_ready" {
+        let project = repo_root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| repo_root.display().to_string());
+        let notice = format!(
+            "symforge: {project}: {}.",
+            crate::protocol::format::INITIAL_INDEXING_IN_PROGRESS
+        );
+        println!("{}", success_json(event_name, &notice));
+        return;
+    }
     println!("{}", fail_open_json(event_name));
 }
 

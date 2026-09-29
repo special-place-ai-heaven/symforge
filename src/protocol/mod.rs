@@ -1,5 +1,6 @@
 pub mod ccr;
 pub mod conventions;
+pub(crate) mod deferred_stdio;
 pub(crate) mod edit;
 pub(crate) mod edit_format;
 pub mod edit_hooks;
@@ -2280,6 +2281,25 @@ impl ServerHandler for SymForgeServer {
                             .join("\n");
                         if !body.is_empty() && tools::is_error_output(&body) {
                             result.is_error = Some(true);
+                        } else if tools::is_index_unavailable_output(&body) {
+                            // The index could not serve (loading, not loaded,
+                            // degraded), so the call did not run. Statused tools
+                            // already type this `internal_failure`; a plain-String
+                            // tool reached the wire as isError:false, which reads
+                            // exactly like a real empty answer. Never overwrite a
+                            // status a statused tool wrote itself.
+                            result.is_error = Some(true);
+                            result
+                                .meta
+                                .get_or_insert_with(Default::default)
+                                .0
+                                .entry(result_status::RESULT_STATUS_META_KEY.to_string())
+                                .or_insert_with(|| {
+                                    serde_json::to_value(result_status::ResultStatus::new(
+                                        OutcomeClass::InternalFailure,
+                                    ))
+                                    .expect("ResultStatus must serialize to JSON")
+                                });
                         }
                     }
                     // Feature 032 (US1): AFTER evidence attachment (the

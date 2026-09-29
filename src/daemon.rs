@@ -1150,7 +1150,7 @@ impl DaemonState {
         canonical_root: &Path,
     ) -> anyhow::Result<Arc<ProjectSlot>> {
         self.ensure_project_slot_for_session_with(session_id, project_id, || {
-            ProjectInstance::load(canonical_root)
+            ProjectInstance::load_for_session_open(canonical_root)
         })
     }
 
@@ -2677,6 +2677,14 @@ impl Drop for DaemonStartLock {
     }
 }
 
+/// How long a session open may take before the adapter gives up on the
+/// daemon and falls back to a local index. The stdio front answers the
+/// handshake while the open runs, so this bound protects no harness timeout;
+/// it only decides when to stop waiting for the daemon. A snapshot restore of
+/// a large project runs inside the open and can take minutes, and giving up
+/// early would leave every such harness on its own private local index.
+const DAEMON_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 pub async fn connect_or_spawn_session(
     project_root: &Path,
     client_name: &str,
@@ -2718,6 +2726,7 @@ async fn connect_or_spawn_session_at(
     let auth_token = resolve_daemon_auth_token_at(control_state_dir);
     let open_request = http_client
         .post(format!("{base_url}/v1/sessions/open"))
+        .timeout(DAEMON_SESSION_OPEN_TIMEOUT)
         .json(&OpenProjectRequest {
             project_root: project_root_text.to_string(),
             client_name: client_name.to_string(),
@@ -3394,7 +3403,24 @@ fn stable_path_identity(path: &str) -> String {
 }
 
 impl ProjectInstance {
+    #[cfg(test)]
     fn load(canonical_root: &Path) -> anyhow::Result<Self> {
+        Self::load_rooted(canonical_root, None)
+    }
+
+    /// The `/v1/sessions/open` load. A cold index (no usable snapshot) gets at
+    /// most [`SESSION_OPEN_COLD_INDEX_BUDGET`] inside the request; past that
+    /// the open answers with the project still `Loading` and the load finishes
+    /// in the background. Without the budget one open on a large repository ran
+    /// the whole cold parse inside the request and outlived the client timeout.
+    fn load_for_session_open(canonical_root: &Path) -> anyhow::Result<Self> {
+        Self::load_rooted(canonical_root, Some(SESSION_OPEN_COLD_INDEX_BUDGET))
+    }
+
+    fn load_rooted(
+        canonical_root: &Path,
+        cold_index_budget: Option<Duration>,
+    ) -> anyhow::Result<Self> {
         let binding = RootBinding {
             source: RootCandidateSource::InitCwd,
             canonical_root: canonical_root.to_path_buf(),
@@ -3402,10 +3428,18 @@ impl ProjectInstance {
             access_mode: SourceAccessMode::NormalProject,
         };
         let state_placement = crate::discovery::resolve_state_placement(&binding);
-        Self::load_bound(&binding, state_placement)
+        Self::load_bound_within(&binding, state_placement, cold_index_budget)
     }
 
     fn load_bound(binding: &RootBinding, state_placement: StatePlacement) -> anyhow::Result<Self> {
+        Self::load_bound_within(binding, state_placement, None)
+    }
+
+    fn load_bound_within(
+        binding: &RootBinding,
+        state_placement: StatePlacement,
+        cold_index_budget: Option<Duration>,
+    ) -> anyhow::Result<Self> {
         let canonical_root = &binding.canonical_root;
         let project_name = canonical_root
             .file_name()
@@ -3432,15 +3466,6 @@ impl ProjectInstance {
             )
         })?;
 
-        let index = match bootstrap_project_index(canonical_root, &state_placement) {
-            Ok(index) => index,
-            Err(error) => {
-                cleanup_failed_daemon_admission(&binding.root_id.0, admission);
-                return Err(error);
-            }
-        };
-        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
-        let token_stats = TokenStats::new();
         let persistence_status = if matches!(
             &state_placement,
             StatePlacement::ProjectLocal { .. } | StatePlacement::UserLocal { .. }
@@ -3451,17 +3476,45 @@ impl ProjectInstance {
                 reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
             }
         };
-        let persistence_health = Arc::new(RwLock::new(persistence_status));
         let curation_coordinator =
             Arc::new(crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default());
-        if let Err(error) = curation_coordinator.recover_on_project_load(
-            &index,
-            canonical_root,
-            Some(&state_placement),
-            persistence_status,
-        ) {
-            tracing::warn!("knowledge curation startup recovery remained fail-closed: {error}");
-        }
+        let bootstrapped = match cold_index_budget {
+            Some(budget) => bootstrap_project_index_within(
+                canonical_root,
+                &state_placement,
+                budget,
+                &curation_coordinator,
+                persistence_status,
+            ),
+            None => bootstrap_project_index(canonical_root, &state_placement)
+                .map(|index| (index, ColdIndex::Loaded)),
+        };
+        let index = match bootstrapped {
+            Ok((index, ColdIndex::Loaded)) => {
+                if let Err(error) = curation_coordinator.recover_on_project_load(
+                    &index,
+                    canonical_root,
+                    Some(&state_placement),
+                    persistence_status,
+                ) {
+                    tracing::warn!(
+                        "knowledge curation startup recovery remained fail-closed: {error}"
+                    );
+                }
+                index
+            }
+            // The background finisher runs curation recovery once the index it
+            // recovers against exists; against the placeholder it could only
+            // fail closed and skip this load's recovery.
+            Ok((index, ColdIndex::LoadingInBackground)) => index,
+            Err(error) => {
+                cleanup_failed_daemon_admission(&binding.root_id.0, admission);
+                return Err(error);
+            }
+        };
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let token_stats = TokenStats::new();
+        let persistence_health = Arc::new(RwLock::new(persistence_status));
 
         Ok(Self {
             project_id: binding.root_id.0.clone(),
@@ -3829,6 +3882,195 @@ fn bootstrap_project_index(
     canonical_root: &Path,
     state_placement: &StatePlacement,
 ) -> anyhow::Result<SharedIndex> {
+    match restore_project_snapshot(canonical_root, state_placement) {
+        Some(index) => Ok(index),
+        None => cold_load_project_index(canonical_root, state_placement),
+    }
+}
+
+/// Session-open bound on an inline cold load (see
+/// [`ProjectInstance::load_for_session_open`]). Small repositories finish well
+/// inside it and open exactly as before; a large one opens `Loading`.
+const SESSION_OPEN_COLD_INDEX_BUDGET: Duration = Duration::from_secs(5);
+
+/// Whether the index handed back by a bootstrap has been loaded, or is a
+/// placeholder a background task is still filling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdIndex {
+    Loaded,
+    LoadingInBackground,
+}
+
+/// Who owns a bounded cold load's outcome: the opener, while it is still
+/// waiting, or the background finisher once the opener stopped waiting.
+enum ColdLoadHandoff {
+    Waiting,
+    Done(anyhow::Result<()>),
+    Abandoned,
+}
+
+/// [`bootstrap_project_index`] with the cold load bounded by `budget`.
+///
+/// A snapshot restore is unchanged. A cold load runs on the blocking pool into
+/// an empty placeholder; if it lands within `budget` its outcome is handled
+/// exactly like the inline path, including failing the open on an error. Past
+/// the budget the placeholder is returned (`Loading`, which every tool guard
+/// already reports) and the finisher owns the outcome: curation recovery and
+/// git temporal on success, a named empty reason on failure, so the project can
+/// never sit in `Loading` for a load that is no longer running.
+fn bootstrap_project_index_within(
+    canonical_root: &Path,
+    state_placement: &StatePlacement,
+    budget: Duration,
+    curation_coordinator: &Arc<crate::protocol::knowledge_curation::KnowledgeCurationCoordinator>,
+    persistence_status: CapabilityStatus,
+) -> anyhow::Result<(SharedIndex, ColdIndex)> {
+    if let Some(index) = restore_project_snapshot(canonical_root, state_placement) {
+        return Ok((index, ColdIndex::Loaded));
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return cold_load_project_index(canonical_root, state_placement)
+            .map(|index| (index, ColdIndex::Loaded));
+    };
+
+    let index = LiveIndex::empty();
+    index.mark_bootstrap_loading();
+    let handoff = Arc::new((Mutex::new(ColdLoadHandoff::Waiting), Condvar::new()));
+    {
+        let index = Arc::clone(&index);
+        let handoff = Arc::clone(&handoff);
+        let root = canonical_root.to_path_buf();
+        let placement = state_placement.clone();
+        let curation_coordinator = Arc::clone(curation_coordinator);
+        runtime.spawn_blocking(move || {
+            let result = index.reload_for_binding_with_exclusions(
+                &root,
+                placement.directory().cloned(),
+                crate::discovery::SourceExclusions::for_state_placement(&root, &placement),
+            );
+            {
+                let (state, ready) = &*handoff;
+                let mut state = state.lock();
+                if matches!(*state, ColdLoadHandoff::Waiting) {
+                    *state = ColdLoadHandoff::Done(result);
+                    ready.notify_one();
+                    return;
+                }
+            }
+            finish_background_cold_load(
+                &index,
+                &root,
+                &placement,
+                &curation_coordinator,
+                persistence_status,
+                result,
+            );
+        });
+    }
+
+    let (state, ready) = &*handoff;
+    let mut state = state.lock();
+    ready.wait_while_for(
+        &mut state,
+        |state| matches!(state, ColdLoadHandoff::Waiting),
+        budget,
+    );
+    match std::mem::replace(&mut *state, ColdLoadHandoff::Abandoned) {
+        ColdLoadHandoff::Done(result) => {
+            degrade_on_capacity_refusal(&index, canonical_root, result)
+                .with_context(|| {
+                    format!(
+                        "failed to load project index for {}",
+                        canonical_root.display()
+                    )
+                })
+                .map(|()| (index, ColdIndex::Loaded))
+        }
+        ColdLoadHandoff::Waiting => {
+            tracing::info!(
+                root = %canonical_root.display(),
+                budget_ms = budget.as_millis() as u64,
+                "cold index load exceeded the session-open budget; continuing in the background"
+            );
+            Ok((index, ColdIndex::LoadingInBackground))
+        }
+        ColdLoadHandoff::Abandoned => unreachable!("only the opener abandons a cold load"),
+    }
+}
+
+/// The half of a session-open cold load the opener stopped waiting for.
+fn finish_background_cold_load(
+    index: &SharedIndex,
+    root: &Path,
+    placement: &StatePlacement,
+    curation_coordinator: &crate::protocol::knowledge_curation::KnowledgeCurationCoordinator,
+    persistence_status: CapabilityStatus,
+    result: anyhow::Result<()>,
+) {
+    match degrade_on_capacity_refusal(index, root, result) {
+        Ok(()) => {
+            if let Err(error) = curation_coordinator.recover_on_project_load(
+                index,
+                root,
+                Some(placement),
+                persistence_status,
+            ) {
+                tracing::warn!("knowledge curation startup recovery remained fail-closed: {error}");
+            }
+            let expected_gen = index.current_project_generation();
+            live_index::git_temporal::spawn_git_temporal_computation(
+                Arc::clone(index),
+                root.to_path_buf(),
+                expected_gen,
+            );
+            tracing::info!(root = %root.display(), "background cold index load complete");
+        }
+        Err(error) => {
+            tracing::error!(
+                root = %root.display(),
+                "background cold index load failed: {error:#}"
+            );
+            index.set_local_empty_reason(Some(format!(
+                "the daemon's background index load failed: {error:#}"
+            )));
+        }
+    }
+}
+
+/// The inline cold path's catalog-capacity rule, applied to a placeholder: a
+/// capacity refusal keeps the project non-ready but open; any other failure is
+/// returned. The placeholder was marked as loading, and no load is coming now,
+/// so the refusal is also its empty reason: `Empty`, never `Loading`.
+fn degrade_on_capacity_refusal(
+    index: &SharedIndex,
+    canonical_root: &Path,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    let Some(capacity) = error.downcast_ref::<crate::discovery::ScoutCapacityError>() else {
+        return Err(error);
+    };
+    index.set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+        last_valid_content_generation: 0,
+        reason_codes: vec![capacity.reason()],
+    });
+    index.set_local_empty_reason(Some(format!(
+        "cold project observation refused by catalog capacity: {error:#}"
+    )));
+    tracing::warn!(
+        root = %canonical_root.display(),
+        reason = ?capacity.reason(),
+        "cold project observation refused by catalog capacity; keeping project non-ready"
+    );
+    Ok(())
+}
+
+fn restore_project_snapshot(
+    canonical_root: &Path,
+    state_placement: &StatePlacement,
+) -> Option<SharedIndex> {
     let source_exclusions =
         crate::discovery::SourceExclusions::for_state_placement(canonical_root, state_placement);
     if let Some(snapshot) = live_index::persist::load_snapshot(canonical_root, state_placement) {
@@ -3881,9 +4123,17 @@ fn bootstrap_project_index(
             });
         }
 
-        return Ok(shared);
+        return Some(shared);
     }
+    None
+}
 
+fn cold_load_project_index(
+    canonical_root: &Path,
+    state_placement: &StatePlacement,
+) -> anyhow::Result<SharedIndex> {
+    let source_exclusions =
+        crate::discovery::SourceExclusions::for_state_placement(canonical_root, state_placement);
     let cold_result = if matches!(state_placement, StatePlacement::ProjectLocal { .. }) {
         live_index::LiveIndex::load_for_state_placement(canonical_root, state_placement)
             .with_context(|| {
@@ -16669,5 +16919,141 @@ mod tests {
                 .expect("corrupt port should be ignored, not fatal");
 
         assert_eq!(selected, None);
+    }
+
+    fn session_open_placement(root: &Path) -> StatePlacement {
+        crate::discovery::resolve_state_placement(&RootBinding {
+            source: RootCandidateSource::InitCwd,
+            canonical_root: root.to_path_buf(),
+            root_id: crate::discovery::project_id_for_canonical_root(root),
+            access_mode: SourceAccessMode::NormalProject,
+        })
+    }
+
+    async fn wait_until_published(
+        index: &SharedIndex,
+        done: impl Fn(&crate::live_index::PublishedIndexState) -> bool,
+    ) -> Arc<crate::live_index::PublishedIndexState> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let published = index.published_state();
+            if done(&published) {
+                return published;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background cold load never settled: status {:?}",
+                published.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The session-open cold load is bounded: past its budget the open gets a
+    /// `Loading` placeholder back at once and the load lands in the background,
+    /// instead of the whole parse running inside `/v1/sessions/open` (which a
+    /// large repository turned into a client timeout).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_open_cold_load_past_its_budget_finishes_in_the_background() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        for file in 0..200 {
+            std::fs::write(
+                root.join("src").join(format!("f{file}.rs")),
+                format!("pub fn f{file}() -> u32 {{ {file} }}\n"),
+            )
+            .expect("write source");
+        }
+        let placement = session_open_placement(&root);
+        let coordinator =
+            Arc::new(crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default());
+
+        let (index, cold) = bootstrap_project_index_within(
+            &root,
+            &placement,
+            Duration::ZERO,
+            &coordinator,
+            CapabilityStatus::Available,
+        )
+        .expect("an open past its budget still succeeds");
+
+        assert_eq!(cold, ColdIndex::LoadingInBackground);
+        assert_eq!(
+            index.published_state().status,
+            crate::live_index::PublishedIndexStatus::Loading,
+            "the placeholder must report Loading, never an empty Ready index"
+        );
+        let published = wait_until_published(&index, |published| {
+            published.status == crate::live_index::PublishedIndexStatus::Ready
+        })
+        .await;
+        assert_eq!(published.file_count, 200);
+    }
+
+    /// A load that finishes inside the budget opens exactly as the inline path
+    /// did: Ready, with curation recovery left to the opener.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_open_cold_load_within_its_budget_opens_ready() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical root");
+        std::fs::write(root.join("lib.rs"), "pub fn f() {}\n").expect("write source");
+        let placement = session_open_placement(&root);
+        let coordinator =
+            Arc::new(crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default());
+
+        let (index, cold) = bootstrap_project_index_within(
+            &root,
+            &placement,
+            Duration::from_secs(60),
+            &coordinator,
+            CapabilityStatus::Available,
+        )
+        .expect("open");
+
+        assert_eq!(cold, ColdIndex::Loaded);
+        let published = index.published_state();
+        assert_eq!(
+            published.status,
+            crate::live_index::PublishedIndexStatus::Ready
+        );
+        assert_eq!(published.file_count, 1);
+    }
+
+    /// A load that fails after the opener stopped waiting must not leave the
+    /// project reporting `Loading` for a load that is no longer running.
+    #[test]
+    fn background_cold_load_failure_is_never_reported_as_loading() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical root");
+        let index = LiveIndex::empty();
+        index.mark_bootstrap_loading();
+        assert_eq!(
+            index.published_state().status,
+            crate::live_index::PublishedIndexStatus::Loading
+        );
+
+        finish_background_cold_load(
+            &index,
+            &root,
+            &session_open_placement(&root),
+            &crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default(),
+            CapabilityStatus::Available,
+            Err(anyhow::anyhow!("source tree unreadable")),
+        );
+
+        let published = index.published_state();
+        assert_eq!(
+            published.status,
+            crate::live_index::PublishedIndexStatus::Empty
+        );
+        assert!(
+            published
+                .local_empty_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("source tree unreadable")),
+            "the failure is named: {:?}",
+            published.local_empty_reason
+        );
     }
 }

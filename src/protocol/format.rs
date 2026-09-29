@@ -5584,6 +5584,11 @@ pub fn loading_guard_message() -> String {
     "Index is loading... try again shortly.".to_string()
 }
 
+/// The single wording for a project whose first index is still being built.
+/// The stdio front's not-ready answer, `status` and `health` in that window,
+/// and the SessionStart hook all say it in these words.
+pub const INITIAL_INDEXING_IN_PROGRESS: &str = "initial indexing of this project is in progress; it can take several minutes on large folders, and tool calls wait for it";
+
 /// Surface-aware empty-index recovery hint (TR-02 / N-5 / FR-011, FR-012).
 ///
 /// Every empty-index / "not loaded" error an agent can reach must name ONLY a

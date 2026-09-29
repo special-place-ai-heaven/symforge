@@ -4195,6 +4195,17 @@ impl SharedIndexHandle {
         live.local_empty_reason = Arc::new(parking_lot::RwLock::new(reason));
         self.swap_and_publish_retaining_content(live);
     }
+
+    /// Mark an empty bootstrap placeholder as having a load on the way, so it
+    /// reports `Loading` until that load publishes. Left alone it reports
+    /// `Empty`, whose guard sends the agent to `index_folder` and so to a
+    /// second full reload racing the first.
+    pub(crate) fn mark_bootstrap_loading(&self) {
+        let _wg = self.write_mutex.lock();
+        let mut live = (*self.live.load_full()).clone();
+        live.is_empty = false;
+        self.swap_and_publish_retaining_content(live);
+    }
 }
 
 impl<'a> Deref for SharedIndexWriteGuard<'a> {

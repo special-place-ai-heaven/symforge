@@ -218,6 +218,57 @@ fn run_hook_routed_success_writes_source_read_routed_event() {
     );
 }
 
+/// A session that starts while the index is still loading gets the one-line
+/// initial-indexing notice instead of empty context, and never the 503 body.
+#[test]
+fn run_hook_session_start_while_indexing_injects_the_initial_indexing_notice() {
+    const PARTIAL_MARKER: &str = "partial-index-context-must-not-escape";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let port = listener
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let mock = thread::spawn(move || {
+        serve_mock_http_response(listener, "503 Service Unavailable", PARTIAL_MARKER)
+    });
+
+    let tmp = TempDir::new().expect("tempdir creation");
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), port);
+
+    let (stdout, log, _stderr) = run_hook_subcommand_in_tempdir(
+        tmp.path(),
+        &["session-start"],
+        "{}",
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    mock.join().expect("mock sidecar thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid JSON");
+    assert_eq!(
+        parsed["hookSpecificOutput"]["hookEventName"],
+        "SessionStart"
+    );
+    let context = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext is a string");
+    assert!(
+        context.starts_with("symforge: ")
+            && context.contains("initial indexing of this project is in progress"),
+        "a loading index must be announced in one line; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(PARTIAL_MARKER),
+        "503 body leaked:\n{stdout}"
+    );
+    assert!(
+        log.contains("\tsidecar-error"),
+        "the refusal keeps its honest outcome lane; got:\n{log}"
+    );
+}
+
 #[test]
 fn run_hook_index_not_ready_fails_open_as_sidecar_error() {
     const PARTIAL_MARKER: &str = "partial-index-context-must-not-escape";
@@ -1502,6 +1553,15 @@ fn run_hook_in_tempdir_with_env_and_stderr(
     payload: &str,
     extra_env: &[(&str, &str)],
 ) -> (String, String, String) {
+    run_hook_subcommand_in_tempdir(cwd, &[], payload, extra_env)
+}
+
+fn run_hook_subcommand_in_tempdir(
+    cwd: &Path,
+    subcommand: &[&str],
+    payload: &str,
+    extra_env: &[(&str, &str)],
+) -> (String, String, String) {
     let control_root = extra_env
         .iter()
         .rev()
@@ -1511,6 +1571,7 @@ fn run_hook_in_tempdir_with_env_and_stderr(
     let mut command = symforge::process_util::hidden_command(bin);
     command
         .arg("hook")
+        .args(subcommand)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

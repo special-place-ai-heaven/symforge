@@ -1017,9 +1017,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // again after the derived-stage hold grew a reached-wait so CR-1 G17 can
 // observe the pause. File count stays 198.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8026002fd0d956c3ed18c66e759975427f7a3b703939d822ea4e82e10e2a7a35",
-    198,
-    9_679_879,
+    "79c6dbaf02ff2a3c04bf18db5e25d7972315f9b6ea17e6c2aed66fa01a488ca7",
+    199,
+    9_705_155,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
