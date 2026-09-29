@@ -39,7 +39,7 @@ use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ReadResourceRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ServerHandler, tool_handler};
@@ -2085,12 +2085,12 @@ impl SymForgeServer {
 /// router delegation the macro would have generated.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SymForgeServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Override rmcp's `from_build_env` default, which expands
         // `CARGO_CRATE_NAME`/`CARGO_PKG_VERSION` inside the rmcp crate and would
         // otherwise identify this server as "rmcp"/<rmcp version>. `env!` here
         // expands in the symforge crate, staying in sync with Cargo.toml.
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
@@ -2103,9 +2103,9 @@ impl ServerHandler for SymForgeServer {
         ))
     }
 
-    /// FR-307 allow-list freeze (spec 025). rmcp 3.1.0's default already
+    /// FR-307 allow-list freeze (spec 025). rmcp 3.5.0's default already
     /// returns `KNOWN_VERSIONS` including `V_2026_07_28`; this override pins
-    /// TODAY'S set explicitly so a future rmcp `"3.1"` semver update cannot
+    /// TODAY'S set explicitly so a future rmcp `"3.5"` semver update cannot
     /// auto-advertise a protocol revision symforge has never tested. Protocol
     /// exposure changes only by deliberate edit here. Extend, never shrink.
     fn supported_protocol_versions(

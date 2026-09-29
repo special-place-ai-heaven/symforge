@@ -1018,10 +1018,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // observe the pause, then for the deferred stdio front, which added
 // src/protocol/deferred_stdio.rs: 199 files. Refreshed again for the
 // `symforge update` change, whose src diff adds no edge into src/index_lifecycle.
+// Refreshed 2026-09-30 for the rmcp 3.5.0 upgrade: the only src change is the
+// deprecated ServerInfo alias renamed to ServerConfig (five sites, +10 bytes)
+// plus a same-length FR-307 comment edit.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "9295c93e001a75c1f740cc0f07771bf878c952984174296ba8cc1c45037f1354",
+    "5e15bd5afaacfc2eea9da2b58a2323984379623d5a6fb7df9acc7194c55950f1",
     199,
-    9_820_221,
+    9_820_231,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
