@@ -22,7 +22,8 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::paths;
 
-use crate::cli::{InitClient, harness};
+use crate::cli::InitClient;
+use crate::cli::harness::{self, HarnessId};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -310,19 +311,13 @@ fn run_init_with_paths(
 ) -> anyhow::Result<()> {
     let registration_binary_path = binary_path_for_registration(binary_path, home_dir)?;
     let binary_path_str = registration_binary_path.display().to_string();
-    // Claude Code keeps its MCP entry in `~/.claude.json`, whose parent is always
-    // the home directory, so its installed test is the `~/.claude` directory (or
-    // the file itself) rather than the parent-directory rule.
-    let claude_installed =
-        paths.claude_config.exists() || harness::config_installed(&paths.claude_settings);
-
     if targeted(
         client,
         InitClient::Claude,
         "Claude Code",
         "claude",
         &paths.claude_settings,
-        claude_installed,
+        harness::harness_installed(HarnessId::ClaudeCode, &paths.claude_config),
     ) {
         merge_hooks_into_settings(&paths.claude_settings, &registration_binary_path)?;
         eprintln!(
@@ -349,7 +344,7 @@ fn run_init_with_paths(
         "Claude Desktop",
         "claude-desktop",
         &paths.claude_desktop_config,
-        harness::config_installed(&paths.claude_desktop_config),
+        harness::harness_installed(HarnessId::ClaudeDesktop, &paths.claude_desktop_config),
     ) {
         register_claude_desktop_mcp_server_with_home(
             &paths.claude_desktop_config,
@@ -368,7 +363,7 @@ fn run_init_with_paths(
         "Codex",
         "codex",
         &paths.codex_config,
-        harness::config_installed(&paths.codex_config),
+        harness::harness_installed(HarnessId::Codex, &paths.codex_config),
     ) {
         register_codex_mcp_server(&paths.codex_config, &binary_path_str)?;
         eprintln!(
@@ -391,7 +386,7 @@ fn run_init_with_paths(
         &paths.grok_config,
         harness::config_installed(&paths.grok_config),
     ) {
-        register_grok_mcp_server(&paths.grok_config, &binary_path_str, working_dir)?;
+        register_grok_mcp_server(&paths.grok_config, &binary_path_str)?;
         eprintln!(
             "Grok MCP server registered in {}",
             paths.grok_config.display()
@@ -404,7 +399,7 @@ fn run_init_with_paths(
         "Gemini CLI",
         "gemini",
         &paths.gemini_settings,
-        harness::config_installed(&paths.gemini_settings),
+        harness::harness_installed(HarnessId::Gemini, &paths.gemini_settings),
     ) {
         register_gemini_mcp_server(&paths.gemini_settings, &binary_path_str)?;
         eprintln!(
@@ -457,7 +452,7 @@ fn run_init_with_paths(
         "Cursor",
         "cursor",
         &paths.cursor_config,
-        harness::config_installed(&paths.cursor_config),
+        harness::harness_installed(HarnessId::Cursor, &paths.cursor_config),
     ) {
         register_cursor_mcp_server(&paths.cursor_config, &binary_path_str)?;
         eprintln!(
@@ -1138,10 +1133,13 @@ fn set_toml_item_preserving_decor(table: &mut dyn toml_edit::TableLike, key: &st
 ///
 /// Grok stores MCP servers under `[mcp_servers.<name>]` TOML tables.
 /// We update only managed SymForge fields and preserve all other content.
+///
+/// The file is GLOBAL, so it carries no workspace root: a literal path would pin
+/// every Grok session to the repo `init` ran in. A root pinned by an earlier init
+/// is removed, see [`remove_legacy_grok_workspace_pin`].
 pub fn register_grok_mcp_server(
     grok_config_path: &std::path::Path,
     binary_path: &str,
-    working_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     if let Some(parent) = grok_config_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1188,16 +1186,31 @@ pub fn register_grok_mcp_server(
         .get_mut("env")
         .and_then(Item::as_table_like_mut)
         .expect("env must be a table or inline table");
+    remove_legacy_grok_workspace_pin(env);
     set_toml_item_preserving_decor(env, "RUST_LOG", value("off"));
-    set_toml_item_preserving_decor(
-        env,
-        "SYMFORGE_WORKSPACE_ROOT",
-        value(working_dir.display().to_string()),
-    );
 
     std::fs::write(grok_config_path, config.to_string())
         .with_context(|| format!("writing {}", grok_config_path.display()))?;
     Ok(())
+}
+
+/// Remove the workspace root an earlier `init` wrote into a global Grok entry.
+///
+/// Grok has no `cwd` field, so the Cursor pair fingerprint cannot apply. The old
+/// writer always set `RUST_LOG = "off"` beside a literal root, so that pairing is
+/// the fingerprint: a literal root next to `RUST_LOG = "off"` is removed. A root
+/// with any other `RUST_LOG`, or one that is a `${...}` variable, is the user's
+/// and stays. Must run before the writer sets `RUST_LOG`.
+fn remove_legacy_grok_workspace_pin(env: &mut dyn toml_edit::TableLike) {
+    let root_key = crate::discovery::WORKSPACE_ROOT_ENV;
+    let pinned = env.get("RUST_LOG").and_then(Item::as_str) == Some("off")
+        && env
+            .get(root_key)
+            .and_then(Item::as_str)
+            .is_some_and(|root| !root.starts_with("${"));
+    if pinned {
+        env.remove(root_key);
+    }
 }
 
 fn merge_symforge_codex_server(config: &mut DocumentMut, binary_path: &str) {

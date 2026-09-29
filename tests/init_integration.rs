@@ -413,9 +413,9 @@ custom = "keep"
 
 [mcp_servers.symforge.env]
 KEEP_ME = "yes"
-RUST_LOG = "debug" # keep env comment
+RUST_LOG = "off" # keep env comment
 SYMFORGE_SURFACE = "compact"
-SYMFORGE_WORKSPACE_ROOT = "stale-root"
+SYMFORGE_WORKSPACE_ROOT = "/repo/init/ran/in"
 "#,
     )
     .unwrap();
@@ -452,9 +452,9 @@ SYMFORGE_WORKSPACE_ROOT = "stale-root"
     assert_eq!(symforge["args"].as_array().map(|args| args.len()), Some(0));
     assert_eq!(symforge["enabled"].as_bool(), Some(true));
     assert_eq!(symforge["env"]["RUST_LOG"].as_str(), Some("off"));
-    assert_eq!(
-        symforge["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
-        Some(cwd.path().display().to_string().as_str())
+    assert!(
+        symforge["env"].get("SYMFORGE_WORKSPACE_ROOT").is_none(),
+        "the pin an earlier init wrote must be removed"
     );
     assert_eq!(symforge["env"]["KEEP_ME"].as_str(), Some("yes"));
     assert_eq!(
@@ -500,10 +500,85 @@ fn test_run_init_grok_preserves_inline_tables() {
     assert_eq!(symforge["args"].as_array().map(|args| args.len()), Some(0));
     assert_eq!(symforge["enabled"].as_bool(), Some(true));
     assert_eq!(symforge["env"]["RUST_LOG"].as_str(), Some("off"));
-    assert_eq!(
-        symforge["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
-        Some(cwd.path().display().to_string().as_str())
+    assert!(
+        symforge["env"].get("SYMFORGE_WORKSPACE_ROOT").is_none(),
+        "the global Grok config must not carry a workspace root"
     );
+}
+
+#[test]
+fn test_grok_reregistration_removes_the_old_pinned_workspace_root() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"[mcp_servers.symforge]
+command = "old"
+
+[mcp_servers.symforge.env]
+KEEP_ME = "yes"
+RUST_LOG = "off"
+SYMFORGE_WORKSPACE_ROOT = "/repo/init/ran/in"
+"#,
+    )
+    .unwrap();
+
+    symforge::cli::init::register_grok_mcp_server(&path, FAKE_BINARY).unwrap();
+
+    let config = read_text(&path).parse::<toml_edit::DocumentMut>().unwrap();
+    let env = &config["mcp_servers"]["symforge"]["env"];
+    assert!(
+        env.get("SYMFORGE_WORKSPACE_ROOT").is_none(),
+        "the pin an earlier init wrote must be removed: {env}"
+    );
+    assert_eq!(env["KEEP_ME"].as_str(), Some("yes"));
+}
+
+#[test]
+fn test_grok_registration_writes_no_workspace_root_on_a_fresh_config() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    symforge::cli::init::register_grok_mcp_server(&path, FAKE_BINARY).unwrap();
+    assert!(
+        !read_text(&path).contains("SYMFORGE_WORKSPACE_ROOT"),
+        "a global config must not be pinned to one project"
+    );
+}
+
+#[test]
+fn test_claude_code_presence_agrees_between_scan_and_all() {
+    use symforge::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState};
+
+    let claude_state = |home: &std::path::Path, cwd: &std::path::Path| {
+        HarnessRegistry::known_with(home, cwd)
+            .scan(&AttachEntry::new("http://127.0.0.1:1/mcp", None))
+            .into_iter()
+            .find(|status| status.id == HarnessId::ClaudeCode)
+            .expect("Claude Code is a known harness")
+            .state
+    };
+    let binary_path = std::path::PathBuf::from(FAKE_BINARY);
+
+    // Neither `~/.claude` nor `~/.claude.json`: not installed, and `all` skips it.
+    let bare = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    assert_eq!(
+        claude_state(bare.path(), cwd.path()),
+        HarnessState::NotInstalled
+    );
+    run_init_with_context(InitClient::All, bare.path(), cwd.path(), &binary_path).unwrap();
+    assert!(!bare.path().join(".claude.json").exists());
+    assert!(!bare.path().join(".claude").exists());
+
+    // `~/.claude` alone: installed, and `all` registers it.
+    let present = TempDir::new().unwrap();
+    std::fs::create_dir_all(present.path().join(".claude")).unwrap();
+    assert_eq!(
+        claude_state(present.path(), cwd.path()),
+        HarnessState::Absent
+    );
+    run_init_with_context(InitClient::All, present.path(), cwd.path(), &binary_path).unwrap();
+    assert!(present.path().join(".claude.json").exists());
 }
 
 #[test]
