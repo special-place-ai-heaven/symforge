@@ -246,6 +246,26 @@ impl HarnessRegistry {
     }
 }
 
+/// Whether a client counts as installed: its config file exists, or the
+/// directory that would hold it does.
+pub(crate) fn config_installed(config_path: &Path) -> bool {
+    config_path.exists() || config_path.parent().is_some_and(Path::exists)
+}
+
+/// The one installed predicate shared by `init --scan` and `init --client all`,
+/// so the two agree. Claude Code keeps its MCP entry in `~/.claude.json`, whose
+/// parent is always the home directory, so the generic rule would call every
+/// machine a Claude host. It counts as installed only when `~/.claude.json` or
+/// the `~/.claude` directory exists.
+pub(crate) fn harness_installed(id: HarnessId, config_path: &Path) -> bool {
+    match id {
+        HarnessId::ClaudeCode => {
+            config_path.exists() || config_path.with_file_name(".claude").exists()
+        }
+        _ => config_installed(config_path),
+    }
+}
+
 /// Resolve the scan state for one target against the desired attach entry.
 fn scan_target(target: &HarnessTarget, desired: &AttachEntry) -> HarnessState {
     if !target.config_path.exists() {
@@ -253,9 +273,10 @@ fn scan_target(target: &HarnessTarget, desired: &AttachEntry) -> HarnessState {
         // exists; otherwise it is NotInstalled (never create in the wrong
         // place). The directory existing but the file missing means the client
         // is installed but has no SymForge entry yet (Absent).
-        return match target.config_path.parent() {
-            Some(parent) if parent.exists() => HarnessState::Absent,
-            _ => HarnessState::NotInstalled,
+        return if harness_installed(target.id, &target.config_path) {
+            HarnessState::Absent
+        } else {
+            HarnessState::NotInstalled
         };
     }
 

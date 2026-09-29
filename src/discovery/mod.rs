@@ -1438,6 +1438,13 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
 /// cold start indexes the real workspace instead of the home directory.
 pub const WORKSPACE_ROOT_ENV: &str = "SYMFORGE_WORKSPACE_ROOT";
 
+/// The project directory Claude Code exports into every MCP server it launches.
+///
+/// It is where the git-ancestor walk STARTS, in place of the process CWD, so a
+/// session opened in `repo/src` still binds `repo`. It is not a bound root and
+/// not authoritative: a client-declared root may still retarget the session.
+pub const CLAUDE_PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
+
 enum WorkspaceRootEnvResolution {
     AbsentOrRecoverable,
     Resolved(PathBuf),
@@ -1456,24 +1463,63 @@ enum WorkspaceRootEnvResolution {
 /// native path that cannot be represented losslessly as UTF-8 is terminal:
 /// falling back would silently replace explicit operator authority with another
 /// workspace.
+///
+/// After that override, the `.git` walk starts at `CLAUDE_PROJECT_DIR` (exported
+/// by Claude Code) when it names an existing directory, else at the process CWD.
+/// A start that yields no usable root falls through to the CWD walk.
 pub fn find_project_root() -> Option<PathBuf> {
+    find_project_root_with(true)
+}
+
+/// [`find_project_root`] for a caller whose answer is written into a persistent
+/// config (Claude Desktop registration in `symforge init`): it resolves from the
+/// explicit override and the process CWD only. `CLAUDE_PROJECT_DIR` names
+/// whichever session happened to spawn the process, e.g. a hook that ran `init`,
+/// and must not be frozen into a config that outlives it.
+pub fn find_project_root_from_cwd() -> Option<PathBuf> {
+    find_project_root_with(false)
+}
+
+fn find_project_root_with(consult_claude_project_dir: bool) -> Option<PathBuf> {
     match workspace_root_env_resolution() {
         WorkspaceRootEnvResolution::Resolved(root) => return Some(root),
         WorkspaceRootEnvResolution::UnsupportedEncoding => return None,
         WorkspaceRootEnvResolution::AbsentOrRecoverable => {}
     }
+    if consult_claude_project_dir
+        && let Some(start) = claude_project_dir_start()
+        && let Some(root) = root_from_walk(&start, RootCandidateSource::ClaudeProjectDir)
+    {
+        return Some(root);
+    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    root_from_walk(&cwd, RootCandidateSource::LaunchCwd)
+}
 
-    // Try to find a git root first (scoped by repo boundary), BUT run the same
-    // sensitive/forbidden guard on the discovered `.git` root that the cwd
-    // fallback below uses. A `.git` planted at a sensitive ancestor (e.g.
-    // `git init` in `C:\Users\<name>` or a malicious `/etc/.git`) must NOT be
-    // selected and indexed unguarded: if the `.git`-bearing ancestor is
-    // forbidden we skip it and keep walking up, exactly as the rest of the
-    // guard does, so a deeper legitimate `.git` is still found and a genuine
-    // project `.git` continues to be selected.
-    let mut current = cwd.clone();
+/// `CLAUDE_PROJECT_DIR` as a walk start, or `None` when it is unset, blank, not
+/// UTF-8, or not an existing directory. Every `None` falls through to the CWD
+/// walk: this is a hint about where the walk begins, never an operator override,
+/// so a bad value must not refuse discovery the way `SYMFORGE_WORKSPACE_ROOT` does.
+fn claude_project_dir_start() -> Option<PathBuf> {
+    let raw = std::env::var_os(CLAUDE_PROJECT_DIR_ENV)?;
+    if raw.to_str().is_none_or(|value| value.trim().is_empty()) {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    path.is_dir().then_some(path)
+}
+
+/// Walk upward from `start` for a `.git` directory, falling back to `start`
+/// itself (labelled `fallback_source`) when there is none.
+///
+/// Try to find a git root first (scoped by repo boundary), BUT run the same
+/// sensitive/forbidden guard on the discovered `.git` root that the fallback
+/// uses. A `.git` planted at a sensitive ancestor (e.g. `git init` in
+/// `C:\Users\<name>` or a malicious `/etc/.git`) must NOT be selected and
+/// indexed unguarded: it is refused, not indexed.
+fn root_from_walk(start: &Path, fallback_source: RootCandidateSource) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
     loop {
         if current.join(".git").exists() {
             return validate_workspace_candidate(
@@ -1488,8 +1534,8 @@ pub fn find_project_root() -> Option<PathBuf> {
         }
     }
 
-    // No git root found — use cwd if it's not a forbidden directory.
-    validate_workspace_candidate(&cwd, "launch CWD", RootCandidateSource::LaunchCwd)
+    // No git root found: use `start` if it is not a forbidden directory.
+    validate_workspace_candidate(start, "walk start", fallback_source)
 }
 
 /// Walk up from `start` looking for a `.git`-bearing ancestor STRICTLY ABOVE
@@ -4738,6 +4784,7 @@ mod tests {
 
         struct RootEnvGuard {
             prev: Option<OsString>,
+            claude_prev: Option<OsString>,
         }
 
         #[allow(unsafe_code)] // test-only env guard; mutation serialized by ENV_LOCK.
@@ -4748,14 +4795,19 @@ mod tests {
 
             fn set_os(value: Option<&OsStr>) -> Self {
                 let prev = std::env::var_os(WORKSPACE_ROOT_ENV);
+                // Discovery reads `CLAUDE_PROJECT_DIR` too, and a test run from
+                // inside Claude Code inherits it: clear it so the CWD-based
+                // expectations below hold. Restored on drop.
+                let claude_prev = std::env::var_os(CLAUDE_PROJECT_DIR_ENV);
                 // SAFETY: serialized by ENV_LOCK held by the caller.
                 unsafe {
                     match value {
                         Some(v) => std::env::set_var(WORKSPACE_ROOT_ENV, v),
                         None => std::env::remove_var(WORKSPACE_ROOT_ENV),
                     }
+                    std::env::remove_var(CLAUDE_PROJECT_DIR_ENV);
                 }
-                Self { prev }
+                Self { prev, claude_prev }
             }
         }
 
@@ -4767,6 +4819,10 @@ mod tests {
                     match &self.prev {
                         Some(v) => std::env::set_var(WORKSPACE_ROOT_ENV, v),
                         None => std::env::remove_var(WORKSPACE_ROOT_ENV),
+                    }
+                    match &self.claude_prev {
+                        Some(v) => std::env::set_var(CLAUDE_PROJECT_DIR_ENV, v),
+                        None => std::env::remove_var(CLAUDE_PROJECT_DIR_ENV),
                     }
                 }
             }
@@ -4840,6 +4896,180 @@ mod tests {
 
             let _unset = RootEnvGuard::set(None);
             assert!(workspace_root_env_override().is_none());
+        }
+
+        /// Sets `CLAUDE_PROJECT_DIR` for one test and restores it on drop.
+        /// Mutation is serialized by the `ENV_LOCK` the caller holds.
+        #[allow(unsafe_code)] // test-only env guard; mutation serialized by ENV_LOCK.
+        struct ClaudeDirGuard(Option<OsString>);
+
+        #[allow(unsafe_code)] // test-only env guard; mutation serialized by ENV_LOCK.
+        impl ClaudeDirGuard {
+            fn set(value: Option<&str>) -> Self {
+                let prev = std::env::var_os(CLAUDE_PROJECT_DIR_ENV);
+                // SAFETY: serialized by ENV_LOCK held by the caller.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(CLAUDE_PROJECT_DIR_ENV, v),
+                        None => std::env::remove_var(CLAUDE_PROJECT_DIR_ENV),
+                    }
+                }
+                Self(prev)
+            }
+        }
+
+        #[allow(unsafe_code)] // test-only env guard; restores serialized state.
+        impl Drop for ClaudeDirGuard {
+            fn drop(&mut self) {
+                // SAFETY: serialized by ENV_LOCK.
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var(CLAUDE_PROJECT_DIR_ENV, v),
+                        None => std::env::remove_var(CLAUDE_PROJECT_DIR_ENV),
+                    }
+                }
+            }
+        }
+
+        fn canonical(dir: &TempDir) -> PathBuf {
+            dir.path().canonicalize().unwrap()
+        }
+
+        /// `<tmp>/repo` holding a `.git` directory, plus its `src` subdirectory.
+        fn repo_with_src() -> (TempDir, PathBuf) {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            (tmp, repo)
+        }
+
+        /// What discovery answers from the CWD alone, with the overrides cleared.
+        fn cwd_only_root() -> Option<PathBuf> {
+            let _ws = RootEnvGuard::set(None);
+            find_project_root()
+        }
+
+        #[test]
+        fn claude_project_dir_starts_the_git_walk() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let (_tmp, repo) = repo_with_src();
+            let _ws = RootEnvGuard::set(None);
+            let _claude = ClaudeDirGuard::set(Some(&repo.join("src").display().to_string()));
+
+            assert_eq!(
+                find_project_root(),
+                Some(repo.canonicalize().unwrap()),
+                "a session opened in repo/src must still bind repo, not repo/src"
+            );
+            assert!(
+                !workspace_root_env_is_authoritative(),
+                "CLAUDE_PROJECT_DIR must not become an authoritative override"
+            );
+        }
+
+        #[test]
+        fn claude_project_dir_without_a_git_root_binds_itself() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let project = TempDir::new().unwrap();
+            let _ws = RootEnvGuard::set(None);
+            let _claude = ClaudeDirGuard::set(Some(&project.path().display().to_string()));
+
+            assert_eq!(find_project_root(), Some(canonical(&project)));
+        }
+
+        #[test]
+        fn workspace_env_outranks_claude_project_dir() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let explicit = TempDir::new().unwrap();
+            let (_tmp, repo) = repo_with_src();
+            let _ws = RootEnvGuard::set(Some(&explicit.path().display().to_string()));
+            let _claude = ClaudeDirGuard::set(Some(&repo.display().to_string()));
+
+            assert_eq!(find_project_root(), Some(canonical(&explicit)));
+        }
+
+        #[test]
+        fn unexpanded_workspace_placeholder_falls_through_to_claude_project_dir() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let (_tmp, repo) = repo_with_src();
+            let _ws = RootEnvGuard::set(Some("${workspaceFolder}"));
+            let _claude = ClaudeDirGuard::set(Some(&repo.join("src").display().to_string()));
+
+            assert_eq!(find_project_root(), Some(repo.canonicalize().unwrap()));
+        }
+
+        #[test]
+        fn unusable_claude_project_dir_falls_through_to_the_cwd_walk() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let baseline = cwd_only_root();
+            assert!(
+                baseline.is_some(),
+                "anti-vacuity: the test CWD must resolve"
+            );
+            let home = dirs::home_dir().expect("a home directory to refuse");
+            for unusable in [
+                "/no/such/symforge/claude/dir".to_string(),
+                "   ".to_string(),
+                home.display().to_string(),
+            ] {
+                let _ws = RootEnvGuard::set(None);
+                let _claude = ClaudeDirGuard::set(Some(&unusable));
+                assert_eq!(
+                    find_project_root(),
+                    baseline,
+                    "CLAUDE_PROJECT_DIR={unusable:?}"
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[allow(unsafe_code)] // test-only env mutation; serialized by ENV_LOCK.
+        #[test]
+        fn non_utf8_claude_project_dir_falls_through_instead_of_refusing() {
+            use std::os::unix::ffi::OsStringExt;
+
+            let _lock = ENV_LOCK.lock().unwrap();
+            let baseline = cwd_only_root();
+            assert!(
+                baseline.is_some(),
+                "anti-vacuity: the test CWD must resolve"
+            );
+            let _ws = RootEnvGuard::set(None);
+            let opaque = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+            // SAFETY: serialized by ENV_LOCK held above.
+            unsafe {
+                std::env::set_var(CLAUDE_PROJECT_DIR_ENV, &opaque);
+            }
+            let found = find_project_root();
+            // SAFETY: as above.
+            unsafe {
+                std::env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+            }
+            assert_eq!(
+                found, baseline,
+                "a hint that cannot be read must fall through, unlike the explicit override"
+            );
+        }
+
+        #[test]
+        fn cwd_only_discovery_ignores_claude_project_dir() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let baseline = cwd_only_root();
+            let (_tmp, repo) = repo_with_src();
+            let _ws = RootEnvGuard::set(None);
+            let _claude = ClaudeDirGuard::set(Some(&repo.display().to_string()));
+
+            assert_eq!(
+                find_project_root_from_cwd(),
+                baseline,
+                "init's Claude Desktop registration must not freeze a session's project"
+            );
+            assert_ne!(
+                find_project_root(),
+                baseline,
+                "anti-vacuity: the env is honored elsewhere"
+            );
         }
 
         #[test]

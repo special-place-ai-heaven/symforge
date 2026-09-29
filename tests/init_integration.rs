@@ -299,12 +299,20 @@ fn test_init_registers_codex_mcp_server() {
         "config must contain the Windows binary path: {config_toml}"
     );
     assert!(
-        config_toml.contains("startup_timeout_sec"),
-        "config must tune Codex MCP startup timeout: {config_toml}"
+        !config_toml.contains("startup_timeout_sec"),
+        "config must not seed a Codex startup timeout (it equals Codex's default): {config_toml}"
     );
     assert!(
-        config_toml.contains("tool_timeout_sec"),
-        "config must tune Codex MCP tool timeout: {config_toml}"
+        !config_toml.contains("tool_timeout_sec"),
+        "config must not seed a Codex tool timeout (it can only shorten the default): {config_toml}"
+    );
+    assert!(
+        !config_toml.contains("allowed_tools"),
+        "Codex has no allowed_tools key, so none may be written: {config_toml}"
+    );
+    assert!(
+        !config_toml.contains("default_tools_approval_mode"),
+        "auto is Codex's own default, so writing it would pre-approve nothing: {config_toml}"
     );
     assert!(
         config_toml.contains("project_doc_fallback_filenames"),
@@ -405,9 +413,9 @@ custom = "keep"
 
 [mcp_servers.symforge.env]
 KEEP_ME = "yes"
-RUST_LOG = "debug" # keep env comment
+RUST_LOG = "off" # keep env comment
 SYMFORGE_SURFACE = "compact"
-SYMFORGE_WORKSPACE_ROOT = "stale-root"
+SYMFORGE_WORKSPACE_ROOT = "/repo/init/ran/in"
 "#,
     )
     .unwrap();
@@ -444,9 +452,9 @@ SYMFORGE_WORKSPACE_ROOT = "stale-root"
     assert_eq!(symforge["args"].as_array().map(|args| args.len()), Some(0));
     assert_eq!(symforge["enabled"].as_bool(), Some(true));
     assert_eq!(symforge["env"]["RUST_LOG"].as_str(), Some("off"));
-    assert_eq!(
-        symforge["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
-        Some(cwd.path().display().to_string().as_str())
+    assert!(
+        symforge["env"].get("SYMFORGE_WORKSPACE_ROOT").is_none(),
+        "the pin an earlier init wrote must be removed"
     );
     assert_eq!(symforge["env"]["KEEP_ME"].as_str(), Some("yes"));
     assert_eq!(
@@ -492,10 +500,85 @@ fn test_run_init_grok_preserves_inline_tables() {
     assert_eq!(symforge["args"].as_array().map(|args| args.len()), Some(0));
     assert_eq!(symforge["enabled"].as_bool(), Some(true));
     assert_eq!(symforge["env"]["RUST_LOG"].as_str(), Some("off"));
-    assert_eq!(
-        symforge["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
-        Some(cwd.path().display().to_string().as_str())
+    assert!(
+        symforge["env"].get("SYMFORGE_WORKSPACE_ROOT").is_none(),
+        "the global Grok config must not carry a workspace root"
     );
+}
+
+#[test]
+fn test_grok_reregistration_removes_the_old_pinned_workspace_root() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"[mcp_servers.symforge]
+command = "old"
+
+[mcp_servers.symforge.env]
+KEEP_ME = "yes"
+RUST_LOG = "off"
+SYMFORGE_WORKSPACE_ROOT = "/repo/init/ran/in"
+"#,
+    )
+    .unwrap();
+
+    symforge::cli::init::register_grok_mcp_server(&path, FAKE_BINARY).unwrap();
+
+    let config = read_text(&path).parse::<toml_edit::DocumentMut>().unwrap();
+    let env = &config["mcp_servers"]["symforge"]["env"];
+    assert!(
+        env.get("SYMFORGE_WORKSPACE_ROOT").is_none(),
+        "the pin an earlier init wrote must be removed: {env}"
+    );
+    assert_eq!(env["KEEP_ME"].as_str(), Some("yes"));
+}
+
+#[test]
+fn test_grok_registration_writes_no_workspace_root_on_a_fresh_config() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    symforge::cli::init::register_grok_mcp_server(&path, FAKE_BINARY).unwrap();
+    assert!(
+        !read_text(&path).contains("SYMFORGE_WORKSPACE_ROOT"),
+        "a global config must not be pinned to one project"
+    );
+}
+
+#[test]
+fn test_claude_code_presence_agrees_between_scan_and_all() {
+    use symforge::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState};
+
+    let claude_state = |home: &std::path::Path, cwd: &std::path::Path| {
+        HarnessRegistry::known_with(home, cwd)
+            .scan(&AttachEntry::new("http://127.0.0.1:1/mcp", None))
+            .into_iter()
+            .find(|status| status.id == HarnessId::ClaudeCode)
+            .expect("Claude Code is a known harness")
+            .state
+    };
+    let binary_path = std::path::PathBuf::from(FAKE_BINARY);
+
+    // Neither `~/.claude` nor `~/.claude.json`: not installed, and `all` skips it.
+    let bare = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    assert_eq!(
+        claude_state(bare.path(), cwd.path()),
+        HarnessState::NotInstalled
+    );
+    run_init_with_context(InitClient::All, bare.path(), cwd.path(), &binary_path).unwrap();
+    assert!(!bare.path().join(".claude.json").exists());
+    assert!(!bare.path().join(".claude").exists());
+
+    // `~/.claude` alone: installed, and `all` registers it.
+    let present = TempDir::new().unwrap();
+    std::fs::create_dir_all(present.path().join(".claude")).unwrap();
+    assert_eq!(
+        claude_state(present.path(), cwd.path()),
+        HarnessState::Absent
+    );
+    run_init_with_context(InitClient::All, present.path(), cwd.path(), &binary_path).unwrap();
+    assert!(present.path().join(".claude.json").exists());
 }
 
 #[test]
@@ -634,6 +717,65 @@ fn project_aware_init_reconciles_existing_root_gitignore() {
     );
 }
 
+/// Claude Desktop's config directory under an injected home, per platform.
+fn claude_desktop_dir(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        home.join("AppData").join("Roaming").join("Claude")
+    } else if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude")
+    } else {
+        home.join(".config").join("Claude")
+    }
+}
+
+#[test]
+fn test_run_init_all_skips_harnesses_that_are_not_installed() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let binary_path = std::path::PathBuf::from(FAKE_BINARY);
+    // Only Codex is installed on this host.
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+
+    run_init_with_context(InitClient::All, home.path(), cwd.path(), &binary_path)
+        .expect("all-client init must succeed");
+
+    assert!(
+        home.path().join(".codex").join("config.toml").exists(),
+        "the installed harness must be registered"
+    );
+    for absent in [".claude", ".claude.json", ".gemini", ".grok", ".cursor"] {
+        assert!(
+            !home.path().join(absent).exists(),
+            "`all` must not create {absent} for a harness that is not installed"
+        );
+    }
+    assert!(
+        !claude_desktop_dir(home.path()).exists(),
+        "`all` must not create the Claude Desktop config directory"
+    );
+    assert!(
+        !cwd.path().join(".kilocode").exists(),
+        "`all` must not write project-local Kilo config"
+    );
+}
+
+#[test]
+fn test_run_init_explicit_client_creates_its_config_directory() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let binary_path = std::path::PathBuf::from(FAKE_BINARY);
+
+    run_init_with_context(InitClient::Cursor, home.path(), cwd.path(), &binary_path)
+        .expect("explicit cursor init must succeed");
+
+    assert!(
+        home.path().join(".cursor").join("mcp.json").exists(),
+        "an explicitly named client may create its config directory"
+    );
+}
+
 #[test]
 fn test_run_init_claude_only_updates_claude_files() {
     let home = TempDir::new().unwrap();
@@ -708,6 +850,13 @@ fn test_run_init_all_updates_both_clients() {
             .join("claude_desktop_config.json")
     };
 
+    // `all` reaches only harnesses that are already installed, so give every
+    // user-scope harness its config root first.
+    for root in [".codex", ".grok", ".claude", ".gemini", ".cursor"] {
+        std::fs::create_dir_all(home.path().join(root)).unwrap();
+    }
+    std::fs::create_dir_all(claude_desktop_config.parent().unwrap()).unwrap();
+
     run_init_with_context(InitClient::All, home.path(), cwd.path(), &binary_path)
         .expect("all-client init must succeed");
 
@@ -744,16 +893,12 @@ fn test_run_init_all_updates_both_clients() {
         "Gemini guidance must be created"
     );
     assert!(
-        cwd.path().join(".kilocode").join("mcp.json").exists(),
-        "Kilo config must be created"
+        !cwd.path().join(".kilocode").exists(),
+        "Kilo is project-local, so `all` must never write it"
     );
     assert!(
-        cwd.path()
-            .join(".kilocode")
-            .join("rules")
-            .join("symforge.md")
-            .exists(),
-        "Kilo guidance rules must be created"
+        home.path().join(".cursor").join("mcp.json").exists(),
+        "Cursor config must be created"
     );
     assert!(
         claude_desktop_config.exists(),
