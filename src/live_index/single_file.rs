@@ -22,6 +22,7 @@ use crate::domain::{
 use crate::hash;
 use crate::live_index::store::{
     FencedRemoval, IndexedFile, PublicationFence, PublishedGeneration, SharedIndex,
+    SnapshotVerifiedAdmission, SnapshotVerifiedFile,
 };
 use crate::parsing;
 
@@ -254,7 +255,7 @@ fn path_spelling_is_refused(abs_path: &Path, relative_path: &str) -> bool {
         .is_some_and(|root| crate::discovery::resolve_repo_path(&root, relative_path).is_err())
 }
 
-fn catalog_terminal_disposition(decision: &ScoutDecision) -> Option<FileDisposition> {
+pub(crate) fn catalog_terminal_disposition(decision: &ScoutDecision) -> Option<FileDisposition> {
     match decision {
         ScoutDecision::HardSkip { reason } => Some(FileDisposition::HardSkip { reason: *reason }),
         ScoutDecision::MetadataOnly { reason } => Some(FileDisposition::MetadataOnly {
@@ -322,6 +323,98 @@ pub(crate) fn admit_and_index_single_path_with_receipt(
         expected_gen,
         crate::live_index::store::stable_read_file,
     )
+}
+
+/// Off-lock half of the canonical seam, for snapshot-verify batches.
+///
+/// Runs the gates of [`read_and_index_with_stable_read_receipt`] in the same
+/// order (exclusions, metadata scout, generated-output placement, stable read,
+/// content policy) but publishes nothing: the caller commits many paths in one
+/// publication. Returns `None` for every outcome this cannot settle without a
+/// publication of its own (exclusion eviction, unreadable, unstable, missing),
+/// and the caller sends that path through the canonical seam instead. `base`
+/// is the row the stat pass saw; matching bytes reuse it without a parse.
+pub(crate) fn prepare_snapshot_verify_admission(
+    relative_path: &str,
+    abs_path: &Path,
+    shared: &SharedIndex,
+    base: Option<&Arc<IndexedFile>>,
+) -> Option<SnapshotVerifiedFile> {
+    let relative = Path::new(relative_path);
+    if crate::discovery::path_is_hard_scope_excluded(relative)
+        || shared.is_source_excluded(relative)
+        || shared.read().is_path_gitignored(relative_path)
+    {
+        return None;
+    }
+    let base_hash = base.map(|row| row.content_hash.clone());
+    let terminal = |scouted, disposition| SnapshotVerifiedFile {
+        path: relative_path.to_string(),
+        scouted,
+        admission: SnapshotVerifiedAdmission::Terminal(disposition),
+        base_hash: base_hash.clone(),
+    };
+    let mut scouted = crate::discovery::scout_single_path(relative_path, abs_path).ok()?;
+    if let Some(disposition) = catalog_terminal_disposition(&scouted.decision) {
+        return Some(terminal(scouted, disposition));
+    }
+    let ScoutDecision::Ingest { targets } = scouted.decision else {
+        return None;
+    };
+    if let Some(root) = project_root_from_paths(abs_path, relative_path)
+        && crate::discovery::is_untracked_generated_output_path(&root, relative_path)
+    {
+        scouted.decision = ScoutDecision::MetadataOnly {
+            reason: MetadataOnlyReason::GeneratedOrVendor,
+        };
+        let disposition = catalog_terminal_disposition(&scouted.decision)?;
+        return Some(terminal(scouted, disposition));
+    }
+    let bytes = match crate::live_index::store::stable_read_file(abs_path, &scouted.stamp) {
+        crate::live_index::store::StableReadOutcome::Accepted { bytes, .. } => bytes,
+        crate::live_index::store::StableReadOutcome::HardSkip { reason } => {
+            scouted.decision = ScoutDecision::HardSkip { reason };
+            return Some(terminal(scouted, FileDisposition::HardSkip { reason }));
+        }
+        _ => return None,
+    };
+    if let crate::knowledge::StableContentAdmission::MetadataOnly(reason) =
+        crate::knowledge::classify_stable_content(relative_path, targets, &bytes)
+    {
+        return Some(terminal(scouted, FileDisposition::MetadataOnly { reason }));
+    }
+    let mtime_secs = scouted
+        .stamp
+        .modified_hint
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let file = match base {
+        Some(row) if row.content_hash == hash::digest_hex(&bytes) => {
+            let mut row = row.as_ref().clone();
+            row.mtime_secs = mtime_secs;
+            row
+        }
+        _ => {
+            let language = scouted.language.unwrap_or(LanguageId::Text);
+            let result = parsing::process_file_with_classification(
+                relative_path,
+                &bytes,
+                language,
+                FileClassification::for_indexed_path(relative_path, targets),
+            );
+            IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs)
+        }
+    };
+    Some(SnapshotVerifiedFile {
+        path: relative_path.to_string(),
+        scouted,
+        admission: SnapshotVerifiedAdmission::Indexed {
+            file: Box::new(file),
+            targets,
+        },
+        base_hash,
+    })
 }
 
 #[cfg(test)]

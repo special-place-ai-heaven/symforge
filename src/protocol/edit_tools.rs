@@ -30,7 +30,8 @@ macro_rules! loading_guard {
             IndexState::Ready => {}
             IndexState::Empty => return format::empty_guard_message(),
             IndexState::Loading => {
-                return format::loading_guard_message(
+                return format::loading_guard_message_for(
+                    &$guard.snapshot_verify_state(),
                     $guard.load_source() == crate::live_index::IndexLoadSource::EmptyBootstrap,
                 );
             }

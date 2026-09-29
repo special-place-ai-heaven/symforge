@@ -9,7 +9,7 @@ use notify::{EventKind, RecommendedWatcher as NotifyRecommendedWatcher, Recursiv
 use notify_debouncer_full::{
     DebounceEventResult, DebouncedEvent, Debouncer, NoCache, new_debouncer_opt,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::domain::{FileDisposition, LanguageId};
 use crate::live_index::store::SharedIndex;
@@ -24,8 +24,8 @@ pub use crate::watcher_state::{WatcherInfo, WatcherState};
 #[cfg(test)]
 pub(crate) use crate::live_index::single_file::read_and_index_with_stable_read;
 pub(crate) use crate::live_index::single_file::{
-    ReindexOutcome as ReindexResult, admit_and_index_single_path,
-    admit_and_index_single_path_with_receipt, maybe_reindex, read_and_index,
+    ReindexOutcome as ReindexResult, admit_and_index_single_path_with_receipt, maybe_reindex,
+    read_and_index,
 };
 
 fn refuses_observed_admission_into_cold_bootstrap(shared: &SharedIndex) -> bool {
@@ -455,7 +455,7 @@ where
             .iter()
             .filter_map(|entry| entry.path.normalized_utf8.clone())
             .collect();
-        let changed_entries: Vec<(String, PathBuf, Option<LanguageId>)> = fresh_plan
+        let changed_entries: Vec<(String, PathBuf, &crate::domain::ScoutedEntry)> = fresh_plan
             .entries
             .iter()
             .filter_map(|entry| {
@@ -465,7 +465,7 @@ where
                 {
                     return None;
                 }
-                Some((relative_path, entry.absolute_path.clone()?, entry.language))
+                Some((relative_path, entry.absolute_path.clone()?, entry))
             })
             .collect();
         let removed_paths: Vec<(String, crate::domain::ScoutedEntry)> =
@@ -480,10 +480,38 @@ where
             };
 
         let mut repairs_applied = 0usize;
-        for (relative_path, absolute_path, language) in changed_entries {
+        // A snapshot verify running beside this sweep owns every path its stat
+        // pass flagged (changed, new, deleted) and publishes them together in
+        // one publication. Admitting them here too would cost one whole-index
+        // publication each, the exact cost the verify batches away. The two
+        // lanes never share state: the sweep does not touch the verify state
+        // or its mismatch report, and the verify treats a row another writer
+        // republished as already newer, so nothing is counted twice and the
+        // verify still resolves. A path that changes after the verify's stat
+        // pass is not claimed, is stale against its row, and is admitted here.
+        let verify = snapshot_verify_claims(shared, &should_stop);
+        let claimed = verify.as_ref().and_then(|progress| progress.claims());
+        let (mut admitted, mut already_current, mut left_to_verify) = (0usize, 0usize, 0usize);
+        for (relative_path, absolute_path, entry) in changed_entries {
             if should_stop() {
                 return stale_count.into();
             }
+            if claimed.is_some_and(|claimed| claimed.contains(&relative_path)) {
+                left_to_verify += 1;
+                continue;
+            }
+            // With no prior plan entry (every path of a snapshot-restored
+            // index) the plan comparison above cannot tell a stale row from a
+            // current one, so compare against the resident row itself.
+            if !previous_entries.contains_key(&relative_path)
+                && !transient_paths.contains(&relative_path)
+                && shared.read().reflects_scouted_entry(entry)
+            {
+                already_current += 1;
+                continue;
+            }
+            admitted += 1;
+            let language = entry.language;
             let outcome = read_and_index_observed(
                 &relative_path,
                 &absolute_path,
@@ -505,6 +533,10 @@ where
                 repairs_applied += 1;
             }
         }
+        info!(
+            "reconciliation sweep: {admitted} admitted, {already_current} already current, \
+             {left_to_verify} left to the running snapshot verify"
+        );
         for (relative_path, expected_entry) in removed_paths {
             if should_stop() {
                 return stale_count.into();
@@ -591,6 +623,34 @@ where
             || shared
                 .scout_plan()
                 .is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded),
+    }
+}
+
+/// Longest a sweep waits for a running snapshot verify to finish its stat
+/// pass and claim its paths. Past it the sweep proceeds on its own: correct,
+/// only slower, because the verify's per-path fences absorb the overlap.
+const SNAPSHOT_VERIFY_CLAIMS_WAIT: Duration = Duration::from_secs(300);
+
+/// The running snapshot verify's progress once its claims are known, or
+/// `None` when no verify is running (or it has not claimed in time).
+fn snapshot_verify_claims(
+    shared: &SharedIndex,
+    should_stop: &impl Fn() -> bool,
+) -> Option<crate::live_index::store::SnapshotVerifyProgress> {
+    let deadline = std::time::Instant::now() + SNAPSHOT_VERIFY_CLAIMS_WAIT;
+    loop {
+        let progress = match &shared.read().snapshot_verify_state {
+            crate::live_index::store::SnapshotVerifyState::Running(progress) => progress.clone(),
+            _ => return None,
+        };
+        if progress.claims().is_some() {
+            return Some(progress);
+        }
+        if should_stop() || std::time::Instant::now() >= deadline {
+            warn!("reconciliation: snapshot verify has not claimed its paths; sweeping without it");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

@@ -3,7 +3,7 @@
 /// Uses postcard (compact binary) for fast round-trips.
 /// Atomic write (tmp → rename) to prevent corruption on crash.
 /// Background verification corrects stale entries after loading a snapshot.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -23,7 +23,7 @@ use crate::index_lifecycle::snapshot::{
 };
 use crate::live_index::store::{
     CircuitBreakerState, CodeSignalsSnapshot, IndexLoadSource, IndexedFile, LiveIndex, ParseStatus,
-    SnapshotVerifyState, normalize_root,
+    SnapshotVerifyProgress, SnapshotVerifyReport, SnapshotVerifyState, normalize_root,
 };
 use crate::paths;
 
@@ -2723,10 +2723,26 @@ fn build_snapshot(
     })
 }
 
+/// Files re-read in parallel between two progress updates.
+const SNAPSHOT_VERIFY_PREPARE_CHUNK: usize = 256;
+
+/// Re-read content held off-lock before the verify publishes early.
+///
+/// The verify publishes once: every publication rebuilds the knowledge bridge,
+/// authority, and outline of the whole index, which costs minutes on a
+/// repository with millions of symbols. Holding the prepared rows until then
+/// costs their size, and they become resident anyway once published, so the
+/// bound only caps the transient doubling. A restore whose changed set is
+/// larger than this publishes once per bound instead of exhausting memory.
+const SNAPSHOT_VERIFY_PUBLISH_BYTES: usize = 256 * 1024 * 1024;
+
 /// Background task: verify a loaded index against disk and re-parse stale files.
 ///
 /// Run after `snapshot_to_live_index` to bring the index to current disk state.
-/// Non-blocking for queries — writes are protected by the index's RwLock.
+/// The pass has no await point, so it runs on the blocking pool rather than
+/// pinning a tokio worker for its whole duration. When it returns, the
+/// snapshot verify state is resolved to `Completed` unless the project was
+/// retargeted meanwhile, in which case the replacement owns that state.
 pub async fn background_verify(
     index: crate::live_index::store::SharedIndex,
     root: std::path::PathBuf,
@@ -2758,36 +2774,109 @@ pub(crate) fn block_on_background_verify_for_test(
         ));
 }
 
-/// `Some(true)` — the path was actually removed (publish it, observe it).
-/// `Some(false)` — nothing held the path; already reconciled, no removal to
-/// observe or publish. `None` — a fence rejected the removal; abort the pass.
-/// T038 round-1 (D14 family): the caller must not observe a removal that did
-/// not happen — the same rule already applied to the watcher and embed
-/// lanes.
-fn remove_snapshot_deleted_file_if_still_absent(
-    index: &crate::live_index::store::SharedIndex,
-    root: &Path,
-    path: &str,
-    expected: crate::live_index::store::PublicationFence,
-) -> Option<bool> {
-    let absolute_path = root.join(path);
-    match index.remove_file_if_absent_at_publication_fence_with_receipt(
-        path,
-        &absolute_path,
-        expected,
-    ) {
-        crate::live_index::store::FencedRemoval::Removed(_) => Some(true),
-        crate::live_index::store::FencedRemoval::NothingHeld => Some(false),
-        crate::live_index::store::FencedRemoval::Rejected => None,
-    }
-}
-
 async fn background_verify_with_hook<F>(
     index: crate::live_index::store::SharedIndex,
     root: std::path::PathBuf,
     snapshot_mtimes: HashMap<String, u64>,
     observer: crate::live_index::index_lifecycle::observer::ObserverId,
-    after_fence: F,
+    after_running: F,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    let expected_gen = index.current_project_generation();
+    let task_index = index.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        run_background_verify(
+            &task_index,
+            &root,
+            &snapshot_mtimes,
+            observer,
+            expected_gen,
+            after_running,
+        );
+    })
+    .await;
+    if let Err(error) = joined {
+        // A pass that died proved nothing. Resolve it as such rather than
+        // leave the restored index in `Running` with no one left to finish it.
+        tracing::error!(%error, "snapshot verify task failed; every restored row is unverified");
+        let unverified: Vec<String> = index.read().files.keys().cloned().collect();
+        let report = SnapshotVerifyReport::from_mismatched_paths(unverified)
+            .with_reason("the snapshot verify task failed before it finished".to_string());
+        if !index.mark_snapshot_verify_completed_at_generation(expected_gen, report) {
+            warn!("snapshot verify task failed after the project was retargeted");
+        }
+    }
+}
+
+/// Re-verify one path through the canonical single-file seam, with its
+/// bounded retries. A re-index, a hash match, or a confirmed removal counts as
+/// reconciled; everything else is the caller's mismatch.
+#[cfg(feature = "server")]
+fn reverify_through_canonical_seam(
+    index: &crate::live_index::store::SharedIndex,
+    root: &Path,
+    rel_path: &str,
+    expected_gen: u64,
+    authority: &crate::live_index::index_lifecycle::activation::ProjectSourceAuthority,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
+) -> bool {
+    let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    match crate::live_index::single_file::maybe_reindex(
+        rel_path,
+        &abs_path,
+        index,
+        None::<crate::domain::LanguageId>,
+        expected_gen,
+    ) {
+        crate::watcher::ReindexResult::Reindexed => {
+            if let Err(active) = authority.observe_admission(observer, rel_path) {
+                tracing::debug!(
+                    ?observer,
+                    ?active,
+                    %rel_path,
+                    "stale verify incarnation: admission observation refused"
+                );
+            }
+            true
+        }
+        crate::watcher::ReindexResult::HashSkip | crate::watcher::ReindexResult::Removed => true,
+        _ => false,
+    }
+}
+
+/// Why a verify's mismatches exist, in words an agent can act on.
+fn snapshot_verify_mismatch_reason(
+    unreconciled: usize,
+    spot_mismatches: usize,
+    not_reparsed: usize,
+) -> String {
+    let mut parts = Vec::new();
+    if unreconciled > 0 {
+        parts.push(format!(
+            "{unreconciled} files could not be re-read or published after a retry"
+        ));
+    }
+    if spot_mismatches > 0 {
+        parts.push(format!(
+            "{spot_mismatches} restored files had changed content behind an unchanged size and mtime"
+        ));
+    }
+    if not_reparsed > 0 {
+        parts.push(format!(
+            "{not_reparsed} changed or new files are not re-parsed in this build"
+        ));
+    }
+    parts.join("; ")
+}
+
+fn run_background_verify<F>(
+    index: &crate::live_index::store::SharedIndex,
+    root: &Path,
+    snapshot_mtimes: &HashMap<String, u64>,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
+    expected_gen: u64,
+    after_running: F,
 ) where
     F: FnOnce(),
 {
@@ -2797,190 +2886,278 @@ async fn background_verify_with_hook<F>(
     // successor registration (watcher (re)start) makes the carried id stale
     // and the lane refuses it — late V10 callbacks are unreachable in the
     // authority lane — while the V10 data-plane reconciliation continues
-    // under its own publication fences (recorded residual until C4 gates it).
-    let authority = crate::live_index::index_lifecycle::activation::project_source_authority(&root);
-    let captured_base = index.publication_fence();
-    after_fence();
-    let Some(mut commit_fence) = index.mark_snapshot_verify_running_at_fence(captured_base) else {
+    // under its own per-path fences (recorded residual until C4 gates it).
+    let authority = crate::live_index::index_lifecycle::activation::project_source_authority(root);
+    let observe_admissions = |paths: &[String]| {
+        for path in paths {
+            if let Err(active) = authority.observe_admission(observer, path) {
+                tracing::debug!(
+                    ?observer,
+                    ?active,
+                    %path,
+                    "stale verify incarnation: admission observation refused"
+                );
+            }
+        }
+    };
+    let observe_removals = |paths: &[String]| {
+        for path in paths {
+            if let Err(active) = authority.observe_removal(observer, path) {
+                tracing::debug!(
+                    ?observer,
+                    ?active,
+                    %path,
+                    "stale verify incarnation: removal observation refused"
+                );
+            }
+        }
+    };
+    // The only way out without resolving the state: the project was
+    // retargeted, and the replacement index owns its own verification state.
+    let abandoned = |stage: &str| {
+        warn!(
+            "snapshot verify abandoned at {stage}: the project was retargeted, \
+             and its replacement owns its own verification state"
+        );
+    };
+    let progress = SnapshotVerifyProgress::started(SystemTime::now(), index.read().files.len());
+    if !index.mark_snapshot_verify_started_at_generation(expected_gen, progress.clone()) {
+        abandoned("start");
         return;
-    };
-    #[cfg(feature = "server")]
-    let expected_gen = commit_fence.project_generation;
+    }
+    after_running();
 
-    // 1. Stat-check all files (fast: just metadata reads)
-    let verify_view = {
-        let guard = index.read();
-        capture_verify_view(&guard)
-    };
-    let stat_result = stat_check_files_from_view(&verify_view, &snapshot_mtimes, &root);
-
+    // 1. Stat-check all files (fast: just metadata reads).
+    let base = index.read();
+    let verify_view = capture_verify_view(&base);
+    let stat_result = stat_check_files_from_view(&verify_view, snapshot_mtimes, root);
     let changed_count = stat_result.changed.len();
     let deleted_count = stat_result.deleted.len();
     let new_count = stat_result.new_files.len();
 
-    // 2. Remove deleted files
-    if !stat_result.deleted.is_empty() {
-        for path in &stat_result.deleted {
-            match remove_snapshot_deleted_file_if_still_absent(&index, &root, path, commit_fence) {
-                Some(true) => {
-                    if let Err(active) = authority.observe_removal(observer, path) {
-                        tracing::debug!(
-                            ?observer,
-                            ?active,
-                            %path,
-                            "stale verify incarnation: removal observation refused"
-                        );
-                    }
-                    commit_fence = index.publication_fence();
-                }
-                // Already reconciled: nothing published, nothing to observe.
-                Some(false) => {}
-                None => return,
-            }
-        }
-    }
-
-    // 3. Re-parse changed files. Reindexing routes through the watcher's
-    //    admission path; embed has no watcher, so changed/new files are
-    //    detected but not re-parsed here (reconciliation is server-only).
-    // Files the re-parse did NOT actually reconcile.
-    //
-    // `admit_and_index_single_path` can return `Skipped` (its publication CAS
-    // lost `MAX_PUBLICATION_ATTEMPTS` times), `ReadError`, or `NotFound` — none
-    // of which refresh the index. That result used to be discarded, so a FAILED
-    // re-parse was indistinguishable from a successful one, the file fell out of
-    // the mismatch set below, and freshness resolved to `Current` over rows that
-    // were never refreshed. Right file, pre-edit anchors, index reporting
-    // healthy — and `Current` is exactly what makes the result envelope collapse
-    // to its confident one-line form.
-    //
-    // Only `Reindexed` and `HashSkip` mean the file is genuinely in sync;
-    // everything else is folded back into the mismatch set so freshness degrades
-    // honestly instead of asserting a currency nothing established.
-    #[cfg(feature = "server")]
-    let mut unreconciled: Vec<String> = Vec::new();
-    #[cfg(feature = "server")]
-    {
-        let to_reparse: Vec<String> = stat_result
+    // 2. Spot-verify a 10% sample of the rows the stat pass cleared: a content
+    //    change behind an unchanged size and mtime. Those are re-read, but
+    //    reported either way, because the unsampled rows share that blind spot.
+    let spot_mismatches = {
+        let flagged: HashSet<&str> = stat_result
             .changed
-            .into_iter()
-            .chain(stat_result.new_files)
+            .iter()
+            .chain(&stat_result.deleted)
+            .map(String::as_str)
             .collect();
-
-        for rel_path in &to_reparse {
-            if !index.matches_publication_fence(commit_fence) {
-                return;
-            }
-            let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            match crate::watcher::admit_and_index_single_path(
-                rel_path,
-                &abs_path,
-                &index,
-                expected_gen,
-            ) {
-                crate::watcher::ReindexResult::Reindexed => {
-                    if let Err(active) = authority.observe_admission(observer, rel_path) {
-                        tracing::debug!(
-                            ?observer,
-                            ?active,
-                            %rel_path,
-                            "stale verify incarnation: admission observation refused"
-                        );
-                    }
-                }
-                crate::watcher::ReindexResult::HashSkip => {}
-                _ => unreconciled.push(rel_path.clone()),
-            }
-            if index.current_project_generation() != expected_gen {
-                return;
-            }
-            commit_fence = index.publication_fence();
-        }
-    }
-
-    // 4. Spot-verify sample (10%) for content hash mismatches
-    let verify_view = {
-        let guard = index.read();
-        capture_verify_view(&guard)
+        let cleared = VerifyIndexView {
+            files: verify_view
+                .files
+                .iter()
+                .filter(|file| !flagged.contains(file.relative_path.as_str()))
+                .cloned()
+                .collect(),
+        };
+        spot_verify_sample_from_view(&cleared, root, 0.10)
     };
-    let spot_mismatches = spot_verify_sample_from_view(&verify_view, &root, 0.10);
-
+    drop(verify_view);
     let spot_count = spot_mismatches.len();
 
-    // Re-parse spot-check mismatches (server-only; see step 3 — embed reports
-    // detected mismatches but has no watcher to re-parse them).
+    // Reported mismatches whatever the re-read does, and the files the verify
+    // could not reconcile. Freshness degrades on them instead of asserting a
+    // currency nothing established.
+    #[cfg_attr(feature = "server", allow(unused_mut))]
+    let mut reported: Vec<String> = spot_mismatches.clone();
+    let mut unreconciled: Vec<String> = Vec::new();
+    let mut claims: HashSet<String> = stat_result.deleted.iter().cloned().collect();
+
+    // Re-parsing routes through the watcher's admission seam; embed has no
+    // watcher, so changed/new files are detected but not re-parsed there and
+    // fold straight into the mismatch set (reconciliation is server-only).
+    #[cfg(feature = "server")]
+    let (to_reparse, not_reparsed) = {
+        let mut to_reparse: Vec<String> = stat_result
+            .changed
+            .iter()
+            .chain(&stat_result.new_files)
+            .chain(&spot_mismatches)
+            .cloned()
+            .collect();
+        to_reparse.sort();
+        to_reparse.dedup();
+        (to_reparse, 0usize)
+    };
+    #[cfg(not(feature = "server"))]
+    let (to_reparse, not_reparsed) = {
+        let not_reparsed = stat_result.changed.len() + stat_result.new_files.len();
+        reported.extend(stat_result.changed.iter().cloned());
+        reported.extend(stat_result.new_files.iter().cloned());
+        (Vec::<String>::new(), not_reparsed)
+    };
+    claims.extend(stat_result.changed.iter().cloned());
+    claims.extend(stat_result.new_files.iter().cloned());
+    claims.extend(to_reparse.iter().cloned());
+    // Rows the stat pass saw, kept only for the paths being re-read: they are
+    // the per-path fence and the parse-free reuse when bytes match.
+    #[cfg(feature = "server")]
+    let base_rows: HashMap<String, Arc<IndexedFile>> = to_reparse
+        .iter()
+        .filter_map(|path| {
+            base.files
+                .get(path)
+                .map(|row| (path.clone(), Arc::clone(row)))
+        })
+        .collect();
+    drop(base);
+    progress.start_reverify(claims, to_reparse.len());
+
+    let removals: Vec<(String, PathBuf)> = stat_result
+        .deleted
+        .iter()
+        .map(|path| (path.clone(), root.join(path)))
+        .collect();
+
+    // 3. Re-read and parse off-lock. Everything is published in ONE
+    //    publication at the end: on a large repository a single publication
+    //    rebuilds the knowledge bridge, authority, and outline and costs
+    //    minutes, so the count of publications, not their size, is the cost.
+    //    Paths the off-lock half cannot settle go through the canonical seam
+    //    now, so the final publication can carry the resolved state.
+    #[cfg_attr(not(feature = "server"), allow(unused_mut))]
+    let mut prepared: Vec<crate::live_index::store::SnapshotVerifiedFile> = Vec::new();
     #[cfg(feature = "server")]
     {
-        for rel_path in &spot_mismatches {
-            if !index.matches_publication_fence(commit_fence) {
-                return;
-            }
-            let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            match crate::watcher::admit_and_index_single_path(
-                rel_path,
-                &abs_path,
-                &index,
-                expected_gen,
-            ) {
-                crate::watcher::ReindexResult::Reindexed => {
-                    if let Err(active) = authority.observe_admission(observer, rel_path) {
-                        tracing::debug!(
-                            ?observer,
-                            ?active,
-                            %rel_path,
-                            "stale verify incarnation: admission observation refused"
+        use rayon::prelude::*;
+        let mut prepared_bytes = 0usize;
+        let mut canonical: Vec<String> = Vec::new();
+        for chunk in to_reparse.chunks(SNAPSHOT_VERIFY_PREPARE_CHUNK) {
+            let results: Vec<(
+                &String,
+                Option<crate::live_index::store::SnapshotVerifiedFile>,
+            )> = chunk
+                .par_iter()
+                .map(|path| {
+                    let abs_path = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    let verified =
+                        crate::live_index::single_file::prepare_snapshot_verify_admission(
+                            path,
+                            &abs_path,
+                            index,
+                            base_rows.get(path),
                         );
+                    (path, verified)
+                })
+                .collect();
+            for (path, verified) in results {
+                match verified {
+                    Some(verified) => {
+                        prepared_bytes += verified.resident_bytes();
+                        prepared.push(verified);
                     }
+                    None => canonical.push(path.clone()),
                 }
-                crate::watcher::ReindexResult::HashSkip => {}
-                // Same reasoning as the changed/new loop above: a spot-check
-                // mismatch whose re-parse did not land is still a mismatch.
-                _ => unreconciled.push(rel_path.clone()),
             }
-            if index.current_project_generation() != expected_gen {
-                return;
+            progress.add_processed(chunk.len());
+            if prepared_bytes >= SNAPSHOT_VERIFY_PUBLISH_BYTES {
+                let Some(receipt) = index.publish_snapshot_verify_at_generation(
+                    expected_gen,
+                    &[],
+                    std::mem::take(&mut prepared),
+                    None,
+                ) else {
+                    abandoned("a memory-bounded publication");
+                    return;
+                };
+                observe_admissions(&receipt.indexed);
+                canonical.extend(receipt.refused);
+                prepared_bytes = 0;
             }
-            commit_fence = index.publication_fence();
+        }
+        for path in canonical {
+            if !reverify_through_canonical_seam(
+                index,
+                root,
+                &path,
+                expected_gen,
+                &authority,
+                observer,
+            ) {
+                unreconciled.push(path);
+            }
         }
     }
 
-    // Under `embed` there is no watcher to re-parse the changed/new files that
-    // the stat-check detected in step 1, so fold them into the reported mismatch
-    // set. Freshness then resolves to `Degraded` (SnapshotVerificationFailed)
-    // rather than mislabeling unreconciled changes as `Current`. Under `server`
-    // those files were re-parsed above, so they are correctly not mismatches.
-    #[cfg(not(feature = "server"))]
-    let spot_mismatches = {
-        let mut mismatches = spot_mismatches;
-        mismatches.extend(stat_result.changed);
-        mismatches.extend(stat_result.new_files);
-        mismatches.sort();
-        mismatches.dedup();
-        mismatches
+    // 4. One publication: deletions, re-read files, and the resolved state.
+    let report = |reported: &[String], unreconciled: &[String]| {
+        let paths: Vec<String> = reported.iter().chain(unreconciled).cloned().collect();
+        let mut unreconciled = unreconciled.to_vec();
+        unreconciled.sort();
+        unreconciled.dedup();
+        SnapshotVerifyReport::from_mismatched_paths(paths).with_reason(
+            snapshot_verify_mismatch_reason(unreconciled.len(), spot_count, not_reparsed),
+        )
     };
-
-    // Under `server` the re-parse above ran, but running is not succeeding: fold
-    // back everything it failed to reconcile. Previously this arm did not exist,
-    // on the assumption — stated in the comment above — that "under `server`
-    // those files were re-parsed above, so they are correctly not mismatches".
-    // That was an assumption, never a check, and `server` is a default feature,
-    // so the honest-degradation path existed only in builds nobody ships.
-    #[cfg(feature = "server")]
-    let spot_mismatches = {
-        let mut mismatches = spot_mismatches;
-        mismatches.extend(unreconciled);
-        mismatches.sort();
-        mismatches.dedup();
-        mismatches
-    };
-
-    if !index.mark_snapshot_verify_completed_at_fence(commit_fence, spot_mismatches) {
+    progress.enter_publish();
+    let prepared_files = prepared.len();
+    let publish_started = Instant::now();
+    let Some(receipt) = index.publish_snapshot_verify_at_generation(
+        expected_gen,
+        &removals,
+        prepared,
+        Some(report(&reported, &unreconciled)),
+    ) else {
+        abandoned("publication");
         return;
-    }
-
+    };
     info!(
-        "background verify complete: {} changed, {} deleted, {} new, {} spot-check mismatches",
-        changed_count, deleted_count, new_count, spot_count
+        "snapshot verify publication: {} prepared files, {} removals, {} superseded by newer writers, {} refused, in {:?}",
+        prepared_files,
+        receipt.removed.len(),
+        receipt.superseded.len(),
+        receipt.refused.len(),
+        publish_started.elapsed()
+    );
+    observe_removals(&receipt.removed);
+    observe_admissions(&receipt.indexed);
+
+    let final_report = if receipt.completed {
+        report(&reported, &unreconciled)
+    } else {
+        // The disk moved after the verify read these paths (or a deleted path
+        // came back). One canonical retry each, then resolve the state.
+        #[cfg(feature = "server")]
+        for path in receipt.refused {
+            if !reverify_through_canonical_seam(
+                index,
+                root,
+                &path,
+                expected_gen,
+                &authority,
+                observer,
+            ) {
+                unreconciled.push(path);
+            }
+        }
+        #[cfg(not(feature = "server"))]
+        unreconciled.extend(receipt.refused);
+        let final_report = report(&reported, &unreconciled);
+        if !index.mark_snapshot_verify_completed_at_generation(expected_gen, final_report.clone()) {
+            abandoned("completion");
+            return;
+        }
+        final_report
+    };
+    if final_report.mismatch_count > 0 {
+        warn!(
+            "background verify reported {} mismatched files: {}; freshness reports \
+             SnapshotVerificationFailed",
+            final_report.mismatch_count,
+            final_report.reason.as_deref().unwrap_or("unknown")
+        );
+    }
+    info!(
+        "background verify complete: {} changed, {} deleted, {} new, {} spot-check mismatches, {} reported mismatches in {:?}",
+        changed_count,
+        deleted_count,
+        new_count,
+        spot_count,
+        final_report.mismatch_count,
+        progress.started_at().elapsed().unwrap_or_default()
     );
 }
 
@@ -4045,7 +4222,7 @@ mod tests {
             "settings.toml",
         ] {
             let absolute_path = tmp.path().join(relative_path);
-            let _ = crate::watcher::admit_and_index_single_path(
+            let _ = crate::live_index::single_file::admit_and_index_single_path(
                 relative_path,
                 &absolute_path,
                 &watch,
@@ -4121,11 +4298,34 @@ mod tests {
         assert_eq!(published.file_count, 0);
     }
 
+    /// A watcher publication and a freshness-only publication while the verify
+    /// runs (the watcher starts right after restore) must not strand the
+    /// restored index in Pending/Running. This test used to assert that the
+    /// verifier publishes nothing after the watcher, which is exactly what
+    /// pinned the abandonment. The invariant kept instead: the verifier never
+    /// regresses the watcher's newer content, and the state is resolved when
+    /// background_verify returns.
     #[tokio::test]
     async fn background_verify_racing_watcher_update_rebases_or_aborts() {
         let tmp = TempDir::new().unwrap();
-        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
-            vec![("src/base.rs", b"fn base() {}\n")],
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src").join("base.rs"), b"fn base() {}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("src").join("watcher.rs"),
+            b"fn watcher_won() {}\n",
+        )
+        .unwrap();
+        let index = make_live_index_with_files(vec![("src/base.rs", b"fn base() {}\n")]);
+        serialize_index(&index, tmp.path()).expect("serialize should succeed");
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
+        let snapshot_mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect::<HashMap<_, _>>();
+        let shared = crate::live_index::SharedIndexHandle::shared(snapshot_to_live_index(
+            snapshot,
+            tmp.path(),
         ));
         let base = shared.published_generation();
         let base_project_generation = base.project_generation;
@@ -4135,7 +4335,7 @@ mod tests {
         background_verify_with_hook(
             shared.clone(),
             tmp.path().to_path_buf(),
-            HashMap::new(),
+            snapshot_mtimes,
             verify_observer(tmp.path()),
             {
                 let shared = shared.clone();
@@ -4166,6 +4366,9 @@ mod tests {
                         watcher.content_generation,
                         std::sync::atomic::Ordering::SeqCst,
                     );
+                    // A freshness-only publication moves the publication
+                    // generation without touching content.
+                    shared.set_freshness_status(crate::domain::FreshnessStatus::Verifying);
                 }
             },
         )
@@ -4173,19 +4376,211 @@ mod tests {
 
         let current = shared.published_generation();
         assert_eq!(current.project_generation, base_project_generation);
-        assert_eq!(
-            current.publication_generation,
-            watcher_publication.load(std::sync::atomic::Ordering::SeqCst),
-            "a verifier fenced to an older publication must not publish after the watcher"
-        );
-        assert_eq!(
-            current.content_generation,
-            watcher_content.load(std::sync::atomic::Ordering::SeqCst),
-            "a verifier must not relabel or replace the watcher's newer content generation"
+        assert!(
+            matches!(
+                current.live.snapshot_verify_state,
+                SnapshotVerifyState::Completed(_)
+            ),
+            "a publication racing the verify must not strand the restored index; \
+             observed {:?} after background_verify returned",
+            current.live.snapshot_verify_state
         );
         assert!(
-            current.live.files.contains_key("src/watcher.rs"),
+            current.publication_generation
+                >= watcher_publication.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            current.content_generation >= watcher_content.load(std::sync::atomic::Ordering::SeqCst),
+            "the verifier must never roll the content generation back past the watcher's"
+        );
+        assert!(
+            current
+                .live
+                .files
+                .get("src/watcher.rs")
+                .is_some_and(|file| file.content == b"fn watcher_won() {}\n"),
             "the watcher winner must remain in the captured publication root"
+        );
+        assert!(
+            !current
+                .freshness
+                .as_ref()
+                .eq(&crate::domain::FreshnessStatus::Verifying),
+            "freshness must leave Verifying once the verify returns, observed {:?}",
+            current.freshness
+        );
+    }
+
+    /// A snapshot-restored index carries no scout plan, so the watcher's fresh
+    /// instance sweep has no prior entry to compare against. It must still
+    /// leave rows that already match disk alone instead of re-admitting the
+    /// whole restored repository one clone-and-publish at a time.
+    #[cfg(feature = "server")]
+    #[test]
+    fn fresh_instance_sweep_skips_restored_rows_that_match_disk() {
+        const FILES: usize = 20;
+        let tmp = TempDir::new().unwrap();
+        for i in 0..FILES {
+            std::fs::write(
+                tmp.path().join(format!("f{i}.rs")),
+                format!("pub fn f{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let loaded = LiveIndex::load(tmp.path()).unwrap();
+        checkpoint_shared_index(&loaded, tmp.path(), &project_local_placement(tmp.path())).unwrap();
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
+        let restored = crate::live_index::SharedIndexHandle::shared(snapshot_to_live_index(
+            snapshot,
+            tmp.path(),
+        ));
+        assert!(
+            restored.scout_plan().is_none(),
+            "precondition: a restored index has no scout plan to diff against"
+        );
+        std::fs::write(tmp.path().join("f3.rs"), "pub fn f3() { let _ = 3; }\n").unwrap();
+
+        let observer = verify_observer(tmp.path());
+        let before = restored.published_generation().publication_generation;
+        let repaired = crate::watcher::reconcile_stale_files_with_stop(
+            tmp.path(),
+            &restored,
+            || false,
+            restored.current_project_generation(),
+            observer,
+        );
+        let publications = restored.published_generation().publication_generation - before;
+
+        assert_eq!(repaired, 1, "only the edited file needs re-admission");
+        assert!(
+            publications <= 2,
+            "{FILES} restored rows with one edit cost {publications} publications"
+        );
+        assert_eq!(
+            restored.read().files["f3.rs"].content,
+            b"pub fn f3() { let _ = 3; }\n"
+        );
+    }
+
+    /// While a snapshot verify runs, the paths its stat pass claimed are left
+    /// to it: the sweep admitting them would cost one whole-index publication
+    /// each, which the verify's single publication exists to avoid.
+    #[cfg(feature = "server")]
+    #[test]
+    fn fresh_instance_sweep_leaves_verify_claims_to_the_verify() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                tmp.path().join(format!("f{i}.rs")),
+                format!("pub fn f{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let loaded = LiveIndex::load(tmp.path()).unwrap();
+        checkpoint_shared_index(&loaded, tmp.path(), &project_local_placement(tmp.path())).unwrap();
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
+        let restored = crate::live_index::SharedIndexHandle::shared(snapshot_to_live_index(
+            snapshot,
+            tmp.path(),
+        ));
+        std::fs::write(tmp.path().join("f3.rs"), "pub fn f3() { let _ = 3; }\n").unwrap();
+        let generation = restored.current_project_generation();
+        let progress = SnapshotVerifyProgress::started(SystemTime::now(), 5);
+        assert!(restored.mark_snapshot_verify_started_at_generation(generation, progress.clone()));
+        progress.start_reverify(HashSet::from(["f3.rs".to_string()]), 1);
+
+        let before = restored.published_generation().publication_generation;
+        let repaired = crate::watcher::reconcile_stale_files_with_stop(
+            tmp.path(),
+            &restored,
+            || false,
+            generation,
+            verify_observer(tmp.path()),
+        );
+
+        assert_eq!(repaired, 0, "the claimed stale file belongs to the verify");
+        assert!(restored.published_generation().publication_generation - before <= 1);
+        assert_eq!(
+            restored.read().files["f3.rs"].content,
+            b"pub fn f3() {}\n",
+            "the sweep must not have re-admitted the claimed file"
+        );
+    }
+
+    /// Cost bound: one publication rebuilds the whole index's derived state,
+    /// so the verify must not publish per changed file, nor per batch. The
+    /// running mark plus one publication for the whole changed set, whatever K.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn background_verify_publishes_changed_files_in_batches() {
+        const CHANGED: usize = 600;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let paths: Vec<String> = (0..CHANGED).map(|i| format!("src/f{i}.rs")).collect();
+        let original: Vec<Vec<u8>> = (0..CHANGED)
+            .map(|i| format!("pub fn f{i}() {{}}\n").into_bytes())
+            .collect();
+        for (path, content) in paths.iter().zip(&original) {
+            std::fs::write(tmp.path().join(path), content).unwrap();
+        }
+        let index = make_live_index_with_files(
+            paths
+                .iter()
+                .zip(&original)
+                .map(|(path, content)| (path.as_str(), content.as_slice()))
+                .collect(),
+        );
+        serialize_index(&index, tmp.path()).expect("serialize should succeed");
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
+        let snapshot_mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect::<HashMap<_, _>>();
+        // Offline edit of every file: sizes change, so the stat pass flags all.
+        for (i, path) in paths.iter().enumerate() {
+            std::fs::write(
+                tmp.path().join(path),
+                format!("pub fn f{i}() {{ let _ = {i}; }}\n"),
+            )
+            .unwrap();
+        }
+        let shared = crate::live_index::SharedIndexHandle::shared(snapshot_to_live_index(
+            snapshot,
+            tmp.path(),
+        ));
+        let before = shared.published_generation().publication_generation;
+
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
+
+        let after = shared.published_generation();
+        assert_eq!(
+            after.live.snapshot_verify_state,
+            SnapshotVerifyState::completed_without_mismatches()
+        );
+        for (i, path) in paths.iter().enumerate() {
+            let expected = format!("pub fn f{i}() {{ let _ = {i}; }}\n");
+            assert_eq!(
+                after
+                    .live
+                    .files
+                    .get(path)
+                    .map(|file| file.content.as_slice()),
+                Some(expected.as_bytes()),
+                "{path} must carry its on-disk bytes after verify"
+            );
+        }
+        let publications = after.publication_generation - before;
+        let bound = 2;
+        assert!(
+            publications <= bound,
+            "{CHANGED} changed files cost {publications} publications; bound is {bound}"
         );
     }
 
@@ -4250,20 +4645,29 @@ mod tests {
             !file_path.exists(),
             "the verifier's stat observation starts from disk absence"
         );
-        let absence_fence = shared.publication_fence();
+        let before = shared.publication_fence();
 
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         std::fs::write(&file_path, b"fn recreated() {}\n").unwrap();
 
+        let receipt = shared
+            .publish_snapshot_verify_at_generation(
+                before.project_generation,
+                &[(relative_path.to_string(), file_path.clone())],
+                Vec::new(),
+                None,
+            )
+            .expect("same project");
         assert_eq!(
-            remove_snapshot_deleted_file_if_still_absent(
-                &shared,
-                tmp.path(),
-                relative_path,
-                absence_fence,
-            ),
-            None,
+            receipt.refused,
+            vec![relative_path.to_string()],
             "a disk recreation after stat must reject snapshot cleanup"
+        );
+        assert!(receipt.removed.is_empty());
+        assert_eq!(
+            shared.publication_fence(),
+            before,
+            "a refusal must not publish"
         );
         assert!(
             shared.read().get_file(relative_path).is_some(),
@@ -4283,9 +4687,17 @@ mod tests {
         ));
         let fence = shared.publication_fence();
 
+        let receipt = shared
+            .publish_snapshot_verify_at_generation(
+                fence.project_generation,
+                &[(held_path.to_string(), tmp.path().join(held_path))],
+                Vec::new(),
+                None,
+            )
+            .expect("same project");
         assert_eq!(
-            remove_snapshot_deleted_file_if_still_absent(&shared, tmp.path(), held_path, fence),
-            Some(true),
+            receipt.removed,
+            vec![held_path.to_string()],
             "a held path confirmed absent must be REMOVED and observed"
         );
         let after_removal = shared.publication_fence();
@@ -4294,20 +4706,71 @@ mod tests {
             "an actual removal must publish (the fence must move)"
         );
 
-        assert_eq!(
-            remove_snapshot_deleted_file_if_still_absent(
-                &shared,
-                tmp.path(),
-                "src/never_held.rs",
-                after_removal,
-            ),
-            Some(false),
+        let receipt = shared
+            .publish_snapshot_verify_at_generation(
+                fence.project_generation,
+                &[(
+                    "src/never_held.rs".to_string(),
+                    tmp.path().join("src/never_held.rs"),
+                )],
+                Vec::new(),
+                None,
+            )
+            .expect("same project");
+        assert!(
+            receipt.removed.is_empty() && receipt.refused.is_empty(),
             "a never-held path has nothing to remove — NothingHeld, not Removed"
         );
         assert_eq!(
             shared.publication_fence(),
             after_removal,
             "a NothingHeld outcome must not publish"
+        );
+    }
+
+    /// Per-path fence: a row another writer republished after the stat pass
+    /// is left as the newer version, never overwritten with the verify's
+    /// older read.
+    #[test]
+    fn snapshot_verify_batch_refuses_a_row_another_writer_moved() {
+        let tmp = TempDir::new().unwrap();
+        let relative_path = "src/main.rs";
+        let file_path = tmp.path().join(relative_path);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"fn on_disk() {}\n").unwrap();
+        let shared = crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(
+            vec![(relative_path, b"fn before() {}\n")],
+        ));
+        let generation = shared.current_project_generation();
+        let base_hash = shared.read().files[relative_path].content_hash.clone();
+        let scouted = crate::discovery::scout_single_path(relative_path, &file_path).unwrap();
+
+        let watcher_row = make_indexed_file(relative_path, b"fn watcher_won() {}\n");
+        assert!(shared.update_file_at_generation(relative_path, watcher_row, generation));
+        let before = shared.publication_fence();
+
+        let receipt = shared
+            .publish_snapshot_verify_at_generation(
+                generation,
+                &[],
+                vec![crate::live_index::store::SnapshotVerifiedFile {
+                    path: relative_path.to_string(),
+                    scouted,
+                    admission: crate::live_index::store::SnapshotVerifiedAdmission::Indexed {
+                        file: Box::new(make_indexed_file(relative_path, b"fn on_disk() {}\n")),
+                        targets: crate::domain::IndexTargets::Code,
+                    },
+                    base_hash: Some(base_hash),
+                }],
+                None,
+            )
+            .expect("same project");
+        assert_eq!(receipt.superseded, vec![relative_path.to_string()]);
+        assert!(receipt.indexed.is_empty() && receipt.refused.is_empty());
+        assert_eq!(shared.publication_fence(), before);
+        assert_eq!(
+            shared.read().files[relative_path].content,
+            b"fn watcher_won() {}\n"
         );
     }
 
@@ -4354,9 +4817,28 @@ mod tests {
                 assert_eq!(report.mismatch_count, 1);
                 assert_eq!(report.mismatched_paths, vec!["src/main.rs".to_string()]);
                 assert_eq!(report.omitted_path_count(), 0);
+                assert_eq!(
+                    report.reason.as_deref(),
+                    Some("1 restored files had changed content behind an unchanged size and mtime"),
+                    "a verify that leaves mismatches must say why"
+                );
             }
             other => panic!("expected completed snapshot verify report, got {other:?}"),
         }
+        assert_ne!(
+            published.status,
+            crate::live_index::store::PublishedIndexStatus::Loading,
+            "an unreconciled verify must not hold the index in Loading"
+        );
+        assert!(
+            matches!(
+                shared.freshness_status().as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::SnapshotVerificationFailed)
+            ),
+            "an unreconciled verify must degrade freshness, observed {:?}",
+            shared.freshness_status()
+        );
     }
 
     #[cfg(not(feature = "server"))]

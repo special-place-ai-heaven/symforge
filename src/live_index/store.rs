@@ -1203,6 +1203,9 @@ const SNAPSHOT_VERIFY_MISMATCH_PATH_LIMIT: usize = 10;
 pub struct SnapshotVerifyReport {
     pub mismatch_count: usize,
     pub mismatched_paths: Vec<String>,
+    /// Why the mismatches exist, in words an agent can act on. `None` when
+    /// there are none.
+    pub reason: Option<String>,
 }
 
 impl SnapshotVerifyReport {
@@ -1214,13 +1217,22 @@ impl SnapshotVerifyReport {
         Self {
             mismatch_count,
             mismatched_paths: paths,
+            reason: None,
         }
+    }
+
+    pub fn with_reason(mut self, reason: String) -> Self {
+        if self.mismatch_count > 0 {
+            self.reason = Some(reason);
+        }
+        self
     }
 
     pub fn empty() -> Self {
         Self {
             mismatch_count: 0,
             mismatched_paths: Vec::new(),
+            reason: None,
         }
     }
 
@@ -1230,12 +1242,113 @@ impl SnapshotVerifyReport {
     }
 }
 
+const SNAPSHOT_VERIFY_PHASE_STAT_PASS: u8 = 0;
+const SNAPSHOT_VERIFY_PHASE_REVERIFY: u8 = 1;
+const SNAPSHOT_VERIFY_PHASE_PUBLISH: u8 = 2;
+
+/// Live progress of a running snapshot verification.
+///
+/// Shared, not copied: every clone of the published index points at the same
+/// counters, so the verify reports progress without minting a publication per
+/// step. On a large repository one publication costs minutes, which is the
+/// very thing this progress exists to explain.
+#[derive(Clone, Debug)]
+pub struct SnapshotVerifyProgress(Arc<SnapshotVerifyCounters>);
+
+#[derive(Debug)]
+struct SnapshotVerifyCounters {
+    started_at: SystemTime,
+    restored_files: usize,
+    phase: std::sync::atomic::AtomicU8,
+    total: AtomicUsize,
+    processed: AtomicUsize,
+    /// Paths the verify took ownership of after its stat pass: changed, new,
+    /// and deleted. The watcher's fresh-instance sweep leaves them to it.
+    claims: OnceLock<HashSet<String>>,
+}
+
+impl PartialEq for SnapshotVerifyProgress {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SnapshotVerifyProgress {}
+
+impl SnapshotVerifyProgress {
+    pub fn started(started_at: SystemTime, restored_files: usize) -> Self {
+        Self(Arc::new(SnapshotVerifyCounters {
+            started_at,
+            restored_files,
+            phase: std::sync::atomic::AtomicU8::new(SNAPSHOT_VERIFY_PHASE_STAT_PASS),
+            total: AtomicUsize::new(0),
+            processed: AtomicUsize::new(0),
+            claims: OnceLock::new(),
+        }))
+    }
+
+    pub fn started_at(&self) -> SystemTime {
+        self.0.started_at
+    }
+
+    /// End of the stat pass: record what the verify now owns and how much.
+    pub fn start_reverify(&self, claims: HashSet<String>, total: usize) {
+        self.0.total.store(total, Ordering::Release);
+        let _ = self.0.claims.set(claims);
+        self.0
+            .phase
+            .store(SNAPSHOT_VERIFY_PHASE_REVERIFY, Ordering::Release);
+    }
+
+    pub fn add_processed(&self, files: usize) {
+        self.0.processed.fetch_add(files, Ordering::AcqRel);
+    }
+
+    pub fn enter_publish(&self) {
+        self.0
+            .phase
+            .store(SNAPSHOT_VERIFY_PHASE_PUBLISH, Ordering::Release);
+    }
+
+    /// The paths the verify owns, once its stat pass has finished.
+    pub fn claims(&self) -> Option<&HashSet<String>> {
+        self.0.claims.get()
+    }
+
+    /// One-line `key=value` rendering shared by health, status, and the
+    /// loading guard, so every surface reports the same phase and counts.
+    pub fn describe(&self) -> String {
+        let elapsed = self
+            .0
+            .started_at
+            .elapsed()
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let restored = self.0.restored_files;
+        let processed = self.0.processed.load(Ordering::Acquire);
+        let total = self.0.total.load(Ordering::Acquire);
+        match self.0.phase.load(Ordering::Acquire) {
+            SNAPSHOT_VERIFY_PHASE_STAT_PASS => {
+                format!("phase=stat_pass restored_files={restored} elapsed={elapsed}s")
+            }
+            SNAPSHOT_VERIFY_PHASE_REVERIFY => format!(
+                "phase=reverify processed={processed}/{total} restored_files={restored} \
+                 elapsed={elapsed}s"
+            ),
+            _ => format!(
+                "phase=publish processed={processed}/{total} restored_files={restored} \
+                 elapsed={elapsed}s"
+            ),
+        }
+    }
+}
+
 /// Reconciliation status after restoring from a persisted snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotVerifyState {
     NotNeeded,
     Pending,
-    Running,
+    Running(SnapshotVerifyProgress),
     Completed(SnapshotVerifyReport),
 }
 
@@ -1445,6 +1558,68 @@ pub(crate) enum FencedRemoval {
     /// A fence rejected the removal (stale generation/publication, changed
     /// scout base, recreated path, or a poisoned mutation). Nothing published.
     Rejected,
+}
+
+/// One path the snapshot verify re-read off-lock, ready for a batch publish.
+pub(crate) struct SnapshotVerifiedFile {
+    pub path: String,
+    pub scouted: crate::domain::ScoutedEntry,
+    pub admission: SnapshotVerifiedAdmission,
+    /// Content hash of the row the stat pass saw; `None` when it held no row.
+    pub base_hash: Option<String>,
+}
+
+impl SnapshotVerifiedFile {
+    /// Content bytes this prepared row will hold once published.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match &self.admission {
+            SnapshotVerifiedAdmission::Indexed { file, .. } => file.content.len(),
+            SnapshotVerifiedAdmission::Terminal(_) => 0,
+        }
+    }
+}
+
+pub(crate) enum SnapshotVerifiedAdmission {
+    Indexed {
+        file: Box<IndexedFile>,
+        targets: crate::domain::IndexTargets,
+    },
+    /// Metadata-only or hard-skip: no resident row, only the catalog entry.
+    Terminal(FileDisposition),
+}
+
+/// What one snapshot-verify publication did, path by path.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotVerifyBatchReceipt {
+    pub removed: Vec<String>,
+    pub indexed: Vec<String>,
+    pub terminal: Vec<String>,
+    /// Terminal admissions that matched what the index already held.
+    pub unchanged: Vec<String>,
+    /// Rows another writer republished after the stat pass: already newer.
+    pub superseded: Vec<String>,
+    /// Paths the disk moved since they were prepared; for the canonical seam.
+    pub refused: Vec<String>,
+    /// The verify state was resolved in this same publication.
+    pub completed: bool,
+}
+
+/// Progress may only move a verification that has not resolved yet.
+fn verify_in_flight(state: &SnapshotVerifyState) -> bool {
+    matches!(
+        state,
+        SnapshotVerifyState::Pending | SnapshotVerifyState::Running(_)
+    )
+}
+
+/// Whether the file still has the size and mtime it was read at.
+fn snapshot_verified_stamp_matches(scouted: &crate::domain::ScoutedEntry) -> bool {
+    let Some(path) = scouted.absolute_path.as_deref() else {
+        return false;
+    };
+    std::fs::metadata(path).is_ok_and(|meta| {
+        meta.len() == scouted.stamp.size && meta.modified().ok() == scouted.stamp.modified_hint
+    })
 }
 
 pub struct PreparedKnowledgeBridge {
@@ -2421,7 +2596,7 @@ impl SharedIndexHandle {
         let next = if next_reasons.is_empty() {
             if matches!(
                 live.snapshot_verify_state,
-                SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+                SnapshotVerifyState::Pending | SnapshotVerifyState::Running(_)
             ) {
                 FreshnessStatus::Verifying
             } else {
@@ -3865,14 +4040,35 @@ impl SharedIndexHandle {
         let _ = self.mark_snapshot_verify_running_at_fence(expected);
     }
 
-    pub fn mark_snapshot_verify_running_at_generation(&self, expected_gen: u64) -> bool {
-        let expected = self.publication_fence();
-        if expected.project_generation != expected_gen {
+    /// Mark the verify running under the project-generation fence only. Its
+    /// progress then moves through the shared counters without publishing.
+    ///
+    /// Returns `false` only when the project was retargeted: the replacement
+    /// owns its own verification state. Unrelated publications (watcher,
+    /// freshness, bridge) are not a conflict for a state marker, and treating
+    /// them as one stranded the restored index in `Running` forever.
+    pub fn mark_snapshot_verify_started_at_generation(
+        &self,
+        expected_gen: u64,
+        progress: SnapshotVerifyProgress,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
             self.note_rejected_stale_mutation();
             return false;
         }
-        self.mark_snapshot_verify_running_at_fence(expected)
-            .is_some()
+        let current = self.live.load_full();
+        if current.load_source != IndexLoadSource::SnapshotRestore
+            || !verify_in_flight(&current.snapshot_verify_state)
+        {
+            return true;
+        }
+        let mut live = (*current).clone();
+        live.mark_snapshot_verify_running(progress);
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        self.swap_and_publish_retaining_content(live);
+        true
     }
 
     pub fn mark_snapshot_verify_running_at_fence(
@@ -3885,7 +4081,11 @@ impl SharedIndexHandle {
             return None;
         }
         let mut live = (*self.live.load_full()).clone();
-        live.mark_snapshot_verify_running();
+        let restored_files = live.files.len();
+        live.mark_snapshot_verify_running(SnapshotVerifyProgress::started(
+            SystemTime::now(),
+            restored_files,
+        ));
         let scout_plan = self.scout_plan.load_full();
         self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish_retaining_content(live);
@@ -3897,17 +4097,234 @@ impl SharedIndexHandle {
         let _ = self.mark_snapshot_verify_completed_at_fence(expected, mismatched_paths);
     }
 
+    /// Resolve the verification under the project-generation fence only; see
+    /// [`Self::mark_snapshot_verify_started_at_generation`] for why the
+    /// publication fence is not used here.
     pub fn mark_snapshot_verify_completed_at_generation(
         &self,
         expected_gen: u64,
-        mismatched_paths: Vec<String>,
+        report: SnapshotVerifyReport,
     ) -> bool {
-        let expected = self.publication_fence();
-        if expected.project_generation != expected_gen {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
             self.note_rejected_stale_mutation();
             return false;
         }
-        self.mark_snapshot_verify_completed_at_fence(expected, mismatched_paths)
+        let current = self.live.load_full();
+        if current.load_source != IndexLoadSource::SnapshotRestore {
+            return true;
+        }
+        if !verify_in_flight(&current.snapshot_verify_state) {
+            return true;
+        }
+        let mut live = (*current).clone();
+        live.snapshot_verify_state = SnapshotVerifyState::Completed(report);
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        self.swap_and_publish_retaining_content(live);
+        true
+    }
+
+    /// Publish snapshot-verify results in ONE publication: deletions confirmed
+    /// absent, re-read files, terminal admissions, and, when `completion` is
+    /// given and nothing was refused, the resolved verify state.
+    ///
+    /// Fenced per path and on the project generation, never on the
+    /// whole-index publication generation, so watcher and freshness-only
+    /// publications during the verify are not conflicts. Per path:
+    /// - a row whose hash moved since the stat pass was republished by
+    ///   another writer from newer bytes; it is `superseded` and left alone;
+    /// - a file whose size or mtime moved since the verify read it, or a
+    ///   deleted path that exists again, is `refused` and handed back for the
+    ///   canonical single-file seam; completion then waits for the caller.
+    ///
+    /// `None` means the project was retargeted and nothing was published.
+    pub(crate) fn publish_snapshot_verify_at_generation(
+        &self,
+        expected_gen: u64,
+        removals: &[(String, PathBuf)],
+        files: Vec<SnapshotVerifiedFile>,
+        completion: Option<SnapshotVerifyReport>,
+    ) -> Option<SnapshotVerifyBatchReceipt> {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
+            self.note_rejected_stale_mutation();
+            return None;
+        }
+        let current = self.live.load_full();
+        let mut live = (*current).clone();
+        let mut receipt = SnapshotVerifyBatchReceipt::default();
+        let mut removed_paths = Vec::new();
+        let mut evicted_rows = Vec::new();
+        let mut scouted_entries = Vec::new();
+
+        for (path, absolute_path) in removals {
+            match std::fs::symlink_metadata(absolute_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed_paths.push(path.clone());
+                    if live.remove_file(path) {
+                        receipt.removed.push(path.clone());
+                    }
+                }
+                _ => receipt.refused.push(path.clone()),
+            }
+        }
+
+        for verified in files {
+            let current_hash = live
+                .files
+                .get(&verified.path)
+                .map(|file| file.content_hash.as_str());
+            if current_hash != verified.base_hash.as_deref() {
+                receipt.superseded.push(verified.path);
+                continue;
+            }
+            if !snapshot_verified_stamp_matches(&verified.scouted) {
+                receipt.refused.push(verified.path);
+                continue;
+            }
+            match verified.admission {
+                SnapshotVerifiedAdmission::Indexed { file, targets } => {
+                    let parse_status = match &file.parse_status {
+                        ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+                        ParseStatus::PartialParse { .. } => {
+                            crate::domain::index::ParseStatus::PartialParse
+                        }
+                        ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
+                    };
+                    let manifest_entry = catalog_entry_from_scout(
+                        &verified.scouted,
+                        FileDisposition::Indexed {
+                            targets,
+                            parse_status,
+                        },
+                        Some(file.content_hash.clone()),
+                    );
+                    live.update_file_with_manifest_sort(verified.path.clone(), *file, false);
+                    live.upsert_manifest_entry_with_sort(manifest_entry, false);
+                    receipt.indexed.push(verified.path);
+                }
+                SnapshotVerifiedAdmission::Terminal(disposition) => {
+                    let manifest_entry =
+                        catalog_entry_from_scout(&verified.scouted, disposition, None);
+                    let row_removed = live.remove_file(&verified.path);
+                    if row_removed {
+                        evicted_rows.push(verified.path.clone());
+                    }
+                    let entry_changed = !live.manifest_entries.contains(&manifest_entry);
+                    if entry_changed {
+                        live.upsert_manifest_entry_with_sort(manifest_entry, false);
+                    }
+                    if row_removed || entry_changed {
+                        receipt.terminal.push(verified.path);
+                    } else {
+                        receipt.unchanged.push(verified.path);
+                    }
+                }
+            }
+            scouted_entries.push(verified.scouted);
+        }
+
+        let content_changed = !receipt.removed.is_empty()
+            || !receipt.indexed.is_empty()
+            || !receipt.terminal.is_empty();
+        if content_changed {
+            live.sort_manifest_entries();
+        }
+        if let Some(report) = completion
+            && receipt.refused.is_empty()
+            && verify_in_flight(&live.snapshot_verify_state)
+            && live.load_source == IndexLoadSource::SnapshotRestore
+        {
+            live.snapshot_verify_state = SnapshotVerifyState::Completed(report);
+            receipt.completed = true;
+        }
+        if !content_changed && !receipt.completed {
+            return Some(receipt);
+        }
+        match self.scout_plan_with_batch_locked(scouted_entries, &removed_paths, &live) {
+            Ok(Some(plan)) => self.scout_plan.store(Some(plan)),
+            Ok(None) => {}
+            Err(error) => {
+                // Nothing published: hand every path back to the canonical seam.
+                tracing::error!(%error, "failed to refresh scout plan for a snapshot-verify publication");
+                let mut refused = std::mem::take(&mut receipt.refused);
+                refused.append(&mut receipt.removed);
+                refused.append(&mut receipt.indexed);
+                refused.append(&mut receipt.terminal);
+                refused.append(&mut receipt.unchanged);
+                return Some(SnapshotVerifyBatchReceipt {
+                    refused,
+                    superseded: receipt.superseded,
+                    ..SnapshotVerifyBatchReceipt::default()
+                });
+            }
+        }
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        if content_changed {
+            self.swap_and_publish(live);
+            let mut snapshots = self.pre_update_snapshots.lock();
+            for path in removed_paths.iter().chain(&evicted_rows) {
+                snapshots.remove(path);
+            }
+        } else {
+            self.swap_and_publish_retaining_content(live);
+        }
+        Some(receipt)
+    }
+
+    /// Batch form of [`Self::scout_plan_with_entry_locked`] plus
+    /// [`Self::scout_plan_without_path_locked`]: one clone and one refresh.
+    fn scout_plan_with_batch_locked(
+        &self,
+        entries: Vec<crate::domain::ScoutedEntry>,
+        removed_paths: &[String],
+        live: &LiveIndex,
+    ) -> anyhow::Result<Option<Arc<discovery::ScoutPlan>>> {
+        let Some(current) = self.scout_plan.load_full() else {
+            return Ok(None);
+        };
+        let mut plan = (*current).clone();
+        let before = plan.entries.len();
+        let removed: std::collections::HashSet<&str> =
+            removed_paths.iter().map(String::as_str).collect();
+        plan.entries.retain(|entry| {
+            entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .is_none_or(|path| !removed.contains(path))
+        });
+        let mut changed = plan.entries.len() != before;
+        let mut positions: HashMap<crate::domain::CatalogPath, usize> = plan
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.path.clone(), position))
+            .collect();
+        for entry in entries {
+            match positions.get(&entry.path) {
+                Some(&position) if plan.entries[position] == entry => {}
+                Some(&position) => {
+                    plan.entries[position] = entry;
+                    changed = true;
+                }
+                None => {
+                    positions.insert(entry.path.clone(), plan.entries.len());
+                    plan.entries.push(entry);
+                    changed = true;
+                }
+            }
+        }
+        discovery::refresh_scout_plan(&mut plan)?;
+        if manifest_requires_degraded_coverage(live) {
+            plan.coverage = crate::domain::CoverageStatus::Degraded;
+        }
+        if !changed && plan.coverage == current.coverage {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(plan)))
     }
 
     pub fn mark_snapshot_verify_completed_at_fence(
@@ -5708,10 +6125,20 @@ impl LiveIndex {
     }
 
     fn upsert_manifest_entry(&mut self, entry: CatalogEntry) {
+        self.upsert_manifest_entry_with_sort(entry, true);
+    }
+
+    fn upsert_manifest_entry_with_sort(&mut self, entry: CatalogEntry, sort: bool) {
         let path = scouted_catalog_path(&entry.path).to_string();
         self.manifest_entries
             .retain(|existing| scouted_catalog_path(&existing.path) != path);
         self.manifest_entries.push(entry);
+        if sort {
+            self.sort_manifest_entries();
+        }
+    }
+
+    fn sort_manifest_entries(&mut self) {
         self.manifest_entries.sort_by_cached_key(|entry| {
             let path = entry
                 .path
@@ -5981,6 +6408,18 @@ impl LiveIndex {
     /// replaced atomically. Existing target routing is preserved; callers that
     /// need to change routing must use the explicit admission publication path.
     pub fn update_file(&mut self, path: String, file: IndexedFile) {
+        self.update_file_with_manifest_sort(path, file, true);
+    }
+
+    /// [`Self::update_file`] for batch writers, which pass `false` and call
+    /// [`Self::sort_manifest_entries`] once: re-sorting the whole manifest per
+    /// file dominated a snapshot-verify batch on a large repository.
+    fn update_file_with_manifest_sort(
+        &mut self,
+        path: String,
+        file: IndexedFile,
+        sort_manifest: bool,
+    ) {
         // Capture old reference names BEFORE replacing the file, so we can
         // clean up stale reverse index entries after the insert.
         let old_ref_names: Vec<String> = self
@@ -6039,7 +6478,7 @@ impl LiveIndex {
         // gitignore assertion failures). Auxiliary indices may become
         // temporarily stale, but the file won't vanish from the index.
         self.files.insert(path.clone(), Arc::new(file));
-        self.upsert_manifest_entry(manifest_entry);
+        self.upsert_manifest_entry_with_sort(manifest_entry, sort_manifest);
 
         // Clean up old auxiliary indices using captured state.
         if had_existing {
@@ -6209,9 +6648,45 @@ impl LiveIndex {
         self.snapshot_verify_state.clone()
     }
 
-    pub(crate) fn mark_snapshot_verify_running(&mut self) {
+    /// Whether this index already holds exactly what `entry` would admit: a
+    /// resident row with the entry's size and mtime second, or, for a
+    /// metadata-terminal entry, the identical catalog row and no resident row.
+    ///
+    /// Reads the rows directly, not through [`Self::get_file`]: this is
+    /// reconciliation bookkeeping, and `get_file` hides every restored row
+    /// while snapshot verification runs, which made the watcher's fresh
+    /// instance sweep re-admit a whole restored repository one file at a time.
+    // ponytail: mtime is compared in whole seconds, the resolution rows store; a same-second, same-size edit needs the watcher event or the verify spot check.
+    pub(crate) fn reflects_scouted_entry(&self, entry: &crate::domain::ScoutedEntry) -> bool {
+        let Some(path) = entry.path.normalized_utf8.as_deref() else {
+            return false;
+        };
+        match crate::live_index::single_file::catalog_terminal_disposition(&entry.decision) {
+            Some(disposition) => {
+                !self.files.contains_key(path)
+                    && self.manifest_entries.contains(&catalog_entry_from_scout(
+                        entry,
+                        disposition,
+                        None,
+                    ))
+            }
+            None if matches!(entry.decision, crate::domain::ScoutDecision::Ingest { .. }) => {
+                let mtime_secs = entry
+                    .stamp
+                    .modified_hint
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs());
+                self.files.get(path).is_some_and(|row| {
+                    row.byte_len == entry.stamp.size && Some(row.mtime_secs) == mtime_secs
+                })
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn mark_snapshot_verify_running(&mut self, progress: SnapshotVerifyProgress) {
         if self.load_source == IndexLoadSource::SnapshotRestore {
-            self.snapshot_verify_state = SnapshotVerifyState::Running;
+            self.snapshot_verify_state = SnapshotVerifyState::Running(progress);
         }
     }
 
@@ -7717,7 +8192,10 @@ mod tests {
         assert_eq!(running.generation, 1);
         assert_eq!(running.status, PublishedIndexStatus::Loading);
         assert_eq!(running.degraded_summary, None);
-        assert_eq!(running.snapshot_verify_state, SnapshotVerifyState::Running);
+        assert!(matches!(
+            running.snapshot_verify_state,
+            SnapshotVerifyState::Running(_)
+        ));
         assert_eq!(running.file_count, initial.file_count);
         assert_eq!(running.partial_parse_count, initial.partial_parse_count);
         assert_eq!(running.failed_count, initial.failed_count);

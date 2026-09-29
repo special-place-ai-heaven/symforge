@@ -4095,7 +4095,8 @@ macro_rules! loading_guard {
             IndexState::Ready => {}
             IndexState::Empty => return format::empty_guard_message(),
             IndexState::Loading => {
-                return format::loading_guard_message(
+                return format::loading_guard_message_for(
+                    &$guard.snapshot_verify_state(),
                     $guard.load_source() == crate::live_index::IndexLoadSource::EmptyBootstrap,
                 );
             }
@@ -4112,9 +4113,12 @@ fn loading_guard_message_from_published(
     match published.status {
         crate::live_index::PublishedIndexStatus::Ready => None,
         crate::live_index::PublishedIndexStatus::Empty => Some(format::empty_guard_message()),
-        crate::live_index::PublishedIndexStatus::Loading => Some(format::loading_guard_message(
-            published.load_source == crate::live_index::IndexLoadSource::EmptyBootstrap,
-        )),
+        crate::live_index::PublishedIndexStatus::Loading => {
+            Some(format::loading_guard_message_for(
+                &published.snapshot_verify_state,
+                published.load_source == crate::live_index::IndexLoadSource::EmptyBootstrap,
+            ))
+        }
         crate::live_index::PublishedIndexStatus::Degraded => Some(format!(
             "Index degraded: {}",
             published
@@ -12202,7 +12206,13 @@ impl SymForgeServer {
         // — same discipline as the env-surface disclosure above.
         ctx.orphaned_daemon_pid = crate::daemon::unrecorded_daemon_pid();
 
-        let body = crate::stel::format_stel_status(request, &ctx);
+        let mut body = crate::stel::format_stel_status(request, &ctx);
+        if let Some(line) =
+            format::snapshot_verify_status_line(guard.load_source(), &guard.snapshot_verify_state())
+        {
+            body.push('\n');
+            body.push_str(&line);
+        }
         match reset_note {
             Some(note) => format!("{body}\n{note}"),
             None => body,
@@ -21618,21 +21628,85 @@ mod tests {
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let mut index = make_live_index_ready(vec![(key, file)]);
         index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
-        index.snapshot_verify_state = crate::live_index::store::SnapshotVerifyState::Running;
+        let progress = crate::live_index::store::SnapshotVerifyProgress::started(
+            std::time::SystemTime::now(),
+            100,
+        );
+        progress.start_reverify(std::collections::HashSet::new(), 40);
+        progress.add_processed(10);
+        index.snapshot_verify_state =
+            crate::live_index::store::SnapshotVerifyState::Running(progress);
         let server = make_server(index);
 
         let full = server
             .health(Parameters(super::HealthInput::default()))
             .await;
         assert!(
-            full.contains("Snapshot verify: load_source=snapshot_restore state=running"),
+            full.contains(
+                "Snapshot verify: load_source=snapshot_restore state=running \
+                 phase=reverify processed=10/40 restored_files=100 elapsed="
+            ),
             "full health should expose background snapshot verification progress: {full}"
         );
 
         let compact = server.health_compact().await;
         assert!(
-            compact.contains("Snapshot: load_source=snapshot_restore verify=running"),
+            compact.contains(
+                "Snapshot: load_source=snapshot_restore verify=running \
+                 phase=reverify processed=10/40"
+            ),
             "compact health should retain snapshot verify progress: {compact}"
+        );
+
+        let status = server.render_stel_status_body(&crate::stel::StelStatusRequest {
+            detail: None,
+            reset_calibration: None,
+            connection_surface: None,
+        });
+        assert!(
+            status.contains("verify=running phase=reverify processed=10/40"),
+            "status should expose snapshot verify progress: {status}"
+        );
+    }
+
+    /// A tool refused while a restored snapshot verifies must say so, with the
+    /// phase and progress, not a bare "try again shortly" that reads the same
+    /// after three hours as after three seconds.
+    #[tokio::test]
+    async fn test_loading_guard_names_snapshot_verify_progress() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+        let progress = crate::live_index::store::SnapshotVerifyProgress::started(
+            std::time::SystemTime::now(),
+            100,
+        );
+        progress.start_reverify(std::collections::HashSet::new(), 40);
+        progress.add_processed(10);
+        index.snapshot_verify_state =
+            crate::live_index::store::SnapshotVerifyState::Running(progress);
+        let server = make_server(index);
+        let result = server
+            .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
+                path: "src/lib.rs".to_string(),
+                name: "foo".to_string(),
+                kind: None,
+                symbol_line: None,
+                targets: None,
+                estimate: None,
+                max_tokens: None,
+                force_refresh: None,
+            }))
+            .await;
+        assert!(
+            result.starts_with(crate::protocol::format::SNAPSHOT_VERIFY_IN_PROGRESS)
+                && result.contains("verify=running phase=reverify processed=10/40"),
+            "the loading guard must name the verify state and progress, got: {result}"
+        );
+        assert!(
+            super::is_index_unavailable_output(&result),
+            "the verify guard must still classify as index-unavailable"
         );
     }
 

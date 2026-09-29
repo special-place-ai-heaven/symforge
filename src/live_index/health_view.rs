@@ -373,7 +373,7 @@ impl LiveIndex {
         }
         if matches!(
             self.snapshot_verify_state,
-            SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+            SnapshotVerifyState::Pending | SnapshotVerifyState::Running(_)
         ) {
             return IndexState::Loading;
         }

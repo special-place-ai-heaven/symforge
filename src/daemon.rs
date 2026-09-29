@@ -824,6 +824,12 @@ pub struct ProjectHealth {
     pub durability: CapabilityStatus,
     pub capabilities: ProjectCapabilities,
     pub opened_at_unix_secs: u64,
+    /// Restored-snapshot verification, rendered like the `status` line, for
+    /// example `Snapshot: load_source=snapshot_restore verify=running
+    /// phase=reverify processed=512/16572 elapsed=40s`. `None` when the index
+    /// was not restored from a snapshot.
+    #[serde(default)]
+    pub snapshot_verify: Option<String>,
 }
 
 fn default_project_freshness() -> FreshnessStatus {
@@ -1672,6 +1678,10 @@ impl DaemonState {
                 team_artifact_export,
             },
             opened_at_unix_secs: unix_seconds(project.opened_at),
+            snapshot_verify: crate::protocol::format::snapshot_verify_status_line(
+                published.load_source,
+                &published.snapshot_verify_state,
+            ),
         })
     }
 
