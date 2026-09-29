@@ -833,10 +833,13 @@ fn default_project_freshness() -> FreshnessStatus {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DaemonHealth {
     pub project_count: usize,
-    /// Every session the daemon still tracks, live or stale.
+    /// Every session the daemon still tracks, heartbeating or stale.
     pub session_count: usize,
     /// Sessions whose heartbeat is older than the stale window, computed when
-    /// health is queried. Live sessions are `session_count - stale_sessions`.
+    /// health is queried. Heartbeating sessions are `session_count -
+    /// stale_sessions`; a fresh heartbeat is evidence of life, not a process
+    /// check, so a just-killed adapter counts as heartbeating until its
+    /// heartbeat ages out.
     #[serde(default)]
     pub stale_sessions: usize,
     pub daemon_version: String,
@@ -1550,6 +1553,12 @@ impl DaemonState {
     /// probe runs outside every lock; the claim re-checks `last_seen_at` under
     /// the write lock, so a late heartbeat wins. A live pid keeps its session
     /// (the TTL rule remains the backstop for pid reuse and pid-less clients).
+    ///
+    /// Accepted residual: a dead adapter whose pid the OS has recycled looks
+    /// alive here and keeps its session until the TTL, and health cannot tell
+    /// it from a suspended adapter. Better design, as a follow-up: hold a
+    /// SYNCHRONIZE handle (Windows) or a pidfd (Linux, `pidfd_open`) in the
+    /// `SessionRecord`, so the pid cannot be recycled and liveness is definite.
     pub fn reap_dead_pid_sessions(&self, stale_after: std::time::Duration) -> usize {
         let cutoff = now_epoch_millis().saturating_sub(stale_after.as_millis() as u64);
         let candidates: Vec<(String, u64, u32)> = self
@@ -2238,7 +2247,7 @@ impl DaemonState {
         }
         let (live, stale) = self.session_liveness();
         lines.push(format!(
-            "sessions: {live} live, {stale} stale (heartbeat > {} s)",
+            "daemon sessions: {live} heartbeating, {stale} stale (heartbeat > {} s)",
             STALE_SESSION_HEARTBEAT.as_secs()
         ));
         lines.push(format!(
@@ -2266,7 +2275,8 @@ impl DaemonState {
         }
     }
 
-    /// `(live, stale)` session counts, judged by heartbeat age at call time.
+    /// `(heartbeating, stale)` session counts, daemon-wide, judged by
+    /// heartbeat age at call time.
     fn session_liveness(&self) -> (usize, usize) {
         let now = now_epoch_millis();
         let sessions = self.sessions.read();
@@ -2780,12 +2790,36 @@ pub(crate) async fn run_then_close_session<T>(
 ) -> anyhow::Result<T> {
     let mut slot = None;
     let result = run(&mut slot).await;
-    let current = match slot {
-        Some(slot) => slot.read().await.clone(),
-        None => session,
-    };
-    let _ = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, current.close()).await;
+    close_current_session(session, slot, SESSION_CLOSE_TIMEOUT).await;
     result
+}
+
+/// Close the current session within ONE `bound` that covers reading the slot
+/// AND the request: a reconnect holds the slot's write lock for as long as the
+/// daemon open takes (up to the open timeout), so an unbounded read would let
+/// an adapter exiting mid-reconnect hang. Giving up is safe: the daemon reaper
+/// collects whatever an unfinished reconnect leaves once this process is gone.
+/// A failure or timeout is logged, never returned.
+async fn close_current_session(
+    session: DaemonSessionClient,
+    slot: Option<SessionSlot>,
+    bound: std::time::Duration,
+) {
+    let close = async {
+        let current = match slot {
+            Some(slot) => slot.read().await.clone(),
+            None => session,
+        };
+        current.close().await
+    };
+    match tokio::time::timeout(bound, close).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!("closing the daemon session on exit failed: {error:#}"),
+        Err(_) => tracing::warn!(
+            "closing the daemon session on exit gave up after {} ms; the daemon reaper will collect it",
+            bound.as_millis()
+        ),
+    }
 }
 
 pub async fn connect_or_spawn_session(
@@ -15278,7 +15312,7 @@ mod tests {
             .render_session_project_inventory(&live.session_id)
             .expect("inventory");
         assert!(
-            inventory.contains("sessions: 1 live, 2 stale (heartbeat > 120 s)"),
+            inventory.contains("daemon sessions: 1 heartbeating, 2 stale (heartbeat > 120 s)"),
             "{inventory}"
         );
 
@@ -15326,6 +15360,57 @@ mod tests {
             0,
             "the session must be closed on the daemon"
         );
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// A reconnect holds the slot's write lock for as long as the daemon open
+    /// takes. An adapter exiting meanwhile must give up within its bound
+    /// instead of queueing behind that lock.
+    #[tokio::test]
+    async fn test_exit_close_gives_up_while_a_reconnect_holds_the_slot() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project = project_dir("symforge-close-bound");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        // ponytail: match instead of expect — DaemonSessionClient has no Debug impl.
+        let session = match connect_or_spawn_session_at(
+            project.path(),
+            "close-bound",
+            Some(std::process::id()),
+            &test_control_state(daemon_home.path()),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => panic!("open session: {error:#}"),
+        };
+        let slot: SessionSlot = Arc::new(tokio::sync::RwLock::new(session.clone()));
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let holder_slot = Arc::clone(&slot);
+        let holder = tokio::spawn(async move {
+            let _write = holder_slot.write().await;
+            let _ = held_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        held_rx.await.expect("write lock held");
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            close_current_session(session, Some(slot), std::time::Duration::from_millis(200)),
+        )
+        .await
+        .expect("the exit close must return within its bound, not wait for the reconnect");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(
+            handle.state.health().session_count,
+            1,
+            "it gave up, so the reaper still owns the session"
+        );
+        holder.abort();
         let _ = handle.shutdown_tx.send(());
     }
 
