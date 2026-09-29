@@ -2569,7 +2569,25 @@ impl DaemonSessionClient {
         .await?;
         let mut new_client = new_client.with_project_root(project_root.to_path_buf());
         new_client.activation_lane = std::sync::Arc::clone(&self.activation_lane);
+        if let Err(error) = self
+            .verify_reconnected_session(project_root, &new_client)
+            .await
+        {
+            // The daemon already opened this session; do not leave it to the
+            // reaper just because verification refused it.
+            close_current_session(new_client, None, SESSION_CLOSE_TIMEOUT).await;
+            return Err(error);
+        }
+        Ok(new_client)
+    }
 
+    /// The post-open half of [`Self::reconnect`]: identity checks and the
+    /// working-set restore against the freshly opened session.
+    async fn verify_reconnected_session(
+        &self,
+        project_root: &Path,
+        new_client: &DaemonSessionClient,
+    ) -> anyhow::Result<()> {
         // Task 8: home is immutable across reconnects — the fresh session
         // must resolve to the SAME deterministic project id, or something
         // rebound the identity underneath us. Fail closed instead of serving
@@ -2655,7 +2673,7 @@ impl DaemonSessionClient {
                 new_client.record_active_root(active);
             }
         }
-        Ok(new_client)
+        Ok(())
     }
 
     pub async fn call_tool_value(
@@ -2879,6 +2897,21 @@ async fn connect_or_spawn_session_at(
         .await
         .context("daemon session open body")?;
     if opened.project_id != expected_project_id {
+        // The daemon already holds this session; close it before refusing so
+        // it is not left to the reaper.
+        close_current_session(
+            DaemonSessionClient::new_with_auth_token(
+                base_url,
+                opened.project_id,
+                opened.session_id,
+                opened.project_name,
+                auth_token,
+                control_state_dir.clone(),
+            ),
+            None,
+            SESSION_CLOSE_TIMEOUT,
+        )
+        .await;
         anyhow::bail!(
             "daemon opened a project identity that does not match the canonical requested root"
         );
@@ -3384,6 +3417,30 @@ fn process_is_alive(pid: u32) -> bool {
         // kill(pid, 0): Ok(0) => the process exists (or is a zombie),
         // ESRCH => it is gone.
         unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+/// One reaper sweep, TTL rule then pid rule, run on the blocking pool: closing
+/// a session stops its project slot, which takes the mutation lock that a long
+/// `index_folder` reload holds, and that must not park a tokio worker.
+/// Returns `(ttl_reaped, dead_pid_reaped)`; a panicked sweep is logged and
+/// counts as zero rather than being reported as a clean pass.
+async fn sweep_sessions_off_thread(
+    state: SharedDaemonState,
+    ttl: std::time::Duration,
+) -> (usize, usize) {
+    let sweep = tokio::task::spawn_blocking(move || {
+        (
+            state.reap_expired_sessions(ttl),
+            state.reap_dead_pid_sessions(STALE_SESSION_HEARTBEAT),
+        )
+    });
+    match sweep.await {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::warn!("session reaper sweep did not complete: {error}");
+            (0, 0)
+        }
     }
 }
 
@@ -4809,11 +4866,10 @@ pub async fn spawn_daemon_at(
             let Some(state) = reaper_state.upgrade() else {
                 break;
             };
-            let reaped = state.reap_expired_sessions(ttl);
+            let (reaped, dead) = sweep_sessions_off_thread(Arc::clone(&state), ttl).await;
             if reaped > 0 {
                 tracing::info!(reaped, ttl_secs = ttl.as_secs(), "session reaper sweep");
             }
-            let dead = state.reap_dead_pid_sessions(STALE_SESSION_HEARTBEAT);
             if dead > 0 {
                 tracing::info!(dead, "session reaper closed sessions whose process exited");
             }
@@ -15201,13 +15257,14 @@ mod tests {
             .expect("spawn long-running child")
     }
 
-    /// The pid of a process that has definitely exited.
-    fn dead_pid() -> u32 {
+    /// A process that has definitely exited. Keep the `Child` in scope for the
+    /// whole test: on Windows its open handle pins the pid, so the OS cannot
+    /// hand it to an unrelated process before the probe runs.
+    fn dead_child() -> std::process::Child {
         let mut child = spawn_sleeper();
-        let pid = child.id();
         child.kill().expect("kill child");
         child.wait().expect("reap child");
-        pid
+        child
     }
 
     fn open_session_with_pid(
@@ -15245,8 +15302,13 @@ mod tests {
         let mut live_child = spawn_sleeper();
         let stale = now_epoch_millis() - 10 * 60_000;
 
-        let dead_stale = open_session_with_pid(&state, &project, dead_pid());
-        let dead_fresh = open_session_with_pid(&state, &project, dead_pid());
+        let (dead_a, dead_b, dead_c) = (dead_child(), dead_child(), dead_child());
+        let dead_stale = open_session_with_pid(&state, &project, dead_a.id());
+        let dead_fresh = open_session_with_pid(&state, &project, dead_b.id());
+        // The only member of its project: reaping it must retire the slot.
+        let lonely_project = project_dir("symforge-pid-reaper-lonely");
+        let lonely = open_session_with_pid(&state, &lonely_project, dead_c.id());
+        set_last_seen(&state, &lonely.session_id, stale);
         let live_stale = open_session_with_pid(&state, &project, live_child.id());
         let no_pid_stale = state
             .open_project_session(OpenProjectRequest {
@@ -15271,8 +15333,12 @@ mod tests {
         let _ = live_child.wait();
 
         assert_eq!(
-            reaped, 1,
-            "only the stale session with a dead pid is reaped"
+            reaped, 2,
+            "only the stale sessions with a dead pid are reaped"
+        );
+        assert!(
+            !state.projects.read().contains_key(&lonely.project_id),
+            "a reaped session that was its project's last member retires the project slot"
         );
         assert_eq!(
             survived,
@@ -15411,6 +15477,72 @@ mod tests {
             "it gave up, so the reaper still owns the session"
         );
         holder.abort();
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// The sweep the reaper tick runs applies the pid rule even when the TTL
+    /// rule has nothing to do (default TTL, heartbeat only ten minutes old).
+    #[tokio::test]
+    async fn test_reaper_sweep_applies_the_pid_rule_off_the_async_worker() {
+        let project = project_dir("symforge-sweep-wiring");
+        let state = Arc::new(DaemonState::new());
+        let mut dead = dead_child();
+        let opened = open_session_with_pid(&state, &project, dead.id());
+        set_last_seen(&state, &opened.session_id, now_epoch_millis() - 10 * 60_000);
+
+        let counts = sweep_sessions_off_thread(Arc::clone(&state), session_ttl_from_env()).await;
+
+        assert_eq!(
+            counts,
+            (0, 1),
+            "TTL rule idle, pid rule reaps the dead session"
+        );
+        assert!(!state.sessions.read().contains_key(&opened.session_id));
+        dead.wait().expect("child stays reaped");
+    }
+
+    /// After a reconnect the server's slot holds a DIFFERENT client than the
+    /// one the adapter started with; the exit close must end that one.
+    #[tokio::test]
+    async fn test_exit_close_ends_the_session_a_reconnect_left_in_the_slot() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project = project_dir("symforge-close-slot");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let control = test_control_state(daemon_home.path());
+        // ponytail: match instead of expect — DaemonSessionClient has no Debug impl.
+        let open = async || match connect_or_spawn_session_at(
+            project.path(),
+            "close-slot",
+            Some(std::process::id()),
+            &control,
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => panic!("open session: {error:#}"),
+        };
+        let original = open().await;
+        let replacement = open().await;
+        let replacement_id = replacement.session_id().to_string();
+        assert_eq!(handle.state.health().session_count, 2);
+
+        let result: anyhow::Result<()> = run_then_close_session(original, async |slot| {
+            *slot = Some(Arc::new(tokio::sync::RwLock::new(replacement)));
+            Ok(())
+        })
+        .await;
+
+        result.expect("body result is preserved");
+        let remaining: Vec<String> = handle.state.sessions.read().keys().cloned().collect();
+        assert_eq!(remaining.len(), 1, "exactly one session is closed");
+        assert_ne!(
+            remaining[0], replacement_id,
+            "the session in the slot is the one that closes"
+        );
         let _ = handle.shutdown_tx.send(());
     }
 
