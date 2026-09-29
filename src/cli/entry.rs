@@ -354,7 +354,12 @@ async fn run_deferred_mcp_server_async(
                 _ = client_left.wait_for(|stop| *stop) => return Ok(()),
             };
             match connected {
-                Ok(session) => run_remote_mcp_server_async(session, serve).await,
+                Ok(session) => {
+                    daemon::run_then_close_session(session.clone(), async |slot| {
+                        run_remote_mcp_server_async(session, serve, slot).await
+                    })
+                    .await
+                }
                 Err(error) => {
                     tracing::warn!(
                         root = %root.display(),
@@ -382,7 +387,16 @@ async fn run_deferred_mcp_server_async(
     });
 
     tracing::info!("serving MCP on stdio while the project runtime starts");
-    let service = serve_server(front, transport::stdio()).await?;
+    let service = match serve_server(front, transport::stdio()).await {
+        Ok(service) => service,
+        Err(error) => {
+            // The runtime task may already hold a daemon session; let it
+            // close that before the process goes, exactly as on a normal exit.
+            let _ = shutdown.send(true);
+            let _ = runtime.await;
+            return Err(error.into());
+        }
+    };
     let served = tokio::select! {
         result = service.waiting() => result.map(|_| ()).map_err(anyhow::Error::from),
         _ = tokio::signal::ctrl_c() => {
@@ -398,9 +412,14 @@ async fn run_deferred_mcp_server_async(
     runtime?
 }
 
+/// Serves one daemon-backed stdio session. Closing that session is the
+/// caller's job (`daemon::run_then_close_session`), so it happens on every
+/// exit path, `?` returns included; this fn only publishes the slot the
+/// current session lives in.
 async fn run_remote_mcp_server_async(
     session: daemon::DaemonSessionClient,
     serve: StdioServe,
+    current_session: &mut Option<daemon::SessionSlot>,
 ) -> anyhow::Result<()> {
     let control_state_dir = crate::paths::process_control_state_placement()
         .directory()
@@ -448,6 +467,7 @@ async fn run_remote_mcp_server_async(
         server.set_descriptor_state_dir(state_dir.clone());
     }
     let heartbeat_slot = server.daemon_client_slot();
+    *current_session = heartbeat_slot.clone();
     let heartbeat_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -496,24 +516,19 @@ async fn run_remote_mcp_server_async(
         session_id = %session.session_id(),
         "starting daemon-backed MCP server on stdio transport"
     );
-    let shutdown_slot = server.daemon_client_slot();
     // Feature 032 (F3): stdio serves exactly one client per process, so this
     // server instance IS the session — the one lane the repeat tracker may
     // attribute a run to. Declared here, at the transport, so a lane that does
     // not say so stays inert instead of sharing a count across clients.
-    serve_stdio(server.with_stdio_transport_lane(), serve).await?;
+    let served = serve_stdio(server.with_stdio_transport_lane(), serve).await;
 
     heartbeat_task.abort();
-    // Close the CURRENT session (post-reconnect), not the stale original.
-    if let Some(slot) = shutdown_slot {
-        let current = slot.read().await.clone();
-        let _ = current.close().await;
-    }
     // Task 8: remove ONLY this adapter's descriptor; sibling adapters on the
     // same root keep theirs.
     if let Some(state_dir) = control_state_dir.as_ref() {
         sidecar::port_file::cleanup_own_descriptor(state_dir);
     }
+    served?;
     tracing::info!("daemon-backed MCP server shut down cleanly");
     Ok(())
 }
