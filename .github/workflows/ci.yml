@@ -326,13 +326,16 @@ jobs:
   windows-native:
     needs: release-version
     runs-on: windows-latest
-    env:
+    steps:
       # Keep test runs off the runner's real control-state home; live daemons
       # and other processes must never share coordination state with them
       # (see .config/nextest.toml). `prepare_control_state_dir` creates the
-      # directory on first use.
-      SYMFORGE_HOME: ${{ runner.temp }}/symforge-test-home
-    steps:
+      # directory on first use. The runner context is not available in
+      # job-level env, so the variable is exported from a step instead.
+      - name: Point SYMFORGE_HOME at a throwaway home
+        shell: bash
+        run: echo "SYMFORGE_HOME=$RUNNER_TEMP/symforge-test-home" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml is the single source of truth for the toolchain
