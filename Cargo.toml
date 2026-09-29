@@ -103,7 +103,7 @@ postcard = { version = "1.1", features = ["use-std"] }
 axum = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 chrono = "0.4"
-dirs = "6"
+dirs = "7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tree-sitter = "=0.26.13"
