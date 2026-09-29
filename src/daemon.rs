@@ -2772,10 +2772,93 @@ async fn connect_or_spawn_session_at(
 }
 
 async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow::Result<u16> {
-    let identity = current_daemon_identity();
+    ensure_daemon_running_as(control_state_dir, &current_daemon_identity(), None).await
+}
+
+/// `symforge update`: make sure a daemon of `version`, running from the freshly
+/// installed `executable`, owns the daemon records. This is the stdio client's
+/// own spawn path with the NEW binary's identity, so an older recorded daemon is
+/// replaced exactly as a new session would replace it. A policy that forbids
+/// starting or replacing one is reported as [`InstalledDaemon::Skipped`], not as
+/// an error: the new binary is not at fault.
+pub(crate) async fn ensure_installed_daemon_running(
+    executable: &Path,
+    version: &str,
+) -> anyhow::Result<InstalledDaemon> {
+    ensure_installed_daemon_running_at(process_control_state_dir()?, executable, version).await
+}
+
+async fn ensure_installed_daemon_running_at(
+    control_state_dir: &ControlStateDir,
+    executable: &Path,
+    version: &str,
+) -> anyhow::Result<InstalledDaemon> {
+    let identity = DaemonIdentity {
+        version: version.to_string(),
+        executable_path: normalized_path_string(executable),
+    };
     if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
+        return Ok(InstalledDaemon::Running {
+            port,
+            started: false,
+        });
+    }
+    if daemon_autospawn_disabled() {
+        return Ok(InstalledDaemon::Skipped(format!(
+            "{DAEMON_AUTOSPAWN_ENV} is off"
+        )));
+    }
+    if let Some(newer) = newer_recorded_daemon_version_at(control_state_dir, &identity).await {
+        return Ok(InstalledDaemon::Skipped(format!(
+            "a newer daemon ({newer}) owns this SymForge home"
+        )));
+    }
+    let port = ensure_daemon_running_as(control_state_dir, &identity, Some(executable)).await?;
+    Ok(InstalledDaemon::Running {
+        port,
+        started: true,
+    })
+}
+
+/// What `symforge update` found or did about the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstalledDaemon {
+    /// A daemon of the new binary serves on `port`; `started` when update
+    /// spawned it rather than finding it running.
+    Running { port: u16, started: bool },
+    /// Policy forbids starting or replacing a daemon; carries why.
+    Skipped(String),
+}
+
+/// Ensure a daemon matching `identity` is running, spawning `executable`
+/// (this process's own binary when `None`) if not.
+async fn ensure_daemon_running_as(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+    executable: Option<&Path>,
+) -> anyhow::Result<u16> {
+    if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
         tracing::debug!("daemon already running on port {port}");
         return Ok(port);
+    }
+
+    // `symforge update` leaves sessions of the previous release running. When
+    // one of them loses its daemon connection it lands here with an OLDER
+    // identity; replacing the newer daemon would knock every new session off it,
+    // and the replacement it spawns from its own path is the new binary, which
+    // never matches the old identity. Serve locally instead.
+    if let Some(newer) = newer_recorded_daemon_version_at(control_state_dir, identity).await {
+        anyhow::bail!(
+            "a newer symforge daemon ({newer}) owns this SymForge home; this {} process will not replace it. \
+             To run {} deliberately (a downgrade or a development build), end the newer daemon's process \
+             first: its pid is in {}",
+            identity.version,
+            identity.version,
+            control_state_dir
+                .as_path()
+                .join(daemon_pid_file_name())
+                .display()
+        );
     }
 
     // INCIDENT GUARD (2026-07-11): when auto-spawn cannot happen (test
@@ -2789,23 +2872,23 @@ async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow
     }
 
     if let Some(lock) = try_acquire_start_lock_at(control_state_dir)? {
-        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
+        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
             tracing::debug!("daemon became ready while acquiring lock, port {port}");
             return Ok(port);
         }
         tracing::info!("acquired start lock, spawning new daemon");
-        stop_incompatible_recorded_daemon_at(control_state_dir, &identity).await?;
-        spawn_daemon_process()?;
+        stop_incompatible_recorded_daemon_at(control_state_dir, identity).await?;
+        spawn_daemon_process(executable)?;
         // Task 9: release the lock as soon as the child is spawned — the
         // child's `guarded_daemon_start` acquires the SAME lock before
         // binding, so holding it through `wait_for_daemon_ready` would
         // deadlock parent (waiting for the child's port file) against child
         // (waiting for the lock).
         drop(lock);
-        wait_for_daemon_ready_at(control_state_dir, &identity).await
+        wait_for_daemon_ready_at(control_state_dir, identity).await
     } else {
         tracing::info!("start lock held by another process, waiting for daemon");
-        wait_for_daemon_ready_at(control_state_dir, &identity).await
+        wait_for_daemon_ready_at(control_state_dir, identity).await
     }
 }
 
@@ -2893,6 +2976,18 @@ async fn daemon_port_if_compatible_at(
         }
         None => Ok(None),
     }
+}
+
+/// The version of the live recorded daemon when it is NEWER than `identity`.
+/// An unreadable record or an unreachable daemon is not newer.
+async fn newer_recorded_daemon_version_at(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+) -> Option<String> {
+    let port = read_daemon_port_file_at(control_state_dir).ok()?;
+    let health = daemon_health(port).await?;
+    crate::cli::version::is_newer_version(&health.daemon_version, &identity.version)
+        .then_some(health.daemon_version)
 }
 
 async fn wait_for_daemon_ready_at(
@@ -3227,8 +3322,12 @@ fn daemon_autospawn_disabled() -> bool {
         .unwrap_or(false)
 }
 
-fn spawn_daemon_process() -> anyhow::Result<()> {
-    let current_exe = std::env::current_exe().context("locating current symforge executable")?;
+/// Spawn `executable daemon` detached; `None` spawns this process's own binary.
+fn spawn_daemon_process(executable: Option<&Path>) -> anyhow::Result<()> {
+    let current_exe = match executable {
+        Some(executable) => executable.to_path_buf(),
+        None => std::env::current_exe().context("locating current symforge executable")?,
+    };
     // INCIDENT GUARD (2026-07-11): under `cargo test`, `current_exe` is the
     // libtest binary and the `daemon` argument below is interpreted as a TEST
     // FILTER — spawning it recursively re-runs the daemon test subset, which
@@ -3278,12 +3377,48 @@ fn spawn_daemon_process() -> anyhow::Result<()> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        stop_std_handle_inheritance();
     }
 
     command
         .spawn()
         .context("spawning detached symforge daemon")?;
     Ok(())
+}
+
+/// A Windows child inherits EVERY inheritable handle of its parent, not just
+/// the three it is given, so the detached daemon would otherwise hold this
+/// process's own stdio: a harness pipe when a stdio session spawns it, or the
+/// caller's pipe when `symforge update | tee` restarts it. A daemon holding a
+/// write end keeps that reader from ever seeing EOF (measured: a piped
+/// `symforge update` hung until the daemon exited). Clearing the inherit flag
+/// is safe for later children: `Stdio::inherit` duplicates the std handles
+/// into a fresh inheritable copy.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn stop_std_handle_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{
+        HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+    };
+
+    for (name, raw) in [
+        ("stdin", std::io::stdin().as_raw_handle()),
+        ("stdout", std::io::stdout().as_raw_handle()),
+        ("stderr", std::io::stderr().as_raw_handle()),
+    ] {
+        if raw.is_null() {
+            continue; // no such handle, nothing to inherit
+        }
+        // SAFETY: `raw` is this process's live std handle, borrowed for the
+        // call only; SetHandleInformation changes its inherit flag and touches
+        // no memory we own.
+        if let Err(error) =
+            unsafe { SetHandleInformation(HANDLE(raw), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }
+        {
+            tracing::warn!("could not stop the daemon inheriting {name}: {error}");
+        }
+    }
 }
 
 fn current_daemon_identity() -> DaemonIdentity {
@@ -3306,7 +3441,16 @@ fn daemon_health_matches(health: &DaemonHealth, identity: &DaemonIdentity) -> bo
         return true;
     }
 
-    stable_path_identity(&health.executable_path) == stable_path_identity(&identity.executable_path)
+    // Canonical, so one binary reached through a symlinked or junctioned
+    // directory (nvm-windows points `C:\Program Files\nodejs` at the active
+    // version dir) is one identity, not two daemons replacing each other.
+    let canonical = |path: &str| {
+        dunce::canonicalize(path)
+            .map(|path| normalized_path_string(&path))
+            .unwrap_or_else(|_| path.to_string())
+    };
+    stable_path_identity(&canonical(&health.executable_path))
+        == stable_path_identity(&canonical(&identity.executable_path))
 }
 
 fn daemon_health_matches_recorded_pid(health: &DaemonHealth, recorded_pid: u32) -> bool {
@@ -13328,7 +13472,33 @@ mod tests {
         // answers 503 until B's publication catches up with its project
         // generation, and on a loaded runner the assertion below can land
         // inside that window -- which is what reddened Release 32660381244 and
-        // 32665940448 with no regression behind it.
+        // 32665940448 with no regression behind it, and PR 715's rust job after
+        // the 10s readiness retry alone ran out. Wait on that exact condition
+        // in B's index first, with a wider bound; a timeout names both
+        // generations, so a stuck publication reads differently from a slow one.
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+        let publication_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let generations = handle.state.projects.read().get(&project_b_id).map(|slot| {
+                let project = slot.metadata.read();
+                let data_plane = project.index.data_plane();
+                (
+                    data_plane.published_generation().project_generation,
+                    data_plane.current_project_generation(),
+                )
+            });
+            if matches!(generations, Some((published, current)) if published == current) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < publication_deadline,
+                "B's publication never caught up with its project generation within 30s; \
+                 (published, current) = {generations:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
         //
         // Retry ONLY the readiness condition. Any other status is decided
         // immediately, so a real 409 still fails fast with its evidence rather
@@ -14025,7 +14195,7 @@ mod tests {
     /// flood). This pins the refusal at both seams.
     #[tokio::test]
     async fn test_test_builds_never_auto_spawn_daemon_processes() {
-        let error = spawn_daemon_process().expect_err("test build must refuse to spawn");
+        let error = spawn_daemon_process(None).expect_err("test build must refuse to spawn");
         assert!(
             error.to_string().contains("test build"),
             "refusal must name the test-build guard: {error}"
@@ -14043,6 +14213,137 @@ mod tests {
             error.to_string().contains("auto-spawn is disabled"),
             "ensure_daemon_running must fail fast without spawning: {error}"
         );
+    }
+
+    /// `symforge update` leaves sessions of the previous release running; one
+    /// that loses its daemon connection must not replace the newer daemon.
+    #[tokio::test]
+    async fn an_older_session_never_replaces_a_newer_daemon() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let older = DaemonIdentity {
+            version: "0.0.1".to_string(),
+            executable_path: current_daemon_identity().executable_path,
+        };
+
+        let error = ensure_daemon_running_as(&test_control_state(daemon_home.path()), &older, None)
+            .await
+            .expect_err("an older identity must not take over");
+
+        assert!(
+            error.to_string().contains("newer symforge daemon"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("end the newer daemon's process first"),
+            "the refusal must say how to downgrade on purpose: {error}"
+        );
+        assert!(
+            daemon_health_ok(handle.port).await,
+            "the newer daemon must still be serving"
+        );
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// nvm-windows makes `C:\Program Files\nodejs` a directory link to the
+    /// active version dir, so `symforge update` can name the running daemon's
+    /// binary through a different path. That is the same binary: the update
+    /// must keep the daemon and say it did not start one.
+    #[tokio::test]
+    async fn the_update_keeps_a_same_version_daemon_named_through_a_linked_directory() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let exe = std::env::current_exe().expect("test binary path");
+        let links = TempDir::new().expect("link dir");
+        let linked_dir = links.path().join("linked");
+        link_dir(exe.parent().expect("test binary dir"), &linked_dir);
+        let linked_exe = linked_dir.join(exe.file_name().expect("test binary name"));
+
+        let kept = ensure_installed_daemon_running_at(
+            &test_control_state(daemon_home.path()),
+            &linked_exe,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await;
+        unlink_dir(&linked_dir);
+
+        assert_eq!(
+            kept.expect("the running daemon is the same binary"),
+            InstalledDaemon::Running {
+                port: handle.port,
+                started: false
+            }
+        );
+        assert!(daemon_health_ok(handle.port).await);
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// Autospawn switched off, or a newer daemon owning the home, is policy:
+    /// the update must report the restart as skipped, not fail (a failure
+    /// rolls the new binary back).
+    #[tokio::test]
+    async fn the_update_reports_a_policy_refusal_as_a_skipped_restart() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let control_state_dir = test_control_state(daemon_home.path());
+        let exe = std::env::current_exe().expect("test binary path");
+
+        let off = {
+            let _autospawn = EnvVarGuard::set(DAEMON_AUTOSPAWN_ENV, Path::new("off"));
+            ensure_installed_daemon_running_at(&control_state_dir, &exe, "99.0.0").await
+        };
+        assert!(
+            matches!(&off, Ok(InstalledDaemon::Skipped(why)) if why.contains(DAEMON_AUTOSPAWN_ENV)),
+            "{off:?}"
+        );
+
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let older = ensure_installed_daemon_running_at(&control_state_dir, &exe, "0.0.1").await;
+        assert!(
+            matches!(&older, Ok(InstalledDaemon::Skipped(why)) if why.contains("newer daemon")),
+            "{older:?}"
+        );
+        assert!(daemon_health_ok(handle.port).await);
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// A directory symlink, or on Windows without the symlink privilege a
+    /// junction (same resolution through `canonicalize`).
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("run mklink");
+            assert!(status.success(), "mklink /J failed");
+        }
+    }
+
+    /// Remove the link itself, never what it points at.
+    fn unlink_dir(link: &Path) {
+        #[cfg(unix)]
+        std::fs::remove_file(link).expect("remove symlink");
+        #[cfg(windows)]
+        std::fs::remove_dir(link).expect("remove junction");
     }
 
     /// Task 8: after the daemon dies and a replacement comes up, the proxy

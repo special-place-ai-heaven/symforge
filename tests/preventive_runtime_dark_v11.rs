@@ -1016,11 +1016,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
 // again after the derived-stage hold grew a reached-wait so CR-1 G17 can
 // observe the pause, then for the deferred stdio front, which added
-// src/protocol/deferred_stdio.rs: 199 files.
+// src/protocol/deferred_stdio.rs: 199 files. Refreshed again for the
+// `symforge update` change, whose src diff adds no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "33e28fd53316caef5733cdad4a712ea54d7c9c994d9cd0aacce4b3de44390fcf",
+    "9295c93e001a75c1f740cc0f07771bf878c952984174296ba8cc1c45037f1354",
     199,
-    9_757_032,
+    9_820_221,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

@@ -236,8 +236,16 @@ pub fn restore(record: &BackupRecord) -> std::io::Result<()> {
 }
 
 /// Atomically write `content` to `path` (temp file in the same dir + rename).
-fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+/// A symlinked config (dotfiles kept in a repo) is written through: the temp
+/// file goes beside the real file and replaces it, so the link survives. A file
+/// that already holds `content` is not rewritten.
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    let real = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if std::fs::read(&real).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+    let path = real.as_path();
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -248,8 +256,11 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     tmp.write_all(content)?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    // rename(2) on Unix / MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows.
-    tmp.persist(path).map_err(|e| e.error)?;
+    // `std::fs::rename`, not `persist`: on Windows `persist`'s MoveFileExW
+    // refuses to replace a file another process has open (the harness reading
+    // its own config), where std's rename replaces it with POSIX semantics.
+    let tmp = tmp.into_temp_path();
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -257,6 +268,36 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::cli::harness::{HarnessTarget, SYMFORGE_SERVER_NAME};
+
+    #[test]
+    fn atomic_write_keeps_a_symlinked_config_linked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("config.toml");
+        std::fs::write(&real, "old").unwrap();
+        let link = tmp.path().join("config.toml");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file(&real, &link) {
+            // A file symlink needs the symlink privilege (an elevated shell or
+            // developer mode); without it this host has no such config to break.
+            eprintln!("skipped: this host cannot create a file symlink: {error}");
+            return;
+        }
+
+        atomic_write(&link, b"new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the config must stay a link into the dotfiles repo"
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+    }
 
     fn entry() -> AttachEntry {
         AttachEntry::new("http://127.0.0.1:8787/mcp", Some("sf_key".to_string()))
