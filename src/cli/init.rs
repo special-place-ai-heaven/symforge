@@ -22,7 +22,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::paths;
 
-use crate::cli::InitClient;
+use crate::cli::{InitClient, harness};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -106,8 +106,10 @@ pub(crate) fn claude_desktop_config_path(
     }
 }
 
-const CODEX_STARTUP_TIMEOUT_SEC: i64 = 30;
-const CODEX_TOOL_TIMEOUT_SEC: i64 = 120;
+/// The Codex `tool_timeout_sec` earlier inits seeded, below Codex's 300 s default.
+const LEGACY_SEEDED_CODEX_TOOL_TIMEOUT_SEC: i64 = 120;
+/// The Gemini `timeout` (ms) earlier inits seeded, below Gemini's 600000 ms default.
+const LEGACY_SEEDED_GEMINI_TIMEOUT_MS: u64 = 120_000;
 const SYMFORGE_GUIDANCE_START: &str = "<!-- SYMFORGE START -->";
 const SYMFORGE_GUIDANCE_END: &str = "<!-- SYMFORGE END -->";
 
@@ -246,6 +248,43 @@ pub fn run_init_with_context(
     run_init_with_paths(client, paths, home_dir, working_dir, binary_path)
 }
 
+/// Whether `init` should write the `this` harness for a request of `client`.
+/// An explicit `--client` always wins (and may create the config directory).
+/// `all` reaches only harnesses that are already installed, using the same
+/// installed test as `init --scan`, so it never litters the home directory with
+/// config roots for tools the user does not have. Every harness `all` passes
+/// over is reported on stderr, never skipped silently.
+fn targeted(
+    client: InitClient,
+    this: InitClient,
+    name: &str,
+    slug: &str,
+    config_path: &std::path::Path,
+    installed: bool,
+) -> bool {
+    if client == this {
+        return true;
+    }
+    if client == InitClient::All && !installed {
+        eprintln!(
+            "{}",
+            skipped_line(name, slug, config_path.parent().unwrap_or(config_path))
+        );
+    }
+    client == InitClient::All && installed
+}
+
+/// The stderr line for a harness `all` passed over, naming the command that
+/// registers it explicitly.
+fn skipped_line(name: &str, slug: &str, missing_dir: &std::path::Path) -> String {
+    format!(
+        "skipped: {name} (no {}; run symforge init --client {slug})",
+        missing_dir.display()
+    )
+}
+
+const KILO_SKIPPED_LINE: &str = "skipped: Kilo Code (project-local config is written only when named; run symforge init --client kilo-code)";
+
 // V11 write classification (Feature 020 Slice 4, T064): this censused
 // writer's disk writes are USER-SCOPE client registrations (Claude/Codex/
 // Gemini/Cursor/... settings, config, and guidance files under the home
@@ -271,8 +310,20 @@ fn run_init_with_paths(
 ) -> anyhow::Result<()> {
     let registration_binary_path = binary_path_for_registration(binary_path, home_dir)?;
     let binary_path_str = registration_binary_path.display().to_string();
+    // Claude Code keeps its MCP entry in `~/.claude.json`, whose parent is always
+    // the home directory, so its installed test is the `~/.claude` directory (or
+    // the file itself) rather than the parent-directory rule.
+    let claude_installed =
+        paths.claude_config.exists() || harness::config_installed(&paths.claude_settings);
 
-    if matches!(client, InitClient::Claude | InitClient::All) {
+    if targeted(
+        client,
+        InitClient::Claude,
+        "Claude Code",
+        "claude",
+        &paths.claude_settings,
+        claude_installed,
+    ) {
         merge_hooks_into_settings(&paths.claude_settings, &registration_binary_path)?;
         eprintln!(
             "Claude hooks installed in {}",
@@ -292,7 +343,14 @@ fn run_init_with_paths(
         );
     }
 
-    if matches!(client, InitClient::ClaudeDesktop | InitClient::All) {
+    if targeted(
+        client,
+        InitClient::ClaudeDesktop,
+        "Claude Desktop",
+        "claude-desktop",
+        &paths.claude_desktop_config,
+        harness::config_installed(&paths.claude_desktop_config),
+    ) {
         register_claude_desktop_mcp_server_with_home(
             &paths.claude_desktop_config,
             &binary_path_str,
@@ -304,7 +362,14 @@ fn run_init_with_paths(
         );
     }
 
-    if matches!(client, InitClient::Codex | InitClient::All) {
+    if targeted(
+        client,
+        InitClient::Codex,
+        "Codex",
+        "codex",
+        &paths.codex_config,
+        harness::config_installed(&paths.codex_config),
+    ) {
         register_codex_mcp_server(&paths.codex_config, &binary_path_str)?;
         eprintln!(
             "Codex MCP server registered in {}",
@@ -314,11 +379,18 @@ fn run_init_with_paths(
         upsert_guidance_markdown(&paths.codex_agents, &codex_guidance_block())?;
         eprintln!("Codex guidance written to {}", paths.codex_agents.display());
         eprintln!(
-            "note: Codex gets MCP tools only. No documented Codex hook/session-start enrichment interface was found, so transparent enrichment remains Claude-only."
+            "note: Codex gets MCP tools only. Codex CLI does ship SessionStart and pre-tool hooks, but symforge does not register them yet, so transparent enrichment remains Claude-only for now."
         );
     }
 
-    if matches!(client, InitClient::Grok | InitClient::All) {
+    if targeted(
+        client,
+        InitClient::Grok,
+        "Grok",
+        "grok",
+        &paths.grok_config,
+        harness::config_installed(&paths.grok_config),
+    ) {
         register_grok_mcp_server(&paths.grok_config, &binary_path_str, working_dir)?;
         eprintln!(
             "Grok MCP server registered in {}",
@@ -326,7 +398,14 @@ fn run_init_with_paths(
         );
     }
 
-    if matches!(client, InitClient::Gemini | InitClient::All) {
+    if targeted(
+        client,
+        InitClient::Gemini,
+        "Gemini CLI",
+        "gemini",
+        &paths.gemini_settings,
+        harness::config_installed(&paths.gemini_settings),
+    ) {
         register_gemini_mcp_server(&paths.gemini_settings, &binary_path_str)?;
         eprintln!(
             "Gemini MCP server registered in {}",
@@ -353,7 +432,12 @@ fn run_init_with_paths(
         }
     }
 
-    if matches!(client, InitClient::KiloCode | InitClient::All) {
+    // Kilo config is project-local (written under the CWD), so `all` never
+    // implies it: it runs only when named.
+    if client == InitClient::All {
+        eprintln!("{KILO_SKIPPED_LINE}");
+    }
+    if client == InitClient::KiloCode {
         register_kilo_mcp_server(&paths.kilo_vscode_config, &binary_path_str)?;
         eprintln!(
             "Kilo Code MCP server registered in {}",
@@ -367,7 +451,14 @@ fn run_init_with_paths(
         );
     }
 
-    if matches!(client, InitClient::Cursor | InitClient::All) {
+    if targeted(
+        client,
+        InitClient::Cursor,
+        "Cursor",
+        "cursor",
+        &paths.cursor_config,
+        harness::config_installed(&paths.cursor_config),
+    ) {
         register_cursor_mcp_server(&paths.cursor_config, &binary_path_str)?;
         eprintln!(
             "Cursor MCP server registered in {}",
@@ -832,12 +923,14 @@ fn register_claude_desktop_mcp_server_with_home(
 
     // Discover the operator's workspace at install time (TR-03 / FR-013). The
     // `symforge init` process CWD is the project the operator is in, so
-    // `find_project_root` resolves the real workspace here — unlike cold start
+    // `find_project_root_from_cwd` resolves the real workspace here — unlike cold start
     // under Claude Desktop, whose CWD is `System32` (Windows) and is useless.
     // We thread the discovered root into both the launcher CWD and the
     // registered `env`, so the server indexes a populated workspace instead of
-    // binding an empty index and emitting the TR-02 dead-end.
-    let workspace_root = crate::discovery::find_project_root();
+    // binding an empty index and emitting the TR-02 dead-end. CLAUDE_PROJECT_DIR
+    // is deliberately not consulted: an init spawned from a Claude Code hook
+    // would pin Desktop's authoritative root to that one session's project.
+    let workspace_root = crate::discovery::find_project_root_from_cwd();
     let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
 
     let command_path = if cfg!(windows) {
@@ -1133,48 +1226,20 @@ fn merge_symforge_codex_server_for_target_os(
         .expect("symforge server entry must be a table");
 
     symforge["command"] = value(native_command_path(binary_path));
-    // Preserve user-tuned timeouts on re-registration (same wipe class as the
-    // G-036 env wipe); only seed defaults when absent.
-    symforge
-        .entry("startup_timeout_sec")
-        .or_insert(value(CODEX_STARTUP_TIMEOUT_SEC));
-    symforge
-        .entry("tool_timeout_sec")
-        .or_insert(value(CODEX_TOOL_TIMEOUT_SEC));
+    // No timeouts are seeded: Codex's own defaults (30 s startup, 300 s tool)
+    // are what a seed could only match or shorten. A 120 s tool timeout written
+    // by an earlier init equals the old seed, so it is removed; any other value
+    // is the user's and stays.
+    if symforge
+        .get("tool_timeout_sec")
+        .and_then(Item::as_integer)
+        .is_some_and(|secs| secs == LEGACY_SEEDED_CODEX_TOOL_TIMEOUT_SEC)
+    {
+        symforge.remove("tool_timeout_sec");
+    }
     merge_codex_mcp_env_overrides(symforge, target_os);
 
-    merge_codex_allowed_tools(symforge);
-
     merge_codex_project_doc_fallbacks(config);
-}
-
-/// Union the full-surface tool names into Codex's `allowed_tools`,
-/// preserving any user-added entries. Codex strips the `mcp__symforge__` prefix,
-/// so the unprefixed short names are what the served surface actually exposes —
-/// the allowlist matches the surface (spec §4; full-by-init per the 2026-07-03
-/// spike gate + 2026-07-06 operator flip).
-fn merge_codex_allowed_tools(symforge: &mut Table) {
-    let mut names: Vec<String> = symforge
-        .get("allowed_tools")
-        .and_then(|item| item.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    for name in CLAUDE_ALWAYS_ALLOW {
-        if !names.iter().any(|existing| existing == name) {
-            names.push(name.to_string());
-        }
-    }
-
-    let mut allow_array = Array::new();
-    for name in &names {
-        allow_array.push(name.as_str());
-    }
-    symforge["allowed_tools"] = value(allow_array);
 }
 
 fn merge_codex_mcp_env_overrides(symforge: &mut Table, target_os: &str) {
@@ -1259,9 +1324,12 @@ pub fn register_gemini_mcp_server(
     // Refresh the managed launcher path; preserve every other user-set field.
     entry.insert("command".to_string(), Value::String(command_path));
     entry.entry("args".to_string()).or_insert_with(|| json!([]));
-    entry
-        .entry("timeout".to_string())
-        .or_insert_with(|| json!(120000));
+    // No `timeout` is seeded: Gemini's own default (600000 ms) is longer than
+    // anything init would pick. The 120000 ms an earlier init seeded is removed;
+    // any other value is the user's and stays.
+    if entry.get("timeout").and_then(Value::as_u64) == Some(LEGACY_SEEDED_GEMINI_TIMEOUT_MS) {
+        entry.remove("timeout");
+    }
     entry
         .entry("trust".to_string())
         .or_insert_with(|| Value::Bool(true));
@@ -1322,14 +1390,15 @@ pub fn register_kilo_mcp_server(
 
 /// Register symforge as an MCP server in Cursor's global `~/.cursor/mcp.json`.
 ///
-/// Cursor launches MCP servers from a fixed `cwd` (commonly the user's home),
-/// so a cold `find_project_root` resolves nothing and the server binds an empty
-/// index — the home-cwd "Index not loaded" trap. Like Claude Desktop, we
-/// discover the operator's workspace at install time (the `symforge init` CWD is
-/// the project the operator is in) and thread it into BOTH the per-server `cwd`
-/// (Cursor honors a `cwd` field) and `SYMFORGE_WORKSPACE_ROOT`, so cold start
-/// indexes a real workspace regardless of how Cursor launches the process. Only
-/// the `symforge` entry is touched; the rest of the file is preserved.
+/// The file is GLOBAL: every Cursor window reads it, so it must carry no
+/// workspace at all. A literal `SYMFORGE_WORKSPACE_ROOT` would pin every window
+/// to the repo `init` ran in, because an env-supplied root is authoritative and
+/// Cursor's own roots answer would then be ignored. Cursor's `${workspaceFolder}`
+/// is no substitute: it names the folder holding the `.cursor/mcp.json`, which is
+/// the home directory for this global file. Cursor documents no `cwd` field
+/// either. So neither is written, and the server binds from the roots Cursor
+/// declares. An entry pinned by an earlier init is migrated, see
+/// [`remove_legacy_pinned_workspace`]. Only the `symforge` entry is touched.
 pub fn register_cursor_mcp_server(
     cursor_config_path: &std::path::Path,
     binary_path: &str,
@@ -1349,35 +1418,43 @@ pub fn register_cursor_mcp_server(
 
     let command_path = native_command_path(binary_path);
 
-    // Discover the operator's workspace at install time (same rationale as
-    // Claude Desktop registration); thread it into env + cwd below.
-    let workspace_root = crate::discovery::find_project_root();
-    let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
-
-    let mut env_defaults: Vec<(&str, &str)> = vec![("SYMFORGE_SURFACE", "full")];
-    if let Some(root) = workspace_root_str.as_deref() {
-        env_defaults.push((crate::discovery::WORKSPACE_ROOT_ENV, root));
-    }
-
     let entry = symforge_json_entry_mut(&mut config);
-    // Refresh the managed launcher path; preserve every other user-set field,
-    // including a user-set env value, workspace root, or `cwd`.
+    // Refresh the managed launcher path; preserve every other user-set field.
     entry.insert("command".to_string(), Value::String(command_path));
     entry.entry("args".to_string()).or_insert_with(|| json!([]));
-    insert_env_defaults(entry, &env_defaults);
-    // Cursor honors a per-server `cwd`; point it at the discovered workspace so
-    // the launch CWD is the project, not the home directory. Preserve an
-    // existing user-set `cwd`.
-    if let Some(root) = workspace_root_str.as_deref() {
-        entry
-            .entry("cwd".to_string())
-            .or_insert_with(|| Value::String(root.to_string()));
-    }
+    remove_legacy_pinned_workspace(entry);
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(cursor_config_path, pretty)
         .with_context(|| format!("writing {}", cursor_config_path.display()))?;
     Ok(())
+}
+
+/// Remove the workspace pin an earlier `init` wrote into a global Cursor entry.
+///
+/// That writer set `cwd` and `env.SYMFORGE_WORKSPACE_ROOT` to the same literal
+/// path. Only that fingerprint is removed: a `cwd` and root that are both
+/// literal paths and equal. A root without a matching `cwd`, or a differing pair,
+/// was set by the user and stays.
+fn remove_legacy_pinned_workspace(entry: &mut serde_json::Map<String, Value>) {
+    let root_key = crate::discovery::WORKSPACE_ROOT_ENV;
+    let pinned = match (
+        entry.get("cwd").and_then(Value::as_str),
+        entry
+            .get("env")
+            .and_then(|env| env.get(root_key))
+            .and_then(Value::as_str),
+    ) {
+        (Some(cwd), Some(root)) => cwd == root && !root.starts_with("${"),
+        _ => false,
+    };
+    if pinned {
+        entry.remove("cwd");
+        if let Some(env) = entry.get_mut("env").and_then(Value::as_object_mut) {
+            env.remove(root_key);
+        }
+    }
 }
 
 fn upsert_guidance_markdown(path: &std::path::Path, guidance_block: &str) -> anyhow::Result<()> {
@@ -1990,8 +2067,8 @@ mod tests {
 
         // SYMFORGE_TOOL_NAMES carries the `mcp__symforge__` prefix; strip it to compare.
         // It backs the Claude Code settings.json `allowedTools` union (the full
-        // surface). Kilo/Codex allowlists union CLAUDE_ALWAYS_ALLOW (pinned to
-        // the registered surface below), so they are covered transitively.
+        // surface). Kilo's allowlist unions CLAUDE_ALWAYS_ALLOW (pinned to
+        // the registered surface below), so it is covered transitively.
         let full: BTreeSet<String> = SYMFORGE_TOOL_NAMES
             .iter()
             .map(|n| n.trim_start_matches("mcp__symforge__").to_string())
@@ -2038,29 +2115,16 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_registration_includes_allow_list() {
+    fn test_codex_registration_writes_no_dead_keys_and_pins_surface() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         register_codex_mcp_server(&config_path, "/usr/bin/symforge").unwrap();
         let content = std::fs::read_to_string(&config_path).unwrap();
-        // G-036 coherence: Codex serves the full surface, so its allowlist
-        // grants every full-surface short name.
-        for name in [
-            "\"symforge\"",
-            "\"symforge_edit\"",
-            "\"status\"",
-            "\"search_symbols\"",
-            "\"search_knowledge\"",
-            "\"review_knowledge\"",
-        ] {
-            assert!(
-                content.contains(name),
-                "Codex allow list must grant full-surface name {name}: {content}"
-            );
-        }
+        // Codex has no `allowed_tools` key (serde drops it), and `enabled_tools`
+        // is an allowlist that would hide every tool not named in it.
         assert!(
-            !content.contains("trace_symbol"),
-            "Codex allow list must not include retired trace_symbol alias: {content}"
+            !content.contains("allowed_tools") && !content.contains("enabled_tools"),
+            "Codex entry must not write a dead allowlist or a tool-hiding one: {content}"
         );
         assert!(
             content.contains("SYMFORGE_SURFACE = \"full\""),
@@ -2200,40 +2264,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cursor_reregistration_preserves_existing_workspace_root() {
+    fn cursor_entry_after_reregistration(entry: Value) -> Value {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
         std::fs::write(
             &path,
-            serde_json::to_string_pretty(&json!({
-                "mcpServers": {
-                    "symforge": {
-                        "command": "/old/symforge",
-                        "env": {
-                            "SYMFORGE_SURFACE": "compact",
-                            "SYMFORGE_WORKSPACE_ROOT": "/user/pinned/workspace"
-                        },
-                        "cwd": "/user/pinned/workspace"
-                    }
-                }
-            }))
-            .unwrap(),
+            serde_json::to_string_pretty(&json!({ "mcpServers": { "symforge": entry } })).unwrap(),
         )
         .unwrap();
         register_cursor_mcp_server(&path, "/new/symforge").unwrap();
         let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let entry = &config["mcpServers"]["symforge"];
-        assert_eq!(
-            entry["env"][crate::discovery::WORKSPACE_ROOT_ENV].as_str(),
-            Some("/user/pinned/workspace"),
-            "existing workspace root must NOT be overwritten by rediscovery: {entry}"
+        config["mcpServers"]["symforge"].clone()
+    }
+
+    #[test]
+    fn test_cursor_reregistration_migrates_the_pinned_workspace() {
+        let entry = cursor_entry_after_reregistration(json!({
+            "command": "/old/symforge",
+            "env": {
+                "SYMFORGE_SURFACE": "compact",
+                "SYMFORGE_WORKSPACE_ROOT": "/repo/init/ran/in"
+            },
+            "cwd": "/repo/init/ran/in"
+        }));
+        assert!(
+            entry.get("cwd").is_none(),
+            "the old init's pinned cwd must be removed: {entry}"
+        );
+        assert!(
+            entry["env"].get("SYMFORGE_WORKSPACE_ROOT").is_none(),
+            "the old init's pinned root must be removed: {entry}"
         );
         assert_eq!(
-            entry["cwd"].as_str(),
-            Some("/user/pinned/workspace"),
-            "existing cwd must be preserved: {entry}"
+            entry["env"]["SYMFORGE_SURFACE"].as_str(),
+            Some("compact"),
+            "unrelated user env must survive the migration: {entry}"
         );
+    }
+
+    #[test]
+    fn test_cursor_reregistration_keeps_user_set_workspace_values() {
+        // A root without a matching cwd, or a differing pair, was not written by
+        // the old init, so it is the user's and stays.
+        let root_only = cursor_entry_after_reregistration(json!({
+            "env": { "SYMFORGE_WORKSPACE_ROOT": "/user/chosen" }
+        }));
+        assert_eq!(
+            root_only["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
+            Some("/user/chosen"),
+            "{root_only}"
+        );
+        let differing = cursor_entry_after_reregistration(json!({
+            "env": { "SYMFORGE_WORKSPACE_ROOT": "/a" },
+            "cwd": "/b"
+        }));
+        assert_eq!(differing["cwd"].as_str(), Some("/b"), "{differing}");
+        assert_eq!(
+            differing["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
+            Some("/a"),
+            "{differing}"
+        );
+    }
+
+    #[test]
+    fn test_skipped_line_names_the_directory_and_the_explicit_command() {
+        let line = skipped_line("Cursor", "cursor", std::path::Path::new("/home/u/.cursor"));
+        assert_eq!(
+            line,
+            format!(
+                "skipped: Cursor (no {}; run symforge init --client cursor)",
+                std::path::Path::new("/home/u/.cursor").display()
+            )
+        );
+        assert!(KILO_SKIPPED_LINE.contains("--client kilo-code"));
     }
 
     #[test]
@@ -2307,14 +2410,24 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_fresh_registration_allowlist_is_exactly_full() {
+    fn test_codex_fresh_registration_writes_only_keys_codex_reads() {
         let mut config = DocumentMut::new();
         merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "macos");
         let content = config.to_string();
-        for name in CLAUDE_ALWAYS_ALLOW {
+        for dead in [
+            "allowed_tools",
+            "enabled_tools",
+            "default_tools_approval_mode",
+        ] {
             assert!(
-                content.contains(&format!("\"{name}\"")),
-                "fresh Codex allowlist must grant full-surface name {name}: {content}"
+                !content.contains(dead),
+                "fresh Codex entry must not write {dead}: {content}"
+            );
+        }
+        for seeded in ["tool_timeout_sec", "startup_timeout_sec"] {
+            assert!(
+                !content.contains(seeded),
+                "no timeout may be seeded, it can only match or shorten Codex's default: {content}"
             );
         }
         assert!(
@@ -2324,13 +2437,14 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_reregistration_unions_allowlist_and_preserves_surface() {
+    fn test_codex_reregistration_preserves_user_entries() {
         let mut config = r#"
     [mcp_servers.symforge]
     command = "/old/symforge"
     startup_timeout_sec = 90
     tool_timeout_sec = 900
     allowed_tools = ["my_custom_tool"]
+    default_tools_approval_mode = "prompt"
 
     [mcp_servers.symforge.env]
     SYMFORGE_SURFACE = "compact"
@@ -2341,14 +2455,12 @@ mod tests {
         let content = config.to_string();
         assert!(
             content.contains("my_custom_tool"),
-            "user-added Codex allow entry must never be dropped: {content}"
+            "a user-authored Codex entry must never be dropped: {content}"
         );
-        for name in ["\"symforge\"", "\"symforge_edit\"", "\"status\""] {
-            assert!(
-                content.contains(name),
-                "surface name {name} must be unioned in: {content}"
-            );
-        }
+        assert!(
+            content.contains("default_tools_approval_mode = \"prompt\""),
+            "a user-set approval mode must not be clobbered: {content}"
+        );
         assert!(
             content.contains("SYMFORGE_SURFACE = \"compact\""),
             "re-registration must preserve a user-set Codex compact escape hatch: {content}"
@@ -2365,6 +2477,28 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_reregistration_removes_the_old_seeded_tool_timeout() {
+        let mut config = r#"
+    [mcp_servers.symforge]
+    command = "/old/symforge"
+    startup_timeout_sec = 30
+    tool_timeout_sec = 120
+    "#
+        .parse::<DocumentMut>()
+        .unwrap();
+        merge_symforge_codex_server_for_target_os(&mut config, "/new/symforge", "macos");
+        let content = config.to_string();
+        assert!(
+            !content.contains("tool_timeout_sec"),
+            "the 120 s value an earlier init seeded shortens Codex's default and must go: {content}"
+        );
+        assert!(
+            content.contains("startup_timeout_sec = 30"),
+            "only the tool timeout is migrated: {content}"
+        );
+    }
+
+    #[test]
     fn test_codex_linux_registration_disables_daemon() {
         let mut config = DocumentMut::new();
         merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "linux");
@@ -2377,10 +2511,6 @@ mod tests {
         assert!(
             content.contains("SYMFORGE_NO_DAEMON = \"1\""),
             "linux Codex config should force reliable local stdio mode: {content}"
-        );
-        assert!(
-            content.contains("allowed_tools ="),
-            "existing Codex allow-list behavior should remain intact: {content}"
         );
     }
 
@@ -2615,17 +2745,16 @@ env = { EXISTING_FLAG = "keep" }
         path.replace('/', "\\").to_ascii_lowercase()
     }
 
-    // Plan 001 (home-cwd disease): `symforge init --client cursor` registers
-    // symforge in Cursor's global mcp.json with a proven env pinning the full
-    // surface (spike-gate default); and when a workspace is discoverable it threads both
-    // SYMFORGE_WORKSPACE_ROOT and a per-server `cwd`, so Cursor never launches
-    // into the empty-index home-cwd trap. Only the `symforge` server is touched.
+    // `symforge init --client cursor` registers symforge in Cursor's GLOBAL
+    // mcp.json, which every window reads. It must carry no workspace: a literal
+    // path pins every window to one repo, and `${workspaceFolder}` means the
+    // folder holding `.cursor/mcp.json`, i.e. the home directory here.
     #[test]
-    fn test_cursor_registration_writes_proven_env_and_cwd() {
+    fn test_cursor_registration_writes_no_workspace() {
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("mcp.json");
         let binary = if cfg!(windows) {
-            "C:\\bin\\symforge.exe"
+            r"C:\bin\symforge.exe"
         } else {
             "/usr/bin/symforge"
         };
@@ -2647,20 +2776,14 @@ env = { EXISTING_FLAG = "keep" }
             Some("full"),
             "cursor env must pin the full surface: {server}"
         );
-        // The init test process runs inside the symforge git repo, so
-        // find_project_root resolves a workspace; when it does, the per-server
-        // `cwd` must equal the SYMFORGE_WORKSPACE_ROOT env (the home-cwd fix —
-        // both point at the discovered workspace).
-        if let Some(root) = env
-            .get(crate::discovery::WORKSPACE_ROOT_ENV)
-            .and_then(Value::as_str)
-        {
-            assert_eq!(
-                server["cwd"].as_str(),
-                Some(root),
-                "cursor cwd must match the workspace-root env when discovered: {server}"
-            );
-        }
+        assert!(
+            !env.contains_key(crate::discovery::WORKSPACE_ROOT_ENV),
+            "the global Cursor config must not carry a workspace root: {server}"
+        );
+        assert!(
+            server.get("cwd").is_none(),
+            "Cursor documents no cwd field, so none may be written: {server}"
+        );
     }
 
     // T029 (TR-03 / FR-013): the generated wrapper `cd`s into the discovered
@@ -2821,16 +2944,52 @@ env = { EXISTING_FLAG = "keep" }
     }
 
     #[test]
-    fn test_gemini_registration_timeout_in_milliseconds() {
+    fn test_gemini_registration_does_not_seed_a_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
         register_gemini_mcp_server(&settings_path, "/usr/bin/symforge").unwrap();
-        let content = std::fs::read_to_string(&settings_path).unwrap();
-        let config: Value = serde_json::from_str(&content).unwrap();
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            config["mcpServers"]["symforge"].get("timeout").is_none(),
+            "a seeded timeout can only shorten Gemini's 600000 ms default"
+        );
+    }
+
+    #[test]
+    fn test_gemini_reregistration_preserves_user_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"mcpServers":{"symforge":{"command":"/old","timeout":900000}}}"#,
+        )
+        .unwrap();
+        register_gemini_mcp_server(&settings_path, "/usr/bin/symforge").unwrap();
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
             config["mcpServers"]["symforge"]["timeout"],
-            json!(120000),
-            "timeout must be in milliseconds (120000ms = 2 minutes)"
+            json!(900000),
+            "a user-set Gemini timeout must survive re-registration"
+        );
+    }
+
+    #[test]
+    fn test_gemini_reregistration_removes_the_old_seeded_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"mcpServers":{"symforge":{"command":"/old","timeout":120000}}}"#,
+        )
+        .unwrap();
+        register_gemini_mcp_server(&settings_path, "/usr/bin/symforge").unwrap();
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            config["mcpServers"]["symforge"].get("timeout").is_none(),
+            "the 120000 ms an earlier init seeded shortens Gemini's default and must go"
         );
     }
 

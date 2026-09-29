@@ -286,10 +286,13 @@ Installing does not touch editor configuration. Configure clients explicitly:
 ```bash
 symforge init                          # interactive
 symforge init --client claude          # also: claude-desktop, codex, gemini,
-symforge init --client all             #       grok, cursor, kilo-code
+                                       #       grok, cursor, kilo-code
+symforge init --client all             # every harness already installed
 ```
 
-Kilo Code is workspace-local — run `symforge init --client kilo-code` from the repository you want to use, and it writes configuration under `.kilocode/` and `.symforge/`.
+`all` registers only harnesses whose config directory already exists, and prints one `skipped:` line per harness it passes over, naming the command that registers it. Naming a client explicitly creates its directory.
+
+Kilo Code is workspace-local — run `symforge init --client kilo-code` from the repository you want to use (`all` never writes it), and it writes configuration under `.kilocode/` and `.symforge/`.
 
 Already have MCP configs scattered around? `symforge init --scan` reports per-client attach status without writing anything; adding `--apply --serve-url <url>` writes an HTTP attach entry into each discovered config.
 

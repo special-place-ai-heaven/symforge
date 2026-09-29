@@ -246,6 +246,13 @@ impl HarnessRegistry {
     }
 }
 
+/// Whether a client counts as installed: its config file exists, or the
+/// directory that would hold it does. The one installed test shared by
+/// `init --scan` and `init --client all`, so the two agree.
+pub(crate) fn config_installed(config_path: &Path) -> bool {
+    config_path.exists() || config_path.parent().is_some_and(Path::exists)
+}
+
 /// Resolve the scan state for one target against the desired attach entry.
 fn scan_target(target: &HarnessTarget, desired: &AttachEntry) -> HarnessState {
     if !target.config_path.exists() {
@@ -253,9 +260,10 @@ fn scan_target(target: &HarnessTarget, desired: &AttachEntry) -> HarnessState {
         // exists; otherwise it is NotInstalled (never create in the wrong
         // place). The directory existing but the file missing means the client
         // is installed but has no SymForge entry yet (Absent).
-        return match target.config_path.parent() {
-            Some(parent) if parent.exists() => HarnessState::Absent,
-            _ => HarnessState::NotInstalled,
+        return if config_installed(&target.config_path) {
+            HarnessState::Absent
+        } else {
+            HarnessState::NotInstalled
         };
     }
 
