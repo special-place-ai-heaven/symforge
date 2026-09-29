@@ -13472,7 +13472,33 @@ mod tests {
         // answers 503 until B's publication catches up with its project
         // generation, and on a loaded runner the assertion below can land
         // inside that window -- which is what reddened Release 32660381244 and
-        // 32665940448 with no regression behind it.
+        // 32665940448 with no regression behind it, and PR 715's rust job after
+        // the 10s readiness retry alone ran out. Wait on that exact condition
+        // in B's index first, with a wider bound; a timeout names both
+        // generations, so a stuck publication reads differently from a slow one.
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+        let publication_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let generations = handle.state.projects.read().get(&project_b_id).map(|slot| {
+                let project = slot.metadata.read();
+                let data_plane = project.index.data_plane();
+                (
+                    data_plane.published_generation().project_generation,
+                    data_plane.current_project_generation(),
+                )
+            });
+            if matches!(generations, Some((published, current)) if published == current) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < publication_deadline,
+                "B's publication never caught up with its project generation within 30s; \
+                 (published, current) = {generations:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
         //
         // Retry ONLY the readiness condition. Any other status is decided
         // immediately, so a real 409 still fails fast with its evidence rather
