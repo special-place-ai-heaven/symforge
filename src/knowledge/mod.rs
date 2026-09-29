@@ -36,13 +36,20 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// Bumped to 3: the context-assignment rule now enters inline arrays and skips
 /// short leading elements (`key = ["dev", "<cred>"]`), so files a v2 manifest
 /// recorded as clean can carry findings under v3.
-pub const SECRET_POLICY_VERSION: u32 = 3;
+///
+/// Bumped to 4: the context-assignment and uri-credentials verdicts moved in the
+/// other direction (a quote that CLOSES an earlier literal, a comma before a
+/// comment or attribute line, a Rust lifetime, `<`-prefixed and userinfo
+/// placeholders). A v3 manifest withholds files v4 admits, so it must be
+/// re-scouted rather than trusted.
+pub const SECRET_POLICY_VERSION: u32 = 4;
 const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
 /// cannot change — from a real content match.
 pub const INDETERMINATE_RULE_ID: &str = "secret.detector.indeterminate";
 const CONTEXT_ASSIGNMENT_RULE_ID: &str = "secret.context-assignment";
+const URI_CREDENTIALS_RULE_ID: &str = "secret.uri-credentials";
 /// Mirrors the `{8,}` payload floor inside that rule's pattern.
 const CONTEXT_ASSIGNMENT_MIN_PAYLOAD: usize = 8;
 /// Bytes of right-hand-side expression the exemption test will read. Five to six
@@ -138,7 +145,7 @@ fn compile_secret_rules() -> Result<Vec<SecretRule>, DetectorFailure> {
             true,
         ),
         (
-            "secret.uri-credentials",
+            URI_CREDENTIALS_RULE_ID,
             &[b"://"],
             r"://[^/\s:@]+:([^@\s/]{4,})@",
             1,
@@ -175,6 +182,14 @@ fn is_placeholder(value: &[u8]) -> bool {
     let Ok(value) = std::str::from_utf8(value) else {
         return false;
     };
+    // `<<FILL_IN: ...>>`, `<your key>`, `<redacted>`: an angle-bracket opener is
+    // template syntax, not a credential byte. The capture class stops at the
+    // first space, so the closer is often outside the capture and cannot be
+    // required. Exempts the capture only; the caller still walks the rest of
+    // the right-hand side.
+    if value.starts_with('<') {
+        return true;
+    }
     let normalized = value
         .trim_matches(|character: char| {
             matches!(character, '"' | '\'' | '`' | '<' | '>' | '[' | ']')
@@ -253,11 +268,43 @@ fn is_placeholder_only_expression(value: &str) -> bool {
 /// closing quote as an opening one, and for a double-quoted literal the
 /// whole-literal skip then jumps to the NEXT literal's opening quote and blinds
 /// the payload fence behind it.
-fn right_hand_side_continuation(bytes: &[u8], capture_end: usize) -> usize {
-    match bytes.get(capture_end) {
-        Some(b'"' | b'\'' | b'`') => capture_end + 1,
-        _ => capture_end,
+///
+/// A placeholder capture can also stop SHORT of its closing quote: the value
+/// class ends at whitespace, so `"<<FILL_IN: model key>>"` captures only
+/// `<<FILL_IN:`. Resuming there would start the walk inside the literal, so the
+/// walk resumes past that literal's closing quote instead — and `None` (never
+/// exempt) when the line ends before the quote closes.
+fn right_hand_side_continuation(
+    bytes: &[u8],
+    capture_start: usize,
+    capture_end: usize,
+) -> Option<usize> {
+    let opener = capture_start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index).copied())
+        .filter(|byte| matches!(byte, b'"' | b'\'' | b'`'));
+    match (opener, bytes.get(capture_end)) {
+        (_, Some(b'"' | b'\'' | b'`')) => Some(capture_end + 1),
+        (Some(quote), _) => bytes[capture_end..]
+            .iter()
+            .take_while(|byte| **byte != b'\n')
+            .position(|byte| *byte == quote)
+            .map(|offset| capture_end + offset + 1),
+        (None, _) => Some(capture_end),
     }
+}
+
+/// uri-credentials exemption: a userinfo password that documents the URI SHAPE
+/// (`scheme://user:pass@host`, `u:<redacted>@`, `u:xxxx@`) rather than carrying
+/// one. Whole-capture only, like every other placeholder test: `pass` exempts,
+/// `passw0rd1` does not.
+fn is_placeholder_userinfo(value: &[u8]) -> bool {
+    is_placeholder(value)
+        || matches!(
+            value.to_ascii_lowercase().as_slice(),
+            b"pass" | b"password" | b"pw" | b"secret"
+        )
+        || value.iter().all(|byte| byte.eq_ignore_ascii_case(&b'x'))
 }
 
 /// Stage 2 for [`CONTEXT_ASSIGNMENT_RULE_ID`], on CODE-language paths only.
@@ -289,25 +336,47 @@ fn right_hand_side_continuation(bytes: &[u8], capture_end: usize) -> usize {
 fn assignment_is_code_expression(
     path: &str,
     bytes: &[u8],
+    match_start: usize,
     value_start: usize,
     value: &[u8],
 ) -> bool {
-    if !crate::domain::LanguageId::from_path(path)
-        .is_some_and(|language| language.is_code_language())
-    {
+    let Some(language) =
+        crate::domain::LanguageId::from_path(path).filter(|language| language.is_code_language())
+    else {
         return false;
-    }
-    let opens_literal = value_start
+    };
+    let rust = language == crate::domain::LanguageId::Rust;
+    let quote_before_value = value_start
         .checked_sub(1)
         .and_then(|index| bytes.get(index).copied())
         .is_some_and(|byte| matches!(byte, b'"' | b'\''));
-    if opens_literal {
-        return false;
+    if quote_before_value {
+        // Step 1 applies only to an OPENING quote. When the KEYWORD sits inside
+        // a literal and the value does not, that quote CLOSED the keyword's
+        // literal (a `split` call whose argument ends in keyword and separator,
+        // matrix row PA1): the capture is the code after it. Walk from just past the quote, which is outside every literal,
+        // tolerating the closers of groups opened before it. Any other shape —
+        // including a parity doubt that leaves either side "inside" — is an
+        // opener and never exempt.
+        // The keyword's literal must also be COMPACT — no whitespace between its
+        // opening quote and this one (`"token="`, `"&access_token="`). Parity
+        // alone is fooled by a stray quote earlier on the line (`'"'`), which
+        // would make a real assignment's OPENING quote look like a closer.
+        let quote = bytes[value_start - 1];
+        let compact_keyword_literal = bytes[..value_start - 1]
+            .iter()
+            .rposition(|byte| *byte == quote || byte.is_ascii_whitespace())
+            .is_some_and(|open| bytes[open] == quote && open < match_start);
+        let closes_keyword_literal = compact_keyword_literal
+            && match_is_inside_string_literal(bytes, match_start, rust)
+            && !match_is_inside_string_literal(bytes, value_start, rust);
+        return closes_keyword_literal
+            && !expression_carries_quoted_payload(bytes, value_start, true);
     }
-    if match_is_inside_string_literal(bytes, value_start) {
+    if match_is_inside_string_literal(bytes, value_start, rust) {
         return capture_is_single_interpolation(value);
     }
-    !expression_carries_quoted_payload(bytes, value_start)
+    !expression_carries_quoted_payload(bytes, value_start, false)
 }
 
 /// True when `value_start` sits inside a string, char or template literal that
@@ -317,10 +386,16 @@ fn assignment_is_code_expression(
 /// Counting each delimiter class SEPARATELY is what keeps a double-quoted
 /// literal detectable when it also contains an apostrophe.
 ///
+/// In Rust (`rust`), an apostrophe followed by an identifier byte whose closing
+/// quote is not two bytes on is a lifetime or label (`&'static str`), not a
+/// char literal, and does not toggle parity. Rust only: in Python, JavaScript
+/// and friends that apostrophe OPENS a string, and skipping it would move a
+/// credential outside the literal it sits in.
+///
 /// CEILING: a literal opened on a PRIOR line is invisible here, and every other
-/// parity mistake (a lone lifetime, an apostrophe in a comment, a raw-string
-/// hash count) reports "inside", which fails closed.
-fn match_is_inside_string_literal(bytes: &[u8], value_start: usize) -> bool {
+/// parity mistake (an apostrophe in a comment, an odd backtick in a doc
+/// comment, a raw-string hash count) reports "inside", which fails closed.
+fn match_is_inside_string_literal(bytes: &[u8], value_start: usize, rust: bool) -> bool {
     let line_start = bytes[..value_start]
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -334,6 +409,12 @@ fn match_is_inside_string_literal(bytes: &[u8], value_start: usize) -> bool {
                 continue;
             }
             b'"' => double = !double,
+            b'\''
+                if rust
+                    && bytes
+                        .get(index + 1)
+                        .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_')
+                    && bytes.get(index + 2) != Some(&b'\'') => {}
             b'\'' => single = !single,
             b'`' => backtick = !backtick,
             _ => {}
@@ -384,16 +465,24 @@ fn capture_is_single_interpolation(value: &[u8]) -> bool {
 /// value (oracle row G10b, accepted regression). Every terminator heuristic
 /// keyed on this byte produced a credential leak, so the comma is a
 /// continuation, never a terminator.
+///
+/// ONE carve-out (owner ruling 2026-09-29): a trailing comma followed by a line
+/// that opens with `//` or `#[` ends the expression. That is a struct field
+/// followed by a doc comment or attribute, and walking on read the NEXT field's
+/// doc-comment example (`(e.g. "model-id")`) as this field's payload. Accepted
+/// cost, pinned by matrix row PB4: a JavaScript declarator list interrupted by
+/// a `//` comment line hides the declarators after it.
 fn line_break_continues_expression(window: &[u8], newline: usize) -> bool {
     const CONTINUATION: &[u8] = b"+-*|&^%=.?:\\,";
     let trailing = window[..newline]
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
         .map(|index| window[index]);
-    let leading = window[newline + 1..]
-        .iter()
-        .find(|byte| !byte.is_ascii_whitespace())
-        .copied();
+    let next_line = window[newline + 1..].trim_ascii_start();
+    if trailing == Some(b',') && (next_line.starts_with(b"//") || next_line.starts_with(b"#[")) {
+        return false;
+    }
+    let leading = next_line.first().copied();
     trailing.is_some_and(|byte| CONTINUATION.contains(&byte))
         || leading.is_some_and(|byte| CONTINUATION.contains(&byte))
 }
@@ -487,8 +576,19 @@ fn bounded_char_literal_len(window: &[u8], at: usize) -> Option<usize> {
 /// [`scan_secret_bytes`], which resumes at
 /// [`right_hand_side_continuation`] — one byte past the quote the capture
 /// closed. Entering mid-literal reads that literal's CLOSING quote as an
-/// opening one and inverts quote parity for the whole window.
-fn expression_carries_quoted_payload(bytes: &[u8], from: usize) -> bool {
+/// opening one and inverts quote parity for the whole window. The third caller,
+/// step 1's closing-quote branch, starts one byte past the quote that closed
+/// the keyword's literal.
+///
+/// `after_closed_literal` is set by that third caller only. Its window starts
+/// INSIDE the argument list the keyword's literal was passed to, so a closer
+/// arriving before any opener belongs to that list and is not evidence the
+/// expression ended: the walk steps over it instead of reporting "consumed".
+fn expression_carries_quoted_payload(
+    bytes: &[u8],
+    from: usize,
+    after_closed_literal: bool,
+) -> bool {
     let end = from
         .saturating_add(CONTEXT_ASSIGNMENT_SCAN_BOUND)
         .min(bytes.len());
@@ -548,8 +648,11 @@ fn expression_carries_quoted_payload(bytes: &[u8], from: usize) -> bool {
             b')' | b']' | b'}' => {
                 depth -= 1;
                 if depth < 0 {
-                    // The match sat inside an enclosing group: consumed.
-                    return false;
+                    if !after_closed_literal {
+                        // The match sat inside an enclosing group: consumed.
+                        return false;
+                    }
+                    depth = 0;
                 }
                 index += 1;
             }
@@ -613,14 +716,23 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                 // outside the literal this capture closed. Same withdrawal test
                 // the code-expression exemption answers to, applied at the one
                 // boundary both exemptions pass through.
-                if !expression_carries_quoted_payload(
-                    bytes,
-                    right_hand_side_continuation(bytes, secret.end()),
-                ) {
+                if right_hand_side_continuation(bytes, secret.start(), secret.end())
+                    .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false))
+                {
                     continue;
                 }
-            } else if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
-                && assignment_is_code_expression(path, bytes, secret.start(), secret.as_bytes())
+            } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
+                && assignment_is_code_expression(
+                    path,
+                    bytes,
+                    captures
+                        .get(0)
+                        .map_or(secret.start(), |whole| whole.start()),
+                    secret.start(),
+                    secret.as_bytes(),
+                ))
+                || (rule.id == URI_CREDENTIALS_RULE_ID
+                    && is_placeholder_userinfo(secret.as_bytes()))
             {
                 continue;
             }
@@ -1486,6 +1598,377 @@ mod tests {
             failures.is_empty(),
             "array rows off expectation: {failures:?}"
         );
+    }
+
+    /// A real-looking alphanumeric value, assembled at runtime so no literal of
+    /// credential shape enters this file.
+    fn mx_real() -> String {
+        ["Zq8r", "Lm3v", "Tx7w", "Pk2n", "Hy5s"].concat()
+    }
+
+    fn scan_verdict(path: &str, body: &str) -> Result<MxVerdict, String> {
+        match scan_secret_bytes(path, body.as_bytes()) {
+            SecretScan::Clean => Ok(MxVerdict::Clean),
+            SecretScan::Sensitive { finding_count, .. } => Ok(MxVerdict::Sensitive(finding_count)),
+            SecretScan::Indeterminate { reason } => Err(format!("Indeterminate: {reason:?}")),
+        }
+    }
+
+    /// (row id, path, body, expected) for the 2026-09-29 precision ruling.
+    /// Every CLEAN row is a false positive measured in a real repository; each
+    /// has a SENSITIVE control in the same shape, here or in
+    /// [`true_positive_corpus_stays_caught`], so no row passes by the detector
+    /// simply not firing.
+    fn precision_rows() -> Vec<(&'static str, &'static str, String, MxVerdict)> {
+        let token = mx_token();
+        let password = mx_password();
+        let apikey = mx_apikey();
+        let v = mx_value();
+        let real = mx_real();
+        vec![
+            // (a) A quote that CLOSES the keyword's literal is not an opener.
+            (
+                "PA1 rust split closes keyword literal",
+                "src/probe.rs",
+                [
+                    "let first_", &token, " = first.split(\"", &token,
+                    "=\").nth(1).expect(\"", &token, " in first URL\");\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PA2 control: literal after the closing quote",
+                "src/probe.rs",
+                [
+                    "let url = base.split(\"", &token, "=\").nth(1).unwrap_or(\"", &real,
+                    "\");\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Adversarial control: a stray quote earlier on the line makes a
+            // real assignment's OPENING quote look like a closer by parity.
+            (
+                "PA3 control: char-literal quote then real assignment",
+                "src/probe.rs",
+                [
+                    "let q = '\"'; let ", &token, " = \"", &real, "\"; // \"\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // (b) Comma then a doc-comment or attribute line ends the field.
+            (
+                "PB1 rust struct field then doc comment",
+                "src/probe.rs",
+                [
+                    "pub struct Config {\n    pub gemini_", &apikey,
+                    ": Option<String>,\n    /// Gemini model ID (e.g. \"gemini-2.5-flash\").\n    pub gemini_model: Option<String>,\n}\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PB2 rust struct field then attribute",
+                "src/probe.rs",
+                [
+                    "pub struct Config {\n    pub openai_", &apikey,
+                    ": Option<String>,\n    #[serde(rename = \"", &v,
+                    "\")]\n    pub model: Option<String>,\n}\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            // Accepted cost of (b), pinned so it cannot move silently.
+            (
+                "PB4 js declarator after a comment line (accepted)",
+                "src/probe.js",
+                [
+                    "const ", &token, " = compute(),\n  // fallback\n  backup = \"", &v,
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            // (c) `<`-prefixed placeholders; the rest of the RHS still walked.
+            (
+                "PC1 env example fill-in placeholder",
+                "server/.env.example",
+                [&apikey.to_uppercase(), "=<<FILL_IN: gemini key>>\nPORT=8080\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PC2 toml quoted fill-in placeholder",
+                "config.toml",
+                [&apikey, " = \"<<FILL_IN: gemini key>>\"\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PC3 control: fill-in then literal element",
+                "config.toml",
+                [&apikey, " = [\"<<FILL_IN: gemini key>>\", \"", &v, "\"]\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // (d) A Rust lifetime is not a char literal.
+            (
+                "PD1 rust lifetime before keyword parameter",
+                "src/probe.rs",
+                [
+                    "pub fn spawn_worker_on<F>(&self, name: &'static str, ", &token,
+                    ": CancellationToken, work: F) -> bool {\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PD2 control: python apostrophe still opens a string",
+                "src/probe.py",
+                ["url = 'https://host/?", &token, "=", &v, "'\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // (e) Placeholder userinfo in a URI.
+            (
+                "PE1 uri pass placeholder in comment",
+                "src/probe.rs",
+                ["// userinfo in scheme://user:", "pass", "@authority/db\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PE2 uri redacted placeholder",
+                "src/probe.rs",
+                ["// postgres://u:", "<redacted>", "@host/db\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PE3 uri password xxxx secret placeholders",
+                "notes.txt",
+                [
+                    "a://admin:", &password, "@db\nb://admin:", "xxxx", "@db\nc://admin:",
+                    "secret", "@db\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            // (f) No cheap fix: a keyword assignment inside a doc-comment code
+            // span reads as inside a literal. Known ceiling, pinned.
+            (
+                "PF1 rust doc comment code span (known ceiling)",
+                "src/probe.rs",
+                [
+                    "/// So `--", &password, "=postgres://u:pw@host` is fully opaque.\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // KNOWN FALSE NEGATIVE, pre-existing on v3 and unchanged here: the
+            // keyword must be followed by the separator, so a quoted JSON key
+            // (`"key": "value"`) never matches. Pinned so a deliberate widening
+            // flips this row rather than slipping in with a precision change.
+            (
+                "PJ1 json quoted key (known false negative)",
+                "config.json",
+                ["{\"", &password, "\": \"hunter2hunter2\"}\n"].concat(),
+                MxVerdict::Clean,
+            ),
+        ]
+    }
+
+    #[test]
+    fn precision_ruling_matrix_pins() {
+        let mut failures = Vec::new();
+        for (id, path, body, expected) in precision_rows() {
+            match scan_verdict(path, &body) {
+                Ok(actual) if actual == expected => {}
+                Ok(actual) => failures.push(format!("{id}: expected {expected:?}, got {actual:?}")),
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "precision rows off expectation: {failures:?}"
+        );
+    }
+
+    /// Security floor for the precision ruling: every row MUST stay caught.
+    /// Real-shaped values, assembled at runtime, in each file class, plus each
+    /// false-positive shape above with its placeholder replaced by a real value.
+    #[test]
+    fn true_positive_corpus_stays_caught() {
+        let token = mx_token();
+        let apikey = mx_apikey();
+        let real = mx_real();
+        let sk = ["sk-", &real, &real].concat();
+        let ghp = ["gh", "p_", &real, &real[..16]].concat();
+        let pem = [
+            "-----BEGIN RSA ",
+            "PRIVATE KEY-----\nMIIEowIBAAKCAQEA",
+            &real,
+            "\n-----END RSA ",
+            "PRIVATE KEY-----\n",
+        ]
+        .concat();
+        let bearer = ["Author", "ization: Bearer ", &real, &real[..12]].concat();
+        let rows: Vec<(&str, &str, String, &str)> = vec![
+            (
+                "github token rust",
+                "src/probe.rs",
+                ["let t = \"", &ghp, "\";\n"].concat(),
+                "secret.provider-token",
+            ),
+            (
+                "github token yaml",
+                "ci.yaml",
+                ["gh: ", &ghp, "\n"].concat(),
+                "secret.provider-token",
+            ),
+            (
+                "pem private key",
+                "certs/server.txt",
+                pem,
+                "secret.private-key-envelope",
+            ),
+            (
+                "authorization bearer",
+                "requests.http",
+                ["GET /\n", &bearer, "\n"].concat(),
+                "secret.authorization-header",
+            ),
+            (
+                "sk key rust",
+                "src/probe.rs",
+                ["let ", &apikey, " = \"", &sk, "\";\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key python",
+                "src/probe.py",
+                [&apikey, " = \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key toml",
+                "config.toml",
+                [&apikey, " = \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key yaml",
+                "config.yaml",
+                [&apikey, ": \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key env",
+                "deploy.env",
+                [&apikey.to_uppercase(), "=", &sk, "\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "uri real password",
+                "src/probe.rs",
+                ["let url = \"postgres://user:", &real, "@db/prod\";\n"].concat(),
+                URI_CREDENTIALS_RULE_ID,
+            ),
+            // The false-positive shapes, placeholder replaced by a real value.
+            (
+                "fp-shape split then literal",
+                "src/probe.rs",
+                [
+                    "let url = base.split(\"",
+                    &token,
+                    "=\").nth(1).unwrap_or(\"",
+                    &real,
+                    "\");\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape struct literal field then doc comment",
+                "src/probe.rs",
+                [
+                    "let c = Config {\n    ",
+                    &apikey,
+                    ": \"",
+                    &real,
+                    "\".into(),\n    /// doc\n    other: 1,\n};\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape test struct literal",
+                "tests/api.rs",
+                ["    admin_", &token, ": \"", &real, "\".into(),\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape env example real value",
+                "server/.env.example",
+                [&apikey.to_uppercase(), "=", &sk, "\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape lifetime then literal",
+                "src/probe.rs",
+                [
+                    "fn f(name: &'static str) { let ",
+                    &token,
+                    " = \"",
+                    &real,
+                    "\"; }\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape lifetime then keyword in literal",
+                "src/probe.rs",
+                [
+                    "const URL: &'static str = \"https://h/?",
+                    &token,
+                    "=",
+                    &real,
+                    "\";\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape uri placeholder slot real value",
+                "src/probe.rs",
+                ["// scheme://user:", &real, "@authority\n"].concat(),
+                URI_CREDENTIALS_RULE_ID,
+            ),
+            (
+                "fp-shape fill-in slot real value",
+                "config.toml",
+                [&apikey, " = \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (id, path, body, rule) in rows {
+            match scan_secret_bytes(path, body.as_bytes()) {
+                SecretScan::Sensitive { rule_ids, .. } if rule_ids.contains(&rule) => {}
+                other => failures.push(format!(
+                    "{id}: expected {rule}, got {:?}",
+                    scan_kind(&other)
+                )),
+            }
+        }
+        assert!(failures.is_empty(), "true positives missed: {failures:?}");
+    }
+
+    /// The verdict's shape without its contents, so a failure never echoes
+    /// matched bytes.
+    fn scan_kind(scan: &SecretScan) -> String {
+        match scan {
+            SecretScan::Clean => "Clean".to_string(),
+            SecretScan::Sensitive { rule_ids, .. } => format!("Sensitive{rule_ids:?}"),
+            SecretScan::Indeterminate { reason } => format!("Indeterminate({reason:?})"),
+        }
     }
 
     #[test]
