@@ -1018,9 +1018,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // observe the pause, then for the deferred stdio front, which added
 // src/protocol/deferred_stdio.rs: 199 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "689ecd31b554297b176767dc982b04c30635fd74e972c187542cc0fef2d6d9b0",
+    "33e28fd53316caef5733cdad4a712ea54d7c9c994d9cd0aacce4b3de44390fcf",
     199,
-    9_749_163,
+    9_757_032,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

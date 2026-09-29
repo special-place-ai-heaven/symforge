@@ -3621,6 +3621,13 @@ impl ProjectSlot {
     /// Start the background cold load again when the last one failed, so a
     /// new session is not joined to that failure for the daemon's lifetime.
     fn retry_failed_background_load(&self) {
+        // Serialized with `reload_with`, which holds the mutation lock through
+        // an `index_folder` reload. A reload in flight will settle the project
+        // itself; the retry stays flagged for the next open instead of
+        // blocking this one behind it.
+        let Some(_mutation) = self.mutation.try_lock() else {
+            return;
+        };
         let job = {
             let project = self.metadata.read();
             // A reload that since succeeded, `index_folder` for one, cleared the
@@ -4089,6 +4096,18 @@ impl ColdLoadJob {
             tracing::info!(
                 root = %self.root.display(),
                 "background cold index load abandoned: its project was closed"
+            );
+            return;
+        }
+        // Another load published while this one ran, `index_folder` for one:
+        // its index stands, and this failure has nothing left to settle.
+        if result.is_err()
+            && self.index.published_state().load_source
+                != crate::live_index::IndexLoadSource::EmptyBootstrap
+        {
+            tracing::info!(
+                root = %self.root.display(),
+                "background cold index load failed after another load published; keeping that index"
             );
             return;
         }
@@ -17392,5 +17411,29 @@ mod tests {
             );
         });
         assert!(!background.failed.load(Ordering::Acquire));
+    }
+
+    /// A background load that fails after another reload already published,
+    /// `index_folder` for one, must not write its failure onto that Ready
+    /// index or schedule a full reload for every later open.
+    #[test]
+    fn a_background_load_failing_after_another_load_published_leaves_it_alone() {
+        let (_tmp, root) = source_tree(3);
+        let job = cold_load_job(&root);
+        job.index
+            .reload_for_state_placement(&root, &job.placement)
+            .expect("another reload published");
+
+        job.finish(Err(anyhow::anyhow!(
+            "reload refused: live mutation conflicts with the disk-built candidate"
+        )));
+
+        let published = job.index.published_state();
+        assert_eq!(
+            published.status,
+            crate::live_index::PublishedIndexStatus::Ready
+        );
+        assert_eq!(published.local_empty_reason, None);
+        assert!(!job.background.failed.load(Ordering::Acquire));
     }
 }

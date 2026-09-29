@@ -5579,15 +5579,27 @@ fn truncate_text_at_line_boundary(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-/// The loading-guard refusal: "Index is loading...", then the initial-indexing wording.
-pub fn loading_guard_message() -> String {
-    format!("Index is loading... {INITIAL_INDEXING_IN_PROGRESS}. Retry the same call shortly.")
+/// The loading-guard refusal: "Index is loading...", then the indexing
+/// wording. It says "initial" only for a cold bootstrap, the one load source
+/// known to be a project's first index; a warm restore still verifying or a
+/// reload in flight is loading too, but is not initial indexing.
+pub fn loading_guard_message(cold_bootstrap: bool) -> String {
+    let wording = if cold_bootstrap {
+        INITIAL_INDEXING_IN_PROGRESS
+    } else {
+        INDEXING_IN_PROGRESS
+    };
+    format!("Index is loading... {wording}. Retry the same call shortly.")
 }
 
-/// The single wording for a project whose first index is still being built.
-/// The loading guard, the stdio front's not-ready answer, `status` and
-/// `health` in that window, and the SessionStart hook all say it in these
-/// words. It claims no waiting: only the stdio front waits, and says so itself.
+/// The single wording for a project whose index is loading, said wherever the
+/// kind of load is not known: the stdio front's not-ready answer, `status` and
+/// `health` in that window, and the SessionStart hook. It claims no waiting:
+/// only the stdio front waits, and says so itself.
+pub const INDEXING_IN_PROGRESS: &str =
+    "indexing of this project is in progress and can take a while on large folders";
+
+/// [`INDEXING_IN_PROGRESS`] for a load known to be a cold bootstrap.
 pub const INITIAL_INDEXING_IN_PROGRESS: &str =
     "initial indexing of this project is in progress and can take a while on large folders";
 

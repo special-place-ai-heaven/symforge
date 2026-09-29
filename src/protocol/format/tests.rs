@@ -2975,8 +2975,13 @@ fn test_around_symbol_includes_doc_comments_in_indexed_range() {
 #[test]
 fn test_loading_guard_message() {
     assert_eq!(
-        loading_guard_message(),
+        loading_guard_message(true),
         "Index is loading... initial indexing of this project is in progress and can take a while on large folders. Retry the same call shortly."
+    );
+    // A warm restore still verifying is loading, not initial indexing.
+    assert_eq!(
+        loading_guard_message(false),
+        "Index is loading... indexing of this project is in progress and can take a while on large folders. Retry the same call shortly."
     );
 }
 

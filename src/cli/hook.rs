@@ -675,7 +675,7 @@ fn emit_live_refusal_fail_open(
             .unwrap_or_else(|| repo_root.display().to_string());
         let notice = format!(
             "symforge: {project}: {}.",
-            crate::protocol::format::INITIAL_INDEXING_IN_PROGRESS
+            crate::protocol::format::INDEXING_IN_PROGRESS
         );
         println!("{}", success_json(event_name, &notice));
         return;

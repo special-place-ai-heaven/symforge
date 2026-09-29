@@ -256,7 +256,7 @@ fn run_hook_session_start_while_indexing_injects_the_initial_indexing_notice() {
         .expect("additionalContext is a string");
     assert!(
         context.starts_with("symforge: ")
-            && context.contains("initial indexing of this project is in progress"),
+            && context.contains("indexing of this project is in progress"),
         "a loading index must be announced in one line; got:\n{stdout}"
     );
     assert!(

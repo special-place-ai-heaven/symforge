@@ -29,7 +29,11 @@ macro_rules! loading_guard {
         match $guard.index_state() {
             IndexState::Ready => {}
             IndexState::Empty => return format::empty_guard_message(),
-            IndexState::Loading => return format::loading_guard_message(),
+            IndexState::Loading => {
+                return format::loading_guard_message(
+                    $guard.load_source() == crate::live_index::IndexLoadSource::EmptyBootstrap,
+                );
+            }
             IndexState::CircuitBreakerTripped { summary } => {
                 return format!("Index degraded: {summary}");
             }

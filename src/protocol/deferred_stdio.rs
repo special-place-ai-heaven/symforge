@@ -20,6 +20,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -34,7 +35,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use tokio::sync::watch;
 
 use super::SymForgeServer;
-use super::format::INITIAL_INDEXING_IN_PROGRESS;
+use super::format::INDEXING_IN_PROGRESS;
 use super::result_status::{
     OutcomeClass, PROJECT_EVIDENCE_META_KEY, ResultStatus, attach_project_evidence_meta,
 };
@@ -61,11 +62,18 @@ pub enum StdioStartup {
 /// Held by the startup task. If the task ends while the front still says
 /// `Starting`, by a panic or by an exit that published nothing, dropping this
 /// publishes a failure, so waiting requests end instead of waiting for a
-/// runtime that is never coming.
-pub struct StartupGuard(pub Arc<watch::Sender<StdioStartup>>);
+/// runtime that is never coming. The second field is the shutdown signal: a
+/// task that stopped because the client left has no failure to report.
+pub struct StartupGuard(
+    pub Arc<watch::Sender<StdioStartup>>,
+    pub watch::Receiver<bool>,
+);
 
 impl Drop for StartupGuard {
     fn drop(&mut self) {
+        if *self.1.borrow() {
+            return;
+        }
         self.0.send_if_modified(|state| {
             let starting = matches!(state, StdioStartup::Starting);
             if starting {
@@ -92,6 +100,9 @@ pub struct DeferredStdioServer {
     opened_at: Instant,
     readiness_wait: Duration,
     startup: watch::Receiver<StdioStartup>,
+    /// Set once a probe saw the runtime's index ready; later calls dispatch
+    /// without probing first.
+    index_seen_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DeferredStdioServer {
@@ -117,6 +128,7 @@ impl DeferredStdioServer {
             opened_at: Instant::now(),
             readiness_wait: TOOL_READINESS_WAIT,
             startup,
+            index_seen_ready: Arc::default(),
         };
         (front, sender)
     }
@@ -130,7 +142,7 @@ impl DeferredStdioServer {
     /// The initial-indexing notice with the one progress figure observed here.
     fn indexing_line(&self) -> String {
         format!(
-            "symforge: {}: {INITIAL_INDEXING_IN_PROGRESS}. {}s since this symforge process began \
+            "symforge: {}: {INDEXING_IN_PROGRESS}. {}s since this symforge process began \
              opening it; tool calls wait up to {}s for it.",
             self.project_name,
             self.opened_at.elapsed().as_secs(),
@@ -211,6 +223,22 @@ fn is_loading_refusal(response: &CallToolResponse) -> bool {
         .first()
         .and_then(|block| block.as_text())
         .is_some_and(|text| text.text.starts_with("Index is loading"))
+}
+
+/// Whether the runtime's index is still loading, asked through `status`. It
+/// answers while loading and records nothing, so a call waits here without
+/// ever dispatching a tool whose loading refusal would still be recorded: the
+/// `symforge` facade writes a ledger row for every call, and its refusal is
+/// wrapped in an envelope no text check can see. An unanswerable probe says
+/// not loading, and the tool itself then answers.
+async fn index_loading(server: &SymForgeServer, context: &RequestContext<RoleServer>) -> bool {
+    match server
+        .call_tool(CallToolRequestParams::new("status"), context.clone())
+        .await
+    {
+        Ok(CallToolResponse::Complete(result)) => reports_loading(&result),
+        _ => false,
+    }
 }
 
 /// Whether the project evidence the server attached observed a loading index.
@@ -305,18 +333,28 @@ impl ServerHandler for DeferredStdioServer {
                     ])));
                 }
                 StdioStartup::Starting => {}
+                StdioStartup::Ready(server) if diagnostic => {
+                    let mut response = server.call_tool(request, context).await?;
+                    if let CallToolResponse::Complete(result) = &mut response
+                        && reports_loading(result)
+                    {
+                        result
+                            .content
+                            .insert(0, ContentBlock::text(self.indexing_line()));
+                    }
+                    return Ok(response);
+                }
                 StdioStartup::Ready(server) => {
-                    let mut response = server.call_tool(request.clone(), context.clone()).await?;
-                    if diagnostic || !is_loading_refusal(&response) {
-                        if diagnostic
-                            && let CallToolResponse::Complete(result) = &mut response
-                            && reports_loading(result)
-                        {
-                            result
-                                .content
-                                .insert(0, ContentBlock::text(self.indexing_line()));
+                    let seen_ready = self.index_seen_ready.load(Ordering::Acquire);
+                    if seen_ready || !index_loading(&server, &context).await {
+                        self.index_seen_ready.store(true, Ordering::Release);
+                        let response = server.call_tool(request.clone(), context.clone()).await?;
+                        // A plain guard refusal after the index was seen ready: a
+                        // later load, such as a retry, is in flight. Such tools
+                        // record nothing, so retrying through dispatch is safe.
+                        if !is_loading_refusal(&response) {
+                            return Ok(response);
                         }
-                        return Ok(response);
                     }
                 }
             }
@@ -451,7 +489,17 @@ mod tests {
         }
 
         async fn call(&mut self, id: u64, name: &str, meta: Option<Value>) -> Value {
-            let mut params = json!({"name": name, "arguments": {}});
+            self.call_with(id, name, json!({}), meta).await
+        }
+
+        async fn call_with(
+            &mut self,
+            id: u64,
+            name: &str,
+            arguments: Value,
+            meta: Option<Value>,
+        ) -> Value {
+            let mut params = json!({"name": name, "arguments": arguments});
             if let Some(meta) = meta {
                 params["_meta"] = meta;
             }
@@ -523,7 +571,7 @@ mod tests {
         );
         let text = tool_text(&pending);
         assert!(text.starts_with("Index is loading"), "{text}");
-        assert!(text.contains(INITIAL_INDEXING_IN_PROGRESS), "{text}");
+        assert!(text.contains(INDEXING_IN_PROGRESS), "{text}");
         assert!(text.contains("large-repo"), "names the project: {text}");
         assert!(text.contains("retry the same call"), "{text}");
         assert_eq!(
@@ -535,7 +583,7 @@ mod tests {
         let status = client.call(4, "status", None).await;
         assert_ne!(status["result"]["isError"], json!(true), "{status}");
         assert!(
-            tool_text(&status).contains(INITIAL_INDEXING_IN_PROGRESS),
+            tool_text(&status).contains(INDEXING_IN_PROGRESS),
             "{status}"
         );
         assert_eq!(
@@ -564,7 +612,7 @@ mod tests {
             .call(2, "search_symbols", Some(json!({"progressToken": "tok-1"})))
             .await;
         assert!(
-            !tool_text(&served).contains(INITIAL_INDEXING_IN_PROGRESS),
+            !tool_text(&served).contains(INDEXING_IN_PROGRESS),
             "the published server answered after the wait: {served}"
         );
         assert!(
@@ -573,7 +621,7 @@ mod tests {
                     && note["params"]["progressToken"] == json!("tok-1")
                     && note["params"]["message"]
                         .as_str()
-                        .is_some_and(|message| message.contains(INITIAL_INDEXING_IN_PROGRESS))
+                        .is_some_and(|message| message.contains(INDEXING_IN_PROGRESS))
             }),
             "a waiting call with a progress token reports progress: {:?}",
             client.notifications
@@ -598,13 +646,13 @@ mod tests {
             "{loading}"
         );
         assert!(
-            tool_text(&loading).contains(INITIAL_INDEXING_IN_PROGRESS),
+            tool_text(&loading).contains(INDEXING_IN_PROGRESS),
             "{loading}"
         );
 
         let health = client.call(3, "health", None).await;
         assert!(
-            tool_text(&health).contains(INITIAL_INDEXING_IN_PROGRESS),
+            tool_text(&health).contains(INDEXING_IN_PROGRESS),
             "health leads with the notice while the index loads: {health}"
         );
     }
@@ -694,8 +742,7 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
         let message = pending["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains(INITIAL_INDEXING_IN_PROGRESS)
-                && message.contains("retry the same call"),
+            message.contains(INDEXING_IN_PROGRESS) && message.contains("retry the same call"),
             "{pending}"
         );
         assert_eq!(
@@ -709,7 +756,7 @@ mod tests {
         )));
         let served = client.request(3, "resources/read", read).await;
         assert!(
-            !served.to_string().contains(INITIAL_INDEXING_IN_PROGRESS),
+            !served.to_string().contains(INDEXING_IN_PROGRESS),
             "the runtime answered: {served}"
         );
     }
@@ -760,7 +807,8 @@ mod tests {
     #[tokio::test]
     async fn a_startup_task_that_panics_is_reported_as_failed() {
         let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
-        let guard = StartupGuard(Arc::new(startup));
+        let (_client_present, shutdown) = watch::channel(false);
+        let guard = StartupGuard(Arc::new(startup), shutdown);
         let task = tokio::spawn(async move {
             let _guard = guard;
             panic!("startup exploded");
@@ -778,5 +826,67 @@ mod tests {
                 && text.contains("startup task stopped"),
             "{reply}"
         );
+    }
+
+    /// The `symforge` facade wraps a loading refusal in its envelope and
+    /// records a ledger row per call. A Ready runtime whose index is loading
+    /// must still make it wait and get the notice, without dispatching it.
+    #[tokio::test]
+    async fn a_facade_call_waits_for_a_loading_index_without_dispatching() {
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        startup.send_replace(StdioStartup::Ready(loading_server()));
+        let mut client = connect(front.with_readiness_wait(Duration::from_millis(600)));
+        client.initialize().await;
+
+        let started = Instant::now();
+        let reply = client
+            .call_with(
+                2,
+                "symforge",
+                json!({"query": "where is foo defined"}),
+                None,
+            )
+            .await;
+        assert!(started.elapsed() >= Duration::from_millis(600), "it waited");
+        assert_eq!(outcome_class(&reply), &json!("internal_failure"), "{reply}");
+        let text = tool_text(&reply);
+        assert!(
+            text.starts_with("Index is loading") && text.contains(INDEXING_IN_PROGRESS),
+            "{reply}"
+        );
+
+        let status = client.call(3, "status", None).await;
+        let status = status.to_string();
+        assert!(
+            status.contains("ledger_events: 0"),
+            "the facade was never dispatched: {status}"
+        );
+    }
+
+    /// The front words every wait the same way and never claims the load is
+    /// the project's first; only the guard, which reads the load source, does.
+    #[tokio::test]
+    async fn the_front_does_not_call_every_load_initial_indexing() {
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        startup.send_replace(StdioStartup::Ready(loading_server()));
+        let mut client = connect(front.with_readiness_wait(Duration::from_millis(300)));
+        client.initialize().await;
+
+        let status = client.call(2, "status", None).await;
+        assert!(
+            tool_text(&status).contains(INDEXING_IN_PROGRESS),
+            "{status}"
+        );
+        assert!(!status.to_string().contains("initial indexing"), "{status}");
+    }
+
+    /// A startup task that stopped because the client left reports nothing.
+    #[tokio::test]
+    async fn a_startup_task_stopped_by_the_client_leaving_is_not_a_failure() {
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        let (client_left, shutdown) = watch::channel(false);
+        client_left.send_replace(true);
+        drop(StartupGuard(Arc::new(startup), shutdown));
+        assert!(matches!(&*front.startup.borrow(), StdioStartup::Starting));
     }
 }

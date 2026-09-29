@@ -335,7 +335,8 @@ async fn run_deferred_mcp_server_async(
     let publish = Arc::new(startup);
     let (shutdown, shutdown_signal) = tokio::sync::watch::channel(false);
     let runtime = tokio::spawn(async move {
-        let _unpublished = protocol::deferred_stdio::StartupGuard(Arc::clone(&publish));
+        let _unpublished =
+            protocol::deferred_stdio::StartupGuard(Arc::clone(&publish), shutdown_signal.clone());
         let mut client_left = shutdown_signal.clone();
         let serve = StdioServe::Deferred {
             startup: Arc::clone(&publish),
