@@ -364,6 +364,31 @@ fn read_toml_entry(text: &str) -> Result<Option<AttachEntry>, String> {
     Ok(Some(AttachEntry { url, bearer_key }))
 }
 
+/// The `command` of the SymForge entry in `status`'s config: set for a stdio
+/// registration, `None` for an HTTP attach entry or an unreadable config.
+pub fn registered_command(status: &HarnessStatus) -> Option<String> {
+    let text = read_config_text(&status.config_path).ok()?;
+    match status.format {
+        HarnessFormat::Json => serde_json::from_str::<Value>(&text)
+            .ok()?
+            .get("mcpServers")?
+            .get(SYMFORGE_SERVER_NAME)?
+            .get("command")?
+            .as_str()
+            .map(str::to_string),
+        HarnessFormat::Toml => text
+            .parse::<DocumentMut>()
+            .ok()?
+            .get("mcp_servers")?
+            .as_table()?
+            .get(SYMFORGE_SERVER_NAME)?
+            .as_table()?
+            .get("command")?
+            .as_str()
+            .map(str::to_string),
+    }
+}
+
 fn strip_bearer(header: &str) -> Option<&str> {
     header
         .strip_prefix("Bearer ")

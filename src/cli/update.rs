@@ -3,8 +3,9 @@
 //! `symforge update` must be safe to run while MCP harness sessions are open,
 //! so it never terminates a stdio server and never lets npm write the path the
 //! harnesses spawn. It orchestrates:
-//!  1. a short circuit: when the binary at the install path already reports the
-//!     latest published version the swap is skipped (verification still runs);
+//!  1. a short circuit: when neither installed package is behind the latest
+//!     published version the swap is skipped (verification still runs), so a
+//!     newer live binary is never downgraded;
 //!  2. a STAGED install: npm installs the new wrapper + OS-native platform
 //!     package (`symforge-<os>-<arch>`) into a staging prefix beside the live
 //!     install, and the staged binary must report the latest version before the
@@ -12,7 +13,9 @@
 //!  3. the swap: each staged file is renamed over its live counterpart. A
 //!     running Windows image refuses replacement but allows a rename, so there
 //!     the old binary is moved aside and the new one follows immediately. Live
-//!     sessions keep executing from the moved file (Unix keeps the old inode);
+//!     sessions keep executing from the moved file (Unix keeps the old inode).
+//!     Every replaced file keeps a copy until the new binary is verified; a
+//!     failed swap, restart, or verification restores them;
 //!  4. VERIFIES the resolved `symforge --version` reached the latest published
 //!     version — and FAILS LOUDLY (stale nested package, a PATH-shadowing install,
 //!     or a WSL Windows-prefix bleed) instead of a hollow success, even when the
@@ -50,6 +53,9 @@ const INITIALIZE_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// every SymForge release still serves, so the replay does not depend on the
 /// newest one.
 const INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"symforge-update-verify","version":"1"}}}"#;
+/// The last release whose sessions lack the newer-daemon guard (`daemon.rs`):
+/// when one reconnects after an update it replaces the new daemon.
+const LAST_VERSION_WITHOUT_NEWER_DAEMON_GUARD: &str = "11.3.0";
 
 /// Map `(os, arch)` to the npm platform package that ships the native binary.
 /// Mirrors `SUPPORTED_TARGETS` in `npm/lib/resolve-binary.js`. `os` is
@@ -137,6 +143,30 @@ fn native_binary_in(modules: &Path, platform_package: &str, os: &str) -> PathBuf
 /// a rename, never a copy) and outside every package dir npm manages.
 fn update_staging_dir(npm_prefix: &Path) -> PathBuf {
     npm_prefix.join(".symforge-update-staging")
+}
+
+/// Where the platform package can live, in the launcher's own `require.resolve`
+/// order: nested under the wrapper (what `npm install -g symforge` creates),
+/// then beside it (what an explicit `npm install -g symforge-<os>-<arch>` adds).
+fn platform_package_dirs(modules: &Path, platform_package: &str) -> [PathBuf; 2] {
+    [
+        modules
+            .join("symforge")
+            .join("node_modules")
+            .join(platform_package),
+        modules.join(platform_package),
+    ]
+}
+
+/// The platform package dirs the swap must update: every one that exists, the
+/// launcher's first choice first, or the top-level one for a fresh install.
+fn live_platform_packages(modules: &Path, platform_package: &str) -> Vec<PathBuf> {
+    let [nested, top] = platform_package_dirs(modules, platform_package);
+    match (nested.is_dir(), top.is_dir()) {
+        (true, true) => vec![nested, top],
+        (true, false) => vec![nested],
+        (false, _) => vec![top],
+    }
 }
 
 /// Parse a `symforge --version` semver out of arbitrary launcher output. Scans
@@ -290,13 +320,20 @@ fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateD
 pub(crate) struct HarnessScan {
     statuses: Vec<HarnessStatus>,
     grok_config_present: bool,
+    /// Harnesses whose registered command already runs the live binary.
+    already_current: Vec<HarnessId>,
+    /// Harnesses attached over HTTP: no binary path to repoint.
+    http_attached: Vec<HarnessId>,
 }
 
 /// Decide which harnesses `update` re-registers. Only a harness that ALREADY
 /// carries a `symforge` entry is touched, so update never creates config for a
 /// client the user does not run. Kilo Code is excluded: its config is
-/// project-local, and update never writes project-local files. Returns the
-/// targets plus the `skipped:` lines to print.
+/// project-local, and update never writes project-local files. A harness that
+/// already runs the live binary, or attaches over HTTP, is left alone: its
+/// config is rewritten only when there is something to repoint, never while
+/// the harness may be writing it for nothing. Returns the targets plus the
+/// lines to print.
 fn plan_reregistration(scan: &HarnessScan) -> (Vec<HarnessId>, Vec<String>) {
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
@@ -307,6 +344,22 @@ fn plan_reregistration(scan: &HarnessScan) -> (Vec<HarnessId>, Vec<String>) {
             {
                 skipped.push(format!(
                     "skipped: {} (its config is project-local; run `symforge init --client kilo-code` inside that project)",
+                    status.id.display_name()
+                ));
+            }
+            HarnessState::PresentCurrent | HarnessState::PresentStale(_)
+                if scan.already_current.contains(&status.id) =>
+            {
+                skipped.push(format!(
+                    "unchanged: {} (it already runs the updated binary)",
+                    status.id.display_name()
+                ));
+            }
+            HarnessState::PresentCurrent | HarnessState::PresentStale(_)
+                if scan.http_attached.contains(&status.id) =>
+            {
+                skipped.push(format!(
+                    "skipped: {} (it attaches over HTTP; there is no binary path to repoint)",
                     status.id.display_name()
                 ));
             }
@@ -339,34 +392,59 @@ fn plan_reregistration(scan: &HarnessScan) -> (Vec<HarnessId>, Vec<String>) {
 struct UpdateSummary {
     old_version: String,
     new_version: String,
-    /// The live binary already reported the latest version.
-    up_to_date: bool,
-    swapped: bool,
+    swap: SwapState,
     reregistered: Vec<&'static str>,
-    daemon: Option<Result<u16, String>>,
+    /// The daemon's port, and whether update had to start it.
+    daemon: Option<Result<(u16, bool), String>>,
     initialize: Option<Result<(), String>>,
     notes: Vec<String>,
 }
 
+/// How far the swap got, so the summary never calls a half-swapped install
+/// unchanged.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SwapState {
+    #[default]
+    NotRun,
+    /// Neither installed package was behind the latest published version.
+    UpToDate,
+    /// Files were being replaced and the previous ones could not all be put
+    /// back.
+    Started,
+    Swapped,
+    /// The swap happened and was undone after a failure.
+    RolledBack,
+}
+
 impl UpdateSummary {
     fn render(&self) -> String {
-        let version = if self.swapped {
-            format!("{} -> {}", self.old_version, self.new_version)
-        } else if self.up_to_date {
-            format!("{} (already the latest; swap skipped)", self.old_version)
-        } else {
-            format!("{} (unchanged)", self.old_version)
+        let version = match self.swap {
+            SwapState::Swapped => format!("{} -> {}", self.old_version, self.new_version),
+            SwapState::UpToDate => {
+                format!("{} (already the latest; swap skipped)", self.old_version)
+            }
+            SwapState::Started => format!(
+                "{} -> {} INCOMPLETE (some files are new, and the previous ones could not all be restored; see the error)",
+                self.old_version, self.new_version
+            ),
+            SwapState::RolledBack => format!(
+                "{} (the swap to {} was undone after a failure)",
+                self.old_version, self.new_version
+            ),
+            SwapState::NotRun => format!("{} (unchanged)", self.old_version),
         };
         let reregistered = if self.reregistered.is_empty() {
             "none".to_string()
         } else {
             self.reregistered.join(", ")
         };
-        let daemon = match (&self.daemon, self.swapped) {
-            (Some(Ok(port)), true) => format!("yes (port {port})"),
-            (Some(Ok(port)), false) => format!("no, not needed (running on port {port})"),
-            (Some(Err(error)), _) => format!("no ({error})"),
-            (None, _) => "no (not attempted)".to_string(),
+        let daemon = match &self.daemon {
+            Some(Ok((port, true))) => format!("yes (port {port})"),
+            Some(Ok((port, false))) => {
+                format!("no, the running daemon already runs this binary (port {port})")
+            }
+            Some(Err(error)) => format!("no ({error})"),
+            None => "no (not attempted)".to_string(),
         };
         let initialize = match &self.initialize {
             Some(Ok(())) => "yes".to_string(),
@@ -374,7 +452,7 @@ impl UpdateSummary {
             None => "no (not attempted)".to_string(),
         };
         let mut out = format!(
-            "symforge update summary:\n  version: {version}\n  re-registered: {reregistered}\n  daemon restarted: {daemon}\n  initialize verified: {initialize}"
+            "symforge update summary:\n  version: {version}\n  re-registered: {reregistered}\n  daemon restarted: {daemon}\n  binary answers initialize: {initialize}"
         );
         for note in &self.notes {
             out.push_str("\n  ");
@@ -394,9 +472,11 @@ fn probe_label(probe: &InstalledProbe) -> String {
 /// Side effects of an update, injected so the orchestration is unit-testable
 /// without touching npm, the network, the daemon, or the filesystem.
 pub(crate) trait UpdateOps {
-    /// Sweep leftover `.old-*` files a PRIOR swap moved aside. One still held
-    /// by a live session is reported as skipped and cleaned on a later run.
-    /// Runs at the START of update. Returns summary lines.
+    /// Sweep the `.old-*` copies swaps kept of the files they replaced. One
+    /// still held by a live session is reported as skipped and cleaned on a
+    /// later run. Runs only once the binary at the install path is verified:
+    /// until then those copies are what a rollback restores. Returns summary
+    /// lines.
     fn sweep_stale_staging(&mut self) -> Vec<String>;
     /// Stop the recorded daemon right before the swap: its records are what the
     /// new binary replaces, and the ownership gate that protects the stop can
@@ -407,9 +487,14 @@ pub(crate) trait UpdateOps {
     fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<bool>;
     /// `--version` of the staged binary.
     fn staged_version(&mut self) -> InstalledProbe;
-    /// Rename the staged packages' files over the live ones. Returns summary
-    /// lines.
+    /// Rename the staged packages' files over the live ones, keeping a copy of
+    /// each replaced file for [`UpdateOps::roll_back`]. Returns summary lines.
     fn swap_staged_into_place(&mut self) -> anyhow::Result<Vec<String>>;
+    /// Put back every file the swap replaced. The error names where the
+    /// previous files are when any could not be restored.
+    fn roll_back(&mut self) -> anyhow::Result<()>;
+    /// `version` of the installed `symforge` wrapper package, if readable.
+    fn wrapper_version(&mut self) -> Option<String>;
     /// Probe the resolved `symforge --version` after install.
     fn installed_version(&mut self) -> InstalledProbe;
     /// Latest version published to the npm registry, or `None` when offline.
@@ -440,8 +525,9 @@ pub(crate) trait UpdateOps {
     /// spawn), probed directly rather than through the PATH launcher.
     fn live_version(&mut self) -> InstalledProbe;
     /// Make sure a daemon of `version`, running from the live install path, owns
-    /// the daemon records; replaces an older recorded daemon. Returns its port.
-    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<u16>;
+    /// the daemon records; replaces an older recorded daemon. Returns its port
+    /// and whether one had to be started.
+    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<(u16, bool)>;
     /// Replay a harness `initialize` against the live binary over stdio.
     fn verify_initialize(&mut self) -> anyhow::Result<()>;
 }
@@ -451,25 +537,58 @@ struct RealUpdateOps {
     live_modules: PathBuf,
     staging: PathBuf,
     platform_package: &'static str,
-    /// The binary every harness registration points at.
+    /// Every installed copy of the platform package, the launcher's first
+    /// choice first.
+    live_packages: Vec<PathBuf>,
+    /// The binary the launcher resolves, which `init` registers everywhere.
     live_binary: PathBuf,
     staged_binary: PathBuf,
     home: PathBuf,
+    /// Each file the swap replaced, with the copy kept of its previous version
+    /// (`None`: the file is new).
+    journal: Vec<(PathBuf, Option<PathBuf>)>,
 }
 
 impl RealUpdateOps {
+    /// `npm_prefix` must be canonical: the paths derived from it are registered
+    /// with every harness and compared against the daemon's own path.
     fn new(os: &str, platform_package: &'static str, npm_prefix: PathBuf, home: PathBuf) -> Self {
         let live_modules = global_modules_dir(&npm_prefix, os);
         let staging = update_staging_dir(&npm_prefix);
+        let live_packages = live_platform_packages(&live_modules, platform_package);
         Self {
-            live_binary: native_binary_in(&live_modules, platform_package, os),
+            live_binary: live_packages[0].join("bin").join(native_binary_name(os)),
             staged_binary: native_binary_in(&staging.join("node_modules"), platform_package, os),
+            live_packages,
             npm_prefix,
             live_modules,
             staging,
             platform_package,
             home,
+            journal: Vec::new(),
         }
+    }
+
+    /// Whether a registered `command` already runs the live binary: the same
+    /// file, or (the Windows Claude Desktop wrapper) a script that invokes it
+    /// by absolute path.
+    fn runs_live_binary(&self, command: &str) -> bool {
+        let command = Path::new(command);
+        if crate::path_shadow::same_file(command, &self.live_binary) {
+            return true;
+        }
+        let is_script = command
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"));
+        is_script
+            && std::fs::read_to_string(command).is_ok_and(|script| {
+                let binary = self.live_binary.display().to_string();
+                if cfg!(windows) {
+                    script.to_lowercase().contains(&binary.to_lowercase())
+                } else {
+                    script.contains(&binary)
+                }
+            })
     }
 }
 
@@ -538,15 +657,30 @@ impl UpdateOps for RealUpdateOps {
     fn swap_staged_into_place(&mut self) -> anyhow::Result<Vec<String>> {
         let staged_modules = self.staging.join("node_modules");
         let aside = stale_staging_dir(&self.npm_prefix);
-        // The platform package first: it holds the binary harnesses spawn.
-        for package in [self.platform_package, "symforge"] {
+        // The platform package first, into every copy the launcher could
+        // resolve: it holds the binary harnesses spawn. Every copy but the last
+        // is fed from copies, since a rename consumes the staged file.
+        let staged_platform = staged_modules.join(self.platform_package);
+        let last = self.live_packages.len() - 1;
+        for (index, live) in self.live_packages.iter().enumerate() {
             overlay_package(
-                &staged_modules.join(package),
-                &self.live_modules.join(package),
+                &staged_platform,
+                live,
                 &aside,
+                index < last,
+                &mut self.journal,
             )
-            .with_context(|| format!("swapping the staged `{package}` package into place"))?;
+            .with_context(|| format!("swapping the staged files into {}", live.display()))?;
         }
+        let live_wrapper = self.live_modules.join("symforge");
+        overlay_package(
+            &staged_modules.join("symforge"),
+            &live_wrapper,
+            &aside,
+            false,
+            &mut self.journal,
+        )
+        .with_context(|| format!("swapping the staged files into {}", live_wrapper.display()))?;
         Ok(match std::fs::remove_dir_all(&self.staging) {
             Ok(()) => Vec::new(),
             Err(error) => vec![format!(
@@ -554,6 +688,45 @@ impl UpdateOps for RealUpdateOps {
                 self.staging.display()
             )],
         })
+    }
+
+    fn roll_back(&mut self) -> anyhow::Result<()> {
+        let aside = stale_staging_dir(&self.npm_prefix);
+        let mut failed = Vec::new();
+        // ponytail: files the swap newly created stay; the previous version
+        // ignores them. Delete them here if a release ever adds one that must not
+        // outlive a rollback.
+        for (live, previous) in std::mem::take(&mut self.journal).into_iter().rev() {
+            let Some(previous) = previous else { continue };
+            if let Err(error) = put_in_place(&previous, &live, &aside, |src, dst| {
+                std::fs::rename(src, dst)
+            }) {
+                failed.push(format!(
+                    "{} (from {}): {error}",
+                    live.display(),
+                    previous.display()
+                ));
+            }
+        }
+        if failed.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "could not restore {} file(s); the previous version's files are kept in {}. Put \
+             each back by hand, then rerun `symforge update`:\n  {}",
+            failed.len(),
+            aside.display(),
+            failed.join("\n  ")
+        )
+    }
+
+    fn wrapper_version(&mut self) -> Option<String> {
+        let manifest =
+            std::fs::read_to_string(self.live_modules.join("symforge").join("package.json"))
+                .ok()?;
+        serde_json::from_str::<serde_json::Value>(&manifest).ok()?["version"]
+            .as_str()
+            .map(str::to_string)
     }
 
     fn installed_version(&mut self) -> InstalledProbe {
@@ -584,12 +757,32 @@ impl UpdateOps for RealUpdateOps {
     fn harness_scan(&mut self) -> HarnessScan {
         // The working dir only feeds the project-local Kilo Code target, which
         // `plan_reregistration` never re-registers; home keeps the caller's cwd
-        // out of it. Only presence matters here, so the desired attach entry is
-        // a placeholder: a stdio entry reads as present-stale.
+        // out of it. Presence comes from the scan (the desired attach entry is a
+        // placeholder); what each entry runs comes from its `command`.
         let registry = HarnessRegistry::known_with(&self.home, &self.home);
+        let statuses = registry.scan(&AttachEntry::new("", None));
+        let mut already_current = Vec::new();
+        let mut http_attached = Vec::new();
+        for status in &statuses {
+            if !matches!(
+                status.state,
+                HarnessState::PresentCurrent | HarnessState::PresentStale(_)
+            ) {
+                continue;
+            }
+            match crate::cli::harness::registered_command(status) {
+                Some(command) if self.runs_live_binary(&command) => {
+                    already_current.push(status.id);
+                }
+                Some(_) => {}
+                None => http_attached.push(status.id),
+            }
+        }
         HarnessScan {
-            statuses: registry.scan(&AttachEntry::new("", None)),
+            statuses,
             grok_config_present: self.home.join(".grok").join("config.toml").exists(),
+            already_current,
+            http_attached,
         }
     }
 
@@ -638,7 +831,7 @@ impl UpdateOps for RealUpdateOps {
         probe_version(&self.live_binary)
     }
 
-    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<u16> {
+    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<(u16, bool)> {
         // `main()` is synchronous, so a short-lived runtime is safe (no
         // nested-runtime panic).
         tokio::runtime::Builder::new_current_thread()
@@ -653,6 +846,9 @@ impl UpdateOps for RealUpdateOps {
     }
 
     fn verify_initialize(&mut self) -> anyhow::Result<()> {
+        // ponytail: from home, the probe binds no project, so this proves the
+        // binary starts and answers the handshake, not that a project session
+        // serves. Replay from a registered project root if that ever matters.
         verify_initialize_at(&self.live_binary, &self.home, INITIALIZE_VERIFY_TIMEOUT)
     }
 }
@@ -815,29 +1011,73 @@ fn sweep_stale_dir(dir: &std::path::Path) -> Vec<String> {
 }
 
 /// Rename every file under `staged` over its counterpart under `live`, creating
-/// directories as needed. Files present only in `live` are left in place.
+/// directories as needed, and record each replacement in `journal`. With
+/// `keep_staged`, each staged file is copied beside its target first and the
+/// copy is moved instead, so `staged` can feed another target. Files present
+/// only in `live` are left in place.
 // ponytail: overlay, not a mirror; delete live-only files if a release ever
 // drops a file that must not linger.
-fn overlay_package(staged: &Path, live: &Path, aside_dir: &Path) -> anyhow::Result<()> {
+fn overlay_package(
+    staged: &Path,
+    live: &Path,
+    aside_dir: &Path,
+    keep_staged: bool,
+    journal: &mut Vec<(PathBuf, Option<PathBuf>)>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(live).with_context(|| format!("creating {}", live.display()))?;
     for entry in
         std::fs::read_dir(staged).with_context(|| format!("reading {}", staged.display()))?
     {
         let entry = entry.with_context(|| format!("reading {}", staged.display()))?;
-        let from = entry.path();
+        let mut from = entry.path();
         let to = live.join(entry.file_name());
         if entry
             .file_type()
             .with_context(|| format!("inspecting {}", from.display()))?
             .is_dir()
         {
-            overlay_package(&from, &to, aside_dir)?;
-        } else {
-            replace_file(&from, &to, aside_dir, |src, dst| std::fs::rename(src, dst))
-                .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+            overlay_package(&from, &to, aside_dir, keep_staged, journal)?;
+            continue;
         }
+        if keep_staged {
+            let copy = aside_dir.join(format!(
+                "{}.new-{}",
+                entry.file_name().to_string_lossy(),
+                stage_suffix()
+            ));
+            std::fs::create_dir_all(aside_dir)
+                .and_then(|()| std::fs::copy(&from, &copy))
+                .with_context(|| format!("copying {} to {}", from.display(), copy.display()))?;
+            from = copy;
+        }
+        let previous = replace_file(&from, &to, aside_dir, |src, dst| std::fs::rename(src, dst))
+            .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+        journal.push((to, previous));
     }
     Ok(())
+}
+
+/// Move `src` over `dst`, first keeping a copy of `dst`'s current file in
+/// `aside_dir` (a hard link where the filesystem allows, so the running binary
+/// is never read). Returns that copy's path, or `None` when `dst` is new.
+fn replace_file(
+    src: &Path,
+    dst: &Path,
+    aside_dir: &Path,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<Option<PathBuf>> {
+    let previous = if dst.exists() {
+        std::fs::create_dir_all(aside_dir)?;
+        let previous = aside_path(aside_dir, dst);
+        if std::fs::hard_link(dst, &previous).is_err() {
+            std::fs::copy(dst, &previous)?;
+        }
+        Some(previous)
+    } else {
+        None
+    };
+    put_in_place(src, dst, aside_dir, rename)?;
+    Ok(previous)
 }
 
 /// Move `src` over `dst` so that `dst` holds either the old or the new file at
@@ -847,7 +1087,7 @@ fn overlay_package(staged: &Path, live: &Path, aside_dir: &Path) -> anyhow::Resu
 /// there `dst` goes aside into `aside_dir` and `src` follows immediately. If
 /// that second rename fails, the old file is moved back. `rename` is injected
 /// so the move-back path is testable.
-fn replace_file(
+fn put_in_place(
     src: &Path,
     dst: &Path,
     aside_dir: &Path,
@@ -861,11 +1101,7 @@ fn replace_file(
         return Err(refused);
     }
     std::fs::create_dir_all(aside_dir)?;
-    let name = dst
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let aside = aside_dir.join(format!("{name}.old-{}", stage_suffix()));
+    let aside = aside_path(aside_dir, dst);
     move_path_aside(dst, &aside)?;
     if let Err(error) = rename(src, dst) {
         return match move_path_aside(&aside, dst) {
@@ -879,15 +1115,26 @@ fn replace_file(
     Ok(())
 }
 
-/// A random-enough suffix for a staged `.old-*` filename: pid + wall-clock nanos
-/// (no `rand` dependency needed — collisions only need avoiding across a rare
-/// concurrent or repeated update, and the sweep tolerates leftovers anyway).
+/// A unique `aside_dir` name for a previous copy of `file`.
+fn aside_path(aside_dir: &Path, file: &Path) -> PathBuf {
+    let name = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    aside_dir.join(format!("{name}.old-{}", stage_suffix()))
+}
+
+/// A unique-enough suffix for a staged `.old-*` filename: pid, wall-clock nanos,
+/// and a per-process counter (no `rand` dependency needed; the counter keeps two
+/// names minted within one clock tick apart).
 fn stage_suffix() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{}-{nanos}", std::process::id())
+    let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos}-{count}", std::process::id())
 }
 
 /// Move `src` to `dst`, freeing `src` for npm. `std::fs::rename` (which maps to
@@ -925,13 +1172,43 @@ fn npm_global_prefix() -> Option<std::path::PathBuf> {
     if !output.status.success() {
         return None;
     }
-    let prefix = String::from_utf8_lossy(&output.stdout);
-    let prefix = prefix.trim();
-    if prefix.is_empty() {
+    resolve_prefix(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// The real directory behind `npm prefix -g` output. nvm-windows reports
+/// `C:\Program Files\nodejs`, a link to the active version dir; the launcher
+/// (and so every registration `init` writes) resolves through it, so the
+/// paths update derives must too.
+fn resolve_prefix(raw: &str) -> Option<PathBuf> {
+    if raw.is_empty() {
         return None;
     }
-    let prefix = std::path::PathBuf::from(prefix);
-    prefix.is_dir().then_some(prefix)
+    dunce::canonicalize(raw)
+        .ok()
+        .filter(|prefix| prefix.is_dir())
+}
+
+/// Hold an exclusive lock on `<npm prefix>/.symforge-update.lock` for as long as
+/// the returned file lives, so a second `symforge update` cannot clear the
+/// staging directory under the first. The OS drops the lock when the process
+/// exits, so a crashed run never leaves it stuck.
+fn lock_update(npm_prefix: &Path) -> anyhow::Result<std::fs::File> {
+    let path = npm_prefix.join(".symforge-update.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening the update lock {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("symforge update: another `symforge update` is already running")
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("locking {}", path.display()))
+        }
+    }
 }
 
 /// Derive the path of the `symforge` launcher npm installs at the global prefix.
@@ -967,6 +1244,7 @@ pub fn run_update() -> anyhow::Result<()> {
          named no existing directory); is npm on PATH?",
     )?;
     let home = dirs::home_dir().context("cannot determine home directory")?;
+    let _lock = lock_update(&npm_prefix)?;
     let mut ops = RealUpdateOps::new(os, platform_package, npm_prefix, home);
     orchestrate_update(os, arch, &mut ops)
 }
@@ -990,7 +1268,8 @@ fn update_steps(
     summary: &mut UpdateSummary,
 ) -> anyhow::Result<()> {
     // Clean cruft from prior runs first, whatever happens to the swap below.
-    summary.notes.extend(ops.sweep_stale_staging());
+    // Copies a prior swap kept are swept only after this run verifies the
+    // binary: until then they may be the only copy of the previous version.
     summary.notes.extend(ops.prune_registry());
 
     let latest = ops.latest_version();
@@ -1002,13 +1281,24 @@ fn update_steps(
     }
     let before = ops.live_version();
     summary.old_version = probe_label(&before);
-    let already_latest =
-        matches!((&before, &latest), (InstalledProbe::Version(v), Some(l)) if v == l);
+    // Skip unless the registry names a version newer than BOTH installed
+    // packages: a live binary ahead of the registry (a lagging registry, a
+    // pre-release) is never downgraded, and a wrapper a failed swap left behind
+    // is still repaired.
+    let wrapper = ops.wrapper_version();
+    let behind = |version: &str| {
+        latest
+            .as_deref()
+            .is_some_and(|latest| crate::cli::version::is_newer_version(latest, version))
+    };
+    let current = latest.is_some()
+        && matches!(&before, InstalledProbe::Version(v) if !behind(v))
+        && wrapper.as_deref().is_some_and(|w| !behind(w));
 
-    summary.up_to_date = already_latest;
-    if already_latest {
+    if current {
+        summary.swap = SwapState::UpToDate;
         eprintln!(
-            "symforge update: {} is already the latest published version; skipping the swap.",
+            "symforge update: {} is not behind the latest published version; skipping the swap.",
             summary.old_version
         );
     } else {
@@ -1039,6 +1329,15 @@ fn update_steps(
                          published {latest}. {untouched}"
                     );
                 }
+                if let InstalledProbe::Version(live) = &before
+                    && crate::cli::version::is_newer_version(live, &staged)
+                {
+                    bail!(
+                        "symforge update failed: the staged binary reports {staged}, older than the \
+                         installed {live}; update does not downgrade. {untouched}"
+                    );
+                }
+                summary.new_version = staged;
             }
             InstalledProbe::LauncherFailed(detail) => bail!(
                 "symforge update failed: the staged binary did not report a version:\n  {detail}\n{untouched}"
@@ -1054,45 +1353,72 @@ fn update_steps(
             Ok(line) => line,
             Err(error) => format!("skipped: stopping the daemon: {error:#}"),
         });
-        summary.notes.extend(ops.swap_staged_into_place().context(
-            "symforge update failed while swapping the staged files into place; the binary path \
-             holds either the old or the new binary, rerun `symforge update` to finish",
-        )?);
-        summary.swapped = true;
-    }
-
-    // What harnesses will spawn from now on.
-    let new_version = match ops.live_version() {
-        InstalledProbe::Version(version) => version,
-        InstalledProbe::LauncherFailed(detail) => bail!(
-            "symforge update incomplete: the binary at the install path did not report a version:\n  {detail}"
-        ),
-        InstalledProbe::Unprobeable => {
-            bail!("symforge update incomplete: the binary at the install path could not be run")
+        summary.swap = SwapState::Started;
+        match ops.swap_staged_into_place() {
+            Ok(lines) => summary.notes.extend(lines),
+            Err(error) => {
+                return Err(roll_back(
+                    ops,
+                    summary,
+                    error.context(
+                        "symforge update failed while swapping the staged files into place",
+                    ),
+                ));
+            }
         }
-    };
-    summary.new_version = new_version.clone();
+        summary.swap = SwapState::Swapped;
+        if let InstalledProbe::Version(old) = &before
+            && !crate::cli::version::is_newer_version(old, LAST_VERSION_WITHOUT_NEWER_DAEMON_GUARD)
+        {
+            summary.notes.push(format!(
+                "note: sessions opened before this update run {old}, which lacks the newer-daemon \
+                 guard; when one reconnects it restarts the daemon under the newer sessions. \
+                 Restart those sessions when convenient."
+            ));
+        }
+    }
+    let swapped = summary.swap == SwapState::Swapped;
 
-    // Verify the install actually took effect for the PATH launcher too. npm can
-    // leave the resolved binary behind, so this is the load-bearing safety net.
+    if let Err(error) = verify_live(ops, summary, swapped) {
+        summary.notes.push(
+            "skipped: harness re-registration (the binary at the install path failed verification)"
+                .to_string(),
+        );
+        if !swapped {
+            return Err(error.context("symforge update failed"));
+        }
+        if matches!(summary.daemon, Some(Ok(_))) {
+            summary.notes.push(match ops.stop_daemon() {
+                Ok(line) => format!("{line} before restoring the previous version"),
+                Err(error) => {
+                    format!("skipped: stopping the new daemon before restoring: {error:#}")
+                }
+            });
+        }
+        return Err(roll_back(ops, summary, error));
+    }
+    summary.notes.extend(ops.sweep_stale_staging());
+
+    // Verify the install took effect for the PATH launcher too. It is not what
+    // harnesses spawn, so a problem here fails the update only after the
+    // harness-facing steps below have run.
     let running = env!("CARGO_PKG_VERSION");
     let pkg = platform_package_for(os, arch).unwrap_or("symforge-<os>-<arch>");
-    match ops.installed_version() {
-        InstalledProbe::LauncherFailed(detail) => {
-            bail!(
-                "symforge update incomplete: the freshly-installed `symforge` launcher could not \
-                 resolve a native binary. Launcher reported:\n  {detail}\n\
-                 This is usually a stale/missing platform package or a WSL Windows-prefix bleed. Try: \
-                 npm install -g symforge@latest {pkg}@latest --force; on WSL, ensure your Linux npm \
-                 prefix bin is on PATH ahead of /usr/local and /mnt."
-            );
-        }
+    let launcher_problem = match ops.installed_version() {
+        InstalledProbe::LauncherFailed(detail) => Some(anyhow::anyhow!(
+            "symforge update incomplete: the freshly-installed `symforge` launcher could not \
+             resolve a native binary. Launcher reported:\n  {detail}\n\
+             This is usually a stale/missing platform package or a WSL Windows-prefix bleed. Rerun \
+             `symforge update`; on WSL, ensure your Linux npm prefix bin is on PATH ahead of \
+             /usr/local and /mnt."
+        )),
         InstalledProbe::Unprobeable => {
             summary.notes.push(
                 "skipped: verifying `symforge --version` through the launcher on PATH (it could not \
                  be run; the npm prefix bin may not be on PATH)"
                     .to_string(),
             );
+            None
         }
         InstalledProbe::Version(installed) => {
             // When the registry is reachable, require the resolved binary to be
@@ -1109,39 +1435,23 @@ fn update_steps(
                     running.to_string(),
                 ),
             };
-            if stale {
-                bail!(
+            stale.then(|| {
+                anyhow::anyhow!(
                     "symforge update incomplete: `symforge --version` still reports {installed}, \
                      behind {target}. The resolved `symforge` is not the one just installed. Likely causes:\n  \
-                     - stale nested platform package — retry: npm install -g symforge@latest {pkg}@latest --force\n  \
+                     - a stale platform package {pkg} the launcher resolves first — rerun `symforge update`\n  \
                      - a PATH-shadowing install — run `which -a symforge`; a root /usr/local copy can win over your npm prefix\n  \
                      - on WSL, a Windows npm prefix bleeding in via /mnt — put your Linux npm prefix bin ahead of /usr/local and /mnt on PATH"
-                );
-            }
+                )
+            })
         }
-    }
+    };
 
     // Proactive PATH-shadow check: the version check above cannot see a
     // same-version shadow or name the exact offending path and fix.
     if let Some(report) = ops.shadow_report() {
         eprintln!("{}", crate::path_shadow::format_shadow_warning(&report));
     }
-
-    summary.daemon = Some(
-        ops.restart_daemon(&new_version)
-            .map_err(|error| format!("{error:#}")),
-    );
-    if let Err(error) = ops.verify_initialize() {
-        summary.initialize = Some(Err(format!("{error:#}")));
-        summary.notes.push(
-            "skipped: harness re-registration (the new binary failed verification)".to_string(),
-        );
-        return Err(error.context(
-            "symforge update failed: the binary at the install path did not answer a harness \
-             `initialize`; new sessions will fail until this is fixed",
-        ));
-    }
-    summary.initialize = Some(Ok(()));
 
     // Re-point the harnesses that already use SymForge. Only after every one of
     // them succeeded are the retired durable-install artifacts cleared —
@@ -1170,7 +1480,69 @@ fn update_steps(
     summary
         .notes
         .extend(ops.reconcile_durable(all_reregistered));
+    match launcher_problem {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Prove the binary at the install path works: it reports a version, a daemon
+/// of that version serves, and it answers a harness `initialize`. After a swap
+/// a daemon that will not start is a failure; without one it is only reported
+/// (sessions start the daemon on demand).
+fn verify_live(
+    ops: &mut impl UpdateOps,
+    summary: &mut UpdateSummary,
+    swapped: bool,
+) -> anyhow::Result<()> {
+    summary.new_version = match ops.live_version() {
+        InstalledProbe::Version(version) => version,
+        InstalledProbe::LauncherFailed(detail) => bail!(
+            "symforge update incomplete: the binary at the install path did not report a version:\n  {detail}"
+        ),
+        InstalledProbe::Unprobeable => {
+            bail!("symforge update incomplete: the binary at the install path could not be run")
+        }
+    };
+    match ops.restart_daemon(&summary.new_version) {
+        Ok(daemon) => summary.daemon = Some(Ok(daemon)),
+        Err(error) => {
+            summary.daemon = Some(Err(format!("{error:#}")));
+            if swapped {
+                return Err(error.context("the daemon did not start from the new binary"));
+            }
+        }
+    }
+    if let Err(error) = ops.verify_initialize() {
+        summary.initialize = Some(Err(format!("{error:#}")));
+        return Err(error.context(
+            "the binary at the install path did not answer a harness `initialize`; new sessions \
+             will fail until this is fixed",
+        ));
+    }
+    summary.initialize = Some(Ok(()));
     Ok(())
+}
+
+/// Undo a swap after `error`, and say what state the install is left in.
+fn roll_back(
+    ops: &mut impl UpdateOps,
+    summary: &mut UpdateSummary,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match ops.roll_back() {
+        Ok(()) => {
+            summary.swap = SwapState::RolledBack;
+            error.context(format!(
+                "symforge update failed; the previous version ({}) was restored. The daemon starts \
+                 again with the next session. Rerun `symforge update` to retry",
+                summary.old_version
+            ))
+        }
+        Err(restore) => error.context(format!(
+            "symforge update failed, and restoring the previous version failed too: {restore:#}"
+        )),
+    }
 }
 
 fn invocation_text(program: &str, args: &[&str]) -> String {
@@ -1236,7 +1608,10 @@ mod tests {
         staged: InstalledProbe,
         stop: Result<String, String>,
         installed: InstalledProbe,
-        daemon: Result<u16, String>,
+        wrapper: Option<String>,
+        swap_fails: bool,
+        roll_back: Result<(), String>,
+        daemon: Result<(u16, bool), String>,
         initialize: Result<(), String>,
         scan: Vec<(HarnessId, HarnessState)>,
         reregister_fails: Vec<HarnessId>,
@@ -1257,7 +1632,10 @@ mod tests {
                 staged: InstalledProbe::Version("7.15.4".to_string()),
                 stop: Ok("stopped the daemon (pid 7)".to_string()),
                 installed: InstalledProbe::Version("7.15.4".to_string()),
-                daemon: Ok(4242),
+                wrapper: Some("7.15.3".to_string()),
+                swap_fails: false,
+                roll_back: Ok(()),
+                daemon: Ok((4242, true)),
                 initialize: Ok(()),
                 scan: vec![
                     (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
@@ -1301,7 +1679,17 @@ mod tests {
         }
         fn swap_staged_into_place(&mut self) -> anyhow::Result<Vec<String>> {
             self.events.push("swap".into());
+            if self.swap_fails {
+                bail!("moving package.json: the process cannot access the file");
+            }
             Ok(Vec::new())
+        }
+        fn roll_back(&mut self) -> anyhow::Result<()> {
+            self.events.push("rollback".into());
+            self.roll_back.clone().map_err(|e| anyhow::anyhow!(e))
+        }
+        fn wrapper_version(&mut self) -> Option<String> {
+            self.wrapper.clone()
         }
         fn installed_version(&mut self) -> InstalledProbe {
             self.installed.clone()
@@ -1339,7 +1727,7 @@ mod tests {
                 self.live[0].clone()
             }
         }
-        fn restart_daemon(&mut self, version: &str) -> anyhow::Result<u16> {
+        fn restart_daemon(&mut self, version: &str) -> anyhow::Result<(u16, bool)> {
             self.events.push(format!("daemon {version}"));
             self.daemon.clone().map_err(|e| anyhow::anyhow!(e))
         }
@@ -1361,6 +1749,8 @@ mod tests {
                 })
                 .collect(),
             grok_config_present: false,
+            already_current: Vec::new(),
+            http_attached: Vec::new(),
         }
     }
 
@@ -1524,7 +1914,11 @@ mod tests {
         assert!(msg.contains("incomplete"), "{msg}");
         assert!(msg.contains("7.15.2") && msg.contains("7.15.4"), "{msg}");
         assert!(msg.contains("PATH-shadowing"), "{msg}");
-        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
+        assert!(
+            ops.happened("reregister claude"),
+            "the PATH launcher is not what harnesses spawn; it must not block them: {:?}",
+            ops.events
+        );
     }
 
     #[test]
@@ -1540,13 +1934,17 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("could not resolve a native binary"), "{msg}");
         assert!(msg.contains("symforge-linux-x64 not found"), "{msg}");
-        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
+        assert!(ops.happened("daemon 7.15.4") && ops.happened("reregister claude"));
     }
 
     #[test]
     fn orchestrate_update_floors_against_running_version_when_registry_offline() {
         let mut ops = FakeOps {
             latest: None,
+            live: vec![
+                InstalledProbe::Unprobeable,
+                InstalledProbe::Version("0.0.1".to_string()),
+            ],
             staged: InstalledProbe::Version("0.0.1".to_string()),
             installed: InstalledProbe::Version("0.0.1".to_string()),
             ..Default::default()
@@ -1554,7 +1952,6 @@ mod tests {
         let err = orchestrate_update("linux", "x86_64", &mut ops)
             .expect_err("a binary older than the running update binary must fail even offline");
         assert!(err.to_string().contains("incomplete"), "{err:?}");
-        assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
     }
 
     #[test]
@@ -1613,6 +2010,7 @@ mod tests {
     fn orchestrate_update_skips_the_swap_when_the_live_binary_is_latest_but_still_verifies() {
         let mut ops = FakeOps {
             live: vec![InstalledProbe::Version("7.15.4".to_string())],
+            wrapper: Some("7.15.4".to_string()),
             ..Default::default()
         };
         orchestrate_update("windows", "x86_64", &mut ops).expect("an up-to-date update succeeds");
@@ -1644,6 +2042,7 @@ mod tests {
             live: vec![InstalledProbe::Version(
                 env!("CARGO_PKG_VERSION").to_string(),
             )],
+            staged: InstalledProbe::Version(env!("CARGO_PKG_VERSION").to_string()),
             installed: InstalledProbe::Version(env!("CARGO_PKG_VERSION").to_string()),
             ..Default::default()
         };
@@ -1674,18 +2073,191 @@ mod tests {
         assert!(format!("{err:#}").contains("initialize"), "{err:#}");
         assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
         assert_eq!(ops.reconciled_with, None);
+        assert!(
+            ops.position("initialize") < ops.position("rollback"),
+            "{:?}",
+            ops.events
+        );
+        assert_eq!(
+            ops.events.iter().filter(|e| *e == "stop-daemon").count(),
+            2,
+            "the daemon started from the new binary is stopped before the restore: {:?}",
+            ops.events
+        );
+        assert!(format!("{err:#}").contains("was restored"), "{err:#}");
     }
 
     #[test]
     fn a_daemon_restart_failure_is_reported_not_swallowed() {
         let mut ops = FakeOps {
+            live: vec![InstalledProbe::Version("7.15.4".to_string())],
+            wrapper: Some("7.15.4".to_string()),
             daemon: Err("auto-spawn disabled".to_string()),
             ..Default::default()
         };
-        // The machine still works (clients spawn the daemon on demand), so the
+        // Nothing was swapped and clients spawn the daemon on demand, so the
         // update succeeds; the summary carries the failure.
-        orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
+        let mut summary = UpdateSummary::default();
+        update_steps("linux", "x86_64", &mut ops, &mut summary).expect("update should succeed");
         assert!(ops.happened("initialize"));
+        assert_eq!(summary.daemon, Some(Err("auto-spawn disabled".to_string())));
+    }
+
+    #[test]
+    fn a_daemon_that_will_not_start_after_a_swap_rolls_the_swap_back() {
+        let mut ops = FakeOps {
+            daemon: Err("timed out waiting for symforge daemon to become ready".to_string()),
+            ..Default::default()
+        };
+        let mut summary = UpdateSummary::default();
+        let err = update_steps("linux", "x86_64", &mut ops, &mut summary)
+            .expect_err("a daemon that will not start from the new binary fails the update");
+        assert!(ops.position("daemon 7.15.4") < ops.position("rollback"));
+        assert!(!ops.happened("initialize") && !ops.happened("reregister claude"));
+        assert_eq!(summary.swap, SwapState::RolledBack);
+        assert!(
+            format!("{err:#}").contains("did not start from the new binary"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_failed_swap_is_rolled_back_and_a_failed_rollback_is_never_reported_unchanged() {
+        let mut ops = FakeOps {
+            swap_fails: true,
+            ..Default::default()
+        };
+        let mut summary = UpdateSummary::default();
+        update_steps("linux", "x86_64", &mut ops, &mut summary).expect_err("the swap failed");
+        assert!(ops.position("swap") < ops.position("rollback"));
+        assert_eq!(summary.swap, SwapState::RolledBack);
+        assert!(!ops.events.iter().any(|e| e.starts_with("daemon ")));
+
+        let mut ops = FakeOps {
+            swap_fails: true,
+            roll_back: Err(
+                "could not restore 1 file(s); the previous version's files are kept in \
+                 /npm/.symforge-update-stale"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let mut summary = UpdateSummary::default();
+        let err =
+            update_steps("linux", "x86_64", &mut ops, &mut summary).expect_err("the swap failed");
+        assert_eq!(summary.swap, SwapState::Started);
+        let text = summary.render();
+        assert!(
+            text.contains("7.15.3 -> 7.15.4 INCOMPLETE") && !text.contains("unchanged"),
+            "{text}"
+        );
+        assert!(
+            format!("{err:#}").contains("/npm/.symforge-update-stale"),
+            "the error names where the previous files are: {err:#}"
+        );
+    }
+
+    #[test]
+    fn the_previous_versions_kept_by_a_swap_are_swept_only_after_verification() {
+        let mut ops = FakeOps::default();
+        orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
+        assert!(ops.position("initialize") < ops.position("sweep"));
+
+        let mut ops = FakeOps {
+            initialize: Err("no `initialize` result within 10s".to_string()),
+            ..Default::default()
+        };
+        orchestrate_update("linux", "x86_64", &mut ops).expect_err("verification failed");
+        assert!(
+            !ops.happened("sweep"),
+            "the kept copies are what the rollback restores: {:?}",
+            ops.events
+        );
+    }
+
+    #[test]
+    fn a_wrapper_behind_the_registry_is_swapped_even_when_the_binary_is_current() {
+        let mut ops = FakeOps {
+            live: vec![InstalledProbe::Version("7.15.4".to_string())],
+            wrapper: Some("7.15.3".to_string()),
+            ..Default::default()
+        };
+        orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
+        assert!(ops.happened("swap"), "{:?}", ops.events);
+    }
+
+    #[test]
+    fn a_live_binary_ahead_of_the_registry_is_never_replaced() {
+        let mut ops = FakeOps {
+            live: vec![InstalledProbe::Version("7.16.0".to_string())],
+            wrapper: Some("7.16.0".to_string()),
+            ..Default::default()
+        };
+        orchestrate_update("linux", "x86_64", &mut ops).expect("nothing to do is a success");
+        assert!(!ops.events.iter().any(|e| e.starts_with("stage")));
+        assert!(!ops.happened("swap"));
+    }
+
+    #[test]
+    fn a_staged_binary_older_than_the_live_one_is_refused_when_the_registry_is_unreachable() {
+        let mut ops = FakeOps {
+            latest: None,
+            live: vec![InstalledProbe::Version("7.15.4".to_string())],
+            staged: InstalledProbe::Version("7.15.3".to_string()),
+            ..Default::default()
+        };
+        let err = orchestrate_update("linux", "x86_64", &mut ops)
+            .expect_err("an older staged binary must not replace a newer live one");
+        assert!(err.to_string().contains("does not downgrade"), "{err}");
+        assert!(!ops.happened("swap") && !ops.happened("stop-daemon"));
+    }
+
+    #[test]
+    fn sessions_from_before_the_newer_daemon_guard_get_a_restart_note() {
+        for (old, noted) in [("11.3.0", true), ("11.3.1", false)] {
+            let mut ops = FakeOps {
+                latest: Some("11.4.0".to_string()),
+                live: vec![
+                    InstalledProbe::Version(old.to_string()),
+                    InstalledProbe::Version("11.4.0".to_string()),
+                ],
+                staged: InstalledProbe::Version("11.4.0".to_string()),
+                installed: InstalledProbe::Version("11.4.0".to_string()),
+                ..Default::default()
+            };
+            let mut summary = UpdateSummary::default();
+            update_steps("linux", "x86_64", &mut ops, &mut summary).expect("update succeeds");
+            assert_eq!(
+                summary
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("lacks the newer-daemon guard")),
+                noted,
+                "{old}: {:?}",
+                summary.notes
+            );
+        }
+    }
+
+    #[test]
+    fn plan_reregistration_leaves_current_and_http_attached_harnesses_alone() {
+        let mut scan = scan_of(&[
+            (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
+            (HarnessId::Codex, HarnessState::PresentCurrent),
+            (
+                HarnessId::Cursor,
+                HarnessState::PresentStale(crate::cli::harness::StaleFields::Url),
+            ),
+        ]);
+        scan.already_current = vec![HarnessId::ClaudeCode];
+        scan.http_attached = vec![HarnessId::Cursor];
+
+        let (targets, notes) = plan_reregistration(&scan);
+
+        assert_eq!(targets, vec![HarnessId::Codex]);
+        let text = notes.join("\n");
+        assert!(text.contains("unchanged: Claude Code"), "{text}");
+        assert!(text.contains("Cursor (it attaches over HTTP"), "{text}");
     }
 
     #[test]
@@ -1734,24 +2306,23 @@ mod tests {
         let summary = UpdateSummary {
             old_version: "11.2.0".to_string(),
             new_version: "11.3.0".to_string(),
-            up_to_date: false,
-            swapped: true,
+            swap: SwapState::Swapped,
             reregistered: vec!["Claude Code", "Codex"],
-            daemon: Some(Ok(51234)),
+            daemon: Some(Ok((51234, true))),
             initialize: Some(Ok(())),
             notes: vec!["skipped: re-registering Cursor: init exited with 1".to_string()],
         };
         assert_eq!(
             summary.render(),
             "symforge update summary:\n  version: 11.2.0 -> 11.3.0\n  re-registered: Claude Code, Codex\n  \
-             daemon restarted: yes (port 51234)\n  initialize verified: yes\n  \
+             daemon restarted: yes (port 51234)\n  binary answers initialize: yes\n  \
              skipped: re-registering Cursor: init exited with 1"
         );
 
         let up_to_date = UpdateSummary {
             old_version: "11.3.0".to_string(),
             new_version: "11.3.0".to_string(),
-            up_to_date: true,
+            swap: SwapState::UpToDate,
             daemon: Some(Err("auto-spawn disabled".to_string())),
             ..Default::default()
         };
@@ -1766,7 +2337,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("initialize verified: no (not attempted)"),
+            text.contains("binary answers initialize: no (not attempted)"),
             "{text}"
         );
 
@@ -1988,7 +2559,8 @@ mod tests {
                 (checks, misses)
             })
         };
-        let swapped = overlay_package(&staged, &live, &aside);
+        let mut journal = Vec::new();
+        let swapped = overlay_package(&staged, &live, &aside, false, &mut journal);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let (checks, misses) = prober.join().unwrap();
         let still_running = holder.try_wait().unwrap().is_none();
@@ -2004,11 +2576,23 @@ mod tests {
         );
         assert!(live.join("only-in-old.txt").exists());
         assert!(checks > 0);
+        // Every replaced file kept a copy of its previous version for a rollback.
+        let kept = journal
+            .iter()
+            .find(|(path, _)| *path == live_binary)
+            .and_then(|(_, previous)| previous.clone())
+            .expect("the binary's previous version is kept");
+        assert_eq!(std::fs::read(&kept).unwrap(), old_bytes);
         if cfg!(windows) {
-            // The running image was refused as a rename target, so it went aside.
-            let moved: Vec<_> = std::fs::read_dir(&aside).unwrap().flatten().collect();
-            assert_eq!(moved.len(), 1, "{moved:?}");
-            assert_eq!(std::fs::read(moved[0].path()).unwrap(), old_bytes);
+            // The running image was refused as a rename target, so it went
+            // aside too; everything there is a previous version.
+            for entry in std::fs::read_dir(&aside).unwrap().flatten() {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(
+                    bytes == old_bytes || bytes == b"{\"version\":\"1\"}",
+                    "{entry:?}"
+                );
+            }
         } else {
             // rename(2) replaces a running binary atomically: never absent.
             assert_eq!(misses, 0, "the path was absent in {misses}/{checks} probes");
@@ -2026,7 +2610,7 @@ mod tests {
 
         // Every rename of the staged file is refused the way Windows refuses a
         // running image; the aside and move-back renames are real.
-        let err = replace_file(&src, &dst, &aside, |from, to| {
+        let err = put_in_place(&src, &dst, &aside, |from, to| {
             if from == src.as_path() {
                 Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
             } else {
@@ -2050,7 +2634,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dst = tmp.path().join("symforge.bin");
         std::fs::write(&dst, b"old").unwrap();
-        let err = replace_file(
+        let err = put_in_place(
             &tmp.path().join("missing"),
             &dst,
             &tmp.path().join("aside"),
@@ -2060,6 +2644,226 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(std::fs::read(&dst).unwrap(), b"old");
         assert!(!tmp.path().join("aside").exists());
+    }
+
+    #[test]
+    fn replace_file_keeps_the_previous_file_for_a_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aside = tmp.path().join("aside");
+        let rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+        let (src, dst) = (
+            tmp.path().join("staged.bin"),
+            tmp.path().join("symforge.bin"),
+        );
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+
+        let previous = replace_file(&src, &dst, &aside, rename)
+            .unwrap()
+            .expect("the replaced file keeps a copy");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert_eq!(std::fs::read(&previous).unwrap(), b"old");
+
+        let fresh_src = tmp.path().join("staged-2.bin");
+        std::fs::write(&fresh_src, b"new").unwrap();
+        let fresh = replace_file(&fresh_src, &tmp.path().join("fresh.bin"), &aside, rename);
+        assert_eq!(fresh.unwrap(), None, "a new file has no previous version");
+    }
+
+    /// A directory symlink, or on Windows without the symlink privilege a
+    /// junction (same resolution through `canonicalize`).
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(Stdio::null())
+                .status()
+                .expect("run mklink");
+            assert!(status.success(), "mklink /J failed");
+        }
+    }
+
+    #[test]
+    fn a_linked_npm_prefix_resolves_to_its_real_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("nvm").join("v22.20.0");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("nodejs");
+        link_dir(&real, &link);
+
+        assert_eq!(
+            resolve_prefix(&link.display().to_string()),
+            Some(dunce::canonicalize(&real).unwrap()),
+            "harness registrations and the daemon name the real path, so update must too"
+        );
+        assert_eq!(resolve_prefix(""), None);
+        assert_eq!(
+            resolve_prefix(&tmp.path().join("missing").display().to_string()),
+            None
+        );
+    }
+
+    fn write_file(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    const TEST_PACKAGE: &str = "symforge-test-x64";
+
+    /// A fake npm global prefix whose staging install holds `new-binary` and a
+    /// 2.0.0 wrapper, with a 1.0.0 wrapper installed. Returns (prefix, modules).
+    fn fake_install() -> (tempfile::TempDir, PathBuf) {
+        let os = std::env::consts::OS;
+        let prefix = tempfile::tempdir().unwrap();
+        let modules = global_modules_dir(prefix.path(), os);
+        let staged = update_staging_dir(prefix.path()).join("node_modules");
+        write_file(
+            &staged
+                .join(TEST_PACKAGE)
+                .join("bin")
+                .join(native_binary_name(os)),
+            "new-binary",
+        );
+        write_file(
+            &staged.join("symforge").join("package.json"),
+            r#"{"version":"2.0.0"}"#,
+        );
+        write_file(
+            &modules.join("symforge").join("package.json"),
+            r#"{"version":"1.0.0"}"#,
+        );
+        (prefix, modules)
+    }
+
+    fn installed_binary(package_dir: &Path) -> PathBuf {
+        package_dir
+            .join("bin")
+            .join(native_binary_name(std::env::consts::OS))
+    }
+
+    #[test]
+    fn the_swap_updates_the_nested_platform_package_the_launcher_resolves_first() {
+        // `npm install -g symforge` nests the platform package under the wrapper.
+        let (prefix, modules) = fake_install();
+        let [nested, top] = platform_package_dirs(&modules, TEST_PACKAGE);
+        write_file(&installed_binary(&nested), "old-binary");
+        let mut ops = RealUpdateOps::new(
+            std::env::consts::OS,
+            TEST_PACKAGE,
+            prefix.path().to_path_buf(),
+            prefix.path().to_path_buf(),
+        );
+        assert_eq!(ops.live_binary, installed_binary(&nested));
+
+        ops.swap_staged_into_place().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(installed_binary(&nested)).unwrap(),
+            "new-binary"
+        );
+        assert!(
+            !top.exists(),
+            "no top-level copy is invented beside the nested one"
+        );
+        assert_eq!(ops.wrapper_version().as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn the_swap_updates_every_installed_copy_of_the_platform_package() {
+        let (prefix, modules) = fake_install();
+        let dirs = platform_package_dirs(&modules, TEST_PACKAGE);
+        for dir in &dirs {
+            write_file(&installed_binary(dir), "old-binary");
+        }
+        let mut ops = RealUpdateOps::new(
+            std::env::consts::OS,
+            TEST_PACKAGE,
+            prefix.path().to_path_buf(),
+            prefix.path().to_path_buf(),
+        );
+
+        ops.swap_staged_into_place().unwrap();
+
+        for dir in &dirs {
+            assert_eq!(
+                std::fs::read_to_string(installed_binary(dir)).unwrap(),
+                "new-binary",
+                "{}",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn roll_back_restores_every_file_the_swap_replaced() {
+        let (prefix, modules) = fake_install();
+        let top = modules.join(TEST_PACKAGE);
+        write_file(&installed_binary(&top), "old-binary");
+        let mut ops = RealUpdateOps::new(
+            std::env::consts::OS,
+            TEST_PACKAGE,
+            prefix.path().to_path_buf(),
+            prefix.path().to_path_buf(),
+        );
+        ops.swap_staged_into_place().unwrap();
+        assert_eq!(ops.wrapper_version().as_deref(), Some("2.0.0"));
+
+        ops.roll_back().expect("every previous file is restored");
+
+        assert_eq!(
+            std::fs::read_to_string(installed_binary(&top)).unwrap(),
+            "old-binary"
+        );
+        assert_eq!(ops.wrapper_version().as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn harness_scan_leaves_a_harness_that_already_runs_the_live_binary_alone() {
+        let (prefix, modules) = fake_install();
+        write_file(&installed_binary(&modules.join(TEST_PACKAGE)), "old-binary");
+        let home = tempfile::tempdir().unwrap();
+        let mut ops = RealUpdateOps::new(
+            std::env::consts::OS,
+            TEST_PACKAGE,
+            prefix.path().to_path_buf(),
+            home.path().to_path_buf(),
+        );
+        let entry = |server: serde_json::Value| {
+            serde_json::json!({ "mcpServers": { "symforge": server } }).to_string()
+        };
+        write_file(
+            &home.path().join(".claude.json"),
+            &entry(serde_json::json!({ "command": ops.live_binary.display().to_string() })),
+        );
+        write_file(
+            &home.path().join(".cursor").join("mcp.json"),
+            &entry(serde_json::json!({ "command": "/elsewhere/symforge" })),
+        );
+        write_file(
+            &home.path().join(".gemini").join("settings.json"),
+            &entry(serde_json::json!({ "url": "http://127.0.0.1:8787/mcp" })),
+        );
+
+        let scan = ops.harness_scan();
+
+        assert_eq!(scan.already_current, vec![HarnessId::ClaudeCode]);
+        assert_eq!(scan.http_attached, vec![HarnessId::Gemini]);
+        assert_eq!(plan_reregistration(&scan).0, vec![HarnessId::Cursor]);
+    }
+
+    #[test]
+    fn a_second_update_is_refused_while_the_first_holds_the_lock() {
+        let prefix = tempfile::tempdir().unwrap();
+        let held = lock_update(prefix.path()).expect("the first update takes the lock");
+        let err = lock_update(prefix.path()).expect_err("a second update must not run");
+        assert!(err.to_string().contains("already running"), "{err}");
+        drop(held);
+        lock_update(prefix.path()).expect("the lock is free once the first update ends");
     }
 
     #[test]

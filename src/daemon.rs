@@ -2778,17 +2778,29 @@ async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow
 /// `symforge update`: make sure a daemon of `version`, running from the freshly
 /// installed `executable`, owns the daemon records. This is the stdio client's
 /// own spawn path with the NEW binary's identity, so an older recorded daemon is
-/// replaced exactly as a new session would replace it.
+/// replaced exactly as a new session would replace it. Returns the port and
+/// whether a daemon had to be started (`false`: the running one already matched).
 pub(crate) async fn ensure_installed_daemon_running(
     executable: &Path,
     version: &str,
-) -> anyhow::Result<u16> {
-    let control_state_dir = process_control_state_dir()?;
+) -> anyhow::Result<(u16, bool)> {
+    ensure_installed_daemon_running_at(process_control_state_dir()?, executable, version).await
+}
+
+async fn ensure_installed_daemon_running_at(
+    control_state_dir: &ControlStateDir,
+    executable: &Path,
+    version: &str,
+) -> anyhow::Result<(u16, bool)> {
     let identity = DaemonIdentity {
         version: version.to_string(),
         executable_path: normalized_path_string(executable),
     };
-    ensure_daemon_running_as(control_state_dir, &identity, Some(executable)).await
+    if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
+        return Ok((port, false));
+    }
+    let port = ensure_daemon_running_as(control_state_dir, &identity, Some(executable)).await?;
+    Ok((port, true))
 }
 
 /// Ensure a daemon matching `identity` is running, spawning `executable`
@@ -2810,8 +2822,15 @@ async fn ensure_daemon_running_as(
     // never matches the old identity. Serve locally instead.
     if let Some(newer) = newer_recorded_daemon_version_at(control_state_dir, identity).await {
         anyhow::bail!(
-            "a newer symforge daemon ({newer}) owns this SymForge home; this {} process will not replace it",
-            identity.version
+            "a newer symforge daemon ({newer}) owns this SymForge home; this {} process will not replace it. \
+             To run {} deliberately (a downgrade or a development build), end the newer daemon's process \
+             first: its pid is in {}",
+            identity.version,
+            identity.version,
+            control_state_dir
+                .as_path()
+                .join(daemon_pid_file_name())
+                .display()
         );
     }
 
@@ -3395,7 +3414,16 @@ fn daemon_health_matches(health: &DaemonHealth, identity: &DaemonIdentity) -> bo
         return true;
     }
 
-    stable_path_identity(&health.executable_path) == stable_path_identity(&identity.executable_path)
+    // Canonical, so one binary reached through a symlinked or junctioned
+    // directory (nvm-windows points `C:\Program Files\nodejs` at the active
+    // version dir) is one identity, not two daemons replacing each other.
+    let canonical = |path: &str| {
+        dunce::canonicalize(path)
+            .map(|path| normalized_path_string(&path))
+            .unwrap_or_else(|_| path.to_string())
+    };
+    stable_path_identity(&canonical(&health.executable_path))
+        == stable_path_identity(&canonical(&identity.executable_path))
 }
 
 fn daemon_health_matches_recorded_pid(health: &DaemonHealth, recorded_pid: u32) -> bool {
@@ -14158,10 +14186,76 @@ mod tests {
             "{error}"
         );
         assert!(
+            error
+                .to_string()
+                .contains("end the newer daemon's process first"),
+            "the refusal must say how to downgrade on purpose: {error}"
+        );
+        assert!(
             daemon_health_ok(handle.port).await,
             "the newer daemon must still be serving"
         );
         let _ = handle.shutdown_tx.send(());
+    }
+
+    /// nvm-windows makes `C:\Program Files\nodejs` a directory link to the
+    /// active version dir, so `symforge update` can name the running daemon's
+    /// binary through a different path. That is the same binary: the update
+    /// must keep the daemon and say it did not start one.
+    #[tokio::test]
+    async fn the_update_keeps_a_same_version_daemon_named_through_a_linked_directory() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let exe = std::env::current_exe().expect("test binary path");
+        let links = TempDir::new().expect("link dir");
+        let linked_dir = links.path().join("linked");
+        link_dir(exe.parent().expect("test binary dir"), &linked_dir);
+        let linked_exe = linked_dir.join(exe.file_name().expect("test binary name"));
+
+        let kept = ensure_installed_daemon_running_at(
+            &test_control_state(daemon_home.path()),
+            &linked_exe,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await;
+        unlink_dir(&linked_dir);
+
+        assert_eq!(
+            kept.expect("the running daemon is the same binary"),
+            (handle.port, false)
+        );
+        assert!(daemon_health_ok(handle.port).await);
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// A directory symlink, or on Windows without the symlink privilege a
+    /// junction (same resolution through `canonicalize`).
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("run mklink");
+            assert!(status.success(), "mklink /J failed");
+        }
+    }
+
+    /// Remove the link itself, never what it points at.
+    fn unlink_dir(link: &Path) {
+        #[cfg(unix)]
+        std::fs::remove_file(link).expect("remove symlink");
+        #[cfg(windows)]
+        std::fs::remove_dir(link).expect("remove junction");
     }
 
     /// Task 8: after the daemon dies and a replacement comes up, the proxy

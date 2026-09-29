@@ -553,7 +553,7 @@ pub fn merge_hooks_into_settings(
 
     // Write back.
     let pretty = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(settings_path, pretty)
+    crate::cli::harness_apply::atomic_write(settings_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", settings_path.display()))?;
 
     Ok(())
@@ -872,7 +872,7 @@ pub fn register_mcp_server(
     union_allow_names(entry, "alwaysAllow", CLAUDE_ALWAYS_ALLOW);
 
     let pretty = serde_json::to_string_pretty(&config)?;
-    std::fs::write(claude_json_path, pretty)
+    crate::cli::harness_apply::atomic_write(claude_json_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", claude_json_path.display()))?;
 
     Ok(())
@@ -968,7 +968,7 @@ fn register_claude_desktop_mcp_server_with_home(
     insert_env_defaults(entry, &env_defaults);
 
     let pretty = serde_json::to_string_pretty(&config)?;
-    std::fs::write(desktop_config_path, pretty)
+    crate::cli::harness_apply::atomic_write(desktop_config_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", desktop_config_path.display()))?;
 
     Ok(())
@@ -1065,7 +1065,7 @@ fn create_desktop_wrapper_windows(
     let cd_target = workspace_root.unwrap_or("%USERPROFILE%");
     let script = format!("@echo off\r\ncd /d \"{cd_target}\"\r\n\"{binary_path}\" %*\r\n");
 
-    std::fs::write(&wrapper_path, script)
+    crate::cli::harness_apply::atomic_write(&wrapper_path, script.as_bytes())
         .with_context(|| format!("writing {}", wrapper_path.display()))?;
 
     Ok(wrapper_path.display().to_string())
@@ -1109,7 +1109,7 @@ pub fn register_codex_mcp_server(
 
     merge_symforge_codex_server(&mut config, binary_path);
 
-    std::fs::write(codex_config_path, config.to_string())
+    crate::cli::harness_apply::atomic_write(codex_config_path, config.to_string().as_bytes())
         .with_context(|| format!("writing {}", codex_config_path.display()))?;
 
     Ok(())
@@ -1189,7 +1189,7 @@ pub fn register_grok_mcp_server(
     remove_legacy_grok_workspace_pin(env);
     set_toml_item_preserving_decor(env, "RUST_LOG", value("off"));
 
-    std::fs::write(grok_config_path, config.to_string())
+    crate::cli::harness_apply::atomic_write(grok_config_path, config.to_string().as_bytes())
         .with_context(|| format!("writing {}", grok_config_path.display()))?;
     Ok(())
 }
@@ -1352,7 +1352,7 @@ pub fn register_gemini_mcp_server(
     insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
-    std::fs::write(gemini_settings_path, pretty)
+    crate::cli::harness_apply::atomic_write(gemini_settings_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", gemini_settings_path.display()))?;
     Ok(())
 }
@@ -1396,7 +1396,7 @@ pub fn register_kilo_mcp_server(
     union_allow_names(entry, "alwaysAllow", CLAUDE_ALWAYS_ALLOW);
 
     let pretty = serde_json::to_string_pretty(&config)?;
-    std::fs::write(kilo_config_path, pretty)
+    crate::cli::harness_apply::atomic_write(kilo_config_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", kilo_config_path.display()))?;
     Ok(())
 }
@@ -1439,7 +1439,7 @@ pub fn register_cursor_mcp_server(
     insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
-    std::fs::write(cursor_config_path, pretty)
+    crate::cli::harness_apply::atomic_write(cursor_config_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", cursor_config_path.display()))?;
     Ok(())
 }
@@ -1487,7 +1487,8 @@ fn upsert_guidance_markdown(path: &std::path::Path, guidance_block: &str) -> any
     if merged == existing {
         return Ok(());
     }
-    std::fs::write(path, merged).with_context(|| format!("writing {}", path.display()))?;
+    crate::cli::harness_apply::atomic_write(path, merged.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
 
     Ok(())
 }
@@ -2168,6 +2169,36 @@ mod tests {
             allow.len(),
             CLAUDE_ALWAYS_ALLOW.len(),
             "the allowlist must match the full surface it serves: {entry}"
+        );
+    }
+
+    #[test]
+    fn a_reader_that_opened_claude_json_before_a_registration_never_sees_a_torn_file() {
+        // Claude Code reads and rewrites ~/.claude.json while `symforge update`
+        // re-registers. An in-place truncate + write hands a concurrent reader a
+        // half-written file; a replace-by-rename leaves its handle on the whole
+        // previous file.
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        let before = serde_json::to_string_pretty(&json!({
+            "mcpServers": {"symforge": {"command": "/old/symforge"}}
+        }))
+        .unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+
+        register_mcp_server(&path, "/new/symforge").unwrap();
+
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, before,
+            "the open handle must still read the whole old file"
+        );
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("new"),
+            "the path holds the new registration"
         );
     }
 

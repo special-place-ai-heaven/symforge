@@ -188,7 +188,7 @@ pub fn detect_shadow(our_binary: &Path) -> Option<ShadowReport> {
 /// Whether two paths point at the same on-disk file. Canonicalizes both; on any
 /// canonicalize failure falls back to a normalized lexical compare so we never
 /// mis-report a shadow just because a path could not be resolved.
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => normalize_for_compare(a) == normalize_for_compare(b),

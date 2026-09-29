@@ -236,7 +236,7 @@ pub fn restore(record: &BackupRecord) -> std::io::Result<()> {
 }
 
 /// Atomically write `content` to `path` (temp file in the same dir + rename).
-fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -248,8 +248,11 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     tmp.write_all(content)?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    // rename(2) on Unix / MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows.
-    tmp.persist(path).map_err(|e| e.error)?;
+    // `std::fs::rename`, not `persist`: on Windows `persist`'s MoveFileExW
+    // refuses to replace a file another process has open (the harness reading
+    // its own config), where std's rename replaces it with POSIX semantics.
+    let tmp = tmp.into_temp_path();
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
