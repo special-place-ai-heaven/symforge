@@ -2976,7 +2976,7 @@ fn test_around_symbol_includes_doc_comments_in_indexed_range() {
 fn test_loading_guard_message() {
     assert_eq!(
         loading_guard_message(),
-        "Index is loading... try again shortly."
+        "Index is loading... initial indexing of this project is in progress and can take a while on large folders. Retry the same call shortly."
     );
 }
 

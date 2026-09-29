@@ -366,6 +366,8 @@ struct ProjectInstance {
     watcher_info: Arc<Mutex<WatcherInfo>>,
     watcher_task: Option<tokio::task::JoinHandle<()>>,
     stop_token: Arc<AtomicBool>,
+    /// Shared with this project's background cold load, if it has one.
+    background_load: Arc<BackgroundLoad>,
     token_stats: Arc<TokenStats>,
     /// Cache census (C4c): the project's symbol-snapshot cache. Never read
     /// here — flows to `SessionRuntime`/`SidecarState`, whose sole reader
@@ -1149,9 +1151,12 @@ impl DaemonState {
         project_id: &str,
         canonical_root: &Path,
     ) -> anyhow::Result<Arc<ProjectSlot>> {
-        self.ensure_project_slot_for_session_with(session_id, project_id, || {
+        let slot = self.ensure_project_slot_for_session_with(session_id, project_id, || {
             ProjectInstance::load_for_session_open(canonical_root)
-        })
+        })?;
+        // Only a plain open retries: `index_folder` reloads inline anyway.
+        slot.retry_failed_background_load();
+        Ok(slot)
     }
 
     fn ensure_project_slot_for_binding(
@@ -3478,6 +3483,7 @@ impl ProjectInstance {
         };
         let curation_coordinator =
             Arc::new(crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default());
+        let background_load = Arc::new(BackgroundLoad::default());
         let bootstrapped = match cold_index_budget {
             Some(budget) => bootstrap_project_index_within(
                 canonical_root,
@@ -3485,6 +3491,7 @@ impl ProjectInstance {
                 budget,
                 &curation_coordinator,
                 persistence_status,
+                &background_load,
             ),
             None => bootstrap_project_index(canonical_root, &state_placement)
                 .map(|index| (index, ColdIndex::Loaded)),
@@ -3532,6 +3539,7 @@ impl ProjectInstance {
             watcher_info,
             watcher_task: None,
             stop_token: Arc::new(AtomicBool::new(false)),
+            background_load,
             token_stats,
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
             session_ids: HashSet::new(),
@@ -3610,10 +3618,52 @@ impl ProjectSlot {
         }
     }
 
+    /// Start the background cold load again when the last one failed, so a
+    /// new session is not joined to that failure for the daemon's lifetime.
+    fn retry_failed_background_load(&self) {
+        let job = {
+            let project = self.metadata.read();
+            // A reload that since succeeded, `index_folder` for one, cleared the
+            // failure's empty reason: nothing is left to retry.
+            if !project.background_load.failed.swap(false, Ordering::AcqRel)
+                || project
+                    .index
+                    .shared()
+                    .published_state()
+                    .local_empty_reason
+                    .is_none()
+            {
+                return;
+            }
+            ColdLoadJob {
+                index: project.index.shared(),
+                root: project.canonical_root.clone(),
+                placement: project.state_placement.clone(),
+                curation_coordinator: Arc::clone(&project.curation_coordinator),
+                persistence_status: *project.persistence_health.read(),
+                background: Arc::clone(&project.background_load),
+            }
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            job.background.failed.store(true, Ordering::Release);
+            return;
+        };
+        tracing::info!(
+            root = %job.root.display(),
+            "retrying the project's failed background index load for a new session"
+        );
+        let load = job.reload();
+        job.retry(&runtime, load);
+    }
+
     fn stop(&self) {
         let _mutation = self.mutation.lock();
         let (mut watcher_task, stop_token, project_id) = {
             let mut project = self.metadata.write();
+            project
+                .background_load
+                .cancel
+                .store(true, Ordering::Release);
             (
                 project.watcher_task.take(),
                 Arc::clone(&project.stop_token),
@@ -3909,21 +3959,172 @@ enum ColdLoadHandoff {
     Abandoned,
 }
 
-/// [`bootstrap_project_index`] with the cold load bounded by `budget`.
-///
-/// A snapshot restore is unchanged. A cold load runs on the blocking pool into
-/// an empty placeholder; if it lands within `budget` its outcome is handled
-/// exactly like the inline path, including failing the open on an error. Past
-/// the budget the placeholder is returned (`Loading`, which every tool guard
-/// already reports) and the finisher owns the outcome: curation recovery and
-/// git temporal on success, a named empty reason on failure, so the project can
-/// never sit in `Loading` for a load that is no longer running.
+/// What a project slot shares with its background cold load.
+#[derive(Default)]
+struct BackgroundLoad {
+    /// Set when the slot stops. The load abandons its unpublished candidate
+    /// and its outcome is dropped: there is no project left to report it to.
+    cancel: AtomicBool,
+    /// Set when a load nobody was waiting for failed. The next session open
+    /// retries it rather than joining the failure for the daemon's lifetime.
+    failed: AtomicBool,
+}
+
+/// A session-open cold load: the placeholder it fills and everything its
+/// outcome is settled against.
+#[derive(Clone)]
+struct ColdLoadJob {
+    index: SharedIndex,
+    root: PathBuf,
+    placement: StatePlacement,
+    curation_coordinator: Arc<crate::protocol::knowledge_curation::KnowledgeCurationCoordinator>,
+    persistence_status: CapabilityStatus,
+    background: Arc<BackgroundLoad>,
+}
+
+impl ColdLoadJob {
+    /// The production load: a full reload of the project that stops early
+    /// once the slot is stopped.
+    fn reload(
+        &self,
+    ) -> impl FnOnce(&SharedIndex, &AtomicBool) -> anyhow::Result<()> + Send + 'static {
+        let (root, placement) = (self.root.clone(), self.placement.clone());
+        move |index, cancel| {
+            index.reload_for_binding_with_exclusions_cancellable(
+                &root,
+                placement.directory().cloned(),
+                crate::discovery::SourceExclusions::for_state_placement(&root, &placement),
+                cancel,
+            )
+        }
+    }
+
+    /// Run `load` into the placeholder on the blocking pool and wait up to
+    /// `budget` for it. Within the budget its outcome is the open's, exactly
+    /// like the inline path, including failing the open on an error. Past it
+    /// the placeholder is returned (`Loading`, which every tool guard already
+    /// reports) and [`Self::finish`] owns the outcome.
+    fn open_within<L>(
+        self,
+        runtime: &tokio::runtime::Handle,
+        budget: Duration,
+        load: L,
+    ) -> anyhow::Result<(SharedIndex, ColdIndex)>
+    where
+        L: FnOnce(&SharedIndex, &AtomicBool) -> anyhow::Result<()> + Send + 'static,
+    {
+        self.index.mark_bootstrap_loading();
+        let handoff = Arc::new((Mutex::new(ColdLoadHandoff::Waiting), Condvar::new()));
+        {
+            let job = self.clone();
+            let handoff = Arc::clone(&handoff);
+            runtime.spawn_blocking(move || {
+                let result = job.run(load);
+                {
+                    let (state, ready) = &*handoff;
+                    let mut state = state.lock();
+                    if matches!(*state, ColdLoadHandoff::Waiting) {
+                        *state = ColdLoadHandoff::Done(result);
+                        ready.notify_one();
+                        return;
+                    }
+                }
+                job.finish(result);
+            });
+        }
+
+        let (state, ready) = &*handoff;
+        let mut state = state.lock();
+        ready.wait_while_for(
+            &mut state,
+            |state| matches!(state, ColdLoadHandoff::Waiting),
+            budget,
+        );
+        match std::mem::replace(&mut *state, ColdLoadHandoff::Abandoned) {
+            ColdLoadHandoff::Done(result) => {
+                degrade_on_capacity_refusal(&self.index, &self.root, result)
+                    .with_context(|| {
+                        format!("failed to load project index for {}", self.root.display())
+                    })
+                    .map(|()| (self.index, ColdIndex::Loaded))
+            }
+            ColdLoadHandoff::Waiting => {
+                tracing::info!(
+                    root = %self.root.display(),
+                    budget_ms = budget.as_millis() as u64,
+                    "cold index load exceeded the session-open budget; continuing in the background"
+                );
+                Ok((self.index, ColdIndex::LoadingInBackground))
+            }
+            ColdLoadHandoff::Abandoned => unreachable!("only the opener abandons a cold load"),
+        }
+    }
+
+    /// Start `load` again after a background load failed. Nobody waits for
+    /// it; [`Self::finish`] owns its outcome.
+    fn retry<L>(self, runtime: &tokio::runtime::Handle, load: L)
+    where
+        L: FnOnce(&SharedIndex, &AtomicBool) -> anyhow::Result<()> + Send + 'static,
+    {
+        self.index.set_local_empty_reason(None);
+        self.index.mark_bootstrap_loading();
+        runtime.spawn_blocking(move || {
+            let result = self.run(load);
+            self.finish(result);
+        });
+    }
+
+    fn run<L>(&self, load: L) -> anyhow::Result<()>
+    where
+        L: FnOnce(&SharedIndex, &AtomicBool) -> anyhow::Result<()>,
+    {
+        load_catching_panic(|| load(&self.index, &self.background.cancel))
+    }
+
+    /// The half of a session-open cold load the opener stopped waiting for:
+    /// curation recovery and git temporal on success, a named empty reason
+    /// and a retry on the next open on failure, nothing once the slot stopped.
+    fn finish(&self, result: anyhow::Result<()>) {
+        if self.background.cancel.load(Ordering::Acquire) {
+            tracing::info!(
+                root = %self.root.display(),
+                "background cold index load abandoned: its project was closed"
+            );
+            return;
+        }
+        // Settle before flagging the retry: a retry that started first would
+        // have its fresh `Loading` overwritten by this failure.
+        if !settle_background_cold_load(&self.index, &self.root, result) {
+            self.background.failed.store(true, Ordering::Release);
+            return;
+        }
+        if let Err(error) = self.curation_coordinator.recover_on_project_load(
+            &self.index,
+            &self.root,
+            Some(&self.placement),
+            self.persistence_status,
+        ) {
+            tracing::warn!("knowledge curation startup recovery remained fail-closed: {error}");
+        }
+        let expected_gen = self.index.current_project_generation();
+        live_index::git_temporal::spawn_git_temporal_computation(
+            Arc::clone(&self.index),
+            self.root.clone(),
+            expected_gen,
+        );
+        tracing::info!(root = %self.root.display(), "background cold index load complete");
+    }
+}
+
+/// [`bootstrap_project_index`] with the cold load bounded by `budget`; see
+/// [`ColdLoadJob::open_within`]. A snapshot restore is unchanged.
 fn bootstrap_project_index_within(
     canonical_root: &Path,
     state_placement: &StatePlacement,
     budget: Duration,
     curation_coordinator: &Arc<crate::protocol::knowledge_curation::KnowledgeCurationCoordinator>,
     persistence_status: CapabilityStatus,
+    background: &Arc<BackgroundLoad>,
 ) -> anyhow::Result<(SharedIndex, ColdIndex)> {
     if let Some(index) = restore_project_snapshot(canonical_root, state_placement) {
         return Ok((index, ColdIndex::Loaded));
@@ -3932,107 +4133,51 @@ fn bootstrap_project_index_within(
         return cold_load_project_index(canonical_root, state_placement)
             .map(|index| (index, ColdIndex::Loaded));
     };
-
-    let index = LiveIndex::empty();
-    index.mark_bootstrap_loading();
-    let handoff = Arc::new((Mutex::new(ColdLoadHandoff::Waiting), Condvar::new()));
-    {
-        let index = Arc::clone(&index);
-        let handoff = Arc::clone(&handoff);
-        let root = canonical_root.to_path_buf();
-        let placement = state_placement.clone();
-        let curation_coordinator = Arc::clone(curation_coordinator);
-        runtime.spawn_blocking(move || {
-            let result = index.reload_for_binding_with_exclusions(
-                &root,
-                placement.directory().cloned(),
-                crate::discovery::SourceExclusions::for_state_placement(&root, &placement),
-            );
-            {
-                let (state, ready) = &*handoff;
-                let mut state = state.lock();
-                if matches!(*state, ColdLoadHandoff::Waiting) {
-                    *state = ColdLoadHandoff::Done(result);
-                    ready.notify_one();
-                    return;
-                }
-            }
-            finish_background_cold_load(
-                &index,
-                &root,
-                &placement,
-                &curation_coordinator,
-                persistence_status,
-                result,
-            );
-        });
-    }
-
-    let (state, ready) = &*handoff;
-    let mut state = state.lock();
-    ready.wait_while_for(
-        &mut state,
-        |state| matches!(state, ColdLoadHandoff::Waiting),
-        budget,
-    );
-    match std::mem::replace(&mut *state, ColdLoadHandoff::Abandoned) {
-        ColdLoadHandoff::Done(result) => {
-            degrade_on_capacity_refusal(&index, canonical_root, result)
-                .with_context(|| {
-                    format!(
-                        "failed to load project index for {}",
-                        canonical_root.display()
-                    )
-                })
-                .map(|()| (index, ColdIndex::Loaded))
-        }
-        ColdLoadHandoff::Waiting => {
-            tracing::info!(
-                root = %canonical_root.display(),
-                budget_ms = budget.as_millis() as u64,
-                "cold index load exceeded the session-open budget; continuing in the background"
-            );
-            Ok((index, ColdIndex::LoadingInBackground))
-        }
-        ColdLoadHandoff::Abandoned => unreachable!("only the opener abandons a cold load"),
-    }
+    let job = ColdLoadJob {
+        index: LiveIndex::empty(),
+        root: canonical_root.to_path_buf(),
+        placement: state_placement.clone(),
+        curation_coordinator: Arc::clone(curation_coordinator),
+        persistence_status,
+        background: Arc::clone(background),
+    };
+    let load = job.reload();
+    job.open_within(&runtime, budget, load)
 }
 
-/// The half of a session-open cold load the opener stopped waiting for.
-fn finish_background_cold_load(
+/// Run a background index load with a panic turned into an error, so the
+/// placeholder it fills is settled instead of left `Loading` by a load that
+/// died. The load builds its candidate outside the index and publishes it by
+/// swap, so a panic leaves nothing half-published behind.
+pub(crate) fn load_catching_panic(load: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)).unwrap_or_else(|panic| {
+        let detail = panic
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        Err(anyhow::anyhow!("the index load panicked: {detail}"))
+    })
+}
+
+/// Settle a background cold load's outcome on its placeholder: a capacity
+/// refusal keeps the project open and non-ready, and any other failure becomes
+/// its named empty reason. Either way the index leaves `Loading`, because no
+/// load is coming. Returns whether the load succeeded. The local stdio lane
+/// settles its own cold start through this too.
+pub(crate) fn settle_background_cold_load(
     index: &SharedIndex,
     root: &Path,
-    placement: &StatePlacement,
-    curation_coordinator: &crate::protocol::knowledge_curation::KnowledgeCurationCoordinator,
-    persistence_status: CapabilityStatus,
     result: anyhow::Result<()>,
-) {
+) -> bool {
     match degrade_on_capacity_refusal(index, root, result) {
-        Ok(()) => {
-            if let Err(error) = curation_coordinator.recover_on_project_load(
-                index,
-                root,
-                Some(placement),
-                persistence_status,
-            ) {
-                tracing::warn!("knowledge curation startup recovery remained fail-closed: {error}");
-            }
-            let expected_gen = index.current_project_generation();
-            live_index::git_temporal::spawn_git_temporal_computation(
-                Arc::clone(index),
-                root.to_path_buf(),
-                expected_gen,
-            );
-            tracing::info!(root = %root.display(), "background cold index load complete");
-        }
+        Ok(()) => true,
         Err(error) => {
-            tracing::error!(
-                root = %root.display(),
-                "background cold index load failed: {error:#}"
-            );
+            tracing::error!(root = %root.display(), "background cold index load failed: {error:#}");
             index.set_local_empty_reason(Some(format!(
-                "the daemon's background index load failed: {error:#}"
+                "the background index load failed: {error:#}"
             )));
+            false
         }
     }
 }
@@ -16949,34 +17094,64 @@ mod tests {
         }
     }
 
-    /// The session-open cold load is bounded: past its budget the open gets a
-    /// `Loading` placeholder back at once and the load lands in the background,
-    /// instead of the whole parse running inside `/v1/sessions/open` (which a
-    /// large repository turned into a client timeout).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn session_open_cold_load_past_its_budget_finishes_in_the_background() {
+    fn source_tree(files: usize) -> (TempDir, PathBuf) {
         let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonical root");
         std::fs::create_dir_all(root.join("src")).expect("src dir");
-        for file in 0..200 {
+        for file in 0..files {
             std::fs::write(
                 root.join("src").join(format!("f{file}.rs")),
                 format!("pub fn f{file}() -> u32 {{ {file} }}\n"),
             )
             .expect("write source");
         }
-        let placement = session_open_placement(&root);
-        let coordinator =
-            Arc::new(crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default());
+        (tmp, root)
+    }
 
-        let (index, cold) = bootstrap_project_index_within(
-            &root,
-            &placement,
-            Duration::ZERO,
-            &coordinator,
-            CapabilityStatus::Available,
-        )
-        .expect("an open past its budget still succeeds");
+    fn cold_load_job(root: &Path) -> ColdLoadJob {
+        ColdLoadJob {
+            index: LiveIndex::empty(),
+            root: root.to_path_buf(),
+            placement: session_open_placement(root),
+            curation_coordinator: Arc::default(),
+            persistence_status: CapabilityStatus::Available,
+            background: Arc::default(),
+        }
+    }
+
+    /// `load`, held until the test opens the gate. Opened only after the
+    /// opener stopped waiting, it can never land inside the budget and turn
+    /// the case under test into the other one.
+    fn gated<L>(
+        load: L,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        impl FnOnce(&SharedIndex, &AtomicBool) -> anyhow::Result<()> + Send + 'static,
+    )
+    where
+        L: FnOnce(&SharedIndex, &AtomicBool) -> anyhow::Result<()> + Send + 'static,
+    {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let held = move |index: &SharedIndex, cancel: &AtomicBool| {
+            let _ = gate.recv();
+            load(index, cancel)
+        };
+        (release, held)
+    }
+
+    /// The session-open cold load is bounded: past its budget the open gets a
+    /// `Loading` placeholder back at once and the load lands in the background,
+    /// instead of the whole parse running inside `/v1/sessions/open` (which a
+    /// large repository turned into a client timeout).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_open_cold_load_past_its_budget_finishes_in_the_background() {
+        let (_tmp, root) = source_tree(200);
+        let job = cold_load_job(&root);
+        let (release, load) = gated(job.reload());
+
+        let (index, cold) = job
+            .open_within(&tokio::runtime::Handle::current(), Duration::ZERO, load)
+            .expect("an open past its budget still succeeds");
 
         assert_eq!(cold, ColdIndex::LoadingInBackground);
         assert_eq!(
@@ -16984,6 +17159,7 @@ mod tests {
             crate::live_index::PublishedIndexStatus::Loading,
             "the placeholder must report Loading, never an empty Ready index"
         );
+        release.send(()).expect("the load is waiting at its gate");
         let published = wait_until_published(&index, |published| {
             published.status == crate::live_index::PublishedIndexStatus::Ready
         })
@@ -17008,6 +17184,7 @@ mod tests {
             Duration::from_secs(60),
             &coordinator,
             CapabilityStatus::Available,
+            &Arc::default(),
         )
         .expect("open");
 
@@ -17021,28 +17198,27 @@ mod tests {
     }
 
     /// A load that fails after the opener stopped waiting must not leave the
-    /// project reporting `Loading` for a load that is no longer running.
-    #[test]
-    fn background_cold_load_failure_is_never_reported_as_loading() {
-        let tmp = TempDir::new().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonical root");
-        let index = LiveIndex::empty();
-        index.mark_bootstrap_loading();
-        assert_eq!(
-            index.published_state().status,
-            crate::live_index::PublishedIndexStatus::Loading
-        );
+    /// project reporting `Loading` for a load that is no longer running, and
+    /// is flagged for the next open to retry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_cold_load_failure_is_never_reported_as_loading() {
+        let (_tmp, root) = source_tree(1);
+        let job = cold_load_job(&root);
+        let background = Arc::clone(&job.background);
+        let (release, load) =
+            gated(|_: &SharedIndex, _: &AtomicBool| Err(anyhow::anyhow!("source tree unreadable")));
 
-        finish_background_cold_load(
-            &index,
-            &root,
-            &session_open_placement(&root),
-            &crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default(),
-            CapabilityStatus::Available,
-            Err(anyhow::anyhow!("source tree unreadable")),
-        );
+        let (index, cold) = job
+            .open_within(&tokio::runtime::Handle::current(), Duration::ZERO, load)
+            .expect("open");
+        assert_eq!(cold, ColdIndex::LoadingInBackground);
+        release.send(()).expect("the load is waiting at its gate");
 
-        let published = index.published_state();
+        let published = wait_until_published(&index, |published| {
+            published.status != crate::live_index::PublishedIndexStatus::Loading
+                && background.failed.load(Ordering::Acquire)
+        })
+        .await;
         assert_eq!(
             published.status,
             crate::live_index::PublishedIndexStatus::Empty
@@ -17055,5 +17231,166 @@ mod tests {
             "the failure is named: {:?}",
             published.local_empty_reason
         );
+    }
+
+    /// A load that panics is settled like one that failed. Before, the
+    /// placeholder reported `Loading` for the rest of the daemon's life.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_background_load_is_settled_instead_of_left_loading() {
+        let (_tmp, root) = source_tree(1);
+        let job = cold_load_job(&root);
+        let (release, load) = gated(|_: &SharedIndex, _: &AtomicBool| -> anyhow::Result<()> {
+            panic!("parser exploded")
+        });
+
+        let (index, _) = job
+            .open_within(&tokio::runtime::Handle::current(), Duration::ZERO, load)
+            .expect("open");
+        release.send(()).expect("the load is waiting at its gate");
+
+        let published = wait_until_published(&index, |published| {
+            published.status != crate::live_index::PublishedIndexStatus::Loading
+        })
+        .await;
+        assert_eq!(
+            published.status,
+            crate::live_index::PublishedIndexStatus::Empty
+        );
+        let reason = published.local_empty_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("panicked") && reason.contains("parser exploded"),
+            "{reason}"
+        );
+    }
+
+    /// Stopping the slot abandons its background load: the reload stops at
+    /// its next cancellation check and nothing is settled or recovered into a
+    /// project that no longer exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_background_load_whose_project_closed_is_abandoned() {
+        let (_tmp, root) = source_tree(50);
+        let job = cold_load_job(&root);
+        let background = Arc::clone(&job.background);
+        let reload = job.reload();
+        let (landed, outcome) = std::sync::mpsc::channel::<bool>();
+        let (release, load) = gated(move |index: &SharedIndex, cancel: &AtomicBool| {
+            let result = reload(index, cancel);
+            let _ = landed.send(result.is_ok());
+            result
+        });
+
+        let (index, _) = job
+            .open_within(&tokio::runtime::Handle::current(), Duration::ZERO, load)
+            .expect("open");
+        // What `ProjectSlot::stop` does.
+        background.cancel.store(true, Ordering::Release);
+        release.send(()).expect("the load is waiting at its gate");
+
+        let loaded = tokio::task::spawn_blocking(move || outcome.recv().expect("the load ran"))
+            .await
+            .expect("join");
+        assert!(!loaded, "a stopped slot's reload abandons its candidate");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let published = index.published_state();
+        assert_eq!(published.file_count, 0, "nothing was published");
+        assert_eq!(published.local_empty_reason, None, "nothing was settled");
+        assert!(
+            !background.failed.load(Ordering::Acquire),
+            "nothing to retry"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_session_cancels_the_project_background_load() {
+        let project = project_dir("symforge-daemon-cancel");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(100),
+            })
+            .expect("open");
+        let background = Arc::clone(
+            &state
+                .projects
+                .read()
+                .get(&opened.project_id)
+                .expect("slot")
+                .metadata
+                .read()
+                .background_load,
+        );
+        assert!(!background.cancel.load(Ordering::Acquire));
+
+        state.close_session(&opened.session_id).expect("closed");
+
+        assert!(
+            background.cancel.load(Ordering::Acquire),
+            "a reaped slot must stop its background load"
+        );
+    }
+
+    /// A background load that failed is retried by the next session open.
+    /// Before, later opens joined the failed slot and it stayed `Empty` until
+    /// the daemon restarted.
+    #[test]
+    fn a_failed_background_load_is_retried_by_the_next_open() {
+        let project = project_dir("symforge-daemon-retry");
+        std::fs::write(project.path().join("src").join("a.rs"), "pub fn a() {}\n")
+            .expect("write source");
+        let state = Arc::new(DaemonState::new());
+        let first = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(100),
+            })
+            .expect("first open");
+        let (index, background) = {
+            let projects = state.projects.read();
+            let project = projects
+                .get(&first.project_id)
+                .expect("slot")
+                .metadata
+                .read();
+            (project.index.shared(), Arc::clone(&project.background_load))
+        };
+        // What a background load that failed after its opener stopped waiting
+        // leaves behind.
+        index.set_local_empty_reason(Some(
+            "the background index load failed: simulated".to_string(),
+        ));
+        background.failed.store(true, Ordering::Release);
+        std::fs::write(project.path().join("src").join("b.rs"), "pub fn b() {}\n")
+            .expect("write source");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let opener = Arc::clone(&state);
+            let root = project.path().display().to_string();
+            tokio::task::spawn_blocking(move || {
+                opener.open_project_session(OpenProjectRequest {
+                    project_root: root,
+                    client_name: "codex".to_string(),
+                    pid: Some(200),
+                })
+            })
+            .await
+            .expect("join")
+            .expect("second open");
+            let published = wait_until_published(&index, |published| {
+                published.file_count == 2 && published.local_empty_reason.is_none()
+            })
+            .await;
+            assert_eq!(
+                published.status,
+                crate::live_index::PublishedIndexStatus::Ready
+            );
+        });
+        assert!(!background.failed.load(Ordering::Acquire));
     }
 }

@@ -5579,15 +5579,17 @@ fn truncate_text_at_line_boundary(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-/// "Index is loading... try again shortly."
+/// The loading-guard refusal: "Index is loading...", then the initial-indexing wording.
 pub fn loading_guard_message() -> String {
-    "Index is loading... try again shortly.".to_string()
+    format!("Index is loading... {INITIAL_INDEXING_IN_PROGRESS}. Retry the same call shortly.")
 }
 
 /// The single wording for a project whose first index is still being built.
-/// The stdio front's not-ready answer, `status` and `health` in that window,
-/// and the SessionStart hook all say it in these words.
-pub const INITIAL_INDEXING_IN_PROGRESS: &str = "initial indexing of this project is in progress; it can take several minutes on large folders, and tool calls wait for it";
+/// The loading guard, the stdio front's not-ready answer, `status` and
+/// `health` in that window, and the SessionStart hook all say it in these
+/// words. It claims no waiting: only the stdio front waits, and says so itself.
+pub const INITIAL_INDEXING_IN_PROGRESS: &str =
+    "initial indexing of this project is in progress and can take a while on large folders";
 
 /// Surface-aware empty-index recovery hint (TR-02 / N-5 / FR-011, FR-012).
 ///

@@ -335,14 +335,24 @@ async fn run_deferred_mcp_server_async(
     let publish = Arc::new(startup);
     let (shutdown, shutdown_signal) = tokio::sync::watch::channel(false);
     let runtime = tokio::spawn(async move {
+        let _unpublished = protocol::deferred_stdio::StartupGuard(Arc::clone(&publish));
+        let mut client_left = shutdown_signal.clone();
         let serve = StdioServe::Deferred {
             startup: Arc::clone(&publish),
             shutdown: shutdown_signal,
         };
         let result = if use_daemon {
-            match daemon::connect_or_spawn_session(&root, "mcp-stdio", Some(std::process::id()))
-                .await
-            {
+            // The daemon may take minutes to open the project; a client that
+            // leaves meanwhile must not hold this process open for it.
+            let connected = tokio::select! {
+                connected = daemon::connect_or_spawn_session(
+                    &root,
+                    "mcp-stdio",
+                    Some(std::process::id()),
+                ) => connected,
+                _ = client_left.wait_for(|stop| *stop) => return Ok(()),
+            };
+            match connected {
                 Ok(session) => run_remote_mcp_server_async(session, serve).await,
                 Err(error) => {
                     tracing::warn!(
@@ -507,6 +517,24 @@ async fn run_remote_mcp_server_async(
     Ok(())
 }
 
+/// Build the local cold-start index into its `Loading` placeholder in the
+/// background. However the load ends, a panic included, the placeholder is
+/// settled by the daemon lane's rule and leaves `Loading`.
+fn spawn_local_cold_load(
+    index: live_index::SharedIndex,
+    root: std::path::PathBuf,
+    placement: crate::domain::StatePlacement,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        tracing::info!("cold-start indexing in background");
+        let result =
+            daemon::load_catching_panic(|| index.reload_for_state_placement(&root, &placement));
+        if daemon::settle_background_cold_load(&index, &root, result) {
+            tracing::info!("background cold-start indexing complete");
+        }
+    })
+}
+
 async fn run_local_mcp_server_async(
     should_auto_index: bool,
     resolved_root: Option<std::path::PathBuf>,
@@ -588,17 +616,7 @@ async fn run_local_mcp_server_async(
             // so the MCP server can respond to initialize/tools/list immediately.
             let shared = live_index::LiveIndex::empty();
             shared.mark_bootstrap_loading();
-            let bg_index = shared.clone();
-            let bg_root = root.clone();
-            let bg_state_placement = state_placement.clone();
-            tokio::task::spawn_blocking(move || {
-                tracing::info!("cold-start indexing in background");
-                if let Err(e) = bg_index.reload_for_state_placement(&bg_root, &bg_state_placement) {
-                    tracing::error!(%e, "background cold-start indexing failed");
-                } else {
-                    tracing::info!("background cold-start indexing complete");
-                }
-            });
+            spawn_local_cold_load(shared.clone(), root.clone(), state_placement.clone());
             shared
         };
 
@@ -766,7 +784,8 @@ async fn run_local_mcp_server_async(
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupIndexLogView, StartupPlan, local_empty_reason, startup_index_log_view, startup_plan,
+        StartupIndexLogView, StartupPlan, local_empty_reason, spawn_local_cold_load,
+        startup_index_log_view, startup_plan,
     };
     use crate::live_index::persist::checkpoint_interval_from_value;
     use crate::live_index::{
@@ -897,6 +916,41 @@ mod tests {
         assert_eq!(
             checkpoint_interval_from_value(Some("999999")),
             Some(Duration::from_secs(3600))
+        );
+    }
+
+    /// A local cold start that fails settles its placeholder with the reason
+    /// instead of logging and leaving it `Loading` for the process lifetime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_local_cold_start_does_not_stay_loading() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("removed-before-the-load");
+        let index = crate::live_index::LiveIndex::empty();
+        index.mark_bootstrap_loading();
+        assert_eq!(
+            index.published_state().status,
+            PublishedIndexStatus::Loading
+        );
+
+        spawn_local_cold_load(
+            index.clone(),
+            missing,
+            crate::domain::StatePlacement::MemoryOnly {
+                failures: Vec::new(),
+            },
+        )
+        .await
+        .expect("the load task finished");
+
+        let published = index.published_state();
+        assert_eq!(published.status, PublishedIndexStatus::Empty);
+        assert!(
+            published
+                .local_empty_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("background index load failed")),
+            "{:?}",
+            published.local_empty_reason
         );
     }
 }

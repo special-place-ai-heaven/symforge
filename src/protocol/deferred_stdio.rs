@@ -11,11 +11,11 @@
 //! touches a project goes to the real server once the startup task publishes
 //! it.
 //!
-//! A tool call that arrives while the project is still opening, or while its
-//! index is still loading, waits here for up to [`TOOL_READINESS_WAIT`] so
-//! small and medium repositories never surface the condition. Past that it is
-//! answered with the initial-indexing notice and the index-unavailable outcome
-//! the tool guards already use, never with an empty answer. `status` and
+//! A tool call, resource read or prompt that arrives while the project is
+//! still opening, or a tool call while its index is still loading, waits here
+//! for up to [`TOOL_READINESS_WAIT`] so small and medium repositories never
+//! surface the condition. Past that it is answered with the initial-indexing
+//! notice, typed as not executed, never with an empty answer. `status` and
 //! `health` never wait: they report the loading state at once.
 
 use std::path::Path;
@@ -34,12 +34,12 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use tokio::sync::watch;
 
 use super::SymForgeServer;
-use super::format::{INITIAL_INDEXING_IN_PROGRESS, loading_guard_message};
+use super::format::INITIAL_INDEXING_IN_PROGRESS;
 use super::result_status::{
     OutcomeClass, PROJECT_EVIDENCE_META_KEY, ResultStatus, attach_project_evidence_meta,
 };
 
-/// How long a tool call waits server-side for the project to become ready
+/// How long a request waits server-side for the project to become ready
 /// before answering not-ready. Kept below common harness tool timeouts.
 pub const TOOL_READINESS_WAIT: Duration = Duration::from_secs(25);
 /// How often a waiting call re-checks readiness when nothing was published.
@@ -56,6 +56,28 @@ pub enum StdioStartup {
     Ready(Arc<SymForgeServer>),
     /// Startup failed; nothing will become ready in this process.
     Failed(Arc<str>),
+}
+
+/// Held by the startup task. If the task ends while the front still says
+/// `Starting`, by a panic or by an exit that published nothing, dropping this
+/// publishes a failure, so waiting requests end instead of waiting for a
+/// runtime that is never coming.
+pub struct StartupGuard(pub Arc<watch::Sender<StdioStartup>>);
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        self.0.send_if_modified(|state| {
+            let starting = matches!(state, StdioStartup::Starting);
+            if starting {
+                *state = StdioStartup::Failed(
+                    "the startup task stopped before the project runtime came up. This is a \
+                     symforge bug; a panic message, if there was one, is on symforge's stderr"
+                        .into(),
+                );
+            }
+            starting
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -108,17 +130,18 @@ impl DeferredStdioServer {
     /// The initial-indexing notice with the one progress figure observed here.
     fn indexing_line(&self) -> String {
         format!(
-            "symforge: {}: {INITIAL_INDEXING_IN_PROGRESS}. {}s since this symforge process began opening it.",
+            "symforge: {}: {INITIAL_INDEXING_IN_PROGRESS}. {}s since this symforge process began \
+             opening it; tool calls wait up to {}s for it.",
             self.project_name,
-            self.opened_at.elapsed().as_secs()
+            self.opened_at.elapsed().as_secs(),
+            self.readiness_wait.as_secs()
         )
     }
 
     fn not_ready_text(&self, waited: Duration) -> String {
         format!(
-            "{} {} This call waited {}s and was not executed. Nothing is wrong: retry the same \
-             call, and do not read this as an error or an empty result.",
-            loading_guard_message(),
+            "Index is loading... {} This call waited {}s and was not executed. Nothing is wrong: \
+             retry the same call, and do not read this as an error or an empty result.",
             self.indexing_line(),
             waited.as_secs()
         )
@@ -138,12 +161,33 @@ impl DeferredStdioServer {
         )
     }
 
-    /// The real server, or the text of the refusal a non-tool request gets.
-    fn server(&self) -> Result<Arc<SymForgeServer>, String> {
-        match &*self.startup.borrow() {
-            StdioStartup::Ready(server) => Ok(Arc::clone(server)),
-            StdioStartup::Starting => Err(self.not_ready_text(Duration::ZERO)),
-            StdioStartup::Failed(reason) => Err(self.failed_text(reason)),
+    /// The real server for a resource read or prompt, waiting for it as a
+    /// tool call does. Still starting after the wait is an explicit,
+    /// retryable not-ready error.
+    async fn ready_server(&self) -> Result<Arc<SymForgeServer>, ErrorData> {
+        let started = Instant::now();
+        let mut startup = self.startup.clone();
+        let _ = tokio::time::timeout(
+            self.readiness_wait,
+            startup.wait_for(|state| !matches!(state, StdioStartup::Starting)),
+        )
+        .await;
+        let phase = self.startup.borrow().clone();
+        match phase {
+            StdioStartup::Ready(server) => Ok(server),
+            StdioStartup::Failed(reason) => {
+                Err(ErrorData::internal_error(self.failed_text(&reason), None))
+            }
+            StdioStartup::Starting => {
+                let waited = started.elapsed();
+                Err(ErrorData::internal_error(
+                    self.not_ready_text(waited),
+                    Some(serde_json::json!({
+                        "retryable": true,
+                        "waited_ms": waited.as_millis() as u64,
+                    })),
+                ))
+            }
         }
     }
 }
@@ -226,9 +270,12 @@ impl ServerHandler for DeferredStdioServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        // An off-surface tool is refused the way the real server refuses it,
-        // ready or not.
+        // An off-surface or unknown tool is refused the way the real server
+        // refuses it, ready or not: its router is the shell's.
         super::surface_probe::enforce_compact_surface(request.name.as_ref())?;
+        if !self.shell.tool_router.has_route(request.name.as_ref()) {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
         let diagnostic = matches!(
             request.name.as_ref(),
             "status" | "health" | "health_compact"
@@ -248,11 +295,10 @@ impl ServerHandler for DeferredStdioServer {
                 }
                 StdioStartup::Starting if diagnostic => {
                     let text = format!(
-                        "{}\nProject root: {}\nTool calls wait up to {}s for readiness; if one \
-                         still reports loading, retry the same call.",
+                        "{}\nProject root: {}\nIf a tool call still reports loading after its \
+                         wait, retry the same call.",
                         self.indexing_line(),
                         self.project_root,
-                        self.readiness_wait.as_secs()
                     );
                     return Ok(front_answer(CallToolResult::success(vec![
                         ContentBlock::text(text),
@@ -306,10 +352,10 @@ impl ServerHandler for DeferredStdioServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        match self.server() {
-            Ok(server) => server.read_resource(request, context).await,
-            Err(refusal) => Err(ErrorData::internal_error(refusal, None)),
-        }
+        self.ready_server()
+            .await?
+            .read_resource(request, context)
+            .await
     }
 
     async fn get_prompt(
@@ -317,19 +363,15 @@ impl ServerHandler for DeferredStdioServer {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        match self.server() {
-            Ok(server) => server.get_prompt(request, context).await,
-            Err(refusal) => Err(ErrorData::internal_error(refusal, None)),
-        }
+        self.ready_server()
+            .await?
+            .get_prompt(request, context)
+            .await
     }
 
     /// The real server binds client-declared roots here, and it may not exist
     /// yet: replay the notification to it once it does.
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        if let Ok(server) = self.server() {
-            server.on_initialized(context).await;
-            return;
-        }
         let mut startup = self.startup.clone();
         tokio::spawn(async move {
             let server = match startup
@@ -417,10 +459,10 @@ mod tests {
         }
     }
 
-    fn connect(front: DeferredStdioServer) -> Client {
+    fn connect<H: ServerHandler>(handler: H) -> Client {
         let (client, server) = tokio::io::duplex(1 << 20);
         tokio::spawn(async move {
-            let service = rmcp::serve_server(front, tokio::io::split(server)).await?;
+            let service = rmcp::serve_server(handler, tokio::io::split(server)).await?;
             service.waiting().await?;
             anyhow::Ok(())
         });
@@ -592,6 +634,149 @@ mod tests {
         assert!(
             tool_text(&status).contains("daemon unreachable"),
             "{status}"
+        );
+    }
+
+    fn real_server() -> SymForgeServer {
+        SymForgeServer::new(
+            crate::live_index::LiveIndex::empty(),
+            "project".to_string(),
+            Arc::new(Mutex::new(crate::watcher::WatcherInfo::default())),
+            None,
+            None,
+        )
+    }
+
+    /// Everything the front answers from its shell is what the real server
+    /// answers: the four lists, and the error for a tool no router has, which
+    /// must not be mistaken for a tool that is still loading.
+    #[tokio::test]
+    async fn the_front_answers_its_static_surfaces_as_the_real_server_does() {
+        let (front, _startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        let mut front = connect(front.with_readiness_wait(Duration::from_millis(300)));
+        let mut real = connect(real_server());
+        front.initialize().await;
+        real.initialize().await;
+
+        for (id, method) in [
+            (2, "tools/list"),
+            (3, "resources/list"),
+            (4, "resources/templates/list"),
+            (5, "prompts/list"),
+        ] {
+            let ours = front.request(id, method, json!({})).await;
+            let theirs = real.request(id, method, json!({})).await;
+            assert!(ours.get("result").is_some(), "{method}: {ours}");
+            assert_eq!(ours, theirs, "{method}");
+        }
+
+        let ours = front.call(6, "no_such_tool", None).await;
+        let theirs = real.call(6, "no_such_tool", None).await;
+        assert!(
+            ours.get("error").is_some(),
+            "an unknown tool is an error, not a loading notice: {ours}"
+        );
+        assert_eq!(ours, theirs);
+    }
+
+    /// A resource read waits like a tool call, then says explicitly that it
+    /// was not served and can be retried; once the runtime exists it is
+    /// served by it.
+    #[tokio::test]
+    async fn a_resource_read_while_starting_waits_then_is_explicitly_retryable() {
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        let mut client = connect(front.with_readiness_wait(Duration::from_millis(300)));
+        client.initialize().await;
+        let read = json!({"uri": "symforge://repo/health"});
+
+        let started = Instant::now();
+        let pending = client.request(2, "resources/read", read.clone()).await;
+        assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
+        let message = pending["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(INITIAL_INDEXING_IN_PROGRESS)
+                && message.contains("retry the same call"),
+            "{pending}"
+        );
+        assert_eq!(
+            pending["error"]["data"]["retryable"],
+            json!(true),
+            "{pending}"
+        );
+
+        startup.send_replace(StdioStartup::Ready(server_with(
+            crate::live_index::LiveIndex::empty(),
+        )));
+        let served = client.request(3, "resources/read", read).await;
+        assert!(
+            !served.to_string().contains(INITIAL_INDEXING_IN_PROGRESS),
+            "the runtime answered: {served}"
+        );
+    }
+
+    /// The client's `initialized` reaches the runtime even though it arrived
+    /// before the runtime existed: an unbound server asks for the client's
+    /// roots from it.
+    #[tokio::test]
+    async fn initialized_is_replayed_to_the_runtime_once_it_exists() {
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        let mut client = connect(front);
+        let init = client
+            .request(
+                1,
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"roots": {"listChanged": true}},
+                    "clientInfo": {"name": "deferred-stdio-test", "version": "0"}
+                }),
+            )
+            .await;
+        assert!(init.get("result").is_some(), "{init}");
+        client
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        startup.send_replace(StdioStartup::Ready(server_with(
+            crate::live_index::LiveIndex::empty(),
+        )));
+        let asked = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let line = client.lines.next_line().await.unwrap().expect("open");
+                let message: Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == json!("roots/list") {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("the runtime ran its initialized handler");
+        assert!(asked.get("id").is_some(), "{asked}");
+    }
+
+    /// A startup task that panics must not leave every request waiting on a
+    /// runtime that is never coming.
+    #[tokio::test]
+    async fn a_startup_task_that_panics_is_reported_as_failed() {
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        let guard = StartupGuard(Arc::new(startup));
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("startup exploded");
+        });
+        assert!(task.await.expect_err("the task panicked").is_panic());
+
+        let mut client = connect(front.with_readiness_wait(Duration::from_secs(8)));
+        client.initialize().await;
+        let started = Instant::now();
+        let reply = client.call(2, "search_symbols", None).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "no full wait");
+        let text = tool_text(&reply);
+        assert!(
+            text.starts_with("Error: symforge failed to start")
+                && text.contains("startup task stopped"),
+            "{reply}"
         );
     }
 }
