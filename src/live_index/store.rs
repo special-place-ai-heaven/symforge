@@ -109,7 +109,21 @@ pub fn hold_reload_after_parses_for_test(
     root: &Path,
     pause_after_parses: usize,
 ) -> ReloadGateForTest {
+    assert!(
+        pause_after_parses > 0,
+        "reload gate needs a positive parse count"
+    );
     install_reload_gate(root, pause_after_parses, true)
+}
+
+/// Holds the reload right after discovery and before any parse starts, so the
+/// progress a test observes is exactly the reset-plus-discovered state. A parse
+/// hold cannot give that: parsing is parallel, so the workers that did not hit
+/// the gate keep raising `files_parsed` while it is held, and the observed count
+/// depends on the machine's thread count.
+#[cfg(feature = "__test-internals")]
+pub fn hold_reload_after_discovery_for_test(root: &Path) -> ReloadGateForTest {
+    install_reload_gate(root, 0, true)
 }
 
 /// Same parse hold as [`hold_reload_after_parses_for_test`], but cancel does
@@ -119,6 +133,10 @@ pub fn hold_reload_through_cancel_for_test(
     root: &Path,
     pause_after_parses: usize,
 ) -> ReloadGateForTest {
+    assert!(
+        pause_after_parses > 0,
+        "reload gate needs a positive parse count"
+    );
     install_reload_gate(root, pause_after_parses, false)
 }
 
@@ -128,10 +146,6 @@ fn install_reload_gate(
     pause_after_parses: usize,
     release_on_cancel: bool,
 ) -> ReloadGateForTest {
-    assert!(
-        pause_after_parses > 0,
-        "reload gate needs a positive parse count"
-    );
     let root = normalize_root(root);
     let state = Arc::new(ReloadGateState {
         pause_after_parses,
@@ -194,6 +208,25 @@ fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) 
     if state.parsed.fetch_add(1, Ordering::AcqRel) + 1 != state.pause_after_parses {
         return;
     }
+    park_reload_gate(&state, cancel);
+}
+
+#[cfg(feature = "__test-internals")]
+fn pause_after_discovery_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) {
+    let source_scope = normalize_root(source_scope);
+    let Some(state) = RELOAD_GATES
+        .get()
+        .and_then(|gates| gates.lock().ok()?.get(&source_scope).cloned())
+    else {
+        return;
+    };
+    if state.pause_after_parses == 0 {
+        park_reload_gate(&state, cancel);
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+fn park_reload_gate(state: &ReloadGateState, cancel: Option<&AtomicBool>) {
     let mut blocked = state.blocked.lock().expect("reload gate state");
     *blocked = true;
     state.reached.notify_all();
@@ -210,6 +243,9 @@ fn pause_after_parse_for_test(source_scope: &Path, cancel: Option<&AtomicBool>) 
 
 #[cfg(not(feature = "__test-internals"))]
 fn pause_after_parse_for_test(_source_scope: &Path, _cancel: Option<&AtomicBool>) {}
+
+#[cfg(not(feature = "__test-internals"))]
+fn pause_after_discovery_for_test(_source_scope: &Path, _cancel: Option<&AtomicBool>) {}
 
 #[cfg(feature = "__test-internals")]
 static DERIVED_STAGE_HOLD: AtomicBool = AtomicBool::new(false);
@@ -5803,6 +5839,7 @@ impl LiveIndex {
         check_reload_cancelled(cancel)?;
         let projection = project_scout_for_legacy_execution(&scout_plan);
         note_reload_discovered(root, projection.entries.len() as u64);
+        pause_after_discovery_for_test(root, cancel);
         info!(
             "scouted {} catalog entries ({} executable by the legacy index)",
             scout_plan.entries.len(),
