@@ -14301,7 +14301,7 @@ mod tests {
         std::os::unix::fs::symlink(target, link).expect("symlink");
         #[cfg(windows)]
         if std::os::windows::fs::symlink_dir(target, link).is_err() {
-            let status = std::process::Command::new("cmd")
+            let status = crate::process_util::hidden_command("cmd")
                 .args(["/C", "mklink", "/J"])
                 .arg(link)
                 .arg(target)
