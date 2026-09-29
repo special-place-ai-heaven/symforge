@@ -1150,7 +1150,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "2b410d713e4822de:15798"),
+    ("ci.yml", "9553334c288b6575:15999"),
     ("release.yml", "60715201b01e0b43:112609"),
 ];
 
