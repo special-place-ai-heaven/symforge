@@ -2243,6 +2243,7 @@ impl ServerHandler for SymForgeServer {
         let initial_project_evidence = self
             .initial_project_evidence_for_call(request.arguments.as_ref())
             .await;
+        let tool_name = request.name.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         // Task 7: bind the selected-project evidence slot for this dispatch,
         // seeded with the LOCAL bound project; the daemon proxy layer
@@ -2260,6 +2261,9 @@ impl ServerHandler for SymForgeServer {
             response.map(|response| match response {
                 rmcp::model::CallToolResponse::Complete(mut result) => {
                     result_status::attach_project_evidence_meta(&mut result.meta);
+                    if result.is_error == Some(true) {
+                        append_required_fields_hint(self.tool_router.get(&tool_name), &mut result);
+                    }
                     // Semantic-error typing (worktree-routing incident): most
                     // primitive tools return plain String bodies, so a
                     // routing refusal or tool error reached the wire as
@@ -2374,6 +2378,43 @@ impl ServerHandler for SymForgeServer {
     }
 }
 
+/// rmcp's prefix for a tool-argument decode failure (`missing field`, wrong type).
+const PARAMETER_DECODE_ERROR_PREFIX: &str = "failed to deserialize parameters:";
+
+/// The required top-level fields of `tool`'s input schema, in schema order.
+fn required_field_names(tool: &Tool) -> Vec<&str> {
+    tool.input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| names.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// A parameter decode failure reaches the caller as serde text alone
+/// (`missing field ...`), which does not say what the tool expects. Append one
+/// line naming the tool's required top-level fields, keeping serde's text first.
+/// Results that are not decode failures, and tools with no required fields, are
+/// left byte-for-byte untouched.
+fn append_required_fields_hint(tool: Option<&Tool>, result: &mut rmcp::model::CallToolResult) {
+    let Some(tool) = tool else { return };
+    let required = required_field_names(tool);
+    if required.is_empty() {
+        return;
+    }
+    for block in &mut result.content {
+        if let rmcp::model::ContentBlock::Text(text) = block
+            && text.text.starts_with(PARAMETER_DECODE_ERROR_PREFIX)
+        {
+            text.text.push_str(&format!(
+                "\nRequired fields for `{}`: {}.",
+                tool.name,
+                required.join(", ")
+            ));
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2384,6 +2425,50 @@ mod tests {
     use rmcp::handler::server::wrapper::Parameters;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
+
+    fn only_text(result: &rmcp::model::CallToolResult) -> &str {
+        match result.content.as_slice() {
+            [rmcp::model::ContentBlock::Text(text)] => &text.text,
+            other => panic!("expected exactly one text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_error_gains_the_required_field_names_after_the_serde_text() {
+        let router = SymForgeServer::tool_router();
+        let serde_text = "failed to deserialize parameters: missing field `name`";
+        let mut result =
+            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(serde_text)]);
+
+        append_required_fields_hint(router.get("find_references"), &mut result);
+
+        let text = only_text(&result);
+        assert!(
+            text.starts_with(serde_text),
+            "serde text must stay first: {text}"
+        );
+        assert!(
+            text.ends_with("\nRequired fields for `find_references`: name."),
+            "one line naming the required fields must follow: {text}"
+        );
+    }
+
+    #[test]
+    fn non_decode_errors_and_unknown_tools_are_left_untouched() {
+        let router = SymForgeServer::tool_router();
+        let mut other = rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+            "Error: symbol not found",
+        )]);
+        append_required_fields_hint(router.get("find_references"), &mut other);
+        assert_eq!(only_text(&other), "Error: symbol not found");
+
+        let mut unknown =
+            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                "failed to deserialize parameters: x",
+            )]);
+        append_required_fields_hint(router.get("no_such_tool"), &mut unknown);
+        assert_eq!(only_text(&unknown), "failed to deserialize parameters: x");
+    }
 
     #[derive(Clone)]
     struct FakeToolState {
