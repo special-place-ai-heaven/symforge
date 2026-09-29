@@ -38,6 +38,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState, HarnessStatus};
+use crate::daemon::InstalledDaemon;
 use crate::domain::ControlStateDir;
 
 /// Hard ceiling on the staging `npm install` so a hung registry fetch can NEVER
@@ -53,9 +54,6 @@ const INITIALIZE_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// every SymForge release still serves, so the replay does not depend on the
 /// newest one.
 const INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"symforge-update-verify","version":"1"}}}"#;
-/// The last release whose sessions lack the newer-daemon guard (`daemon.rs`):
-/// when one reconnects after an update it replaces the new daemon.
-const LAST_VERSION_WITHOUT_NEWER_DAEMON_GUARD: &str = "11.3.0";
 
 /// Map `(os, arch)` to the npm platform package that ships the native binary.
 /// Mirrors `SUPPORTED_TARGETS` in `npm/lib/resolve-binary.js`. `os` is
@@ -329,12 +327,13 @@ pub(crate) struct HarnessScan {
 /// Decide which harnesses `update` re-registers. Only a harness that ALREADY
 /// carries a `symforge` entry is touched, so update never creates config for a
 /// client the user does not run. Kilo Code is excluded: its config is
-/// project-local, and update never writes project-local files. A harness that
-/// already runs the live binary, or attaches over HTTP, is left alone: its
-/// config is rewritten only when there is something to repoint, never while
-/// the harness may be writing it for nothing. Returns the targets plus the
-/// lines to print.
-fn plan_reregistration(scan: &HarnessScan) -> (Vec<HarnessId>, Vec<String>) {
+/// project-local, and update never writes project-local files. A harness
+/// attached over HTTP has no binary path to repoint. After a real swap every
+/// other present harness is re-registered, since the new release may change
+/// hooks, allow lists, env defaults, or guidance (each writer skips an
+/// unchanged file); without one, a harness that already runs the live binary
+/// is left alone. Returns the targets plus the lines to print.
+fn plan_reregistration(scan: &HarnessScan, swapped: bool) -> (Vec<HarnessId>, Vec<String>) {
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
     for status in &scan.statuses {
@@ -348,7 +347,7 @@ fn plan_reregistration(scan: &HarnessScan) -> (Vec<HarnessId>, Vec<String>) {
                 ));
             }
             HarnessState::PresentCurrent | HarnessState::PresentStale(_)
-                if scan.already_current.contains(&status.id) =>
+                if !swapped && scan.already_current.contains(&status.id) =>
             {
                 skipped.push(format!(
                     "unchanged: {} (it already runs the updated binary)",
@@ -394,8 +393,7 @@ struct UpdateSummary {
     new_version: String,
     swap: SwapState,
     reregistered: Vec<&'static str>,
-    /// The daemon's port, and whether update had to start it.
-    daemon: Option<Result<(u16, bool), String>>,
+    daemon: Option<Result<InstalledDaemon, String>>,
     initialize: Option<Result<(), String>>,
     notes: Vec<String>,
 }
@@ -408,6 +406,8 @@ enum SwapState {
     NotRun,
     /// Neither installed package was behind the latest published version.
     UpToDate,
+    /// The registry was unreachable and npm staged the installed version.
+    StagedIsInstalled,
     /// Files were being replaced and the previous ones could not all be put
     /// back.
     Started,
@@ -423,6 +423,10 @@ impl UpdateSummary {
             SwapState::UpToDate => {
                 format!("{} (already the latest; swap skipped)", self.old_version)
             }
+            SwapState::StagedIsInstalled => format!(
+                "{} (the registry was unreachable and npm staged this same version; swap skipped)",
+                self.old_version
+            ),
             SwapState::Started => format!(
                 "{} -> {} INCOMPLETE (some files are new, and the previous ones could not all be restored; see the error)",
                 self.old_version, self.new_version
@@ -439,10 +443,15 @@ impl UpdateSummary {
             self.reregistered.join(", ")
         };
         let daemon = match &self.daemon {
-            Some(Ok((port, true))) => format!("yes (port {port})"),
-            Some(Ok((port, false))) => {
-                format!("no, the running daemon already runs this binary (port {port})")
-            }
+            Some(Ok(InstalledDaemon::Running {
+                port,
+                started: true,
+            })) => format!("yes (port {port})"),
+            Some(Ok(InstalledDaemon::Running {
+                port,
+                started: false,
+            })) => format!("no, the running daemon already runs this binary (port {port})"),
+            Some(Ok(InstalledDaemon::Skipped(why))) => format!("no, skipped ({why})"),
             Some(Err(error)) => format!("no ({error})"),
             None => "no (not attempted)".to_string(),
         };
@@ -525,9 +534,10 @@ pub(crate) trait UpdateOps {
     /// spawn), probed directly rather than through the PATH launcher.
     fn live_version(&mut self) -> InstalledProbe;
     /// Make sure a daemon of `version`, running from the live install path, owns
-    /// the daemon records; replaces an older recorded daemon. Returns its port
-    /// and whether one had to be started.
-    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<(u16, bool)>;
+    /// the daemon records; replaces an older recorded daemon. A policy refusal
+    /// comes back as [`InstalledDaemon::Skipped`]; an error means a daemon
+    /// started from the new binary did not become ready.
+    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<InstalledDaemon>;
     /// Replay a harness `initialize` against the live binary over stdio.
     fn verify_initialize(&mut self) -> anyhow::Result<()>;
 }
@@ -696,16 +706,29 @@ impl UpdateOps for RealUpdateOps {
         // ponytail: files the swap newly created stay; the previous version
         // ignores them. Delete them here if a release ever adds one that must not
         // outlive a rollback.
-        for (live, previous) in std::mem::take(&mut self.journal).into_iter().rev() {
+        let journal = std::mem::take(&mut self.journal);
+        for (live, previous) in journal.iter().rev() {
             let Some(previous) = previous else { continue };
-            if let Err(error) = put_in_place(&previous, &live, &aside, |src, dst| {
-                std::fs::rename(src, dst)
-            }) {
+            if let Err(error) =
+                put_in_place(previous, live, &aside, |src, dst| std::fs::rename(src, dst))
+            {
                 failed.push(format!(
                     "{} (from {}): {error}",
                     live.display(),
                     previous.display()
                 ));
+            }
+        }
+        // Observed, not assumed: every file that had a previous version must
+        // be back on disk.
+        for (live, previous) in &journal {
+            if previous.is_some()
+                && !live.exists()
+                && !failed
+                    .iter()
+                    .any(|f| f.starts_with(&live.display().to_string()))
+            {
+                failed.push(format!("{} is missing after the restore", live.display()));
             }
         }
         if failed.is_empty() {
@@ -831,7 +854,7 @@ impl UpdateOps for RealUpdateOps {
         probe_version(&self.live_binary)
     }
 
-    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<(u16, bool)> {
+    fn restart_daemon(&mut self, version: &str) -> anyhow::Result<InstalledDaemon> {
         // `main()` is synchronous, so a short-lived runtime is safe (no
         // nested-runtime panic).
         tokio::runtime::Builder::new_current_thread()
@@ -1050,22 +1073,25 @@ fn overlay_package(
                 .with_context(|| format!("copying {} to {}", from.display(), copy.display()))?;
             from = copy;
         }
-        let previous = replace_file(&from, &to, aside_dir, |src, dst| std::fs::rename(src, dst))
-            .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
-        journal.push((to, previous));
+        replace_file(&from, &to, aside_dir, journal, |src, dst| {
+            std::fs::rename(src, dst)
+        })
+        .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
     }
     Ok(())
 }
 
 /// Move `src` over `dst`, first keeping a copy of `dst`'s current file in
 /// `aside_dir` (a hard link where the filesystem allows, so the running binary
-/// is never read). Returns that copy's path, or `None` when `dst` is new.
+/// is never read) and journaling it. The entry is journaled BEFORE the move, so
+/// a move that fails midway is still restored by a rollback.
 fn replace_file(
     src: &Path,
     dst: &Path,
     aside_dir: &Path,
+    journal: &mut Vec<(PathBuf, Option<PathBuf>)>,
     rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
-) -> std::io::Result<Option<PathBuf>> {
+) -> std::io::Result<()> {
     let previous = if dst.exists() {
         std::fs::create_dir_all(aside_dir)?;
         let previous = aside_path(aside_dir, dst);
@@ -1076,8 +1102,8 @@ fn replace_file(
     } else {
         None
     };
-    put_in_place(src, dst, aside_dir, rename)?;
-    Ok(previous)
+    journal.push((dst.to_path_buf(), previous));
+    put_in_place(src, dst, aside_dir, rename)
 }
 
 /// Move `src` over `dst` so that `dst` holds either the old or the new file at
@@ -1346,35 +1372,40 @@ fn update_steps(
                 bail!("symforge update failed: the staged binary could not be run. {untouched}")
             }
         }
-        // Only the daemon is stopped; stdio sessions keep running from the old
-        // binary. A failed stop is not fatal: the restart below replaces an
-        // older daemon it finds.
-        summary.notes.push(match ops.stop_daemon() {
-            Ok(line) => line,
-            Err(error) => format!("skipped: stopping the daemon: {error:#}"),
-        });
-        summary.swap = SwapState::Started;
-        match ops.swap_staged_into_place() {
-            Ok(lines) => summary.notes.extend(lines),
-            Err(error) => {
-                return Err(roll_back(
-                    ops,
-                    summary,
-                    error.context(
-                        "symforge update failed while swapping the staged files into place",
-                    ),
-                ));
+        // Offline, npm installs from its cache: a staged copy of exactly what is
+        // installed is no reason to stop anyone's daemon.
+        // ponytail: the staging dir stays until the next run clears it.
+        let staged_is_installed = latest.is_none()
+            && matches!(&before, InstalledProbe::Version(v) if *v == summary.new_version)
+            && wrapper.as_deref() == Some(summary.new_version.as_str());
+        if staged_is_installed {
+            summary.swap = SwapState::StagedIsInstalled;
+            eprintln!(
+                "symforge update: npm staged the installed {}; skipping the swap.",
+                summary.new_version
+            );
+        } else {
+            // Only the daemon is stopped; stdio sessions keep running from the
+            // old binary. A failed stop is not fatal: the restart below replaces
+            // an older daemon it finds.
+            summary.notes.push(match ops.stop_daemon() {
+                Ok(line) => line,
+                Err(error) => format!("skipped: stopping the daemon: {error:#}"),
+            });
+            summary.swap = SwapState::Started;
+            match ops.swap_staged_into_place() {
+                Ok(lines) => summary.notes.extend(lines),
+                Err(error) => {
+                    return Err(roll_back(
+                        ops,
+                        summary,
+                        error.context(
+                            "symforge update failed while swapping the staged files into place",
+                        ),
+                    ));
+                }
             }
-        }
-        summary.swap = SwapState::Swapped;
-        if let InstalledProbe::Version(old) = &before
-            && !crate::cli::version::is_newer_version(old, LAST_VERSION_WITHOUT_NEWER_DAEMON_GUARD)
-        {
-            summary.notes.push(format!(
-                "note: sessions opened before this update run {old}, which lacks the newer-daemon \
-                 guard; when one reconnects it restarts the daemon under the newer sessions. \
-                 Restart those sessions when convenient."
-            ));
+            summary.swap = SwapState::Swapped;
         }
     }
     let swapped = summary.swap == SwapState::Swapped;
@@ -1387,7 +1418,7 @@ fn update_steps(
         if !swapped {
             return Err(error.context("symforge update failed"));
         }
-        if matches!(summary.daemon, Some(Ok(_))) {
+        if matches!(summary.daemon, Some(Ok(InstalledDaemon::Running { .. }))) {
             summary.notes.push(match ops.stop_daemon() {
                 Ok(line) => format!("{line} before restoring the previous version"),
                 Err(error) => {
@@ -1456,7 +1487,7 @@ fn update_steps(
     // Re-point the harnesses that already use SymForge. Only after every one of
     // them succeeded are the retired durable-install artifacts cleared —
     // deleting the orphan while a client still references it would break it.
-    let (targets, skipped) = plan_reregistration(&ops.harness_scan());
+    let (targets, skipped) = plan_reregistration(&ops.harness_scan(), swapped);
     summary.notes.extend(skipped);
     let mut all_reregistered = true;
     for harness in targets {
@@ -1611,7 +1642,7 @@ mod tests {
         wrapper: Option<String>,
         swap_fails: bool,
         roll_back: Result<(), String>,
-        daemon: Result<(u16, bool), String>,
+        daemon: Result<InstalledDaemon, String>,
         initialize: Result<(), String>,
         scan: Vec<(HarnessId, HarnessState)>,
         reregister_fails: Vec<HarnessId>,
@@ -1635,7 +1666,10 @@ mod tests {
                 wrapper: Some("7.15.3".to_string()),
                 swap_fails: false,
                 roll_back: Ok(()),
-                daemon: Ok((4242, true)),
+                daemon: Ok(InstalledDaemon::Running {
+                    port: 4242,
+                    started: true,
+                }),
                 initialize: Ok(()),
                 scan: vec![
                     (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
@@ -1727,7 +1761,7 @@ mod tests {
                 self.live[0].clone()
             }
         }
-        fn restart_daemon(&mut self, version: &str) -> anyhow::Result<(u16, bool)> {
+        fn restart_daemon(&mut self, version: &str) -> anyhow::Result<InstalledDaemon> {
             self.events.push(format!("daemon {version}"));
             self.daemon.clone().map_err(|e| anyhow::anyhow!(e))
         }
@@ -2122,6 +2156,58 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_restart_refused_by_policy_after_a_swap_keeps_the_new_binary() {
+        let mut ops = FakeOps {
+            daemon: Ok(InstalledDaemon::Skipped(
+                "SYMFORGE_DAEMON_AUTOSPAWN is off".to_string(),
+            )),
+            ..Default::default()
+        };
+        let mut summary = UpdateSummary::default();
+        update_steps("linux", "x86_64", &mut ops, &mut summary)
+            .expect("a policy refusal is not a broken binary");
+        assert!(!ops.happened("rollback"), "{:?}", ops.events);
+        assert!(ops.happened("initialize") && ops.happened("reregister claude"));
+        assert_eq!(summary.swap, SwapState::Swapped);
+        assert!(
+            summary
+                .render()
+                .contains("daemon restarted: no, skipped (SYMFORGE_DAEMON_AUTOSPAWN is off)"),
+            "{}",
+            summary.render()
+        );
+    }
+
+    #[test]
+    fn offline_a_staged_copy_of_what_is_installed_is_not_swapped() {
+        let running = env!("CARGO_PKG_VERSION").to_string();
+        let mut ops = FakeOps {
+            latest: None,
+            live: vec![InstalledProbe::Version(running.clone())],
+            wrapper: Some(running.clone()),
+            staged: InstalledProbe::Version(running.clone()),
+            installed: InstalledProbe::Version(running),
+            ..Default::default()
+        };
+        let mut summary = UpdateSummary::default();
+        update_steps("linux", "x86_64", &mut ops, &mut summary)
+            .expect("nothing to do is a success");
+        assert!(
+            !ops.happened("stop-daemon") && !ops.happened("swap"),
+            "{:?}",
+            ops.events
+        );
+        assert!(ops.happened("initialize"));
+        assert!(
+            summary
+                .render()
+                .contains("npm staged this same version; swap skipped"),
+            "{}",
+            summary.render()
+        );
+    }
+
+    #[test]
     fn a_failed_swap_is_rolled_back_and_a_failed_rollback_is_never_reported_unchanged() {
         let mut ops = FakeOps {
             swap_fails: true,
@@ -2213,33 +2299,6 @@ mod tests {
     }
 
     #[test]
-    fn sessions_from_before_the_newer_daemon_guard_get_a_restart_note() {
-        for (old, noted) in [("11.3.0", true), ("11.3.1", false)] {
-            let mut ops = FakeOps {
-                latest: Some("11.4.0".to_string()),
-                live: vec![
-                    InstalledProbe::Version(old.to_string()),
-                    InstalledProbe::Version("11.4.0".to_string()),
-                ],
-                staged: InstalledProbe::Version("11.4.0".to_string()),
-                installed: InstalledProbe::Version("11.4.0".to_string()),
-                ..Default::default()
-            };
-            let mut summary = UpdateSummary::default();
-            update_steps("linux", "x86_64", &mut ops, &mut summary).expect("update succeeds");
-            assert_eq!(
-                summary
-                    .notes
-                    .iter()
-                    .any(|note| note.contains("lacks the newer-daemon guard")),
-                noted,
-                "{old}: {:?}",
-                summary.notes
-            );
-        }
-    }
-
-    #[test]
     fn plan_reregistration_leaves_current_and_http_attached_harnesses_alone() {
         let mut scan = scan_of(&[
             (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
@@ -2252,12 +2311,18 @@ mod tests {
         scan.already_current = vec![HarnessId::ClaudeCode];
         scan.http_attached = vec![HarnessId::Cursor];
 
-        let (targets, notes) = plan_reregistration(&scan);
+        let (targets, notes) = plan_reregistration(&scan, false);
 
         assert_eq!(targets, vec![HarnessId::Codex]);
         let text = notes.join("\n");
         assert!(text.contains("unchanged: Claude Code"), "{text}");
         assert!(text.contains("Cursor (it attaches over HTTP"), "{text}");
+
+        // After a real swap the binary path is the same file, so "already
+        // current" says nothing about hooks, allow lists, env, or guidance the
+        // new release changed: every stdio harness is re-registered.
+        let (targets, _) = plan_reregistration(&scan, true);
+        assert_eq!(targets, vec![HarnessId::ClaudeCode, HarnessId::Codex]);
     }
 
     #[test]
@@ -2278,7 +2343,7 @@ mod tests {
         ]);
         scan.grok_config_present = true;
 
-        let (targets, skipped) = plan_reregistration(&scan);
+        let (targets, skipped) = plan_reregistration(&scan, true);
 
         assert_eq!(targets, vec![HarnessId::ClaudeCode, HarnessId::Codex]);
         let text = skipped.join("\n");
@@ -2308,7 +2373,10 @@ mod tests {
             new_version: "11.3.0".to_string(),
             swap: SwapState::Swapped,
             reregistered: vec!["Claude Code", "Codex"],
-            daemon: Some(Ok((51234, true))),
+            daemon: Some(Ok(InstalledDaemon::Running {
+                port: 51234,
+                started: true,
+            })),
             initialize: Some(Ok(())),
             notes: vec!["skipped: re-registering Cursor: init exited with 1".to_string()],
         };
@@ -2658,16 +2726,54 @@ mod tests {
         std::fs::write(&src, b"new").unwrap();
         std::fs::write(&dst, b"old").unwrap();
 
-        let previous = replace_file(&src, &dst, &aside, rename)
-            .unwrap()
+        let mut journal = Vec::new();
+        replace_file(&src, &dst, &aside, &mut journal, rename).unwrap();
+        let previous = journal[0]
+            .1
+            .clone()
             .expect("the replaced file keeps a copy");
+        assert_eq!(journal[0].0, dst);
         assert_eq!(std::fs::read(&dst).unwrap(), b"new");
         assert_eq!(std::fs::read(&previous).unwrap(), b"old");
 
         let fresh_src = tmp.path().join("staged-2.bin");
         std::fs::write(&fresh_src, b"new").unwrap();
-        let fresh = replace_file(&fresh_src, &tmp.path().join("fresh.bin"), &aside, rename);
-        assert_eq!(fresh.unwrap(), None, "a new file has no previous version");
+        replace_file(
+            &fresh_src,
+            &tmp.path().join("fresh.bin"),
+            &aside,
+            &mut journal,
+            rename,
+        )
+        .unwrap();
+        assert_eq!(journal[1].1, None, "a new file has no previous version");
+    }
+
+    #[test]
+    fn a_replacement_that_fails_midway_is_still_journaled_for_the_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aside = tmp.path().join("aside");
+        let (src, dst) = (
+            tmp.path().join("staged.bin"),
+            tmp.path().join("symforge.bin"),
+        );
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+        let mut journal = Vec::new();
+
+        // The staged file never lands, the way Windows refuses a running image.
+        replace_file(&src, &dst, &aside, &mut journal, |from, to| {
+            if from == src.as_path() {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                std::fs::rename(from, to)
+            }
+        })
+        .expect_err("the staged file never landed");
+
+        assert_eq!(journal.len(), 1, "a failed move must still be journaled");
+        let previous = journal[0].1.as_ref().expect("the previous copy was kept");
+        assert_eq!(std::fs::read(previous).unwrap(), b"old");
     }
 
     /// A directory symlink, or on Windows without the symlink privilege a
@@ -2853,7 +2959,7 @@ mod tests {
 
         assert_eq!(scan.already_current, vec![HarnessId::ClaudeCode]);
         assert_eq!(scan.http_attached, vec![HarnessId::Gemini]);
-        assert_eq!(plan_reregistration(&scan).0, vec![HarnessId::Cursor]);
+        assert_eq!(plan_reregistration(&scan, false).0, vec![HarnessId::Cursor]);
     }
 
     #[test]

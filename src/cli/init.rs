@@ -2203,6 +2203,31 @@ mod tests {
     }
 
     #[test]
+    fn re_registering_an_unchanged_config_does_not_rewrite_it() {
+        // `symforge update` re-registers every present harness after a swap; a
+        // config that already says the same must not be rewritten under a
+        // running harness.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        register_mcp_server(&path, "/usr/bin/symforge").unwrap();
+        let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        register_mcp_server(&path, "/usr/bin/symforge").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            long_ago,
+            "an identical registration must leave the file alone"
+        );
+    }
+
+    #[test]
     fn test_reregistration_preserves_user_set_surface_both_directions() {
         // Direction 1: user pinned compact on Claude Code (fresh default full).
         let dir = tempfile::tempdir().unwrap();

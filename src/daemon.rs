@@ -2778,12 +2778,13 @@ async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow
 /// `symforge update`: make sure a daemon of `version`, running from the freshly
 /// installed `executable`, owns the daemon records. This is the stdio client's
 /// own spawn path with the NEW binary's identity, so an older recorded daemon is
-/// replaced exactly as a new session would replace it. Returns the port and
-/// whether a daemon had to be started (`false`: the running one already matched).
+/// replaced exactly as a new session would replace it. A policy that forbids
+/// starting or replacing one is reported as [`InstalledDaemon::Skipped`], not as
+/// an error: the new binary is not at fault.
 pub(crate) async fn ensure_installed_daemon_running(
     executable: &Path,
     version: &str,
-) -> anyhow::Result<(u16, bool)> {
+) -> anyhow::Result<InstalledDaemon> {
     ensure_installed_daemon_running_at(process_control_state_dir()?, executable, version).await
 }
 
@@ -2791,16 +2792,42 @@ async fn ensure_installed_daemon_running_at(
     control_state_dir: &ControlStateDir,
     executable: &Path,
     version: &str,
-) -> anyhow::Result<(u16, bool)> {
+) -> anyhow::Result<InstalledDaemon> {
     let identity = DaemonIdentity {
         version: version.to_string(),
         executable_path: normalized_path_string(executable),
     };
     if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
-        return Ok((port, false));
+        return Ok(InstalledDaemon::Running {
+            port,
+            started: false,
+        });
+    }
+    if daemon_autospawn_disabled() {
+        return Ok(InstalledDaemon::Skipped(format!(
+            "{DAEMON_AUTOSPAWN_ENV} is off"
+        )));
+    }
+    if let Some(newer) = newer_recorded_daemon_version_at(control_state_dir, &identity).await {
+        return Ok(InstalledDaemon::Skipped(format!(
+            "a newer daemon ({newer}) owns this SymForge home"
+        )));
     }
     let port = ensure_daemon_running_as(control_state_dir, &identity, Some(executable)).await?;
-    Ok((port, true))
+    Ok(InstalledDaemon::Running {
+        port,
+        started: true,
+    })
+}
+
+/// What `symforge update` found or did about the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstalledDaemon {
+    /// A daemon of the new binary serves on `port`; `started` when update
+    /// spawned it rather than finding it running.
+    Running { port: u16, started: bool },
+    /// Policy forbids starting or replacing a daemon; carries why.
+    Skipped(String),
 }
 
 /// Ensure a daemon matching `identity` is running, spawning `executable`
@@ -14226,7 +14253,42 @@ mod tests {
 
         assert_eq!(
             kept.expect("the running daemon is the same binary"),
-            (handle.port, false)
+            InstalledDaemon::Running {
+                port: handle.port,
+                started: false
+            }
+        );
+        assert!(daemon_health_ok(handle.port).await);
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// Autospawn switched off, or a newer daemon owning the home, is policy:
+    /// the update must report the restart as skipped, not fail (a failure
+    /// rolls the new binary back).
+    #[tokio::test]
+    async fn the_update_reports_a_policy_refusal_as_a_skipped_restart() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let control_state_dir = test_control_state(daemon_home.path());
+        let exe = std::env::current_exe().expect("test binary path");
+
+        let off = {
+            let _autospawn = EnvVarGuard::set(DAEMON_AUTOSPAWN_ENV, Path::new("off"));
+            ensure_installed_daemon_running_at(&control_state_dir, &exe, "99.0.0").await
+        };
+        assert!(
+            matches!(&off, Ok(InstalledDaemon::Skipped(why)) if why.contains(DAEMON_AUTOSPAWN_ENV)),
+            "{off:?}"
+        );
+
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let older = ensure_installed_daemon_running_at(&control_state_dir, &exe, "0.0.1").await;
+        assert!(
+            matches!(&older, Ok(InstalledDaemon::Skipped(why)) if why.contains("newer daemon")),
+            "{older:?}"
         );
         assert!(daemon_health_ok(handle.port).await);
         let _ = handle.shutdown_tx.send(());
