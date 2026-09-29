@@ -4092,7 +4092,11 @@ macro_rules! loading_guard {
         match $guard.index_state() {
             IndexState::Ready => {}
             IndexState::Empty => return format::empty_guard_message(),
-            IndexState::Loading => return format::loading_guard_message(),
+            IndexState::Loading => {
+                return format::loading_guard_message(
+                    $guard.load_source() == crate::live_index::IndexLoadSource::EmptyBootstrap,
+                );
+            }
             IndexState::CircuitBreakerTripped { summary } => {
                 return format!("Index degraded: {summary}");
             }
@@ -4106,7 +4110,9 @@ fn loading_guard_message_from_published(
     match published.status {
         crate::live_index::PublishedIndexStatus::Ready => None,
         crate::live_index::PublishedIndexStatus::Empty => Some(format::empty_guard_message()),
-        crate::live_index::PublishedIndexStatus::Loading => Some(format::loading_guard_message()),
+        crate::live_index::PublishedIndexStatus::Loading => Some(format::loading_guard_message(
+            published.load_source == crate::live_index::IndexLoadSource::EmptyBootstrap,
+        )),
         crate::live_index::PublishedIndexStatus::Degraded => Some(format!(
             "Index degraded: {}",
             published

@@ -257,9 +257,10 @@ async fn run_mcp_server_async() -> anyhow::Result<()> {
 
     // 012 D4-B (defer launch pin): the launch-CWD bind fires ONLY when
     // `find_project_root()` resolved a usable root (env override or a safe CWD
-    // walk). That is the single-harness happy path and stays byte-for-byte
-    // unchanged — a found root pins the daemon session here, before the
-    // transport comes up.
+    // walk). That is the single-harness happy path — a found root pins the
+    // daemon session, which now opens BEHIND the transport: the deferred front
+    // answers the handshake while the session (or the local fallback index) is
+    // built, because building it can take minutes on a large repository.
     //
     // When `resolved_root` is `None` (home-CWD launchers such as Cursor, or a
     // forbidden/too-broad CWD) we deliberately do NOT pin anything: we fall
@@ -271,28 +272,136 @@ async fn run_mcp_server_async() -> anyhow::Result<()> {
     // disclosed through `_meta` project evidence (spec 025 FR-319). Eagerly
     // pinning a home/forbidden CWD is exactly the wrong-repo binding C4 fixes,
     // so deferring on `None` is the fix, not a regression.
-    if use_daemon && let Some(root) = resolved_root.clone() {
-        match daemon::connect_or_spawn_session(&root, "mcp-stdio", Some(std::process::id())).await {
-            Ok(session) => return run_remote_mcp_server_async(session).await,
-            Err(error) => {
-                tracing::warn!(
-                    root = %root.display(),
-                    "daemon-backed startup failed, falling back to local mode: {error}"
-                );
-            }
+    match startup_plan(should_auto_index, resolved_root, use_daemon) {
+        StartupPlan::Daemon { root } => {
+            run_deferred_mcp_server_async(root, true, should_auto_index).await
         }
-    }
-
-    match startup_plan(should_auto_index, resolved_root, false) {
-        StartupPlan::Daemon { .. } => unreachable!("daemon sessions return before local startup"),
         StartupPlan::LocalAutoIndex { root } => {
-            run_local_mcp_server_async(should_auto_index, Some(root)).await
+            run_deferred_mcp_server_async(root, false, should_auto_index).await
         }
-        StartupPlan::LocalEmpty { .. } => run_local_mcp_server_async(should_auto_index, None).await,
+        StartupPlan::LocalEmpty { .. } => {
+            run_local_mcp_server_async(should_auto_index, None, StdioServe::Direct).await
+        }
     }
 }
 
-async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> anyhow::Result<()> {
+/// Where a built stdio server goes.
+enum StdioServe {
+    /// Straight onto the stdio transport, served until the client leaves.
+    Direct,
+    /// Into the deferred front that is already serving stdio; returns once the
+    /// front has shut down.
+    Deferred {
+        startup: Arc<tokio::sync::watch::Sender<protocol::deferred_stdio::StdioStartup>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    },
+}
+
+async fn serve_stdio(server: protocol::SymForgeServer, serve: StdioServe) -> anyhow::Result<()> {
+    match serve {
+        StdioServe::Direct => {
+            let service = serve_server(server, transport::stdio()).await?;
+            // Wait for either MCP server shutdown (stdin EOF) or Ctrl+C/SIGTERM.
+            tokio::select! {
+                result = service.waiting() => { result?; }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl+C received, shutting down");
+                }
+            }
+        }
+        StdioServe::Deferred {
+            startup,
+            mut shutdown,
+        } => {
+            startup.send_replace(protocol::deferred_stdio::StdioStartup::Ready(Arc::new(
+                server,
+            )));
+            // An error means the front dropped its sender: it is gone either way.
+            let _ = shutdown.wait_for(|stop| *stop).await;
+        }
+    }
+    Ok(())
+}
+
+/// Serve stdio on the deferred front handler while the project runtime is
+/// built behind it: a daemon session when `use_daemon`, else (or when the
+/// daemon cannot be reached) the local index. `initialize` never waits on it.
+async fn run_deferred_mcp_server_async(
+    root: std::path::PathBuf,
+    use_daemon: bool,
+    should_auto_index: bool,
+) -> anyhow::Result<()> {
+    let (front, startup) = protocol::deferred_stdio::DeferredStdioServer::new(&root);
+    let publish = Arc::new(startup);
+    let (shutdown, shutdown_signal) = tokio::sync::watch::channel(false);
+    let runtime = tokio::spawn(async move {
+        let _unpublished =
+            protocol::deferred_stdio::StartupGuard(Arc::clone(&publish), shutdown_signal.clone());
+        let mut client_left = shutdown_signal.clone();
+        let serve = StdioServe::Deferred {
+            startup: Arc::clone(&publish),
+            shutdown: shutdown_signal,
+        };
+        let result = if use_daemon {
+            // The daemon may take minutes to open the project; a client that
+            // leaves meanwhile must not hold this process open for it.
+            let connected = tokio::select! {
+                connected = daemon::connect_or_spawn_session(
+                    &root,
+                    "mcp-stdio",
+                    Some(std::process::id()),
+                ) => connected,
+                _ = client_left.wait_for(|stop| *stop) => return Ok(()),
+            };
+            match connected {
+                Ok(session) => run_remote_mcp_server_async(session, serve).await,
+                Err(error) => {
+                    tracing::warn!(
+                        root = %root.display(),
+                        "daemon-backed startup failed, falling back to local mode: {error}"
+                    );
+                    run_local_mcp_server_async(should_auto_index, Some(root), serve).await
+                }
+            }
+        } else {
+            run_local_mcp_server_async(should_auto_index, Some(root), serve).await
+        };
+        // A runtime that never came up must say so; one that was already
+        // serving keeps its Ready state for the rest of the shutdown.
+        if let Err(error) = &result {
+            publish.send_if_modified(|state| {
+                let starting = matches!(state, protocol::deferred_stdio::StdioStartup::Starting);
+                if starting {
+                    *state =
+                        protocol::deferred_stdio::StdioStartup::Failed(format!("{error:#}").into());
+                }
+                starting
+            });
+        }
+        result
+    });
+
+    tracing::info!("serving MCP on stdio while the project runtime starts");
+    let service = serve_server(front, transport::stdio()).await?;
+    let served = tokio::select! {
+        result = service.waiting() => result.map(|_| ()).map_err(anyhow::Error::from),
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl+C received, shutting down");
+            Ok(())
+        }
+    };
+    // The runtime tears down (daemon session close, index snapshot, sidecar)
+    // only after the front is done with it.
+    let _ = shutdown.send(true);
+    let runtime = runtime.await;
+    served?;
+    runtime?
+}
+
+async fn run_remote_mcp_server_async(
+    session: daemon::DaemonSessionClient,
+    serve: StdioServe,
+) -> anyhow::Result<()> {
     let control_state_dir = crate::paths::process_control_state_placement()
         .directory()
         .cloned();
@@ -392,15 +501,7 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     // server instance IS the session — the one lane the repeat tracker may
     // attribute a run to. Declared here, at the transport, so a lane that does
     // not say so stays inert instead of sharing a count across clients.
-    let server = server.with_stdio_transport_lane();
-    let service = serve_server(server, transport::stdio()).await?;
-
-    tokio::select! {
-        result = service.waiting() => { result?; }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl+C received, shutting down");
-        }
-    }
+    serve_stdio(server.with_stdio_transport_lane(), serve).await?;
 
     heartbeat_task.abort();
     // Close the CURRENT session (post-reconnect), not the stale original.
@@ -417,9 +518,28 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     Ok(())
 }
 
+/// Build the local cold-start index into its `Loading` placeholder in the
+/// background. However the load ends, a panic included, the placeholder is
+/// settled by the daemon lane's rule and leaves `Loading`.
+fn spawn_local_cold_load(
+    index: live_index::SharedIndex,
+    root: std::path::PathBuf,
+    placement: crate::domain::StatePlacement,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        tracing::info!("cold-start indexing in background");
+        let result =
+            daemon::load_catching_panic(|| index.reload_for_state_placement(&root, &placement));
+        if daemon::settle_background_cold_load(&index, &root, result) {
+            tracing::info!("background cold-start indexing complete");
+        }
+    })
+}
+
 async fn run_local_mcp_server_async(
     should_auto_index: bool,
     resolved_root: Option<std::path::PathBuf>,
+    serve: StdioServe,
 ) -> anyhow::Result<()> {
     let (index, project_name, watcher_root, state_placement) = if let Some(root) = resolved_root {
         tracing::info!(root = %root.display(), "auto-indexing from project root");
@@ -496,17 +616,8 @@ async fn run_local_mcp_server_async(
             // No snapshot — start with empty index and re-index in background
             // so the MCP server can respond to initialize/tools/list immediately.
             let shared = live_index::LiveIndex::empty();
-            let bg_index = shared.clone();
-            let bg_root = root.clone();
-            let bg_state_placement = state_placement.clone();
-            tokio::task::spawn_blocking(move || {
-                tracing::info!("cold-start indexing in background");
-                if let Err(e) = bg_index.reload_for_state_placement(&bg_root, &bg_state_placement) {
-                    tracing::error!(%e, "background cold-start indexing failed");
-                } else {
-                    tracing::info!("background cold-start indexing complete");
-                }
-            });
+            shared.mark_bootstrap_loading();
+            spawn_local_cold_load(shared.clone(), root.clone(), state_placement.clone());
             shared
         };
 
@@ -647,16 +758,7 @@ async fn run_local_mcp_server_async(
     // Feature 032 (F3): see the daemon-backed path above — stdio is the one
     // transport whose process/client/session identity is observable, so it is
     // the one that declares itself to the repeat tracker.
-    let server = server.with_stdio_transport_lane();
-    let service = serve_server(server, transport::stdio()).await?;
-
-    // Wait for either MCP server shutdown (stdin EOF) or Ctrl+C/SIGTERM.
-    tokio::select! {
-        result = service.waiting() => { result?; }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl+C received, shutting down");
-        }
-    }
+    serve_stdio(server.with_stdio_transport_lane(), serve).await?;
 
     tracing::info!("MCP server shut down cleanly");
 
@@ -683,7 +785,8 @@ async fn run_local_mcp_server_async(
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupIndexLogView, StartupPlan, local_empty_reason, startup_index_log_view, startup_plan,
+        StartupIndexLogView, StartupPlan, local_empty_reason, spawn_local_cold_load,
+        startup_index_log_view, startup_plan,
     };
     use crate::live_index::persist::checkpoint_interval_from_value;
     use crate::live_index::{
@@ -814,6 +917,41 @@ mod tests {
         assert_eq!(
             checkpoint_interval_from_value(Some("999999")),
             Some(Duration::from_secs(3600))
+        );
+    }
+
+    /// A local cold start that fails settles its placeholder with the reason
+    /// instead of logging and leaving it `Loading` for the process lifetime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_local_cold_start_does_not_stay_loading() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("removed-before-the-load");
+        let index = crate::live_index::LiveIndex::empty();
+        index.mark_bootstrap_loading();
+        assert_eq!(
+            index.published_state().status,
+            PublishedIndexStatus::Loading
+        );
+
+        spawn_local_cold_load(
+            index.clone(),
+            missing,
+            crate::domain::StatePlacement::MemoryOnly {
+                failures: Vec::new(),
+            },
+        )
+        .await
+        .expect("the load task finished");
+
+        let published = index.published_state();
+        assert_eq!(published.status, PublishedIndexStatus::Empty);
+        assert!(
+            published
+                .local_empty_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("background index load failed")),
+            "{:?}",
+            published.local_empty_reason
         );
     }
 }

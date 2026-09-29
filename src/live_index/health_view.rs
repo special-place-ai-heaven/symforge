@@ -355,9 +355,11 @@ impl LiveIndex {
             // `EmptyBootstrap`. Reporting Loading there tells the agent to retry
             // something that never lands AND hides
             // `format::empty_index_recovery_hint` — the only message naming the
-            // real recovery. `local_empty_reason` is set exactly in that lane and
-            // cleared by `apply_reload_data` beside its `load_source` and
-            // `indexed_root` assignments, so it is the discriminator.
+            // real recovery. `local_empty_reason` is set in that lane, and by the
+            // daemon's `bootstrap_project_index_within` when its background load
+            // fails (no load is coming there either), and cleared by
+            // `apply_reload_data` beside its `load_source` and `indexed_root`
+            // assignments, so it is the discriminator.
             //
             // Cited by NAME, not line number: the original versions of these
             // comments were 50+ lines stale within one edit of being written. A

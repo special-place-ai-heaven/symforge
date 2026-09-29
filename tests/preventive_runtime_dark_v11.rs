@@ -1015,11 +1015,12 @@ const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
 // again after the derived-stage hold grew a reached-wait so CR-1 G17 can
-// observe the pause. File count stays 198.
+// observe the pause, then for the deferred stdio front, which added
+// src/protocol/deferred_stdio.rs: 199 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8026002fd0d956c3ed18c66e759975427f7a3b703939d822ea4e82e10e2a7a35",
-    198,
-    9_679_879,
+    "33e28fd53316caef5733cdad4a712ea54d7c9c994d9cd0aacce4b3de44390fcf",
+    199,
+    9_757_032,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
