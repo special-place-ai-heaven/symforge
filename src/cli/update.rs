@@ -2611,25 +2611,38 @@ mod tests {
         let mut holder = spawn_holder_at(&live_binary);
         let old_bytes = std::fs::read(&live_binary).unwrap();
 
-        // Probe the path the whole time the swap runs.
+        // Probe the path the whole time the swap runs. The swap starts only once
+        // the prober has checked at least once: on a runner with few cores the
+        // whole swap can otherwise finish before the prober is first scheduled.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let prober = {
-            let stop = std::sync::Arc::clone(&stop);
+            let (stop, probing) = (
+                std::sync::Arc::clone(&stop),
+                std::sync::Arc::clone(&probing),
+            );
             let path = live_binary.clone();
             std::thread::spawn(move || {
                 let (mut checks, mut misses) = (0u64, 0u64);
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                loop {
                     checks += 1;
                     if std::fs::metadata(&path).is_err() {
                         misses += 1;
+                    }
+                    probing.store(true, std::sync::atomic::Ordering::Release);
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
                     }
                 }
                 (checks, misses)
             })
         };
+        while !probing.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
         let mut journal = Vec::new();
         let swapped = overlay_package(&staged, &live, &aside, false, &mut journal);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.store(true, std::sync::atomic::Ordering::Release);
         let (checks, misses) = prober.join().unwrap();
         let still_running = holder.try_wait().unwrap().is_none();
         holder.kill().unwrap();
