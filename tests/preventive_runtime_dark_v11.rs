@@ -1060,10 +1060,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for the diff-based trigram update and the snapshot-verify review
 // nits (trigram, store, persist tests, watcher sweep, protocol withheld note):
 // no new file, no edge into src/index_lifecycle.
+// Refreshed for `symforge update` installing into the running copy's npm
+// prefix (src/cli/update.rs only): no new file, no edge into
+// src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "2b8c37dea7ceb69590e189027d75f88a0ff6ccba5960eb04780d2630caeaa92a",
+    "8cf362d9d4b299e052716198eea4efc9e5e98818820d559e94aa357b0e51e3c2",
     199,
-    10_168_049,
+    10_177_773,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

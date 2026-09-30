@@ -530,6 +530,11 @@ pub(crate) trait UpdateOps {
     /// reactive stale-version bail: it also fires when the shadow is the SAME
     /// version (which the stale-version check cannot see).
     fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport>;
+    /// Set when the update installs into a different prefix than npm's global
+    /// one, so a plain `npm install -g` would miss this copy.
+    fn prefix_mismatch(&mut self) -> Option<PrefixMismatch> {
+        None
+    }
     /// `--version` of the binary at the live install path (the one harnesses
     /// spawn), probed directly rather than through the PATH launcher.
     fn live_version(&mut self) -> InstalledProbe;
@@ -557,6 +562,8 @@ struct RealUpdateOps {
     /// Each file the swap replaced, with the copy kept of its previous version
     /// (`None`: the file is new).
     journal: Vec<(PathBuf, Option<PathBuf>)>,
+    /// Set by `run_update` when `npm_prefix` is not npm's own global prefix.
+    mismatch: Option<PrefixMismatch>,
 }
 
 impl RealUpdateOps {
@@ -576,6 +583,7 @@ impl RealUpdateOps {
             platform_package,
             home,
             journal: Vec::new(),
+            mismatch: None,
         }
     }
 
@@ -846,8 +854,12 @@ impl UpdateOps for RealUpdateOps {
     }
 
     fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport> {
-        let installed = npm_installed_launcher_path()?;
+        let installed = launcher_path_in_prefix(&self.npm_prefix, std::env::consts::OS);
         crate::path_shadow::detect_shadow(&installed)
+    }
+
+    fn prefix_mismatch(&mut self) -> Option<PrefixMismatch> {
+        self.mismatch.clone()
     }
 
     fn live_version(&mut self) -> InstalledProbe {
@@ -1237,15 +1249,94 @@ fn lock_update(npm_prefix: &Path) -> anyhow::Result<std::fs::File> {
     }
 }
 
-/// Derive the path of the `symforge` launcher npm installs at the global prefix.
-/// On Windows the shim lives at the prefix root (`<prefix>/symforge.cmd`); on
-/// Unix it lives in `<prefix>/bin/symforge`. Returns `None` when the prefix
-/// cannot be resolved.
-fn npm_installed_launcher_path() -> Option<std::path::PathBuf> {
-    Some(launcher_path_in_prefix(
-        &npm_global_prefix()?,
-        std::env::consts::OS,
-    ))
+/// The npm global prefix whose package tree holds `exe`, read from the path
+/// alone: `<prefix>/lib/node_modules/symforge[-<os>-<arch>]/...` on Unix,
+/// `<prefix>/node_modules/symforge[-<os>-<arch>]/...` on Windows. The outermost
+/// match wins, because the platform package nests under the wrapper. `None` for
+/// any other layout (a cargo install, a manual binary).
+fn npm_prefix_of_exe(exe: &Path, os: &str) -> Option<PathBuf> {
+    let parts: Vec<_> = exe.components().collect();
+    let is_named = |part: &std::path::Component<'_>, name: &str| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(name))
+    };
+    let at = (1..parts.len().saturating_sub(1)).find(|&i| {
+        is_named(&parts[i], "node_modules")
+            && parts[i + 1].as_os_str().to_str().is_some_and(|s| {
+                s.eq_ignore_ascii_case("symforge")
+                    || s.to_ascii_lowercase().starts_with("symforge-")
+            })
+    })?;
+    let prefix_end = if os == "windows" {
+        at
+    } else {
+        // Unix globals live in `<prefix>/lib/node_modules`; a project-local
+        // `node_modules` is not a prefix to update.
+        (at >= 2 && is_named(&parts[at - 1], "lib")).then_some(at - 1)?
+    };
+    Some(parts[..prefix_end].iter().collect())
+}
+
+/// The npm global prefix the RUNNING symforge was installed into, when it runs
+/// from an npm package tree that has its launcher shim in place.
+fn running_npm_prefix(os: &str) -> Option<PathBuf> {
+    let exe = dunce::canonicalize(std::env::current_exe().ok()?).ok()?;
+    let prefix = resolve_prefix(npm_prefix_of_exe(&exe, os)?.to_str()?)?;
+    launcher_path_in_prefix(&prefix, os)
+        .exists()
+        .then_some(prefix)
+}
+
+/// Where the update installs, and why it differs from what a plain
+/// `npm install -g` would do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrefixMismatch {
+    /// The prefix the update installs into (the running copy's).
+    pub(crate) install_prefix: PathBuf,
+    /// Plain-language explanation naming both prefixes and the setting behind npm's.
+    pub(crate) message: String,
+}
+
+/// Pick the prefix to update: the running copy's when it is in an npm tree,
+/// otherwise npm's global prefix. Returns the mismatch when both exist and
+/// differ. `env_prefix` is the `NPM_CONFIG_PREFIX` value, if set.
+fn choose_update_prefix(
+    running: Option<PathBuf>,
+    npm_global: Option<PathBuf>,
+    env_prefix: Option<&str>,
+) -> Option<(PathBuf, Option<PrefixMismatch>)> {
+    let Some(running) = running else {
+        return Some((npm_global?, None));
+    };
+    let mismatch = npm_global.filter(|global| *global != running).map(|global| {
+        let source = match env_prefix {
+            Some(value) => format!(
+                "the NPM_CONFIG_PREFIX environment variable ({value}), which overrides any npmrc `prefix`"
+            ),
+            None => "an npmrc `prefix` setting or npm's default".to_string(),
+        };
+        PrefixMismatch {
+            message: format!(
+                "this symforge is installed under the npm prefix {}, but npm's global prefix is {} \
+                 (set by {source}). `npm install -g symforge` installs into {} and leaves this copy \
+                 unchanged; `symforge update` installs into {}.",
+                running.display(),
+                global.display(),
+                global.display(),
+                running.display(),
+            ),
+            install_prefix: running.clone(),
+        }
+    });
+    Some((running, mismatch))
+}
+
+/// `NPM_CONFIG_PREFIX` as npm reads it (the name is case-insensitive to npm).
+fn env_npm_config_prefix() -> Option<String> {
+    std::env::vars()
+        .find(|(name, value)| name.eq_ignore_ascii_case("npm_config_prefix") && !value.is_empty())
+        .map(|(_, value)| value)
 }
 
 /// Pure mapping from an npm global prefix to the `symforge` launcher path it
@@ -1265,13 +1356,19 @@ pub fn run_update() -> anyhow::Result<()> {
     let platform_package = platform_package_for(os, arch).with_context(|| {
         format!("symforge update: no npm platform package ships a binary for {os}-{arch}")
     })?;
-    let npm_prefix = npm_global_prefix().context(
+    let (npm_prefix, mismatch) = choose_update_prefix(
+        running_npm_prefix(os),
+        npm_global_prefix(),
+        env_npm_config_prefix().as_deref(),
+    )
+    .context(
         "symforge update: could not resolve the npm global prefix (`npm prefix -g` failed or \
          named no existing directory); is npm on PATH?",
     )?;
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let _lock = lock_update(&npm_prefix)?;
     let mut ops = RealUpdateOps::new(os, platform_package, npm_prefix, home);
+    ops.mismatch = mismatch;
     orchestrate_update(os, arch, &mut ops)
 }
 
@@ -1297,6 +1394,11 @@ fn update_steps(
     // Copies a prior swap kept are swept only after this run verifies the
     // binary: until then they may be the only copy of the previous version.
     summary.notes.extend(ops.prune_registry());
+
+    let mismatch = ops.prefix_mismatch();
+    if let Some(mismatch) = &mismatch {
+        eprintln!("symforge update: note: {}", mismatch.message);
+    }
 
     let latest = ops.latest_version();
     if latest.is_none() {
@@ -1330,7 +1432,14 @@ fn update_steps(
     } else {
         let program = npm_executable_for_os(os);
         let specs = install_specs(os, arch);
-        let plain_cmd = format!("npm install -g {}", specs.join(" "));
+        let plain_cmd = match &mismatch {
+            Some(m) => format!(
+                "npm install -g --prefix {} {}",
+                m.install_prefix.display(),
+                specs.join(" ")
+            ),
+            None => format!("npm install -g {}", specs.join(" ")),
+        };
         eprintln!(
             "symforge update: installing {} into a staging directory; running sessions are not touched.",
             specs.join(" ")
@@ -1467,8 +1576,11 @@ fn update_steps(
                 ),
             };
             stale.then(|| {
+                let lead = mismatch.as_ref().map_or(String::new(), |m| {
+                    format!("prefix mismatch: {}\n", m.message)
+                });
                 anyhow::anyhow!(
-                    "symforge update incomplete: `symforge --version` still reports {installed}, \
+                    "symforge update incomplete: {lead}`symforge --version` still reports {installed}, \
                      behind {target}. The resolved `symforge` is not the one just installed. Likely causes:\n  \
                      - a stale platform package {pkg} the launcher resolves first — rerun `symforge update`\n  \
                      - a PATH-shadowing install — run `which -a symforge`; a root /usr/local copy can win over your npm prefix\n  \
@@ -1648,6 +1760,7 @@ mod tests {
         reregister_fails: Vec<HarnessId>,
         reconciled_with: Option<bool>,
         shadow: Option<crate::path_shadow::ShadowReport>,
+        mismatch: Option<PrefixMismatch>,
     }
 
     impl Default for FakeOps {
@@ -1678,6 +1791,7 @@ mod tests {
                 reregister_fails: Vec::new(),
                 reconciled_with: None,
                 shadow: None,
+                mismatch: None,
             }
         }
     }
@@ -1752,6 +1866,9 @@ mod tests {
         fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport> {
             self.events.push("shadow".into());
             self.shadow.clone()
+        }
+        fn prefix_mismatch(&mut self) -> Option<PrefixMismatch> {
+            self.mismatch.clone()
         }
         fn live_version(&mut self) -> InstalledProbe {
             self.events.push("live-probe".into());
@@ -1889,6 +2006,138 @@ mod tests {
         assert_eq!(
             launcher_path_in_prefix(std::path::Path::new("/home/you/.npm-global"), "linux"),
             std::path::Path::new("/home/you/.npm-global/bin/symforge")
+        );
+    }
+
+    #[test]
+    fn npm_prefix_of_exe_reads_the_unix_global_layout() {
+        let wrapper_nested = Path::new(
+            "/home/box/.npm-global/lib/node_modules/symforge/node_modules/symforge-linux-x64/bin/symforge",
+        );
+        let platform_beside =
+            Path::new("/home/box/.npm-global/lib/node_modules/symforge-linux-x64/bin/symforge");
+        for exe in [wrapper_nested, platform_beside] {
+            assert_eq!(
+                npm_prefix_of_exe(exe, "linux"),
+                Some(PathBuf::from("/home/box/.npm-global")),
+                "{exe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_prefix_of_exe_reads_the_windows_global_layout() {
+        let exe = Path::new(
+            "C:/Users/me/AppData/Roaming/npm/node_modules/symforge/node_modules/symforge-windows-x64/bin/symforge.exe",
+        );
+        assert_eq!(
+            npm_prefix_of_exe(exe, "windows"),
+            Some(PathBuf::from("C:/Users/me/AppData/Roaming/npm"))
+        );
+    }
+
+    #[test]
+    fn npm_prefix_of_exe_ignores_trees_that_are_not_a_global_npm_install() {
+        for (exe, os) in [
+            ("/home/box/.cargo/bin/symforge", "linux"),
+            ("/usr/local/bin/symforge", "linux"),
+            // A project-local package is not a prefix to update on Unix.
+            ("/work/app/node_modules/symforge/bin/symforge", "linux"),
+            // An unrelated package under a global tree.
+            (
+                "/home/box/.npm-global/lib/node_modules/other/bin/symforge",
+                "linux",
+            ),
+            ("C:/tools/symforge/symforge.exe", "windows"),
+        ] {
+            assert_eq!(npm_prefix_of_exe(Path::new(exe), os), None, "{exe}");
+        }
+    }
+
+    #[test]
+    fn update_prefix_follows_the_running_copy_and_names_npm_config_prefix() {
+        let running = PathBuf::from("/home/box/.npm-global");
+        let global = PathBuf::from("/home/box/.local");
+        let (chosen, mismatch) = choose_update_prefix(
+            Some(running.clone()),
+            Some(global),
+            Some("/home/box/.local"),
+        )
+        .expect("a prefix is chosen");
+        assert_eq!(chosen, running);
+        let mismatch = mismatch.expect("differing prefixes are reported");
+        assert_eq!(mismatch.install_prefix, running);
+        let msg = mismatch.message;
+        assert!(
+            msg.contains("/home/box/.npm-global") && msg.contains("/home/box/.local"),
+            "{msg}"
+        );
+        assert!(msg.contains("NPM_CONFIG_PREFIX"), "{msg}");
+
+        let (_, without_env) =
+            choose_update_prefix(Some(PathBuf::from("/a")), Some(PathBuf::from("/b")), None)
+                .expect("a prefix is chosen");
+        let msg = without_env.expect("reported").message;
+        assert!(
+            msg.contains("npmrc") && !msg.contains("NPM_CONFIG_PREFIX"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn update_prefix_keeps_todays_behaviour_outside_an_npm_tree() {
+        let global = PathBuf::from("/home/box/.local");
+        assert_eq!(
+            choose_update_prefix(None, Some(global.clone()), None),
+            Some((global.clone(), None))
+        );
+        assert_eq!(
+            choose_update_prefix(Some(global.clone()), Some(global.clone()), None),
+            Some((global, None))
+        );
+        assert_eq!(choose_update_prefix(None, None, None), None);
+    }
+
+    #[test]
+    fn orchestrate_update_leads_a_stale_failure_with_the_prefix_mismatch() {
+        let mut ops = FakeOps {
+            installed: InstalledProbe::Version("7.15.2".to_string()),
+            mismatch: choose_update_prefix(
+                Some(PathBuf::from("/home/box/.npm-global")),
+                Some(PathBuf::from("/home/box/.local")),
+                Some("/home/box/.local"),
+            )
+            .and_then(|(_, m)| m),
+            ..Default::default()
+        };
+        let err = orchestrate_update("linux", "x86_64", &mut ops)
+            .expect_err("a stale resolved version must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("symforge update incomplete: prefix mismatch:"),
+            "{msg}"
+        );
+        assert!(msg.contains("NPM_CONFIG_PREFIX"), "{msg}");
+    }
+
+    #[test]
+    fn a_failed_staging_install_advises_the_running_prefix_when_it_differs() {
+        let mut ops = FakeOps {
+            stage_result: false,
+            mismatch: choose_update_prefix(
+                Some(PathBuf::from("/home/box/.npm-global")),
+                Some(PathBuf::from("/home/box/.local")),
+                None,
+            )
+            .and_then(|(_, m)| m),
+            ..Default::default()
+        };
+        let msg = orchestrate_update("linux", "x86_64", &mut ops)
+            .expect_err("staging failed")
+            .to_string();
+        assert!(
+            msg.contains("npm install -g --prefix /home/box/.npm-global symforge@latest"),
+            "{msg}"
         );
     }
 

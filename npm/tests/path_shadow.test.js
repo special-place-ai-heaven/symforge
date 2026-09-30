@@ -257,6 +257,83 @@ test("launcher does NOT warn when the resolved native binary is itself first on 
   assert.deepEqual(errors, []);
 });
 
+// Build a real npm-global-shaped install under `prefix`: the package's bin dir
+// holds symforge.js, and `<prefix>/bin/symforge` is a symlink to it (skips the
+// test where the OS refuses symlinks).
+function linkedInstall(t, prefix) {
+  const selfDir = path.join(prefix, "lib", "node_modules", "symforge", "bin");
+  fs.mkdirSync(selfDir, { recursive: true });
+  fs.writeFileSync(path.join(selfDir, "symforge.js"), "// launcher\n");
+  const binDir = path.join(prefix, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  const link = path.join(binDir, "symforge");
+  try {
+    fs.symlinkSync(path.join(selfDir, "symforge.js"), link);
+  } catch (err) {
+    t.skip(`symlinks unavailable: ${err.code}`);
+    return null;
+  }
+  return { selfDir, binDir, link };
+}
+
+function runLauncher(selfDir, pathDirs, resolvedBinary) {
+  const errors = [];
+  const launcher = createLauncher({
+    process: { platform: "linux", arch: "x64", env: { PATH: pathDirs.join(path.delimiter) } },
+    console: { error: (message) => errors.push(message) },
+    selfDir,
+    resolveBinary() {
+      return { reason: "ok", binaryPath: resolvedBinary };
+    },
+    spawnSync() {
+      return { status: 0 };
+    },
+  });
+  assert.equal(launcher.main([]), 0);
+  return errors;
+}
+
+test("launcher does NOT flag itself when first on PATH through a symlinked bin", (t) => {
+  const root = tmpDir(t, "symforge-selflink-");
+  // The prefix is NOT the npm-configured one and the shim text never names the
+  // package, so only the realpath comparison can prove this is the launcher.
+  const install = linkedInstall(t, path.join(root, ".npm-global"));
+  if (!install) return;
+  const resolvedBinary = path.join(root, ".npm-global", "lib", "node_modules", "symforge-linux-x64", "bin", "symforge");
+
+  assert.deepEqual(runLauncher(install.selfDir, [install.binDir], resolvedBinary), []);
+});
+
+test("launcher reached through a symlinked prefix does not flag itself", (t) => {
+  const root = tmpDir(t, "symforge-prefixlink-");
+  const install = linkedInstall(t, path.join(root, "real-prefix"));
+  if (!install) return;
+  const aliasPrefix = path.join(root, "alias-prefix");
+  try {
+    fs.symlinkSync(path.join(root, "real-prefix"), aliasPrefix, "dir");
+  } catch (err) {
+    t.skip(`symlinks unavailable: ${err.code}`);
+    return;
+  }
+  const resolvedBinary = path.join(root, "real-prefix", "lib", "node_modules", "symforge-linux-x64", "bin", "symforge");
+
+  assert.deepEqual(runLauncher(install.selfDir, [path.join(aliasPrefix, "bin")], resolvedBinary), []);
+});
+
+test("a genuinely different first copy still warns even when this launcher is also on PATH", (t) => {
+  const root = tmpDir(t, "symforge-twocopies-");
+  const mine = linkedInstall(t, path.join(root, "mine"));
+  if (!mine) return;
+  const other = linkedInstall(t, path.join(root, "other"));
+  if (!other) return;
+  const resolvedBinary = path.join(root, "mine", "lib", "node_modules", "symforge-linux-x64", "bin", "symforge");
+
+  const errors = runLauncher(mine.selfDir, [other.binDir, mine.binDir], resolvedBinary);
+  const joined = errors.join("\n");
+  assert.match(joined, /different 'symforge'/);
+  assert.ok(joined.includes(other.link), joined);
+});
+
 test("SYMFORGE_NO_SHADOW_WARN suppresses the warning entirely", (t) => {
   const root = tmpDir(t, "symforge-suppress-");
   const shadowDir = path.join(root, "usr", "local", "bin");
