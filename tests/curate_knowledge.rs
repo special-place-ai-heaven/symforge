@@ -9,9 +9,10 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use symforge::domain::{ProjectId, ProjectStateDir, StatePlacement, UserLocalPlacementReason};
+use symforge::live_index::git_temporal::GitTemporalState;
 use symforge::live_index::{LiveIndex, SharedIndex};
 use symforge::protocol::SymForgeServer;
-use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
+use symforge::watcher::{WatcherInfo, WatcherState, run_watcher_with_stop};
 
 struct CurationFixture {
     dir: tempfile::TempDir,
@@ -433,12 +434,48 @@ async fn implicit_worktree_without_project_selector_is_rejected_before_probe_io(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successful_apply_publishes_policy_and_voice_through_the_ordinary_watcher() {
     let fixture = CurationFixture::new();
-    // The review hash binds the exact publication it was captured from, so any
-    // republish between review and apply stales it. A running watcher
-    // republishes on its own schedule (its registration reconcile hands off to
-    // an async git-temporal job that publishes twice), so review+apply raced
-    // it. Review and apply against a quiescent index, then start the watcher:
-    // it is still the only thing that can publish the committed policy.
+    let stop_token = Arc::new(AtomicBool::new(false));
+    let watcher_task = tokio::spawn(run_watcher_with_stop(
+        fixture.dir.path().to_path_buf(),
+        Arc::clone(&fixture.index),
+        Arc::clone(&fixture.watcher_info),
+        Arc::clone(&stop_token),
+    ));
+    // The review hash binds the exact publication it was captured from, so a
+    // republish between review and apply stales it. The watcher's registration
+    // reconcile hands off to an async git-temporal job that publishes twice,
+    // so wait until the watcher is Active with its reconcile recorded AND the
+    // published code signals are terminal for the current content and source
+    // version -- the exact condition under which a git-temporal spawn is a
+    // no-op. Nothing else publishes until a filesystem event arrives.
+    let (quiescent_generation, quiescent_reconcile_at, events_before) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let watcher = {
+                    let info = fixture.watcher_info.lock();
+                    (info.state == WatcherState::Active)
+                        .then_some(info.last_reconcile_at)
+                        .flatten()
+                        .map(|reconciled| (reconciled, info.events_processed))
+                };
+                let published = fixture.index.published_generation();
+                let signals = &published.code_signals;
+                let signals_settled = matches!(
+                    signals.state,
+                    GitTemporalState::Ready | GitTemporalState::Unavailable(_)
+                ) && signals.computed_for_content_generation
+                    == published.content_generation
+                    && published.source_version.as_deref()
+                        == Some(&signals.computed_for_source_version);
+                if let (Some((reconciled, events)), true) = (watcher, signals_settled) {
+                    break (published.publication_generation, reconciled, events);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher registration and its git-temporal job must settle");
+
     let (_review_hash, mut apply) = fixture.review_and_action().await;
     let target_path = apply["actions"][0]["mutation"]["entry"]["target"]["path"]
         .as_str()
@@ -447,6 +484,10 @@ async fn successful_apply_publishes_policy_and_voice_through_the_ordinary_watche
     apply["apply"] = json!(true);
     apply["idempotency_key"] = json!("gate-k-r11");
     let captured_before = fixture.index.published_generation();
+    assert_eq!(
+        captured_before.publication_generation, quiescent_generation,
+        "nothing may publish between watcher quiescence and the review"
+    );
     let policy_digest_before = captured_before.authority.policy_digest.clone();
 
     let applied = fixture
@@ -461,19 +502,6 @@ async fn successful_apply_publishes_policy_and_voice_through_the_ordinary_watche
         )),
         "{applied}"
     );
-    assert_eq!(
-        fixture.index.published_generation().publication_generation,
-        captured_before.publication_generation,
-        "curation must leave publication to the watcher"
-    );
-
-    let stop_token = Arc::new(AtomicBool::new(false));
-    let watcher_task = tokio::spawn(run_watcher_with_stop(
-        fixture.dir.path().to_path_buf(),
-        Arc::clone(&fixture.index),
-        Arc::clone(&fixture.watcher_info),
-        Arc::clone(&stop_token),
-    ));
     let expected_policy_digest = token(&applied, "post_policy_digest");
 
     let published_after = tokio::time::timeout(Duration::from_secs(5), async {
@@ -495,6 +523,16 @@ async fn successful_apply_publishes_policy_and_voice_through_the_ordinary_watche
         .await
         .expect("watcher must stop promptly")
         .expect("watcher task must not panic");
+    {
+        // The running watcher, not a reconcile, published the write: its event
+        // lane advanced and no reconcile ran after quiescence.
+        let info = fixture.watcher_info.lock();
+        assert!(
+            info.events_processed > events_before,
+            "the watcher's event lane must observe the curation write"
+        );
+        assert_eq!(info.last_reconcile_at, Some(quiescent_reconcile_at));
+    }
 
     assert_eq!(
         captured_before.authority.policy_digest, policy_digest_before,
