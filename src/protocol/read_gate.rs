@@ -89,6 +89,9 @@ pub fn observe_disk_beneath(
              observation is confined beneath it]"
         ));
     }
+    // `refuse_by_policy` inside the gate matches the caller's spelling only; an
+    // alias of a credential file is refused on the path the filesystem resolves.
+    crate::protocol::edit::refuse_path_alias(workspace_root, relative_path)?;
     let full_path = workspace_root.join(candidate);
     admit_disk_read(live, relative_path, &full_path)
 }

@@ -1213,7 +1213,7 @@ fn freshen_exact_path_for_targeted_retrieval(
     ))
 }
 
-pub(super) fn safe_repo_path_for_freshen(
+pub(crate) fn safe_repo_path_for_freshen(
     repo_root: &std::path::Path,
     relative_path: &str,
 ) -> Result<PathBuf, String> {
@@ -1225,6 +1225,9 @@ pub(super) fn safe_repo_path_for_freshen(
     {
         return Err(format!("path '{relative_path}' is outside the repository"));
     }
+    // Checked before the not-on-disk fallback below, which would otherwise
+    // swallow the refusal and hand the alias to the freshen lane anyway.
+    edit::refuse_path_alias(repo_root, relative_path)?;
 
     match edit::safe_repo_path(repo_root, relative_path) {
         Ok(path) => Ok(path),
@@ -9048,6 +9051,7 @@ impl SymForgeServer {
                     Err(message) if message.contains("outside the repository") => {
                         return format::path_outside_repo(&input.path);
                     }
+                    Err(message) if is_admission_refusal(&message) => return message,
                     _ => {}
                 }
             }
@@ -9169,6 +9173,9 @@ impl SymForgeServer {
                         Err(message) if message.contains("outside the repository") => {
                             return format::path_outside_repo(&input.path);
                         }
+                        // An alias of a credential file gets the refusal its
+                        // canonical spelling gets, not a false "not found".
+                        Err(message) if is_admission_refusal(&message) => return message,
                         Err(_) => return format::not_found_file(&input.path),
                     };
                     if canon_path.is_file() {
@@ -9306,6 +9313,7 @@ impl SymForgeServer {
         };
         let canon_path = match edit::safe_repo_path(&root, &input.path) {
             Ok(path) => path,
+            Err(message) if is_admission_refusal(&message) => return message,
             Err(_) => return format::not_found_file(&input.path),
         };
         if !canon_path.is_file() {
@@ -29414,6 +29422,157 @@ mod tests {
                 .get_file("src/lib.rs")
                 .is_none()
         );
+    }
+
+    /// Placeholder bytes for credential-path fixtures. Deliberately not shaped
+    /// like any secret, so only the PATH rule can withhold them.
+    const ALIAS_FIXTURE_BODY: &str = "placeholder-fixture-value\n";
+
+    fn write_credential_alias_fixtures(root: &Path) {
+        std::fs::create_dir_all(root.join(".aws")).unwrap();
+        std::fs::write(root.join(".aws/credentials"), ALIAS_FIXTURE_BODY).unwrap();
+        std::fs::write(root.join(".env"), ALIAS_FIXTURE_BODY).unwrap();
+    }
+
+    /// Spellings that open a credential fixture without naming it lexically.
+    /// Windows adds trailing-dot, trailing-space, stream and (when the volume
+    /// generates them) 8.3 short-name aliases. A directory symlink is portable
+    /// wherever the platform lets the test create one.
+    fn credential_alias_spellings(root: &Path) -> Vec<String> {
+        let mut aliases = Vec::new();
+        #[cfg(windows)]
+        {
+            aliases.push(".aws/credentials.".to_string());
+            aliases.push(".aws/credentials ".to_string());
+            aliases.push(".aws/credentials::$DATA".to_string());
+            aliases.push(".env::$DATA".to_string());
+            if root.join(".aws").join("CREDEN~1").is_file() {
+                aliases.push(".aws/CREDEN~1".to_string());
+            } else {
+                eprintln!(
+                    "8.3 short names are not generated on this volume; short-name alias skipped"
+                );
+            }
+        }
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(root.join(".aws"), root.join("linked"));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(root.join(".aws"), root.join("linked"));
+        match linked {
+            Ok(()) => aliases.push("linked/credentials".to_string()),
+            Err(error) => {
+                eprintln!("cannot create a directory symlink here ({error}); symlink alias skipped")
+            }
+        }
+        aliases
+    }
+
+    #[test]
+    fn caller_path_entry_points_refuse_aliases_of_credential_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_credential_alias_fixtures(dir.path());
+
+        // Lexical traversal is refused before any alias resolution.
+        assert!(super::edit::safe_repo_path(dir.path(), "sub/../.aws/credentials").is_err());
+        assert!(super::safe_repo_path_for_freshen(dir.path(), "sub/../.aws/credentials").is_err());
+
+        for alias in credential_alias_spellings(dir.path()) {
+            let direct = super::edit::safe_repo_path(dir.path(), &alias);
+            assert!(direct.is_err(), "safe_repo_path admitted alias {alias:?}");
+            let freshen = super::safe_repo_path_for_freshen(dir.path(), &alias);
+            assert!(
+                freshen.is_err(),
+                "safe_repo_path_for_freshen admitted alias {alias:?}"
+            );
+            // When the alias resolves to the credential file, the refusal is the
+            // one the canonical spelling gets from the read gate.
+            if !alias.contains(':') {
+                assert_eq!(
+                    direct.unwrap_err(),
+                    super::format::content_withheld_by_admission(&alias),
+                    "alias {alias:?} must get the canonical refusal"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_alias_components_are_refused_for_ordinary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        // Each of these opens src/lib.rs on Windows; admitting one would index
+        // the same file under a second key.
+        for alias in [
+            "src/lib.rs.",
+            "src/lib.rs ",
+            "src/lib.rs::$DATA",
+            "src./lib.rs",
+        ] {
+            assert!(
+                super::edit::safe_repo_path(dir.path(), alias).is_err(),
+                "safe_repo_path admitted alias {alias:?}"
+            );
+            assert!(
+                super::safe_repo_path_for_freshen(dir.path(), alias).is_err(),
+                "safe_repo_path_for_freshen admitted alias {alias:?}"
+            );
+        }
+        assert!(super::edit::safe_repo_path(dir.path(), "src/lib.rs").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_dot_and_colon_names_stay_legal_on_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["notes.", "a:b.txt"] {
+            std::fs::write(dir.path().join(name), "distinct file\n").unwrap();
+            assert!(
+                super::edit::safe_repo_path(dir.path(), name).is_ok(),
+                "{name:?} names a distinct file on Unix"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aliased_credential_file_is_neither_published_nor_served() {
+        let (dir, server) = setup_loaded_edit_test(&[]);
+        write_credential_alias_fixtures(dir.path());
+
+        for alias in credential_alias_spellings(dir.path()) {
+            // Lane A: a targeted freshen must not publish the alias.
+            let _ = super::freshen_exact_path_for_targeted_retrieval(
+                &server,
+                &super::search::PathScope::exact(&alias),
+            );
+            let published = server
+                .index()
+                .data_plane()
+                .read()
+                .get_file(&alias)
+                .map(|file| file.content.clone());
+            assert!(
+                published.is_none(),
+                "alias {alias:?} was published into the index"
+            );
+
+            // Lane B: the disk fallback must not serve the bytes either.
+            let served = server
+                .get_file_content(Parameters(get_file_content_input(&alias)))
+                .await;
+            assert!(
+                !served.contains(ALIAS_FIXTURE_BODY.trim()),
+                "alias {alias:?} disclosed credential bytes: {served}"
+            );
+            if !alias.contains(':') {
+                assert!(
+                    super::is_admission_refusal(&served),
+                    "alias {alias:?} must get the canonical admission refusal: {served}"
+                );
+            }
+        }
     }
 
     #[test]

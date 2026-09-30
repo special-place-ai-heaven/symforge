@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{LanguageId, ReferenceKind};
 use crate::sidecar::{SidecarState, SymbolSnapshot, SymbolSnapshotCache, build_with_budget};
-use crate::{protocol::edit, watcher};
+use crate::watcher;
 
 // ---------------------------------------------------------------------------
 // Request parameter structs
@@ -224,30 +224,6 @@ fn format_context_envelope(
     }
 }
 
-fn safe_sidecar_path_for_freshen(
-    repo_root: &std::path::Path,
-    relative_path: &str,
-) -> Result<std::path::PathBuf, String> {
-    let relative = std::path::Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(format!("path '{relative_path}' is outside the repository"));
-    }
-
-    match edit::safe_repo_path(repo_root, relative_path) {
-        Ok(path) => Ok(path),
-        Err(_) => {
-            let canon_root = repo_root
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve repo root: {e}"))?;
-            Ok(canon_root.join(relative))
-        }
-    }
-}
-
 fn freshen_sidecar_path_if_stale_at_generation(
     state: &SidecarState,
     repo_root: Option<&std::path::Path>,
@@ -257,7 +233,8 @@ fn freshen_sidecar_path_if_stale_at_generation(
     let Some(repo_root) = repo_root else {
         return Ok(ContextSourceAuthority::CurrentIndex);
     };
-    let Ok(abs_path) = safe_sidecar_path_for_freshen(repo_root, relative_path) else {
+    let Ok(abs_path) = crate::protocol::tools::safe_repo_path_for_freshen(repo_root, relative_path)
+    else {
         return Ok(ContextSourceAuthority::CurrentIndex);
     };
     // V11 observation lane (C4c): a request-path freshen re-admission
@@ -1142,6 +1119,10 @@ async fn impact_text(
     if normalized_path.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // Both branches below publish this caller-supplied path into the index, so
+    // it takes the same alias refusal as every other caller-path entry point.
+    crate::protocol::tools::safe_repo_path_for_freshen(&root, &normalized_path)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let is_new_file = params.new_file.unwrap_or(false);
 

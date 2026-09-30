@@ -30,6 +30,7 @@ pub(crate) fn safe_repo_path(repo_root: &Path, relative_path: &str) -> Result<Pa
     if has_parent_traversal {
         return Err(format!("path '{relative_path}' is outside the repository"));
     }
+    refuse_path_alias(repo_root, relative_path)?;
 
     let canon_root = repo_root
         .canonicalize()
@@ -41,6 +42,54 @@ pub(crate) fn safe_repo_path(repo_root: &Path, relative_path: &str) -> Result<Pa
         return Err(format!("path '{relative_path}' is outside the repository"));
     }
     Ok(canon_path)
+}
+
+/// Refuse a caller spelling that opens a file under a name other than its own.
+///
+/// The credential path rule is lexical, but the filesystem is not: a symlinked
+/// directory, an 8.3 short name, a trailing dot or space, or an NTFS stream
+/// suffix all open a credential file while the caller's string never matches
+/// the rule. So the rule is evaluated again on the path the filesystem
+/// resolves, relative to the resolved root, and a match gets the same refusal
+/// the canonical spelling gets from the read gate. Spellings the rule already
+/// matches are left to the downstream gate, which refuses them unchanged.
+///
+/// On Windows a component containing `:` or ending in `.` or ` ` never names a
+/// distinct file, only another spelling of one, so it is refused outright and
+/// no file is ever indexed under a second key. On Unix those are ordinary,
+/// distinct file names and stay legal.
+pub(crate) fn refuse_path_alias(repo_root: &Path, relative_path: &str) -> Result<(), String> {
+    // Resolve through the non-verbatim root: a `\\?\` root switches off the
+    // Win32 name normalization that turns an alias into the real file, so it
+    // would hide an alias that any non-verbatim reader would still open.
+    if crate::knowledge::sensitive_path_rule(relative_path).is_none()
+        && let (Ok(canon_root), Ok(canon_path)) = (
+            repo_root.canonicalize(),
+            dunce::simplified(repo_root)
+                .join(relative_path)
+                .canonicalize(),
+        )
+        && let Ok(canonical_relative) = canon_path.strip_prefix(&canon_root)
+        && crate::knowledge::sensitive_path_rule(&canonical_relative.to_string_lossy()).is_some()
+    {
+        return Err(crate::protocol::format::content_withheld_by_admission(
+            relative_path,
+        ));
+    }
+    #[cfg(windows)]
+    if Path::new(relative_path).components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        name.contains(':') || name.ends_with('.') || name.ends_with(' ')
+    }) {
+        return Err(format!(
+            "path '{relative_path}' is an alias spelling on Windows (a ':' stream \
+             suffix or a trailing dot or space); use the file's own name"
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
