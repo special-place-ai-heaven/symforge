@@ -74,6 +74,34 @@ pub fn exceeds_scan_limit(len: usize) -> bool {
     len > SECRET_SCAN_MAX_BYTES
 }
 
+/// How many finding line ranges a scan keeps: the ten a refusal shows, plus one
+/// so it knows to say there are more.
+pub const FINDING_LINE_RANGES_KEPT: usize = 11;
+
+/// The first [`FINDING_LINE_RANGES_KEPT`] runs of set bits, as inclusive
+/// 1-based line ranges. Bit `n` is line `n + 1`.
+fn first_line_ranges(line_bits: &[u64]) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for (word_index, &word) in line_bits.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            let bit = word_index * 64 + rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let line = u32::try_from(bit + 1).unwrap_or(u32::MAX);
+            match ranges.last_mut() {
+                Some((_, end)) if end.checked_add(1) == Some(line) => *end = line,
+                _ => {
+                    if ranges.len() == FINDING_LINE_RANGES_KEPT {
+                        return ranges;
+                    }
+                    ranges.push((line, line));
+                }
+            }
+        }
+    }
+    ranges
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DetectorFailure {
     PolicyCompilation,
@@ -87,11 +115,13 @@ pub enum SecretScan {
     Sensitive {
         rule_ids: Vec<&'static str>,
         finding_count: u32,
-        /// 1-based line of each finding's capture, ascending, deduplicated.
-        /// Lines, never bytes: enough to locate a false positive, nothing of
-        /// the value. Rendered by the read gate at refusal time and never
-        /// persisted, so the snapshot schema does not change.
-        lines: Vec<u32>,
+        /// Inclusive 1-based line ranges holding a finding's capture,
+        /// ascending, merged across rules, and only the first
+        /// [`FINDING_LINE_RANGES_KEPT`]: one more than a refusal shows, so it
+        /// can say more exist. Lines, never bytes: enough to locate a false
+        /// positive, nothing of the value. Rendered by the read gate at refusal
+        /// time and never persisted, so the snapshot schema does not change.
+        line_ranges: Vec<(u32, u32)>,
     },
     Indeterminate {
         reason: DetectorFailure,
@@ -805,7 +835,9 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
 
     let mut rule_ids = Vec::new();
     let mut finding_count = 0_u32;
-    let mut lines = Vec::new();
+    // One bit per line, merged across rules. Bounded by the scan budget: at most
+    // one bit per byte, so 512 KiB for a file of nothing but newlines.
+    let mut line_bits: Vec<u64> = Vec::new();
     for rule in rules {
         if !rule
             .keywords
@@ -814,6 +846,10 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
         {
             continue;
         }
+        // A rule's captures arrive in ascending order, so one cursor per rule
+        // counts every newline once: linear in the file, not in findings times
+        // file.
+        let (mut cursor, mut line) = (0_usize, 0_usize);
         for captures in rule.pattern.captures_iter(bytes) {
             let Some(secret) = captures.get(rule.secret_capture) else {
                 return SecretScan::Indeterminate {
@@ -855,26 +891,26 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
             if !rule_ids.contains(&rule.id) {
                 rule_ids.push(rule.id);
             }
-            // ponytail: one newline count per finding; findings are few, and a
-            // running cursor is the upgrade if a file ever carries thousands.
-            let line = bytes[..secret.start()]
+            line += bytes[cursor..secret.start()]
                 .iter()
                 .filter(|byte| **byte == b'\n')
-                .count()
-                .saturating_add(1);
-            lines.push(u32::try_from(line).unwrap_or(u32::MAX));
+                .count();
+            cursor = secret.start();
+            let word = line / 64;
+            if word >= line_bits.len() {
+                line_bits.resize(word + 1, 0);
+            }
+            line_bits[word] |= 1 << (line % 64);
         }
     }
 
     if finding_count == 0 {
         SecretScan::Clean
     } else {
-        lines.sort_unstable();
-        lines.dedup();
         SecretScan::Sensitive {
             rule_ids,
             finding_count,
-            lines,
+            line_ranges: first_line_ranges(&line_bits),
         }
     }
 }
@@ -2182,9 +2218,11 @@ mod tests {
         for (id, path, body, rule) in rows {
             match scan_secret_bytes(path, body.as_bytes()) {
                 SecretScan::Sensitive {
-                    rule_ids, lines, ..
+                    rule_ids,
+                    line_ranges,
+                    ..
                 } if rule_ids.contains(&rule) => {
-                    if lines.is_empty() {
+                    if line_ranges.is_empty() {
                         failures.push(format!("{id}: caught but no finding line recorded"));
                     }
                 }
@@ -2210,12 +2248,77 @@ mod tests {
     #[test]
     fn findings_carry_one_based_lines() {
         let body = ["fn a() {}\nlet ", &mx_token(), " = \"", &mx_real(), "\";\n"].concat();
-        let SecretScan::Sensitive { lines, .. } =
+        let SecretScan::Sensitive { line_ranges, .. } =
             scan_secret_bytes("src/probe.rs", body.as_bytes())
         else {
             panic!("fixture must be caught");
         };
-        assert_eq!(lines, vec![2]);
+        assert_eq!(line_ranges, vec![(2, 2)]);
+    }
+
+    /// Two rules on alternating lines are ONE range: ranges merge across rules,
+    /// not per rule, so a rule's own gaps never split what the file shows.
+    #[test]
+    fn finding_ranges_merge_across_rules() {
+        let uri = ["scheme://u:", &mx_real(), "@db.prod\n"].concat();
+        let short = [&["p", "wd"].concat(), "=", "a1b2c3d4", "\n"].concat();
+        let body = format!("{uri}{short}").repeat(3);
+        let SecretScan::Sensitive {
+            finding_count,
+            line_ranges,
+            ..
+        } = scan_secret_bytes("deploy.env", body.as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        assert_eq!(finding_count, 6);
+        assert_eq!(line_ranges, vec![(1, 6)]);
+    }
+
+    /// Only the first ranges are kept, and one more than a refusal shows.
+    #[test]
+    fn finding_ranges_stop_after_the_kept_count() {
+        let short = [&["p", "wd"].concat(), "=", "a1b2c3d4", "\n\n"].concat();
+        let SecretScan::Sensitive {
+            finding_count,
+            line_ranges,
+            ..
+        } = scan_secret_bytes("deploy.env", short.repeat(15).as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        assert_eq!(finding_count, 15);
+        let expected = (0..FINDING_LINE_RANGES_KEPT as u32)
+            .map(|index| (2 * index + 1, 2 * index + 1))
+            .collect::<Vec<_>>();
+        assert_eq!(line_ranges, expected);
+    }
+
+    /// A file of nothing but short findings at the scan budget: every
+    /// classification pays for the line accounting, so it must be linear in the
+    /// file, not in findings times file. About 2 s in a local debug build; the
+    /// per-finding recount did not finish in 120 s.
+    #[test]
+    fn dense_findings_at_the_scan_budget_scan_in_linear_time() {
+        let finding = [&["p", "wd"].concat(), "=", "a1b2c3d4", "\n"].concat();
+        let count = (SECRET_SCAN_MAX_BYTES - 64) / finding.len();
+        let body = finding.repeat(count);
+        let started = std::time::Instant::now();
+        let SecretScan::Sensitive {
+            finding_count,
+            line_ranges,
+            ..
+        } = scan_secret_bytes("deploy.env", body.as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(finding_count as usize, count);
+        assert_eq!(line_ranges, vec![(1, u32::try_from(count).unwrap())]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "{count} findings took {elapsed:?}"
+        );
     }
 
     #[test]

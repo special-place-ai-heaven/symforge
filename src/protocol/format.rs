@@ -3856,21 +3856,17 @@ pub fn content_withheld_by_admission<S: AsRef<str>>(
     path: &str,
     rule_ids: &[S],
     finding_count: u32,
-    lines: &[u32],
+    line_ranges: &[(u32, u32)],
 ) -> String {
     let rules = rule_ids
         .iter()
         .map(AsRef::as_ref)
         .collect::<Vec<_>>()
         .join(", ");
-    let at = if lines.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " at line{} {}",
-            if lines.len() == 1 { "" } else { "s" },
-            line_ranges(lines)
-        )
+    let at = match line_ranges {
+        [] => String::new(),
+        [(start, end)] if start == end => format!(" at line {start}"),
+        _ => format!(" at lines {}", render_line_ranges(line_ranges)),
     };
     format!(
         "Content withheld by admission policy: {path}. \
@@ -3891,17 +3887,10 @@ pub fn content_withheld_by_path_rule(path: &str, rule_id: &str) -> String {
     )
 }
 
-/// `1, 3-5, 9`: ascending 1-based lines collapsed into ranges, the first ten
-/// ranges shown.
-fn line_ranges(lines: &[u32]) -> String {
+/// `1, 3-5, 9`: the first ten ranges; the scan keeps one more only to say
+/// there are more.
+fn render_line_ranges(ranges: &[(u32, u32)]) -> String {
     const SHOWN: usize = 10;
-    let mut ranges: Vec<(u32, u32)> = Vec::new();
-    for &line in lines {
-        match ranges.last_mut() {
-            Some((_, end)) if end.checked_add(1) == Some(line) => *end = line,
-            _ => ranges.push((line, line)),
-        }
-    }
     let mut rendered = ranges
         .iter()
         .take(SHOWN)
@@ -3915,7 +3904,7 @@ fn line_ranges(lines: &[u32]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     if ranges.len() > SHOWN {
-        rendered.push_str(&format!(" (+{} more)", ranges.len() - SHOWN));
+        rendered.push_str(" and more");
     }
     rendered
 }

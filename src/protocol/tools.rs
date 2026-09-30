@@ -35312,7 +35312,7 @@ mod tests {
             "config/settings.toml",
             &["secret.context-assignment"],
             1,
-            &[3],
+            &[(3, 3)],
         );
         assert_eq!(
             super::classify_compact_tool_output("validate_file_syntax", &refusal),
@@ -35335,7 +35335,7 @@ mod tests {
             "config/settings.toml",
             &["secret.context-assignment"],
             1,
-            &[3],
+            &[(3, 3)],
         );
         assert_eq!(
             super::classify_compact_tool_output("get_file_content", &refusal),
@@ -36451,9 +36451,9 @@ mod tests {
                 crate::knowledge::SecretScan::Sensitive {
                     rule_ids,
                     finding_count,
-                    lines,
+                    line_ranges,
                 } => findings.push(format!(
-                    "{relative} [{finding_count}] {rule_ids:?} lines {lines:?}"
+                    "{relative} [{finding_count}] {rule_ids:?} lines {line_ranges:?}"
                 )),
                 crate::knowledge::SecretScan::Indeterminate { reason } => {
                     findings.push(format!("{relative} [indeterminate {reason:?}]"));

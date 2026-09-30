@@ -281,7 +281,11 @@ pub(crate) fn unverified_notice(live: &LiveIndex, requested: &str) -> Option<Str
 /// relative path beneath the indexed root, a regular file (a symlink is not
 /// followed), and no more than the scan budget. Any doubt yields no lines, and
 /// the refusal itself never depends on this read.
-fn recorded_finding_lines(live: &LiveIndex, relative_path: &str, recorded: &[String]) -> Vec<u32> {
+fn recorded_finding_lines(
+    live: &LiveIndex,
+    relative_path: &str,
+    recorded: &[String],
+) -> Vec<(u32, u32)> {
     let Some(root) = live.indexed_root.as_deref() else {
         return Vec::new();
     };
@@ -308,13 +312,15 @@ fn recorded_finding_lines(live: &LiveIndex, relative_path: &str, recorded: &[Str
     };
     match crate::knowledge::scan_secret_bytes(relative_path, &bytes) {
         crate::knowledge::SecretScan::Sensitive {
-            rule_ids, lines, ..
+            rule_ids,
+            line_ranges,
+            ..
         } if rule_ids.len() == recorded.len()
             && rule_ids
                 .iter()
                 .all(|rule| recorded.iter().any(|seen| seen == rule)) =>
         {
-            lines
+            line_ranges
         }
         _ => Vec::new(),
     }
@@ -451,8 +457,8 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
         bytes,
         |path, bytes| {
             let scan = crate::knowledge::scan_secret_bytes(path, bytes);
-            if let crate::knowledge::SecretScan::Sensitive { lines, .. } = &scan {
-                finding_lines.clone_from(lines);
+            if let crate::knowledge::SecretScan::Sensitive { line_ranges, .. } = &scan {
+                finding_lines.clone_from(line_ranges);
             }
             scan
         },
