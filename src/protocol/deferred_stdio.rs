@@ -28,7 +28,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
     GetPromptResponse, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
     ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResponse, ServerInfo,
+    ReadResourceRequestParams, ReadResourceResponse, ServerConfig,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -253,7 +253,7 @@ fn reports_loading(result: &CallToolResult) -> bool {
 }
 
 impl ServerHandler for DeferredStdioServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.shell.get_info()
     }
 

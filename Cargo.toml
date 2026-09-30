@@ -85,7 +85,7 @@ schemars = "1"
 # resolves >=1.7 (the `allowed_hosts` DNS-rebinding behavior depends on >=1.7
 # APIs). Future fix: pin an exact/min version (or treat Cargo.lock as the source
 # of truth) and add a minimum-version / deny check so a downgrade can't slip in.
-rmcp = { version = "3.1", features = ["transport-io", "transport-streamable-http-server"], optional = true }
+rmcp = { version = "3.5", features = ["transport-io", "transport-streamable-http-server"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Maintained libyaml-lineage YAML backend. The previous `serde_yml 0.0.13` fork
@@ -175,6 +175,10 @@ criterion = "0.8.2"
 # Upstream build.rs uses `-Wno-unused-parameter` which MSVC rejects.
 # Patched copy uses `flag_if_supported` so the flag is silently skipped on MSVC.
 tree-sitter-scss = { path = "vendor/tree-sitter-scss" }
+# rmcp 3.5.0 with two lifecycle fixes: clear the discover-latched request-metadata
+# requirement after a successful initialize, and record the negotiated protocol
+# version as peer info. See vendor/rmcp/SYMFORGE-PATCH.md; drop on upstream fix.
+rmcp = { path = "vendor/rmcp" }
 
 [profile.release]
 lto = true
