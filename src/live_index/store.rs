@@ -1204,8 +1204,13 @@ pub struct SnapshotVerifyReport {
     pub mismatch_count: usize,
     pub mismatched_paths: Vec<String>,
     /// Why the mismatches exist, in words an agent can act on. `None` when
-    /// there are none.
+    /// nothing needed explaining.
     pub reason: Option<String>,
+    /// Restored paths the verify could not reconcile, with why. Their rows
+    /// are withheld from every query lane, their catalog entries stay, and a
+    /// direct request is refused with the reason. A later successful re-read
+    /// of the path through the canonical single-file seam releases it.
+    pub unverified: Arc<BTreeMap<String, String>>,
 }
 
 impl SnapshotVerifyReport {
@@ -1218,13 +1223,19 @@ impl SnapshotVerifyReport {
             mismatch_count,
             mismatched_paths: paths,
             reason: None,
+            unverified: Arc::default(),
         }
     }
 
     pub fn with_reason(mut self, reason: String) -> Self {
-        if self.mismatch_count > 0 {
+        if !reason.is_empty() {
             self.reason = Some(reason);
         }
+        self
+    }
+
+    pub fn with_unverified(mut self, unverified: BTreeMap<String, String>) -> Self {
+        self.unverified = Arc::new(unverified);
         self
     }
 
@@ -1233,12 +1244,31 @@ impl SnapshotVerifyReport {
             mismatch_count: 0,
             mismatched_paths: Vec::new(),
             reason: None,
+            unverified: Arc::default(),
         }
     }
 
     pub fn omitted_path_count(&self) -> usize {
         self.mismatch_count
             .saturating_sub(self.mismatched_paths.len())
+    }
+}
+
+/// How a snapshot verify resolves: its report, and for every path it could
+/// not reconcile, the restored row the stat pass saw. Only a row still
+/// identical to that one is withheld; a row another writer republished since
+/// is that writer's, and current.
+pub(crate) struct SnapshotVerifyCompletion {
+    pub report: SnapshotVerifyReport,
+    pub restored_rows: Vec<(String, Option<Arc<IndexedFile>>)>,
+}
+
+impl From<SnapshotVerifyReport> for SnapshotVerifyCompletion {
+    fn from(report: SnapshotVerifyReport) -> Self {
+        Self {
+            report,
+            restored_rows: Vec::new(),
+        }
     }
 }
 
@@ -1623,8 +1653,9 @@ pub(crate) struct SnapshotVerifyBatchReceipt {
     pub completed: bool,
 }
 
-/// Test-only fault injection: a snapshot-verify batch panics while applying
-/// this path, standing in for any panic inside `update_file`.
+/// Test-only fault injection: the next `update_file` of this path panics once,
+/// after inserting the row and before updating its indices, standing in for
+/// any panic that leaves a row half applied.
 #[cfg(test)]
 pub(crate) fn snapshot_verify_test_panic_path() -> &'static parking_lot::Mutex<Option<String>> {
     static PATH: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
@@ -4128,10 +4159,10 @@ impl SharedIndexHandle {
     /// Resolve the verification under the project-generation fence only; see
     /// [`Self::mark_snapshot_verify_started_at_generation`] for why the
     /// publication fence is not used here.
-    pub fn mark_snapshot_verify_completed_at_generation(
+    pub(crate) fn mark_snapshot_verify_completed_at_generation(
         &self,
         expected_gen: u64,
-        report: SnapshotVerifyReport,
+        completion: impl Into<SnapshotVerifyCompletion>,
     ) -> bool {
         let _wg = self.write_mutex.lock();
         if self.project_generation.load(Ordering::Acquire) != expected_gen {
@@ -4146,10 +4177,14 @@ impl SharedIndexHandle {
             return true;
         }
         let mut live = (*current).clone();
-        live.snapshot_verify_state = SnapshotVerifyState::Completed(report);
+        let withheld = live.resolve_snapshot_verify(completion.into());
         let scout_plan = self.scout_plan.load_full();
         self.recompute_freshness_locked(&live, scout_plan.as_deref());
-        self.swap_and_publish_retaining_content(live);
+        if withheld {
+            self.swap_and_publish(live);
+        } else {
+            self.swap_and_publish_retaining_content(live);
+        }
         true
     }
 
@@ -4199,7 +4234,7 @@ impl SharedIndexHandle {
         expected_gen: u64,
         removals: &[(String, PathBuf)],
         files: Vec<SnapshotVerifiedFile>,
-        completion: Option<SnapshotVerifyReport>,
+        completion: Option<SnapshotVerifyCompletion>,
     ) -> Option<SnapshotVerifyBatchReceipt> {
         let _wg = self.write_mutex.lock();
         if self.project_generation.load(Ordering::Acquire) != expected_gen {
@@ -4212,13 +4247,28 @@ impl SharedIndexHandle {
         let mut removed_paths = Vec::new();
         let mut evicted_rows = Vec::new();
         let mut scouted_entries = Vec::new();
-        let mut indexed_entries = Vec::new();
+        // Catalog writes are collected and applied in one pass at the end:
+        // finding or replacing a single entry scans the whole manifest.
+        let catalog: HashMap<String, usize> = live
+            .manifest_entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (scouted_catalog_path(&entry.path).to_string(), position))
+            .collect();
+        let mut catalog_drop: HashSet<String> = HashSet::new();
+        let mut catalog_set: Vec<CatalogEntry> = Vec::new();
+        let mut panicked = false;
 
         for (path, absolute_path) in removals {
             match std::fs::symlink_metadata(absolute_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     removed_paths.push(path.clone());
-                    if live.remove_file(path) {
+                    let row_removed = live.remove_row(path);
+                    let entry_held = catalog.contains_key(path);
+                    if entry_held {
+                        catalog_drop.insert(path.clone());
+                    }
+                    if row_removed || entry_held {
                         receipt.removed.push(path.clone());
                     }
                 }
@@ -4258,39 +4308,39 @@ impl SharedIndexHandle {
                     );
                     let path = verified.path.clone();
                     let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        #[cfg(test)]
-                        if snapshot_verify_test_panic_path().lock().as_deref() == Some(&path) {
-                            panic!("injected snapshot-verify admission panic");
-                        }
                         live.update_file_with_manifest(path.clone(), *file, false);
                     }));
                     if applied.is_err() {
                         // `update_file` inserts the row before its auxiliary
                         // indices, so a panic can leave this path half
-                        // applied. Drop it (row, indices, catalog entry) and
-                        // hand it to the canonical seam, whose own guard
+                        // applied. Drop the row and its indices, rebuild the
+                        // reverse index once before publishing, and hand the
+                        // path to the canonical seam, whose own guard
                         // discards its clone on a panic.
                         tracing::error!(
                             path = %verified.path,
                             "snapshot-verify admission panicked; path removed and retried alone"
                         );
-                        live.remove_file(&verified.path);
+                        live.remove_row(&verified.path);
+                        panicked = true;
                         receipt.refused.push(verified.path);
                         continue;
                     }
-                    indexed_entries.push(manifest_entry);
+                    catalog_set.push(manifest_entry);
                     receipt.indexed.push(verified.path);
                 }
                 SnapshotVerifiedAdmission::Terminal(disposition) => {
                     let manifest_entry =
                         catalog_entry_from_scout(&verified.scouted, disposition, None);
-                    let row_removed = live.remove_file(&verified.path);
+                    let row_removed = live.remove_row(&verified.path);
                     if row_removed {
                         evicted_rows.push(verified.path.clone());
                     }
-                    let entry_changed = !live.manifest_entries.contains(&manifest_entry);
+                    let entry_changed = catalog
+                        .get(&verified.path)
+                        .is_none_or(|&position| live.manifest_entries[position] != manifest_entry);
                     if entry_changed {
-                        live.upsert_manifest_entry_with_sort(manifest_entry, false);
+                        catalog_set.push(manifest_entry);
                     }
                     if row_removed || entry_changed {
                         receipt.terminal.push(verified.path);
@@ -4302,28 +4352,32 @@ impl SharedIndexHandle {
             scouted_entries.push(verified.scouted);
         }
 
-        let content_changed = !receipt.removed.is_empty()
+        if panicked {
+            live.rebuild_reverse_index();
+        }
+        let mut content_changed = panicked
+            || !receipt.removed.is_empty()
             || !receipt.indexed.is_empty()
             || !receipt.terminal.is_empty();
-        if !indexed_entries.is_empty() {
-            let replaced: HashSet<&str> = indexed_entries
-                .iter()
-                .map(|entry| scouted_catalog_path(&entry.path))
-                .collect();
+        if !catalog_drop.is_empty() || !catalog_set.is_empty() {
+            catalog_drop.extend(
+                catalog_set
+                    .iter()
+                    .map(|entry| scouted_catalog_path(&entry.path).to_string()),
+            );
             live.manifest_entries
-                .retain(|entry| !replaced.contains(scouted_catalog_path(&entry.path)));
-            drop(replaced);
-            live.manifest_entries.append(&mut indexed_entries);
+                .retain(|entry| !catalog_drop.contains(scouted_catalog_path(&entry.path)));
+            live.manifest_entries.append(&mut catalog_set);
         }
         if content_changed {
             live.sort_manifest_entries();
         }
-        if let Some(report) = completion
+        if let Some(completion) = completion
             && receipt.refused.is_empty()
             && verify_in_flight(&live.snapshot_verify_state)
             && live.load_source == IndexLoadSource::SnapshotRestore
         {
-            live.snapshot_verify_state = SnapshotVerifyState::Completed(report);
+            content_changed |= live.resolve_snapshot_verify(completion);
             receipt.completed = true;
         }
         if !content_changed && !receipt.completed {
@@ -6503,6 +6557,7 @@ impl LiveIndex {
     /// the entry per file scans the whole manifest each time, which dominated
     /// a snapshot-verify batch on a large repository.
     fn update_file_with_manifest(&mut self, path: String, file: IndexedFile, manifest: bool) {
+        self.release_unverified(&path);
         // Capture old reference names BEFORE replacing the file, so we can
         // clean up stale reverse index entries after the insert.
         let old_ref_names: Vec<String> = self
@@ -6519,6 +6574,14 @@ impl LiveIndex {
         // gitignore assertion failures). Auxiliary indices may become
         // temporarily stale, but the file won't vanish from the index.
         self.files.insert(path.clone(), Arc::new(file));
+        #[cfg(test)]
+        if snapshot_verify_test_panic_path()
+            .lock()
+            .take_if(|injected| *injected == path)
+            .is_some()
+        {
+            panic!("injected panic between a row insert and its index updates");
+        }
         if let Some(manifest_entry) = manifest_entry {
             self.upsert_manifest_entry_with_sort(manifest_entry, true);
         }
@@ -6632,17 +6695,76 @@ impl LiveIndex {
     /// Returns whether the index actually HELD anything for this path — the
     /// caller that reports a removal (or publishes one) must know, not assume.
     pub fn remove_file(&mut self, path: &str) -> bool {
-        self.remove_reverse_index_for_path(path);
-        let removed_file = self.files.remove(path).is_some();
+        self.release_unverified(path);
+        let removed_file = self.remove_row(path);
         let removed_manifest = self.remove_manifest_entry(path);
-        if removed_file {
-            self.trigram_index.remove_file(path);
-            self.remove_path_indices_for_path(path);
-        }
         if removed_file || removed_manifest {
             self.loaded_at_system = SystemTime::now();
         }
         removed_file || removed_manifest
+    }
+
+    /// Remove a row and its derived indices, leaving its catalog entry.
+    fn remove_row(&mut self, path: &str) -> bool {
+        self.remove_reverse_index_for_path(path);
+        let removed = self.files.remove(path).is_some();
+        if removed {
+            self.trigram_index.remove_file(path);
+            self.remove_path_indices_for_path(path);
+        }
+        removed
+    }
+
+    /// Why a restored path the snapshot verify could not reconcile is
+    /// withheld, while it still is.
+    pub fn unverified_since_restore(&self, path: &str) -> Option<&str> {
+        match &self.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => {
+                report.unverified.get(path).map(String::as_str)
+            }
+            _ => None,
+        }
+    }
+
+    /// A write that reached this path through a canonical seam settles it.
+    fn release_unverified(&mut self, path: &str) {
+        if let SnapshotVerifyState::Completed(report) = &mut self.snapshot_verify_state
+            && report.unverified.contains_key(path)
+        {
+            Arc::make_mut(&mut report.unverified).remove(path);
+            report.mismatch_count = report.mismatch_count.saturating_sub(1);
+            report
+                .mismatched_paths
+                .retain(|mismatched| mismatched != path);
+        }
+    }
+
+    /// Resolve the verify as `Completed`, withholding every restored row it
+    /// could not reconcile that is still the row it restored. Returns whether
+    /// any row was withheld, which changes content.
+    fn resolve_snapshot_verify(&mut self, completion: SnapshotVerifyCompletion) -> bool {
+        let SnapshotVerifyCompletion {
+            mut report,
+            restored_rows,
+        } = completion;
+        let mut withheld = false;
+        let mut unverified = (*report.unverified).clone();
+        for (path, restored) in restored_rows {
+            let current = self.files.get(&path);
+            match (current, restored) {
+                (None, _) => {}
+                (Some(current), Some(restored)) if Arc::ptr_eq(current, &restored) => {
+                    withheld |= self.remove_row(&path);
+                }
+                // Another writer republished it since the stat pass.
+                _ => {
+                    unverified.remove(&path);
+                }
+            }
+        }
+        report.unverified = Arc::new(unverified);
+        self.snapshot_verify_state = SnapshotVerifyState::Completed(report);
+        withheld
     }
 
     /// Remove reverse index entries for a single file path.

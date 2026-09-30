@@ -195,6 +195,12 @@ pub(crate) fn disk_read_would_refuse(
 /// Split out so both the disk lane and the git-object lane consult exactly the
 /// same policy, and so the disk lane can still refuse WITHOUT reading the file.
 pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
+    // A restored row the snapshot verify could not reconcile: its index row
+    // is withheld, and disk bytes are not a substitute the verify vouched for.
+    if let Some(reason) = live.unverified_since_restore(relative_path) {
+        return Some(format::unverified_since_restore(relative_path, reason));
+    }
+
     // Current path rule — no read needed.
     if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
         return Some(format::content_withheld_by_admission(relative_path));

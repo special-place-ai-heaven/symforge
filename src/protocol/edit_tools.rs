@@ -949,6 +949,9 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
+                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
+                    return format::unverified_since_restore(&params.0.path, reason);
+                }
                 return format::not_found_file(&params.0.path);
             }
         }
@@ -1262,6 +1265,9 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
+                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
+                    return format::unverified_since_restore(&params.0.path, reason);
+                }
                 return format::not_found_file(&params.0.path);
             }
         }
@@ -1484,6 +1490,9 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
+                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
+                    return format::unverified_since_restore(&params.0.path, reason);
+                }
                 return format::not_found_file(&params.0.path);
             }
         }
@@ -1703,6 +1712,9 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
+                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
+                    return format::unverified_since_restore(&params.0.path, reason);
+                }
                 return format::not_found_file(&params.0.path);
             }
         }

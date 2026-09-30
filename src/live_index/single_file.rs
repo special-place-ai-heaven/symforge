@@ -255,6 +255,26 @@ fn path_spelling_is_refused(abs_path: &Path, relative_path: &str) -> bool {
         .is_some_and(|root| crate::discovery::resolve_repo_path(&root, relative_path).is_err())
 }
 
+/// The metadata scout both halves of the seam run, with a test-only failure
+/// injection standing in for a scout error on a file that exists.
+fn scout_single_path(
+    relative_path: &str,
+    abs_path: &Path,
+) -> anyhow::Result<crate::domain::ScoutedEntry> {
+    #[cfg(test)]
+    if test_scout_failure_path().lock().as_deref() == Some(relative_path) {
+        anyhow::bail!("injected scout failure");
+    }
+    crate::discovery::scout_single_path(relative_path, abs_path)
+}
+
+/// Test-only fault injection for [`scout_single_path`].
+#[cfg(test)]
+pub(crate) fn test_scout_failure_path() -> &'static parking_lot::Mutex<Option<String>> {
+    static PATH: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+    &PATH
+}
+
 pub(crate) fn catalog_terminal_disposition(decision: &ScoutDecision) -> Option<FileDisposition> {
     match decision {
         ScoutDecision::HardSkip { reason } => Some(FileDisposition::HardSkip { reason: *reason }),
@@ -354,7 +374,7 @@ pub(crate) fn prepare_snapshot_verify_admission(
         admission: SnapshotVerifiedAdmission::Terminal(disposition),
         base_hash: base_hash.clone(),
     };
-    let mut scouted = crate::discovery::scout_single_path(relative_path, abs_path).ok()?;
+    let mut scouted = scout_single_path(relative_path, abs_path).ok()?;
     if let Some(disposition) = catalog_terminal_disposition(&scouted.decision) {
         return Some(terminal(scouted, disposition));
     }
@@ -500,7 +520,7 @@ where
         let expected_index_state_generation = base.health.generation;
 
         // Run the same metadata-first scout as cold load before any whole-file read.
-        let mut scouted = match crate::discovery::scout_single_path(relative_path, abs_path) {
+        let mut scouted = match scout_single_path(relative_path, abs_path) {
             Ok(scouted) => scouted,
             Err(error) => {
                 if matches!(

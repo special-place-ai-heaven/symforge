@@ -480,28 +480,34 @@ where
             };
 
         let mut repairs_applied = 0usize;
-        // A snapshot verify running beside this sweep owns every path its stat
-        // pass flagged (changed, new, deleted) and publishes them together in
-        // one publication. Admitting them here too would cost one whole-index
-        // publication each, the exact cost the verify batches away. The two
-        // lanes never share state: the sweep does not touch the verify state
-        // or its mismatch report, and the verify treats a row another writer
-        // republished as already newer, so nothing is counted twice and the
-        // verify still resolves. A path that changes after the verify's stat
-        // pass is not claimed, is stale against its row, and is admitted here.
-        // Past the wait the verify is still in its stat pass and owns every
-        // restored row it has yet to classify, so defer all of them and admit
-        // only paths it holds no row for.
-        let verify = snapshot_verify_claims(shared, &should_stop);
-        let claimed = verify.as_ref().and_then(|verify| verify.as_ref()?.claims());
-        let defer_restored = verify.is_some() && claimed.is_none();
+        // While a restored index's snapshot verify is pending or running it
+        // owns every restored row, and it publishes its re-reads together in
+        // one publication; after it failed, the restored rows stay withheld
+        // until index_folder rebuilds them. In all three states the sweep
+        // leaves every row the index holds alone, and every path the running
+        // verify has claimed, and handles only paths nobody holds. It never
+        // waits on the verify and never re-admits restored rows one
+        // whole-index publication each. It does not reconcile restored rows
+        // at all until the verify has resolved.
+        let verify_progress = match &shared.read().snapshot_verify_state {
+            crate::live_index::store::SnapshotVerifyState::Pending
+            | crate::live_index::store::SnapshotVerifyState::Failed(_) => Some(None),
+            crate::live_index::store::SnapshotVerifyState::Running(progress) => {
+                Some(Some(progress.clone()))
+            }
+            _ => None,
+        };
+        let verify_owns_rows = verify_progress.is_some();
+        let claimed = verify_progress
+            .as_ref()
+            .and_then(|progress| progress.as_ref()?.claims());
         let (mut admitted, mut already_current, mut left_to_verify) = (0usize, 0usize, 0usize);
         for (relative_path, absolute_path, entry) in changed_entries {
             if should_stop() {
                 return stale_count.into();
             }
             if claimed.is_some_and(|claimed| claimed.contains(&relative_path))
-                || (defer_restored && shared.read().files.contains_key(&relative_path))
+                || (verify_owns_rows && shared.read().files.contains_key(&relative_path))
             {
                 left_to_verify += 1;
                 continue;
@@ -632,48 +638,19 @@ where
     }
 }
 
-/// Longest a sweep waits for a running snapshot verify to finish its stat
-/// pass and claim its paths. Past it the sweep still leaves every restored
-/// row to the verify and admits only paths it holds no row for.
-const SNAPSHOT_VERIFY_CLAIMS_WAIT: Duration = Duration::from_secs(300);
+/// Holds the periodic-sweep flag while a sweep runs, and clears it when the
+/// sweep ends, panics included.
+struct SweepSingleFlight(Arc<AtomicBool>);
 
-/// Longest a sweep waits for a pending snapshot verify to start. Its task is
-/// spawned beside the restore and marks itself running at once; one still
-/// pending past this is not coming (a restore with no runtime to spawn it on),
-/// and the sweep reconciles the restored rows itself.
-const SNAPSHOT_VERIFY_START_WAIT: Duration = Duration::from_secs(5);
+impl SweepSingleFlight {
+    fn try_start(flag: &Arc<AtomicBool>) -> Option<Self> {
+        (!flag.swap(true, Ordering::AcqRel)).then(|| Self(Arc::clone(flag)))
+    }
+}
 
-/// `None` when no snapshot verify is in flight (or one never started);
-/// otherwise `Some` of its progress once it has claimed its paths, or
-/// `Some(None)` when it is running but has not claimed them in time.
-fn snapshot_verify_claims(
-    shared: &SharedIndex,
-    should_stop: &impl Fn() -> bool,
-) -> Option<Option<crate::live_index::store::SnapshotVerifyProgress>> {
-    use crate::live_index::store::SnapshotVerifyState;
-    let started = std::time::Instant::now();
-    loop {
-        let progress = match &shared.read().snapshot_verify_state {
-            SnapshotVerifyState::Running(progress) => Some(progress.clone()),
-            SnapshotVerifyState::Pending => None,
-            _ => return None,
-        };
-        if progress.is_none() && (should_stop() || started.elapsed() >= SNAPSHOT_VERIFY_START_WAIT)
-        {
-            warn!("reconciliation: snapshot verify never started; sweeping without it");
-            return None;
-        }
-        if let Some(progress) = progress.filter(|progress| progress.claims().is_some()) {
-            return Some(Some(progress));
-        }
-        if should_stop() || started.elapsed() >= SNAPSHOT_VERIFY_CLAIMS_WAIT {
-            warn!(
-                "reconciliation: snapshot verify has not claimed its paths; \
-                 leaving every restored row to it"
-            );
-            return Some(None);
-        }
-        std::thread::sleep(Duration::from_millis(50));
+impl Drop for SweepSingleFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -1252,6 +1229,7 @@ pub async fn run_watcher_with_stop(
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(30);
                 let mut last_reconcile = Instant::now();
+                let periodic_sweep = Arc::new(AtomicBool::new(false));
 
                 loop {
                     if stop_token.load(Ordering::Acquire) {
@@ -1272,17 +1250,24 @@ pub async fn run_watcher_with_stop(
                         let watcher_info_clone = watcher_info.clone();
                         let stop_for_reconcile = Arc::clone(&stop_token);
                         let expected_gen_for_reconcile = expected_gen;
-                        tokio::task::spawn_blocking(move || {
-                            reconcile_for_cause(
-                                &root_clone,
-                                &shared_clone,
-                                &watcher_info_clone,
-                                &stop_for_reconcile,
-                                expected_gen_for_reconcile,
-                                ReconciliationCause::Periodic,
-                                observer,
-                            );
-                        });
+                        // One periodic sweep at a time: a sweep slower than
+                        // the interval must not pile up behind itself.
+                        if let Some(single_flight) = SweepSingleFlight::try_start(&periodic_sweep) {
+                            tokio::task::spawn_blocking(move || {
+                                let _single_flight = single_flight;
+                                reconcile_for_cause(
+                                    &root_clone,
+                                    &shared_clone,
+                                    &watcher_info_clone,
+                                    &stop_for_reconcile,
+                                    expected_gen_for_reconcile,
+                                    ReconciliationCause::Periodic,
+                                    observer,
+                                );
+                            });
+                        } else {
+                            debug!("watcher: periodic sweep still running; skipping this tick");
+                        }
                         // Coupling store refresh runs on its own task so a
                         // slow delta never delays stale-file reconciliation.
                         // Gates on SYMFORGE_COUPLING internally and holds a
@@ -1513,6 +1498,21 @@ pub fn restart_watcher(
 mod tests {
     use super::*;
     use crate::domain::index::{AdmissionTier, SkipReason};
+
+    #[test]
+    fn periodic_sweep_is_single_flight() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = SweepSingleFlight::try_start(&flag).expect("the first sweep starts");
+        assert!(
+            SweepSingleFlight::try_start(&flag).is_none(),
+            "a tick while a sweep runs must not start a second one"
+        );
+        drop(first);
+        assert!(
+            SweepSingleFlight::try_start(&flag).is_some(),
+            "the next tick starts a sweep once the first ended"
+        );
+    }
     use crate::domain::{MetadataOnlyReason, ScoutDecision};
     use std::time::Duration;
     use tempfile::TempDir;

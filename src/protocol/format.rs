@@ -591,6 +591,21 @@ fn append_snapshot_verify_mismatch_summary(
                 line.push_str(&paths);
             }
         }
+        if !report.unverified.is_empty() {
+            let shown = report.unverified.len().min(path_limit);
+            let listed = report
+                .unverified
+                .iter()
+                .take(shown)
+                .map(|(path, reason)| format!("{path}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            line.push_str(&format!(
+                " unverified_since_restore={} unverified_omitted={} unverified=\"{listed}\"",
+                report.unverified.len(),
+                report.unverified.len() - shown
+            ));
+        }
     }
 }
 
@@ -3835,6 +3850,18 @@ pub fn content_withheld_unscanned(path: &str) -> String {
         "Content withheld by admission policy: {path}. \
          SymForge could not inspect this file's contents and will not read, \
          parse, or search it. Reindexing will not change this."
+    )
+}
+
+/// Refusal for a restored file the snapshot verify could not reconcile. Its
+/// restored content is withheld rather than served as current, and the file
+/// is not reported absent, because it is not.
+pub fn unverified_since_restore(path: &str, reason: &str) -> String {
+    format!(
+        "Unverified since restore: {path}. The snapshot verify could not reconcile this \
+         file ({reason}), so its restored content is withheld instead of served as current. \
+         A successful re-read releases it: the watcher does that on the next change to the \
+         file, and index_folder rebuilds the whole project from source."
     )
 }
 

@@ -21710,6 +21710,71 @@ mod tests {
         );
     }
 
+    /// A restored file the verify could not reconcile is refused with its
+    /// reason on the symbol lane and on the raw-read lane, never reported
+    /// absent and never served from disk as if the verify had vouched for it.
+    #[tokio::test]
+    async fn test_unverified_restored_file_is_refused_not_reported_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("src dir");
+        std::fs::write(tmp.path().join("src/held.rs"), b"fn held() {}").expect("held file");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+        index.snapshot_verify_state = crate::live_index::store::SnapshotVerifyState::Completed(
+            crate::live_index::store::SnapshotVerifyReport::from_mismatched_paths(vec![
+                "src/held.rs".to_string(),
+            ])
+            .with_unverified(std::collections::BTreeMap::from([(
+                "src/held.rs".to_string(),
+                "it could not be read: access denied".to_string(),
+            )])),
+        );
+        let server = make_server_with_root(index, Some(tmp.path().to_path_buf()));
+        // A successful re-read on request would release the file through the
+        // canonical seam; the refusal is for the case where that fails too.
+        struct ClearInjection;
+        impl Drop for ClearInjection {
+            fn drop(&mut self) {
+                *crate::live_index::single_file::test_scout_failure_path().lock() = None;
+            }
+        }
+        let _clear = ClearInjection;
+        *crate::live_index::single_file::test_scout_failure_path().lock() =
+            Some("src/held.rs".to_string());
+
+        let symbol = server
+            .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
+                path: "src/held.rs".to_string(),
+                name: "held".to_string(),
+                kind: None,
+                symbol_line: None,
+                targets: None,
+                estimate: None,
+                max_tokens: None,
+                force_refresh: None,
+            }))
+            .await;
+        let content_input: super::GetFileContentInput =
+            serde_json::from_value(serde_json::json!({ "path": "src/held.rs" }))
+                .expect("content input");
+        let content = server.get_file_content(Parameters(content_input)).await;
+
+        for result in [&symbol, &content] {
+            assert!(
+                result.starts_with("Unverified since restore: src/held.rs")
+                    && result.contains("access denied")
+                    && result.contains("index_folder"),
+                "an unverified restored file must be refused with its reason, got: {result}"
+            );
+            assert!(
+                !result.contains("fn held"),
+                "no content may be served: {result}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_health_surfaces_snapshot_verify_mismatch_summary() {
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
