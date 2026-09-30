@@ -345,6 +345,9 @@ fn assignment_is_code_expression(
     else {
         return false;
     };
+    if separator_is_path_not_assignment(bytes, match_start, value_start) {
+        return true;
+    }
     let rust = language == crate::domain::LanguageId::Rust;
     let quote_before_value = value_start
         .checked_sub(1)
@@ -422,6 +425,50 @@ fn match_is_inside_string_literal(bytes: &[u8], value_start: usize, rust: bool) 
         index += 1;
     }
     double || single || backtick
+}
+
+/// A doubled colon after the keyword (`CancellationToken::new`, a doc link to
+/// `CancellationToken::is_cancelled`) is a PATH separator in every code
+/// language here, never an assignment. Exempt only when the rest of the line
+/// leaves no bracket open and fences no payload, so a path CALL carrying a
+/// literal — on this line, or in an argument list that continues past it — is
+/// still judged by the ordinary steps.
+fn separator_is_path_not_assignment(bytes: &[u8], match_start: usize, value_start: usize) -> bool {
+    let Some(separator) = bytes[match_start..value_start]
+        .iter()
+        .position(|byte| matches!(byte, b':' | b'='))
+        .map(|offset| match_start + offset)
+    else {
+        return false;
+    };
+    if bytes[separator] != b':' || bytes.get(separator + 1) != Some(&b':') {
+        return false;
+    }
+    let line_end = bytes[separator..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |offset| separator + offset);
+    let rest = &bytes[separator + 2..line_end];
+    let mut depth = 0_u32;
+    for byte in rest {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let fences_payload = rest.iter().enumerate().any(|(index, quote)| {
+        matches!(quote, b'"' | b'\'' | b'`') && {
+            let run = rest[index + 1..]
+                .iter()
+                .take_while(|byte| {
+                    !matches!(byte, b'"' | b'\'' | b'`' | b'#') && !byte.is_ascii_whitespace()
+                })
+                .count();
+            run >= CONTEXT_ASSIGNMENT_MIN_PAYLOAD && rest.get(index + 1 + run) == Some(quote)
+        }
+    });
+    depth == 0 && !fences_payload
 }
 
 /// A capture that is WHOLLY one interpolation placeholder: `{`, at least one
@@ -1757,6 +1804,32 @@ mod tests {
                 "src/probe.rs",
                 [
                     "/// So `--", &password, "=postgres://u:pw@host` is fully opaque.\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // A doubled colon is a path separator, not an assignment.
+            (
+                "PG1 rust doc link to a token path",
+                "src/probe.rs",
+                [
+                    "    /// and must poll [`Cancellation", &token.to_uppercase()[..1], &token[1..],
+                    "::is_cancelled`] wherever it would\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PG2 control: path call carrying a literal",
+                "src/probe.rs",
+                ["let t = ", &token, "::from_secret_value(\"", &real, "\");\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "PG3 control: path call whose literal is on the next line",
+                "src/probe.rs",
+                [
+                    "let t = ", &token, "::from_secret_value(\n    \"", &real, "\",\n);\n",
                 ]
                 .concat(),
                 MxVerdict::Sensitive(1),
