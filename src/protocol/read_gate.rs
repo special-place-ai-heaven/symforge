@@ -77,6 +77,25 @@ pub fn observe_disk_beneath(
     workspace_root: &Path,
     relative_path: &str,
 ) -> Result<Vec<u8>, String> {
+    observe_beneath(live, workspace_root, relative_path, true)
+}
+
+/// [`observe_disk_beneath`] for a sweep that drops the refusal: a recorded
+/// content demotion is refused without the gate's re-read to name its lines.
+pub(crate) fn observe_disk_beneath_without_lines(
+    live: &LiveIndex,
+    workspace_root: &Path,
+    relative_path: &str,
+) -> Result<Vec<u8>, String> {
+    observe_beneath(live, workspace_root, relative_path, false)
+}
+
+fn observe_beneath(
+    live: &LiveIndex,
+    workspace_root: &Path,
+    relative_path: &str,
+    name_lines: bool,
+) -> Result<Vec<u8>, String> {
     let candidate = Path::new(relative_path);
     let escapes = candidate.components().any(|component| {
         matches!(
@@ -94,7 +113,7 @@ pub fn observe_disk_beneath(
     // stays syscall-free; the spelling is judged on the resolved path here.
     refuse_disk_spelling(workspace_root, relative_path)?;
     let full_path = workspace_root.join(candidate);
-    admit_disk_read(live, relative_path, &full_path)
+    disk_read(live, relative_path, &full_path, name_lines)
 }
 
 /// The on-disk half of the gate's confinement, shared by both disk-reading
@@ -144,6 +163,26 @@ pub(crate) fn admit_worktree_text(
     repo: &crate::git::GitRepo,
     relative_path: &str,
 ) -> Result<Option<String>, String> {
+    worktree_text(live, repo, relative_path, true)
+}
+
+/// [`admit_worktree_text`] for a lane that drops the refusal (the `search_text`
+/// untracked sweep, `detect_impact` seeding): a recorded content demotion is
+/// refused without the gate's re-read to name its lines.
+pub(crate) fn admit_worktree_text_without_lines(
+    live: &LiveIndex,
+    repo: &crate::git::GitRepo,
+    relative_path: &str,
+) -> Result<Option<String>, String> {
+    worktree_text(live, repo, relative_path, false)
+}
+
+fn worktree_text(
+    live: &LiveIndex,
+    repo: &crate::git::GitRepo,
+    relative_path: &str,
+    name_lines: bool,
+) -> Result<Option<String>, String> {
     let Some(workdir) = repo.workdir() else {
         return Err("bare repository has no working directory".to_string());
     };
@@ -157,7 +196,7 @@ pub(crate) fn admit_worktree_text(
     // The gate owns the read: it classifies the exact buffer it just read and
     // returns it only on a permit, so no lane can classify one set of bytes and
     // then render another.
-    let bytes = admit_disk_read(live, relative_path, &full_path)?;
+    let bytes = disk_read(live, relative_path, &full_path, name_lines)?;
     Ok(String::from_utf8(bytes).ok())
 }
 
@@ -196,7 +235,9 @@ pub(crate) fn disk_read_would_refuse(
 /// manifest, identical for a demoted file that exists and one that does not,
 /// so the degradation view, the binary sniff and the sweeps that ask it hold no
 /// existence bit. A recorded content demotion therefore names no lines here;
-/// [`admit_disk_read`] adds them when it renders the refusal.
+/// [`admit_disk_read`] and the read lanes built on it add them, because their
+/// callers render the refusal. The `_without_lines` twins the sweeps use never
+/// re-read, since the sweeps drop it.
 pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
     // Current path rule — no read needed.
     if let Some(rule_id) = crate::knowledge::sensitive_path_rule(relative_path) {
@@ -341,6 +382,11 @@ fn recorded_finding_lines(
             _ => return Vec::new(),
         }
     }
+    // Only a regular file is opened: opening a FIFO for reading blocks until a
+    // writer appears, which would hang the refusal.
+    if !std::fs::symlink_metadata(&full_path).is_ok_and(|metadata| metadata.is_file()) {
+        return Vec::new();
+    }
     let Ok(file) = std::fs::File::open(&full_path) else {
         return Vec::new();
     };
@@ -438,15 +484,26 @@ pub(crate) fn admit_disk_read(
     relative_path: &str,
     canon_path: &Path,
 ) -> Result<Vec<u8>, String> {
+    disk_read(live, relative_path, canon_path, true)
+}
+
+fn disk_read(
+    live: &LiveIndex,
+    relative_path: &str,
+    canon_path: &Path,
+    name_lines: bool,
+) -> Result<Vec<u8>, String> {
     // Policy refusals need no bytes, so they run BEFORE the read: a demoted
-    // file is never opened for disclosure. Only once refusing does the gate
-    // re-read a recorded content demotion, bounded, to name its finding lines;
-    // those bytes never leave the gate.
-    // ponytail: callers that drop the refusal (the search_text untracked sweep,
-    // detect_impact seeding) still pay that bounded re-read per recorded content
-    // demotion; give them a line-free entry point if it ever shows up hot.
+    // file is never opened for disclosure. Only once refusing, and only for a
+    // caller that renders the refusal, does the gate re-read a recorded content
+    // demotion, bounded, to name its finding lines; those bytes never leave the
+    // gate.
     if let Some(refusal) = refuse_by_policy(live, relative_path) {
-        return Err(recorded_refusal_naming_lines(live, relative_path).unwrap_or(refusal));
+        return Err(if name_lines {
+            recorded_refusal_naming_lines(live, relative_path).unwrap_or(refusal)
+        } else {
+            refusal
+        });
     }
 
     // The one read, and the classification of exactly those bytes. Required

@@ -2617,7 +2617,7 @@ fn matching_untracked_paths_for_search_text(
         .into_iter()
         .filter(|path| untracked_text_path_allowed(path, options))
         .filter(|path| {
-            crate::protocol::read_gate::admit_worktree_text(live, &repo, path)
+            crate::protocol::read_gate::admit_worktree_text_without_lines(live, &repo, path)
                 .ok()
                 .flatten()
                 .is_some_and(|content| {
@@ -3061,7 +3061,7 @@ fn tier2_reference_disclosure(
         // T045: this is a DISK OBSERVATION by name — the sweep wants what is on
         // disk right now, confined beneath the root. Manifest paths are
         // relative and catalogued, so the confine never fires on them.
-        match read_gate::observe_disk_beneath(live, root, path) {
+        match read_gate::observe_disk_beneath_without_lines(live, root, path) {
             Ok(bytes) => {
                 bytes_budget = bytes_budget.saturating_sub(bytes.len() as u64);
                 if String::from_utf8_lossy(&bytes).contains(name) {
@@ -8835,9 +8835,11 @@ impl SymForgeServer {
                 // seeds conservatively from the index rather than disclosing
                 // the demoted file's current symbol names or signatures.
                 let current_content =
-                    crate::protocol::read_gate::admit_worktree_text(&guard, &repo, path)
-                        .unwrap_or_default()
-                        .unwrap_or_default();
+                    crate::protocol::read_gate::admit_worktree_text_without_lines(
+                        &guard, &repo, path,
+                    )
+                    .unwrap_or_default()
+                    .unwrap_or_default();
 
                 // Unsupported/config languages return None from the extractor;
                 // we cannot body-diff them, so fall back to seeding every
@@ -36296,6 +36298,92 @@ mod tests {
         assert!(
             refusal.contains("secret.context-assignment") && !refusal.contains(" at line"),
             "lines must not be read through a linked directory; shape: {}",
+            refusal_shape(&refusal)
+        );
+    }
+
+    /// A lane that drops the refusal asks the line-free twin: a recorded content
+    /// demotion is refused there without naming lines, while the rendering lane
+    /// beside it still names them from the same file.
+    #[test]
+    fn sweep_lanes_refuse_a_recorded_demotion_without_naming_lines() {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let swept = crate::protocol::read_gate::observe_disk_beneath_without_lines(
+            &live,
+            repo.path(),
+            "src/probe.rs",
+        )
+        .expect_err("a recorded demotion must refuse");
+        assert!(
+            swept.contains("secret.context-assignment") && !swept.contains(" at line"),
+            "the sweep twin must not re-read for lines; shape: {}",
+            refusal_shape(&swept)
+        );
+        let rendered =
+            crate::protocol::read_gate::observe_disk_beneath(&live, repo.path(), "src/probe.rs")
+                .expect_err("a recorded demotion must refuse");
+        assert_names_rule_and_line_without_bypass(&rendered);
+    }
+
+    /// Caller level: the degradation block for a recorded demotion is the same
+    /// with the file present and deleted, so it is no existence oracle.
+    #[test]
+    fn degradation_view_for_a_recorded_demotion_ignores_file_existence() {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let degrade = |live: &LiveIndex| {
+            super::admission_tier_degradation_for_path(
+                live,
+                Some(repo.path()),
+                "find_references",
+                "src/probe.rs",
+                "anything",
+            )
+        };
+        let present = degrade(&live).expect("a recorded demotion must be refused");
+        fs::remove_file(repo.path().join("src/probe.rs")).expect("remove probe");
+        let absent = degrade(&live).expect("a recorded demotion must be refused");
+        assert_eq!(
+            present, absent,
+            "the degradation view must not depend on existence"
+        );
+        assert!(
+            present.starts_with(WITHHELD_REFUSAL_PREFIX) && !present.contains(" at line"),
+            "shape: {}",
+            refusal_shape(&present)
+        );
+    }
+
+    /// A recorded demotion whose path is now a FIFO refuses at once: the gate
+    /// never opens a non-regular file for its line re-read, which would block
+    /// until a writer appeared.
+    #[cfg(unix)]
+    #[test]
+    fn recorded_demotion_refusal_does_not_open_a_fifo() {
+        let (repo, mut live) = admission_probe_repo();
+        let probe = repo.path().join("src/probe.rs");
+        fs::remove_file(&probe).expect("remove probe");
+        let status = crate::process_util::hidden_command("mkfifo")
+            .arg(&probe)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let refusal = crate::protocol::read_gate::admit_disk_read(&live, "src/probe.rs", &probe)
+            .expect_err("a recorded demotion must refuse");
+        assert!(
+            refusal.contains("secret.context-assignment") && !refusal.contains(" at line"),
+            "shape: {}",
             refusal_shape(&refusal)
         );
     }
