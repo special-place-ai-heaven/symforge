@@ -1049,10 +1049,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for the session-reuse change (same-root rebind skip, first-build
 // snapshot, idle project grace): daemon.rs and protocol/mod.rs only, no new
 // file, no edge into src/index_lifecycle.
+// Refreshed for the largest-first parse order and the linear xref macro
+// fallback (store, parsing, xref, domain index): no new file, no edge into
+// src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "17352ebc298494cde315c9a7228c0bdb7d69890557463ed6769729f46ec47a1a",
+    "f519c54d75469d3e78ec5879097f7ac126f6adb4b0227af6e8b647a4b92ffecb",
     199,
-    10_123_811,
+    10_132_323,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

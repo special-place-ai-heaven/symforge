@@ -24,7 +24,6 @@ use crate::domain::{
     HistoryLimit, LanguageId, ManifestResourceUsage, MetadataOnlyReason, ProjectStateDir,
     ReferenceRecord, RepositoryManifest, ScoutDecision, SourceId, SourceIdentity,
     SourceResponseEnvelope, SourceVersion, StatePlacement, SymbolRecord, WorkingTreeState,
-    find_enclosing_symbol,
 };
 use crate::{discovery, parsing};
 
@@ -1010,16 +1009,17 @@ impl IndexedFile {
             symbols.iter().map(|s| s.byte_range).collect();
 
         // Assign enclosing_symbol_index for each reference and skip definition sites.
-        let references: Vec<ReferenceRecord> = raw_references
+        let mut references: Vec<ReferenceRecord> = raw_references
             .into_iter()
             .filter(|r| !symbol_byte_ranges.contains(&r.byte_range))
-            .map(|mut r| {
-                if r.enclosing_symbol_index.is_none() {
-                    r.enclosing_symbol_index = find_enclosing_symbol(&symbols, r.line_range.0);
-                }
-                r
-            })
             .collect();
+        let lines: Vec<u32> = references.iter().map(|r| r.line_range.0).collect();
+        let enclosing = crate::domain::index::find_enclosing_symbols(&symbols, &lines);
+        for (r, idx) in references.iter_mut().zip(enclosing) {
+            if r.enclosing_symbol_index.is_none() {
+                r.enclosing_symbol_index = idx;
+            }
+        }
 
         IndexedFile {
             relative_path,
@@ -5658,9 +5658,18 @@ fn admit_and_parse_entries(
     });
     let staged_accounting = Arc::new(StagedContentAccounting::new(staged_ceiling));
 
+    // Largest first, one file per task: parse cost grows with size, and one
+    // big file started late holds the whole phase on a single core. Rayon
+    // otherwise hands each worker a contiguous run, which would put the
+    // largest files back to back on one thread. Only the work order changes;
+    // every consumer below re-sorts its results by path.
+    let mut largest_first: Vec<&crate::discovery::DiscoveredEntry> = entries.iter().collect();
+    largest_first.sort_by_key(|entry| std::cmp::Reverse(entry.file_size));
+
     let outcomes: Vec<AdmissionOutcome> = indexing_thread_pool().install(|| {
-        entries
-            .par_iter()
+        largest_first
+            .into_par_iter()
+            .with_max_len(1)
             .map(|entry| {
                 if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                     cancelled_during_parse.store(true, Ordering::Release);
