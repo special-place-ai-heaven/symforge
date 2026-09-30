@@ -328,6 +328,10 @@ fn right_hand_side_continuation(
 /// `>`. So `<v1><credential>` and a heredoc opener (`<<-EOT`, whose body is the
 /// credential) are not placeholders, and a literal that never closes on this
 /// line is not one either.
+///
+/// Brackets alone prove nothing: `<credential>` is still the credential. The
+/// group's interior must read as prose (whitespace), carry no digit, or be a
+/// placeholder word (`<your-api-key>`).
 fn is_angle_placeholder(bytes: &[u8], start: usize) -> bool {
     if bytes.get(start) != Some(&b'<') {
         return false;
@@ -351,10 +355,17 @@ fn is_angle_placeholder(bytes: &[u8], start: usize) -> bool {
         None => line_end,
     };
     let value = bytes[start..end].trim_ascii_end();
-    value
-        .iter()
-        .position(|byte| *byte == b'>')
-        .is_some_and(|first_close| value[first_close..].iter().all(|byte| *byte == b'>'))
+    let Some(first_close) = value.iter().position(|byte| *byte == b'>') else {
+        return false;
+    };
+    if !value[first_close..].iter().all(|byte| *byte == b'>') {
+        return false;
+    }
+    let interior = &value[..first_close];
+    let interior = &interior[interior.iter().take_while(|byte| **byte == b'<').count()..];
+    interior.iter().any(u8::is_ascii_whitespace)
+        || !interior.iter().any(u8::is_ascii_digit)
+        || is_placeholder(interior)
 }
 
 /// uri-credentials exemption: the URI documents a SHAPE rather than carrying a
@@ -2013,6 +2024,27 @@ mod tests {
                 "infra/main.tf",
                 [&secret_kw, " = <<-EOT_LONGNAME\n", &real40, "\nEOT_LONGNAME\n"].concat(),
                 MxVerdict::Sensitive(1),
+            ),
+            // Review round 2: brackets around a real value do not make it a
+            // placeholder. Only an interior with whitespace, no digit, or a
+            // placeholder word is template syntax.
+            (
+                "F6c env angle group around a real value",
+                "deploy.env",
+                [&apikey.to_uppercase(), "=<", &real40, ">\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F6d yaml quoted angle group around a real value",
+                "config.yaml",
+                [&password, ": \"<", &real40, ">\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F6e env angle placeholder word",
+                "deploy.env",
+                [&apikey.to_uppercase(), "=<your-api-", "key>\n"].concat(),
+                MxVerdict::Clean,
             ),
             // Review F7: a placeholder password on a real host stays flagged.
             (
