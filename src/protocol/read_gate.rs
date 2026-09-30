@@ -123,10 +123,18 @@ fn observe_beneath(
 /// reads either.
 fn refuse_disk_spelling(root: &Path, relative_path: &str) -> Result<(), String> {
     crate::protocol::edit::refuse_path_alias(root, relative_path)?;
-    match hard_scope_refusal(relative_path) {
-        Some(refusal) => Err(refusal),
-        None => Ok(()),
+    if let Some(refusal) = hard_scope_refusal(relative_path) {
+        return Err(refusal);
     }
+    if let Some(rule_id) =
+        crate::knowledge::sensitive_path_rule_at(relative_path, &root.join(relative_path))
+    {
+        return Err(format::content_withheld_by_path_rule(
+            relative_path,
+            rule_id,
+        ));
+    }
+    Ok(())
 }
 
 /// The refusal for a path under VCS or runtime-state internals (`.git`,

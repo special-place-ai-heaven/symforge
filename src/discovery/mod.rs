@@ -473,6 +473,15 @@ fn is_under_repo_root_build_dir(relative_path: &str, target_dir_child: Option<&s
     matches!(target_dir_child, Some(child) if child == first)
 }
 
+/// Whether the cold walk skips `relative_path` as build output under a
+/// repo-root build directory (`target`, `target-*`, `CARGO_TARGET_DIR`),
+/// whether or not it is gitignored. Shared with the watcher so a live event
+/// never indexes what the walk would not. The walk rescues git-tracked files
+/// there; applying that rescue is the caller's part.
+pub(crate) fn path_is_root_build_output(root: &Path, relative_path: &str) -> bool {
+    is_under_repo_root_build_dir(relative_path, cargo_target_dir_root_child(root).as_deref())
+}
+
 /// VCS/runtime internals are outside source scope even when ignore rules
 /// explicitly re-include them. Other repository-owned hidden paths remain
 /// discoverable and flow through normal ignore/admission policy.
@@ -482,7 +491,7 @@ pub(crate) fn path_is_hard_scope_excluded(relative_path: &Path) -> bool {
             return false;
         };
         name.to_str().is_some_and(|name| {
-            name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".symforge")
+            matches!(crate::paths::fold_case(name).as_str(), ".git" | ".symforge")
         })
     })
 }
@@ -588,12 +597,64 @@ pub(crate) fn resolve_repo_path(
         .components()
         .filter(|component| !matches!(component, Component::CurDir));
     if canonical.components().eq(spelled) {
+        // glibc's realpath returns the caller's spelling on a case-insensitive
+        // mount (WSL DrvFs, CIFS, vfat, exFAT, ntfs3, ext4/f2fs casefold), so
+        // the comparison above cannot see a case alias there; the directory
+        // listing can. Windows and macOS canonicalize to the on-disk name.
+        #[cfg(not(any(windows, target_os = "macos")))]
+        match listed_spelling(&canon_root, canonical) {
+            Some(listed) if listed == canonical => {}
+            Some(listed) => {
+                return Err(refuse_as_spelling_of(listed.to_string_lossy().into_owned()));
+            }
+            None => return Err(PathRefusal::SpellingDiffers(None)),
+        }
         return Ok(Some(canon_path));
     }
 
     Err(refuse_as_spelling_of(
         canonical.to_string_lossy().replace('\\', "/"),
     ))
+}
+
+/// The name each component of `relative` is listed under in its parent
+/// directory beneath `root`: the exact name when it is listed, otherwise the
+/// listed name it case-folds to. `None` when a component is listed under
+/// neither or a directory cannot be read.
+// ponytail: one directory listing per component, linear in each directory's
+// size; only caller-path lanes pay it. Upgrade: an fd-relative name lookup.
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+fn listed_spelling(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut parent = root.to_path_buf();
+    let mut listed = PathBuf::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let folded = crate::paths::fold_case(&name.to_string_lossy());
+        let mut fold_match = None;
+        let mut exact = false;
+        for entry in std::fs::read_dir(&parent).ok()?.flatten() {
+            let entry_name = entry.file_name();
+            if entry_name == name {
+                exact = true;
+                break;
+            }
+            if fold_match.is_none()
+                && crate::paths::fold_case(&entry_name.to_string_lossy()) == folded
+            {
+                fold_match = Some(entry_name);
+            }
+        }
+        let name = if exact {
+            name.to_os_string()
+        } else {
+            fold_match?
+        };
+        parent.push(&name);
+        listed.push(&name);
+    }
+    Some(listed)
 }
 
 /// The refusal for a spelling whose own name is `name`: a credential path gets
@@ -1200,7 +1261,9 @@ where
         entry.file_size = metadata.len();
         let decision = if let Some(reason) = path_reason {
             ScoutDecision::MetadataOnly { reason }
-        } else if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&entry.relative_path) {
+        } else if let Some(rule_id) =
+            crate::knowledge::sensitive_path_rule_at(&entry.relative_path, &entry.absolute_path)
+        {
             ScoutDecision::MetadataOnly {
                 reason: MetadataOnlyReason::SensitivePath {
                     rule_id: rule_id.to_string(),
@@ -1550,16 +1613,12 @@ fn scout_decision_for_discovered(
 /// Load all `.gitignore` patterns from a repository root and nested directories.
 ///
 /// Uses `ignore::gitignore::GitignoreBuilder` to build a composite gitignore matcher.
-/// Walks nested `.gitignore` files up to `max_depth` levels (default 6).
+/// Walks nested `.gitignore` files up to `max_depth` levels (default 6), and
+/// applies each one relative to its own directory, as git does.
 /// Returns `None` if no `.gitignore` files are found or if loading fails.
 pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     use ignore::gitignore::GitignoreBuilder;
     use std::collections::VecDeque;
-
-    let root_gitignore = root.join(".gitignore");
-    if !root_gitignore.exists() {
-        return None;
-    }
 
     let mut builder = GitignoreBuilder::new(root);
 
@@ -1570,10 +1629,8 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
 
     while let Some((dir, depth)) = queue.pop_front() {
         let gitignore_path = dir.join(".gitignore");
-        if gitignore_path.is_file()
-            && let Some(err) = builder.add(&gitignore_path)
-        {
-            tracing::debug!("failed to load {:?}: {}", gitignore_path, err);
+        if gitignore_path.is_file() {
+            add_gitignore_file(&mut builder, root, &dir, &gitignore_path);
         }
 
         if depth < max_depth
@@ -1604,6 +1661,93 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
             None
         }
     }
+}
+
+/// Add `dir/.gitignore` to a matcher rooted at `root`. Git applies a nested
+/// file's patterns relative to the directory holding it; fed to the root
+/// matcher unchanged they would apply at the repository root instead, so each
+/// one is re-anchored beneath `dir` first.
+fn add_gitignore_file(
+    builder: &mut ignore::gitignore::GitignoreBuilder,
+    root: &Path,
+    dir: &Path,
+    file: &Path,
+) {
+    let Ok(relative) = dir.strip_prefix(root) else {
+        return;
+    };
+    let prefix = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(escape_glob(&name.to_string_lossy())),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if prefix.is_empty() {
+        if let Some(err) = builder.add(file) {
+            tracing::debug!("failed to load {:?}: {}", file, err);
+        }
+        return;
+    }
+    let contents = match std::fs::read_to_string(file) {
+        Ok(contents) => contents,
+        Err(err) => {
+            tracing::debug!("failed to load {:?}: {}", file, err);
+            return;
+        }
+    };
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+    for line in contents.lines() {
+        if let Some(pattern) = anchor_nested_gitignore_line(&prefix, line)
+            && let Err(err) = builder.add_line(Some(file.to_path_buf()), &pattern)
+        {
+            tracing::debug!("failed to load {:?}: {}", file, err);
+        }
+    }
+}
+
+/// Rewrite one line of a nested `.gitignore` in directory `prefix` (glob
+/// escaped, `/`-separated) into the root-anchored pattern git's rule gives
+/// it: a slash anywhere but the end anchors the pattern to its directory,
+/// otherwise it matches at any depth below it. Comment and blank lines, which
+/// match nothing, yield `None`; trailing spaces are judged as the matcher
+/// judges them.
+fn anchor_nested_gitignore_line(prefix: &str, line: &str) -> Option<String> {
+    if line.starts_with('#') {
+        return None;
+    }
+    let line = if line.ends_with("\\ ") {
+        line
+    } else {
+        line.trim_end()
+    };
+    if line.is_empty() {
+        return None;
+    }
+    let (negation, pattern) = match line.strip_prefix('!') {
+        Some(rest) => ("!", rest),
+        None => ("", line),
+    };
+    let body = pattern.strip_suffix('/').unwrap_or(pattern);
+    let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+    Some(if body.contains('/') {
+        format!("{negation}/{prefix}/{pattern}")
+    } else {
+        format!("{negation}/{prefix}/**/{pattern}")
+    })
+}
+
+/// Escape glob metacharacters so a directory name matches only itself.
+fn escape_glob(name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len());
+    for character in name.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// Environment override for the project root used by cold-start discovery.
@@ -1891,6 +2035,11 @@ where
     if is_device_or_special_namespace(candidate) || is_special_filesystem_entry(candidate) {
         return unbound(RootRefusalReason::DeviceOrSpecialNamespace);
     }
+    // Checked on both spellings and never overridable: no explicit authority
+    // turns a credential store into a project.
+    if crate::paths::is_credential_directory_path(candidate) {
+        return unbound(RootRefusalReason::CredentialDirectory);
+    }
 
     let raw_is_protected =
         crate::paths::is_sensitive_path(candidate) || is_forbidden_root(candidate);
@@ -1921,6 +2070,9 @@ where
         || is_special_filesystem_entry(&canonical_root)
     {
         return unbound(RootRefusalReason::DeviceOrSpecialNamespace);
+    }
+    if crate::paths::is_credential_directory_path(&canonical_root) {
+        return unbound(RootRefusalReason::CredentialDirectory);
     }
     let canonical_is_protected =
         crate::paths::is_sensitive_path(&canonical_root) || is_forbidden_root(&canonical_root);
@@ -3204,6 +3356,103 @@ mod tests {
         }
     }
 
+    /// `git check-ignore` exits 0 for an ignored path and 1 for one that is not.
+    fn git_ignores(root: &Path, relative_path: &str) -> bool {
+        let excludes = root.join(".no-global-excludes");
+        let output = crate::process_util::hidden_command("git")
+            .arg("-C")
+            .arg(root)
+            .arg("-c")
+            .arg(format!("core.excludesFile={}", excludes.display()))
+            .args(["check-ignore", "-q", "--", relative_path])
+            .output()
+            .expect("run git check-ignore");
+        match output.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            other => panic!(
+                "git check-ignore {relative_path} failed ({other:?}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    /// Nested `.gitignore` rules apply relative to their own directory, as git
+    /// applies them. A root-anchored matcher fed the nested file would ignore
+    /// the root `needle.txt` and index `sub/needle.txt` instead.
+    #[test]
+    fn nested_gitignore_matches_like_git_check_ignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let init = crate::process_util::hidden_command("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+
+        create_file(root, ".gitignore", "*.tmp\n");
+        create_file(
+            root,
+            "sub/.gitignore",
+            "/needle.txt\nlocal.log\n!keep.tmp\nbuild/\ndeep/*.rs\n",
+        );
+        create_file(root, "br[a]ck/.gitignore", "/x.txt\n");
+        let paths = [
+            "needle.txt",
+            "sub/needle.txt",
+            "sub/deeper/needle.txt",
+            "local.log",
+            "sub/local.log",
+            "sub/deeper/local.log",
+            "keep.tmp",
+            "sub/keep.tmp",
+            "sub/other.tmp",
+            "build/x.rs",
+            "sub/build/x.rs",
+            "sub/deep/a.rs",
+            "sub/x/deep/a.rs",
+            "deep/a.rs",
+            "br[a]ck/x.txt",
+            "bra/x.txt",
+            "x.txt",
+        ];
+        for path in paths {
+            create_file(root, path, "placeholder\n");
+        }
+
+        let gitignore = load_gitignore(root).expect("rules were loaded");
+        let mut disagreements = Vec::new();
+        for path in paths {
+            let ours = gitignore
+                .matched_path_or_any_parents(path, false)
+                .is_ignore();
+            let git = git_ignores(root, path);
+            if ours != git {
+                disagreements.push(format!("{path}: ours={ours} git={git}"));
+            }
+        }
+        assert!(disagreements.is_empty(), "{disagreements:#?}");
+    }
+
+    /// Git applies a nested `.gitignore` whether or not the root has one.
+    #[test]
+    fn nested_gitignore_applies_without_a_root_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        create_file(tmp.path(), "sub/.gitignore", "/needle.txt\n");
+        let gitignore = load_gitignore(tmp.path()).expect("the nested rules were loaded");
+        assert!(
+            gitignore
+                .matched_path_or_any_parents("sub/needle.txt", false)
+                .is_ignore()
+        );
+        assert!(
+            !gitignore
+                .matched_path_or_any_parents("needle.txt", false)
+                .is_ignore()
+        );
+    }
+
     // ── Feature 020: repository-owned hidden knowledge vs hard scope ──
     mod hidden_path {
         use super::*;
@@ -3220,6 +3469,40 @@ mod tests {
             assert!(path_is_hard_scope_excluded(Path::new(
                 "nested/.SYmFoRgE/state.rs"
             )));
+        }
+
+        /// The byte-exact check `resolve_repo_path` makes where realpath
+        /// echoes the caller's spelling (Linux case-insensitive mounts). It is
+        /// exercised here on every platform, since each directory lists the
+        /// name it stores.
+        #[test]
+        fn listed_spelling_reports_the_name_each_directory_lists() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "Dir/Secret.rs", "placeholder\n");
+            let listed = |spelling: &str| listed_spelling(tmp.path(), Path::new(spelling));
+            assert_eq!(
+                listed("Dir/Secret.rs"),
+                Some(PathBuf::from("Dir/Secret.rs"))
+            );
+            assert_eq!(
+                listed("dir/SECRET.rs"),
+                Some(PathBuf::from("Dir/Secret.rs"))
+            );
+            assert_eq!(
+                listed("Dir/\u{17F}ecret.rs"),
+                Some(PathBuf::from("Dir/Secret.rs"))
+            );
+            assert_eq!(listed("Dir/absent.rs"), None);
+        }
+
+        /// U+017F folds with `s` on case-insensitive filesystems, so this
+        /// spelling opens `.symforge` there.
+        #[test]
+        fn detects_unicode_case_fold_spellings() {
+            assert!(path_is_hard_scope_excluded(Path::new(
+                ".\u{17F}ymforge/index.bin"
+            )));
+            assert!(path_is_hard_scope_excluded(Path::new(".GIT/config")));
         }
 
         #[test]
@@ -4492,6 +4775,38 @@ mod tests {
                 } if rule_id == "path.environment-credentials"
             ));
             assert!(probed.is_empty(), "path policy must run before content I/O");
+        }
+
+        /// A root that IS `.aws` leaves the relative path `credentials`, which
+        /// no anchored rule matches; the absolute path still does.
+        #[test]
+        fn credential_file_under_a_credential_directory_root_is_withheld_by_path() {
+            let parent = TempDir::new().unwrap();
+            let root = parent.path().join(".aws");
+            std::fs::create_dir(&root).unwrap();
+            create_file(&root, "credentials", "placeholder\n");
+
+            let plan = scout_repository_with_io(
+                &root,
+                |path| std::fs::metadata(path),
+                |_path, _max_bytes| Ok(Vec::new()),
+            )
+            .expect("scout the modeled credential directory");
+            let entry = plan
+                .entries
+                .iter()
+                .find(|entry| entry.path.normalized_utf8.as_deref() == Some("credentials"))
+                .expect("the credential file must stay catalog-visible");
+            assert!(
+                matches!(
+                    &entry.decision,
+                    ScoutDecision::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitivePath { rule_id }
+                    } if rule_id == "path.cloud-credential-store"
+                ),
+                "got {:?}",
+                entry.decision
+            );
         }
 
         #[test]

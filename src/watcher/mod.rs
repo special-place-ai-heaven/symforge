@@ -992,10 +992,17 @@ pub(crate) fn process_events(
             // most importantly SymForge's own `.symforge/` state dir (e.g.
             // `tee/*.rs` edit snapshots) — polluting search and reference
             // results and growing the index unbounded.
+            // The walk also skips repo-root build directories, gitignored or
+            // not, keeping only the tracked files it rescues there; a path the
+            // index already holds is one of those.
+            // ponytail: a file first tracked under a build dir mid-session waits
+            // for the next reload, as the walk's git-tracked set is not re-read.
             let relative = Path::new(&relative_path);
             if crate::discovery::path_is_hard_scope_excluded(relative)
                 || shared.is_source_excluded(relative)
                 || shared.read().is_path_gitignored(&relative_path)
+                || (crate::discovery::path_is_root_build_output(repo_root, &relative_path)
+                    && !shared.read().files.contains_key(relative_path.as_str()))
             {
                 continue;
             }
@@ -3675,6 +3682,58 @@ mod tests {
         // Absolute paths are rejected defensively (the `ignore` crate requires
         // relative paths).
         assert!(!index.is_path_gitignored("/abs/path.rs"));
+    }
+
+    /// The cold walk skips repo-root build directories whether or not they are
+    /// gitignored; a watcher event under one must not index what the walk
+    /// never would.
+    #[test]
+    fn process_events_skips_repo_root_build_directories_like_the_walk() {
+        use crate::live_index::store::LiveIndex;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seed() {}\n").expect("seed");
+        let shared = LiveIndex::load(dir.path()).expect("cold load");
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let observer = authority.register_observer();
+        let expected_gen = shared.current_project_generation();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let mut trackers = HashMap::new();
+
+        let mut events = Vec::new();
+        for relative in [
+            "target/debug/build.rs",
+            "target-wsl/gen.rs",
+            "src/target/mod.rs",
+        ] {
+            let path = dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
+            std::fs::write(&path, "pub fn built() {}\n").expect("write file");
+            events.push(DebouncedEvent {
+                event: notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(path),
+                time: Instant::now(),
+            });
+        }
+        process_events(
+            events,
+            dir.path(),
+            &shared,
+            &mut trackers,
+            &watcher_info,
+            &|| false,
+            expected_gen,
+            observer,
+        );
+
+        let index = shared.read();
+        assert!(index.get_file("target/debug/build.rs").is_none());
+        assert!(index.get_file("target-wsl/gen.rs").is_none());
+        assert!(
+            index.get_file("src/target/mod.rs").is_some(),
+            "a nested source dir named target is ordinary source, as in the walk"
+        );
     }
 
     /// Test-only: the incarnation current for `root` at call time — the

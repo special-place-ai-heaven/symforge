@@ -505,6 +505,36 @@ fn is_windows_user_container(comps: &[&str]) -> bool {
     matches!(comps.get(1), Some(&"users")) && comps.len() <= 3
 }
 
+/// Fold `text` the way case-insensitive filesystems compare names. ASCII
+/// lowercasing is not enough: ext4/f2fs casefold, NTFS and APFS all fold
+/// U+017F (long s) with `s` and U+212A (Kelvin sign) with `k`.
+#[must_use]
+pub fn fold_case(text: &str) -> String {
+    text.to_uppercase().to_lowercase()
+}
+
+/// Returns true when `path` lies in a credential store: a `.aws`, `.kube`,
+/// `.ssh`, `.gnupg` or `.docker` component, or `gcloud` under `.config`.
+/// No project lives there, and the credential path rules are anchored on
+/// those directory names, so a root inside one would leave its files matching
+/// no rule. Components are compared after [`fold_case`].
+#[must_use]
+pub fn is_credential_directory_path(path: &Path) -> bool {
+    let names: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(fold_case(&name.to_string_lossy())),
+            _ => None,
+        })
+        .collect();
+    names.iter().enumerate().any(|(index, name)| {
+        matches!(
+            name.as_str(),
+            ".aws" | ".kube" | ".ssh" | ".gnupg" | ".docker"
+        ) || (name == "gcloud" && index > 0 && names[index - 1] == ".config")
+    })
+}
+
 /// Returns true if `canonical` is a sensitive system or credential-bearing
 /// directory (or a descendant of one) that must never be indexed.
 ///

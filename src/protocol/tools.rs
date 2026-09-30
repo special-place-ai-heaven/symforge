@@ -570,6 +570,11 @@ fn resolve_index_folder_binding(
                 crate::domain::RootRefusalReason::UnsupportedPathEncoding => {
                     "Refused to index path: canonical root is not valid UTF-8 and cannot be represented without changing its identity".to_string()
                 }
+                crate::domain::RootRefusalReason::CredentialDirectory => format!(
+                    "Refused to index credential directory: {} ({}). A credential store (.aws, .kube, .ssh, .gnupg, .docker, .config/gcloud) is never indexed, even with allow_protected_root=true.",
+                    input.path,
+                    reason.code()
+                ),
                 _ => format!(
                     "Refused to index sensitive system path: {}. Use a project directory or retry this exact direct request with allow_protected_root=true.",
                     reason.code()
@@ -9098,6 +9103,11 @@ impl SymForgeServer {
         }
         // Estimate mode: return token cost without reading content
         if input.estimate == Some(true) {
+            // Internals are refused before any lookup, so an estimate never
+            // discloses whether a `.git` or `.symforge` path exists or its size.
+            if let Some(refusal) = read_gate::hard_scope_refusal(&input.path) {
+                return refusal;
+            }
             let indexed = {
                 let guard = self.index.data_plane().read();
                 loading_guard!(guard);
@@ -9143,8 +9153,9 @@ impl SymForgeServer {
         // refused before any filesystem call, so an existing and a missing file
         // get the same answer. Every lane below would refuse it anyway;
         // answering here keeps the refusal from depending on existence. The
-        // estimate above is exempt by contract (Feature 020 R1/E1: aggregate
-        // counts for a demoted file succeed).
+        // estimate above refuses internals itself and is exempt for credential
+        // paths by contract (Feature 020 R1/E1: aggregate counts for a demoted
+        // file succeed).
         if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&input.path) {
             return format::content_withheld_by_path_rule(&input.path, rule_id);
         }
@@ -17486,6 +17497,77 @@ mod tests {
             !protected.join(".symforge").exists(),
             "explicit-protected indexing must skip source-local state entirely"
         );
+    }
+
+    /// A root inside a credential directory is refused outright: the path rules
+    /// are anchored at `.aws/credentials`, so once the root IS `.aws` the bare
+    /// relative `credentials` would match none of them. The explicit override
+    /// does not reach it either; no project lives in a credential store.
+    #[tokio::test]
+    async fn index_folder_refuses_credential_directory_roots_even_with_override() {
+        let fixture = TempDir::new().expect("credential-root fixture parent");
+        for store in [
+            ".aws",
+            ".kube",
+            ".ssh",
+            ".gnupg",
+            ".docker",
+            ".config/gcloud",
+        ] {
+            let root = fixture.path().join("home").join(store);
+            fs::create_dir_all(&root).expect("create modeled credential directory");
+            fs::write(root.join("credentials"), "placeholder\n").expect("write placeholder");
+
+            let server = make_server(make_live_index_empty());
+            for allow_protected_root in [None, Some(true)] {
+                let refused = server
+                    .index_folder(Parameters(super::IndexFolderInput {
+                        path: root.display().to_string(),
+                        idempotency_key: None,
+                        add: None,
+                        allow_protected_root,
+                    }))
+                    .await;
+                assert!(
+                    refused.contains("credential_directory") && !refused.contains("Indexed"),
+                    "{store} root must be refused as a credential directory \
+                     (allow_protected_root={allow_protected_root:?}): {refused}"
+                );
+            }
+            assert!(!root.join(".symforge").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn get_file_content_estimate_refuses_internals_whether_present_or_absent() {
+        let (dir, server) = setup_loaded_edit_test(&[("src/lib.rs", "pub fn anchor() {}\n")]);
+        fs::create_dir_all(dir.path().join(".git")).expect("create .git");
+        fs::write(dir.path().join(".git/config"), "placeholder\n").expect("write .git/config");
+        fs::create_dir_all(dir.path().join(".symforge")).expect("create .symforge");
+        fs::write(dir.path().join(".symforge/present.bin"), "placeholder\n")
+            .expect("write .symforge file");
+
+        let estimate = |path: &str| {
+            let mut input = get_file_content_input(path);
+            input.estimate = Some(true);
+            server.get_file_content(Parameters(input))
+        };
+        for (present, absent) in [
+            (".git/config", ".git/absent"),
+            (".symforge/present.bin", ".symforge/absent.bin"),
+        ] {
+            let present_answer = estimate(present).await;
+            let absent_answer = estimate(absent).await;
+            assert!(
+                present_answer.contains("outside source scope"),
+                "{present} estimate must be the hard-scope refusal: {present_answer}"
+            );
+            assert_eq!(
+                present_answer.replace(present, "<path>"),
+                absent_answer.replace(absent, "<path>"),
+                "the estimate must not disclose whether {present} exists"
+            );
+        }
     }
 
     #[tokio::test]
