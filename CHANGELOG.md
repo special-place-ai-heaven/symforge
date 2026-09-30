@@ -32,6 +32,15 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.2...v11.3.3) (2026-09-30)
+
+
+### Bug Fixes
+
+* **daemon:** reap sessions whose process died and report heartbeating versus stale ([#718](https://github.com/special-place-ai-heaven/symforge/issues/718)) ([fd8c3de](https://github.com/special-place-ai-heaven/symforge/commit/fd8c3de1998a6a4960d41848fd59530c2ecd5d79))
+* **protocol:** upgrade rmcp to 3.5.0 and clear its sticky metadata requirement after initialize ([#719](https://github.com/special-place-ai-heaven/symforge/issues/719)) ([5f56f19](https://github.com/special-place-ai-heaven/symforge/commit/5f56f1973f73b86d870834c232a42ceb39e2cc1a))
+* **windows:** make the windows-native CI job green ([#722](https://github.com/special-place-ai-heaven/symforge/issues/722)) ([a9f08e4](https://github.com/special-place-ai-heaven/symforge/commit/a9f08e4101b242f6d549a7e79fe1e31d6c1b5f7c))
+
 ## [11.3.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.1...v11.3.2) (2026-09-30)
 
 
