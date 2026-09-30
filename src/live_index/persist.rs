@@ -2475,7 +2475,16 @@ fn stat_check_files_from_view(
     }
 
     // Find new files (on disk but not in index)
-    let (new_files, discovery_error) = match crate::discovery::discover_files(root) {
+    let discovered = crate::discovery::discover_files(root);
+    #[cfg(test)]
+    let discovered = match test_discovery_failure_root().lock().as_deref() {
+        Some(failing) if failing == root => Err(anyhow::anyhow!(
+            "injected discovery failure under {}",
+            root.display()
+        )),
+        _ => discovered,
+    };
+    let (new_files, discovery_error) = match discovered {
         Ok(discovered) => (
             discovered
                 .into_iter()
@@ -2499,6 +2508,13 @@ fn stat_check_files_from_view(
         new_files,
         discovery_error,
     })
+}
+
+/// Test-only fault injection: discovery fails for this project root.
+#[cfg(test)]
+fn test_discovery_failure_root() -> &'static parking_lot::Mutex<Option<PathBuf>> {
+    static ROOT: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
+    &ROOT
 }
 
 /// Files a stat pass or spot check handles between two stop checks.
@@ -2942,25 +2958,21 @@ fn reverify_through_canonical_seam(
     }
 }
 
-/// Why a verify's mismatches exist, in words an agent can act on.
+/// Why a verify's mismatches exist, in words an agent can act on. Withheld
+/// paths are not counted here: status renders them from the live set, which
+/// shrinks as re-reads release them.
 fn snapshot_verify_mismatch_reason(
-    unreconciled: usize,
     spot_mismatches: usize,
     unreadable_not_reparsed: usize,
-    discovery_error: Option<&str>,
+    discovery_failed: bool,
     not_reparsed: usize,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(error) = discovery_error {
-        parts.push(format!(
-            "new files could not be discovered ({error}), so files added since the snapshot may be missing"
-        ));
-    }
-    if unreconciled > 0 {
-        parts.push(format!(
-            "{unreconciled} restored files could not be reconciled and are withheld until a \
-             re-read of the file or index_folder"
-        ));
+    if discovery_failed {
+        parts.push(
+            "new files could not be discovered, so files added since the snapshot may be missing"
+                .to_string(),
+        );
     }
     if spot_mismatches > 0 {
         parts.push(format!(
@@ -3103,15 +3115,23 @@ fn run_background_verify<F, C>(
     // of asserting a currency nothing established.
     #[cfg_attr(feature = "server", allow(unused_mut))]
     let mut reported: Vec<String> = spot_mismatches.clone();
-    let discovery_error = stat_result.discovery_error.as_deref();
-    if discovery_error.is_some() {
-        // No path stands for the files nobody could discover; the root does.
-        reported.push(root.display().to_string());
-    }
+    // No path stands for the files nobody could discover. The error goes in
+    // its own field, without the machine's absolute project root.
+    let discovery_error = stat_result.discovery_error.as_deref().map(|error| {
+        // The walker reports canonical paths, so both spellings are elided,
+        // the longer canonical one first.
+        let canonical = std::fs::canonicalize(root).ok();
+        canonical
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(root))
+            .fold(error.to_string(), |error, form| {
+                error.replace(form.to_string_lossy().as_ref(), "<project root>")
+            })
+    });
     // Restored paths the verify could not reconcile, with why. Withheld when
     // the verify resolves.
     let mut unreconciled: BTreeMap<String, String> = BTreeMap::new();
-    let mut claims: HashSet<String> = stat_result.deleted.iter().cloned().collect();
 
     // Re-parsing routes through the watcher's admission seam; embed has no
     // watcher, so changed/new files are detected but not re-parsed there and
@@ -3138,15 +3158,15 @@ fn run_background_verify<F, C>(
         reported.extend(spot_unreadable.iter().cloned());
         (Vec::<String>::new(), not_reparsed, spot_unreadable.len())
     };
-    claims.extend(stat_result.changed.iter().cloned());
-    claims.extend(stat_result.new_files.iter().cloned());
-    claims.extend(to_reparse.iter().cloned());
-    // Rows the stat pass saw, kept for every path being re-read: they are the
-    // per-path fence, the parse-free reuse when bytes match, and, for a path
-    // the verify cannot reconcile, the exact row to withhold.
-    #[cfg(feature = "server")]
+    // Rows the stat pass saw, for every path the verify may leave
+    // unreconciled: re-read paths, and deleted paths that can come back
+    // before the publication re-checks their absence. They are the per-path
+    // fence, the parse-free reuse when bytes match, and the exact row to
+    // withhold. Every build keeps them, so the read gate and the search lanes
+    // agree on what is withheld.
     let base_rows: HashMap<String, Arc<IndexedFile>> = to_reparse
         .iter()
+        .chain(&stat_result.deleted)
         .filter_map(|path| {
             base.files
                 .get(path)
@@ -3154,7 +3174,7 @@ fn run_background_verify<F, C>(
         })
         .collect();
     drop(base);
-    progress.start_reverify(claims, to_reparse.len());
+    progress.start_reverify(to_reparse.len());
 
     #[cfg_attr(not(feature = "server"), allow(unused_mut))]
     let mut removals: Vec<(String, PathBuf)> = stat_result
@@ -3270,20 +3290,17 @@ fn run_background_verify<F, C>(
             .collect();
         let report = SnapshotVerifyReport::from_mismatched_paths(paths)
             .with_reason(snapshot_verify_mismatch_reason(
-                unreconciled.len(),
                 spot_count,
                 unreadable_not_reparsed,
-                discovery_error,
+                discovery_error.is_some(),
                 not_reparsed,
             ))
-            .with_unverified(unreconciled.clone());
-        #[cfg(feature = "server")]
+            .with_unverified(unreconciled.clone())
+            .with_discovery_error(discovery_error.clone());
         let restored_rows = unreconciled
             .keys()
             .map(|path| (path.clone(), base_rows.get(path).cloned()))
             .collect();
-        #[cfg(not(feature = "server"))]
-        let restored_rows = Vec::new();
         SnapshotVerifyCompletion {
             report,
             restored_rows,
@@ -3352,7 +3369,7 @@ fn run_background_verify<F, C>(
         }
         final_report
     };
-    if final_report.mismatch_count > 0 {
+    if final_report.has_mismatches() {
         warn!(
             "background verify reported {} mismatched files: {}; freshness reports \
              SnapshotVerificationFailed",
@@ -4903,7 +4920,6 @@ mod tests {
 
     /// A loaded index checkpointed and restored, as a daemon open does, with
     /// `edited` of its `files` rewritten on disk afterwards.
-    #[cfg(feature = "server")]
     fn restored_with_offline_edits(
         root: &Path,
         files: usize,
@@ -5097,6 +5113,15 @@ mod tests {
         assert_eq!(live.files[BROKEN].content, b"pub fn f1() { let _ = 1; }\n");
         assert!(live.unverified_since_restore(BROKEN).is_none());
         assert!(crate::protocol::read_gate::refuse_by_policy(&live, BROKEN).is_none());
+        let status = crate::protocol::format::snapshot_verify_status_line(
+            IndexLoadSource::SnapshotRestore,
+            &live.snapshot_verify_state,
+        )
+        .expect("a restore reports its verify");
+        assert!(
+            !status.contains("withheld") && !status.contains("unverified_since_restore"),
+            "status must not report a released path as withheld: {status}"
+        );
     }
 
     /// A file gone between the stat pass and its re-read is removed inside the
@@ -5312,7 +5337,7 @@ mod tests {
             "{}",
             progress.describe()
         );
-        progress.start_reverify(HashSet::new(), 5);
+        progress.start_reverify(5);
         assert!(
             progress
                 .describe()
@@ -5378,32 +5403,19 @@ mod tests {
         );
     }
 
-    /// While a snapshot verify runs, the paths its stat pass claimed are left
-    /// to it: the sweep admitting them would cost one whole-index publication
+    /// While a snapshot verify runs, the sweep defers every path, new files
+    /// included: admitting them itself would cost one whole-index publication
     /// each, which the verify's single publication exists to avoid.
     #[cfg(feature = "server")]
     #[test]
-    fn fresh_instance_sweep_leaves_verify_claims_to_the_verify() {
+    fn sweep_defers_new_files_while_a_verify_runs() {
         let tmp = TempDir::new().unwrap();
-        for i in 0..5 {
-            std::fs::write(
-                tmp.path().join(format!("f{i}.rs")),
-                format!("pub fn f{i}() {{}}\n"),
-            )
-            .unwrap();
-        }
-        let loaded = LiveIndex::load(tmp.path()).unwrap();
-        checkpoint_shared_index(&loaded, tmp.path(), &project_local_placement(tmp.path())).unwrap();
-        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let restored = crate::live_index::SharedIndexHandle::shared(snapshot_to_live_index(
-            snapshot,
-            tmp.path(),
-        ));
-        std::fs::write(tmp.path().join("f3.rs"), "pub fn f3() { let _ = 3; }\n").unwrap();
+        let (restored, _) = restored_with_offline_edits(tmp.path(), 5, 1);
+        std::fs::write(tmp.path().join("new.rs"), "pub fn new() {}\n").unwrap();
         let generation = restored.current_project_generation();
         let progress = SnapshotVerifyProgress::started(SystemTime::now(), 5);
         assert!(restored.mark_snapshot_verify_started_at_generation(generation, progress.clone()));
-        progress.start_reverify(HashSet::from(["f3.rs".to_string()]), 1);
+        progress.start_reverify(1);
 
         let before = restored.published_generation().publication_generation;
         let repaired = crate::watcher::reconcile_stale_files_with_stop(
@@ -5414,13 +5426,189 @@ mod tests {
             verify_observer(tmp.path()),
         );
 
-        assert_eq!(repaired, 0, "the claimed stale file belongs to the verify");
-        assert!(restored.published_generation().publication_generation - before <= 1);
+        assert_eq!(repaired, 0, "every path belongs to the running verify");
         assert_eq!(
-            restored.read().files["f3.rs"].content,
-            b"pub fn f3() {}\n",
-            "the sweep must not have re-admitted the claimed file"
+            restored.published_generation().publication_generation,
+            before,
+            "a deferred sweep publishes nothing"
         );
+        assert!(
+            !restored.read().files.contains_key("new.rs"),
+            "the sweep must not admit a new file while the verify runs"
+        );
+        assert_eq!(restored.read().files["f0.rs"].content, b"pub fn f0() {}\n");
+    }
+
+    /// A path deleted offline and recreated while the verify runs returns
+    /// between the stat pass and the publication, which refuses its removal.
+    /// When the path cannot be re-read either, the restored seed row is
+    /// withheld, not served as current. Every build agrees: whatever the read
+    /// gate reports withheld, no lane holds a row for.
+    #[tokio::test]
+    async fn background_verify_withholds_a_deleted_path_that_returns_unreadable() {
+        const BACK: &str = "f2.rs";
+        struct ClearInjection;
+        impl Drop for ClearInjection {
+            fn drop(&mut self) {
+                *crate::live_index::single_file::test_scout_failure_path().lock() = None;
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let (shared, snapshot_mtimes) = restored_with_offline_edits(tmp.path(), 5, 0);
+        std::fs::remove_file(tmp.path().join(BACK)).unwrap();
+        let _clear = ClearInjection;
+        *crate::live_index::single_file::test_scout_failure_path().lock() = Some(BACK.to_string());
+
+        let root = tmp.path().to_path_buf();
+        let watched = shared.clone();
+        background_verify_cancellable(
+            shared.clone(),
+            root.clone(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+            move || {
+                // Once the stat pass has recorded the path as deleted, bring
+                // it back before the publication re-checks its absence.
+                let past_stat_pass = matches!(
+                    &watched.read().snapshot_verify_state,
+                    SnapshotVerifyState::Running(progress)
+                        if !progress.describe().starts_with("phase=stat_pass")
+                );
+                if past_stat_pass && !root.join(BACK).exists() {
+                    std::fs::write(root.join(BACK), "pub fn f2() { let _ = 2; }\n").unwrap();
+                }
+                false
+            },
+        )
+        .await;
+
+        let live = shared.read();
+        assert!(tmp.path().join(BACK).exists(), "the path came back");
+        assert!(
+            live.unverified_since_restore(BACK).is_some(),
+            "the path the verify could not reconcile is recorded: {:?}",
+            live.snapshot_verify_state
+        );
+        assert!(
+            !live.files.contains_key(BACK),
+            "its restored seed row must not be served as current"
+        );
+        for path in live.withheld_since_restore().keys() {
+            assert!(
+                !live.files.contains_key(path),
+                "{path} is reported withheld but a lane still holds its row"
+            );
+        }
+    }
+
+    /// A discovery failure is reported in its own field, with the project
+    /// root elided: no absolute machine path lands in the mismatched paths or
+    /// in status, and the verify still reports that it could not vouch.
+    #[tokio::test]
+    async fn background_verify_reports_a_discovery_failure_without_a_machine_path() {
+        struct ClearInjection;
+        impl Drop for ClearInjection {
+            fn drop(&mut self) {
+                *super::test_discovery_failure_root().lock() = None;
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let (shared, snapshot_mtimes) = restored_with_offline_edits(tmp.path(), 3, 0);
+        let _clear = ClearInjection;
+        *super::test_discovery_failure_root().lock() = Some(tmp.path().to_path_buf());
+
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
+
+        let live = shared.read();
+        let SnapshotVerifyState::Completed(report) = &live.snapshot_verify_state else {
+            panic!(
+                "expected a completed verify: {:?}",
+                live.snapshot_verify_state
+            );
+        };
+        let root = tmp.path().display().to_string();
+        let error = report
+            .discovery_error
+            .as_deref()
+            .expect("the failure is recorded");
+        assert!(
+            error.contains("injected discovery failure under <project root>"),
+            "{error}"
+        );
+        assert!(
+            report.has_mismatches(),
+            "the verify could not vouch for new files"
+        );
+        assert!(
+            report
+                .mismatched_paths
+                .iter()
+                .all(|path| !path.contains(&root)),
+            "{:?}",
+            report.mismatched_paths
+        );
+        #[cfg(feature = "server")]
+        {
+            let status = crate::protocol::format::snapshot_verify_status_line(
+                IndexLoadSource::SnapshotRestore,
+                &live.snapshot_verify_state,
+            )
+            .expect("a restore reports its verify");
+            assert!(!status.contains(&root), "{status}");
+            assert!(status.contains("discovery_error="), "{status}");
+        }
+    }
+
+    /// A path withheld because its read failed is retried by every sweep, even
+    /// after a published scout plan records it as unchanged on disk.
+    #[cfg(feature = "server")]
+    #[test]
+    fn sweep_retries_a_withheld_path_until_it_reads() {
+        const BROKEN: &str = "f1.rs";
+        struct ClearInjection;
+        impl Drop for ClearInjection {
+            fn drop(&mut self) {
+                *crate::live_index::single_file::test_scout_failure_path().lock() = None;
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let (shared, snapshot_mtimes) = restored_with_offline_edits(tmp.path(), 3, 2);
+        let _clear = ClearInjection;
+        *crate::live_index::single_file::test_scout_failure_path().lock() =
+            Some(BROKEN.to_string());
+        block_on_background_verify_for_test(shared.clone(), tmp.path(), snapshot_mtimes);
+        assert!(shared.read().unverified_since_restore(BROKEN).is_some());
+        let sweep = || {
+            crate::watcher::reconcile_stale_files_with_stop(
+                tmp.path(),
+                &shared,
+                || false,
+                shared.current_project_generation(),
+                verify_observer(tmp.path()),
+            )
+        };
+
+        // The read still fails; this sweep publishes the plan that lists the
+        // path as seen.
+        sweep();
+        assert!(shared.read().unverified_since_restore(BROKEN).is_some());
+        assert!(
+            shared.scout_plan().is_some(),
+            "the sweep published its plan"
+        );
+
+        // The failure was transient. The next sweep retries and releases it.
+        *crate::live_index::single_file::test_scout_failure_path().lock() = None;
+        sweep();
+        let live = shared.read();
+        assert!(live.unverified_since_restore(BROKEN).is_none());
+        assert_eq!(live.files[BROKEN].content, b"pub fn f1() { let _ = 1; }\n");
     }
 
     /// Cost bound: one publication rebuilds the whole index's derived state,

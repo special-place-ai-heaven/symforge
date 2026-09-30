@@ -576,9 +576,15 @@ fn append_snapshot_verify_mismatch_summary(
             let shown = report.mismatched_paths.len().min(path_limit);
             let omitted = report.mismatch_count.saturating_sub(shown);
             line.push_str(&format!(" showing={shown} omitted={omitted}"));
-            if let Some(reason) = &report.reason {
-                line.push_str(&format!(" reason=\"{reason}\""));
-            }
+        }
+        if let Some(reason) = &report.reason {
+            line.push_str(&format!(" reason={}", quoted_status_value(reason)));
+        }
+        if let Some(error) = &report.discovery_error {
+            line.push_str(&format!(" discovery_error={}", quoted_status_value(error)));
+        }
+        if report.mismatch_count > 0 {
+            let shown = report.mismatched_paths.len().min(path_limit);
             if shown > 0 {
                 let paths = report
                     .mismatched_paths
@@ -601,12 +607,31 @@ fn append_snapshot_verify_mismatch_summary(
                 .collect::<Vec<_>>()
                 .join("; ");
             line.push_str(&format!(
-                " unverified_since_restore={} unverified_omitted={} unverified=\"{listed}\"",
+                " unverified_since_restore={} unverified_omitted={} unverified={}",
                 report.unverified.len(),
-                report.unverified.len() - shown
+                report.unverified.len() - shown,
+                quoted_status_value(&listed)
             ));
         }
     }
+}
+
+/// A double-quoted `key=value` value: backslashes and quotes escaped, and
+/// control characters (newlines in an error message) flattened to spaces, so
+/// free text can never end the value or the line early.
+fn quoted_status_value(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            ch if ch.is_control() => quoted.push(' '),
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn snapshot_verify_health_line(published: &PublishedIndexState) -> Option<String> {
@@ -3863,6 +3888,61 @@ pub fn unverified_since_restore(path: &str, reason: &str) -> String {
          A successful re-read releases it: the watcher does that on the next change to the \
          file, and index_folder rebuilds the whole project from source."
     )
+}
+
+/// Paths the snapshot verify withheld inside `scope`, bounded for display:
+/// the count, up to `limit` paths, and how many more there are.
+fn withheld_listing(
+    unverified: &std::collections::BTreeMap<String, String>,
+    scope: Option<&str>,
+    limit: usize,
+) -> Option<(usize, String)> {
+    let in_scope: Vec<&str> = unverified
+        .keys()
+        .map(String::as_str)
+        .filter(|path| scope.is_none_or(|scope| path.starts_with(scope)))
+        .collect();
+    if in_scope.is_empty() {
+        return None;
+    }
+    let mut listed = in_scope
+        .iter()
+        .take(limit)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if in_scope.len() > limit {
+        listed.push_str(&format!(" (+{} more)", in_scope.len() - limit));
+    }
+    Some((in_scope.len(), listed))
+}
+
+/// Appended to a project-wide answer when the snapshot verify withheld files
+/// inside its scope: those files were not searched, so the answer may be
+/// missing hits from them.
+pub fn withheld_not_searched_note(
+    unverified: &std::collections::BTreeMap<String, String>,
+    scope: Option<&str>,
+) -> Option<String> {
+    let (count, listed) = withheld_listing(unverified, scope, 5)?;
+    Some(format!(
+        "Note: {count} files withheld as unverified since restore were not searched: {listed}. \
+         A successful re-read releases each one, and index_folder rebuilds the project from source."
+    ))
+}
+
+/// A project-wide mutation cannot see references inside withheld files, so
+/// it refuses rather than leave them half-renamed.
+pub fn project_wide_mutation_refused_unverified(
+    tool: &str,
+    unverified: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let (count, listed) = withheld_listing(unverified, None, 10)?;
+    Some(format!(
+        "{tool} refused: {count} files are withheld as unverified since restore, and a \
+         project-wide change cannot see what they contain: {listed}. A successful re-read \
+         releases each one; run index_folder to rebuild the project from source, then retry."
+    ))
 }
 
 /// Richer "file not found" with suggested similar paths.

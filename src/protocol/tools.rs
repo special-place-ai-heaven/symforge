@@ -2636,12 +2636,19 @@ struct AdmissionDegradationView {
     reason: Option<SkipReason>,
 }
 
-fn normalize_admission_degradation_path(raw: &str) -> String {
-    let mut normalized = raw.trim().replace('\\', "/");
-    while normalized.starts_with("./") {
-        normalized = normalized[2..].to_string();
+/// Appends the withheld-files note when the snapshot verify withheld files
+/// inside `scope`, so a project-wide answer never reads as complete.
+fn with_withheld_note(live: &LiveIndex, scope: Option<&str>, mut output: String) -> String {
+    let scope = scope
+        .map(crate::protocol::read_gate::normalize_requested_path)
+        .filter(|scope| !scope.is_empty());
+    if let Some(note) =
+        format::withheld_not_searched_note(live.withheld_since_restore(), scope.as_deref())
+    {
+        output.push_str("\n\n");
+        output.push_str(&note);
     }
-    normalized.trim_matches('/').to_string()
+    output
 }
 
 fn admission_degradation_view_from_lookup(
@@ -2684,7 +2691,7 @@ fn admission_degradation_view_from_disk(
         .ok()
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
         .filter(|relative| !relative.is_empty())
-        .unwrap_or_else(|| normalize_admission_degradation_path(path));
+        .unwrap_or_else(|| crate::protocol::read_gate::normalize_requested_path(path));
 
     // The binary sniff below OPENS the file, so the admission gate's no-bytes
     // policy decides first and a demoted path is never read here. Callers
@@ -2764,7 +2771,9 @@ fn admission_degradation_view_for_path(
     repo_root: Option<&Path>,
     path: &str,
 ) -> Result<Option<AdmissionDegradationView>, String> {
-    if let Some(refusal) = crate::protocol::read_gate::refuse_by_policy(index, path) {
+    // Normalized first (pure string work) so `./x` and `x` refuse alike.
+    let requested = crate::protocol::read_gate::normalize_requested_path(path);
+    if let Some(refusal) = crate::protocol::read_gate::refuse_by_policy(index, &requested) {
         return Err(refusal);
     }
     let Some(view) = index
@@ -5640,6 +5649,14 @@ impl SymForgeServer {
         let result = {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
+            if let Some(notice) = params
+                .0
+                .path_prefix
+                .as_deref()
+                .and_then(|path| crate::protocol::read_gate::unverified_notice(&guard, path))
+            {
+                return notice;
+            }
             search::search_symbols_with_options(
                 &guard,
                 query_str,
@@ -5766,6 +5783,7 @@ impl SymForgeServer {
         // tool. See wiki `[[SymForge Frecency-Weighted File Ranking]]`
         // §"Search tools deliberately do NOT bump" for the positive-feedback-
         // loop rationale.
+        let output = with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), output);
         self.apply_ccr_budget("search_symbols", output, params.0.max_tokens)
     }
     /// Shows matches with enclosing symbol context. Use group_by='symbol' to deduplicate,
@@ -6004,6 +6022,13 @@ impl SymForgeServer {
         // rebuilt the local index. The source-free estimate above deliberately
         // remains before publication selection.
         let generation = self.capture_local_response_generation();
+        if let Some(notice) =
+            params.0.path_prefix.as_deref().and_then(|path| {
+                crate::protocol::read_gate::unverified_notice(&generation.live, path)
+            })
+        {
+            return notice;
+        }
         // Structural (AST-pattern) search mode.
         if params.0.structural.unwrap_or(false) {
             let pattern = match params.0.query.as_deref() {
@@ -6044,7 +6069,11 @@ impl SymForgeServer {
                 "search_text",
                 (output.len() / 4).min(u32::MAX as usize) as u32,
             );
-            return self.apply_ccr_budget("search_text", output, params.0.max_tokens);
+            return self.apply_ccr_budget(
+                "search_text",
+                with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), output),
+                params.0.max_tokens,
+            );
         }
 
         let mut options = match search_text_options_from_input(&params.0) {
@@ -6186,7 +6215,15 @@ impl SymForgeServer {
                         "search_text",
                         (output.len() / 4).min(u32::MAX as usize) as u32,
                     );
-                    return self.apply_ccr_budget("search_text", output, params.0.max_tokens);
+                    return self.apply_ccr_budget(
+                        "search_text",
+                        with_withheld_note(
+                            &generation.live,
+                            params.0.path_prefix.as_deref(),
+                            output,
+                        ),
+                        params.0.max_tokens,
+                    );
                 }
             }
         }
@@ -6217,6 +6254,7 @@ impl SymForgeServer {
         // (hot files get searched more, which would bump them more, which
         // would rank them higher still). See wiki `[[SymForge Frecency-
         // Weighted File Ranking]]` §"Search tools deliberately do NOT bump".
+        let result = with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), result);
         self.apply_ccr_budget("search_text", result, params.0.max_tokens)
     }
 
@@ -6286,6 +6324,11 @@ impl SymForgeServer {
         let view = {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
+            if let Some(notice) =
+                crate::protocol::read_gate::unverified_notice(&guard, &params.0.path)
+            {
+                return notice;
+            }
             guard.capture_inspect_match_view(
                 &params.0.path,
                 params.0.line,
@@ -9487,6 +9530,7 @@ impl SymForgeServer {
                     );
                 }
             }
+            let result = with_withheld_note(&generation.live, None, result);
             return match envelope {
                 Some(envelope) => format!("{envelope}\n\n{result}"),
                 None => result,
@@ -9662,6 +9706,7 @@ impl SymForgeServer {
                     output.push_str("\n\n");
                     output.push_str(disclosure);
                 }
+                let output = with_withheld_note(&generation.live, None, output);
 
                 self.record_tool_savings_named(
                     "find_references",
@@ -9730,6 +9775,11 @@ impl SymForgeServer {
         if let Some(message) = loading_guard_message_from_published(&generation.health) {
             return message;
         }
+        if let Some(notice) =
+            crate::protocol::read_gate::unverified_notice(&generation.live, &input.path)
+        {
+            return notice;
+        }
         let view = generation.live.capture_find_dependents_view(&input.path);
         // Default per-file reference detail is capped at 5 lines (not 10) so the
         // non-compact view stays bounded on hub files with dozens of dependents;
@@ -9740,10 +9790,16 @@ impl SymForgeServer {
         let output = match fmt {
             "mermaid" => format::find_dependents_mermaid(&view, &input.path, &limits),
             "dot" => format::find_dependents_dot(&view, &input.path, &limits),
-            _ if input.compact.unwrap_or(false) => {
-                format::find_dependents_compact_view(&view, &input.path, &limits)
-            }
-            _ => format::find_dependents_result_view(&view, &input.path, &limits),
+            _ if input.compact.unwrap_or(false) => with_withheld_note(
+                &generation.live,
+                None,
+                format::find_dependents_compact_view(&view, &input.path, &limits),
+            ),
+            _ => with_withheld_note(
+                &generation.live,
+                None,
+                format::find_dependents_result_view(&view, &input.path, &limits),
+            ),
         };
         self.session_context.record_summary_output(
             "find_dependents",
@@ -21632,7 +21688,7 @@ mod tests {
             std::time::SystemTime::now(),
             100,
         );
-        progress.start_reverify(std::collections::HashSet::new(), 40);
+        progress.start_reverify(40);
         progress.add_processed(10);
         index.snapshot_verify_state =
             crate::live_index::store::SnapshotVerifyState::Running(progress);
@@ -21681,7 +21737,7 @@ mod tests {
             std::time::SystemTime::now(),
             100,
         );
-        progress.start_reverify(std::collections::HashSet::new(), 40);
+        progress.start_reverify(40);
         progress.add_processed(10);
         index.snapshot_verify_state =
             crate::live_index::store::SnapshotVerifyState::Running(progress);
@@ -21773,6 +21829,157 @@ mod tests {
                 "no content may be served: {result}"
             );
         }
+    }
+
+    /// Every lane that names a withheld path answers with the unverified
+    /// notice, whatever spelling the path arrives in; project-wide answers say
+    /// what they did not search; and a project-wide rename refuses.
+    #[tokio::test]
+    async fn test_withheld_restored_file_is_named_by_every_lane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("src dir");
+        std::fs::write(tmp.path().join("src/held.rs"), b"fn held() { foo(); }").expect("held");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+        index.snapshot_verify_state = crate::live_index::store::SnapshotVerifyState::Completed(
+            crate::live_index::store::SnapshotVerifyReport::from_mismatched_paths(vec![
+                "src/held.rs".to_string(),
+            ])
+            .with_unverified(std::collections::BTreeMap::from([(
+                "src/held.rs".to_string(),
+                "it could not be read: access denied".to_string(),
+            )])),
+        );
+        let server = make_server_with_root(index, Some(tmp.path().to_path_buf()));
+        struct ClearInjection;
+        impl Drop for ClearInjection {
+            fn drop(&mut self) {
+                *crate::live_index::single_file::test_scout_failure_path().lock() = None;
+            }
+        }
+        let _clear = ClearInjection;
+        *crate::live_index::single_file::test_scout_failure_path().lock() =
+            Some("src/held.rs".to_string());
+        fn input<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Parameters<T> {
+            Parameters(serde_json::from_value(value).expect("tool input"))
+        }
+
+        let named = [
+            (
+                "inspect_match",
+                server
+                    .inspect_match(input(serde_json::json!({"path": "src/held.rs", "line": 1})))
+                    .await,
+            ),
+            (
+                "inspect_match ./",
+                server
+                    .inspect_match(input(
+                        serde_json::json!({"path": "./src/held.rs", "line": 1}),
+                    ))
+                    .await,
+            ),
+            (
+                "search_symbols path_prefix",
+                server
+                    .search_symbols(input(serde_json::json!({
+                        "query": "held", "path_prefix": "src/held.rs"
+                    })))
+                    .await,
+            ),
+            (
+                "search_text path_prefix backslash",
+                server
+                    .search_text(input(serde_json::json!({
+                        "query": "held", "path_prefix": "src\\held.rs"
+                    })))
+                    .await,
+            ),
+            (
+                "find_dependents",
+                server
+                    .find_dependents(input(serde_json::json!({"path": "src/held.rs"})))
+                    .await,
+            ),
+            (
+                "get_symbol ./",
+                server
+                    .get_symbol(input(serde_json::json!({
+                        "path": "./src/held.rs", "name": "held"
+                    })))
+                    .await,
+            ),
+        ];
+        for (lane, result) in &named {
+            assert!(
+                result.starts_with("Unverified since restore: src/held.rs")
+                    && result.contains("access denied")
+                    && result.contains("index_folder"),
+                "{lane} must answer with the unverified notice, got: {result}"
+            );
+        }
+
+        let references = server
+            .find_references(input(serde_json::json!({"name": "foo"})))
+            .await;
+        assert!(
+            references.contains(
+                "Note: 1 files withheld as unverified since restore were not searched: src/held.rs"
+            ),
+            "a project-wide answer must say what it did not search: {references}"
+        );
+
+        let rename = server
+            .batch_rename(input(serde_json::json!({
+                "path": "src/lib.rs", "name": "foo", "new_name": "bar", "dry_run": true
+            })))
+            .await;
+        assert!(
+            rename.starts_with("batch_rename refused: 1 files are withheld as unverified")
+                && rename.contains("src/held.rs")
+                && rename.contains("index_folder"),
+            "a project-wide rename must refuse while files are withheld: {rename}"
+        );
+    }
+
+    /// A withheld sensitive path keeps its path-rule refusal, and free text in
+    /// a reason cannot break out of its status value.
+    #[test]
+    fn test_unverified_check_yields_to_path_rules_and_status_escapes_reasons() {
+        let mut index = make_live_index_ready(vec![]);
+        index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+        let report = crate::live_index::store::SnapshotVerifyReport::from_mismatched_paths(vec![
+            ".env".to_string(),
+            "src/q.rs".to_string(),
+        ])
+        .with_reason("a \"quoted\"\nreason".to_string())
+        .with_unverified(std::collections::BTreeMap::from([
+            (".env".to_string(), "it could not be read".to_string()),
+            ("src/q.rs".to_string(), "bad \"x\" y\nz".to_string()),
+        ]));
+        index.snapshot_verify_state =
+            crate::live_index::store::SnapshotVerifyState::Completed(report);
+
+        let refusal =
+            crate::protocol::read_gate::refuse_by_policy(&index, ".env").expect("refused");
+        assert_eq!(
+            refusal,
+            crate::protocol::format::content_withheld_by_admission(".env"),
+            "the sensitive path rule takes precedence"
+        );
+
+        let status = crate::protocol::format::snapshot_verify_status_line(
+            crate::live_index::store::IndexLoadSource::SnapshotRestore,
+            &index.snapshot_verify_state,
+        )
+        .expect("status line");
+        assert!(!status.contains('\n'), "{status}");
+        assert!(
+            status.contains("reason=\"a \\\"quoted\\\" reason\"")
+                && status.contains("src/q.rs: bad \\\"x\\\" y z"),
+            "{status}"
+        );
     }
 
     #[tokio::test]

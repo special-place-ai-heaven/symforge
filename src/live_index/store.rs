@@ -1211,6 +1211,9 @@ pub struct SnapshotVerifyReport {
     /// direct request is refused with the reason. A later successful re-read
     /// of the path through the canonical single-file seam releases it.
     pub unverified: Arc<BTreeMap<String, String>>,
+    /// Why discovering new files failed, with the project root elided. Files
+    /// added since the snapshot may then be missing; no path stands for them.
+    pub discovery_error: Option<String>,
 }
 
 impl SnapshotVerifyReport {
@@ -1224,6 +1227,7 @@ impl SnapshotVerifyReport {
             mismatched_paths: paths,
             reason: None,
             unverified: Arc::default(),
+            discovery_error: None,
         }
     }
 
@@ -1239,13 +1243,37 @@ impl SnapshotVerifyReport {
         self
     }
 
+    pub fn with_discovery_error(mut self, discovery_error: Option<String>) -> Self {
+        self.discovery_error = discovery_error;
+        self
+    }
+
     pub fn empty() -> Self {
         Self {
             mismatch_count: 0,
             mismatched_paths: Vec::new(),
             reason: None,
             unverified: Arc::default(),
+            discovery_error: None,
         }
+    }
+
+    /// Whether this verify found anything it could not vouch for.
+    pub fn has_mismatches(&self) -> bool {
+        self.mismatch_count > 0 || self.discovery_error.is_some()
+    }
+
+    /// Settle one withheld path. It leaves the unverified set, the mismatch
+    /// count and the listed paths together, so status never reports a count
+    /// that disagrees with what is withheld.
+    fn drop_unverified(&mut self, path: &str) {
+        if !self.unverified.contains_key(path) {
+            return;
+        }
+        Arc::make_mut(&mut self.unverified).remove(path);
+        self.mismatch_count = self.mismatch_count.saturating_sub(1);
+        self.mismatched_paths
+            .retain(|mismatched| mismatched != path);
     }
 
     pub fn omitted_path_count(&self) -> usize {
@@ -1293,9 +1321,6 @@ struct SnapshotVerifyCounters {
     phase: std::sync::atomic::AtomicU8,
     total: AtomicUsize,
     processed: AtomicUsize,
-    /// Paths the verify took ownership of after its stat pass: changed, new,
-    /// and deleted. The watcher's fresh-instance sweep leaves them to it.
-    claims: OnceLock<HashSet<String>>,
 }
 
 impl PartialEq for SnapshotVerifyProgress {
@@ -1314,7 +1339,6 @@ impl SnapshotVerifyProgress {
             phase: std::sync::atomic::AtomicU8::new(SNAPSHOT_VERIFY_PHASE_STAT_PASS),
             total: AtomicUsize::new(0),
             processed: AtomicUsize::new(0),
-            claims: OnceLock::new(),
         }))
     }
 
@@ -1331,11 +1355,10 @@ impl SnapshotVerifyProgress {
             .store(SNAPSHOT_VERIFY_PHASE_SPOT_CHECK, Ordering::Release);
     }
 
-    /// End of the spot check: record what the verify now owns and how much.
-    pub fn start_reverify(&self, claims: HashSet<String>, total: usize) {
+    /// End of the spot check: the verify now re-reads `total` files.
+    pub fn start_reverify(&self, total: usize) {
         self.0.processed.store(0, Ordering::Release);
         self.0.total.store(total, Ordering::Release);
-        let _ = self.0.claims.set(claims);
         self.0
             .phase
             .store(SNAPSHOT_VERIFY_PHASE_REVERIFY, Ordering::Release);
@@ -1349,11 +1372,6 @@ impl SnapshotVerifyProgress {
         self.0
             .phase
             .store(SNAPSHOT_VERIFY_PHASE_PUBLISH, Ordering::Release);
-    }
-
-    /// The paths the verify owns, once its stat pass has finished.
-    pub fn claims(&self) -> Option<&HashSet<String>> {
-        self.0.claims.get()
     }
 
     /// One-line `key=value` rendering shared by health, status, and the
@@ -2624,7 +2642,7 @@ impl SharedIndexHandle {
         let snapshot_verification_failed =
             matches!(
                 &live.snapshot_verify_state,
-                SnapshotVerifyState::Completed(report) if report.mismatch_count > 0
+                SnapshotVerifyState::Completed(report) if report.has_mismatches()
             ) || matches!(live.snapshot_verify_state, SnapshotVerifyState::Failed(_));
         let mut next_reasons = Vec::new();
         for reason in reason_codes.iter().copied().filter(|reason| {
@@ -6726,16 +6744,20 @@ impl LiveIndex {
         }
     }
 
+    /// Every restored path the snapshot verify withheld, with why. Empty
+    /// unless a completed verify withheld something.
+    pub fn withheld_since_restore(&self) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        match &self.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => &report.unverified,
+            _ => &NONE,
+        }
+    }
+
     /// A write that reached this path through a canonical seam settles it.
     fn release_unverified(&mut self, path: &str) {
-        if let SnapshotVerifyState::Completed(report) = &mut self.snapshot_verify_state
-            && report.unverified.contains_key(path)
-        {
-            Arc::make_mut(&mut report.unverified).remove(path);
-            report.mismatch_count = report.mismatch_count.saturating_sub(1);
-            report
-                .mismatched_paths
-                .retain(|mismatched| mismatched != path);
+        if let SnapshotVerifyState::Completed(report) = &mut self.snapshot_verify_state {
+            report.drop_unverified(path);
         }
     }
 
@@ -6748,7 +6770,6 @@ impl LiveIndex {
             restored_rows,
         } = completion;
         let mut withheld = false;
-        let mut unverified = (*report.unverified).clone();
         for (path, restored) in restored_rows {
             let current = self.files.get(&path);
             match (current, restored) {
@@ -6757,12 +6778,9 @@ impl LiveIndex {
                     withheld |= self.remove_row(&path);
                 }
                 // Another writer republished it since the stat pass.
-                _ => {
-                    unverified.remove(&path);
-                }
+                _ => report.drop_unverified(&path),
             }
         }
-        report.unverified = Arc::new(unverified);
         self.snapshot_verify_state = SnapshotVerifyState::Completed(report);
         withheld
     }
@@ -8474,6 +8492,43 @@ mod tests {
                 if reason_codes.contains(&FreshnessReason::ReconciliationPending)
                     && !reason_codes.contains(&FreshnessReason::SnapshotVerificationFailed)
         ));
+    }
+
+    /// A withheld path another writer republished leaves the unverified set,
+    /// the mismatch count and the listed paths together, so status never
+    /// counts a mismatch that nothing withholds.
+    #[test]
+    fn resolve_settles_a_republished_path_in_count_and_set_together() {
+        let mut live = make_empty_live_index();
+        live.is_empty = false;
+        live.load_source = IndexLoadSource::SnapshotRestore;
+        live.files.insert(
+            "src/a.rs".to_string(),
+            Arc::new(make_indexed_file_for_mutation("src/a.rs")),
+        );
+        // The seed the stat pass saw: a different row than the current one.
+        let seed = Arc::new(make_indexed_file_for_mutation("src/a.rs"));
+        let report = SnapshotVerifyReport::from_mismatched_paths(vec!["src/a.rs".to_string()])
+            .with_unverified(BTreeMap::from([(
+                "src/a.rs".to_string(),
+                "it could not be read".to_string(),
+            )]));
+
+        let withheld = live.resolve_snapshot_verify(SnapshotVerifyCompletion {
+            report,
+            restored_rows: vec![("src/a.rs".to_string(), Some(seed))],
+        });
+
+        assert!(!withheld, "another writer's row is current, not withheld");
+        assert!(live.files.contains_key("src/a.rs"));
+        match &live.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => {
+                assert!(report.unverified.is_empty());
+                assert_eq!(report.mismatch_count, 0, "{report:?}");
+                assert!(report.mismatched_paths.is_empty(), "{report:?}");
+            }
+            other => panic!("expected a completed verify, got {other:?}"),
+        }
     }
 
     #[test]

@@ -410,6 +410,32 @@ where
     // cross-project retarget keeps the stale spawn generation and is rejected.
     let fence_gen = effective_fence_generation(shared, repo_root, expected_gen);
 
+    // While a restored index's snapshot verify is pending or running it owns
+    // every restored row and discovers the new files itself, publishing all
+    // of it in one publication. The sweep admitting them instead would cost
+    // one whole-index publication per file. After the verify failed, the
+    // restored rows stay withheld until index_folder rebuilds them. In all
+    // three states the sweep defers every path and never waits on the verify.
+    // It publishes no plan either, so the first sweep after the verify still
+    // compares every path against the resident rows.
+    if matches!(
+        shared.read().snapshot_verify_state,
+        crate::live_index::store::SnapshotVerifyState::Pending
+            | crate::live_index::store::SnapshotVerifyState::Running(_)
+            | crate::live_index::store::SnapshotVerifyState::Failed(_)
+    ) {
+        info!("reconciliation sweep deferred: the snapshot verify has not resolved");
+        return 0.into();
+    }
+    // Paths the resolved verify withheld. The set is small, and a sweep
+    // re-reads each one every time, so a transient failure gets retried.
+    let withheld: HashSet<String> = shared
+        .read()
+        .withheld_since_restore()
+        .keys()
+        .cloned()
+        .collect();
+
     let previous_plan = shared.scout_plan();
     let previous_entries = previous_plan
         .as_ref()
@@ -462,6 +488,7 @@ where
                 let relative_path = entry.path.normalized_utf8.clone()?;
                 if previous_entries.get(&relative_path) == Some(entry)
                     && !transient_paths.contains(&relative_path)
+                    && !withheld.contains(&relative_path)
                 {
                     return None;
                 }
@@ -480,37 +507,10 @@ where
             };
 
         let mut repairs_applied = 0usize;
-        // While a restored index's snapshot verify is pending or running it
-        // owns every restored row, and it publishes its re-reads together in
-        // one publication; after it failed, the restored rows stay withheld
-        // until index_folder rebuilds them. In all three states the sweep
-        // leaves every row the index holds alone, and every path the running
-        // verify has claimed, and handles only paths nobody holds. It never
-        // waits on the verify and never re-admits restored rows one
-        // whole-index publication each. It does not reconcile restored rows
-        // at all until the verify has resolved.
-        let verify_progress = match &shared.read().snapshot_verify_state {
-            crate::live_index::store::SnapshotVerifyState::Pending
-            | crate::live_index::store::SnapshotVerifyState::Failed(_) => Some(None),
-            crate::live_index::store::SnapshotVerifyState::Running(progress) => {
-                Some(Some(progress.clone()))
-            }
-            _ => None,
-        };
-        let verify_owns_rows = verify_progress.is_some();
-        let claimed = verify_progress
-            .as_ref()
-            .and_then(|progress| progress.as_ref()?.claims());
-        let (mut admitted, mut already_current, mut left_to_verify) = (0usize, 0usize, 0usize);
+        let (mut admitted, mut already_current) = (0usize, 0usize);
         for (relative_path, absolute_path, entry) in changed_entries {
             if should_stop() {
                 return stale_count.into();
-            }
-            if claimed.is_some_and(|claimed| claimed.contains(&relative_path))
-                || (verify_owns_rows && shared.read().files.contains_key(&relative_path))
-            {
-                left_to_verify += 1;
-                continue;
             }
             // With no prior plan entry (every path of a snapshot-restored
             // index) the plan comparison above cannot tell a stale row from a
@@ -545,10 +545,7 @@ where
                 repairs_applied += 1;
             }
         }
-        info!(
-            "reconciliation sweep: {admitted} admitted, {already_current} already current, \
-             {left_to_verify} left to the running snapshot verify"
-        );
+        info!("reconciliation sweep: {admitted} admitted, {already_current} already current");
         for (relative_path, expected_entry) in removed_paths {
             if should_stop() {
                 return stale_count.into();
@@ -645,6 +642,21 @@ struct SweepSingleFlight(Arc<AtomicBool>);
 impl SweepSingleFlight {
     fn try_start(flag: &Arc<AtomicBool>) -> Option<Self> {
         (!flag.swap(true, Ordering::AcqRel)).then(|| Self(Arc::clone(flag)))
+    }
+
+    /// An overflow sweep cannot be skipped like a periodic tick, so it waits
+    /// for the running sweep to end. `None` once the watcher stops.
+    // ponytail: polls the flag; a condvar if overflow storms ever show here.
+    fn wait_to_start(flag: &Arc<AtomicBool>, stop: &AtomicBool) -> Option<Self> {
+        loop {
+            if let Some(started) = Self::try_start(flag) {
+                return Some(started);
+            }
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -1230,6 +1242,10 @@ pub async fn run_watcher_with_stop(
                     .unwrap_or(30);
                 let mut last_reconcile = Instant::now();
                 let periodic_sweep = Arc::new(AtomicBool::new(false));
+                // Set while an overflow sweep waits for the running sweep; one
+                // waiting sweep covers every overflow that arrives before it
+                // scouts.
+                let overflow_queued = Arc::new(AtomicBool::new(false));
 
                 loop {
                     if stop_token.load(Ordering::Acquire) {
@@ -1355,12 +1371,29 @@ pub async fn run_watcher_with_stop(
                                         "watcher: stale incarnation's gap report refused"
                                     );
                                 }
+                                if overflow_queued.swap(true, Ordering::AcqRel) {
+                                    // A queued sweep has not scouted yet, so
+                                    // it covers this overflow too.
+                                    return;
+                                }
                                 let shared_clone = shared.clone();
                                 let root_clone = repo_root.clone();
                                 let watcher_info_clone = watcher_info.clone();
                                 let stop_for_reconcile = Arc::clone(&stop_token);
                                 let expected_gen_for_reconcile = expected_gen;
+                                let sweep_flag = Arc::clone(&periodic_sweep);
+                                let queued = Arc::clone(&overflow_queued);
                                 tokio::task::spawn_blocking(move || {
+                                    let Some(_single_flight) = SweepSingleFlight::wait_to_start(
+                                        &sweep_flag,
+                                        &stop_for_reconcile,
+                                    ) else {
+                                        queued.store(false, Ordering::Release);
+                                        return;
+                                    };
+                                    // Cleared before the scout: an overflow
+                                    // after this point needs a sweep of its own.
+                                    queued.store(false, Ordering::Release);
                                     reconcile_for_cause(
                                         &root_clone,
                                         &shared_clone,
@@ -1511,6 +1544,33 @@ mod tests {
         assert!(
             SweepSingleFlight::try_start(&flag).is_some(),
             "the next tick starts a sweep once the first ended"
+        );
+    }
+    #[test]
+    fn overflow_sweep_waits_for_the_running_sweep() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let stop = AtomicBool::new(false);
+        let running = SweepSingleFlight::try_start(&flag).expect("a sweep runs");
+        let waiter = {
+            let flag = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                SweepSingleFlight::wait_to_start(&flag, &stop).is_some()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "the overflow sweep waits its turn");
+        drop(running);
+        assert!(
+            waiter.join().unwrap(),
+            "it starts once the running sweep ends"
+        );
+
+        let _held = SweepSingleFlight::try_start(&flag).expect("a sweep runs");
+        stop.store(true, Ordering::Release);
+        assert!(
+            SweepSingleFlight::wait_to_start(&flag, &stop).is_none(),
+            "a stopped watcher does not wait"
         );
     }
     use crate::domain::{MetadataOnlyReason, ScoutDecision};

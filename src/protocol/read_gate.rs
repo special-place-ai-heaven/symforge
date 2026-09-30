@@ -195,12 +195,6 @@ pub(crate) fn disk_read_would_refuse(
 /// Split out so both the disk lane and the git-object lane consult exactly the
 /// same policy, and so the disk lane can still refuse WITHOUT reading the file.
 pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
-    // A restored row the snapshot verify could not reconcile: its index row
-    // is withheld, and disk bytes are not a substitute the verify vouched for.
-    if let Some(reason) = live.unverified_since_restore(relative_path) {
-        return Some(format::unverified_since_restore(relative_path, reason));
-    }
-
     // Current path rule — no read needed.
     if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
         return Some(format::content_withheld_by_admission(relative_path));
@@ -229,7 +223,32 @@ pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<
             _ => {}
         }
     }
-    None
+    // Last, so a sensitive path keeps its policy refusal: a restored row the
+    // snapshot verify could not reconcile. Its index row is withheld, and
+    // disk bytes are not a substitute the verify vouched for.
+    unverified_notice(live, relative_path)
+}
+
+/// A caller's path as a catalog key: separators forward, no leading `./`,
+/// no leading or trailing `/`. Pure string work, no filesystem access.
+pub(crate) fn normalize_requested_path(raw: &str) -> String {
+    let mut normalized = raw.trim().replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    normalized.trim_matches('/').to_string()
+}
+
+/// The unverified-since-restore refusal for a path the caller named, when the
+/// snapshot verify withheld it. In-memory only, like every policy refusal
+/// here. A sensitive path is left to the path rule, which takes precedence.
+pub(crate) fn unverified_notice(live: &LiveIndex, requested: &str) -> Option<String> {
+    let path = normalize_requested_path(requested);
+    if crate::knowledge::sensitive_path_rule(&path).is_some() {
+        return None;
+    }
+    live.unverified_since_restore(&path)
+        .map(|reason| format::unverified_since_restore(&path, reason))
 }
 
 /// Admit bytes the caller ALREADY HOLDS — a git blob, not a disk read.

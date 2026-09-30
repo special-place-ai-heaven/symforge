@@ -2135,11 +2135,17 @@ impl SymForgeServer {
             return refusal;
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
+        let batch_paths: Vec<String> = params.0.edits.iter().map(|e| e.path.clone()).collect();
         {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
+            if let Some(notice) = batch_paths
+                .iter()
+                .find_map(|path| crate::protocol::read_gate::unverified_notice(&guard, path))
+            {
+                return notice;
+            }
         }
-        let batch_paths: Vec<String> = params.0.edits.iter().map(|e| e.path.clone()).collect();
         let (repo_root, source_authority) = match prepare_batch_paths_for_edit(self, &batch_paths) {
             Ok(prepared) => prepared,
             Err(e) => return e,
@@ -2271,6 +2277,12 @@ impl SymForgeServer {
         {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
+            if let Some(refusal) = format::project_wide_mutation_refused_unverified(
+                "batch_rename",
+                guard.withheld_since_restore(),
+            ) {
+                return refusal;
+            }
         }
         let source_authority = prepare_project_wide_rename(self, &repo_root);
         let dry_run = params.0.dry_run.unwrap_or(false);
@@ -2373,11 +2385,17 @@ impl SymForgeServer {
             return refusal;
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
+        let batch_paths: Vec<String> = params.0.targets.iter().map(|t| t.path.clone()).collect();
         {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
+            if let Some(notice) = batch_paths
+                .iter()
+                .find_map(|path| crate::protocol::read_gate::unverified_notice(&guard, path))
+            {
+                return notice;
+            }
         }
-        let batch_paths: Vec<String> = params.0.targets.iter().map(|t| t.path.clone()).collect();
         let (repo_root, source_authority) = match prepare_batch_paths_for_edit(self, &batch_paths) {
             Ok(prepared) => prepared,
             Err(e) => return e,
