@@ -1203,6 +1203,17 @@ const SNAPSHOT_VERIFY_MISMATCH_PATH_LIMIT: usize = 10;
 pub struct SnapshotVerifyReport {
     pub mismatch_count: usize,
     pub mismatched_paths: Vec<String>,
+    /// Why the mismatches exist, in words an agent can act on. `None` when
+    /// nothing needed explaining.
+    pub reason: Option<String>,
+    /// Restored paths the verify could not reconcile, with why. Their rows
+    /// are withheld from every query lane, their catalog entries stay, and a
+    /// direct request is refused with the reason. A later successful re-read
+    /// of the path through the canonical single-file seam releases it.
+    pub unverified: Arc<BTreeMap<String, String>>,
+    /// Why discovering new files failed, with the project root elided. Files
+    /// added since the snapshot may then be missing; no path stands for them.
+    pub discovery_error: Option<String>,
 }
 
 impl SnapshotVerifyReport {
@@ -1214,14 +1225,56 @@ impl SnapshotVerifyReport {
         Self {
             mismatch_count,
             mismatched_paths: paths,
+            reason: None,
+            unverified: Arc::default(),
+            discovery_error: None,
         }
+    }
+
+    pub fn with_reason(mut self, reason: String) -> Self {
+        if !reason.is_empty() {
+            self.reason = Some(reason);
+        }
+        self
+    }
+
+    pub fn with_unverified(mut self, unverified: BTreeMap<String, String>) -> Self {
+        self.unverified = Arc::new(unverified);
+        self
+    }
+
+    pub fn with_discovery_error(mut self, discovery_error: Option<String>) -> Self {
+        self.discovery_error = discovery_error;
+        self
     }
 
     pub fn empty() -> Self {
         Self {
             mismatch_count: 0,
             mismatched_paths: Vec::new(),
+            reason: None,
+            unverified: Arc::default(),
+            discovery_error: None,
         }
+    }
+
+    /// Whether this verify found anything it could not vouch for.
+    pub fn has_mismatches(&self) -> bool {
+        self.mismatch_count > 0 || self.discovery_error.is_some()
+    }
+
+    /// Settle one withheld path. It leaves the unverified set, the mismatch
+    /// count and the listed paths together, so status never reports a count
+    /// that disagrees with what is withheld.
+    fn drop_unverified(&mut self, path: &str) -> bool {
+        if !self.unverified.contains_key(path) {
+            return false;
+        }
+        Arc::make_mut(&mut self.unverified).remove(path);
+        self.mismatch_count = self.mismatch_count.saturating_sub(1);
+        self.mismatched_paths
+            .retain(|mismatched| mismatched != path);
+        true
     }
 
     pub fn omitted_path_count(&self) -> usize {
@@ -1230,13 +1283,141 @@ impl SnapshotVerifyReport {
     }
 }
 
+/// How a snapshot verify resolves: its report, and for every path it could
+/// not reconcile, the restored row the stat pass saw. Only a row still
+/// identical to that one is withheld; a row another writer republished since
+/// is that writer's, and current.
+pub(crate) struct SnapshotVerifyCompletion {
+    pub report: SnapshotVerifyReport,
+    pub restored_rows: Vec<(String, Option<Arc<IndexedFile>>)>,
+}
+
+impl From<SnapshotVerifyReport> for SnapshotVerifyCompletion {
+    fn from(report: SnapshotVerifyReport) -> Self {
+        Self {
+            report,
+            restored_rows: Vec::new(),
+        }
+    }
+}
+
+const SNAPSHOT_VERIFY_PHASE_STAT_PASS: u8 = 0;
+const SNAPSHOT_VERIFY_PHASE_REVERIFY: u8 = 1;
+const SNAPSHOT_VERIFY_PHASE_PUBLISH: u8 = 2;
+const SNAPSHOT_VERIFY_PHASE_SPOT_CHECK: u8 = 3;
+
+/// Live progress of a running snapshot verification.
+///
+/// Shared, not copied: every clone of the published index points at the same
+/// counters, so the verify reports progress without minting a publication per
+/// step. On a large repository one publication costs minutes, which is the
+/// very thing this progress exists to explain.
+#[derive(Clone, Debug)]
+pub struct SnapshotVerifyProgress(Arc<SnapshotVerifyCounters>);
+
+#[derive(Debug)]
+struct SnapshotVerifyCounters {
+    started_at: SystemTime,
+    restored_files: usize,
+    phase: std::sync::atomic::AtomicU8,
+    total: AtomicUsize,
+    processed: AtomicUsize,
+}
+
+impl PartialEq for SnapshotVerifyProgress {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SnapshotVerifyProgress {}
+
+impl SnapshotVerifyProgress {
+    pub fn started(started_at: SystemTime, restored_files: usize) -> Self {
+        Self(Arc::new(SnapshotVerifyCounters {
+            started_at,
+            restored_files,
+            phase: std::sync::atomic::AtomicU8::new(SNAPSHOT_VERIFY_PHASE_STAT_PASS),
+            total: AtomicUsize::new(0),
+            processed: AtomicUsize::new(0),
+        }))
+    }
+
+    pub fn started_at(&self) -> SystemTime {
+        self.0.started_at
+    }
+
+    /// End of the stat pass: the spot check re-reads `total` restored files.
+    pub fn start_spot_check(&self, total: usize) {
+        self.0.total.store(total, Ordering::Release);
+        self.0.processed.store(0, Ordering::Release);
+        self.0
+            .phase
+            .store(SNAPSHOT_VERIFY_PHASE_SPOT_CHECK, Ordering::Release);
+    }
+
+    /// End of the spot check: the verify now re-reads `total` files.
+    pub fn start_reverify(&self, total: usize) {
+        self.0.processed.store(0, Ordering::Release);
+        self.0.total.store(total, Ordering::Release);
+        self.0
+            .phase
+            .store(SNAPSHOT_VERIFY_PHASE_REVERIFY, Ordering::Release);
+    }
+
+    pub fn add_processed(&self, files: usize) {
+        self.0.processed.fetch_add(files, Ordering::AcqRel);
+    }
+
+    pub fn enter_publish(&self) {
+        self.0
+            .phase
+            .store(SNAPSHOT_VERIFY_PHASE_PUBLISH, Ordering::Release);
+    }
+
+    /// One-line `key=value` rendering shared by health, status, and the
+    /// loading guard, so every surface reports the same phase and counts.
+    pub fn describe(&self) -> String {
+        let elapsed = self
+            .0
+            .started_at
+            .elapsed()
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let restored = self.0.restored_files;
+        let processed = self.0.processed.load(Ordering::Acquire);
+        let total = self.0.total.load(Ordering::Acquire);
+        match self.0.phase.load(Ordering::Acquire) {
+            SNAPSHOT_VERIFY_PHASE_STAT_PASS => {
+                format!("phase=stat_pass restored_files={restored} elapsed={elapsed}s")
+            }
+            SNAPSHOT_VERIFY_PHASE_SPOT_CHECK => format!(
+                "phase=spot_check processed={processed}/{total} restored_files={restored} \
+                 elapsed={elapsed}s"
+            ),
+            SNAPSHOT_VERIFY_PHASE_REVERIFY => format!(
+                "phase=reverify processed={processed}/{total} restored_files={restored} \
+                 elapsed={elapsed}s"
+            ),
+            _ => format!(
+                "phase=publish processed={processed}/{total} restored_files={restored} \
+                 elapsed={elapsed}s"
+            ),
+        }
+    }
+}
+
 /// Reconciliation status after restoring from a persisted snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotVerifyState {
     NotNeeded,
     Pending,
-    Running,
+    Running(SnapshotVerifyProgress),
     Completed(SnapshotVerifyReport),
+    /// The verify died before it could resolve. Nothing it proved is known,
+    /// so the restored rows stay hidden and the index reports degraded until
+    /// a rebuild from source (`index_folder`) replaces them.
+    Failed(SnapshotVerifyReport),
 }
 
 impl SnapshotVerifyState {
@@ -1445,6 +1626,77 @@ pub(crate) enum FencedRemoval {
     /// A fence rejected the removal (stale generation/publication, changed
     /// scout base, recreated path, or a poisoned mutation). Nothing published.
     Rejected,
+}
+
+/// One path the snapshot verify re-read off-lock, ready for a batch publish.
+pub(crate) struct SnapshotVerifiedFile {
+    pub path: String,
+    pub scouted: crate::domain::ScoutedEntry,
+    pub admission: SnapshotVerifiedAdmission,
+    /// Content hash of the row the stat pass saw; `None` when it held no row.
+    pub base_hash: Option<String>,
+}
+
+impl SnapshotVerifiedFile {
+    /// Content bytes this prepared row will hold once published.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match &self.admission {
+            SnapshotVerifiedAdmission::Indexed { file, .. } => file.content.len(),
+            SnapshotVerifiedAdmission::Terminal(_) => 0,
+        }
+    }
+}
+
+pub(crate) enum SnapshotVerifiedAdmission {
+    Indexed {
+        file: Box<IndexedFile>,
+        targets: crate::domain::IndexTargets,
+    },
+    /// Metadata-only or hard-skip: no resident row, only the catalog entry.
+    Terminal(FileDisposition),
+}
+
+/// What one snapshot-verify publication did, path by path.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotVerifyBatchReceipt {
+    pub removed: Vec<String>,
+    pub indexed: Vec<String>,
+    pub terminal: Vec<String>,
+    /// Terminal admissions that matched what the index already held.
+    pub unchanged: Vec<String>,
+    /// Rows another writer republished after the stat pass: already newer.
+    pub superseded: Vec<String>,
+    /// Paths the disk moved since they were prepared; for the canonical seam.
+    pub refused: Vec<String>,
+    /// The verify state was resolved in this same publication.
+    pub completed: bool,
+}
+
+/// Test-only fault injection: the next `update_file` of this path panics once,
+/// after inserting the row and before updating its indices, standing in for
+/// any panic that leaves a row half applied.
+#[cfg(test)]
+pub(crate) fn snapshot_verify_test_panic_path() -> &'static parking_lot::Mutex<Option<String>> {
+    static PATH: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+    &PATH
+}
+
+/// Progress may only move a verification that has not resolved yet.
+fn verify_in_flight(state: &SnapshotVerifyState) -> bool {
+    matches!(
+        state,
+        SnapshotVerifyState::Pending | SnapshotVerifyState::Running(_)
+    )
+}
+
+/// Whether the file still has the size and mtime it was read at.
+fn snapshot_verified_stamp_matches(scouted: &crate::domain::ScoutedEntry) -> bool {
+    let Some(path) = scouted.absolute_path.as_deref() else {
+        return false;
+    };
+    std::fs::metadata(path).is_ok_and(|meta| {
+        meta.len() == scouted.stamp.size && meta.modified().ok() == scouted.stamp.modified_hint
+    })
 }
 
 pub struct PreparedKnowledgeBridge {
@@ -2388,10 +2640,11 @@ impl SharedIndexHandle {
         });
         let reconciliation_pending =
             scout_plan.is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded);
-        let snapshot_verification_failed = matches!(
-            &live.snapshot_verify_state,
-            SnapshotVerifyState::Completed(report) if report.mismatch_count > 0
-        );
+        let snapshot_verification_failed =
+            matches!(
+                &live.snapshot_verify_state,
+                SnapshotVerifyState::Completed(report) if report.has_mismatches()
+            ) || matches!(live.snapshot_verify_state, SnapshotVerifyState::Failed(_));
         let mut next_reasons = Vec::new();
         for reason in reason_codes.iter().copied().filter(|reason| {
             !matches!(
@@ -2421,7 +2674,7 @@ impl SharedIndexHandle {
         let next = if next_reasons.is_empty() {
             if matches!(
                 live.snapshot_verify_state,
-                SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+                SnapshotVerifyState::Pending | SnapshotVerifyState::Running(_)
             ) {
                 FreshnessStatus::Verifying
             } else {
@@ -3865,14 +4118,35 @@ impl SharedIndexHandle {
         let _ = self.mark_snapshot_verify_running_at_fence(expected);
     }
 
-    pub fn mark_snapshot_verify_running_at_generation(&self, expected_gen: u64) -> bool {
-        let expected = self.publication_fence();
-        if expected.project_generation != expected_gen {
+    /// Mark the verify running under the project-generation fence only. Its
+    /// progress then moves through the shared counters without publishing.
+    ///
+    /// Returns `false` only when the project was retargeted: the replacement
+    /// owns its own verification state. Unrelated publications (watcher,
+    /// freshness, bridge) are not a conflict for a state marker, and treating
+    /// them as one stranded the restored index in `Running` forever.
+    pub fn mark_snapshot_verify_started_at_generation(
+        &self,
+        expected_gen: u64,
+        progress: SnapshotVerifyProgress,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
             self.note_rejected_stale_mutation();
             return false;
         }
-        self.mark_snapshot_verify_running_at_fence(expected)
-            .is_some()
+        let current = self.live.load_full();
+        if current.load_source != IndexLoadSource::SnapshotRestore
+            || !verify_in_flight(&current.snapshot_verify_state)
+        {
+            return true;
+        }
+        let mut live = (*current).clone();
+        live.mark_snapshot_verify_running(progress);
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        self.swap_and_publish_retaining_content(live);
+        true
     }
 
     pub fn mark_snapshot_verify_running_at_fence(
@@ -3885,7 +4159,11 @@ impl SharedIndexHandle {
             return None;
         }
         let mut live = (*self.live.load_full()).clone();
-        live.mark_snapshot_verify_running();
+        let restored_files = live.files.len();
+        live.mark_snapshot_verify_running(SnapshotVerifyProgress::started(
+            SystemTime::now(),
+            restored_files,
+        ));
         let scout_plan = self.scout_plan.load_full();
         self.recompute_freshness_locked(&live, scout_plan.as_deref());
         self.swap_and_publish_retaining_content(live);
@@ -3897,17 +4175,316 @@ impl SharedIndexHandle {
         let _ = self.mark_snapshot_verify_completed_at_fence(expected, mismatched_paths);
     }
 
-    pub fn mark_snapshot_verify_completed_at_generation(
+    /// Resolve the verification under the project-generation fence only; see
+    /// [`Self::mark_snapshot_verify_started_at_generation`] for why the
+    /// publication fence is not used here.
+    pub(crate) fn mark_snapshot_verify_completed_at_generation(
         &self,
         expected_gen: u64,
-        mismatched_paths: Vec<String>,
+        completion: impl Into<SnapshotVerifyCompletion>,
     ) -> bool {
-        let expected = self.publication_fence();
-        if expected.project_generation != expected_gen {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
             self.note_rejected_stale_mutation();
             return false;
         }
-        self.mark_snapshot_verify_completed_at_fence(expected, mismatched_paths)
+        let current = self.live.load_full();
+        if current.load_source != IndexLoadSource::SnapshotRestore {
+            return true;
+        }
+        if !verify_in_flight(&current.snapshot_verify_state) {
+            return true;
+        }
+        let mut live = (*current).clone();
+        let withheld = live.resolve_snapshot_verify(completion.into());
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        if withheld {
+            self.swap_and_publish(live);
+        } else {
+            self.swap_and_publish_retaining_content(live);
+        }
+        true
+    }
+
+    /// Resolve a verify that died before it finished as `Failed`, under the
+    /// project-generation fence only. Unlike `Completed`, this keeps every
+    /// restored row hidden: a pass that died proved nothing about them.
+    pub fn mark_snapshot_verify_failed_at_generation(
+        &self,
+        expected_gen: u64,
+        report: SnapshotVerifyReport,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
+            self.note_rejected_stale_mutation();
+            return false;
+        }
+        let current = self.live.load_full();
+        if current.load_source != IndexLoadSource::SnapshotRestore
+            || !verify_in_flight(&current.snapshot_verify_state)
+        {
+            return true;
+        }
+        let mut live = (*current).clone();
+        live.snapshot_verify_state = SnapshotVerifyState::Failed(report);
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        self.swap_and_publish_retaining_content(live);
+        true
+    }
+
+    /// Publish snapshot-verify results in ONE publication: deletions confirmed
+    /// absent, re-read files, terminal admissions, and, when `completion` is
+    /// given and nothing was refused, the resolved verify state.
+    ///
+    /// Fenced per path and on the project generation, never on the
+    /// whole-index publication generation, so watcher and freshness-only
+    /// publications during the verify are not conflicts. Per path:
+    /// - a row whose hash moved since the stat pass was republished by
+    ///   another writer from newer bytes; it is `superseded` and left alone;
+    /// - a file whose size or mtime moved since the verify read it, or a
+    ///   deleted path that exists again, is `refused` and handed back for the
+    ///   canonical single-file seam; completion then waits for the caller.
+    ///
+    /// `None` means the project was retargeted and nothing was published.
+    pub(crate) fn publish_snapshot_verify_at_generation(
+        &self,
+        expected_gen: u64,
+        removals: &[(String, PathBuf)],
+        files: Vec<SnapshotVerifiedFile>,
+        completion: Option<SnapshotVerifyCompletion>,
+    ) -> Option<SnapshotVerifyBatchReceipt> {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
+            self.note_rejected_stale_mutation();
+            return None;
+        }
+        let current = self.live.load_full();
+        let mut live = (*current).clone();
+        let mut receipt = SnapshotVerifyBatchReceipt::default();
+        let mut removed_paths = Vec::new();
+        let mut evicted_rows = Vec::new();
+        let mut scouted_entries = Vec::new();
+        // Catalog writes are collected and applied in one pass at the end:
+        // finding or replacing a single entry scans the whole manifest.
+        let catalog: HashMap<String, usize> = live
+            .manifest_entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (scouted_catalog_path(&entry.path).to_string(), position))
+            .collect();
+        let mut catalog_drop: HashSet<String> = HashSet::new();
+        let mut catalog_set: Vec<CatalogEntry> = Vec::new();
+        let mut panicked = false;
+
+        for (path, absolute_path) in removals {
+            match std::fs::symlink_metadata(absolute_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed_paths.push(path.clone());
+                    let row_removed = live.remove_row(path);
+                    let entry_held = catalog.contains_key(path);
+                    if entry_held {
+                        catalog_drop.insert(path.clone());
+                    }
+                    if row_removed || entry_held {
+                        receipt.removed.push(path.clone());
+                    }
+                }
+                _ => receipt.refused.push(path.clone()),
+            }
+        }
+
+        for verified in files {
+            let current_hash = live
+                .files
+                .get(&verified.path)
+                .map(|file| file.content_hash.as_str());
+            if current_hash != verified.base_hash.as_deref() {
+                receipt.superseded.push(verified.path);
+                continue;
+            }
+            if !snapshot_verified_stamp_matches(&verified.scouted) {
+                receipt.refused.push(verified.path);
+                continue;
+            }
+            match verified.admission {
+                SnapshotVerifiedAdmission::Indexed { file, targets } => {
+                    let parse_status = match &file.parse_status {
+                        ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+                        ParseStatus::PartialParse { .. } => {
+                            crate::domain::index::ParseStatus::PartialParse
+                        }
+                        ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
+                    };
+                    let manifest_entry = catalog_entry_from_scout(
+                        &verified.scouted,
+                        FileDisposition::Indexed {
+                            targets,
+                            parse_status,
+                        },
+                        Some(file.content_hash.clone()),
+                    );
+                    let path = verified.path.clone();
+                    let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        live.update_file_with_manifest(path.clone(), *file, false);
+                    }));
+                    if applied.is_err() {
+                        // `update_file` inserts the row before its auxiliary
+                        // indices, so a panic can leave this path half
+                        // applied. Drop the row and its indices, rebuild the
+                        // reverse index once before publishing, and hand the
+                        // path to the canonical seam, whose own guard
+                        // discards its clone on a panic.
+                        tracing::error!(
+                            path = %verified.path,
+                            "snapshot-verify admission panicked; path removed and retried alone"
+                        );
+                        live.remove_row(&verified.path);
+                        panicked = true;
+                        receipt.refused.push(verified.path);
+                        continue;
+                    }
+                    catalog_set.push(manifest_entry);
+                    receipt.indexed.push(verified.path);
+                }
+                SnapshotVerifiedAdmission::Terminal(disposition) => {
+                    let manifest_entry =
+                        catalog_entry_from_scout(&verified.scouted, disposition, None);
+                    let row_removed = live.remove_row(&verified.path);
+                    if row_removed {
+                        evicted_rows.push(verified.path.clone());
+                    }
+                    let entry_changed = catalog
+                        .get(&verified.path)
+                        .is_none_or(|&position| live.manifest_entries[position] != manifest_entry);
+                    if entry_changed {
+                        catalog_set.push(manifest_entry);
+                    }
+                    if row_removed || entry_changed {
+                        receipt.terminal.push(verified.path);
+                    } else {
+                        receipt.unchanged.push(verified.path);
+                    }
+                }
+            }
+            scouted_entries.push(verified.scouted);
+        }
+
+        if panicked {
+            live.rebuild_reverse_index();
+        }
+        let mut content_changed = panicked
+            || !receipt.removed.is_empty()
+            || !receipt.indexed.is_empty()
+            || !receipt.terminal.is_empty();
+        if !catalog_drop.is_empty() || !catalog_set.is_empty() {
+            catalog_drop.extend(
+                catalog_set
+                    .iter()
+                    .map(|entry| scouted_catalog_path(&entry.path).to_string()),
+            );
+            live.manifest_entries
+                .retain(|entry| !catalog_drop.contains(scouted_catalog_path(&entry.path)));
+            live.manifest_entries.append(&mut catalog_set);
+        }
+        if content_changed {
+            live.sort_manifest_entries();
+        }
+        if let Some(completion) = completion
+            && receipt.refused.is_empty()
+            && verify_in_flight(&live.snapshot_verify_state)
+            && live.load_source == IndexLoadSource::SnapshotRestore
+        {
+            content_changed |= live.resolve_snapshot_verify(completion);
+            receipt.completed = true;
+        }
+        if !content_changed && !receipt.completed {
+            return Some(receipt);
+        }
+        match self.scout_plan_with_batch_locked(scouted_entries, &removed_paths, &live) {
+            Ok(Some(plan)) => self.scout_plan.store(Some(plan)),
+            Ok(None) => {}
+            Err(error) => {
+                // Nothing published: hand every path back to the canonical seam.
+                tracing::error!(%error, "failed to refresh scout plan for a snapshot-verify publication");
+                let mut refused = std::mem::take(&mut receipt.refused);
+                refused.append(&mut receipt.removed);
+                refused.append(&mut receipt.indexed);
+                refused.append(&mut receipt.terminal);
+                refused.append(&mut receipt.unchanged);
+                return Some(SnapshotVerifyBatchReceipt {
+                    refused,
+                    superseded: receipt.superseded,
+                    ..SnapshotVerifyBatchReceipt::default()
+                });
+            }
+        }
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        if content_changed {
+            self.swap_and_publish(live);
+            let mut snapshots = self.pre_update_snapshots.lock();
+            for path in removed_paths.iter().chain(&evicted_rows) {
+                snapshots.remove(path);
+            }
+        } else {
+            self.swap_and_publish_retaining_content(live);
+        }
+        Some(receipt)
+    }
+
+    /// Batch form of [`Self::scout_plan_with_entry_locked`] plus
+    /// [`Self::scout_plan_without_path_locked`]: one clone and one refresh.
+    fn scout_plan_with_batch_locked(
+        &self,
+        entries: Vec<crate::domain::ScoutedEntry>,
+        removed_paths: &[String],
+        live: &LiveIndex,
+    ) -> anyhow::Result<Option<Arc<discovery::ScoutPlan>>> {
+        let Some(current) = self.scout_plan.load_full() else {
+            return Ok(None);
+        };
+        let mut plan = (*current).clone();
+        let before = plan.entries.len();
+        let removed: std::collections::HashSet<&str> =
+            removed_paths.iter().map(String::as_str).collect();
+        plan.entries.retain(|entry| {
+            entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .is_none_or(|path| !removed.contains(path))
+        });
+        let mut changed = plan.entries.len() != before;
+        let mut positions: HashMap<crate::domain::CatalogPath, usize> = plan
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.path.clone(), position))
+            .collect();
+        for entry in entries {
+            match positions.get(&entry.path) {
+                Some(&position) if plan.entries[position] == entry => {}
+                Some(&position) => {
+                    plan.entries[position] = entry;
+                    changed = true;
+                }
+                None => {
+                    positions.insert(entry.path.clone(), plan.entries.len());
+                    plan.entries.push(entry);
+                    changed = true;
+                }
+            }
+        }
+        discovery::refresh_scout_plan(&mut plan)?;
+        if manifest_requires_degraded_coverage(live) {
+            plan.coverage = crate::domain::CoverageStatus::Degraded;
+        }
+        if !changed && plan.coverage == current.coverage {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(plan)))
     }
 
     pub fn mark_snapshot_verify_completed_at_fence(
@@ -5708,10 +6285,20 @@ impl LiveIndex {
     }
 
     fn upsert_manifest_entry(&mut self, entry: CatalogEntry) {
+        self.upsert_manifest_entry_with_sort(entry, true);
+    }
+
+    fn upsert_manifest_entry_with_sort(&mut self, entry: CatalogEntry, sort: bool) {
         let path = scouted_catalog_path(&entry.path).to_string();
         self.manifest_entries
             .retain(|existing| scouted_catalog_path(&existing.path) != path);
         self.manifest_entries.push(entry);
+        if sort {
+            self.sort_manifest_entries();
+        }
+    }
+
+    fn sort_manifest_entries(&mut self) {
         self.manifest_entries.sort_by_cached_key(|entry| {
             let path = entry
                 .path
@@ -5981,6 +6568,15 @@ impl LiveIndex {
     /// replaced atomically. Existing target routing is preserved; callers that
     /// need to change routing must use the explicit admission publication path.
     pub fn update_file(&mut self, path: String, file: IndexedFile) {
+        self.update_file_with_manifest(path, file, true);
+    }
+
+    /// [`Self::update_file`] for batch writers, which pass `false` and write
+    /// their own catalog entries in one pass: finding, replacing, and sorting
+    /// the entry per file scans the whole manifest each time, which dominated
+    /// a snapshot-verify batch on a large repository.
+    fn update_file_with_manifest(&mut self, path: String, file: IndexedFile, manifest: bool) {
+        self.release_unverified(&path);
         // Capture old reference names BEFORE replacing the file, so we can
         // clean up stale reverse index entries after the insert.
         let old_ref_names: Vec<String> = self
@@ -5989,49 +6585,7 @@ impl LiveIndex {
             .map(|f| f.references.iter().map(|r| r.name.clone()).collect())
             .unwrap_or_default();
         let had_existing = !old_ref_names.is_empty() || self.files.contains_key(&path);
-
-        let (catalog_path, targets) = self
-            .manifest_entries
-            .iter()
-            .find(|entry| scouted_catalog_path(&entry.path) == path)
-            .map(|entry| {
-                let targets = match entry.disposition {
-                    FileDisposition::Indexed { targets, .. } => targets,
-                    _ if file.language.is_code_language() => crate::domain::IndexTargets::Code,
-                    _ => crate::domain::IndexTargets::Knowledge,
-                };
-                (entry.path.clone(), targets)
-            })
-            .unwrap_or_else(|| {
-                let targets = if file.language.is_code_language() {
-                    crate::domain::IndexTargets::Code
-                } else {
-                    crate::domain::IndexTargets::Knowledge
-                };
-                (
-                    crate::domain::CatalogPath {
-                        public_id: path.clone(),
-                        normalized_utf8: Some(path.clone()),
-                    },
-                    targets,
-                )
-            });
-        let parse_status = match &file.parse_status {
-            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
-            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
-            ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
-        };
-        let manifest_entry = CatalogEntry {
-            path: catalog_path,
-            size: file.byte_len,
-            language: Some(file.language),
-            classification: file.classification,
-            disposition: FileDisposition::Indexed {
-                targets,
-                parse_status,
-            },
-            content_hash: Some(file.content_hash.clone()),
-        };
+        let manifest_entry = manifest.then(|| self.derived_manifest_entry(&path, &file));
 
         // SAFETY: Insert the new file into the primary store FIRST.
         // This ensures the file is always present in `self.files` even if
@@ -6039,7 +6593,17 @@ impl LiveIndex {
         // gitignore assertion failures). Auxiliary indices may become
         // temporarily stale, but the file won't vanish from the index.
         self.files.insert(path.clone(), Arc::new(file));
-        self.upsert_manifest_entry(manifest_entry);
+        #[cfg(test)]
+        if snapshot_verify_test_panic_path()
+            .lock()
+            .take_if(|injected| *injected == path)
+            .is_some()
+        {
+            panic!("injected panic between a row insert and its index updates");
+        }
+        if let Some(manifest_entry) = manifest_entry {
+            self.upsert_manifest_entry_with_sort(manifest_entry, true);
+        }
 
         // Clean up old auxiliary indices using captured state.
         if had_existing {
@@ -6061,6 +6625,53 @@ impl LiveIndex {
         self.insert_path_indices_for_path(&path);
         self.is_empty = false;
         self.loaded_at_system = SystemTime::now();
+    }
+
+    /// The catalog entry `update_file` writes for `file`, keeping the routing
+    /// targets of any entry already held for `path`.
+    fn derived_manifest_entry(&self, path: &str, file: &IndexedFile) -> CatalogEntry {
+        let (catalog_path, targets) = self
+            .manifest_entries
+            .iter()
+            .find(|entry| scouted_catalog_path(&entry.path) == path)
+            .map(|entry| {
+                let targets = match entry.disposition {
+                    FileDisposition::Indexed { targets, .. } => targets,
+                    _ if file.language.is_code_language() => crate::domain::IndexTargets::Code,
+                    _ => crate::domain::IndexTargets::Knowledge,
+                };
+                (entry.path.clone(), targets)
+            })
+            .unwrap_or_else(|| {
+                let targets = if file.language.is_code_language() {
+                    crate::domain::IndexTargets::Code
+                } else {
+                    crate::domain::IndexTargets::Knowledge
+                };
+                (
+                    crate::domain::CatalogPath {
+                        public_id: path.to_string(),
+                        normalized_utf8: Some(path.to_string()),
+                    },
+                    targets,
+                )
+            });
+        let parse_status = match &file.parse_status {
+            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
+            ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
+        };
+        CatalogEntry {
+            path: catalog_path,
+            size: file.byte_len,
+            language: Some(file.language),
+            classification: file.classification,
+            disposition: FileDisposition::Indexed {
+                targets,
+                parse_status,
+            },
+            content_hash: Some(file.content_hash.clone()),
+        }
     }
 
     /// Returns `true` when `relative_path` is excluded by the repository's
@@ -6103,17 +6714,81 @@ impl LiveIndex {
     /// Returns whether the index actually HELD anything for this path — the
     /// caller that reports a removal (or publishes one) must know, not assume.
     pub fn remove_file(&mut self, path: &str) -> bool {
-        self.remove_reverse_index_for_path(path);
-        let removed_file = self.files.remove(path).is_some();
+        // A withheld path the index holds no row for still holds its refusal:
+        // a confirmed removal settles it, and that settlement is published.
+        let released = self.release_unverified(path);
+        let removed_file = self.remove_row(path);
         let removed_manifest = self.remove_manifest_entry(path);
-        if removed_file {
-            self.trigram_index.remove_file(path);
-            self.remove_path_indices_for_path(path);
-        }
         if removed_file || removed_manifest {
             self.loaded_at_system = SystemTime::now();
         }
-        removed_file || removed_manifest
+        released || removed_file || removed_manifest
+    }
+
+    /// Remove a row and its derived indices, leaving its catalog entry.
+    fn remove_row(&mut self, path: &str) -> bool {
+        self.remove_reverse_index_for_path(path);
+        let removed = self.files.remove(path).is_some();
+        if removed {
+            self.trigram_index.remove_file(path);
+            self.remove_path_indices_for_path(path);
+        }
+        removed
+    }
+
+    /// Why a restored path the snapshot verify could not reconcile is
+    /// withheld, while it still is.
+    pub fn unverified_since_restore(&self, path: &str) -> Option<&str> {
+        match &self.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => {
+                report.unverified.get(path).map(String::as_str)
+            }
+            _ => None,
+        }
+    }
+
+    /// Every restored path the snapshot verify withheld, with why. Empty
+    /// unless a completed verify withheld something.
+    pub fn withheld_since_restore(&self) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        match &self.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => &report.unverified,
+            _ => &NONE,
+        }
+    }
+
+    /// A write that reached this path through a canonical seam settles it.
+    fn release_unverified(&mut self, path: &str) -> bool {
+        match &mut self.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => report.drop_unverified(path),
+            _ => false,
+        }
+    }
+
+    /// Resolve the verify as `Completed`, withholding every restored row it
+    /// could not reconcile that is still the row it restored. Returns whether
+    /// any row was withheld, which changes content.
+    fn resolve_snapshot_verify(&mut self, completion: SnapshotVerifyCompletion) -> bool {
+        let SnapshotVerifyCompletion {
+            mut report,
+            restored_rows,
+        } = completion;
+        let mut withheld = false;
+        for (path, restored) in restored_rows {
+            let current = self.files.get(&path);
+            match (current, restored) {
+                (None, _) => {}
+                (Some(current), Some(restored)) if Arc::ptr_eq(current, &restored) => {
+                    withheld |= self.remove_row(&path);
+                }
+                // Another writer republished it since the stat pass.
+                _ => {
+                    report.drop_unverified(&path);
+                }
+            }
+        }
+        self.snapshot_verify_state = SnapshotVerifyState::Completed(report);
+        withheld
     }
 
     /// Remove reverse index entries for a single file path.
@@ -6209,9 +6884,45 @@ impl LiveIndex {
         self.snapshot_verify_state.clone()
     }
 
-    pub(crate) fn mark_snapshot_verify_running(&mut self) {
+    /// Whether this index already holds exactly what `entry` would admit: a
+    /// resident row with the entry's size and mtime second, or, for a
+    /// metadata-terminal entry, the identical catalog row and no resident row.
+    ///
+    /// Reads the rows directly, not through [`Self::get_file`]: this is
+    /// reconciliation bookkeeping, and `get_file` hides every restored row
+    /// while snapshot verification runs, which made the watcher's fresh
+    /// instance sweep re-admit a whole restored repository one file at a time.
+    // ponytail: mtime is compared in whole seconds, the resolution rows store; a same-second, same-size edit needs the watcher event or the verify spot check.
+    pub(crate) fn reflects_scouted_entry(&self, entry: &crate::domain::ScoutedEntry) -> bool {
+        let Some(path) = entry.path.normalized_utf8.as_deref() else {
+            return false;
+        };
+        match crate::live_index::single_file::catalog_terminal_disposition(&entry.decision) {
+            Some(disposition) => {
+                !self.files.contains_key(path)
+                    && self.manifest_entries.contains(&catalog_entry_from_scout(
+                        entry,
+                        disposition,
+                        None,
+                    ))
+            }
+            None if matches!(entry.decision, crate::domain::ScoutDecision::Ingest { .. }) => {
+                let mtime_secs = entry
+                    .stamp
+                    .modified_hint
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs());
+                self.files.get(path).is_some_and(|row| {
+                    row.byte_len == entry.stamp.size && Some(row.mtime_secs) == mtime_secs
+                })
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn mark_snapshot_verify_running(&mut self, progress: SnapshotVerifyProgress) {
         if self.load_source == IndexLoadSource::SnapshotRestore {
-            self.snapshot_verify_state = SnapshotVerifyState::Running;
+            self.snapshot_verify_state = SnapshotVerifyState::Running(progress);
         }
     }
 
@@ -7717,7 +8428,10 @@ mod tests {
         assert_eq!(running.generation, 1);
         assert_eq!(running.status, PublishedIndexStatus::Loading);
         assert_eq!(running.degraded_summary, None);
-        assert_eq!(running.snapshot_verify_state, SnapshotVerifyState::Running);
+        assert!(matches!(
+            running.snapshot_verify_state,
+            SnapshotVerifyState::Running(_)
+        ));
         assert_eq!(running.file_count, initial.file_count);
         assert_eq!(running.partial_parse_count, initial.partial_parse_count);
         assert_eq!(running.failed_count, initial.failed_count);
@@ -7784,6 +8498,43 @@ mod tests {
                 if reason_codes.contains(&FreshnessReason::ReconciliationPending)
                     && !reason_codes.contains(&FreshnessReason::SnapshotVerificationFailed)
         ));
+    }
+
+    /// A withheld path another writer republished leaves the unverified set,
+    /// the mismatch count and the listed paths together, so status never
+    /// counts a mismatch that nothing withholds.
+    #[test]
+    fn resolve_settles_a_republished_path_in_count_and_set_together() {
+        let mut live = make_empty_live_index();
+        live.is_empty = false;
+        live.load_source = IndexLoadSource::SnapshotRestore;
+        live.files.insert(
+            "src/a.rs".to_string(),
+            Arc::new(make_indexed_file_for_mutation("src/a.rs")),
+        );
+        // The seed the stat pass saw: a different row than the current one.
+        let seed = Arc::new(make_indexed_file_for_mutation("src/a.rs"));
+        let report = SnapshotVerifyReport::from_mismatched_paths(vec!["src/a.rs".to_string()])
+            .with_unverified(BTreeMap::from([(
+                "src/a.rs".to_string(),
+                "it could not be read".to_string(),
+            )]));
+
+        let withheld = live.resolve_snapshot_verify(SnapshotVerifyCompletion {
+            report,
+            restored_rows: vec![("src/a.rs".to_string(), Some(seed))],
+        });
+
+        assert!(!withheld, "another writer's row is current, not withheld");
+        assert!(live.files.contains_key("src/a.rs"));
+        match &live.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => {
+                assert!(report.unverified.is_empty());
+                assert_eq!(report.mismatch_count, 0, "{report:?}");
+                assert!(report.mismatched_paths.is_empty(), "{report:?}");
+            }
+            other => panic!("expected a completed verify, got {other:?}"),
+        }
     }
 
     #[test]

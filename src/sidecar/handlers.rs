@@ -1024,7 +1024,25 @@ pub async fn impact_handler(
     let _impact_guard = impact_index.lock_impact_analysis().await;
     capture_queryable_sidecar_generation(&state, &fence)?;
     let result = impact_hook_text(state.clone(), &params, &fence).await;
-    finish_impact_response_at_fence(&state, &fence, result)
+    finish_impact_response_at_fence(&state, &fence, with_withheld_note(&state, result))
+}
+
+/// Leads a hook enrichment with the files the snapshot verify withheld, so a
+/// project-wide answer never reads as complete.
+fn with_withheld_note(
+    state: &SidecarState,
+    result: Result<String, StatusCode>,
+) -> Result<String, StatusCode> {
+    result.map(|text| {
+        let live = state.index.data_plane().read();
+        match crate::protocol::format::withheld_not_searched_note(
+            live.withheld_since_restore(),
+            None,
+        ) {
+            Some(note) => format!("{note}\n\n{text}"),
+            None => text,
+        }
+    })
 }
 
 fn finish_impact_response_at_fence(
@@ -1776,7 +1794,7 @@ pub async fn symbol_context_handler(
     let fence = require_queryable_sidecar_index(&state)?;
     let result = symbol_context_hook_text(&state, &params, &fence);
     capture_queryable_sidecar_generation(&state, &fence)?;
-    result
+    with_withheld_note(&state, result)
 }
 
 /// Workflow adapter for search-hit expansion and quick caller/context reads.
@@ -2096,7 +2114,7 @@ pub async fn repo_map_handler(State(state): State<SidecarState>) -> Result<Strin
     let fence = require_queryable_sidecar_index(&state)?;
     let result = repo_map_text(&state, &fence);
     capture_queryable_sidecar_generation(&state, &fence)?;
-    result
+    with_withheld_note(&state, result)
 }
 
 /// Workflow adapter for repo-start quick maps.
@@ -2345,7 +2363,7 @@ pub async fn prompt_context_handler(
     let fence = require_queryable_sidecar_index(&state)?;
     let result = prompt_context_hook_text(&state, &params, &fence).await;
     capture_queryable_sidecar_generation(&state, &fence)?;
-    result
+    with_withheld_note(&state, result)
 }
 
 /// Workflow adapter for prompt-context narrowing.
@@ -4738,6 +4756,53 @@ mod tests {
     // -----------------------------------------------------------------------
     // repo_map_handler
     // -----------------------------------------------------------------------
+
+    /// A hook enrichment leads with the files the snapshot verify withheld.
+    #[tokio::test]
+    async fn hook_enrichment_leads_with_the_withheld_note() {
+        let root = GENERIC_TEST_ROOT.path().to_path_buf();
+        let shared = build_shared_index(
+            &root,
+            vec![(
+                "src/main.rs",
+                make_indexed_file(
+                    "src/main.rs",
+                    vec![make_symbol("x", SymbolKind::Function, 1, 3)],
+                    vec![],
+                    ParseStatus::Parsed,
+                ),
+            )],
+        );
+        {
+            let mut live = shared.write();
+            live.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+            live.snapshot_verify_state = crate::live_index::store::SnapshotVerifyState::Completed(
+                crate::live_index::store::SnapshotVerifyReport::from_mismatched_paths(vec![
+                    "src/held.rs".to_string(),
+                ])
+                .with_unverified(std::collections::BTreeMap::from([(
+                    "src/held.rs".to_string(),
+                    "it could not be read".to_string(),
+                )])),
+            );
+        }
+        let state = SidecarState {
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                shared,
+            ),
+            token_stats: TokenStats::new(),
+            repo_root: None,
+            symbol_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let map = repo_map_handler(State(state)).await.unwrap();
+        assert!(
+            map.starts_with(
+                "Note: 1 files withheld as unverified since restore were not searched: src/held.rs"
+            ),
+            "{map}"
+        );
+    }
 
     #[tokio::test]
     async fn test_repo_map_handler_returns_formatted_tree() {

@@ -824,6 +824,12 @@ pub struct ProjectHealth {
     pub durability: CapabilityStatus,
     pub capabilities: ProjectCapabilities,
     pub opened_at_unix_secs: u64,
+    /// Restored-snapshot verification, rendered like the `status` line, for
+    /// example `Snapshot: load_source=snapshot_restore verify=running
+    /// phase=reverify processed=512/16572 elapsed=40s`. `None` when the index
+    /// was not restored from a snapshot.
+    #[serde(default)]
+    pub snapshot_verify: Option<String>,
 }
 
 fn default_project_freshness() -> FreshnessStatus {
@@ -1672,6 +1678,10 @@ impl DaemonState {
                 team_artifact_export,
             },
             opened_at_unix_secs: unix_seconds(project.opened_at),
+            snapshot_verify: crate::protocol::format::snapshot_verify_status_line(
+                published.load_source,
+                &published.snapshot_verify_state,
+            ),
         })
     }
 
@@ -3826,7 +3836,7 @@ impl ProjectInstance {
                 persistence_status,
                 &background_load,
             ),
-            None => bootstrap_project_index(canonical_root, &state_placement)
+            None => bootstrap_project_index(canonical_root, &state_placement, &background_load)
                 .map(|index| (index, ColdIndex::Loaded)),
         };
         let index = match bootstrapped {
@@ -4271,8 +4281,9 @@ fn spawn_local_ref_reconcile(
 fn bootstrap_project_index(
     canonical_root: &Path,
     state_placement: &StatePlacement,
+    background: &Arc<BackgroundLoad>,
 ) -> anyhow::Result<SharedIndex> {
-    match restore_project_snapshot(canonical_root, state_placement) {
+    match restore_project_snapshot(canonical_root, state_placement, background) {
         Some(index) => Ok(index),
         None => cold_load_project_index(canonical_root, state_placement),
     }
@@ -4478,7 +4489,7 @@ fn bootstrap_project_index_within(
     persistence_status: CapabilityStatus,
     background: &Arc<BackgroundLoad>,
 ) -> anyhow::Result<(SharedIndex, ColdIndex)> {
-    if let Some(index) = restore_project_snapshot(canonical_root, state_placement) {
+    if let Some(index) = restore_project_snapshot(canonical_root, state_placement, background) {
         return Ok((index, ColdIndex::Loaded));
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -4567,6 +4578,7 @@ fn degrade_on_capacity_refusal(
 fn restore_project_snapshot(
     canonical_root: &Path,
     state_placement: &StatePlacement,
+    background: &Arc<BackgroundLoad>,
 ) -> Option<SharedIndex> {
     let source_exclusions =
         crate::discovery::SourceExclusions::for_state_placement(canonical_root, state_placement);
@@ -4609,12 +4621,16 @@ fn restore_project_snapshot(
             let observer =
                 live_index::index_lifecycle::activation::project_source_authority(canonical_root)
                     .active_observer();
+            // A stopped slot retires this index; the verify stops with it
+            // instead of re-reading a repository nobody will query.
+            let background = Arc::clone(background);
             handle.spawn(async move {
-                live_index::persist::background_verify(
+                live_index::persist::background_verify_cancellable(
                     bg_index,
                     bg_root,
                     snapshot_mtimes,
                     observer,
+                    move || background.cancel.load(Ordering::Acquire),
                 )
                 .await;
             });
@@ -17231,8 +17247,8 @@ mod tests {
             panic!("B must remain a valid automatic project root");
         };
         let placement_b = crate::discovery::resolve_state_placement(&binding_b);
-        let restored =
-            bootstrap_project_index(&canonical_b, &placement_b).expect("restore B from snapshot");
+        let restored = bootstrap_project_index(&canonical_b, &placement_b, &Arc::default())
+            .expect("restore B from snapshot");
         {
             let guard = restored.read();
             assert_eq!(

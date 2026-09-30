@@ -9,7 +9,7 @@ use notify::{EventKind, RecommendedWatcher as NotifyRecommendedWatcher, Recursiv
 use notify_debouncer_full::{
     DebounceEventResult, DebouncedEvent, Debouncer, NoCache, new_debouncer_opt,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::domain::{FileDisposition, LanguageId};
 use crate::live_index::store::SharedIndex;
@@ -24,8 +24,8 @@ pub use crate::watcher_state::{WatcherInfo, WatcherState};
 #[cfg(test)]
 pub(crate) use crate::live_index::single_file::read_and_index_with_stable_read;
 pub(crate) use crate::live_index::single_file::{
-    ReindexOutcome as ReindexResult, admit_and_index_single_path,
-    admit_and_index_single_path_with_receipt, maybe_reindex, read_and_index,
+    ReindexOutcome as ReindexResult, admit_and_index_single_path_with_receipt, maybe_reindex,
+    read_and_index,
 };
 
 fn refuses_observed_admission_into_cold_bootstrap(shared: &SharedIndex) -> bool {
@@ -410,6 +410,36 @@ where
     // cross-project retarget keeps the stale spawn generation and is rejected.
     let fence_gen = effective_fence_generation(shared, repo_root, expected_gen);
 
+    // While a restored index's snapshot verify is pending or running it owns
+    // every restored row and discovers the new files itself, publishing all
+    // of it in one publication. The sweep admitting them instead would cost
+    // one whole-index publication per file. After the verify failed, the
+    // restored rows stay withheld until index_folder rebuilds them. In all
+    // three states the sweep defers every path and never waits on the verify.
+    // It publishes no plan either, so the first sweep after the verify still
+    // compares every path against the resident rows.
+    if snapshot_verify_unresolved(shared)
+        || matches!(
+            shared.read().snapshot_verify_state,
+            crate::live_index::store::SnapshotVerifyState::Failed(_)
+        )
+    {
+        info!("reconciliation sweep deferred: the snapshot verify has not resolved");
+        return ReconciliationAttempt {
+            repaired: 0,
+            retry_degraded: false,
+            deferred: true,
+        };
+    }
+    // Paths the resolved verify withheld. The set is small, and a sweep
+    // re-reads each one every time, so a transient failure gets retried.
+    let withheld: HashSet<String> = shared
+        .read()
+        .withheld_since_restore()
+        .keys()
+        .cloned()
+        .collect();
+
     let previous_plan = shared.scout_plan();
     let previous_entries = previous_plan
         .as_ref()
@@ -455,17 +485,18 @@ where
             .iter()
             .filter_map(|entry| entry.path.normalized_utf8.clone())
             .collect();
-        let changed_entries: Vec<(String, PathBuf, Option<LanguageId>)> = fresh_plan
+        let changed_entries: Vec<(String, PathBuf, &crate::domain::ScoutedEntry)> = fresh_plan
             .entries
             .iter()
             .filter_map(|entry| {
                 let relative_path = entry.path.normalized_utf8.clone()?;
                 if previous_entries.get(&relative_path) == Some(entry)
                     && !transient_paths.contains(&relative_path)
+                    && !withheld.contains(&relative_path)
                 {
                     return None;
                 }
-                Some((relative_path, entry.absolute_path.clone()?, entry.language))
+                Some((relative_path, entry.absolute_path.clone()?, entry))
             })
             .collect();
         let removed_paths: Vec<(String, crate::domain::ScoutedEntry)> =
@@ -480,10 +511,23 @@ where
             };
 
         let mut repairs_applied = 0usize;
-        for (relative_path, absolute_path, language) in changed_entries {
+        let (mut admitted, mut already_current) = (0usize, 0usize);
+        for (relative_path, absolute_path, entry) in changed_entries {
             if should_stop() {
                 return stale_count.into();
             }
+            // With no prior plan entry (every path of a snapshot-restored
+            // index) the plan comparison above cannot tell a stale row from a
+            // current one, so compare against the resident row itself.
+            if !previous_entries.contains_key(&relative_path)
+                && !transient_paths.contains(&relative_path)
+                && shared.read().reflects_scouted_entry(entry)
+            {
+                already_current += 1;
+                continue;
+            }
+            admitted += 1;
+            let language = entry.language;
             let outcome = read_and_index_observed(
                 &relative_path,
                 &absolute_path,
@@ -505,6 +549,7 @@ where
                 repairs_applied += 1;
             }
         }
+        info!("reconciliation sweep: {admitted} admitted, {already_current} already current");
         for (relative_path, expected_entry) in removed_paths {
             if should_stop() {
                 return stale_count.into();
@@ -517,6 +562,36 @@ where
                 repairs_applied += 1;
                 if authority.observe_removal(observer, &relative_path).is_err() {
                     debug!("reconciliation: stale incarnation's removal observation refused");
+                }
+            }
+        }
+
+        // A withheld path a complete scout no longer sees is gone: settle it
+        // once its absence is confirmed on disk, so it is not withheld forever.
+        if fresh_plan.coverage == crate::domain::CoverageStatus::Complete {
+            for relative_path in withheld
+                .iter()
+                .filter(|path| !fresh_paths.contains(path.as_str()))
+            {
+                if should_stop() {
+                    return stale_count.into();
+                }
+                let fence = shared.publication_fence();
+                if fence.project_generation != fence_gen {
+                    break;
+                }
+                if matches!(
+                    shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                        relative_path,
+                        &repo_root.join(relative_path),
+                        fence,
+                    ),
+                    crate::live_index::store::FencedRemoval::Removed(_)
+                ) {
+                    repairs_applied += 1;
+                    if authority.observe_removal(observer, relative_path).is_err() {
+                        debug!("reconciliation: stale incarnation's removal observation refused");
+                    }
                 }
             }
         }
@@ -591,6 +666,48 @@ where
             || shared
                 .scout_plan()
                 .is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded),
+        deferred: false,
+    }
+}
+
+/// Whether a snapshot verify still owns the restored rows, so a sweep now
+/// would defer to it.
+fn snapshot_verify_unresolved(shared: &SharedIndex) -> bool {
+    matches!(
+        shared.read().snapshot_verify_state,
+        crate::live_index::store::SnapshotVerifyState::Pending
+            | crate::live_index::store::SnapshotVerifyState::Running(_)
+    )
+}
+
+/// Holds the periodic-sweep flag while a sweep runs, and clears it when the
+/// sweep ends, panics included.
+struct SweepSingleFlight(Arc<AtomicBool>);
+
+impl SweepSingleFlight {
+    fn try_start(flag: &Arc<AtomicBool>) -> Option<Self> {
+        (!flag.swap(true, Ordering::AcqRel)).then(|| Self(Arc::clone(flag)))
+    }
+
+    /// An overflow sweep cannot be skipped like a periodic tick, so it waits
+    /// for the running sweep to end. `None` once the watcher stops.
+    // ponytail: polls the flag; a condvar if overflow storms ever show here.
+    fn wait_to_start(flag: &Arc<AtomicBool>, stop: &AtomicBool) -> Option<Self> {
+        loop {
+            if let Some(started) = Self::try_start(flag) {
+                return Some(started);
+            }
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for SweepSingleFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -609,6 +726,9 @@ pub(crate) fn reconcile_stale_files(repo_root: &Path, shared: &SharedIndex) -> u
 struct ReconciliationAttempt {
     repaired: usize,
     retry_degraded: bool,
+    /// The sweep deferred to an unresolved snapshot verify and observed
+    /// nothing, so it must not be reported as a reconcile.
+    deferred: bool,
 }
 
 impl From<usize> for ReconciliationAttempt {
@@ -616,6 +736,7 @@ impl From<usize> for ReconciliationAttempt {
         Self {
             repaired,
             retry_degraded: false,
+            deferred: false,
         }
     }
 }
@@ -688,10 +809,12 @@ where
     let effective_generation = effective_fence_generation(shared, repo_root, expected_gen);
     let batch_belongs_to_active_project = effective_generation == active_generation;
     let mut repaired = 0usize;
+    let mut deferred = false;
     let mut delay = INITIAL_DEGRADED_DELAY;
     for attempt in 1..=MAX_DEGRADED_ATTEMPTS {
         let outcome: ReconciliationAttempt = reconcile_once().into();
         repaired = repaired.saturating_add(outcome.repaired);
+        deferred = outcome.deferred;
         if stop_token.load(Ordering::Acquire)
             || !batch_belongs_to_active_project
             || shared.current_project_generation() != active_generation
@@ -724,7 +847,10 @@ where
             info.last_overflow_at = Some(now);
         }
         info.stale_files_found += repaired as u64;
-        info.last_reconcile_at = Some(now);
+        // Reporting invariant: a sweep that deferred observed nothing.
+        if !deferred {
+            info.last_reconcile_at = Some(now);
+        }
     }
     // A settled, current result is skipped by the temporal queue. Calling on
     // every reconciliation also detects bytes-identical ref movement, which
@@ -1146,6 +1272,11 @@ pub async fn run_watcher_with_stop(
                     cancelled = true;
                     break 'watcher;
                 }
+                // The fresh-instance sweep deferred to a snapshot verify that
+                // still owns the restored rows. It runs again once the verify
+                // completes, whatever the periodic interval, even when that is
+                // off.
+                let mut sweep_after_verify = snapshot_verify_unresolved(&shared);
 
                 // `Active` means the watcher is ready to consume events, not
                 // merely that the OS handle exists. Keep the state at
@@ -1169,6 +1300,11 @@ pub async fn run_watcher_with_stop(
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(30);
                 let mut last_reconcile = Instant::now();
+                let periodic_sweep = Arc::new(AtomicBool::new(false));
+                // Set while an overflow sweep waits for the running sweep; one
+                // waiting sweep covers every overflow that arrives before it
+                // scouts.
+                let overflow_queued = Arc::new(AtomicBool::new(false));
 
                 loop {
                     if stop_token.load(Ordering::Acquire) {
@@ -1180,6 +1316,34 @@ pub async fn run_watcher_with_stop(
                         break;
                     }
 
+                    if sweep_after_verify
+                        && matches!(
+                            shared.read().snapshot_verify_state,
+                            crate::live_index::store::SnapshotVerifyState::NotNeeded
+                                | crate::live_index::store::SnapshotVerifyState::Completed(_)
+                        )
+                        && let Some(single_flight) = SweepSingleFlight::try_start(&periodic_sweep)
+                    {
+                        sweep_after_verify = false;
+                        last_reconcile = Instant::now();
+                        let shared_clone = shared.clone();
+                        let root_clone = repo_root.clone();
+                        let watcher_info_clone = watcher_info.clone();
+                        let stop_for_reconcile = Arc::clone(&stop_token);
+                        tokio::task::spawn_blocking(move || {
+                            let _single_flight = single_flight;
+                            reconcile_for_cause(
+                                &root_clone,
+                                &shared_clone,
+                                &watcher_info_clone,
+                                &stop_for_reconcile,
+                                expected_gen,
+                                ReconciliationCause::FreshInstance,
+                                observer,
+                            );
+                        });
+                    }
+
                     // Periodic reconciliation sweep (belt-and-suspenders against missed events).
                     if reconcile_interval_secs > 0
                         && last_reconcile.elapsed() >= Duration::from_secs(reconcile_interval_secs)
@@ -1189,17 +1353,24 @@ pub async fn run_watcher_with_stop(
                         let watcher_info_clone = watcher_info.clone();
                         let stop_for_reconcile = Arc::clone(&stop_token);
                         let expected_gen_for_reconcile = expected_gen;
-                        tokio::task::spawn_blocking(move || {
-                            reconcile_for_cause(
-                                &root_clone,
-                                &shared_clone,
-                                &watcher_info_clone,
-                                &stop_for_reconcile,
-                                expected_gen_for_reconcile,
-                                ReconciliationCause::Periodic,
-                                observer,
-                            );
-                        });
+                        // One periodic sweep at a time: a sweep slower than
+                        // the interval must not pile up behind itself.
+                        if let Some(single_flight) = SweepSingleFlight::try_start(&periodic_sweep) {
+                            tokio::task::spawn_blocking(move || {
+                                let _single_flight = single_flight;
+                                reconcile_for_cause(
+                                    &root_clone,
+                                    &shared_clone,
+                                    &watcher_info_clone,
+                                    &stop_for_reconcile,
+                                    expected_gen_for_reconcile,
+                                    ReconciliationCause::Periodic,
+                                    observer,
+                                );
+                            });
+                        } else {
+                            debug!("watcher: periodic sweep still running; skipping this tick");
+                        }
                         // Coupling store refresh runs on its own task so a
                         // slow delta never delays stale-file reconciliation.
                         // Gates on SYMFORGE_COUPLING internally and holds a
@@ -1287,12 +1458,29 @@ pub async fn run_watcher_with_stop(
                                         "watcher: stale incarnation's gap report refused"
                                     );
                                 }
+                                if overflow_queued.swap(true, Ordering::AcqRel) {
+                                    // A queued sweep has not scouted yet, so
+                                    // it covers this overflow too.
+                                    return;
+                                }
                                 let shared_clone = shared.clone();
                                 let root_clone = repo_root.clone();
                                 let watcher_info_clone = watcher_info.clone();
                                 let stop_for_reconcile = Arc::clone(&stop_token);
                                 let expected_gen_for_reconcile = expected_gen;
+                                let sweep_flag = Arc::clone(&periodic_sweep);
+                                let queued = Arc::clone(&overflow_queued);
                                 tokio::task::spawn_blocking(move || {
+                                    let Some(_single_flight) = SweepSingleFlight::wait_to_start(
+                                        &sweep_flag,
+                                        &stop_for_reconcile,
+                                    ) else {
+                                        queued.store(false, Ordering::Release);
+                                        return;
+                                    };
+                                    // Cleared before the scout: an overflow
+                                    // after this point needs a sweep of its own.
+                                    queued.store(false, Ordering::Release);
                                     reconcile_for_cause(
                                         &root_clone,
                                         &shared_clone,
@@ -1430,6 +1618,48 @@ pub fn restart_watcher(
 mod tests {
     use super::*;
     use crate::domain::index::{AdmissionTier, SkipReason};
+
+    #[test]
+    fn periodic_sweep_is_single_flight() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = SweepSingleFlight::try_start(&flag).expect("the first sweep starts");
+        assert!(
+            SweepSingleFlight::try_start(&flag).is_none(),
+            "a tick while a sweep runs must not start a second one"
+        );
+        drop(first);
+        assert!(
+            SweepSingleFlight::try_start(&flag).is_some(),
+            "the next tick starts a sweep once the first ended"
+        );
+    }
+    #[test]
+    fn overflow_sweep_waits_for_the_running_sweep() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let stop = AtomicBool::new(false);
+        let running = SweepSingleFlight::try_start(&flag).expect("a sweep runs");
+        let waiter = {
+            let flag = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                SweepSingleFlight::wait_to_start(&flag, &stop).is_some()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "the overflow sweep waits its turn");
+        drop(running);
+        assert!(
+            waiter.join().unwrap(),
+            "it starts once the running sweep ends"
+        );
+
+        let _held = SweepSingleFlight::try_start(&flag).expect("a sweep runs");
+        stop.store(true, Ordering::Release);
+        assert!(
+            SweepSingleFlight::wait_to_start(&flag, &stop).is_none(),
+            "a stopped watcher does not wait"
+        );
+    }
     use crate::domain::{MetadataOnlyReason, ScoutDecision};
     use std::time::Duration;
     use tempfile::TempDir;

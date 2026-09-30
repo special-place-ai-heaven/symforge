@@ -555,8 +555,9 @@ fn snapshot_verify_state_label(state: &SnapshotVerifyState) -> &'static str {
     match state {
         SnapshotVerifyState::NotNeeded => "not_needed",
         SnapshotVerifyState::Pending => "pending",
-        SnapshotVerifyState::Running => "running",
+        SnapshotVerifyState::Running(_) => "running",
         SnapshotVerifyState::Completed(_) => "completed",
+        SnapshotVerifyState::Failed(_) => "failed",
     }
 }
 
@@ -565,12 +566,25 @@ fn append_snapshot_verify_mismatch_summary(
     state: &SnapshotVerifyState,
     path_limit: usize,
 ) {
-    if let SnapshotVerifyState::Completed(report) = state {
+    if let SnapshotVerifyState::Running(progress) = state {
+        line.push(' ');
+        line.push_str(&progress.describe());
+    }
+    if let SnapshotVerifyState::Completed(report) | SnapshotVerifyState::Failed(report) = state {
         line.push_str(&format!(" mismatches={}", report.mismatch_count));
         if report.mismatch_count > 0 {
             let shown = report.mismatched_paths.len().min(path_limit);
             let omitted = report.mismatch_count.saturating_sub(shown);
             line.push_str(&format!(" showing={shown} omitted={omitted}"));
+        }
+        if let Some(reason) = &report.reason {
+            line.push_str(&format!(" reason={}", quoted_status_value(reason)));
+        }
+        if let Some(error) = &report.discovery_error {
+            line.push_str(&format!(" discovery_error={}", quoted_status_value(error)));
+        }
+        if report.mismatch_count > 0 {
+            let shown = report.mismatched_paths.len().min(path_limit);
             if shown > 0 {
                 let paths = report
                     .mismatched_paths
@@ -583,7 +597,41 @@ fn append_snapshot_verify_mismatch_summary(
                 line.push_str(&paths);
             }
         }
+        if !report.unverified.is_empty() {
+            let shown = report.unverified.len().min(path_limit);
+            let listed = report
+                .unverified
+                .iter()
+                .take(shown)
+                .map(|(path, reason)| format!("{path}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            line.push_str(&format!(
+                " unverified_since_restore={} unverified_omitted={} unverified={}",
+                report.unverified.len(),
+                report.unverified.len() - shown,
+                quoted_status_value(&listed)
+            ));
+        }
     }
+}
+
+/// A double-quoted `key=value` value: backslashes and quotes escaped, and
+/// control characters (newlines in an error message) flattened to spaces, so
+/// free text can never end the value or the line early.
+fn quoted_status_value(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            ch if ch.is_control() => quoted.push(' '),
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn snapshot_verify_health_line(published: &PublishedIndexState) -> Option<String> {
@@ -606,21 +654,27 @@ fn snapshot_verify_health_line(published: &PublishedIndexState) -> Option<String
 }
 
 fn snapshot_verify_compact_line(published: &PublishedIndexState) -> Option<String> {
-    if published.load_source != IndexLoadSource::SnapshotRestore
-        && matches!(
-            &published.snapshot_verify_state,
-            SnapshotVerifyState::NotNeeded
-        )
+    snapshot_verify_status_line(published.load_source, &published.snapshot_verify_state)
+}
+
+/// Compact snapshot-verify line shared by `health_compact` and `status`;
+/// `None` when no snapshot was restored.
+pub(crate) fn snapshot_verify_status_line(
+    load_source: IndexLoadSource,
+    state: &SnapshotVerifyState,
+) -> Option<String> {
+    if load_source != IndexLoadSource::SnapshotRestore
+        && matches!(state, SnapshotVerifyState::NotNeeded)
     {
         return None;
     }
 
     let mut line = format!(
         "Snapshot: load_source={} verify={}",
-        index_load_source_label(published.load_source),
-        snapshot_verify_state_label(&published.snapshot_verify_state)
+        index_load_source_label(load_source),
+        snapshot_verify_state_label(state)
     );
-    append_snapshot_verify_mismatch_summary(&mut line, &published.snapshot_verify_state, 3);
+    append_snapshot_verify_mismatch_summary(&mut line, state, 3);
     Some(line)
 }
 
@@ -3824,6 +3878,79 @@ pub fn content_withheld_unscanned(path: &str) -> String {
     )
 }
 
+/// Refusal for a restored file the snapshot verify could not reconcile. Its
+/// restored content is withheld rather than served as current, and the file
+/// is not reported absent, because it is not.
+pub fn unverified_since_restore(path: &str, reason: &str) -> String {
+    format!(
+        "Unverified since restore: {path}. The snapshot verify could not reconcile this \
+         file ({reason}), so its restored content is withheld instead of served as current. \
+         A successful re-read releases it: the watcher does that on the next change to the \
+         file, and index_folder rebuilds the whole project from source."
+    )
+}
+
+/// Paths the snapshot verify withheld inside `scope`, bounded for display:
+/// the count, up to `limit` paths, and how many more there are.
+fn withheld_listing(
+    unverified: &std::collections::BTreeMap<String, String>,
+    scope: Option<&str>,
+    limit: usize,
+) -> Option<(usize, String)> {
+    let in_scope: Vec<&str> = unverified
+        .keys()
+        .map(String::as_str)
+        .filter(|path| {
+            // Whole path segments: `src` covers `src/a.rs`, not `src2/a.rs`.
+            scope.is_none_or(|scope| {
+                path.strip_prefix(scope)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        })
+        .collect();
+    if in_scope.is_empty() {
+        return None;
+    }
+    let mut listed = in_scope
+        .iter()
+        .take(limit)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if in_scope.len() > limit {
+        listed.push_str(&format!(" (+{} more)", in_scope.len() - limit));
+    }
+    Some((in_scope.len(), listed))
+}
+
+/// Appended to a project-wide answer when the snapshot verify withheld files
+/// inside its scope: those files were not searched, so the answer may be
+/// missing hits from them.
+pub fn withheld_not_searched_note(
+    unverified: &std::collections::BTreeMap<String, String>,
+    scope: Option<&str>,
+) -> Option<String> {
+    let (count, listed) = withheld_listing(unverified, scope, 5)?;
+    Some(format!(
+        "Note: {count} files withheld as unverified since restore were not searched: {listed}. \
+         A successful re-read releases each one, and index_folder rebuilds the project from source."
+    ))
+}
+
+/// A project-wide mutation cannot see references inside withheld files, so
+/// it refuses rather than leave them half-renamed.
+pub fn project_wide_mutation_refused_unverified(
+    tool: &str,
+    unverified: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let (count, listed) = withheld_listing(unverified, None, 10)?;
+    Some(format!(
+        "{tool} refused: {count} files are withheld as unverified since restore, and a \
+         project-wide change cannot see what they contain: {listed}. A successful re-read \
+         releases each one; run index_folder to rebuild the project from source, then retry."
+    ))
+}
+
 /// Richer "file not found" with suggested similar paths.
 /// Call this from tool handlers where the index is available.
 pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> String {
@@ -5602,6 +5729,35 @@ pub const INDEXING_IN_PROGRESS: &str =
 /// [`INDEXING_IN_PROGRESS`] for a load known to be a cold bootstrap.
 pub const INITIAL_INDEXING_IN_PROGRESS: &str =
     "initial indexing of this project is in progress and can take a while on large folders";
+
+/// Loading-guard prefix while a restored snapshot is being verified. The
+/// `Index is loading` start is load-bearing: `is_index_unavailable_output` and
+/// `edit_output_is_error` classify the guard by it.
+pub const SNAPSHOT_VERIFY_IN_PROGRESS: &str =
+    "Index is loading: verifying a restored snapshot against disk";
+
+/// Loading-guard text that names what holds the index. A restored snapshot
+/// stays unqueryable until its verification completes (Feature 020 V11: only a
+/// complete verified generation is queryable), so say which phase it is in and
+/// how far it got instead of a bare "try again shortly".
+pub fn loading_guard_message_for(state: &SnapshotVerifyState, cold_bootstrap: bool) -> String {
+    let detail = match state {
+        SnapshotVerifyState::Pending => "verify=pending".to_string(),
+        SnapshotVerifyState::Running(progress) => {
+            format!("verify=running {}", progress.describe())
+        }
+        SnapshotVerifyState::NotNeeded
+        | SnapshotVerifyState::Completed(_)
+        | SnapshotVerifyState::Failed(_) => {
+            return loading_guard_message(cold_bootstrap);
+        }
+    };
+    format!(
+        "{SNAPSHOT_VERIFY_IN_PROGRESS} ({detail}). It re-reads the files that changed \
+         since the snapshot and publishes them once; restored files stay hidden until it \
+         completes. `status` and `health` report its progress."
+    )
+}
 
 /// Surface-aware empty-index recovery hint (TR-02 / N-5 / FR-011, FR-012).
 ///

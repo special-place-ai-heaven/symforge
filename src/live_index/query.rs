@@ -1225,7 +1225,9 @@ impl LiveIndex {
         if self.load_source == IndexLoadSource::SnapshotRestore
             && matches!(
                 self.snapshot_verify_state,
-                SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+                SnapshotVerifyState::Pending
+                    | SnapshotVerifyState::Running(_)
+                    | SnapshotVerifyState::Failed(_)
             )
         {
             return None;

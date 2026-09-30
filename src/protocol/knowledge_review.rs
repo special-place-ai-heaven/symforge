@@ -160,6 +160,17 @@ pub(crate) fn review_current(
                     .to_string(),
             );
         }
+        // A failed snapshot verify leaves the restored bridge unproven.
+        _ if matches!(
+            generation.health.snapshot_verify_state,
+            crate::live_index::SnapshotVerifyState::Failed(_)
+        ) =>
+        {
+            return Err(
+                "Readiness: no_valid_source; run index_folder to rebuild from repository source."
+                    .to_string(),
+            );
+        }
         _ => {}
     }
     let envelope = generation.source_response_envelope().ok_or_else(|| {

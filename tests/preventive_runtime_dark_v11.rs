@@ -1028,10 +1028,22 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed 2026-09-30 for the windows-native fix: sidecar descriptors
 // normalize their root through the existing live_index normalize_root, plus
 // test-body edits; no new edge into src/index_lifecycle.
+// Refreshed 2026-09-30 for the single-publication snapshot verify and the
+// fresh-instance sweep fix; their lifecycle references stay inside persist.rs,
+// already on the wired roster. Refreshed again for its review round: the
+// Failed verify state, slot-stop cancellation, and the batch catalog pass add
+// no edge into src/index_lifecycle.
+// Refreshed at the tip of the snapshot-verify branch after its rebase: the
+// verify, its withheld rows, the checkpoint refusal and the sweep stand-down
+// add no edge into src/index_lifecycle. Refreshed once more for the withheld-
+// file lanes, the batch_rename refusal and the deferred sweep, likewise, and
+// for the withheld-file release and the post-verify sweep. Refreshed after
+// rebasing onto the path-alias fix, whose refusals the verify re-read now
+// shares; likewise no new edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "bb64035d0b9480538812019b02c3bdc88bfc047ae3ad0737d43625537d12d62b",
+    "d7a74f660d6950b74e9b6c892a8bdd63d38fedfd90335b6c9f2fb4f05d6a1e0e",
     199,
-    9_884_451,
+    10_039_361,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
