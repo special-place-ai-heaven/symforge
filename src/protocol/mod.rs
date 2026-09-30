@@ -996,16 +996,6 @@ impl SymForgeServer {
     }
 
     /// Apply token budget with CCR offload for eligible discovery tools (011).
-    /// Leads a project-wide answer served from this server's index with the
-    /// files the snapshot verify withheld and it therefore did not search.
-    pub(crate) fn with_withheld_note(&self, output: String) -> String {
-        let live = self.index.data_plane().read();
-        match format::withheld_not_searched_note(live.withheld_since_restore(), None) {
-            Some(note) => format!("{note}\n\n{output}"),
-            None => output,
-        }
-    }
-
     pub(crate) fn apply_ccr_budget(
         &self,
         tool_name: &str,

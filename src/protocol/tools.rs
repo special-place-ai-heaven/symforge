@@ -4812,15 +4812,20 @@ impl SymForgeServer {
                     .iter()
                     .any(|section| section == "consumers" || section == "references")
         });
-        let output = self.get_file_context_unnoted(params).await;
-        if project_wide {
-            self.with_withheld_note(output)
-        } else {
-            output
+        let mut served = None;
+        let output = self.get_file_context_unnoted(params, &mut served).await;
+        match served {
+            Some(live) if project_wide => with_withheld_note(&live, None, output),
+            _ => output,
         }
     }
 
-    async fn get_file_context_unnoted(&self, params: Parameters<GetFileContextInput>) -> String {
+    /// `served` receives the index the answer is rendered from, once captured.
+    async fn get_file_context_unnoted(
+        &self,
+        params: Parameters<GetFileContextInput>,
+        served: &mut Option<Arc<LiveIndex>>,
+    ) -> String {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
         }
@@ -4835,6 +4840,7 @@ impl SymForgeServer {
             return refusal.message(&params.0.path);
         }
         let published = self.capture_local_response_generation();
+        *served = Some(Arc::clone(&published.live));
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             return message;
         }
@@ -5099,13 +5105,19 @@ impl SymForgeServer {
         &self,
         params: Parameters<GetSymbolContextInput>,
     ) -> String {
-        let output = self.get_symbol_context_unnoted(params).await;
-        self.with_withheld_note(output)
+        let mut served = None;
+        let output = self.get_symbol_context_unnoted(params, &mut served).await;
+        match served {
+            Some(live) => with_withheld_note(&live, None, output),
+            None => output,
+        }
     }
 
+    /// `served` receives the index the answer is rendered from, once captured.
     async fn get_symbol_context_unnoted(
         &self,
         params: Parameters<GetSymbolContextInput>,
+        served: &mut Option<Arc<LiveIndex>>,
     ) -> String {
         if let Some(result) = self.proxy_tool_call("get_symbol_context", &params.0).await {
             return result;
@@ -5122,6 +5134,7 @@ impl SymForgeServer {
             false
         };
         let published = self.capture_local_response_generation();
+        *served = Some(Arc::clone(&published.live));
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             return message;
         }
@@ -5893,7 +5906,7 @@ impl SymForgeServer {
 
         let source_set = self.index.data_plane().published_source_set();
         let output = super::knowledge_search::search_scoped(&source_set, &params.0);
-        let output = self.with_withheld_note(output);
+        let output = with_withheld_note(&source_set.current_generation().live, None, output);
         self.apply_ccr_budget("search_knowledge", output, params.0.max_tokens)
     }
 
@@ -10311,15 +10324,20 @@ impl SymForgeServer {
     )]
     pub(crate) async fn explore(&self, params: Parameters<ExploreInput>) -> String {
         let project_wide = params.0.depth.unwrap_or(1) >= 2;
-        let output = self.explore_unnoted(params).await;
-        if project_wide {
-            self.with_withheld_note(output)
-        } else {
-            output
+        let mut served = None;
+        let output = self.explore_unnoted(params, &mut served).await;
+        match served {
+            Some(live) if project_wide => with_withheld_note(&live, None, output),
+            _ => output,
         }
     }
 
-    async fn explore_unnoted(&self, params: Parameters<ExploreInput>) -> String {
+    /// `served` receives the index the answer is rendered from, once captured.
+    async fn explore_unnoted(
+        &self,
+        params: Parameters<ExploreInput>,
+        served: &mut Option<Arc<LiveIndex>>,
+    ) -> String {
         if let Some(result) = self.proxy_tool_call("explore", &params.0).await {
             return result;
         }
@@ -10350,6 +10368,7 @@ impl SymForgeServer {
         let suppress_other_noise = !include_noise;
         let any_suppression = suppress_vendor || suppress_personal || suppress_other_noise;
         let guard = self.index.data_plane().read();
+        *served = Some(Arc::clone(&guard));
         loading_guard!(guard);
 
         let concept = super::explore::match_concept(&params.0.query);

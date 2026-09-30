@@ -566,8 +566,9 @@ where
             }
         }
 
-        // A withheld path a complete scout no longer sees is gone: settle it
-        // once its absence is confirmed on disk, so it is not withheld forever.
+        // A withheld path a complete scout no longer sees is gone or excluded
+        // by policy (the scout applies every ignore rule, which a restored
+        // index does not hold): settle it, so it is not withheld forever.
         if fresh_plan.coverage == crate::domain::CoverageStatus::Complete {
             for relative_path in withheld
                 .iter()
@@ -581,11 +582,7 @@ where
                     break;
                 }
                 if matches!(
-                    shared.remove_file_if_absent_at_publication_fence_with_receipt(
-                        relative_path,
-                        &repo_root.join(relative_path),
-                        fence,
-                    ),
+                    shared.remove_file_at_publication_fence_with_receipt(relative_path, fence),
                     crate::live_index::store::FencedRemoval::Removed(_)
                 ) {
                     repairs_applied += 1;
@@ -895,6 +892,11 @@ pub struct WatcherTaskHandle {
 
 #[cfg(test)]
 static FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Test-only: runs once right after the fresh-instance sweep returns.
+#[cfg(test)]
+pub(crate) static AFTER_FRESH_INSTANCE_SWEEP: Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    Mutex::new(None);
 
 /// Create a new debouncer watching `repo_root` recursively.
 ///
@@ -1255,6 +1257,13 @@ pub async fn run_watcher_with_stop(
                 // before this point cannot be recovered from the new channel,
                 // so repair that uncertainty with an immediate full manifest
                 // reconciliation before consuming incremental hints.
+                //
+                // When that sweep defers to a snapshot verify that still owns
+                // the restored rows, it runs again once the verify completes,
+                // whatever the periodic interval, even when that is off. Read
+                // before the sweep: a verify that completes during it must
+                // still get that sweep.
+                let mut sweep_after_verify = snapshot_verify_unresolved(&shared);
                 let shared_for_fresh = shared.clone();
                 let root_for_fresh = repo_root.clone();
                 let watcher_info_for_fresh = watcher_info.clone();
@@ -1279,11 +1288,10 @@ pub async fn run_watcher_with_stop(
                     cancelled = true;
                     break 'watcher;
                 }
-                // The fresh-instance sweep deferred to a snapshot verify that
-                // still owns the restored rows. It runs again once the verify
-                // completes, whatever the periodic interval, even when that is
-                // off.
-                let mut sweep_after_verify = snapshot_verify_unresolved(&shared);
+                #[cfg(test)]
+                if let Some(hook) = AFTER_FRESH_INSTANCE_SWEEP.lock().take() {
+                    hook();
+                }
 
                 // `Active` means the watcher is ready to consume events, not
                 // merely that the OS handle exists. Keep the state at
