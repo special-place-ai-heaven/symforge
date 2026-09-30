@@ -2761,9 +2761,9 @@ fn admission_degradation_view_from_disk(
 /// The first refusal runs BEFORE any syscall, so the answer is a pure function
 /// of the requested path plus the manifest and is identical for a demoted file
 /// that exists and one that does not — otherwise the difference between this
-/// block and `File not found:` is a one-bit existence oracle. That is why it
-/// asks `refuse_by_policy`, which names no finding lines, and never the
-/// line-naming variant, whose bounded re-read would observe the file. The second runs
+/// block and `File not found:` is a one-bit existence oracle. `refuse_by_policy`
+/// therefore names no finding lines; only the gate's read lane, which opens the
+/// file anyway, adds them. The second runs
 /// on the RESOLVED path, which can differ from the requested string (absolute
 /// arguments do not normalize against a catalog key) and is the only clause
 /// that catches a content-detected demotion reached that way.
@@ -36309,15 +36309,14 @@ mod tests {
         let (repo, mut live) = admission_probe_repo();
         let recorded = |rule: &str| recorded_content_demotion("src/probe.rs", rule);
         live.manifest_entries = vec![recorded("secret.context-assignment")];
-        let refusal =
-            crate::protocol::read_gate::refuse_by_policy_naming_lines(&live, "src/probe.rs")
-                .expect("a recorded demotion must refuse");
+        let probe = repo.path().join("src/probe.rs");
+        let refusal = crate::protocol::read_gate::admit_disk_read(&live, "src/probe.rs", &probe)
+            .expect_err("a recorded demotion must refuse");
         assert_names_rule_and_line_without_bypass(&refusal);
 
         live.manifest_entries = vec![recorded("secret.uri-credentials")];
-        let moved =
-            crate::protocol::read_gate::refuse_by_policy_naming_lines(&live, "src/probe.rs")
-                .expect("a recorded demotion refuses whatever the file now holds");
+        let moved = crate::protocol::read_gate::admit_disk_read(&live, "src/probe.rs", &probe)
+            .expect_err("a recorded demotion refuses whatever the file now holds");
         assert!(
             moved.contains("secret.uri-credentials") && !moved.contains(" at line"),
             "lines from a different verdict must not be paired with the record; shape: {}",

@@ -195,22 +195,9 @@ pub(crate) fn disk_read_would_refuse(
 /// Makes no syscall: the answer is a pure function of the path and the
 /// manifest, identical for a demoted file that exists and one that does not,
 /// so the degradation view, the binary sniff and the sweeps that ask it hold no
-/// existence bit. A recorded content demotion therefore names no lines here.
+/// existence bit. A recorded content demotion therefore names no lines here;
+/// [`admit_disk_read`] adds them when it renders the refusal.
 pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
-    policy_refusal(live, relative_path, false)
-}
-
-/// [`refuse_by_policy`] for the lanes that hand the refusal to a caller asking
-/// for the content itself: a recorded content demotion also names its finding
-/// lines, recomputed by a bounded re-read inside the gate.
-pub(crate) fn refuse_by_policy_naming_lines(
-    live: &LiveIndex,
-    relative_path: &str,
-) -> Option<String> {
-    policy_refusal(live, relative_path, true)
-}
-
-fn policy_refusal(live: &LiveIndex, relative_path: &str, name_lines: bool) -> Option<String> {
     // Current path rule — no read needed.
     if let Some(rule_id) = crate::knowledge::sensitive_path_rule(relative_path) {
         return Some(format::content_withheld_by_path_rule(
@@ -245,16 +232,11 @@ fn policy_refusal(live: &LiveIndex, relative_path: &str, name_lines: bool) -> Op
                 rule_ids,
                 finding_count,
             } => {
-                let line_ranges = if name_lines {
-                    recorded_finding_lines(live, relative_path, rule_ids)
-                } else {
-                    Vec::new()
-                };
                 return Some(format::content_withheld_by_admission(
                     relative_path,
                     rule_ids,
                     *finding_count,
-                    &line_ranges,
+                    &[],
                 ));
             }
             _ => {}
@@ -286,6 +268,40 @@ pub(crate) fn unverified_notice(live: &LiveIndex, requested: &str) -> Option<Str
     }
     live.unverified_since_restore(&path)
         .map(|reason| format::unverified_since_restore(&path, reason))
+}
+
+/// The read lane's refusal for a RECORDED content demotion, naming its finding
+/// lines from the gate's bounded re-read. Asked only by [`admit_disk_read`],
+/// and only once [`refuse_by_policy`] has refused, so the policy answer itself
+/// stays syscall-free.
+///
+/// `None` when that refusal is not a recorded content match (the path rule and
+/// a detector failure take precedence exactly as in [`refuse_by_policy`]) or no
+/// lines were recovered; the caller then renders the policy refusal unchanged.
+fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Option<String> {
+    if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
+        return None;
+    }
+    let Some(FileDisposition::MetadataOnly {
+        reason:
+            MetadataOnlyReason::SensitiveContent {
+                rule_ids,
+                finding_count,
+            },
+    }) = live.capture_file_disposition(relative_path)
+    else {
+        return None;
+    };
+    if rule_ids
+        .iter()
+        .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID)
+    {
+        return None;
+    }
+    let line_ranges = recorded_finding_lines(live, relative_path, rule_ids);
+    (!line_ranges.is_empty()).then(|| {
+        format::content_withheld_by_admission(relative_path, rule_ids, *finding_count, &line_ranges)
+    })
 }
 
 /// Finding lines for a RECORDED content demotion, computed at refusal time.
@@ -369,7 +385,7 @@ pub(crate) fn admit_bytes(
     relative_path: &str,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
-    if let Some(refusal) = refuse_by_policy_naming_lines(live, relative_path) {
+    if let Some(refusal) = refuse_by_policy(live, relative_path) {
         return Err(refusal);
     }
     if let Some(refusal) = classify_admitted_bytes(relative_path, &bytes) {
@@ -393,9 +409,8 @@ pub(crate) fn admit_git_text(
     relative_path: &str,
 ) -> Result<Option<String>, String> {
     // Policy first: a path-ruled file is refused without touching the object
-    // store at all. The line re-read runs only on this refusing branch, which
-    // returns, so `admit_bytes` asking policy again below never repeats it.
-    if let Some(refusal) = refuse_by_policy_naming_lines(live, relative_path) {
+    // store at all.
+    if let Some(refusal) = refuse_by_policy(live, relative_path) {
         return Err(refusal);
     }
     let Some(text) = repo.file_at_ref(git_ref, relative_path)? else {
@@ -424,11 +439,14 @@ pub(crate) fn admit_disk_read(
     canon_path: &Path,
 ) -> Result<Vec<u8>, String> {
     // Policy refusals need no bytes, so they run BEFORE the read: a demoted
-    // file is never opened for disclosure. A recorded content demotion is
-    // re-read by the gate, bounded, only to name its finding lines; the bytes
-    // never leave the gate.
-    if let Some(refusal) = refuse_by_policy_naming_lines(live, relative_path) {
-        return Err(refusal);
+    // file is never opened for disclosure. Only once refusing does the gate
+    // re-read a recorded content demotion, bounded, to name its finding lines;
+    // those bytes never leave the gate.
+    // ponytail: callers that drop the refusal (the search_text untracked sweep,
+    // detect_impact seeding) still pay that bounded re-read per recorded content
+    // demotion; give them a line-free entry point if it ever shows up hot.
+    if let Some(refusal) = refuse_by_policy(live, relative_path) {
+        return Err(recorded_refusal_naming_lines(live, relative_path).unwrap_or(refusal));
     }
 
     // The one read, and the classification of exactly those bytes. Required
