@@ -407,20 +407,45 @@ impl ServerHandler for DeferredStdioServer {
             .await
     }
 
-    /// The real server binds client-declared roots here, and it may not exist
-    /// yet: replay the notification to it once it does.
+    /// Ask for client roots immediately; bind once the runtime exists.
+    ///
+    /// Previously this waited for [`StdioStartup::Ready`] before forwarding
+    /// `notifications/initialized`, so `roots/list` sat behind daemon session
+    /// open / index load (3.5–5s). The ask now runs at once; the bind still
+    /// applies on the real server when it is Ready. Tool calls continue to wait
+    /// honestly for readiness via [`Self::ready_server`] / the call_tool path.
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         let mut startup = self.startup.clone();
         tokio::spawn(async move {
-            let server = match startup
-                .wait_for(|state| !matches!(state, StdioStartup::Starting))
-                .await
-                .as_deref()
-            {
-                Ok(StdioStartup::Ready(server)) => Arc::clone(server),
-                _ => return,
+            // Fast path: runtime already up — identical to today's forward.
+            // Clone out of the watch Ref before any `.await` so the future stays Send.
+            let already = startup.borrow().clone();
+            if let StdioStartup::Ready(server) = already {
+                server.on_initialized(context).await;
+                return;
+            }
+
+            // Runtime still starting: solicit roots now, in parallel with
+            // waiting for the runtime, so session open / index load cannot
+            // delay the client's roots/list. Bind when both are done.
+            let roots_ask = SymForgeServer::fetch_client_root_uris(&context.peer);
+            let runtime = async {
+                match startup
+                    .wait_for(|state| !matches!(state, StdioStartup::Starting))
+                    .await
+                {
+                    // Clone StdioStartup out of the watch Ref before any later
+                    // `.await` so the spawned future stays Send.
+                    Ok(state) => Some(state.clone()),
+                    Err(_) => None,
+                }
             };
-            server.on_initialized(context).await;
+            let (uris, phase) = tokio::join!(roots_ask, runtime);
+            let Some(StdioStartup::Ready(server)) = phase else {
+                return;
+            };
+            tracing::info!("client initialized");
+            server.apply_prefetched_client_roots(uris).await;
         });
     }
 }
@@ -783,12 +808,8 @@ mod tests {
         client
             .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
             .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        startup.send_replace(StdioStartup::Ready(server_with(
-            crate::live_index::LiveIndex::empty(),
-        )));
-        let asked = tokio::time::timeout(Duration::from_secs(10), async {
+        // Roots must be asked immediately — not queued behind runtime Ready.
+        let asked = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let line = client.lines.next_line().await.unwrap().expect("open");
                 let message: Value = serde_json::from_str(&line).unwrap();
@@ -798,8 +819,65 @@ mod tests {
             }
         })
         .await
-        .expect("the runtime ran its initialized handler");
+        .expect("roots/list must be solicited before the runtime becomes Ready");
         assert!(asked.get("id").is_some(), "{asked}");
+        assert!(
+            matches!(&*startup.borrow(), StdioStartup::Starting),
+            "roots/list must arrive while the project runtime is still Starting"
+        );
+        // Publish a still-loading runtime after roots were already asked —
+        // bind still applies once Ready, but the ask did not wait for it.
+        startup.send_replace(StdioStartup::Ready(loading_server()));
+    }
+
+    /// Proof (Task A): `roots/list` is sent before the index is ready. The
+    /// deferred front must not wait for `StdioStartup::Ready` (daemon session /
+    /// index load) before asking the client for its roots.
+    #[tokio::test]
+    async fn roots_list_is_sent_before_index_ready() {
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        let mut client = connect(front);
+        let init = client
+            .request(
+                1,
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"roots": {"listChanged": true}},
+                    "clientInfo": {"name": "deferred-stdio-test", "version": "0"}
+                }),
+            )
+            .await;
+        assert!(init.get("result").is_some(), "{init}");
+
+        // Runtime stays Starting with no Ready publish: if roots/list were
+        // queued behind Ready, this would time out.
+        client
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+
+        let asked = tokio::time::timeout(Duration::from_millis(800), async {
+            loop {
+                let line = client.lines.next_line().await.unwrap().expect("open");
+                let message: Value = serde_json::from_str(&line).unwrap();
+                if message["method"] == json!("roots/list") {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("roots/list must be sent before the index/runtime is ready");
+
+        assert!(asked.get("id").is_some(), "{asked}");
+        assert!(
+            matches!(&*startup.borrow(), StdioStartup::Starting),
+            "startup must still be Starting when roots/list is sent: roots must not wait for Ready"
+        );
+        // Never published Ready — so no index can be ready behind this front.
+        assert!(
+            !matches!(&*startup.borrow(), StdioStartup::Ready(_)),
+            "index/runtime must not be Ready yet when roots/list is sent"
+        );
     }
 
     /// A startup task that panics must not leave every request waiting on a

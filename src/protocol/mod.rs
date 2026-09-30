@@ -1809,7 +1809,105 @@ impl SymForgeServer {
     // allow to this fn. Upgrade path: when the spec settles on a successor
     // capability (or rmcp removes Roots), migrate this single function.
     // https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577
+    /// Ask the client for its `roots/list` URIs without binding yet.
+    ///
+    /// Used by the deferred stdio front so `roots/list` is solicited as soon as
+    /// `notifications/initialized` arrives — in parallel with daemon session
+    /// setup — rather than waiting for `StdioStartup::Ready`. Env authority and
+    /// a missing roots capability still skip the round-trip. The single
+    /// `Peer::list_roots` solicitation lives here (FR-314).
     #[allow(deprecated)]
+    pub(crate) async fn fetch_client_root_uris(
+        peer: &rmcp::Peer<RoleServer>,
+    ) -> Option<Vec<String>> {
+        // Env override always wins: never bother the client for roots.
+        if crate::discovery::workspace_root_env_is_authoritative() {
+            tracing::debug!(
+                "workspace environment authority prevents client-roots retarget or fallback"
+            );
+            return None;
+        }
+
+        // Spec correctness: only issue `roots/list` when the client actually
+        // declared the `roots` capability at `initialize`. A client that did not
+        // advertise roots (capabilities `{}`) has no obligation to answer a
+        // `roots/list` request and may never reply, which would hang this hook
+        // (and the session) indefinitely. `peer_info()` is the client's stored
+        // `InitializeRequestParams`; absent or roots-less capabilities => skip.
+        let declares_roots = peer
+            .peer_info()
+            .map(|info| info.capabilities.roots.is_some())
+            .unwrap_or(false);
+        if !declares_roots {
+            tracing::debug!("client did not declare the roots capability; workspace stays unbound");
+            return None;
+        }
+
+        // Defense in depth: even a roots-declaring client could stall. Bound the
+        // request so a non-answering peer cannot hang the session — on timeout we
+        // simply leave the workspace unbound, identical to the no-roots path.
+        let roots = match tokio::time::timeout(std::time::Duration::from_secs(5), peer.list_roots())
+            .await
+        {
+            Ok(Ok(result)) => result.roots,
+            Ok(Err(error)) => {
+                // Client declined / transport error. Stay unbound (pre-hook behavior).
+                tracing::debug!(%error, "client roots/list failed; workspace stays unbound");
+                return None;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "client roots/list did not respond within 5s; workspace stays unbound"
+                );
+                return None;
+            }
+        };
+
+        if roots.is_empty() {
+            tracing::debug!("client declared no roots; workspace stays unbound");
+            return None;
+        }
+
+        Some(roots.into_iter().map(|root| root.uri).collect())
+    }
+
+    /// Apply previously fetched client root URIs to this server.
+    ///
+    /// Re-checks the local-already-bound gate (which needs the live server) so a
+    /// prefetch that raced ahead of Ready cannot reload a local index. Daemon
+    /// proxies may still retarget when the declared root differs.
+    pub(crate) async fn apply_prefetched_client_roots(&self, root_uris: Option<Vec<String>>) {
+        let Some(root_uris) = root_uris else {
+            return;
+        };
+        if crate::discovery::workspace_root_env_is_authoritative() {
+            return;
+        }
+        if self.capture_repo_root().is_some() {
+            let is_daemon_proxy = self.daemon_client.is_some();
+            if !is_daemon_proxy {
+                return;
+            }
+            tracing::debug!(
+                "daemon-proxy bound from CWD (no env override); allowing client roots to retarget"
+            );
+        }
+
+        // Reaching this point means env is not authoritative; Passing None for
+        // the env slot therefore cannot let a client root jump ahead of an
+        // authoritative environment decision — `env > roots` holds.
+        let Some(resolved) = crate::discovery::resolve_workspace_root(None, &root_uris, None)
+        else {
+            tracing::info!(
+                roots = ?root_uris,
+                "no usable workspace among client roots (forbidden/unparseable); staying unbound"
+            );
+            return;
+        };
+
+        let _ = self.bind_declared_client_root(resolved).await;
+    }
+
     async fn bind_workspace_from_client_roots(&self, peer: &rmcp::Peer<RoleServer>) {
         // Precedence: `SYMFORGE_WORKSPACE_ROOT (env) > client roots > CWD walk`.
         //
@@ -1832,13 +1930,6 @@ impl SymForgeServer {
         // The env override always wins (case skipped) so `env > roots` holds, and
         // a local (non-proxy) server keeps its exact prior behavior: it returns
         // here whenever it is already bound, never reloading a loaded index.
-        let env_is_authoritative = crate::discovery::workspace_root_env_is_authoritative();
-        if env_is_authoritative {
-            tracing::debug!(
-                "workspace environment authority prevents client-roots retarget or fallback"
-            );
-            return;
-        }
         if self.capture_repo_root().is_some() {
             let is_daemon_proxy = self.daemon_client.is_some();
             if !is_daemon_proxy {
@@ -1849,62 +1940,8 @@ impl SymForgeServer {
             );
         }
 
-        // Spec correctness: only issue `roots/list` when the client actually
-        // declared the `roots` capability at `initialize`. A client that did not
-        // advertise roots (capabilities `{}`) has no obligation to answer a
-        // `roots/list` request and may never reply, which would hang this hook
-        // (and the session) indefinitely. `peer_info()` is the client's stored
-        // `InitializeRequestParams`; absent or roots-less capabilities => skip.
-        let declares_roots = peer
-            .peer_info()
-            .map(|info| info.capabilities.roots.is_some())
-            .unwrap_or(false);
-        if !declares_roots {
-            tracing::debug!("client did not declare the roots capability; workspace stays unbound");
-            return;
-        }
-
-        // Defense in depth: even a roots-declaring client could stall. Bound the
-        // request so a non-answering peer cannot hang the session — on timeout we
-        // simply leave the workspace unbound, identical to the no-roots path.
-        let roots = match tokio::time::timeout(std::time::Duration::from_secs(5), peer.list_roots())
-            .await
-        {
-            Ok(Ok(result)) => result.roots,
-            Ok(Err(error)) => {
-                // Client declined / transport error. Stay unbound (pre-hook behavior).
-                tracing::debug!(%error, "client roots/list failed; workspace stays unbound");
-                return;
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    "client roots/list did not respond within 5s; workspace stays unbound"
-                );
-                return;
-            }
-        };
-
-        if roots.is_empty() {
-            tracing::debug!("client declared no roots; workspace stays unbound");
-            return;
-        }
-
-        let root_uris: Vec<String> = roots.into_iter().map(|root| root.uri).collect();
-
-        // Reaching this point means `env_is_authoritative` was false; the gate
-        // above covers both a resolved workspace override and an unsupported-
-        // encoding refusal. Passing None therefore cannot let a client root jump
-        // ahead of an authoritative environment decision — `env > roots` holds.
-        let Some(resolved) = crate::discovery::resolve_workspace_root(None, &root_uris, None)
-        else {
-            tracing::info!(
-                roots = ?root_uris,
-                "no usable workspace among client roots (forbidden/unparseable); staying unbound"
-            );
-            return;
-        };
-
-        let _ = self.bind_declared_client_root(resolved).await;
+        let uris = Self::fetch_client_root_uris(peer).await;
+        self.apply_prefetched_client_roots(uris).await;
     }
 
     /// Bind this connection to `resolved`, the workspace its client's roots
