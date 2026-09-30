@@ -1225,13 +1225,12 @@ pub(crate) fn safe_repo_path_for_freshen(
     {
         return Err(format!("path '{relative_path}' is outside the repository"));
     }
-    // Checked before the not-on-disk fallback below, which would otherwise
-    // swallow the refusal and hand the alias to the freshen lane anyway.
-    edit::refuse_path_alias(repo_root, relative_path)?;
-
-    match edit::safe_repo_path(repo_root, relative_path) {
-        Ok(path) => Ok(path),
-        Err(_) => {
+    match edit::resolve_repo_path(repo_root, relative_path)? {
+        Some(path) => Ok(path),
+        // Only a spelling with nothing on disk falls back, so the freshen lane
+        // can confirm a deletion. Every refusal and every other I/O error
+        // propagates instead of becoming a path the lane would follow.
+        None => {
             let canon_root = repo_root
                 .canonicalize()
                 .map_err(|e| format!("cannot resolve repo root: {e}"))?;
@@ -9052,6 +9051,9 @@ impl SymForgeServer {
                         return format::path_outside_repo(&input.path);
                     }
                     Err(message) if is_admission_refusal(&message) => return message,
+                    Err(message) if message.starts_with(edit::PATH_SPELLING_DIFFERS) => {
+                        return format!("Error: {message}");
+                    }
                     _ => {}
                 }
             }
@@ -9176,6 +9178,9 @@ impl SymForgeServer {
                         // An alias of a credential file gets the refusal its
                         // canonical spelling gets, not a false "not found".
                         Err(message) if is_admission_refusal(&message) => return message,
+                        Err(message) if message.starts_with(edit::PATH_SPELLING_DIFFERS) => {
+                            return format!("Error: {message}");
+                        }
                         Err(_) => return format::not_found_file(&input.path),
                     };
                     if canon_path.is_file() {
@@ -9314,6 +9319,9 @@ impl SymForgeServer {
         let canon_path = match edit::safe_repo_path(&root, &input.path) {
             Ok(path) => path,
             Err(message) if is_admission_refusal(&message) => return message,
+            Err(message) if message.starts_with(edit::PATH_SPELLING_DIFFERS) => {
+                return format!("Error: {message}");
+            }
             Err(_) => return format::not_found_file(&input.path),
         };
         if !canon_path.is_file() {
@@ -29541,7 +29549,29 @@ mod tests {
         let (dir, server) = setup_loaded_edit_test(&[]);
         write_credential_alias_fixtures(dir.path());
 
-        for alias in credential_alias_spellings(dir.path()) {
+        // A committed symlink whose target lies outside the repository.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("credentials"), ALIAS_FIXTURE_BODY).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        #[cfg(unix)]
+        let escaping = std::os::unix::fs::symlink(
+            outside.path().join("credentials"),
+            dir.path().join("docs/setup.txt"),
+        );
+        #[cfg(windows)]
+        let escaping = std::os::windows::fs::symlink_file(
+            outside.path().join("credentials"),
+            dir.path().join("docs/setup.txt"),
+        );
+        let mut spellings = credential_alias_spellings(dir.path());
+        match escaping {
+            Ok(()) => spellings.push("docs/setup.txt".to_string()),
+            Err(error) => {
+                eprintln!("cannot create a file symlink here ({error}); escape case skipped")
+            }
+        }
+
+        for alias in spellings {
             // Lane A: a targeted freshen must not publish the alias.
             let _ = super::freshen_exact_path_for_targeted_retrieval(
                 &server,
@@ -29566,13 +29596,58 @@ mod tests {
                 !served.contains(ALIAS_FIXTURE_BODY.trim()),
                 "alias {alias:?} disclosed credential bytes: {served}"
             );
-            if !alias.contains(':') {
+            if !alias.contains(':') && alias != "docs/setup.txt" {
                 assert!(
                     super::is_admission_refusal(&served),
                     "alias {alias:?} must get the canonical admission refusal: {served}"
                 );
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_and_short_name_aliases_of_ordinary_files_are_refused() {
+        let (dir, server) = setup_loaded_edit_test(&[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            ("src/longer_module_name.rs", "pub fn g() {}\n"),
+            (".git/config", "[core]\n"),
+        ]);
+        let root = dir.path();
+        let differs = "path spelling differs from the on-disk name";
+
+        let mut hinted = vec![("SRC/LIB.RS", "src/lib.rs"), ("src/Lib.rs", "src/lib.rs")];
+        if root.join("src").join("LONGER~1.RS").is_file() {
+            hinted.push(("src/LONGER~1.RS", "src/longer_module_name.rs"));
+        } else {
+            eprintln!("8.3 short names are not generated on this volume; short-name alias skipped");
+        }
+        for (alias, canonical) in hinted {
+            let expected = format!("{differs}; retry with `{canonical}`");
+            assert_eq!(
+                super::edit::safe_repo_path(root, alias).unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                super::safe_repo_path_for_freshen(root, alias).unwrap_err(),
+                expected
+            );
+            let _ = super::freshen_exact_path_for_targeted_retrieval(
+                &server,
+                &super::search::PathScope::exact(alias),
+            );
+            assert!(
+                server.index().data_plane().read().get_file(alias).is_none(),
+                "alias {alias:?} was published under a second key"
+            );
+        }
+
+        // A hard-scope-excluded canonical name gets no hint.
+        assert_eq!(
+            super::edit::safe_repo_path(root, ".GIT/config").unwrap_err(),
+            differs
+        );
+        assert!(super::edit::safe_repo_path(root, "src/lib.rs").is_ok());
     }
 
     #[test]

@@ -216,6 +216,20 @@ fn project_root_from_paths(abs_path: &Path, relative_path: &str) -> Option<PathB
     abs_path.ancestors().nth(depth).map(|p| p.to_path_buf())
 }
 
+/// The cold walk never follows a symlink: it skips a linked file and does not
+/// descend a linked directory. A single path is held to the same rule, checked
+/// on each in-repository component of `abs_path`, so a link committed to the
+/// repository or created by a checkout never publishes its target's bytes
+/// under the in-repository name.
+fn path_crosses_symlink(abs_path: &Path, relative: &Path) -> bool {
+    abs_path
+        .ancestors()
+        .take(relative.components().count())
+        .any(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
+}
+
 fn catalog_terminal_disposition(decision: &ScoutDecision) -> Option<FileDisposition> {
     match decision {
         ScoutDecision::HardSkip { reason } => Some(FileDisposition::HardSkip { reason: *reason }),
@@ -332,6 +346,7 @@ where
     if crate::discovery::path_is_hard_scope_excluded(relative)
         || shared.is_source_excluded(relative)
         || shared.read().is_path_gitignored(relative_path)
+        || path_crosses_symlink(abs_path, relative)
     {
         if observed_at.project_generation != expected_gen {
             return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
@@ -844,6 +859,67 @@ mod tests {
             "a removal rides the accumulator, not the candidate pipeline \
              (dark bridging: no removal payload exists yet)"
         );
+    }
+
+    /// The cold walk never follows a symlink, so the single-path lane shared by
+    /// the watcher, freshen-on-read and the embed facade must not either. A link
+    /// that arrives through a checkout would otherwise publish its target's bytes
+    /// under the in-repo name.
+    #[test]
+    fn single_path_admission_does_not_follow_symlinks() {
+        let root = tempfile::TempDir::new().expect("root");
+        let outside = tempfile::TempDir::new().expect("outside");
+        std::fs::write(
+            outside.path().join("secret.txt"),
+            "placeholder-fixture-value\n",
+        )
+        .expect("outside file");
+        std::fs::create_dir_all(root.path().join("docs")).expect("docs");
+        std::fs::write(root.path().join("lib.rs"), "pub fn first() {}\n").expect("seed");
+        let shared = LiveIndex::load(root.path()).expect("cold load");
+
+        #[cfg(unix)]
+        let links = (
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.txt"),
+                root.path().join("docs/setup.txt"),
+            ),
+            std::os::unix::fs::symlink(outside.path(), root.path().join("linked")),
+        );
+        #[cfg(windows)]
+        let links = (
+            std::os::windows::fs::symlink_file(
+                outside.path().join("secret.txt"),
+                root.path().join("docs/setup.txt"),
+            ),
+            std::os::windows::fs::symlink_dir(outside.path(), root.path().join("linked")),
+        );
+        let mut exercised = Vec::new();
+        match links.0 {
+            Ok(()) => exercised.push("docs/setup.txt"),
+            Err(error) => eprintln!("cannot create a file symlink here ({error}); skipped"),
+        }
+        match links.1 {
+            Ok(()) => exercised.push("linked/secret.txt"),
+            Err(error) => eprintln!("cannot create a directory symlink here ({error}); skipped"),
+        }
+
+        for relative in exercised {
+            let outcome = admit_and_index_single_path(
+                relative,
+                &root.path().join(relative),
+                &shared,
+                shared.current_project_generation(),
+            );
+            assert!(
+                matches!(outcome, ReindexOutcome::Skipped),
+                "{relative} must be skipped like the cold walk skips it, got {outcome:?}"
+            );
+            assert!(
+                shared.read().get_file(relative).is_none(),
+                "{relative} was published through a symlink"
+            );
+        }
     }
 
     #[test]

@@ -64,13 +64,14 @@ pub fn resolve_generation_bytes<'a>(
 /// `workspace_root`, admitted by the same policy and classification as every
 /// other content read.
 ///
-/// Confinement is lexical and refuses BEFORE any read: an absolute path, a
-/// drive or root prefix, or any `..` component is an escape however it is
-/// spelled, and the refusal never carries the escaped content.
-// ponytail: lexical confinement only — a symlink beneath the root that points
-// outside it is governed by the crate's existing never-follow walk policy, not
-// re-checked here; canonicalize-and-compare is the upgrade path if that policy
-// ever changes.
+/// Confinement refuses BEFORE any read. Lexically, an absolute path, a drive or
+/// root prefix, or any `..` component is an escape however it is spelled. On
+/// disk, [`crate::protocol::edit::refuse_path_alias`] refuses a symlink that
+/// resolves outside the root and any spelling whose resolved name differs.
+/// The refusal never carries the escaped content.
+// ponytail: resolve-then-read, not open-by-handle — a link swapped in between
+// the check and the read is a TOCTOU window; the upgrade path is opening the
+// file once and checking the handle's final path.
 pub fn observe_disk_beneath(
     live: &LiveIndex,
     workspace_root: &Path,
@@ -89,8 +90,8 @@ pub fn observe_disk_beneath(
              observation is confined beneath it]"
         ));
     }
-    // `refuse_by_policy` inside the gate matches the caller's spelling only; an
-    // alias of a credential file is refused on the path the filesystem resolves.
+    // `refuse_by_policy` inside the gate matches the caller's spelling only and
+    // stays syscall-free; the spelling is judged on the resolved path here.
     crate::protocol::edit::refuse_path_alias(workspace_root, relative_path)?;
     let full_path = workspace_root.join(candidate);
     admit_disk_read(live, relative_path, &full_path)
@@ -125,6 +126,9 @@ pub(crate) fn admit_worktree_text(
     if !full_path.is_file() {
         return Ok(None);
     }
+    // `is_file` follows links, so a tracked symlink to a file outside the work
+    // tree reaches here; the resolved spelling decides before the read.
+    crate::protocol::edit::refuse_path_alias(workdir, relative_path)?;
     // The gate owns the read: it classifies the exact buffer it just read and
     // returns it only on a permit, so no lane can classify one set of bytes and
     // then render another.
