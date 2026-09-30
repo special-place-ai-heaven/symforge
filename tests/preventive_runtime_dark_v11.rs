@@ -1046,10 +1046,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // (credential aliases name their path rule; the re-read uses its resolver)
 // and the snapshot verify (edit-tool refusals keep its withheld notice last):
 // no new file, no edge into src/index_lifecycle.
+// Refreshed for the session-reuse change (same-root rebind skip, first-build
+// snapshot, idle project grace): daemon.rs and protocol/mod.rs only, no new
+// file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d1d6c3f11bb075b85cb08c0649d848306e3f5d75734bff8ffbec43f29023de27",
+    "17352ebc298494cde315c9a7228c0bdb7d69890557463ed6769729f46ec47a1a",
     199,
-    10_101_187,
+    10_123_811,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

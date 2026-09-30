@@ -1914,17 +1914,41 @@ impl SymForgeServer {
             return;
         };
 
-        tracing::info!(
-            root = %resolved.display(),
-            "binding workspace from MCP client roots (no env/CWD root at startup)"
-        );
+        let _ = self.bind_declared_client_root(resolved).await;
+    }
+
+    /// Bind this connection to `resolved`, the workspace its client's roots
+    /// named, through [`Self::index_folder`]. Returns the `index_folder`
+    /// outcome, or `None` when nothing needed to change: a daemon session
+    /// already bound to that root keeps its index, because re-indexing it would
+    /// rebuild and re-snapshot the project its session open just loaded.
+    pub(crate) async fn bind_declared_client_root(&self, resolved: PathBuf) -> Option<String> {
+        // Record the declared root first so health can flag a serving-root
+        // mismatch even if the bind itself fails.
+        *self.caller_declared_root.write() = Some(resolved.clone());
+        if let Some(daemon_lock) = self.daemon_client.as_ref() {
+            let active = daemon_lock.read().await.active_project_id();
+            if crate::daemon::project_key(&resolved) == active {
+                tracing::info!(
+                    root = %resolved.display(),
+                    "client roots name the root this session is already bound to; skipped the rebind"
+                );
+                return None;
+            }
+            tracing::info!(
+                root = %resolved.display(),
+                "client roots name a different root than this session's; retargeting"
+            );
+        } else {
+            tracing::info!(
+                root = %resolved.display(),
+                "binding workspace from MCP client roots (no env/CWD root at startup)"
+            );
+        }
 
         // Drive the existing index path. `index_folder` handles both the local
         // in-process reload (this server) and, in a daemon-proxy server, the
         // proxied session rebind — so no new index plumbing is introduced.
-        // Record the declared root first so health can flag a serving-root
-        // mismatch even if the bind itself fails.
-        *self.caller_declared_root.write() = Some(resolved.clone());
         let input = crate::protocol::tools::IndexFolderInput {
             path: resolved.display().to_string(),
             idempotency_key: None,
@@ -1935,6 +1959,7 @@ impl SymForgeServer {
             .index_folder(rmcp::handler::server::wrapper::Parameters(input))
             .await;
         tracing::info!(outcome = %result, "workspace bind from client roots complete");
+        Some(result)
     }
 
     /// Legacy-renderer dispatcher used by tests and the constrained A-019 relay.
