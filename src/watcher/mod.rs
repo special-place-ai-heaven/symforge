@@ -4143,7 +4143,7 @@ mod tests {
         let published = shared.published_generation();
         assert_eq!(
             published.live.indexed_root.as_deref(),
-            Some(project_b.path())
+            Some(crate::live_index::store::normalize_root(project_b.path()).as_path())
         );
         assert!(
             !matches!(

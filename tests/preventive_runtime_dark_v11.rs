@@ -1025,10 +1025,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // sidecar/port_file.rs), which adds no edge into src/index_lifecycle either.
 // Refreshed for the discovery-only reload hold (a `__test-internals` hook in
 // live_index/store.rs), likewise no edge into index_lifecycle.
+// Refreshed 2026-09-30 for the windows-native fix: sidecar descriptors
+// normalize their root through the existing live_index normalize_root, plus
+// test-body edits; no new edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "32ce0b8e2ff76d9a4c4ae847ba46e5f43e12d7e73bbd3a6bcf989d7a196259cb",
+    "e71a86a40e5b6ed3f9e6292bcb5d3d0690ce3300670823344f002c261f07328d",
     199,
-    9_844_037,
+    9_846_865,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

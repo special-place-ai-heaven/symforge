@@ -16775,9 +16775,17 @@ mod tests {
             .await
             .expect("private-pinned call must carry project evidence");
         assert_eq!(private_home_evidence.project_id, opened.project_id);
+        let root_a_canonical = project_a
+            .path()
+            .canonicalize()
+            .expect("canonical project A root");
+        let root_a_receipt = dunce::simplified(&root_a_canonical)
+            .display()
+            .to_string()
+            .replace('\\', "/");
         assert_eq!(
             private_home_evidence.canonical_root.as_deref(),
-            Some(root_a_norm.as_str()),
+            Some(root_a_receipt.as_str()),
             "the private route pin must override mutable daemon ACTIVE"
         );
 

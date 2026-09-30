@@ -2921,7 +2921,12 @@ mod tests {
     fn intent_journal_durability_probe_failure_gates_apply_after_ledger_probe() {
         let fixture = CrashFixture::new("journal-probe-failure");
         let coordinator = KnowledgeCurationCoordinator::default();
-        let curation_dir = fixture.dir.path().join(".symforge/curation");
+        // Built from the canonical root: the curation dir does not exist yet,
+        // so `fail_probe_for_tests` cannot canonicalize it, and an 8.3 short
+        // TEMP spelling would never equal the path the apply probes.
+        let curation_dir = dunce::canonicalize(fixture.dir.path())
+            .expect("canonical root")
+            .join(".symforge/curation");
         coordinator.fail_probe_for_tests(&curation_dir);
 
         let output = fixture.execute(&coordinator);
