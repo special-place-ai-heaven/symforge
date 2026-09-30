@@ -35308,8 +35308,12 @@ mod tests {
     /// chain. Same class of defect as the `is_error_output` duplication.
     #[test]
     fn oracle_d5_validate_file_syntax_refusal_is_not_reported_as_a_success() {
-        let refusal =
-            crate::protocol::format::content_withheld_by_admission("config/settings.toml");
+        let refusal = crate::protocol::format::content_withheld_by_admission(
+            "config/settings.toml",
+            &["secret.context-assignment"],
+            1,
+            &[3],
+        );
         assert_eq!(
             super::classify_compact_tool_output("validate_file_syntax", &refusal),
             OutcomeClass::InvalidRequest,
@@ -35327,8 +35331,12 @@ mod tests {
     /// the phrase mid-text is a successful read, not a refusal.
     #[test]
     fn oracle_d6_d7_withheld_refusal_is_classified_only_when_anchored() {
-        let refusal =
-            crate::protocol::format::content_withheld_by_admission("config/settings.toml");
+        let refusal = crate::protocol::format::content_withheld_by_admission(
+            "config/settings.toml",
+            &["secret.context-assignment"],
+            1,
+            &[3],
+        );
         assert_eq!(
             super::classify_compact_tool_output("get_file_content", &refusal),
             OutcomeClass::InvalidRequest,
@@ -36123,8 +36131,174 @@ mod tests {
         let path_refusal = crate::protocol::read_gate::admit_disk_read(&live, ".env", &path_rule)
             .expect_err("a path-rule exclusion must stay refused");
         assert!(
-            path_refusal.contains("reindex the repository"),
-            "E2 a path-rule exclusion must keep its recovery advice; got: {path_refusal}"
+            path_refusal.contains("path.environment-credentials")
+                && !path_refusal.contains("could not inspect"),
+            "E2 a path-rule exclusion must name its rule, not the unscanned wording; got: {path_refusal}"
+        );
+    }
+
+    /// A probe repository holding one content finding at line 2 of
+    /// `src/probe.rs` and the same bytes in a credential-path `.env`, plus a
+    /// ready index rooted there.
+    fn admission_probe_repo() -> (TempDir, LiveIndex) {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        let body = [
+            "fn a() {}\nlet ",
+            &kw_key(),
+            " = \"",
+            &oracle_opaque(),
+            "\";\n",
+        ]
+        .concat();
+        fs::write(repo.path().join("src/probe.rs"), &body).expect("write probe");
+        fs::write(repo.path().join(".env"), &body).expect("write dotenv");
+        let mut live = make_live_index_ready(vec![]);
+        live.indexed_root = Some(repo.path().to_path_buf());
+        (repo, live)
+    }
+
+    fn assert_names_rule_and_line_without_bypass(refusal: &str) {
+        assert!(refusal.starts_with(WITHHELD_REFUSAL_PREFIX));
+        for needle in ["secret.context-assignment", "matched 1 time at line 2"] {
+            assert!(
+                refusal.contains(needle),
+                "refusal must contain {needle:?}; shape: {}",
+                refusal_shape(refusal)
+            );
+        }
+        assert!(
+            !refusal.contains(&oracle_opaque()),
+            "the refusal must never echo the matched value"
+        );
+        assert!(
+            !refusal.contains("admission-allow") && !refusal.contains("reindex"),
+            "the refusal offers no self-service remedy; shape: {}",
+            refusal_shape(refusal)
+        );
+    }
+
+    /// Owner ruling 2026-09-29, decision 1. A content refusal names the rule,
+    /// the count and the line — never the value, and no self-service bypass. A
+    /// path refusal names its path rule.
+    #[test]
+    fn withheld_refusal_names_the_rule_and_the_lines() {
+        let (repo, live) = admission_probe_repo();
+        let refusal = crate::protocol::read_gate::admit_disk_read(
+            &live,
+            "src/probe.rs",
+            &repo.path().join("src/probe.rs"),
+        )
+        .expect_err("a content finding must be refused");
+        assert_names_rule_and_line_without_bypass(&refusal);
+
+        let path_refusal =
+            crate::protocol::read_gate::admit_disk_read(&live, ".env", &repo.path().join(".env"))
+                .expect_err("a credential path must be refused");
+        assert!(
+            path_refusal.starts_with(WITHHELD_REFUSAL_PREFIX)
+                && path_refusal.contains("path.environment-credentials"),
+            "path refusal must name its rule; shape: {}",
+            refusal_shape(&path_refusal)
+        );
+    }
+
+    /// A RECORDED demotion carries no lines — the snapshot schema is unchanged —
+    /// so the gate recomputes them from its own read at refusal time. When the
+    /// file has moved on to a different verdict, the refusal still stands and
+    /// names the recorded rule, without lines from other content.
+    #[test]
+    fn recorded_demotion_refusal_recomputes_lines_through_the_gate() {
+        let (repo, mut live) = admission_probe_repo();
+        let recorded = |rule: &str| crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: "src/probe.rs".to_string(),
+                normalized_utf8: Some("src/probe.rs".to_string()),
+            },
+            size: 40,
+            language: Some(LanguageId::Rust),
+            classification: crate::domain::FileClassification::for_code_path("src/probe.rs"),
+            disposition: crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::SensitiveContent {
+                    rule_ids: vec![rule.to_string()],
+                    finding_count: 1,
+                },
+            },
+            content_hash: None,
+        };
+        live.manifest_entries = vec![recorded("secret.context-assignment")];
+        let refusal = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
+            .expect("a recorded demotion must refuse");
+        assert_names_rule_and_line_without_bypass(&refusal);
+
+        live.manifest_entries = vec![recorded("secret.uri-credentials")];
+        let moved = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
+            .expect("a recorded demotion refuses whatever the file now holds");
+        assert!(
+            moved.contains("secret.uri-credentials") && !moved.contains(" at line"),
+            "lines from a different verdict must not be paired with the record; shape: {}",
+            refusal_shape(&moved)
+        );
+        drop(repo);
+    }
+
+    /// Owner ruling 2026-09-29, decision 4. An edit aimed at a withheld file
+    /// gets the withheld refusal, not "File not found" — the file exists, and
+    /// the refusal is what tells the caller why it cannot be edited here.
+    #[tokio::test]
+    async fn edit_tools_refuse_withheld_files_instead_of_reporting_them_missing() {
+        let mut live = make_live_index_ready(vec![]);
+        live.manifest_entries = vec![crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: "src/config.rs".to_string(),
+                normalized_utf8: Some("src/config.rs".to_string()),
+            },
+            size: 40,
+            language: Some(LanguageId::Rust),
+            classification: crate::domain::FileClassification::for_code_path("src/config.rs"),
+            disposition: crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::SensitiveContent {
+                    rule_ids: vec!["secret.context-assignment".to_string()],
+                    finding_count: 2,
+                },
+            },
+            content_hash: None,
+        }];
+        let server = make_server_with_root(live, None);
+        let edit = |path: &str| crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
+            path: path.to_string(),
+            name: "target".to_string(),
+            kind: None,
+            symbol_line: None,
+            new_body: "fn target() {}".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            if_match: None,
+            working_directory: None,
+        };
+        for path in ["src/config.rs", ".env"] {
+            let out = server.replace_symbol_body(Parameters(edit(path))).await;
+            assert!(
+                out.starts_with(WITHHELD_REFUSAL_PREFIX),
+                "{path}: edit must refuse as withheld; shape: {}",
+                refusal_shape(&out)
+            );
+        }
+        let out = server
+            .replace_symbol_body(Parameters(edit("src/config.rs")))
+            .await;
+        assert!(
+            out.contains("secret.context-assignment matched 2 times"),
+            "content refusal names the rule and count: {out}"
+        );
+        let missing = server
+            .replace_symbol_body(Parameters(edit("src/absent.rs")))
+            .await;
+        assert!(
+            missing.starts_with("File not found:"),
+            "a genuinely absent file keeps the not-found answer; shape: {}",
+            refusal_shape(&missing)
         );
     }
 
@@ -36277,7 +36451,10 @@ mod tests {
                 crate::knowledge::SecretScan::Sensitive {
                     rule_ids,
                     finding_count,
-                } => findings.push(format!("{relative} [{finding_count}] {rule_ids:?}")),
+                    lines,
+                } => findings.push(format!(
+                    "{relative} [{finding_count}] {rule_ids:?} lines {lines:?}"
+                )),
                 crate::knowledge::SecretScan::Indeterminate { reason } => {
                     findings.push(format!("{relative} [indeterminate {reason:?}]"));
                 }

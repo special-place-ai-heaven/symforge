@@ -87,6 +87,11 @@ pub enum SecretScan {
     Sensitive {
         rule_ids: Vec<&'static str>,
         finding_count: u32,
+        /// 1-based line of each finding's capture, ascending, deduplicated.
+        /// Lines, never bytes: enough to locate a false positive, nothing of
+        /// the value. Rendered by the read gate at refusal time and never
+        /// persisted, so the snapshot schema does not change.
+        lines: Vec<u32>,
     },
     Indeterminate {
         reason: DetectorFailure,
@@ -785,8 +790,8 @@ fn expression_carries_quoted_payload(
 }
 
 /// Scan stable admitted bytes under the deterministic, compile-once v1 policy.
-/// The result retains only safe rule IDs and a count; matched bytes and ranges
-/// never escape this function.
+/// The result retains only safe rule IDs, a count, and the 1-based line of each
+/// finding; matched bytes and byte ranges never escape this function.
 pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
     if exceeds_scan_limit(bytes.len()) {
         return SecretScan::Indeterminate {
@@ -800,6 +805,7 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
 
     let mut rule_ids = Vec::new();
     let mut finding_count = 0_u32;
+    let mut lines = Vec::new();
     for rule in rules {
         if !rule
             .keywords
@@ -849,15 +855,26 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
             if !rule_ids.contains(&rule.id) {
                 rule_ids.push(rule.id);
             }
+            // ponytail: one newline count per finding; findings are few, and a
+            // running cursor is the upgrade if a file ever carries thousands.
+            let line = bytes[..secret.start()]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                .saturating_add(1);
+            lines.push(u32::try_from(line).unwrap_or(u32::MAX));
         }
     }
 
     if finding_count == 0 {
         SecretScan::Clean
     } else {
+        lines.sort_unstable();
+        lines.dedup();
         SecretScan::Sensitive {
             rule_ids,
             finding_count,
+            lines,
         }
     }
 }
@@ -998,6 +1015,7 @@ where
         SecretScan::Sensitive {
             rule_ids,
             finding_count,
+            ..
         } => StableContentAdmission::MetadataOnly(
             crate::domain::MetadataOnlyReason::SensitiveContent {
                 rule_ids: rule_ids.into_iter().map(ToOwned::to_owned).collect(),
@@ -1040,6 +1058,7 @@ fn guard_visible_fields(fields: &[&str]) -> Result<(), GuardFailure> {
             SecretScan::Sensitive {
                 rule_ids: field_rule_ids,
                 finding_count: field_count,
+                ..
             } => {
                 finding_count = finding_count.saturating_add(field_count);
                 for rule_id in field_rule_ids {
@@ -2162,7 +2181,13 @@ mod tests {
         let mut failures = Vec::new();
         for (id, path, body, rule) in rows {
             match scan_secret_bytes(path, body.as_bytes()) {
-                SecretScan::Sensitive { rule_ids, .. } if rule_ids.contains(&rule) => {}
+                SecretScan::Sensitive {
+                    rule_ids, lines, ..
+                } if rule_ids.contains(&rule) => {
+                    if lines.is_empty() {
+                        failures.push(format!("{id}: caught but no finding line recorded"));
+                    }
+                }
                 other => failures.push(format!(
                     "{id}: expected {rule}, got {:?}",
                     scan_kind(&other)
@@ -2180,6 +2205,17 @@ mod tests {
             SecretScan::Sensitive { rule_ids, .. } => format!("Sensitive{rule_ids:?}"),
             SecretScan::Indeterminate { reason } => format!("Indeterminate({reason:?})"),
         }
+    }
+
+    #[test]
+    fn findings_carry_one_based_lines() {
+        let body = ["fn a() {}\nlet ", &mx_token(), " = \"", &mx_real(), "\";\n"].concat();
+        let SecretScan::Sensitive { lines, .. } =
+            scan_secret_bytes("src/probe.rs", body.as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        assert_eq!(lines, vec![2]);
     }
 
     #[test]

@@ -196,8 +196,11 @@ pub(crate) fn disk_read_would_refuse(
 /// same policy, and so the disk lane can still refuse WITHOUT reading the file.
 pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
     // Current path rule — no read needed.
-    if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
-        return Some(format::content_withheld_by_admission(relative_path));
+    if let Some(rule_id) = crate::knowledge::sensitive_path_rule(relative_path) {
+        return Some(format::content_withheld_by_path_rule(
+            relative_path,
+            rule_id,
+        ));
     }
 
     // Recorded disposition on the publication that produced the miss — no read
@@ -216,9 +219,22 @@ pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<
             {
                 return Some(format::content_withheld_unscanned(relative_path));
             }
-            MetadataOnlyReason::SensitivePath { .. }
-            | MetadataOnlyReason::SensitiveContent { .. } => {
-                return Some(format::content_withheld_by_admission(relative_path));
+            MetadataOnlyReason::SensitivePath { rule_id } => {
+                return Some(format::content_withheld_by_path_rule(
+                    relative_path,
+                    rule_id,
+                ));
+            }
+            MetadataOnlyReason::SensitiveContent {
+                rule_ids,
+                finding_count,
+            } => {
+                return Some(format::content_withheld_by_admission(
+                    relative_path,
+                    rule_ids,
+                    *finding_count,
+                    &recorded_finding_lines(live, relative_path, rule_ids),
+                ));
             }
             _ => {}
         }
@@ -249,6 +265,59 @@ pub(crate) fn unverified_notice(live: &LiveIndex, requested: &str) -> Option<Str
     }
     live.unverified_since_restore(&path)
         .map(|reason| format::unverified_since_restore(&path, reason))
+}
+
+/// Finding lines for a RECORDED content demotion, computed at refusal time.
+///
+/// The manifest records the verdict (rule ids, count) but not where the
+/// findings sit — persisting lines would change the snapshot schema. So the
+/// gate re-reads the file ITSELF, scans it, and keeps only the line numbers;
+/// the bytes are dropped here and never reach a caller. Lines are returned only
+/// when the fresh scan names exactly the recorded rules; if the file moved on,
+/// the refusal names the recorded verdict without lines rather than pairing it
+/// with positions from different content.
+///
+/// The read is bounded like every other gate read: a lexically confined
+/// relative path beneath the indexed root, a regular file (a symlink is not
+/// followed), and no more than the scan budget. Any doubt yields no lines, and
+/// the refusal itself never depends on this read.
+fn recorded_finding_lines(live: &LiveIndex, relative_path: &str, recorded: &[String]) -> Vec<u32> {
+    let Some(root) = live.indexed_root.as_deref() else {
+        return Vec::new();
+    };
+    let candidate = Path::new(relative_path);
+    if candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Vec::new();
+    }
+    let full_path = root.join(candidate);
+    let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
+        return Vec::new();
+    };
+    if !metadata.is_file() || crate::knowledge::exceeds_scan_limit(metadata.len() as usize) {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(&full_path) else {
+        return Vec::new();
+    };
+    match crate::knowledge::scan_secret_bytes(relative_path, &bytes) {
+        crate::knowledge::SecretScan::Sensitive {
+            rule_ids, lines, ..
+        } if rule_ids.len() == recorded.len()
+            && rule_ids
+                .iter()
+                .all(|rule| recorded.iter().any(|seen| seen == rule)) =>
+        {
+            lines
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Admit bytes the caller ALREADY HOLDS — a git blob, not a disk read.
@@ -320,7 +389,8 @@ pub(crate) fn admit_disk_read(
     canon_path: &Path,
 ) -> Result<Vec<u8>, String> {
     // Policy refusals need no bytes, so they run BEFORE the read: a demoted
-    // file is never opened.
+    // file is never opened for disclosure (a recorded content demotion is
+    // re-scanned inside the gate only to name its finding lines).
     if let Some(refusal) = refuse_by_policy(live, relative_path) {
         return Err(refusal);
     }
@@ -345,7 +415,7 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
     // populations correctly on its own — it collapses the scan-budget refusal
     // into `SensitiveContent`, and since Ruling 4 it encoding-validates the whole
     // buffer on every path — but neither cause is legible in that verdict, so its
-    // refusal would advise a reindex that cannot help. Placed before
+    // refusal would name a detector match that never happened. Placed before
     // `classify_stable_content` so a binary buffer is not pointlessly scanned;
     // `detect_lfs_pointer` requires valid UTF-8 under 1 KiB, so no pointer is
     // swallowed here.
@@ -366,11 +436,27 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
     // failures here are the global ones (policy compilation, internal), which
     // `classify_stable_content` maps to `SensitiveContent` carrying the reserved
     // indeterminate id — a detector failure, so the honest message, not the one
-    // advising a reindex.
+    // naming a match.
+    // The scan's finding lines are kept beside the verdict for the refusal
+    // text; they are never part of the recorded disposition.
+    let mut finding_lines = Vec::new();
     if let crate::knowledge::StableContentAdmission::MetadataOnly(
-        MetadataOnlyReason::SensitiveContent { rule_ids, .. },
-    ) = crate::knowledge::classify_stable_content(relative_path, targets, bytes)
-    {
+        MetadataOnlyReason::SensitiveContent {
+            rule_ids,
+            finding_count,
+        },
+    ) = crate::knowledge::classify_stable_content_with(
+        relative_path,
+        targets,
+        bytes,
+        |path, bytes| {
+            let scan = crate::knowledge::scan_secret_bytes(path, bytes);
+            if let crate::knowledge::SecretScan::Sensitive { lines, .. } = &scan {
+                finding_lines.clone_from(lines);
+            }
+            scan
+        },
+    ) {
         return Some(
             if rule_ids
                 .iter()
@@ -378,7 +464,12 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
             {
                 format::content_withheld_unscanned(relative_path)
             } else {
-                format::content_withheld_by_admission(relative_path)
+                format::content_withheld_by_admission(
+                    relative_path,
+                    &rule_ids,
+                    finding_count,
+                    &finding_lines,
+                )
             },
         );
     }

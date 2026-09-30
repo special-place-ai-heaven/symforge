@@ -3844,20 +3844,80 @@ pub fn path_outside_repo(path: &str) -> String {
     )
 }
 
-/// Refusal for a file the admission pipeline excluded from content disclosure.
+/// Refusal for a file a secret-detector CONTENT rule excluded from disclosure.
 ///
-/// Deliberately UNIFORM across every security exclusion: it names no rule id, no
-/// rule class, no finding count, no size, and no byte of the file. Whether the
-/// exclusion came from the path rule or from a content detector is the one
-/// content-derived bit a refusal could still leak, and the recovery action is
-/// identical either way, so the message does not distinguish them.
-pub fn content_withheld_by_admission(path: &str) -> String {
+/// Names the rule ids, the finding count and, when the gate could compute them,
+/// the 1-based finding lines — never a byte of the file — so a false positive
+/// can be located and reported (owner ruling 2026-09-29; an earlier revision
+/// named nothing, which left every false positive undiagnosable). It offers no
+/// remedy: a reindex gives the same verdict on the same bytes, and a
+/// self-service override is deliberately not part of this surface.
+pub fn content_withheld_by_admission<S: AsRef<str>>(
+    path: &str,
+    rule_ids: &[S],
+    finding_count: u32,
+    lines: &[u32],
+) -> String {
+    let rules = rule_ids
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let at = if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " at line{} {}",
+            if lines.len() == 1 { "" } else { "s" },
+            line_ranges(lines)
+        )
+    };
     format!(
         "Content withheld by admission policy: {path}. \
-         This file is excluded from content retrieval by the repository's \
-         admission rules; SymForge will not read, parse, or search it. \
-         If the exclusion is stale, reindex the repository (index_folder) and retry."
+         Secret detector rule{} {rules} matched {finding_count} time{}{at}; \
+         SymForge will not read, parse, or search this file.",
+        if rule_ids.len() == 1 { "" } else { "s" },
+        if finding_count == 1 { "" } else { "s" },
     )
+}
+
+/// Refusal for a file a PATH rule excluded: a credential container by name
+/// (`.env`, private keys, cloud credential stores). Names the rule.
+pub fn content_withheld_by_path_rule(path: &str, rule_id: &str) -> String {
+    format!(
+        "Content withheld by admission policy: {path}. \
+         Path rule {rule_id} excludes this file by name as a credential file; \
+         SymForge will not read, parse, or search it."
+    )
+}
+
+/// `1, 3-5, 9`: ascending 1-based lines collapsed into ranges, the first ten
+/// ranges shown.
+fn line_ranges(lines: &[u32]) -> String {
+    const SHOWN: usize = 10;
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for &line in lines {
+        match ranges.last_mut() {
+            Some((_, end)) if end.checked_add(1) == Some(line) => *end = line,
+            _ => ranges.push((line, line)),
+        }
+    }
+    let mut rendered = ranges
+        .iter()
+        .take(SHOWN)
+        .map(|&(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ranges.len() > SHOWN {
+        rendered.push_str(&format!(" (+{} more)", ranges.len() - SHOWN));
+    }
+    rendered
 }
 
 /// Refusal for a file the admission pipeline could not INSPECT at all — over the
@@ -3865,9 +3925,9 @@ pub fn content_withheld_by_admission(path: &str) -> String {
 ///
 /// Shares [`content_withheld_by_admission`]'s opening clause, so one anchored
 /// predicate classifies both and every contract keyed on that prefix keeps
-/// holding. Differs only in the recovery sentence: "reindex and retry" is not
-/// merely untrue for these files, it is unactionable — they refuse the same way
-/// on every read. Names no size, no threshold, no encoding, no rule id, no
+/// holding. Differs in what follows: these files were never inspected, so
+/// there is no rule to name, and they refuse the same way on every read —
+/// reindexing will not change them. Names no size, no threshold, no encoding, no rule id, no
 /// finding count, and no byte; the wording is identical for both causes, so it
 /// does not even distinguish which one applied.
 pub fn content_withheld_unscanned(path: &str) -> String {
@@ -6806,12 +6866,12 @@ pub fn diff_symbols_result_view(
         let base_content =
             match crate::protocol::read_gate::admit_git_text(live, repo, base, file_path) {
                 Ok(text) => text.unwrap_or_default(),
-                Err(_) => {
+                Err(refusal) => {
                     // Withheld. Say so and move on: falling through with empty
                     // content would render every symbol in the file as REMOVED,
                     // which is a false claim about the file rather than a
                     // refusal to describe it.
-                    lines.push(content_withheld_by_admission(file_path));
+                    lines.push(refusal);
                     lines.push(String::new());
                     continue;
                 }
@@ -6823,8 +6883,8 @@ pub fn diff_symbols_result_view(
         let target_content = if target.is_empty() {
             match crate::protocol::read_gate::admit_worktree_text(live, repo, file_path) {
                 Ok(text) => text.unwrap_or_default(),
-                Err(_) => {
-                    lines.push(content_withheld_by_admission(file_path));
+                Err(refusal) => {
+                    lines.push(refusal);
                     lines.push(String::new());
                     continue;
                 }
@@ -6832,8 +6892,8 @@ pub fn diff_symbols_result_view(
         } else {
             match crate::protocol::read_gate::admit_git_text(live, repo, target, file_path) {
                 Ok(text) => text.unwrap_or_default(),
-                Err(_) => {
-                    lines.push(content_withheld_by_admission(file_path));
+                Err(refusal) => {
+                    lines.push(refusal);
                     lines.push(String::new());
                     continue;
                 }
