@@ -32,6 +32,18 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.8](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.7...v11.3.8) (2026-09-30)
+
+
+### Bug Fixes
+
+* **update:** install into the running copy's prefix and stop the launcher flagging itself ([#735](https://github.com/special-place-ai-heaven/symforge/issues/735)) ([9adf0ac](https://github.com/special-place-ai-heaven/symforge/commit/9adf0ac75e2396bfb838098ea7ada9ada760c5ac))
+
+
+### Performance Improvements
+
+* **index:** update trigrams by diff and settle the snapshot-verify review nits ([#733](https://github.com/special-place-ai-heaven/symforge/issues/733)) ([e407925](https://github.com/special-place-ai-heaven/symforge/commit/e40792502c07ab3d2f8ba2404059bb0b981cdefd))
+
 ## [11.3.7](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.6...v11.3.7) (2026-09-30)
 
 
