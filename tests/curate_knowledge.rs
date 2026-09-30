@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use symforge::domain::{ProjectId, ProjectStateDir, StatePlacement, UserLocalPlacementReason};
 use symforge::live_index::{LiveIndex, SharedIndex};
 use symforge::protocol::SymForgeServer;
-use symforge::watcher::{WatcherInfo, WatcherState, run_watcher_with_stop};
+use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
 
 struct CurationFixture {
     dir: tempfile::TempDir,
@@ -433,30 +433,12 @@ async fn implicit_worktree_without_project_selector_is_rejected_before_probe_io(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successful_apply_publishes_policy_and_voice_through_the_ordinary_watcher() {
     let fixture = CurationFixture::new();
-    let stop_token = Arc::new(AtomicBool::new(false));
-    let watcher_task = tokio::spawn(run_watcher_with_stop(
-        fixture.dir.path().to_path_buf(),
-        Arc::clone(&fixture.index),
-        Arc::clone(&fixture.watcher_info),
-        Arc::clone(&stop_token),
-    ));
-    // The guard is intentionally held across the await: it throttles the
-    // background watcher during registration so it does not republish (and
-    // stale the captured review hash) before the apply below. This is a bounded
-    // test wait loop, not production async, so await-holding-lock is benign.
-    #[allow(clippy::await_holding_lock)]
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let watcher = fixture.watcher_info.lock();
-            if watcher.last_reconcile_at.is_some() && watcher.state == WatcherState::Active {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("watcher must complete its registration reconcile");
-
+    // The review hash binds the exact publication it was captured from, so any
+    // republish between review and apply stales it. A running watcher
+    // republishes on its own schedule (its registration reconcile hands off to
+    // an async git-temporal job that publishes twice), so review+apply raced
+    // it. Review and apply against a quiescent index, then start the watcher:
+    // it is still the only thing that can publish the committed policy.
     let (_review_hash, mut apply) = fixture.review_and_action().await;
     let target_path = apply["actions"][0]["mutation"]["entry"]["target"]["path"]
         .as_str()
@@ -479,6 +461,19 @@ async fn successful_apply_publishes_policy_and_voice_through_the_ordinary_watche
         )),
         "{applied}"
     );
+    assert_eq!(
+        fixture.index.published_generation().publication_generation,
+        captured_before.publication_generation,
+        "curation must leave publication to the watcher"
+    );
+
+    let stop_token = Arc::new(AtomicBool::new(false));
+    let watcher_task = tokio::spawn(run_watcher_with_stop(
+        fixture.dir.path().to_path_buf(),
+        Arc::clone(&fixture.index),
+        Arc::clone(&fixture.watcher_info),
+        Arc::clone(&stop_token),
+    ));
     let expected_policy_digest = token(&applied, "post_policy_digest");
 
     let published_after = tokio::time::timeout(Duration::from_secs(5), async {
