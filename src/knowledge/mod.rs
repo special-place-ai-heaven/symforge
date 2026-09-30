@@ -182,14 +182,6 @@ fn is_placeholder(value: &[u8]) -> bool {
     let Ok(value) = std::str::from_utf8(value) else {
         return false;
     };
-    // `<<FILL_IN: ...>>`, `<your key>`, `<redacted>`: an angle-bracket opener is
-    // template syntax, not a credential byte. The capture class stops at the
-    // first space, so the closer is often outside the capture and cannot be
-    // required. Exempts the capture only; the caller still walks the rest of
-    // the right-hand side.
-    if value.starts_with('<') {
-        return true;
-    }
     let normalized = value
         .trim_matches(|character: char| {
             matches!(character, '"' | '\'' | '`' | '<' | '>' | '[' | ']')
@@ -294,17 +286,78 @@ fn right_hand_side_continuation(
     }
 }
 
-/// uri-credentials exemption: a userinfo password that documents the URI SHAPE
-/// (`scheme://user:pass@host`, `u:<redacted>@`, `u:xxxx@`) rather than carrying
-/// one. Whole-capture only, like every other placeholder test: `pass` exempts,
-/// `passw0rd1` does not.
-fn is_placeholder_userinfo(value: &[u8]) -> bool {
-    is_placeholder(value)
+/// `<<FILL_IN: model key>>`, `<your key>`: template syntax, not a credential —
+/// but only when the WHOLE value is one angle group. The value runs from the
+/// capture's `<` to the closing quote of the literal it sits in or, unquoted,
+/// to the end of the line, and after its FIRST `>` it may hold nothing but more
+/// `>`. So `<v1><credential>` and a heredoc opener (`<<-EOT`, whose body is the
+/// credential) are not placeholders, and a literal that never closes on this
+/// line is not one either.
+fn is_angle_placeholder(bytes: &[u8], start: usize) -> bool {
+    if bytes.get(start) != Some(&b'<') {
+        return false;
+    }
+    let line_end = bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |offset| start + offset);
+    let opener = start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index).copied())
+        .filter(|byte| matches!(byte, b'"' | b'\'' | b'`'));
+    let end = match opener {
+        Some(quote) => match bytes[start..line_end]
+            .iter()
+            .position(|byte| *byte == quote)
+        {
+            Some(offset) => start + offset,
+            None => return false,
+        },
+        None => line_end,
+    };
+    let value = bytes[start..end].trim_ascii_end();
+    value
+        .iter()
+        .position(|byte| *byte == b'>')
+        .is_some_and(|first_close| value[first_close..].iter().all(|byte| *byte == b'>'))
+}
+
+/// uri-credentials exemption: the URI documents a SHAPE rather than carrying a
+/// credential. BOTH halves must be placeholders: the userinfo password (`pass`,
+/// `password`, `pw`, `secret`, all `x`, or a generic placeholder), whole-capture
+/// only, AND the host (`host`, `localhost`, `example.*`, `<...>`, `${...}`). A
+/// placeholder-looking password on a real host (`admin:changeme@prod-db`) is a
+/// real, if weak, credential and stays flagged.
+fn uri_credentials_are_placeholder(
+    bytes: &[u8],
+    userinfo_start: usize,
+    userinfo_end: usize,
+) -> bool {
+    let userinfo = &bytes[userinfo_start..userinfo_end];
+    let placeholder_userinfo = is_placeholder(userinfo)
         || matches!(
-            value.to_ascii_lowercase().as_slice(),
+            userinfo.to_ascii_lowercase().as_slice(),
             b"pass" | b"password" | b"pw" | b"secret"
         )
-        || value.iter().all(|byte| byte.eq_ignore_ascii_case(&b'x'))
+        || userinfo.iter().all(|byte| byte.eq_ignore_ascii_case(&b'x'));
+    // `userinfo_end` holds the `@`; the host runs to the first delimiter.
+    let host = bytes[userinfo_end + 1..]
+        .iter()
+        .take_while(|byte| {
+            !matches!(
+                byte,
+                b'/' | b':' | b'?' | b'#' | b'"' | b'\'' | b'`' | b')' | b']' | b',' | b';'
+            ) && !byte.is_ascii_whitespace()
+        })
+        .count();
+    let host = std::str::from_utf8(&bytes[userinfo_end + 1..userinfo_end + 1 + host])
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let placeholder_host = matches!(host.as_str(), "host" | "localhost")
+        || host.starts_with("example.")
+        || (host.len() > 2 && host.starts_with('<') && host.ends_with('>'))
+        || is_placeholder_only_expression(&host);
+    placeholder_userinfo && placeholder_host
 }
 
 /// Stage 2 for [`CONTEXT_ASSIGNMENT_RULE_ID`], on CODE-language paths only.
@@ -430,9 +483,9 @@ fn match_is_inside_string_literal(bytes: &[u8], value_start: usize, rust: bool) 
 /// A doubled colon after the keyword (`CancellationToken::new`, a doc link to
 /// `CancellationToken::is_cancelled`) is a PATH separator in every code
 /// language here, never an assignment. Exempt only when the rest of the line
-/// leaves no bracket open and fences no payload, so a path CALL carrying a
-/// literal — on this line, or in an argument list that continues past it — is
-/// still judged by the ordinary steps.
+/// leaves no bracket open, fences no payload, and does not continue onto the
+/// next line, so a path CALL or constant carrying a literal — on this line or
+/// on a continuation line — is still judged by the ordinary steps.
 fn separator_is_path_not_assignment(bytes: &[u8], match_start: usize, value_start: usize) -> bool {
     let Some(separator) = bytes[match_start..value_start]
         .iter()
@@ -448,6 +501,12 @@ fn separator_is_path_not_assignment(bytes: &[u8], match_start: usize, value_star
         .iter()
         .position(|byte| *byte == b'\n')
         .map_or(bytes.len(), |offset| separator + offset);
+    // The line proves nothing when the expression continues past it
+    // (a C++ constant whose literal sits on the next line, a builder chain):
+    // fall through to the ordinary steps, whose walk follows continuations.
+    if line_end < bytes.len() && line_break_continues_expression(bytes, line_end) {
+        return false;
+    }
     let rest = &bytes[separator + 2..line_end];
     let mut depth = 0_u32;
     for byte in rest {
@@ -755,7 +814,10 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                     reason: DetectorFailure::Internal,
                 };
             };
-            if rule.placeholders_allowed && is_placeholder(secret.as_bytes()) {
+            if rule.placeholders_allowed
+                && (is_placeholder(secret.as_bytes())
+                    || is_angle_placeholder(bytes, secret.start()))
+            {
                 // The CAPTURE is a placeholder — but that exempts the capture,
                 // not the expression it sits in. A placeholder in one operand
                 // must never license a hardcoded literal in another, so the
@@ -779,7 +841,7 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                     secret.as_bytes(),
                 ))
                 || (rule.id == URI_CREDENTIALS_RULE_ID
-                    && is_placeholder_userinfo(secret.as_bytes()))
+                    && uri_credentials_are_placeholder(bytes, secret.start(), secret.end()))
             {
                 continue;
             }
@@ -1668,6 +1730,10 @@ mod tests {
     /// simply not firing.
     fn precision_rows() -> Vec<(&'static str, &'static str, String, MxVerdict)> {
         let token = mx_token();
+        let token_camel = ["To", "ken"].concat();
+        let apikey_camel = ["Api", "Key"].concat();
+        let secret_kw = ["sec", "ret"].concat();
+        let real40 = [mx_real(), mx_real()].concat();
         let password = mx_password();
         let apikey = mx_apikey();
         let v = mx_value();
@@ -1778,7 +1844,7 @@ mod tests {
             (
                 "PE1 uri pass placeholder in comment",
                 "src/probe.rs",
-                ["// userinfo in scheme://user:", "pass", "@authority/db\n"].concat(),
+                ["// userinfo in scheme://user:", "pass", "@host/db\n"].concat(),
                 MxVerdict::Clean,
             ),
             (
@@ -1791,8 +1857,13 @@ mod tests {
                 "PE3 uri password xxxx secret placeholders",
                 "notes.txt",
                 [
-                    "a://admin:", &password, "@db\nb://admin:", "xxxx", "@db\nc://admin:",
-                    "secret", "@db\n",
+                    "a://admin:",
+                    &password,
+                    "@localhost\nb://admin:",
+                    "xxxx",
+                    "@example.com\nc://admin:",
+                    "secret",
+                    "@${DB_HOST}\n",
                 ]
                 .concat(),
                 MxVerdict::Clean,
@@ -1832,6 +1903,73 @@ mod tests {
                     "let t = ", &token, "::from_secret_value(\n    \"", &real, "\",\n);\n",
                 ]
                 .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Review F1: the doubled-colon exemption must follow continuation
+            // lines.
+            (
+                "F1a cpp constant with its literal on the next line",
+                "src/probe.cpp",
+                [
+                    "const char* ",
+                    &apikey_camel,
+                    "::kDefault =\n    \"",
+                    &real40,
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F1b rust builder chain on a continuation line",
+                "src/probe.rs",
+                [
+                    "let client = ",
+                    &token_camel,
+                    "::builder()\n    .secret(\"",
+                    &real40,
+                    "\")\n    .build();\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F1c ruby constant with its literal on the next line",
+                "lib/probe.rb",
+                [&token_camel, "::DEFAULT_VALUE =\n  \"", &real40, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Review F6: only a WHOLE angle group is a placeholder.
+            (
+                "F6a angle group followed by a value",
+                "src/probe.rs",
+                [
+                    "let u = \"https://h/?",
+                    &token,
+                    "=<v1>",
+                    &real40,
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F6b heredoc opener with the value on the next line",
+                "infra/main.tf",
+                [&secret_kw, " = <<-EOT_LONGNAME\n", &real40, "\nEOT_LONGNAME\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Review F7: a placeholder password on a real host stays flagged.
+            (
+                "F7a changeme on a production host",
+                "config.yaml",
+                ["url: postgres://admin:", "changeme", "@prod-db.internal:5432/app\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F7b password on a production host",
+                "config.yaml",
+                ["broker: amqp://app:", &password, "@mq-prod\n"].concat(),
                 MxVerdict::Sensitive(1),
             ),
             // KNOWN FALSE NEGATIVE, pre-existing on v3 and unchanged here: the
