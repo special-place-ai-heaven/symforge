@@ -20,27 +20,42 @@ use crate::live_index::store::IndexedFile;
 ///
 /// NOTE: Requires the target path to exist on disk (canonicalize).
 pub(crate) fn safe_repo_path(repo_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
-    let full_path = repo_root.join(relative_path);
+    resolve_repo_path(repo_root, relative_path)?
+        .ok_or_else(|| format!("cannot resolve path '{relative_path}': not found on disk"))
+}
 
-    // Lexical containment check — catches traversals like "../secret" even when
-    // the target path doesn't exist on disk (where canonicalize would just fail).
-    let has_parent_traversal = std::path::Path::new(relative_path)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    if has_parent_traversal {
-        return Err(format!("path '{relative_path}' is outside the repository"));
-    }
+/// Leading text of the refusal for a spelling that reaches a file whose
+/// on-disk name is different. Callers match on it to surface the hint.
+pub(crate) const PATH_SPELLING_DIFFERS: &str = "path spelling differs from the on-disk name";
 
-    let canon_root = repo_root
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve repo root: {e}"))?;
-    let canon_path = full_path
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve path '{relative_path}': {e}"))?;
-    if !canon_path.starts_with(&canon_root) {
-        return Err(format!("path '{relative_path}' is outside the repository"));
-    }
-    Ok(canon_path)
+/// [`crate::discovery::resolve_repo_path`] with its refusal rendered as the
+/// caller-facing message. `Ok(None)` means nothing exists at that spelling.
+pub(crate) fn resolve_repo_path(
+    repo_root: &Path,
+    relative_path: &str,
+) -> Result<Option<PathBuf>, String> {
+    use crate::discovery::PathRefusal;
+    crate::discovery::resolve_repo_path(repo_root, relative_path).map_err(|refusal| match refusal {
+        PathRefusal::OutsideRoot => format!("path '{relative_path}' is outside the repository"),
+        PathRefusal::Unresolvable(message) => message,
+        PathRefusal::WindowsAlias => format!(
+            "path '{relative_path}' is an alias spelling on Windows (a ':' stream \
+             suffix or a trailing dot or space); use the file's own name"
+        ),
+        // The refusal the on-disk name gets from the read gate.
+        PathRefusal::CredentialAlias => {
+            crate::protocol::format::content_withheld_by_admission(relative_path)
+        }
+        PathRefusal::SpellingDiffers(None) => PATH_SPELLING_DIFFERS.to_string(),
+        PathRefusal::SpellingDiffers(Some(canonical)) => {
+            format!("{PATH_SPELLING_DIFFERS}; retry with `{canonical}`")
+        }
+    })
+}
+
+/// [`resolve_repo_path`] for lanes that only need its verdict.
+pub(crate) fn refuse_path_alias(repo_root: &Path, relative_path: &str) -> Result<(), String> {
+    resolve_repo_path(repo_root, relative_path).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

@@ -64,13 +64,14 @@ pub fn resolve_generation_bytes<'a>(
 /// `workspace_root`, admitted by the same policy and classification as every
 /// other content read.
 ///
-/// Confinement is lexical and refuses BEFORE any read: an absolute path, a
-/// drive or root prefix, or any `..` component is an escape however it is
-/// spelled, and the refusal never carries the escaped content.
-// ponytail: lexical confinement only — a symlink beneath the root that points
-// outside it is governed by the crate's existing never-follow walk policy, not
-// re-checked here; canonicalize-and-compare is the upgrade path if that policy
-// ever changes.
+/// Confinement refuses BEFORE any read. Lexically, an absolute path, a drive or
+/// root prefix, or any `..` component is an escape however it is spelled. On
+/// disk, [`crate::protocol::edit::refuse_path_alias`] refuses a symlink that
+/// resolves outside the root and any spelling whose resolved name differs.
+/// The refusal never carries the escaped content.
+// ponytail: resolve-then-read, not open-by-handle — a link swapped in between
+// the check and the read is a TOCTOU window; the upgrade path is opening the
+// file once and checking the handle's final path.
 pub fn observe_disk_beneath(
     live: &LiveIndex,
     workspace_root: &Path,
@@ -89,8 +90,36 @@ pub fn observe_disk_beneath(
              observation is confined beneath it]"
         ));
     }
+    // `refuse_by_policy` inside the gate matches the caller's spelling only and
+    // stays syscall-free; the spelling is judged on the resolved path here.
+    refuse_disk_spelling(workspace_root, relative_path)?;
     let full_path = workspace_root.join(candidate);
     admit_disk_read(live, relative_path, &full_path)
+}
+
+/// The on-disk half of the gate's confinement, shared by both disk-reading
+/// entries. It refuses any spelling the shared resolver refuses: an escape
+/// through a symlink, or another spelling of a file. It also refuses VCS and
+/// runtime-state internals (`.git`, `.symforge`), which the cold walk never
+/// reads either.
+fn refuse_disk_spelling(root: &Path, relative_path: &str) -> Result<(), String> {
+    crate::protocol::edit::refuse_path_alias(root, relative_path)?;
+    match hard_scope_refusal(relative_path) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for a path under VCS or runtime-state internals (`.git`,
+/// `.symforge`). Lexical and case-insensitive, so it needs no filesystem call
+/// and answers the same whether or not the path exists.
+pub(crate) fn hard_scope_refusal(relative_path: &str) -> Option<String> {
+    crate::discovery::path_is_hard_scope_excluded(Path::new(relative_path)).then(|| {
+        format!(
+            "{relative_path} [error: VCS and runtime-state internals are outside \
+             source scope; a disk observation never reads them]"
+        )
+    })
 }
 
 /// Working-tree text for `relative_path`, admitted by [`admit_disk_read`].
@@ -122,6 +151,9 @@ pub(crate) fn admit_worktree_text(
     if !full_path.is_file() {
         return Ok(None);
     }
+    // `is_file` follows links, so a tracked symlink to a file outside the work
+    // tree reaches here; the resolved spelling decides before the read.
+    refuse_disk_spelling(workdir, relative_path)?;
     // The gate owns the read: it classifies the exact buffer it just read and
     // returns it only on a permit, so no lane can classify one set of bytes and
     // then render another.

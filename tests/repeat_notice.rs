@@ -871,12 +871,15 @@ fn every_eligible_tool_is_byte_stable_and_notices_on_third_serve() {
 // F1 — the witness must observe the RESULT, not only the evidence. On every
 // zero-hit result `search_text` appends an "untracked file may match"
 // diagnostic computed at query time from live `git status` plus raw worktree
-// content — an input the index never publishes. An untracked `.symforge/tee/*.rs`
-// edit snapshot is exactly such a file: `.symforge/` is hard-scope-excluded from
-// the walker AND the watcher, the gitignore hygiene never creates a root
-// `.gitignore`, and the sweep classifies every untracked path as code. So the
-// body changes while the evidence compares equal — and a notice here would be
-// a false "cannot differ".
+// content — an input the index never publishes. The fixture changes only git's
+// view: a file listed in `.git/info/exclude` is skipped by the walker (which
+// honors git's exclude file, as git does) and ignored by git, so it is neither
+// indexed nor untracked. Dropping it from the exclude file edits only `.git/`,
+// which the watcher never reads, so nothing is published; yet git now lists the
+// file as untracked and the sweep reads it. So the body changes while the
+// evidence compares equal — and a notice here would be a false "cannot differ".
+// The file must stay outside `.git/` and `.symforge/`: the disk-read gate never
+// reads VCS or runtime-state internals, so a needle there is never swept.
 // ---------------------------------------------------------------------------
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -906,6 +909,18 @@ fn git_init_with_initial_commit(root: &Path) {
 #[test]
 fn untracked_file_diagnostic_never_earns_a_notice() {
     let workspace = Workspace::seed();
+    // A file the index will never admit, containing the needle: git excludes it
+    // through `.git/info/exclude`, and the walker honors that file too.
+    let exclude = workspace.root().join(".git").join("info").join("exclude");
+    run_git(workspace.root(), &["init", "-b", "main"]);
+    std::fs::write(&exclude, "notes/\n").expect("exclude the scratch dir");
+    let notes = workspace.root().join("notes");
+    std::fs::create_dir_all(&notes).expect("notes dir");
+    std::fs::write(
+        notes.join("scratch.txt"),
+        "// needle-zz lives here, outside the index\n",
+    )
+    .expect("plant excluded scratch file");
     git_init_with_initial_commit(workspace.root());
     let mut client = StdioClient::spawn(workspace.root());
     let stable = stabilize(&mut client);
@@ -924,14 +939,9 @@ fn untracked_file_diagnostic_never_earns_a_notice() {
     assert_no_notice(&serve2, "serve 2");
     assert_eq!(serve2, serve1, "serve 2 must be byte-identical to serve 1");
 
-    // An untracked file the index will never admit, containing the needle.
-    let tee = workspace.root().join(".symforge").join("tee");
-    std::fs::create_dir_all(&tee).expect("tee dir");
-    std::fs::write(
-        tee.join("snapshot.rs"),
-        "// needle-zz lives here, outside the index\n",
-    )
-    .expect("plant untracked snapshot");
+    // Make the file untracked by editing only `.git/`: nothing the watcher
+    // reads changes, so nothing is published.
+    std::fs::write(&exclude, "").expect("drop the exclusion");
 
     // Serve 3: the body DIFFERS (the diagnostic appeared) while the evidence is
     // still equal — the seam must not claim "cannot differ".

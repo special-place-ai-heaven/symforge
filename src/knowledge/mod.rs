@@ -683,7 +683,14 @@ fn is_safe_template_basename(basename: &str) -> bool {
 /// Return the fixed v1 rule ID for a definite repository credential container.
 /// Prose names containing words such as "secret" are intentionally not enough.
 pub fn sensitive_path_rule(relative_path: &str) -> Option<&'static str> {
-    let normalized = relative_path.replace('\\', "/").to_ascii_lowercase();
+    // Empty and `.` segments open the same file, so they are dropped before
+    // matching; otherwise `.aws//credentials` escapes the multi-component rules.
+    let normalized = relative_path
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_ascii_lowercase();
     let basename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
 
     if !is_safe_template_basename(basename)
@@ -1035,6 +1042,26 @@ mod tests {
         assert!(sensitive_path_rule("state/prod.tfstate").is_some());
         assert!(sensitive_path_rule(".env.example").is_none());
         assert!(sensitive_path_rule("docs/secret-design.md").is_none());
+    }
+
+    /// Repeated separators and `.` segments open the same file, so they must not
+    /// hide a multi-component credential path from the lexical rule.
+    #[test]
+    fn sensitive_path_rule_ignores_empty_and_dot_segments() {
+        for spelling in [
+            ".aws//credentials",
+            ".aws/./credentials",
+            "./.aws/credentials",
+            "infra/.kube/./config",
+            "infra\\.kube\\config",
+            ".aws/credentials/",
+        ] {
+            assert!(
+                sensitive_path_rule(spelling).is_some(),
+                "{spelling:?} must match the credential rule"
+            );
+        }
+        assert!(sensitive_path_rule("src/./lib.rs").is_none());
     }
 
     // ── D1 comma-continuation pinning matrix (spec 023 proposal v2 §6) ─────
