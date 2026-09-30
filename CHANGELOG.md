@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.9](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.8...v11.3.9) (2026-09-30)
+
+
+### Performance Improvements
+
+* **stdio:** ask for client roots as soon as the session initializes ([2a4686d](https://github.com/special-place-ai-heaven/symforge/commit/2a4686d645ccf74e2a6c94280692fc506f687b29))
+
 ## [11.3.8](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.7...v11.3.8) (2026-09-30)
 
 
