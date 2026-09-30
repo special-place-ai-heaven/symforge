@@ -43,7 +43,7 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// placeholders). A v3 manifest withholds files v4 admits, so it must be
 /// re-scouted rather than trusted.
 pub const SECRET_POLICY_VERSION: u32 = 4;
-const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
+pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
 /// cannot change — from a real content match.

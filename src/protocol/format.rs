@@ -3871,7 +3871,7 @@ pub fn content_withheld_by_admission<S: AsRef<str>>(
     format!(
         "Content withheld by admission policy: {path}. \
          Secret detector rule{} {rules} matched {finding_count} time{}{at}; \
-         SymForge will not read, parse, or search this file.",
+         SymForge will not disclose, parse, or search this file.",
         if rule_ids.len() == 1 { "" } else { "s" },
         if finding_count == 1 { "" } else { "s" },
     )
@@ -3883,7 +3883,7 @@ pub fn content_withheld_by_path_rule(path: &str, rule_id: &str) -> String {
     format!(
         "Content withheld by admission policy: {path}. \
          Path rule {rule_id} excludes this file by name as a credential file; \
-         SymForge will not read, parse, or search it."
+         SymForge will not disclose, parse, or search it."
     )
 }
 

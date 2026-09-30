@@ -2761,7 +2761,9 @@ fn admission_degradation_view_from_disk(
 /// The first refusal runs BEFORE any syscall, so the answer is a pure function
 /// of the requested path plus the manifest and is identical for a demoted file
 /// that exists and one that does not — otherwise the difference between this
-/// block and `File not found:` is a one-bit existence oracle. The second runs
+/// block and `File not found:` is a one-bit existence oracle. That is why it
+/// asks `refuse_by_policy`, which names no finding lines, and never the
+/// line-naming variant, whose bounded re-read would observe the file. The second runs
 /// on the RESOLVED path, which can differ from the requested string (absolute
 /// arguments do not normalize against a catalog key) and is the only clause
 /// that catches a content-detected demotion reached that way.
@@ -36160,7 +36162,11 @@ mod tests {
 
     fn assert_names_rule_and_line_without_bypass(refusal: &str) {
         assert!(refusal.starts_with(WITHHELD_REFUSAL_PREFIX));
-        for needle in ["secret.context-assignment", "matched 1 time at line 2"] {
+        for needle in [
+            "secret.context-assignment",
+            "matched 1 time at line 2",
+            "will not disclose",
+        ] {
             assert!(
                 refusal.contains(needle),
                 "refusal must contain {needle:?}; shape: {}",
@@ -36203,21 +36209,16 @@ mod tests {
         );
     }
 
-    /// A RECORDED demotion carries no lines — the snapshot schema is unchanged —
-    /// so the gate recomputes them from its own read at refusal time. When the
-    /// file has moved on to a different verdict, the refusal still stands and
-    /// names the recorded rule, without lines from other content.
-    #[test]
-    fn recorded_demotion_refusal_recomputes_lines_through_the_gate() {
-        let (repo, mut live) = admission_probe_repo();
-        let recorded = |rule: &str| crate::domain::CatalogEntry {
+    /// A manifest entry recording a content demotion of `path` under `rule`.
+    fn recorded_content_demotion(path: &str, rule: &str) -> crate::domain::CatalogEntry {
+        crate::domain::CatalogEntry {
             path: crate::domain::CatalogPath {
-                public_id: "src/probe.rs".to_string(),
-                normalized_utf8: Some("src/probe.rs".to_string()),
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
             },
             size: 40,
             language: Some(LanguageId::Rust),
-            classification: crate::domain::FileClassification::for_code_path("src/probe.rs"),
+            classification: crate::domain::FileClassification::for_code_path(path),
             disposition: crate::domain::FileDisposition::MetadataOnly {
                 reason: crate::domain::MetadataOnlyReason::SensitiveContent {
                     rule_ids: vec![rule.to_string()],
@@ -36225,15 +36226,98 @@ mod tests {
                 },
             },
             content_hash: None,
-        };
-        live.manifest_entries = vec![recorded("secret.context-assignment")];
-        let refusal = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
+        }
+    }
+
+    /// A directory symlink, or on Windows without the symlink privilege a
+    /// junction; both are reparse points `symlink_metadata` reports as links.
+    fn link_dir_for_admission_test(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("run mklink");
+            assert!(status.success(), "mklink /J failed");
+        }
+    }
+
+    /// The no-bytes policy answer is a pure function of the path and the
+    /// manifest: identical for a demoted file that exists and one that does
+    /// not. The degradation view and the sweeps answer from it, so a difference
+    /// here is an existence oracle.
+    #[test]
+    fn policy_refusal_is_identical_whether_the_file_exists() {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let present = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
             .expect("a recorded demotion must refuse");
+        fs::remove_file(repo.path().join("src/probe.rs")).expect("remove probe");
+        let absent = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
+            .expect("a recorded demotion must refuse");
+        assert_eq!(
+            refusal_shape(&present),
+            refusal_shape(&absent),
+            "the no-bytes refusal must not depend on the file existing"
+        );
+        assert_eq!(present, absent);
+    }
+
+    /// The gate's line re-read follows no link on ANY component, not only the
+    /// final one: a demoted path under a linked directory names no lines.
+    #[test]
+    fn recorded_demotion_lines_are_not_read_through_a_linked_directory() {
+        let (repo, mut live) = admission_probe_repo();
+        let outside = TempDir::new().expect("outside dir");
+        fs::copy(
+            repo.path().join("src/probe.rs"),
+            outside.path().join("probe.rs"),
+        )
+        .expect("copy probe");
+        link_dir_for_admission_test(outside.path(), &repo.path().join("linked"));
+        live.manifest_entries = vec![recorded_content_demotion(
+            "linked/probe.rs",
+            "secret.context-assignment",
+        )];
+        let refusal = crate::protocol::read_gate::admit_disk_read(
+            &live,
+            "linked/probe.rs",
+            &repo.path().join("linked/probe.rs"),
+        )
+        .expect_err("a recorded demotion must refuse");
+        assert!(
+            refusal.contains("secret.context-assignment") && !refusal.contains(" at line"),
+            "lines must not be read through a linked directory; shape: {}",
+            refusal_shape(&refusal)
+        );
+    }
+
+    /// A RECORDED demotion carries no lines — the snapshot schema is unchanged —
+    /// so the gate recomputes them from its own read at refusal time. When the
+    /// file has moved on to a different verdict, the refusal still stands and
+    /// names the recorded rule, without lines from other content.
+    #[test]
+    fn recorded_demotion_refusal_recomputes_lines_through_the_gate() {
+        let (repo, mut live) = admission_probe_repo();
+        let recorded = |rule: &str| recorded_content_demotion("src/probe.rs", rule);
+        live.manifest_entries = vec![recorded("secret.context-assignment")];
+        let refusal =
+            crate::protocol::read_gate::refuse_by_policy_naming_lines(&live, "src/probe.rs")
+                .expect("a recorded demotion must refuse");
         assert_names_rule_and_line_without_bypass(&refusal);
 
         live.manifest_entries = vec![recorded("secret.uri-credentials")];
-        let moved = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
-            .expect("a recorded demotion refuses whatever the file now holds");
+        let moved =
+            crate::protocol::read_gate::refuse_by_policy_naming_lines(&live, "src/probe.rs")
+                .expect("a recorded demotion refuses whatever the file now holds");
         assert!(
             moved.contains("secret.uri-credentials") && !moved.contains(" at line"),
             "lines from a different verdict must not be paired with the record; shape: {}",
