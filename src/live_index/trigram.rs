@@ -109,41 +109,48 @@ impl TrigramIndex {
             .collect()
     }
 
-    /// Update trigrams for a single file. Removes old trigrams if path was already indexed.
-    /// Reuses existing file_id if path is known; allocates new ID otherwise.
-    pub fn update_file(&mut self, path: &str, content: &[u8]) {
-        // Remove old trigrams first if the path was already tracked
-        if self.path_to_id.contains_key(path) {
-            self.remove_trigrams_for_path(path);
+    /// Replace the trigrams of `path` with those of `content`.
+    ///
+    /// `old` is the content this index last indexed for `path`. With it only
+    /// the trigrams that vanished or appeared are touched, so the cost follows
+    /// the file rather than the whole map, and shared trigrams stay put. A
+    /// tracked path without `old` falls back to scanning every posting list.
+    /// The file ID is stable per path.
+    pub fn update_file(&mut self, path: &str, old: Option<&[u8]>, content: &[u8]) {
+        let Some(&file_id) = self.path_to_id.get(path) else {
+            self.insert_file(path, content);
+            return;
+        };
+        let Some(old) = old else {
+            self.remove_id_everywhere(file_id);
+            self.insert_file(path, content);
+            return;
+        };
+        let old = trigrams_of(old);
+        let new = trigrams_of(content);
+        for tg in old.difference(&new) {
+            self.remove_id(tg, file_id);
         }
-
-        // Get or allocate file_id
-        let file_id = self.get_or_alloc_id(path);
-
-        // Insert new trigrams — index stores lowercase trigrams for CI search.
-        let content_lower: Vec<u8> = content.iter().map(|b| b.to_ascii_lowercase()).collect();
-        let trigrams = extract_trigrams(&content_lower);
-        for tg in trigrams {
-            let list = self.map.entry(tg).or_default();
-            // Insert in sorted order (maintaining sorted invariant for binary search)
-            match list.binary_search(&file_id) {
-                Ok(_) => {} // already present
-                Err(pos) => list.insert(pos, file_id),
-            }
+        for tg in new.difference(&old) {
+            insert_sorted(self.map.entry(*tg).or_default(), file_id);
         }
     }
 
-    /// Remove all trigram entries for the given path and clean up ID mappings.
-    pub fn remove_file(&mut self, path: &str) {
-        if !self.path_to_id.contains_key(path) {
-            return; // Not indexed — no-op
-        }
-        self.remove_trigrams_for_path(path);
-        // The contains_key guard above typically ensures remove returns Some.
-        // The if-let is defensive against future refactors of remove_trigrams_for_path
-        // that might mutate path_to_id.
-        if let Some(id) = self.path_to_id.remove(path) {
-            self.id_to_path.remove(&id);
+    /// Forget `path`. `content` is what it was indexed with, whose trigrams
+    /// are the only posting lists touched; `None` scans every posting list,
+    /// for when that content is not known.
+    pub fn remove_file(&mut self, path: &str, content: Option<&[u8]>) {
+        let Some(id) = self.path_to_id.remove(path) else {
+            return;
+        };
+        self.id_to_path.remove(&id);
+        match content {
+            Some(content) => {
+                for tg in trigrams_of(content) {
+                    self.remove_id(&tg, id);
+                }
+            }
+            None => self.remove_id_everywhere(id),
         }
     }
 
@@ -167,20 +174,26 @@ impl TrigramIndex {
             .collect()
     }
 
-    /// Remove all trigram posting list entries for a given path.
-    fn remove_trigrams_for_path(&mut self, path: &str) {
-        let id = match self.path_to_id.get(path) {
-            Some(&id) => id,
-            None => return,
-        };
-
-        // Remove this file_id from all posting lists; drop empty lists
+    /// Remove `id` from every posting list; drop empty lists.
+    fn remove_id_everywhere(&mut self, id: u64) {
         self.map.retain(|_, list| {
             if let Ok(pos) = list.binary_search(&id) {
                 list.remove(pos);
             }
             !list.is_empty()
         });
+    }
+
+    /// Remove `id` from one posting list; drop it when empty.
+    fn remove_id(&mut self, tg: &[u8; 3], id: u64) {
+        if let Some(list) = self.map.get_mut(tg)
+            && let Ok(pos) = list.binary_search(&id)
+        {
+            list.remove(pos);
+            if list.is_empty() {
+                self.map.remove(tg);
+            }
+        }
     }
 
     /// Get existing file_id for path or allocate a new one.
@@ -198,15 +211,22 @@ impl TrigramIndex {
     /// Insert a file without clearing old trigrams first (used in build_from_files).
     fn insert_file(&mut self, path: &str, content: &[u8]) {
         let file_id = self.get_or_alloc_id(path);
-        let content_lower: Vec<u8> = content.iter().map(|b| b.to_ascii_lowercase()).collect();
-        let trigrams = extract_trigrams(&content_lower);
-        for tg in trigrams {
-            let list = self.map.entry(tg).or_default();
-            match list.binary_search(&file_id) {
-                Ok(_) => {}
-                Err(pos) => list.insert(pos, file_id),
-            }
+        for tg in trigrams_of(content) {
+            insert_sorted(self.map.entry(tg).or_default(), file_id);
         }
+    }
+}
+
+/// The trigrams the index stores for `content`: lowercased for CI search.
+fn trigrams_of(content: &[u8]) -> HashSet<[u8; 3]> {
+    let content_lower: Vec<u8> = content.iter().map(|b| b.to_ascii_lowercase()).collect();
+    extract_trigrams(&content_lower)
+}
+
+/// Insert `id` keeping the list sorted, for binary search.
+fn insert_sorted(list: &mut Vec<u64>, id: u64) {
+    if let Err(pos) = list.binary_search(&id) {
+        list.insert(pos, id);
     }
 }
 
@@ -256,6 +276,7 @@ mod tests {
     use super::*;
     use crate::domain::LanguageId;
     use crate::live_index::store::{IndexedFile, ParseStatus};
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn make_file(path: &str, content: &[u8]) -> (String, IndexedFile) {
         (
@@ -425,7 +446,11 @@ mod tests {
         assert!(old_results.contains(&"src/main.rs".to_string()));
 
         // Update with new content
-        idx.update_file("src/main.rs", b"fn new_function() {}");
+        idx.update_file(
+            "src/main.rs",
+            Some(b"fn old_function() {}"),
+            b"fn new_function() {}",
+        );
 
         // Build new files map reflecting the update
         let mut new_files = files;
@@ -452,7 +477,7 @@ mod tests {
         let mut idx = TrigramIndex::build_from_files(&files);
 
         let id_before = *idx.path_to_id.get("src/lib.rs").unwrap();
-        idx.update_file("src/lib.rs", b"fn beta() {}");
+        idx.update_file("src/lib.rs", Some(b"fn alpha() {}"), b"fn beta() {}");
         let id_after = *idx.path_to_id.get("src/lib.rs").unwrap();
 
         assert_eq!(
@@ -471,7 +496,7 @@ mod tests {
         ]);
         let mut idx = TrigramIndex::build_from_files(&files);
 
-        idx.remove_file("remove.rs");
+        idx.remove_file("remove.rs", Some(b"fn remove_me() {}"));
 
         // "remove.rs" path should be gone from mappings
         assert!(
@@ -500,11 +525,65 @@ mod tests {
         let mut idx = TrigramIndex::build_from_files(&files);
 
         // Should not panic
-        idx.remove_file("nonexistent.rs");
+        idx.remove_file("nonexistent.rs", None);
 
         // Existing file still searchable
         let results = idx.search(b"foo", &files);
         assert!(results.contains(&"a.rs".to_string()));
+    }
+
+    // ── incremental equals rebuild ───────────────────────────────────────────
+
+    /// Trigram -> paths, independent of how file IDs were allocated.
+    fn by_path(idx: &TrigramIndex) -> BTreeMap<[u8; 3], BTreeSet<String>> {
+        idx.map
+            .iter()
+            .map(|(tg, ids)| {
+                assert!(!ids.is_empty(), "no empty posting list is kept");
+                assert!(ids.windows(2).all(|w| w[0] < w[1]), "sorted, deduped");
+                (
+                    *tg,
+                    ids.iter().map(|id| idx.id_to_path[id].clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Random update and remove sequences, with and without the old content,
+    /// leave the index equal to one built from scratch over the same files.
+    #[test]
+    fn incremental_updates_and_removes_match_a_rebuild() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let paths = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"];
+        let mut files: HashMap<String, IndexedFile> = HashMap::new();
+        let mut idx = TrigramIndex::new();
+        for step in 0..2_000 {
+            let path = paths[(next() % paths.len() as u64) as usize];
+            let pass_old = next() % 8 != 0;
+            if next() % 4 == 0 {
+                let old = files.remove(path);
+                let old = old.as_ref().filter(|_| pass_old);
+                idx.remove_file(path, old.map(|f| f.content.as_slice()));
+            } else {
+                // A tiny mixed-case alphabet, so files share and lose trigrams.
+                let len = (next() % 12) as usize;
+                let content: Vec<u8> = (0..len).map(|_| b"abAB c"[(next() % 6) as usize]).collect();
+                let old = files.insert(path.to_string(), make_file(path, &content).1);
+                let old = old.as_ref().filter(|_| pass_old);
+                idx.update_file(path, old.map(|f| f.content.as_slice()), &content);
+            }
+            let rebuilt = TrigramIndex::build_from_files(&files);
+            assert_eq!(by_path(&idx), by_path(&rebuilt), "step {step}");
+            let tracked: BTreeSet<&String> = idx.path_to_id.keys().collect();
+            assert_eq!(tracked, files.keys().collect(), "step {step}");
+            assert_eq!(idx.id_to_path.len(), idx.path_to_id.len(), "step {step}");
+        }
     }
 
     // ── extract_trigrams ─────────────────────────────────────────────────────

@@ -3984,9 +3984,10 @@ impl SharedIndexHandle {
 
         let mut live = (*self.live.load_full()).clone();
         let path_owned = path.to_string();
-        let mut removed_from_live = false;
+        let (mut released, mut removed_content) = (false, false);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            removed_from_live = live.remove_file(path);
+            released = live.release_unverified(path);
+            removed_content = live.remove_file(path);
         }));
         if let Err(panic_info) = result {
             let msg = panic_info
@@ -4015,7 +4016,8 @@ impl SharedIndexHandle {
         // file, manifest row, scout entry). When neither removed anything,
         // there is no removal to publish — publishing anyway would mint a new
         // publication out of a failed observation.
-        if !removed_from_live && updated_scout_plan.is_none() {
+        let content_changed = removed_content || updated_scout_plan.is_some();
+        if !released && !content_changed {
             return FencedRemoval::NothingHeld;
         }
 
@@ -4024,7 +4026,12 @@ impl SharedIndexHandle {
         }
         let scout_plan = self.scout_plan.load_full();
         self.recompute_freshness_locked(&live, scout_plan.as_deref());
-        self.swap_and_publish(live);
+        // Releasing a withheld record alone changes no content.
+        if content_changed {
+            self.swap_and_publish(live);
+        } else {
+            self.swap_and_publish_retaining_content(live);
+        }
         self.pre_update_snapshots.lock().remove(path);
         FencedRemoval::Removed(self.published_generation())
     }
@@ -4340,6 +4347,8 @@ impl SharedIndexHandle {
                             path = %verified.path,
                             "snapshot-verify admission panicked; path removed and retried alone"
                         );
+                        // Its trigrams may match neither row, so scan them all.
+                        live.trigram_index.remove_file(&verified.path, None);
                         live.remove_row(&verified.path);
                         panicked = true;
                         receipt.refused.push(verified.path);
@@ -6601,7 +6610,7 @@ impl LiveIndex {
         // auxiliary index updates panic (e.g., from concurrent access or
         // gitignore assertion failures). Auxiliary indices may become
         // temporarily stale, but the file won't vanish from the index.
-        self.files.insert(path.clone(), Arc::new(file));
+        let old_row = self.files.insert(path.clone(), Arc::new(file));
         #[cfg(test)]
         if snapshot_verify_test_panic_path()
             .lock()
@@ -6628,8 +6637,11 @@ impl LiveIndex {
                 }
             }
         }
-        self.trigram_index
-            .update_file(&path, &self.files[&path].content);
+        self.trigram_index.update_file(
+            &path,
+            old_row.as_ref().map(|row| row.content.as_slice()),
+            &self.files[&path].content,
+        );
         self.insert_reverse_index_for_path(&path);
         self.insert_path_indices_for_path(&path);
         self.is_empty = false;
@@ -6737,12 +6749,12 @@ impl LiveIndex {
     /// Remove a row and its derived indices, leaving its catalog entry.
     fn remove_row(&mut self, path: &str) -> bool {
         self.remove_reverse_index_for_path(path);
-        let removed = self.files.remove(path).is_some();
-        if removed {
-            self.trigram_index.remove_file(path);
-            self.remove_path_indices_for_path(path);
-        }
-        removed
+        let Some(row) = self.files.remove(path) else {
+            return false;
+        };
+        self.trigram_index.remove_file(path, Some(&row.content));
+        self.remove_path_indices_for_path(path);
+        true
     }
 
     /// Why a restored path the snapshot verify could not reconcile is

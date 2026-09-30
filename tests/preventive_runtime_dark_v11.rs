@@ -1057,10 +1057,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // the INI secret-access-key detector widening
 // add no edge into src/index_lifecycle; its one reference is a watcher test
 // registering an observer exactly as the neighbouring tests do.
+// Refreshed for the diff-based trigram update and the snapshot-verify review
+// nits (trigram, store, persist tests, watcher sweep, protocol withheld note):
+// no new file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "972a8f74b4399c758097801bf6dca706332fa30320bd4eae5cd92c76332e0392",
+    "2b8c37dea7ceb69590e189027d75f88a0ff6ccba5960eb04780d2630caeaa92a",
     199,
-    10_158_896,
+    10_168_049,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

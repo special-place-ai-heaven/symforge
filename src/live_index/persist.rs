@@ -5608,6 +5608,69 @@ mod tests {
         assert!(crate::protocol::read_gate::refuse_by_policy(&live, "n.rs").is_none());
     }
 
+    /// Releasing a withheld path that holds no row, catalog entry or scout
+    /// entry changes no content, so the publication keeps the content
+    /// generation and the knowledge bridge.
+    #[cfg(feature = "server")]
+    #[test]
+    fn releasing_a_withheld_path_alone_keeps_the_content_generation() {
+        let tmp = TempDir::new().unwrap();
+        let shared = withheld_new_file_without_a_row(tmp.path());
+        std::fs::remove_file(tmp.path().join("n.rs")).unwrap();
+        let before = shared.published_generation();
+        assert!(
+            before
+                .live
+                .manifest_entries
+                .iter()
+                .all(|entry| entry.path.normalized_utf8.as_deref() != Some("n.rs")),
+            "the release is the only thing held"
+        );
+        assert!(shared.scout_plan().is_none_or(|plan| {
+            plan.entries
+                .iter()
+                .all(|entry| entry.path.normalized_utf8.as_deref() != Some("n.rs"))
+        }));
+
+        let removal = shared.remove_file_if_absent_at_publication_fence_with_receipt(
+            "n.rs",
+            &tmp.path().join("n.rs"),
+            shared.publication_fence(),
+        );
+
+        assert!(matches!(
+            removal,
+            crate::live_index::store::FencedRemoval::Removed(_)
+        ));
+        let after = shared.published_generation();
+        assert!(after.live.unverified_since_restore("n.rs").is_none());
+        assert!(after.publication_generation > before.publication_generation);
+        assert_eq!(after.content_generation, before.content_generation);
+        assert!(Arc::ptr_eq(&after.bridge, &before.bridge));
+    }
+
+    /// A withheld path that still exists but is now excluded by policy (here
+    /// an `.ignore` rule) is released by the complete sweep that no longer
+    /// sees it, instead of being refused by the absence check forever.
+    #[cfg(feature = "server")]
+    #[test]
+    fn complete_sweep_releases_a_withheld_path_excluded_by_policy() {
+        let tmp = TempDir::new().unwrap();
+        let shared = withheld_new_file_without_a_row(tmp.path());
+        std::fs::write(tmp.path().join(".ignore"), "n.rs\n").unwrap();
+
+        crate::watcher::reconcile_stale_files_with_stop(
+            tmp.path(),
+            &shared,
+            || false,
+            shared.current_project_generation(),
+            verify_observer(tmp.path()),
+        );
+
+        assert!(tmp.path().join("n.rs").exists());
+        assert!(shared.read().unverified_since_restore("n.rs").is_none());
+    }
+
     /// A complete sweep that no longer sees a withheld path settles it once
     /// its absence is confirmed, even with no watcher event for the delete.
     #[cfg(feature = "server")]
@@ -5679,6 +5742,53 @@ mod tests {
         wait_for("the reconcile stamp", &|| {
             info.lock().last_reconcile_at.is_some()
         });
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("the watcher stops")
+            .expect("the watcher does not panic");
+    }
+
+    /// A verify that completes while the fresh-instance sweep defers to it
+    /// still gets its post-verify sweep, well before the periodic interval.
+    #[cfg(feature = "server")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watcher_sweeps_after_a_verify_that_completes_during_the_fresh_sweep() {
+        let tmp = TempDir::new().unwrap();
+        let (restored, _) = restored_with_offline_edits(tmp.path(), 3, 0);
+        std::fs::write(tmp.path().join("offline.rs"), "pub fn offline() {}\n").unwrap();
+        let generation = restored.current_project_generation();
+        assert!(restored.mark_snapshot_verify_started_at_generation(
+            generation,
+            SnapshotVerifyProgress::started(SystemTime::now(), 3),
+        ));
+        let completer = restored.clone();
+        *crate::watcher::AFTER_FRESH_INSTANCE_SWEEP.lock() = Some(Box::new(move || {
+            assert!(completer.mark_snapshot_verify_completed_at_generation(
+                generation,
+                SnapshotVerifyReport::empty(),
+            ));
+        }));
+        let info = Arc::new(parking_lot::Mutex::new(
+            crate::watcher::WatcherInfo::default(),
+        ));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = tokio::spawn(crate::watcher::run_watcher_with_stop(
+            tmp.path().to_path_buf(),
+            restored.clone(),
+            Arc::clone(&info),
+            Arc::clone(&stop),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !restored.read().files.contains_key("offline.rs") {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the post-verify sweep"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
 
         stop.store(true, std::sync::atomic::Ordering::Release);
         tokio::time::timeout(Duration::from_secs(5), watcher)
