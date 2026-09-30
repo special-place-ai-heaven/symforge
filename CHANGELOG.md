@@ -32,6 +32,14 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.5...v11.3.6) (2026-09-30)
+
+
+### Bug Fixes
+
+* **daemon:** reuse live projects across sessions and skip same-root rebinds ([#729](https://github.com/special-place-ai-heaven/symforge/issues/729)) ([a135d90](https://github.com/special-place-ai-heaven/symforge/commit/a135d9080fdaffe2b0649cf8250b4d997df15742))
+* **knowledge:** stop secret-scan false positives on ordinary source and name the rule in refusals ([#724](https://github.com/special-place-ai-heaven/symforge/issues/724)) ([8b89efa](https://github.com/special-place-ai-heaven/symforge/commit/8b89efaed070b29c242ec37ecbdf57cde45b594f))
+
 ## [11.3.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.4...v11.3.5) (2026-09-30)
 
 
