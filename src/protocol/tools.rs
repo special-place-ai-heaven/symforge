@@ -9060,13 +9060,17 @@ impl SymForgeServer {
             return format::not_found_file(&input.path);
         }
 
-        // A credential path is refused before any filesystem call, so an
-        // existing and a missing file get the same answer. Every lane below
-        // would refuse it anyway; answering here keeps the refusal from
-        // depending on existence. The estimate above is exempt by contract
-        // (Feature 020 R1/E1: aggregate counts for a demoted file succeed).
+        // A credential path, or a path under VCS or runtime-state internals, is
+        // refused before any filesystem call, so an existing and a missing file
+        // get the same answer. Every lane below would refuse it anyway;
+        // answering here keeps the refusal from depending on existence. The
+        // estimate above is exempt by contract (Feature 020 R1/E1: aggregate
+        // counts for a demoted file succeed).
         if crate::knowledge::sensitive_path_rule(&input.path).is_some() {
             return format::content_withheld_by_admission(&input.path);
+        }
+        if let Some(refusal) = read_gate::hard_scope_refusal(&input.path) {
+            return refusal;
         }
 
         let options = match file_content_options_from_input(&input) {
@@ -29711,6 +29715,92 @@ mod tests {
             );
             assert_tool_result_status(&result, OutcomeClass::InvalidRequest);
         }
+
+        // Missing and existing internals answer the same, so the refusal is
+        // not an existence probe.
+        let (_absent_dir, absent) = setup_loaded_edit_test(&[]);
+        for spelling in [".git/config", ".symforge/state.txt", ".GIT/missing"] {
+            assert_eq!(
+                server
+                    .get_file_content(Parameters(get_file_content_input(spelling)))
+                    .await,
+                absent
+                    .get_file_content(Parameters(get_file_content_input(spelling)))
+                    .await,
+                "{spelling:?} answer depends on existence"
+            );
+        }
+    }
+
+    /// Repeated separators and `.` segments name the same file as the clean
+    /// spelling. Neither lane may publish or serve under such a key, and a
+    /// credential path spelled that way gets the credential refusal.
+    #[tokio::test]
+    async fn empty_and_dot_segment_spellings_are_refused() {
+        let (dir, server) = setup_loaded_edit_test(&[("src/x.rs", "pub fn x_fixture() {}\n")]);
+        write_credential_alias_fixtures(dir.path());
+        std::fs::create_dir_all(dir.path().join("infra/.kube")).unwrap();
+        std::fs::write(dir.path().join("infra/.kube/config"), ALIAS_FIXTURE_BODY).unwrap();
+
+        for spelling in [
+            ".aws//credentials",
+            ".aws/./credentials",
+            "infra/.kube/./config",
+            "src/./x.rs",
+        ] {
+            let _ = super::freshen_exact_path_for_targeted_retrieval(
+                &server,
+                &super::search::PathScope::exact(spelling),
+            );
+            assert!(
+                server
+                    .index()
+                    .data_plane()
+                    .read()
+                    .get_file(spelling)
+                    .is_none(),
+                "{spelling:?} was published under a second key"
+            );
+            let served = server
+                .get_file_content(Parameters(get_file_content_input(spelling)))
+                .await;
+            assert!(
+                !served.contains(ALIAS_FIXTURE_BODY.trim()) && !served.contains("x_fixture"),
+                "{spelling:?} was served: {served}"
+            );
+            if spelling == "src/./x.rs" {
+                assert_eq!(
+                    served,
+                    "Error: path spelling differs from the on-disk name; retry with `src/x.rs`"
+                );
+            } else {
+                assert!(
+                    super::is_admission_refusal(&served),
+                    "{spelling:?} must get the credential refusal: {served}"
+                );
+            }
+        }
+    }
+
+    /// An absolute path inside the repository is not outside it. It is refused
+    /// with the relative spelling to retry with, and nothing is served from it.
+    #[test]
+    fn absolute_in_repo_path_is_answered_with_its_relative_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/x.rs"), "pub fn x() {}\n").unwrap();
+        let absolute = dir.path().join("src").join("x.rs");
+        assert_eq!(
+            super::edit::safe_repo_path(dir.path(), &absolute.to_string_lossy()).unwrap_err(),
+            "path spelling differs from the on-disk name; retry with `src/x.rs`"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("y.rs"), "pub fn y() {}\n").unwrap();
+        assert!(
+            super::edit::safe_repo_path(dir.path(), &outside.path().join("y.rs").to_string_lossy())
+                .unwrap_err()
+                .contains("outside the repository")
+        );
     }
 
     /// A content read of a credential path's canonical spelling must not reveal

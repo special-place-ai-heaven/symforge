@@ -104,13 +104,22 @@ pub fn observe_disk_beneath(
 /// reads either.
 fn refuse_disk_spelling(root: &Path, relative_path: &str) -> Result<(), String> {
     crate::protocol::edit::refuse_path_alias(root, relative_path)?;
-    if crate::discovery::path_is_hard_scope_excluded(Path::new(relative_path)) {
-        return Err(format!(
+    match hard_scope_refusal(relative_path) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for a path under VCS or runtime-state internals (`.git`,
+/// `.symforge`). Lexical and case-insensitive, so it needs no filesystem call
+/// and answers the same whether or not the path exists.
+pub(crate) fn hard_scope_refusal(relative_path: &str) -> Option<String> {
+    crate::discovery::path_is_hard_scope_excluded(Path::new(relative_path)).then(|| {
+        format!(
             "{relative_path} [error: VCS and runtime-state internals are outside \
              source scope; a disk observation never reads them]"
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 /// Working-tree text for `relative_path`, admitted by [`admit_disk_read`].

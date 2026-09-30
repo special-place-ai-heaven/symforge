@@ -216,8 +216,18 @@ fn finalize_missing_file(
 /// freshen-on-read call), so the suffix relationship holds by construction;
 /// `None` only if the relative path is deeper than the absolute one.
 fn project_root_from_paths(abs_path: &Path, relative_path: &str) -> Option<PathBuf> {
-    let depth = Path::new(relative_path).components().count();
+    let depth = relative_depth(Path::new(relative_path));
     abs_path.ancestors().nth(depth).map(|p| p.to_path_buf())
+}
+
+/// How many ancestors of the absolute path the relative path spans. `.`
+/// components have no ancestor of their own; counting them would walk above
+/// the root.
+fn relative_depth(relative: &Path) -> usize {
+    relative
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .count()
 }
 
 /// The cold walk never follows a symlink: it skips a linked file and does not
@@ -226,15 +236,12 @@ fn project_root_from_paths(abs_path: &Path, relative_path: &str) -> Option<PathB
 /// repository or created by a checkout never publishes its target's bytes
 /// under the in-repository name.
 fn path_crosses_symlink(abs_path: &Path, relative: &Path) -> bool {
-    // `.` components have no ancestor of their own; counting them would walk
-    // above the root.
-    let depth = relative
-        .components()
-        .filter(|component| !matches!(component, std::path::Component::CurDir))
-        .count();
-    abs_path.ancestors().take(depth).any(|path| {
-        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-    })
+    abs_path
+        .ancestors()
+        .take(relative_depth(relative))
+        .any(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
 }
 
 /// A watcher event or freshen request can carry a spelling other than the
@@ -976,6 +983,8 @@ mod tests {
         )
         .expect("credential fixture");
         std::fs::write(root.path().join("lib.rs"), "pub fn first() {}\n").expect("seed");
+        std::fs::create_dir_all(root.path().join("src")).expect("src dir");
+        std::fs::write(root.path().join("src/x.rs"), "pub fn x() {}\n").expect("src file");
         let shared = LiveIndex::load(root.path()).expect("cold load");
 
         let outside_name = outside
@@ -992,6 +1001,9 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             ".aws/credentials.".to_string(),
+            ".aws//credentials".to_string(),
+            ".aws/./credentials".to_string(),
+            "src/./x.rs".to_string(),
         ];
         if filesystem_is_case_insensitive(root.path()) {
             refused.push("LIB.RS".to_string());

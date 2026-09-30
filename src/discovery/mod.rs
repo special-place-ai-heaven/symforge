@@ -517,10 +517,16 @@ pub(crate) enum PathRefusal {
 /// would publish the file under a second key while the credential, gitignore
 /// and scope rules judged the alias rather than the file.
 ///
-/// Absolute paths, root or drive prefixes and `..` are refused lexically. On
-/// Windows an alias component is refused before any filesystem call, so the
-/// answer for those spellings does not depend on whether the file exists. On
-/// Unix such names are ordinary, distinct files and stay legal.
+/// These checks are lexical and run before any filesystem call, so their
+/// answer does not depend on whether the file exists:
+///
+/// * a root or drive prefix or `..` is outside the root;
+/// * an absolute path is outside the root unless it lies beneath it, in which
+///   case it is refused with its relative spelling to retry with;
+/// * an empty or `.` segment or a trailing separator names the same file as the
+///   clean spelling, so it is refused with the clean spelling to retry with;
+/// * on Windows, an alias component is refused. On Unix such names are
+///   ordinary, distinct files and stay legal.
 pub(crate) fn resolve_repo_path(
     root: &Path,
     relative_path: &str,
@@ -528,18 +534,32 @@ pub(crate) fn resolve_repo_path(
     use std::path::Component;
 
     let requested = Path::new(relative_path);
-    if requested.is_absolute()
-        || requested.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
+    if requested.is_absolute() {
+        return Err(absolute_beneath_root(root, requested)
+            .map_or(PathRefusal::OutsideRoot, refuse_as_spelling_of));
+    }
+    if requested.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
         return Err(PathRefusal::OutsideRoot);
     }
     #[cfg(windows)]
     refuse_windows_alias_components(requested)?;
+
+    // `Path::components` drops repeated separators and interior `.`, so the
+    // on-disk comparison below cannot see them; compare the raw text instead.
+    let clean = clean_spelling(requested);
+    let spelled = if cfg!(windows) {
+        relative_path.replace('\\', "/")
+    } else {
+        relative_path.to_string()
+    };
+    if !clean.is_empty() && spelled != clean {
+        return Err(refuse_as_spelling_of(clean));
+    }
 
     // Resolve through the non-verbatim root: a `\\?\` root switches off the
     // Win32 name normalization that turns an alias into the real file, so it
@@ -570,14 +590,55 @@ pub(crate) fn resolve_repo_path(
         return Ok(Some(canon_path));
     }
 
-    let canonical = canonical.to_string_lossy().replace('\\', "/");
-    if crate::knowledge::sensitive_path_rule(&canonical).is_some() {
-        return Err(PathRefusal::CredentialAlias);
+    Err(refuse_as_spelling_of(
+        canonical.to_string_lossy().replace('\\', "/"),
+    ))
+}
+
+/// The refusal for a spelling whose own name is `name`: a credential path gets
+/// that path's refusal, a hard-scope-excluded name is never suggested, and any
+/// other name is offered as the spelling to retry with.
+fn refuse_as_spelling_of(name: String) -> PathRefusal {
+    if crate::knowledge::sensitive_path_rule(&name).is_some() {
+        PathRefusal::CredentialAlias
+    } else if path_is_hard_scope_excluded(Path::new(&name)) {
+        PathRefusal::SpellingDiffers(None)
+    } else {
+        PathRefusal::SpellingDiffers(Some(name))
     }
-    if path_is_hard_scope_excluded(Path::new(&canonical)) {
-        return Err(PathRefusal::SpellingDiffers(None));
-    }
-    Err(PathRefusal::SpellingDiffers(Some(canonical)))
+}
+
+/// The normal components of `path`, joined with `/`.
+fn clean_spelling(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The relative spelling of an absolute `requested` path that lies beneath
+/// `root`, judged lexically first and then on the resolved paths.
+fn absolute_beneath_root(root: &Path, requested: &Path) -> Option<String> {
+    let relative = dunce::simplified(requested)
+        .strip_prefix(dunce::simplified(root))
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let canon_root = root.canonicalize().ok()?;
+            let canon_path = requested.canonicalize().ok()?;
+            canon_path
+                .strip_prefix(&canon_root)
+                .ok()
+                .map(Path::to_path_buf)
+        })?;
+    let escapes = relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)));
+    let clean = clean_spelling(&relative);
+    (!escapes && !clean.is_empty()).then_some(clean)
 }
 
 #[cfg(windows)]
