@@ -5687,6 +5687,102 @@ mod tests {
             .expect("the watcher does not panic");
     }
 
+    /// A restored file replaced by a symlink while the daemon was down: the
+    /// verify's re-read is held to the single-path lane's never-follow rule,
+    /// so the link target's bytes are never published under the in-repo name.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn background_verify_does_not_follow_a_symlink_swapped_in_offline() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "pub fn leaked() {}\n").unwrap();
+        let (shared, snapshot_mtimes) = restored_with_offline_edits(tmp.path(), 3, 0);
+        std::fs::remove_file(tmp.path().join("f1.rs")).unwrap();
+        #[cfg(unix)]
+        let linked =
+            std::os::unix::fs::symlink(outside.path().join("secret.rs"), tmp.path().join("f1.rs"));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(
+            outside.path().join("secret.rs"),
+            tmp.path().join("f1.rs"),
+        );
+        if let Err(error) = linked {
+            eprintln!("cannot create a file symlink here ({error}); skipped");
+            return;
+        }
+
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            snapshot_mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
+
+        let live = shared.read();
+        assert!(
+            live.files
+                .get("f1.rs")
+                .is_none_or(|file| !String::from_utf8_lossy(&file.content).contains("leaked")),
+            "the verify published a symlink target's bytes under the in-repo name"
+        );
+    }
+
+    /// An alias spelling of a withheld path is refused before any read, and it
+    /// neither releases the withheld entry nor publishes anything. Only the
+    /// file's own name releases it.
+    #[cfg(feature = "server")]
+    #[test]
+    fn an_alias_spelling_never_releases_a_withheld_path() {
+        const BROKEN: &str = "f1.rs";
+        let tmp = TempDir::new().unwrap();
+        let (shared, snapshot_mtimes) = restored_with_offline_edits(tmp.path(), 3, 2);
+        *crate::live_index::single_file::test_scout_failure_path().lock() =
+            Some(BROKEN.to_string());
+        block_on_background_verify_for_test(shared.clone(), tmp.path(), snapshot_mtimes);
+        *crate::live_index::single_file::test_scout_failure_path().lock() = None;
+        assert!(shared.read().unverified_since_restore(BROKEN).is_some());
+
+        let probe = tmp.path().join("case_probe.tmp");
+        std::fs::write(&probe, b"").unwrap();
+        let case_insensitive = tmp.path().join("CASE_PROBE.TMP").exists();
+        std::fs::remove_file(&probe).unwrap();
+        let mut aliases = vec!["./f1.rs", "f1.rs."];
+        if case_insensitive {
+            aliases.push("F1.RS");
+        }
+        for alias in aliases {
+            let before = shared.published_generation().publication_generation;
+            crate::live_index::single_file::maybe_reindex(
+                alias,
+                &tmp.path().join(alias),
+                &shared,
+                None::<LanguageId>,
+                shared.current_project_generation(),
+            );
+            let live = shared.read();
+            assert!(
+                live.unverified_since_restore(BROKEN).is_some(),
+                "{alias} released the withheld path"
+            );
+            assert!(!live.files.contains_key(alias), "{alias} was published");
+            assert_eq!(
+                shared.published_generation().publication_generation,
+                before,
+                "{alias} published something"
+            );
+        }
+
+        crate::live_index::single_file::maybe_reindex(
+            BROKEN,
+            &tmp.path().join(BROKEN),
+            &shared,
+            None::<LanguageId>,
+            shared.current_project_generation(),
+        );
+        assert!(shared.read().unverified_since_restore(BROKEN).is_none());
+    }
+
     /// A path withheld because its read failed is retried by every sweep, even
     /// after a published scout plan records it as unchanged on disk.
     #[cfg(feature = "server")]

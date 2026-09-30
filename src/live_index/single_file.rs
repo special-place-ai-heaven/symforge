@@ -361,9 +361,13 @@ pub(crate) fn prepare_snapshot_verify_admission(
     base: Option<&Arc<IndexedFile>>,
 ) -> Option<SnapshotVerifiedFile> {
     let relative = Path::new(relative_path);
+    // The same refusals as the canonical seam, before any read: a link or a
+    // spelling the resolver refuses goes to that seam, which evicts it.
     if crate::discovery::path_is_hard_scope_excluded(relative)
         || shared.is_source_excluded(relative)
         || shared.read().is_path_gitignored(relative_path)
+        || path_crosses_symlink(abs_path, relative)
+        || path_spelling_is_refused(abs_path, relative_path)
     {
         return None;
     }
