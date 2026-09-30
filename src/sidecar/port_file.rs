@@ -521,7 +521,7 @@ fn probe_daemon_epoch(
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn process_may_be_alive(pid: u32) -> bool {
+pub(crate) fn process_may_be_alive(pid: u32) -> bool {
     use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -550,7 +550,7 @@ fn process_may_be_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn process_may_be_alive(pid: u32) -> bool {
+pub(crate) fn process_may_be_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -564,7 +564,7 @@ fn process_may_be_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_may_be_alive(_pid: u32) -> bool {
+pub(crate) fn process_may_be_alive(_pid: u32) -> bool {
     true
 }
 
@@ -1138,6 +1138,7 @@ mod tests {
                     let health = crate::daemon::DaemonHealth {
                         project_count: 0,
                         session_count: 0,
+                        stale_sessions: 0,
                         daemon_version: "10.1.0".to_string(),
                         executable_path: "x".to_string(),
                         auth_required: true,

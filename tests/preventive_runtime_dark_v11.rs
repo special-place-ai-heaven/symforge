@@ -1021,10 +1021,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed 2026-09-30 for the rmcp 3.5.0 upgrade: the only src change is the
 // deprecated ServerInfo alias renamed to ServerConfig (five sites, +10 bytes)
 // plus a same-length FR-307 comment edit.
+// Refreshed once more for the dead-pid session reaper (daemon.rs, cli/entry.rs,
+// sidecar/port_file.rs), which adds no edge into src/index_lifecycle either.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "5e15bd5afaacfc2eea9da2b58a2323984379623d5a6fb7df9acc7194c55950f1",
+    "3b8921a3ae58c2dae94811c1d02ecf31ecfde95c8ee1abd3afe450a435b2e6f1",
     199,
-    9_820_231,
+    9_842_646,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
