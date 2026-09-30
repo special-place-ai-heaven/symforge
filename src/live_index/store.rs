@@ -1245,6 +1245,7 @@ impl SnapshotVerifyReport {
 const SNAPSHOT_VERIFY_PHASE_STAT_PASS: u8 = 0;
 const SNAPSHOT_VERIFY_PHASE_REVERIFY: u8 = 1;
 const SNAPSHOT_VERIFY_PHASE_PUBLISH: u8 = 2;
+const SNAPSHOT_VERIFY_PHASE_SPOT_CHECK: u8 = 3;
 
 /// Live progress of a running snapshot verification.
 ///
@@ -1291,8 +1292,18 @@ impl SnapshotVerifyProgress {
         self.0.started_at
     }
 
-    /// End of the stat pass: record what the verify now owns and how much.
+    /// End of the stat pass: the spot check re-reads `total` restored files.
+    pub fn start_spot_check(&self, total: usize) {
+        self.0.total.store(total, Ordering::Release);
+        self.0.processed.store(0, Ordering::Release);
+        self.0
+            .phase
+            .store(SNAPSHOT_VERIFY_PHASE_SPOT_CHECK, Ordering::Release);
+    }
+
+    /// End of the spot check: record what the verify now owns and how much.
     pub fn start_reverify(&self, claims: HashSet<String>, total: usize) {
+        self.0.processed.store(0, Ordering::Release);
         self.0.total.store(total, Ordering::Release);
         let _ = self.0.claims.set(claims);
         self.0
@@ -1331,6 +1342,10 @@ impl SnapshotVerifyProgress {
             SNAPSHOT_VERIFY_PHASE_STAT_PASS => {
                 format!("phase=stat_pass restored_files={restored} elapsed={elapsed}s")
             }
+            SNAPSHOT_VERIFY_PHASE_SPOT_CHECK => format!(
+                "phase=spot_check processed={processed}/{total} restored_files={restored} \
+                 elapsed={elapsed}s"
+            ),
             SNAPSHOT_VERIFY_PHASE_REVERIFY => format!(
                 "phase=reverify processed={processed}/{total} restored_files={restored} \
                  elapsed={elapsed}s"
@@ -1350,6 +1365,10 @@ pub enum SnapshotVerifyState {
     Pending,
     Running(SnapshotVerifyProgress),
     Completed(SnapshotVerifyReport),
+    /// The verify died before it could resolve. Nothing it proved is known,
+    /// so the restored rows stay hidden and the index reports degraded until
+    /// a rebuild from source (`index_folder`) replaces them.
+    Failed(SnapshotVerifyReport),
 }
 
 impl SnapshotVerifyState {
@@ -1602,6 +1621,14 @@ pub(crate) struct SnapshotVerifyBatchReceipt {
     pub refused: Vec<String>,
     /// The verify state was resolved in this same publication.
     pub completed: bool,
+}
+
+/// Test-only fault injection: a snapshot-verify batch panics while applying
+/// this path, standing in for any panic inside `update_file`.
+#[cfg(test)]
+pub(crate) fn snapshot_verify_test_panic_path() -> &'static parking_lot::Mutex<Option<String>> {
+    static PATH: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+    &PATH
 }
 
 /// Progress may only move a verification that has not resolved yet.
@@ -2563,10 +2590,11 @@ impl SharedIndexHandle {
         });
         let reconciliation_pending =
             scout_plan.is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded);
-        let snapshot_verification_failed = matches!(
-            &live.snapshot_verify_state,
-            SnapshotVerifyState::Completed(report) if report.mismatch_count > 0
-        );
+        let snapshot_verification_failed =
+            matches!(
+                &live.snapshot_verify_state,
+                SnapshotVerifyState::Completed(report) if report.mismatch_count > 0
+            ) || matches!(live.snapshot_verify_state, SnapshotVerifyState::Failed(_));
         let mut next_reasons = Vec::new();
         for reason in reason_codes.iter().copied().filter(|reason| {
             !matches!(
@@ -4125,6 +4153,33 @@ impl SharedIndexHandle {
         true
     }
 
+    /// Resolve a verify that died before it finished as `Failed`, under the
+    /// project-generation fence only. Unlike `Completed`, this keeps every
+    /// restored row hidden: a pass that died proved nothing about them.
+    pub fn mark_snapshot_verify_failed_at_generation(
+        &self,
+        expected_gen: u64,
+        report: SnapshotVerifyReport,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        if self.project_generation.load(Ordering::Acquire) != expected_gen {
+            self.note_rejected_stale_mutation();
+            return false;
+        }
+        let current = self.live.load_full();
+        if current.load_source != IndexLoadSource::SnapshotRestore
+            || !verify_in_flight(&current.snapshot_verify_state)
+        {
+            return true;
+        }
+        let mut live = (*current).clone();
+        live.snapshot_verify_state = SnapshotVerifyState::Failed(report);
+        let scout_plan = self.scout_plan.load_full();
+        self.recompute_freshness_locked(&live, scout_plan.as_deref());
+        self.swap_and_publish_retaining_content(live);
+        true
+    }
+
     /// Publish snapshot-verify results in ONE publication: deletions confirmed
     /// absent, re-read files, terminal admissions, and, when `completion` is
     /// given and nothing was refused, the resolved verify state.
@@ -4157,6 +4212,7 @@ impl SharedIndexHandle {
         let mut removed_paths = Vec::new();
         let mut evicted_rows = Vec::new();
         let mut scouted_entries = Vec::new();
+        let mut indexed_entries = Vec::new();
 
         for (path, absolute_path) in removals {
             match std::fs::symlink_metadata(absolute_path) {
@@ -4200,8 +4256,29 @@ impl SharedIndexHandle {
                         },
                         Some(file.content_hash.clone()),
                     );
-                    live.update_file_with_manifest_sort(verified.path.clone(), *file, false);
-                    live.upsert_manifest_entry_with_sort(manifest_entry, false);
+                    let path = verified.path.clone();
+                    let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if snapshot_verify_test_panic_path().lock().as_deref() == Some(&path) {
+                            panic!("injected snapshot-verify admission panic");
+                        }
+                        live.update_file_with_manifest(path.clone(), *file, false);
+                    }));
+                    if applied.is_err() {
+                        // `update_file` inserts the row before its auxiliary
+                        // indices, so a panic can leave this path half
+                        // applied. Drop it (row, indices, catalog entry) and
+                        // hand it to the canonical seam, whose own guard
+                        // discards its clone on a panic.
+                        tracing::error!(
+                            path = %verified.path,
+                            "snapshot-verify admission panicked; path removed and retried alone"
+                        );
+                        live.remove_file(&verified.path);
+                        receipt.refused.push(verified.path);
+                        continue;
+                    }
+                    indexed_entries.push(manifest_entry);
                     receipt.indexed.push(verified.path);
                 }
                 SnapshotVerifiedAdmission::Terminal(disposition) => {
@@ -4228,6 +4305,16 @@ impl SharedIndexHandle {
         let content_changed = !receipt.removed.is_empty()
             || !receipt.indexed.is_empty()
             || !receipt.terminal.is_empty();
+        if !indexed_entries.is_empty() {
+            let replaced: HashSet<&str> = indexed_entries
+                .iter()
+                .map(|entry| scouted_catalog_path(&entry.path))
+                .collect();
+            live.manifest_entries
+                .retain(|entry| !replaced.contains(scouted_catalog_path(&entry.path)));
+            drop(replaced);
+            live.manifest_entries.append(&mut indexed_entries);
+        }
         if content_changed {
             live.sort_manifest_entries();
         }
@@ -6408,18 +6495,14 @@ impl LiveIndex {
     /// replaced atomically. Existing target routing is preserved; callers that
     /// need to change routing must use the explicit admission publication path.
     pub fn update_file(&mut self, path: String, file: IndexedFile) {
-        self.update_file_with_manifest_sort(path, file, true);
+        self.update_file_with_manifest(path, file, true);
     }
 
-    /// [`Self::update_file`] for batch writers, which pass `false` and call
-    /// [`Self::sort_manifest_entries`] once: re-sorting the whole manifest per
-    /// file dominated a snapshot-verify batch on a large repository.
-    fn update_file_with_manifest_sort(
-        &mut self,
-        path: String,
-        file: IndexedFile,
-        sort_manifest: bool,
-    ) {
+    /// [`Self::update_file`] for batch writers, which pass `false` and write
+    /// their own catalog entries in one pass: finding, replacing, and sorting
+    /// the entry per file scans the whole manifest each time, which dominated
+    /// a snapshot-verify batch on a large repository.
+    fn update_file_with_manifest(&mut self, path: String, file: IndexedFile, manifest: bool) {
         // Capture old reference names BEFORE replacing the file, so we can
         // clean up stale reverse index entries after the insert.
         let old_ref_names: Vec<String> = self
@@ -6428,49 +6511,7 @@ impl LiveIndex {
             .map(|f| f.references.iter().map(|r| r.name.clone()).collect())
             .unwrap_or_default();
         let had_existing = !old_ref_names.is_empty() || self.files.contains_key(&path);
-
-        let (catalog_path, targets) = self
-            .manifest_entries
-            .iter()
-            .find(|entry| scouted_catalog_path(&entry.path) == path)
-            .map(|entry| {
-                let targets = match entry.disposition {
-                    FileDisposition::Indexed { targets, .. } => targets,
-                    _ if file.language.is_code_language() => crate::domain::IndexTargets::Code,
-                    _ => crate::domain::IndexTargets::Knowledge,
-                };
-                (entry.path.clone(), targets)
-            })
-            .unwrap_or_else(|| {
-                let targets = if file.language.is_code_language() {
-                    crate::domain::IndexTargets::Code
-                } else {
-                    crate::domain::IndexTargets::Knowledge
-                };
-                (
-                    crate::domain::CatalogPath {
-                        public_id: path.clone(),
-                        normalized_utf8: Some(path.clone()),
-                    },
-                    targets,
-                )
-            });
-        let parse_status = match &file.parse_status {
-            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
-            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
-            ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
-        };
-        let manifest_entry = CatalogEntry {
-            path: catalog_path,
-            size: file.byte_len,
-            language: Some(file.language),
-            classification: file.classification,
-            disposition: FileDisposition::Indexed {
-                targets,
-                parse_status,
-            },
-            content_hash: Some(file.content_hash.clone()),
-        };
+        let manifest_entry = manifest.then(|| self.derived_manifest_entry(&path, &file));
 
         // SAFETY: Insert the new file into the primary store FIRST.
         // This ensures the file is always present in `self.files` even if
@@ -6478,7 +6519,9 @@ impl LiveIndex {
         // gitignore assertion failures). Auxiliary indices may become
         // temporarily stale, but the file won't vanish from the index.
         self.files.insert(path.clone(), Arc::new(file));
-        self.upsert_manifest_entry_with_sort(manifest_entry, sort_manifest);
+        if let Some(manifest_entry) = manifest_entry {
+            self.upsert_manifest_entry_with_sort(manifest_entry, true);
+        }
 
         // Clean up old auxiliary indices using captured state.
         if had_existing {
@@ -6500,6 +6543,53 @@ impl LiveIndex {
         self.insert_path_indices_for_path(&path);
         self.is_empty = false;
         self.loaded_at_system = SystemTime::now();
+    }
+
+    /// The catalog entry `update_file` writes for `file`, keeping the routing
+    /// targets of any entry already held for `path`.
+    fn derived_manifest_entry(&self, path: &str, file: &IndexedFile) -> CatalogEntry {
+        let (catalog_path, targets) = self
+            .manifest_entries
+            .iter()
+            .find(|entry| scouted_catalog_path(&entry.path) == path)
+            .map(|entry| {
+                let targets = match entry.disposition {
+                    FileDisposition::Indexed { targets, .. } => targets,
+                    _ if file.language.is_code_language() => crate::domain::IndexTargets::Code,
+                    _ => crate::domain::IndexTargets::Knowledge,
+                };
+                (entry.path.clone(), targets)
+            })
+            .unwrap_or_else(|| {
+                let targets = if file.language.is_code_language() {
+                    crate::domain::IndexTargets::Code
+                } else {
+                    crate::domain::IndexTargets::Knowledge
+                };
+                (
+                    crate::domain::CatalogPath {
+                        public_id: path.to_string(),
+                        normalized_utf8: Some(path.to_string()),
+                    },
+                    targets,
+                )
+            });
+        let parse_status = match &file.parse_status {
+            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
+            ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
+        };
+        CatalogEntry {
+            path: catalog_path,
+            size: file.byte_len,
+            language: Some(file.language),
+            classification: file.classification,
+            disposition: FileDisposition::Indexed {
+                targets,
+                parse_status,
+            },
+            content_hash: Some(file.content_hash.clone()),
+        }
     }
 
     /// Returns `true` when `relative_path` is excluded by the repository's

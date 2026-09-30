@@ -377,6 +377,19 @@ impl LiveIndex {
         ) {
             return IndexState::Loading;
         }
+        // A verify that died leaves every restored row unproven. Degraded, not
+        // Loading (nothing is coming) and not Ready (nothing was verified): the
+        // guards refuse on it exactly as on a tripped breaker.
+        if let SnapshotVerifyState::Failed(report) = &self.snapshot_verify_state {
+            return IndexState::CircuitBreakerTripped {
+                summary: format!(
+                    "snapshot verify failed ({}); the {} restored files stay hidden until \
+                     index_folder rebuilds this project from source",
+                    report.reason.as_deref().unwrap_or("no reason recorded"),
+                    report.mismatch_count
+                ),
+            };
+        }
         if self.cb_state.is_tripped() {
             IndexState::CircuitBreakerTripped {
                 summary: self.cb_state.summary(),

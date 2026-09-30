@@ -468,6 +468,20 @@ fn extract_lane(
                 Vec::new(),
             );
         }
+        // A failed snapshot verify leaves the restored bridge unproven; it is
+        // degraded, not loading, so it needs its own refusal here.
+        _ if matches!(
+            generation.health.snapshot_verify_state,
+            crate::live_index::SnapshotVerifyState::Failed(_)
+        ) =>
+        {
+            return empty(
+                Some(KnowledgeLaneReadiness::NoValidSource),
+                None,
+                0,
+                Vec::new(),
+            );
+        }
         _ => {}
     }
 

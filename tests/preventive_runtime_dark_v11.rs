@@ -1030,7 +1030,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // test-body edits; no new edge into src/index_lifecycle.
 // Refreshed 2026-09-30 for the single-publication snapshot verify and the
 // fresh-instance sweep fix; their lifecycle references stay inside persist.rs,
-// already on the wired roster.
+// already on the wired roster. Refreshed again for its review round: the
+// Failed verify state, slot-stop cancellation, and the batch catalog pass add
+// no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
     "bb64035d0b9480538812019b02c3bdc88bfc047ae3ad0737d43625537d12d62b",
     199,

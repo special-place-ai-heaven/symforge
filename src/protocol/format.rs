@@ -557,6 +557,7 @@ fn snapshot_verify_state_label(state: &SnapshotVerifyState) -> &'static str {
         SnapshotVerifyState::Pending => "pending",
         SnapshotVerifyState::Running(_) => "running",
         SnapshotVerifyState::Completed(_) => "completed",
+        SnapshotVerifyState::Failed(_) => "failed",
     }
 }
 
@@ -569,7 +570,7 @@ fn append_snapshot_verify_mismatch_summary(
         line.push(' ');
         line.push_str(&progress.describe());
     }
-    if let SnapshotVerifyState::Completed(report) = state {
+    if let SnapshotVerifyState::Completed(report) | SnapshotVerifyState::Failed(report) = state {
         line.push_str(&format!(" mismatches={}", report.mismatch_count));
         if report.mismatch_count > 0 {
             let shown = report.mismatched_paths.len().min(path_limit);
@@ -5632,7 +5633,9 @@ pub fn loading_guard_message_for(state: &SnapshotVerifyState, cold_bootstrap: bo
         SnapshotVerifyState::Running(progress) => {
             format!("verify=running {}", progress.describe())
         }
-        SnapshotVerifyState::NotNeeded | SnapshotVerifyState::Completed(_) => {
+        SnapshotVerifyState::NotNeeded
+        | SnapshotVerifyState::Completed(_)
+        | SnapshotVerifyState::Failed(_) => {
             return loading_guard_message(cold_bootstrap);
         }
     };

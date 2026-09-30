@@ -489,14 +489,20 @@ where
         // republished as already newer, so nothing is counted twice and the
         // verify still resolves. A path that changes after the verify's stat
         // pass is not claimed, is stale against its row, and is admitted here.
+        // Past the wait the verify is still in its stat pass and owns every
+        // restored row it has yet to classify, so defer all of them and admit
+        // only paths it holds no row for.
         let verify = snapshot_verify_claims(shared, &should_stop);
-        let claimed = verify.as_ref().and_then(|progress| progress.claims());
+        let claimed = verify.as_ref().and_then(|verify| verify.as_ref()?.claims());
+        let defer_restored = verify.is_some() && claimed.is_none();
         let (mut admitted, mut already_current, mut left_to_verify) = (0usize, 0usize, 0usize);
         for (relative_path, absolute_path, entry) in changed_entries {
             if should_stop() {
                 return stale_count.into();
             }
-            if claimed.is_some_and(|claimed| claimed.contains(&relative_path)) {
+            if claimed.is_some_and(|claimed| claimed.contains(&relative_path))
+                || (defer_restored && shared.read().files.contains_key(&relative_path))
+            {
                 left_to_verify += 1;
                 continue;
             }
@@ -627,28 +633,45 @@ where
 }
 
 /// Longest a sweep waits for a running snapshot verify to finish its stat
-/// pass and claim its paths. Past it the sweep proceeds on its own: correct,
-/// only slower, because the verify's per-path fences absorb the overlap.
+/// pass and claim its paths. Past it the sweep still leaves every restored
+/// row to the verify and admits only paths it holds no row for.
 const SNAPSHOT_VERIFY_CLAIMS_WAIT: Duration = Duration::from_secs(300);
 
-/// The running snapshot verify's progress once its claims are known, or
-/// `None` when no verify is running (or it has not claimed in time).
+/// Longest a sweep waits for a pending snapshot verify to start. Its task is
+/// spawned beside the restore and marks itself running at once; one still
+/// pending past this is not coming (a restore with no runtime to spawn it on),
+/// and the sweep reconciles the restored rows itself.
+const SNAPSHOT_VERIFY_START_WAIT: Duration = Duration::from_secs(5);
+
+/// `None` when no snapshot verify is in flight (or one never started);
+/// otherwise `Some` of its progress once it has claimed its paths, or
+/// `Some(None)` when it is running but has not claimed them in time.
 fn snapshot_verify_claims(
     shared: &SharedIndex,
     should_stop: &impl Fn() -> bool,
-) -> Option<crate::live_index::store::SnapshotVerifyProgress> {
-    let deadline = std::time::Instant::now() + SNAPSHOT_VERIFY_CLAIMS_WAIT;
+) -> Option<Option<crate::live_index::store::SnapshotVerifyProgress>> {
+    use crate::live_index::store::SnapshotVerifyState;
+    let started = std::time::Instant::now();
     loop {
         let progress = match &shared.read().snapshot_verify_state {
-            crate::live_index::store::SnapshotVerifyState::Running(progress) => progress.clone(),
+            SnapshotVerifyState::Running(progress) => Some(progress.clone()),
+            SnapshotVerifyState::Pending => None,
             _ => return None,
         };
-        if progress.claims().is_some() {
-            return Some(progress);
-        }
-        if should_stop() || std::time::Instant::now() >= deadline {
-            warn!("reconciliation: snapshot verify has not claimed its paths; sweeping without it");
+        if progress.is_none() && (should_stop() || started.elapsed() >= SNAPSHOT_VERIFY_START_WAIT)
+        {
+            warn!("reconciliation: snapshot verify never started; sweeping without it");
             return None;
+        }
+        if let Some(progress) = progress.filter(|progress| progress.claims().is_some()) {
+            return Some(Some(progress));
+        }
+        if should_stop() || started.elapsed() >= SNAPSHOT_VERIFY_CLAIMS_WAIT {
+            warn!(
+                "reconciliation: snapshot verify has not claimed its paths; \
+                 leaving every restored row to it"
+            );
+            return Some(None);
         }
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -720,8 +720,11 @@ where
         // Compute the hash and compare without holding the publication writer lock.
         let new_hash = hash::digest_hex(&bytes);
         {
+            // The resident row, not the query-gated `get_file`: a restored row
+            // hidden while its snapshot is verified still proves these bytes
+            // are already held, and missing it re-parses and republishes.
             let index = shared.read();
-            if let Some(existing) = index.get_file(relative_path)
+            if let Some(existing) = index.files.get(relative_path)
                 && existing.content_hash == new_hash
             {
                 drop(index);
