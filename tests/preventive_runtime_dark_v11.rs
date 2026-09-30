@@ -1045,9 +1045,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // finding lines, bounded gate re-read): no new file, no edge into
 // src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "be0b0ca1f0d29490ca5dd2fa4ea5a8532c333d59d37b75f392c3d5c677c5224a",
+    "1ecd5e0f0d3bc339c5254defaf1260f674d78bf870b29a62acef2857c7412cae",
     199,
-    9_903_942,
+    9_906_296,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

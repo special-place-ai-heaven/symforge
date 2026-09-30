@@ -607,3 +607,56 @@ impl ReadGate {
         admit_disk_read(live, relative_path, canon_path)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The recorded-demotion line re-read has exactly one caller: the disk-read
+    /// core behind `admit_disk_read`, on its rendering branch. Visibility keeps
+    /// it inside this file; this pin keeps it out of every other lane here.
+    #[test]
+    fn recorded_line_reread_is_called_only_from_the_disk_read_lane() {
+        let needle = concat!("recorded_refusal_", "naming_lines(");
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = manifest.join("src");
+        let mut callers: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read source dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&src)
+                    .expect("under src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let contents = std::fs::read_to_string(&path).expect("read source file");
+                let mut enclosing = String::new();
+                for line in contents.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    for prefix in ["fn ", "pub fn ", "pub(crate) fn "] {
+                        if let Some(rest) = trimmed.strip_prefix(prefix) {
+                            enclosing = rest.split(['(', '<']).next().unwrap_or("").to_string();
+                        }
+                    }
+                    if line.contains(needle) && !trimmed.contains(&format!("fn {needle}")) {
+                        callers.push((relative.clone(), enclosing.clone()));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            callers,
+            vec![("protocol/read_gate.rs".to_string(), "disk_read".to_string())],
+            "the line re-read must be reached only through the disk-read lane"
+        );
+    }
+}
