@@ -17976,7 +17976,9 @@ mod tests {
         );
 
         // Matching-local by the bound root's deterministic project key -> proceed.
-        let key = crate::daemon::project_key(&root);
+        // The key is defined over the canonical root, which differs from the
+        // tempdir spelling when TEMP is an 8.3 short name.
+        let key = crate::daemon::project_key(&crate::live_index::store::normalize_root(&root));
         assert!(
             server
                 .local_cross_project_refusal(Some(key.as_str()), None)

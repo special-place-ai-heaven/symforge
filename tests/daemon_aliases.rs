@@ -117,53 +117,6 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
         .await
         .expect("open session body");
 
-    // --- Call the OLD name: trace_symbol -----------------------------------
-    let alias_resp = client
-        .post(format!(
-            "{base_url}/v1/sessions/{}/tools/trace_symbol",
-            opened.session_id
-        ))
-        .bearer_auth(&auth_token)
-        .json(&serde_json::json!({
-            "path": "src/main.rs",
-            "name": "main",
-        }))
-        .send()
-        .await
-        .expect("trace_symbol alias request");
-
-    assert!(
-        alias_resp.status().is_success(),
-        "trace_symbol alias HTTP status must be 2xx, got {}",
-        alias_resp.status(),
-    );
-    let alias_body = alias_resp.text().await.expect("trace_symbol alias body");
-    assert!(
-        !alias_body.contains("unknown tool"),
-        "trace_symbol alias must not return 'unknown tool' while retained for \
-         compatibility. Got body: {alias_body}"
-    );
-    let deprecation_warning = concat!(
-        "Deprecation warning: `trace_symbol` is retired; ",
-        "use `get_symbol_context` with `sections=[...]` or `find_references` instead. ",
-        "Compatibility policy: keep daemon alias through v7.x; planned removal in v8.0."
-    );
-    assert!(
-        alias_body.starts_with(deprecation_warning),
-        "trace_symbol alias must emit an explicit deprecation warning. Got body: {alias_body}"
-    );
-    assert!(
-        !alias_body.starts_with("Error in trace_symbol:"),
-        "trace_symbol dispatch layer must not error — the alias branch in \
-         execute_tool_call is responsible for translating input. Got body: \
-         {alias_body}"
-    );
-    assert!(
-        alias_body.contains("main"),
-        "trace_symbol response must mention the traced symbol `main`. Got \
-         body: {alias_body}"
-    );
-
     // --- Call the DESTINATION with the translated input --------------------
     //
     // `execute_tool_call`'s `trace_symbol` branch maps `{path, name}` to
@@ -171,30 +124,98 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
     // ..Default::default()-equivalent }`. Reproduce that input exactly here.
     // `sections: []` in the JSON deserializes to `Some(vec![])`, which the
     // handler treats as "trace mode, all sections".
-    let destination_resp = client
-        .post(format!(
-            "{base_url}/v1/sessions/{}/tools/get_symbol_context",
-            opened.session_id
-        ))
-        .bearer_auth(&auth_token)
-        .json(&serde_json::json!({
-            "name": "main",
-            "path": "src/main.rs",
-            "sections": [],
-        }))
-        .send()
-        .await
-        .expect("get_symbol_context destination request");
+    let fetch_destination = || async {
+        let destination_resp = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/get_symbol_context",
+                opened.session_id
+            ))
+            .bearer_auth(&auth_token)
+            .json(&serde_json::json!({
+                "name": "main",
+                "path": "src/main.rs",
+                "sections": [],
+            }))
+            .send()
+            .await
+            .expect("get_symbol_context destination request");
 
-    assert!(
-        destination_resp.status().is_success(),
-        "get_symbol_context destination HTTP status must be 2xx, got {}",
-        destination_resp.status(),
+        assert!(
+            destination_resp.status().is_success(),
+            "get_symbol_context destination HTTP status must be 2xx, got {}",
+            destination_resp.status(),
+        );
+        destination_resp
+            .text()
+            .await
+            .expect("get_symbol_context destination body")
+    };
+
+    // Both payloads embed the index publication generation, which background
+    // work (watcher reconciliation, git temporal) may advance at any moment
+    // after open without changing content. Bracket the alias call between two
+    // destination calls and compare only when the brackets agree, so no
+    // publication landed between the two answers being compared.
+    let deprecation_warning = concat!(
+        "Deprecation warning: `trace_symbol` is retired; ",
+        "use `get_symbol_context` with `sections=[...]` or `find_references` instead. ",
+        "Compatibility policy: keep daemon alias through v7.x; planned removal in v8.0."
     );
-    let destination_body = destination_resp
-        .text()
-        .await
-        .expect("get_symbol_context destination body");
+    let mut attempts = 0;
+    let (alias_body, destination_body) = loop {
+        let before = fetch_destination().await;
+        // --- Call the OLD name: trace_symbol -------------------------------
+        let alias_resp = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/trace_symbol",
+                opened.session_id
+            ))
+            .bearer_auth(&auth_token)
+            .json(&serde_json::json!({
+                "path": "src/main.rs",
+                "name": "main",
+            }))
+            .send()
+            .await
+            .expect("trace_symbol alias request");
+
+        assert!(
+            alias_resp.status().is_success(),
+            "trace_symbol alias HTTP status must be 2xx, got {}",
+            alias_resp.status(),
+        );
+        let alias_body = alias_resp.text().await.expect("trace_symbol alias body");
+        assert!(
+            !alias_body.contains("unknown tool"),
+            "trace_symbol alias must not return 'unknown tool' while retained for \
+             compatibility. Got body: {alias_body}"
+        );
+        assert!(
+            alias_body.starts_with(deprecation_warning),
+            "trace_symbol alias must emit an explicit deprecation warning. Got body: {alias_body}"
+        );
+        assert!(
+            !alias_body.starts_with("Error in trace_symbol:"),
+            "trace_symbol dispatch layer must not error — the alias branch in \
+             execute_tool_call is responsible for translating input. Got body: \
+             {alias_body}"
+        );
+        assert!(
+            alias_body.contains("main"),
+            "trace_symbol response must mention the traced symbol `main`. Got \
+             body: {alias_body}"
+        );
+
+        let destination_body = fetch_destination().await;
+        if before == destination_body {
+            break (alias_body, destination_body);
+        }
+        attempts += 1;
+        assert!(
+            attempts < 5,
+            "the index republished between every bracketed read; last pair:\n{before}\n---\n{destination_body}"
+        );
+    };
 
     // --- Deprecated alias preserves destination payload after warning ------
     let alias_payload = alias_body
