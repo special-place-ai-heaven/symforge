@@ -67,6 +67,9 @@ pub enum WorktreeError {
     #[error("TargetFileMissing: target file `{}` does not exist — {hint}", path.display())]
     TargetFileMissing { path: PathBuf, hint: String },
 
+    #[error("TargetPathRefused: rerouted target `{}` is refused — {reason}", path.display())]
+    TargetPathRefused { path: PathBuf, reason: String },
+
     #[error(
         "PathOutsideIndexedRoot: indexed path `{}` is not under the indexed root `{}`",
         path.display(), indexed_root.display()
@@ -291,11 +294,24 @@ pub fn resolve_target_path(
     }
 
     let target_path = canonical_wd.join(relative);
-    if !target_path.exists() {
-        return Err(WorktreeError::TargetFileMissing {
-            path: target_path,
-            hint: "the worktree may be at a commit where this file does not yet exist; check `git ls-tree HEAD <relative_path>` in the worktree".to_string(),
-        });
+    // The target is read and written, so it must be the worktree's own file
+    // under its own name. It is resolved like any caller path beneath that
+    // root: a link out of the worktree or another spelling of a file is
+    // refused before anything opens it.
+    match crate::discovery::resolve_repo_path(&canonical_wd, &relative.to_string_lossy()) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(WorktreeError::TargetFileMissing {
+                path: target_path,
+                hint: "the worktree may be at a commit where this file does not yet exist; check `git ls-tree HEAD <relative_path>` in the worktree".to_string(),
+            });
+        }
+        Err(refusal) => {
+            return Err(WorktreeError::TargetPathRefused {
+                path: target_path,
+                reason: format!("{refusal:?}"),
+            });
+        }
     }
 
     Ok(ResolvedTarget {
@@ -754,6 +770,43 @@ mod tests {
                 WorktreeError::WorkingDirectoryNotARecognizedWorktree { .. }
             ),
             "got {err:?}"
+        );
+    }
+
+    /// The reroute target is read and written, so it must be the worktree's
+    /// own file: another spelling of it, or a link out of the worktree, is
+    /// refused before anything opens it.
+    #[test]
+    fn resolve_refuses_an_aliased_or_linked_reroute_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("main/src")).unwrap();
+        fs::create_dir_all(tmp.path().join("wt/src")).unwrap();
+        let main_root = canonicalize(&tmp.path().join("main")).unwrap();
+        let wt_root = canonicalize(&tmp.path().join("wt")).unwrap();
+        fs::write(main_root.join("src/file.rs"), "fn main() {}\n").unwrap();
+
+        #[cfg(windows)]
+        fs::write(wt_root.join("src/FILE.rs"), "fn main() {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            let outside = tmp.path().join("outside.rs");
+            fs::write(&outside, "placeholder\n").unwrap();
+            std::os::unix::fs::symlink(&outside, wt_root.join("src/file.rs")).unwrap();
+        }
+
+        let mut cache = WorktreeCache::new();
+        cache.insert(&main_root, wt_root.clone());
+        let result = resolve_target_path(
+            &main_root.join("src/file.rs"),
+            &main_root,
+            Some(&wt_root),
+            &mut cache,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|err| err.to_string().starts_with("TargetPathRefused")),
+            "got {result:?}"
         );
     }
 

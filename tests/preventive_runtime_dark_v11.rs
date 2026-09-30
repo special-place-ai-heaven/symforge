@@ -1052,10 +1052,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for the largest-first parse order and the linear xref macro
 // fallback (store, parsing, xref, domain index): no new file, no edge into
 // src/index_lifecycle.
+// Refreshed for the path-safety fix: credential-directory roots, Unicode
+// case folding, nested gitignore anchoring, the watcher build-dir skip and
+// the INI secret-access-key detector widening
+// add no edge into src/index_lifecycle; its one reference is a watcher test
+// registering an observer exactly as the neighbouring tests do.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "f519c54d75469d3e78ec5879097f7ac126f6adb4b0227af6e8b647a4b92ffecb",
+    "972a8f74b4399c758097801bf6dca706332fa30320bd4eae5cd92c76332e0392",
     199,
-    10_132_323,
+    10_158_896,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

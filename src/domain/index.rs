@@ -614,6 +614,7 @@ pub enum RootRefusalReason {
     UnsupportedPathEncoding,
     DeviceOrSpecialNamespace,
     ProtectedRootRequiresExplicitOverride,
+    CredentialDirectory,
 }
 
 impl RootRefusalReason {
@@ -631,6 +632,7 @@ impl RootRefusalReason {
             Self::ProtectedRootRequiresExplicitOverride => {
                 "protected_root_requires_explicit_override"
             }
+            Self::CredentialDirectory => "credential_directory",
         }
     }
 }

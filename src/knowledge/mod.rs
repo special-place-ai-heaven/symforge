@@ -42,7 +42,11 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// comment or attribute line, a Rust lifetime, `<`-prefixed and userinfo
 /// placeholders). A v3 manifest withholds files v4 admits, so it must be
 /// re-scouted rather than trusted.
-pub const SECRET_POLICY_VERSION: u32 = 4;
+///
+/// Bumped to 5: `secret_access_key` (the INI credential-profile key) now
+/// reaches the context-assignment rule, so a v4 manifest admits files v5
+/// withholds.
+pub const SECRET_POLICY_VERSION: u32 = 5;
 pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
@@ -175,7 +179,7 @@ fn compile_secret_rules() -> Result<Vec<SecretRule>, DetectorFailure> {
             // the NEXT KEY (`{token: "ab", environment: production}` would
             // capture `environment:`), the exact false-positive class the FO-5
             // ruling refuses. Zero skips keeps the historical shape byte-for-byte.
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret)[ \t]*[:=][ \t]*(?:\[[ \t]*)?(?:(?:["'][^"'\n]{0,7}["'][ \t]*,[ \t]*)+["']|["']?)([^\s"'#]{8,})"#,
+            r#"(?i)(?:api[_-]?key|secret(?:[_-]?access[_-]?key)?|token|password|passwd|pwd|client[_-]?secret)[ \t]*[:=][ \t]*(?:\[[ \t]*)?(?:(?:["'][^"'\n]{0,7}["'][ \t]*,[ \t]*)+["']|["']?)([^\s"'#]{8,})"#,
             1,
             true,
         ),
@@ -970,12 +974,14 @@ fn is_safe_template_basename(basename: &str) -> bool {
 pub fn sensitive_path_rule(relative_path: &str) -> Option<&'static str> {
     // Empty and `.` segments open the same file, so they are dropped before
     // matching; otherwise `.aws//credentials` escapes the multi-component rules.
-    let normalized = relative_path
-        .split(['/', '\\'])
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .collect::<Vec<_>>()
-        .join("/")
-        .to_ascii_lowercase();
+    // Folded as case-insensitive filesystems fold names, not just ASCII.
+    let normalized = crate::paths::fold_case(
+        &relative_path
+            .split(['/', '\\'])
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .collect::<Vec<_>>()
+            .join("/"),
+    );
     let basename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
 
     if !is_safe_template_basename(basename)
@@ -1004,6 +1010,18 @@ pub fn sensitive_path_rule(relative_path: &str) -> Option<&'static str> {
         return Some("path.infrastructure-state");
     }
     None
+}
+
+/// [`sensitive_path_rule`] judged on the file's absolute path as well as its
+/// root-relative one. A root inside a credential directory leaves only the
+/// bare name (`credentials` under a root ending in `.aws`), which no
+/// multi-component rule matches; the absolute path still carries it.
+pub fn sensitive_path_rule_at(
+    relative_path: &str,
+    absolute_path: &std::path::Path,
+) -> Option<&'static str> {
+    sensitive_path_rule(relative_path)
+        .or_else(|| sensitive_path_rule(&absolute_path.to_string_lossy()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1349,6 +1367,46 @@ mod tests {
             );
         }
         assert!(sensitive_path_rule("src/./lib.rs").is_none());
+    }
+
+    /// Case-insensitive filesystems fold more than ASCII: ext4/f2fs casefold,
+    /// NTFS and APFS all fold U+017F (long s) with `s` and U+212A (Kelvin sign)
+    /// with `k`, so these spellings open the credential file itself.
+    #[test]
+    fn sensitive_path_rule_folds_unicode_case() {
+        for spelling in [
+            ".aws/credential\u{17F}",
+            ".\u{212A}ube/config",
+            "keys/id_r\u{17F}a",
+            "deploy/.ENV",
+            ".\u{212A}UBE/CONFIG",
+        ] {
+            assert!(
+                sensitive_path_rule(spelling).is_some(),
+                "{spelling:?} must match its credential rule"
+            );
+        }
+    }
+
+    /// A root inside a credential directory leaves only the bare file name as
+    /// the relative path; the absolute path still carries the directory.
+    #[test]
+    fn sensitive_path_rule_at_judges_the_absolute_path_too() {
+        let root = std::path::Path::new("/home/user/.aws");
+        assert!(sensitive_path_rule("credentials").is_none());
+        assert_eq!(
+            sensitive_path_rule_at("credentials", &root.join("credentials")),
+            Some("path.cloud-credential-store")
+        );
+        let kube = std::path::Path::new(r"C:\Users\user\.kube");
+        assert!(sensitive_path_rule_at("config", &kube.join("config")).is_some());
+        assert!(
+            sensitive_path_rule_at(
+                "src/lib.rs",
+                std::path::Path::new("/home/user/repo/src/lib.rs")
+            )
+            .is_none()
+        );
     }
 
     // ── D1 comma-continuation pinning matrix (spec 023 proposal v2 §6) ─────
@@ -2063,6 +2121,20 @@ mod tests {
             // keyword must be followed by the separator, so a quoted JSON key
             // (`"key": "value"`) never matches. Pinned so a deliberate widening
             // flips this row rather than slipping in with a precision change.
+            // The INI credential key: a code lookup stays clean, its literal
+            // twin is caught.
+            (
+                "AWS1 python secret access key from environment",
+                "src/probe.py",
+                ["aws_", &secret_kw, "_access_key = os.environ.get(KEY_NAME)\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "AWS2 python secret access key literal",
+                "src/probe.py",
+                ["aws_", &secret_kw, "_access_key = \"", &real40, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
             (
                 "PJ1 json quoted key (known false negative)",
                 "config.json",
@@ -2107,6 +2179,8 @@ mod tests {
         ]
         .concat();
         let bearer = ["Author", "ization: Bearer ", &real, &real[..12]].concat();
+        // Forty characters of the AWS secret-key alphabet, `/` and `+` included.
+        let aws_secret = [&real, "/", &real[..9], "+", &real[..9]].concat();
         let rows: Vec<(&str, &str, String, &str)> = vec![
             (
                 "github token rust",
@@ -2243,6 +2317,27 @@ mod tests {
                 "fp-shape fill-in slot real value",
                 "config.toml",
                 [&apikey, " = \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            // INI credential profile: the keyword is followed by more of the
+            // key's name before the separator, and the value is unquoted.
+            (
+                "aws secret access key ini",
+                "deploy/aws.ini",
+                [
+                    "[default]\naws_",
+                    "sec",
+                    "ret_access_key = ",
+                    &aws_secret,
+                    "\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "aws secret access key ini upper",
+                "deploy/profile.cfg",
+                ["AWS_", "SEC", "RET_ACCESS_KEY=", &aws_secret, "\n"].concat(),
                 CONTEXT_ASSIGNMENT_RULE_ID,
             ),
         ];
