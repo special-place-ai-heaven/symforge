@@ -189,8 +189,13 @@ pub(crate) fn write_descriptor_for_pid_at(
 ) -> io::Result<()> {
     let sessions = dir.join(SESSIONS_DIR);
     std::fs::create_dir_all(&sessions)?;
-    let project_id = project_root.map(crate::daemon::project_key);
+    // Writer and reader both key the descriptor on `normalize_root`, so an
+    // 8.3 short name, verbatim prefix, or symlinked spelling of one directory
+    // still names one project on both sides of the comparison.
+    let project_root = project_root.map(crate::live_index::store::normalize_root);
+    let project_id = project_root.as_deref().map(crate::daemon::project_key);
     let project_root = project_root
+        .as_deref()
         .map(|root| {
             root.to_str().map(str::to_string).ok_or_else(|| {
                 io::Error::new(
@@ -335,7 +340,8 @@ fn select_descriptor_status(
 ) -> Option<SelectedSidecar> {
     let scan_started = Instant::now();
     prune_dead_descriptor_files_at(dir);
-    let expected_identity = match expected_project_root {
+    let expected_project_root = expected_project_root.map(crate::live_index::store::normalize_root);
+    let expected_identity = match expected_project_root.as_deref() {
         Some(root) => match root.to_str() {
             Some(root_text) => Some((crate::daemon::project_key(root), root_text.to_string())),
             None => {
@@ -923,6 +929,41 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("not valid UTF-8"))
         );
+    }
+
+    /// Two spellings of one directory must select one sidecar. The Windows CI
+    /// runner's TEMP is an 8.3 short name (`RUNNER~1`) that canonicalizes to
+    /// the long name; a `nested/..` spelling exercises the same textual
+    /// divergence portably.
+    #[test]
+    fn root_scoped_lookup_matches_non_canonical_spellings_of_one_root() {
+        let control = tempfile::tempdir().expect("control dir");
+        let project = tempfile::tempdir().expect("project root");
+        std::fs::create_dir(project.path().join("nested")).expect("nested dir");
+        let plain = project.path().to_path_buf();
+        let dotted = project.path().join("nested").join("..");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        for (written, looked_up) in [(&dotted, &plain), (&plain, &dotted)] {
+            write_descriptor_for_pid_at(
+                control.path(),
+                std::process::id(),
+                port,
+                None,
+                Some(written),
+                None,
+            )
+            .expect("write descriptor");
+            let selected = select_descriptor_status(control.path(), "127.0.0.1", Some(looked_up))
+                .expect("a descriptor exists for this root");
+            assert_eq!(
+                selected.status.port,
+                Some(port),
+                "written as {written:?}, looked up as {looked_up:?}: {:?}",
+                selected.status
+            );
+        }
     }
 
     #[test]
