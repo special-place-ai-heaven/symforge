@@ -355,13 +355,11 @@ fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Optio
 /// the refusal names the recorded verdict without lines rather than pairing it
 /// with positions from different content.
 ///
-/// The read is bounded like every other gate read: a relative path of plain
-/// components beneath the indexed root, none of them a link, a regular file
-/// opened once, and no more than the scan budget read from that one handle.
-/// Any doubt yields no lines, and the refusal itself never depends on this
-/// read.
-// ponytail: own per-component link walk; reuse the path-alias lane's
-// symlink resolver once that lands on main.
+/// The read is bounded like every other gate read: a spelling the shared
+/// repository-path resolver admits as the file's own name beneath the indexed
+/// root, a regular file opened once, and no more than the scan budget read
+/// from that one handle. Any doubt yields no lines, and the refusal itself
+/// never depends on this read.
 fn recorded_finding_lines(
     live: &LiveIndex,
     relative_path: &str,
@@ -370,18 +368,12 @@ fn recorded_finding_lines(
     let Some(root) = live.indexed_root.as_deref() else {
         return Vec::new();
     };
-    let mut full_path = root.to_path_buf();
-    for component in Path::new(relative_path).components() {
-        match component {
-            Component::CurDir => continue,
-            Component::Normal(part) => full_path.push(part),
-            _ => return Vec::new(),
-        }
-        match std::fs::symlink_metadata(&full_path) {
-            Ok(metadata) if !metadata.file_type().is_symlink() => {}
-            _ => return Vec::new(),
-        }
-    }
+    // The shared resolver admits only a spelling whose canonical path is,
+    // component for component, the spelling itself beneath the root: no link
+    // on any component, no alias, no escape.
+    let Ok(Some(full_path)) = crate::discovery::resolve_repo_path(root, relative_path) else {
+        return Vec::new();
+    };
     // Only a regular file is opened: opening a FIFO for reading blocks until a
     // writer appears, which would hang the refusal.
     if !std::fs::symlink_metadata(&full_path).is_ok_and(|metadata| metadata.is_file()) {
