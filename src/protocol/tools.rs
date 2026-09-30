@@ -22064,7 +22064,10 @@ mod tests {
             crate::protocol::read_gate::refuse_by_policy(&index, ".env").expect("refused");
         assert_eq!(
             refusal,
-            crate::protocol::format::content_withheld_by_admission(".env"),
+            crate::protocol::format::content_withheld_by_path_rule(
+                ".env",
+                crate::knowledge::sensitive_path_rule(".env").expect("a credential path"),
+            ),
             "the sensitive path rule takes precedence"
         );
 

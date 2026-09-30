@@ -1043,12 +1043,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for the secret-scan precision and withheld-refusal change
 // (knowledge, read gate, format, edit tools) and its review round (linear
 // finding lines, bounded gate re-read), rebased onto the path-alias fix
-// (credential aliases name their path rule; the re-read uses its resolver):
+// (credential aliases name their path rule; the re-read uses its resolver)
+// and the snapshot verify (edit-tool refusals keep its withheld notice last):
 // no new file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "f6a333f448151a4c45af56919babcd8633aa080fc4ce3acadbeabf685e6ddf76",
+    "d1d6c3f11bb075b85cb08c0649d848306e3f5d75734bff8ffbec43f29023de27",
     199,
-    9_946_776,
+    10_101_187,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
