@@ -36,13 +36,20 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// Bumped to 3: the context-assignment rule now enters inline arrays and skips
 /// short leading elements (`key = ["dev", "<cred>"]`), so files a v2 manifest
 /// recorded as clean can carry findings under v3.
-pub const SECRET_POLICY_VERSION: u32 = 3;
-const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
+///
+/// Bumped to 4: the context-assignment and uri-credentials verdicts moved in the
+/// other direction (a quote that CLOSES an earlier literal, a comma before a
+/// comment or attribute line, a Rust lifetime, `<`-prefixed and userinfo
+/// placeholders). A v3 manifest withholds files v4 admits, so it must be
+/// re-scouted rather than trusted.
+pub const SECRET_POLICY_VERSION: u32 = 4;
+pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
 /// cannot change — from a real content match.
 pub const INDETERMINATE_RULE_ID: &str = "secret.detector.indeterminate";
 const CONTEXT_ASSIGNMENT_RULE_ID: &str = "secret.context-assignment";
+const URI_CREDENTIALS_RULE_ID: &str = "secret.uri-credentials";
 /// Mirrors the `{8,}` payload floor inside that rule's pattern.
 const CONTEXT_ASSIGNMENT_MIN_PAYLOAD: usize = 8;
 /// Bytes of right-hand-side expression the exemption test will read. Five to six
@@ -67,6 +74,34 @@ pub fn exceeds_scan_limit(len: usize) -> bool {
     len > SECRET_SCAN_MAX_BYTES
 }
 
+/// How many finding line ranges a scan keeps: the ten a refusal shows, plus one
+/// so it knows to say there are more.
+pub const FINDING_LINE_RANGES_KEPT: usize = 11;
+
+/// The first [`FINDING_LINE_RANGES_KEPT`] runs of set bits, as inclusive
+/// 1-based line ranges. Bit `n` is line `n + 1`.
+fn first_line_ranges(line_bits: &[u64]) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for (word_index, &word) in line_bits.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            let bit = word_index * 64 + rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let line = u32::try_from(bit + 1).unwrap_or(u32::MAX);
+            match ranges.last_mut() {
+                Some((_, end)) if end.checked_add(1) == Some(line) => *end = line,
+                _ => {
+                    if ranges.len() == FINDING_LINE_RANGES_KEPT {
+                        return ranges;
+                    }
+                    ranges.push((line, line));
+                }
+            }
+        }
+    }
+    ranges
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DetectorFailure {
     PolicyCompilation,
@@ -80,6 +115,13 @@ pub enum SecretScan {
     Sensitive {
         rule_ids: Vec<&'static str>,
         finding_count: u32,
+        /// Inclusive 1-based line ranges holding a finding's capture,
+        /// ascending, merged across rules, and only the first
+        /// [`FINDING_LINE_RANGES_KEPT`]: one more than a refusal shows, so it
+        /// can say more exist. Lines, never bytes: enough to locate a false
+        /// positive, nothing of the value. Rendered by the read gate at refusal
+        /// time and never persisted, so the snapshot schema does not change.
+        line_ranges: Vec<(u32, u32)>,
     },
     Indeterminate {
         reason: DetectorFailure,
@@ -138,7 +180,7 @@ fn compile_secret_rules() -> Result<Vec<SecretRule>, DetectorFailure> {
             true,
         ),
         (
-            "secret.uri-credentials",
+            URI_CREDENTIALS_RULE_ID,
             &[b"://"],
             r"://[^/\s:@]+:([^@\s/]{4,})@",
             1,
@@ -253,11 +295,115 @@ fn is_placeholder_only_expression(value: &str) -> bool {
 /// closing quote as an opening one, and for a double-quoted literal the
 /// whole-literal skip then jumps to the NEXT literal's opening quote and blinds
 /// the payload fence behind it.
-fn right_hand_side_continuation(bytes: &[u8], capture_end: usize) -> usize {
-    match bytes.get(capture_end) {
-        Some(b'"' | b'\'' | b'`') => capture_end + 1,
-        _ => capture_end,
+///
+/// A placeholder capture can also stop SHORT of its closing quote: the value
+/// class ends at whitespace, so `"<<FILL_IN: model key>>"` captures only
+/// `<<FILL_IN:`. Resuming there would start the walk inside the literal, so the
+/// walk resumes past that literal's closing quote instead — and `None` (never
+/// exempt) when the line ends before the quote closes.
+fn right_hand_side_continuation(
+    bytes: &[u8],
+    capture_start: usize,
+    capture_end: usize,
+) -> Option<usize> {
+    let opener = capture_start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index).copied())
+        .filter(|byte| matches!(byte, b'"' | b'\'' | b'`'));
+    match (opener, bytes.get(capture_end)) {
+        (_, Some(b'"' | b'\'' | b'`')) => Some(capture_end + 1),
+        (Some(quote), _) => bytes[capture_end..]
+            .iter()
+            .take_while(|byte| **byte != b'\n')
+            .position(|byte| *byte == quote)
+            .map(|offset| capture_end + offset + 1),
+        (None, _) => Some(capture_end),
     }
+}
+
+/// `<<FILL_IN: model key>>`, `<your key>`: template syntax, not a credential —
+/// but only when the WHOLE value is one angle group. The value runs from the
+/// capture's `<` to the closing quote of the literal it sits in or, unquoted,
+/// to the end of the line, and after its FIRST `>` it may hold nothing but more
+/// `>`. So `<v1><credential>` and a heredoc opener (`<<-EOT`, whose body is the
+/// credential) are not placeholders, and a literal that never closes on this
+/// line is not one either.
+///
+/// Brackets alone prove nothing: `<credential>` is still the credential. The
+/// group's interior must read as prose (whitespace), carry no digit, or be a
+/// placeholder word (`<your-api-key>`).
+fn is_angle_placeholder(bytes: &[u8], start: usize) -> bool {
+    if bytes.get(start) != Some(&b'<') {
+        return false;
+    }
+    let line_end = bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |offset| start + offset);
+    let opener = start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index).copied())
+        .filter(|byte| matches!(byte, b'"' | b'\'' | b'`'));
+    let end = match opener {
+        Some(quote) => match bytes[start..line_end]
+            .iter()
+            .position(|byte| *byte == quote)
+        {
+            Some(offset) => start + offset,
+            None => return false,
+        },
+        None => line_end,
+    };
+    let value = bytes[start..end].trim_ascii_end();
+    let Some(first_close) = value.iter().position(|byte| *byte == b'>') else {
+        return false;
+    };
+    if !value[first_close..].iter().all(|byte| *byte == b'>') {
+        return false;
+    }
+    let interior = &value[..first_close];
+    let interior = &interior[interior.iter().take_while(|byte| **byte == b'<').count()..];
+    interior.iter().any(u8::is_ascii_whitespace)
+        || !interior.iter().any(u8::is_ascii_digit)
+        || is_placeholder(interior)
+}
+
+/// uri-credentials exemption: the URI documents a SHAPE rather than carrying a
+/// credential. BOTH halves must be placeholders: the userinfo password (`pass`,
+/// `password`, `pw`, `secret`, all `x`, or a generic placeholder), whole-capture
+/// only, AND the host (`host`, `localhost`, `example.*`, `<...>`, `${...}`). A
+/// placeholder-looking password on a real host (`admin:changeme@prod-db`) is a
+/// real, if weak, credential and stays flagged.
+fn uri_credentials_are_placeholder(
+    bytes: &[u8],
+    userinfo_start: usize,
+    userinfo_end: usize,
+) -> bool {
+    let userinfo = &bytes[userinfo_start..userinfo_end];
+    let placeholder_userinfo = is_placeholder(userinfo)
+        || matches!(
+            userinfo.to_ascii_lowercase().as_slice(),
+            b"pass" | b"password" | b"pw" | b"secret"
+        )
+        || userinfo.iter().all(|byte| byte.eq_ignore_ascii_case(&b'x'));
+    // `userinfo_end` holds the `@`; the host runs to the first delimiter.
+    let host = bytes[userinfo_end + 1..]
+        .iter()
+        .take_while(|byte| {
+            !matches!(
+                byte,
+                b'/' | b':' | b'?' | b'#' | b'"' | b'\'' | b'`' | b')' | b']' | b',' | b';'
+            ) && !byte.is_ascii_whitespace()
+        })
+        .count();
+    let host = std::str::from_utf8(&bytes[userinfo_end + 1..userinfo_end + 1 + host])
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let placeholder_host = matches!(host.as_str(), "host" | "localhost")
+        || host.starts_with("example.")
+        || (host.len() > 2 && host.starts_with('<') && host.ends_with('>'))
+        || is_placeholder_only_expression(&host);
+    placeholder_userinfo && placeholder_host
 }
 
 /// Stage 2 for [`CONTEXT_ASSIGNMENT_RULE_ID`], on CODE-language paths only.
@@ -289,25 +435,50 @@ fn right_hand_side_continuation(bytes: &[u8], capture_end: usize) -> usize {
 fn assignment_is_code_expression(
     path: &str,
     bytes: &[u8],
+    match_start: usize,
     value_start: usize,
     value: &[u8],
 ) -> bool {
-    if !crate::domain::LanguageId::from_path(path)
-        .is_some_and(|language| language.is_code_language())
-    {
+    let Some(language) =
+        crate::domain::LanguageId::from_path(path).filter(|language| language.is_code_language())
+    else {
         return false;
+    };
+    if separator_is_path_not_assignment(bytes, match_start, value_start) {
+        return true;
     }
-    let opens_literal = value_start
+    let rust = language == crate::domain::LanguageId::Rust;
+    let quote_before_value = value_start
         .checked_sub(1)
         .and_then(|index| bytes.get(index).copied())
         .is_some_and(|byte| matches!(byte, b'"' | b'\''));
-    if opens_literal {
-        return false;
+    if quote_before_value {
+        // Step 1 applies only to an OPENING quote. When the KEYWORD sits inside
+        // a literal and the value does not, that quote CLOSED the keyword's
+        // literal (a `split` call whose argument ends in keyword and separator,
+        // matrix row PA1): the capture is the code after it. Walk from just past the quote, which is outside every literal,
+        // tolerating the closers of groups opened before it. Any other shape —
+        // including a parity doubt that leaves either side "inside" — is an
+        // opener and never exempt.
+        // The keyword's literal must also be COMPACT — no whitespace between its
+        // opening quote and this one (`"token="`, `"&access_token="`). Parity
+        // alone is fooled by a stray quote earlier on the line (`'"'`), which
+        // would make a real assignment's OPENING quote look like a closer.
+        let quote = bytes[value_start - 1];
+        let compact_keyword_literal = bytes[..value_start - 1]
+            .iter()
+            .rposition(|byte| *byte == quote || byte.is_ascii_whitespace())
+            .is_some_and(|open| bytes[open] == quote && open < match_start);
+        let closes_keyword_literal = compact_keyword_literal
+            && match_is_inside_string_literal(bytes, match_start, rust)
+            && !match_is_inside_string_literal(bytes, value_start, rust);
+        return closes_keyword_literal
+            && !expression_carries_quoted_payload(bytes, value_start, true);
     }
-    if match_is_inside_string_literal(bytes, value_start) {
+    if match_is_inside_string_literal(bytes, value_start, rust) {
         return capture_is_single_interpolation(value);
     }
-    !expression_carries_quoted_payload(bytes, value_start)
+    !expression_carries_quoted_payload(bytes, value_start, false)
 }
 
 /// True when `value_start` sits inside a string, char or template literal that
@@ -317,10 +488,16 @@ fn assignment_is_code_expression(
 /// Counting each delimiter class SEPARATELY is what keeps a double-quoted
 /// literal detectable when it also contains an apostrophe.
 ///
+/// In Rust (`rust`), an apostrophe followed by an identifier byte whose closing
+/// quote is not two bytes on is a lifetime or label (`&'static str`), not a
+/// char literal, and does not toggle parity. Rust only: in Python, JavaScript
+/// and friends that apostrophe OPENS a string, and skipping it would move a
+/// credential outside the literal it sits in.
+///
 /// CEILING: a literal opened on a PRIOR line is invisible here, and every other
-/// parity mistake (a lone lifetime, an apostrophe in a comment, a raw-string
-/// hash count) reports "inside", which fails closed.
-fn match_is_inside_string_literal(bytes: &[u8], value_start: usize) -> bool {
+/// parity mistake (an apostrophe in a comment, an odd backtick in a doc
+/// comment, a raw-string hash count) reports "inside", which fails closed.
+fn match_is_inside_string_literal(bytes: &[u8], value_start: usize, rust: bool) -> bool {
     let line_start = bytes[..value_start]
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -334,6 +511,12 @@ fn match_is_inside_string_literal(bytes: &[u8], value_start: usize) -> bool {
                 continue;
             }
             b'"' => double = !double,
+            b'\''
+                if rust
+                    && bytes
+                        .get(index + 1)
+                        .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_')
+                    && bytes.get(index + 2) != Some(&b'\'') => {}
             b'\'' => single = !single,
             b'`' => backtick = !backtick,
             _ => {}
@@ -341,6 +524,56 @@ fn match_is_inside_string_literal(bytes: &[u8], value_start: usize) -> bool {
         index += 1;
     }
     double || single || backtick
+}
+
+/// A doubled colon after the keyword (`CancellationToken::new`, a doc link to
+/// `CancellationToken::is_cancelled`) is a PATH separator in every code
+/// language here, never an assignment. Exempt only when the rest of the line
+/// leaves no bracket open, fences no payload, and does not continue onto the
+/// next line, so a path CALL or constant carrying a literal — on this line or
+/// on a continuation line — is still judged by the ordinary steps.
+fn separator_is_path_not_assignment(bytes: &[u8], match_start: usize, value_start: usize) -> bool {
+    let Some(separator) = bytes[match_start..value_start]
+        .iter()
+        .position(|byte| matches!(byte, b':' | b'='))
+        .map(|offset| match_start + offset)
+    else {
+        return false;
+    };
+    if bytes[separator] != b':' || bytes.get(separator + 1) != Some(&b':') {
+        return false;
+    }
+    let line_end = bytes[separator..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |offset| separator + offset);
+    // The line proves nothing when the expression continues past it
+    // (a C++ constant whose literal sits on the next line, a builder chain):
+    // fall through to the ordinary steps, whose walk follows continuations.
+    if line_end < bytes.len() && line_break_continues_expression(bytes, line_end) {
+        return false;
+    }
+    let rest = &bytes[separator + 2..line_end];
+    let mut depth = 0_u32;
+    for byte in rest {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let fences_payload = rest.iter().enumerate().any(|(index, quote)| {
+        matches!(quote, b'"' | b'\'' | b'`') && {
+            let run = rest[index + 1..]
+                .iter()
+                .take_while(|byte| {
+                    !matches!(byte, b'"' | b'\'' | b'`' | b'#') && !byte.is_ascii_whitespace()
+                })
+                .count();
+            run >= CONTEXT_ASSIGNMENT_MIN_PAYLOAD && rest.get(index + 1 + run) == Some(quote)
+        }
+    });
+    depth == 0 && !fences_payload
 }
 
 /// A capture that is WHOLLY one interpolation placeholder: `{`, at least one
@@ -384,16 +617,24 @@ fn capture_is_single_interpolation(value: &[u8]) -> bool {
 /// value (oracle row G10b, accepted regression). Every terminator heuristic
 /// keyed on this byte produced a credential leak, so the comma is a
 /// continuation, never a terminator.
+///
+/// ONE carve-out (owner ruling 2026-09-29): a trailing comma followed by a line
+/// that opens with `//` or `#[` ends the expression. That is a struct field
+/// followed by a doc comment or attribute, and walking on read the NEXT field's
+/// doc-comment example (`(e.g. "model-id")`) as this field's payload. Accepted
+/// cost, pinned by matrix row PB4: a JavaScript declarator list interrupted by
+/// a `//` comment line hides the declarators after it.
 fn line_break_continues_expression(window: &[u8], newline: usize) -> bool {
     const CONTINUATION: &[u8] = b"+-*|&^%=.?:\\,";
     let trailing = window[..newline]
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
         .map(|index| window[index]);
-    let leading = window[newline + 1..]
-        .iter()
-        .find(|byte| !byte.is_ascii_whitespace())
-        .copied();
+    let next_line = window[newline + 1..].trim_ascii_start();
+    if trailing == Some(b',') && (next_line.starts_with(b"//") || next_line.starts_with(b"#[")) {
+        return false;
+    }
+    let leading = next_line.first().copied();
     trailing.is_some_and(|byte| CONTINUATION.contains(&byte))
         || leading.is_some_and(|byte| CONTINUATION.contains(&byte))
 }
@@ -487,8 +728,19 @@ fn bounded_char_literal_len(window: &[u8], at: usize) -> Option<usize> {
 /// [`scan_secret_bytes`], which resumes at
 /// [`right_hand_side_continuation`] — one byte past the quote the capture
 /// closed. Entering mid-literal reads that literal's CLOSING quote as an
-/// opening one and inverts quote parity for the whole window.
-fn expression_carries_quoted_payload(bytes: &[u8], from: usize) -> bool {
+/// opening one and inverts quote parity for the whole window. The third caller,
+/// step 1's closing-quote branch, starts one byte past the quote that closed
+/// the keyword's literal.
+///
+/// `after_closed_literal` is set by that third caller only. Its window starts
+/// INSIDE the argument list the keyword's literal was passed to, so a closer
+/// arriving before any opener belongs to that list and is not evidence the
+/// expression ended: the walk steps over it instead of reporting "consumed".
+fn expression_carries_quoted_payload(
+    bytes: &[u8],
+    from: usize,
+    after_closed_literal: bool,
+) -> bool {
     let end = from
         .saturating_add(CONTEXT_ASSIGNMENT_SCAN_BOUND)
         .min(bytes.len());
@@ -548,8 +800,11 @@ fn expression_carries_quoted_payload(bytes: &[u8], from: usize) -> bool {
             b')' | b']' | b'}' => {
                 depth -= 1;
                 if depth < 0 {
-                    // The match sat inside an enclosing group: consumed.
-                    return false;
+                    if !after_closed_literal {
+                        // The match sat inside an enclosing group: consumed.
+                        return false;
+                    }
+                    depth = 0;
                 }
                 index += 1;
             }
@@ -576,8 +831,8 @@ fn expression_carries_quoted_payload(bytes: &[u8], from: usize) -> bool {
 }
 
 /// Scan stable admitted bytes under the deterministic, compile-once v1 policy.
-/// The result retains only safe rule IDs and a count; matched bytes and ranges
-/// never escape this function.
+/// The result retains only safe rule IDs, a count, and the 1-based line of each
+/// finding; matched bytes and byte ranges never escape this function.
 pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
     if exceeds_scan_limit(bytes.len()) {
         return SecretScan::Indeterminate {
@@ -591,6 +846,9 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
 
     let mut rule_ids = Vec::new();
     let mut finding_count = 0_u32;
+    // One bit per line, merged across rules. Bounded by the scan budget: at most
+    // one bit per byte, so 512 KiB for a file of nothing but newlines.
+    let mut line_bits: Vec<u64> = Vec::new();
     for rule in rules {
         if !rule
             .keywords
@@ -599,13 +857,20 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
         {
             continue;
         }
+        // A rule's captures arrive in ascending order, so one cursor per rule
+        // counts every newline once: linear in the file, not in findings times
+        // file.
+        let (mut cursor, mut line) = (0_usize, 0_usize);
         for captures in rule.pattern.captures_iter(bytes) {
             let Some(secret) = captures.get(rule.secret_capture) else {
                 return SecretScan::Indeterminate {
                     reason: DetectorFailure::Internal,
                 };
             };
-            if rule.placeholders_allowed && is_placeholder(secret.as_bytes()) {
+            if rule.placeholders_allowed
+                && (is_placeholder(secret.as_bytes())
+                    || is_angle_placeholder(bytes, secret.start()))
+            {
                 // The CAPTURE is a placeholder — but that exempts the capture,
                 // not the expression it sits in. A placeholder in one operand
                 // must never license a hardcoded literal in another, so the
@@ -613,14 +878,23 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                 // outside the literal this capture closed. Same withdrawal test
                 // the code-expression exemption answers to, applied at the one
                 // boundary both exemptions pass through.
-                if !expression_carries_quoted_payload(
-                    bytes,
-                    right_hand_side_continuation(bytes, secret.end()),
-                ) {
+                if right_hand_side_continuation(bytes, secret.start(), secret.end())
+                    .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false))
+                {
                     continue;
                 }
-            } else if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
-                && assignment_is_code_expression(path, bytes, secret.start(), secret.as_bytes())
+            } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
+                && assignment_is_code_expression(
+                    path,
+                    bytes,
+                    captures
+                        .get(0)
+                        .map_or(secret.start(), |whole| whole.start()),
+                    secret.start(),
+                    secret.as_bytes(),
+                ))
+                || (rule.id == URI_CREDENTIALS_RULE_ID
+                    && uri_credentials_are_placeholder(bytes, secret.start(), secret.end()))
             {
                 continue;
             }
@@ -628,6 +902,16 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
             if !rule_ids.contains(&rule.id) {
                 rule_ids.push(rule.id);
             }
+            line += bytes[cursor..secret.start()]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = secret.start();
+            let word = line / 64;
+            if word >= line_bits.len() {
+                line_bits.resize(word + 1, 0);
+            }
+            line_bits[word] |= 1 << (line % 64);
         }
     }
 
@@ -637,6 +921,7 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
         SecretScan::Sensitive {
             rule_ids,
             finding_count,
+            line_ranges: first_line_ranges(&line_bits),
         }
     }
 }
@@ -777,6 +1062,7 @@ where
         SecretScan::Sensitive {
             rule_ids,
             finding_count,
+            ..
         } => StableContentAdmission::MetadataOnly(
             crate::domain::MetadataOnlyReason::SensitiveContent {
                 rule_ids: rule_ids.into_iter().map(ToOwned::to_owned).collect(),
@@ -819,6 +1105,7 @@ fn guard_visible_fields(fields: &[&str]) -> Result<(), GuardFailure> {
             SecretScan::Sensitive {
                 rule_ids: field_rule_ids,
                 finding_count: field_count,
+                ..
             } => {
                 finding_count = finding_count.saturating_add(field_count);
                 for rule_id in field_rule_ids {
@@ -1485,6 +1772,584 @@ mod tests {
         assert!(
             failures.is_empty(),
             "array rows off expectation: {failures:?}"
+        );
+    }
+
+    /// A real-looking alphanumeric value, assembled at runtime so no literal of
+    /// credential shape enters this file.
+    fn mx_real() -> String {
+        ["Zq8r", "Lm3v", "Tx7w", "Pk2n", "Hy5s"].concat()
+    }
+
+    fn scan_verdict(path: &str, body: &str) -> Result<MxVerdict, String> {
+        match scan_secret_bytes(path, body.as_bytes()) {
+            SecretScan::Clean => Ok(MxVerdict::Clean),
+            SecretScan::Sensitive { finding_count, .. } => Ok(MxVerdict::Sensitive(finding_count)),
+            SecretScan::Indeterminate { reason } => Err(format!("Indeterminate: {reason:?}")),
+        }
+    }
+
+    /// (row id, path, body, expected) for the 2026-09-29 precision ruling.
+    /// Every CLEAN row is a false positive measured in a real repository; each
+    /// has a SENSITIVE control in the same shape, here or in
+    /// [`true_positive_corpus_stays_caught`], so no row passes by the detector
+    /// simply not firing.
+    fn precision_rows() -> Vec<(&'static str, &'static str, String, MxVerdict)> {
+        let token = mx_token();
+        let token_camel = ["To", "ken"].concat();
+        let apikey_camel = ["Api", "Key"].concat();
+        let secret_kw = ["sec", "ret"].concat();
+        let real40 = [mx_real(), mx_real()].concat();
+        let password = mx_password();
+        let apikey = mx_apikey();
+        let v = mx_value();
+        let real = mx_real();
+        vec![
+            // (a) A quote that CLOSES the keyword's literal is not an opener.
+            (
+                "PA1 rust split closes keyword literal",
+                "src/probe.rs",
+                [
+                    "let first_", &token, " = first.split(\"", &token,
+                    "=\").nth(1).expect(\"", &token, " in first URL\");\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PA2 control: literal after the closing quote",
+                "src/probe.rs",
+                [
+                    "let url = base.split(\"", &token, "=\").nth(1).unwrap_or(\"", &real,
+                    "\");\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Adversarial control: a stray quote earlier on the line makes a
+            // real assignment's OPENING quote look like a closer by parity.
+            (
+                "PA3 control: char-literal quote then real assignment",
+                "src/probe.rs",
+                [
+                    "let q = '\"'; let ", &token, " = \"", &real, "\"; // \"\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // (b) Comma then a doc-comment or attribute line ends the field.
+            (
+                "PB1 rust struct field then doc comment",
+                "src/probe.rs",
+                [
+                    "pub struct Config {\n    pub gemini_", &apikey,
+                    ": Option<String>,\n    /// Gemini model ID (e.g. \"gemini-2.5-flash\").\n    pub gemini_model: Option<String>,\n}\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PB2 rust struct field then attribute",
+                "src/probe.rs",
+                [
+                    "pub struct Config {\n    pub openai_", &apikey,
+                    ": Option<String>,\n    #[serde(rename = \"", &v,
+                    "\")]\n    pub model: Option<String>,\n}\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            // Accepted cost of (b), pinned so it cannot move silently.
+            (
+                "PB4 js declarator after a comment line (accepted)",
+                "src/probe.js",
+                [
+                    "const ", &token, " = compute(),\n  // fallback\n  backup = \"", &v,
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            // (c) `<`-prefixed placeholders; the rest of the RHS still walked.
+            (
+                "PC1 env example fill-in placeholder",
+                "server/.env.example",
+                [&apikey.to_uppercase(), "=<<FILL_IN: gemini key>>\nPORT=8080\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PC2 toml quoted fill-in placeholder",
+                "config.toml",
+                [&apikey, " = \"<<FILL_IN: gemini key>>\"\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PC3 control: fill-in then literal element",
+                "config.toml",
+                [&apikey, " = [\"<<FILL_IN: gemini key>>\", \"", &v, "\"]\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // (d) A Rust lifetime is not a char literal.
+            (
+                "PD1 rust lifetime before keyword parameter",
+                "src/probe.rs",
+                [
+                    "pub fn spawn_worker_on<F>(&self, name: &'static str, ", &token,
+                    ": CancellationToken, work: F) -> bool {\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PD2 control: python apostrophe still opens a string",
+                "src/probe.py",
+                ["url = 'https://host/?", &token, "=", &v, "'\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // (e) Placeholder userinfo in a URI.
+            (
+                "PE1 uri pass placeholder in comment",
+                "src/probe.rs",
+                ["// userinfo in scheme://user:", "pass", "@host/db\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PE2 uri redacted placeholder",
+                "src/probe.rs",
+                ["// postgres://u:", "<redacted>", "@host/db\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PE3 uri password xxxx secret placeholders",
+                "notes.txt",
+                [
+                    "a://admin:",
+                    &password,
+                    "@localhost\nb://admin:",
+                    "xxxx",
+                    "@example.com\nc://admin:",
+                    "secret",
+                    "@${DB_HOST}\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            // (f) No cheap fix: a keyword assignment inside a doc-comment code
+            // span reads as inside a literal. Known ceiling, pinned.
+            (
+                "PF1 rust doc comment code span (known ceiling)",
+                "src/probe.rs",
+                [
+                    "/// So `--", &password, "=postgres://u:pw@host` is fully opaque.\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // A doubled colon is a path separator, not an assignment.
+            (
+                "PG1 rust doc link to a token path",
+                "src/probe.rs",
+                [
+                    "    /// and must poll [`Cancellation", &token.to_uppercase()[..1], &token[1..],
+                    "::is_cancelled`] wherever it would\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PG2 control: path call carrying a literal",
+                "src/probe.rs",
+                ["let t = ", &token, "::from_secret_value(\"", &real, "\");\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "PG3 control: path call whose literal is on the next line",
+                "src/probe.rs",
+                [
+                    "let t = ", &token, "::from_secret_value(\n    \"", &real, "\",\n);\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Review F1: the doubled-colon exemption must follow continuation
+            // lines.
+            (
+                "F1a cpp constant with its literal on the next line",
+                "src/probe.cpp",
+                [
+                    "const char* ",
+                    &apikey_camel,
+                    "::kDefault =\n    \"",
+                    &real40,
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F1b rust builder chain on a continuation line",
+                "src/probe.rs",
+                [
+                    "let client = ",
+                    &token_camel,
+                    "::builder()\n    .secret(\"",
+                    &real40,
+                    "\")\n    .build();\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F1c ruby constant with its literal on the next line",
+                "lib/probe.rb",
+                [&token_camel, "::DEFAULT_VALUE =\n  \"", &real40, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Review F6: only a WHOLE angle group is a placeholder.
+            (
+                "F6a angle group followed by a value",
+                "src/probe.rs",
+                [
+                    "let u = \"https://h/?",
+                    &token,
+                    "=<v1>",
+                    &real40,
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F6b heredoc opener with the value on the next line",
+                "infra/main.tf",
+                [&secret_kw, " = <<-EOT_LONGNAME\n", &real40, "\nEOT_LONGNAME\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Review round 2: brackets around a real value do not make it a
+            // placeholder. Only an interior with whitespace, no digit, or a
+            // placeholder word is template syntax.
+            (
+                "F6c env angle group around a real value",
+                "deploy.env",
+                [&apikey.to_uppercase(), "=<", &real40, ">\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F6d yaml quoted angle group around a real value",
+                "config.yaml",
+                [&password, ": \"<", &real40, ">\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F6e env angle placeholder word",
+                "deploy.env",
+                [&apikey.to_uppercase(), "=<your-api-", "key>\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            // Review F7: a placeholder password on a real host stays flagged.
+            (
+                "F7a changeme on a production host",
+                "config.yaml",
+                ["url: postgres://admin:", "changeme", "@prod-db.internal:5432/app\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F7b password on a production host",
+                "config.yaml",
+                ["broker: amqp://app:", &password, "@mq-prod\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // KNOWN FALSE NEGATIVE, pre-existing on v3 and unchanged here: the
+            // keyword must be followed by the separator, so a quoted JSON key
+            // (`"key": "value"`) never matches. Pinned so a deliberate widening
+            // flips this row rather than slipping in with a precision change.
+            (
+                "PJ1 json quoted key (known false negative)",
+                "config.json",
+                ["{\"", &password, "\": \"hunter2hunter2\"}\n"].concat(),
+                MxVerdict::Clean,
+            ),
+        ]
+    }
+
+    #[test]
+    fn precision_ruling_matrix_pins() {
+        let mut failures = Vec::new();
+        for (id, path, body, expected) in precision_rows() {
+            match scan_verdict(path, &body) {
+                Ok(actual) if actual == expected => {}
+                Ok(actual) => failures.push(format!("{id}: expected {expected:?}, got {actual:?}")),
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "precision rows off expectation: {failures:?}"
+        );
+    }
+
+    /// Security floor for the precision ruling: every row MUST stay caught.
+    /// Real-shaped values, assembled at runtime, in each file class, plus each
+    /// false-positive shape above with its placeholder replaced by a real value.
+    #[test]
+    fn true_positive_corpus_stays_caught() {
+        let token = mx_token();
+        let apikey = mx_apikey();
+        let real = mx_real();
+        let sk = ["sk-", &real, &real].concat();
+        let ghp = ["gh", "p_", &real, &real[..16]].concat();
+        let pem = [
+            "-----BEGIN RSA ",
+            "PRIVATE KEY-----\nMIIEowIBAAKCAQEA",
+            &real,
+            "\n-----END RSA ",
+            "PRIVATE KEY-----\n",
+        ]
+        .concat();
+        let bearer = ["Author", "ization: Bearer ", &real, &real[..12]].concat();
+        let rows: Vec<(&str, &str, String, &str)> = vec![
+            (
+                "github token rust",
+                "src/probe.rs",
+                ["let t = \"", &ghp, "\";\n"].concat(),
+                "secret.provider-token",
+            ),
+            (
+                "github token yaml",
+                "ci.yaml",
+                ["gh: ", &ghp, "\n"].concat(),
+                "secret.provider-token",
+            ),
+            (
+                "pem private key",
+                "certs/server.txt",
+                pem,
+                "secret.private-key-envelope",
+            ),
+            (
+                "authorization bearer",
+                "requests.http",
+                ["GET /\n", &bearer, "\n"].concat(),
+                "secret.authorization-header",
+            ),
+            (
+                "sk key rust",
+                "src/probe.rs",
+                ["let ", &apikey, " = \"", &sk, "\";\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key python",
+                "src/probe.py",
+                [&apikey, " = \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key toml",
+                "config.toml",
+                [&apikey, " = \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key yaml",
+                "config.yaml",
+                [&apikey, ": \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "sk key env",
+                "deploy.env",
+                [&apikey.to_uppercase(), "=", &sk, "\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "uri real password",
+                "src/probe.rs",
+                ["let url = \"postgres://user:", &real, "@db/prod\";\n"].concat(),
+                URI_CREDENTIALS_RULE_ID,
+            ),
+            // The false-positive shapes, placeholder replaced by a real value.
+            (
+                "fp-shape split then literal",
+                "src/probe.rs",
+                [
+                    "let url = base.split(\"",
+                    &token,
+                    "=\").nth(1).unwrap_or(\"",
+                    &real,
+                    "\");\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape struct literal field then doc comment",
+                "src/probe.rs",
+                [
+                    "let c = Config {\n    ",
+                    &apikey,
+                    ": \"",
+                    &real,
+                    "\".into(),\n    /// doc\n    other: 1,\n};\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape test struct literal",
+                "tests/api.rs",
+                ["    admin_", &token, ": \"", &real, "\".into(),\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape env example real value",
+                "server/.env.example",
+                [&apikey.to_uppercase(), "=", &sk, "\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape lifetime then literal",
+                "src/probe.rs",
+                [
+                    "fn f(name: &'static str) { let ",
+                    &token,
+                    " = \"",
+                    &real,
+                    "\"; }\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape lifetime then keyword in literal",
+                "src/probe.rs",
+                [
+                    "const URL: &'static str = \"https://h/?",
+                    &token,
+                    "=",
+                    &real,
+                    "\";\n",
+                ]
+                .concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+            (
+                "fp-shape uri placeholder slot real value",
+                "src/probe.rs",
+                ["// scheme://user:", &real, "@authority\n"].concat(),
+                URI_CREDENTIALS_RULE_ID,
+            ),
+            (
+                "fp-shape fill-in slot real value",
+                "config.toml",
+                [&apikey, " = \"", &sk, "\"\n"].concat(),
+                CONTEXT_ASSIGNMENT_RULE_ID,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (id, path, body, rule) in rows {
+            match scan_secret_bytes(path, body.as_bytes()) {
+                SecretScan::Sensitive {
+                    rule_ids,
+                    line_ranges,
+                    ..
+                } if rule_ids.contains(&rule) => {
+                    if line_ranges.is_empty() {
+                        failures.push(format!("{id}: caught but no finding line recorded"));
+                    }
+                }
+                other => failures.push(format!(
+                    "{id}: expected {rule}, got {:?}",
+                    scan_kind(&other)
+                )),
+            }
+        }
+        assert!(failures.is_empty(), "true positives missed: {failures:?}");
+    }
+
+    /// The verdict's shape without its contents, so a failure never echoes
+    /// matched bytes.
+    fn scan_kind(scan: &SecretScan) -> String {
+        match scan {
+            SecretScan::Clean => "Clean".to_string(),
+            SecretScan::Sensitive { rule_ids, .. } => format!("Sensitive{rule_ids:?}"),
+            SecretScan::Indeterminate { reason } => format!("Indeterminate({reason:?})"),
+        }
+    }
+
+    #[test]
+    fn findings_carry_one_based_lines() {
+        let body = ["fn a() {}\nlet ", &mx_token(), " = \"", &mx_real(), "\";\n"].concat();
+        let SecretScan::Sensitive { line_ranges, .. } =
+            scan_secret_bytes("src/probe.rs", body.as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        assert_eq!(line_ranges, vec![(2, 2)]);
+    }
+
+    /// Two rules on alternating lines are ONE range: ranges merge across rules,
+    /// not per rule, so a rule's own gaps never split what the file shows.
+    #[test]
+    fn finding_ranges_merge_across_rules() {
+        let uri = ["scheme://u:", &mx_real(), "@db.prod\n"].concat();
+        let short = [&["p", "wd"].concat(), "=", "a1b2c3d4", "\n"].concat();
+        let body = format!("{uri}{short}").repeat(3);
+        let SecretScan::Sensitive {
+            finding_count,
+            line_ranges,
+            ..
+        } = scan_secret_bytes("deploy.env", body.as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        assert_eq!(finding_count, 6);
+        assert_eq!(line_ranges, vec![(1, 6)]);
+    }
+
+    /// Only the first ranges are kept, and one more than a refusal shows.
+    #[test]
+    fn finding_ranges_stop_after_the_kept_count() {
+        let short = [&["p", "wd"].concat(), "=", "a1b2c3d4", "\n\n"].concat();
+        let SecretScan::Sensitive {
+            finding_count,
+            line_ranges,
+            ..
+        } = scan_secret_bytes("deploy.env", short.repeat(15).as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        assert_eq!(finding_count, 15);
+        let expected = (0..FINDING_LINE_RANGES_KEPT as u32)
+            .map(|index| (2 * index + 1, 2 * index + 1))
+            .collect::<Vec<_>>();
+        assert_eq!(line_ranges, expected);
+    }
+
+    /// A file of nothing but short findings at the scan budget: every
+    /// classification pays for the line accounting, so it must be linear in the
+    /// file, not in findings times file. About 2 s in a local debug build; the
+    /// per-finding recount did not finish in 120 s.
+    #[test]
+    fn dense_findings_at_the_scan_budget_scan_in_linear_time() {
+        let finding = [&["p", "wd"].concat(), "=", "a1b2c3d4", "\n"].concat();
+        let count = (SECRET_SCAN_MAX_BYTES - 64) / finding.len();
+        let body = finding.repeat(count);
+        let started = std::time::Instant::now();
+        let SecretScan::Sensitive {
+            finding_count,
+            line_ranges,
+            ..
+        } = scan_secret_bytes("deploy.env", body.as_bytes())
+        else {
+            panic!("fixture must be caught");
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(finding_count as usize, count);
+        assert_eq!(line_ranges, vec![(1, u32::try_from(count).unwrap())]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "{count} findings took {elapsed:?}"
         );
     }
 

@@ -500,8 +500,9 @@ pub(crate) enum PathRefusal {
     /// space. Such a name never denotes a distinct file there.
     #[cfg_attr(not(windows), allow(dead_code))]
     WindowsAlias,
-    /// Another spelling of a credential path; it gets that path's refusal.
-    CredentialAlias,
+    /// Another spelling of a credential path; it gets that path's refusal,
+    /// naming the path rule its on-disk name matches.
+    CredentialAlias(&'static str),
     /// Another spelling of an in-repository file: a symlink, letter case or an
     /// 8.3 short name. Carries the on-disk spelling to retry with, or `None`
     /// when that name is hard-scope excluded and must not be suggested.
@@ -599,8 +600,8 @@ pub(crate) fn resolve_repo_path(
 /// that path's refusal, a hard-scope-excluded name is never suggested, and any
 /// other name is offered as the spelling to retry with.
 fn refuse_as_spelling_of(name: String) -> PathRefusal {
-    if crate::knowledge::sensitive_path_rule(&name).is_some() {
-        PathRefusal::CredentialAlias
+    if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&name) {
+        PathRefusal::CredentialAlias(rule_id)
     } else if path_is_hard_scope_excluded(Path::new(&name)) {
         PathRefusal::SpellingDiffers(None)
     } else {
@@ -659,8 +660,8 @@ fn refuse_windows_alias_components(requested: &Path) -> std::result::Result<(), 
     }
     // The name Windows would open, so a credential file's alias gets that
     // file's refusal whether or not it exists.
-    if crate::knowledge::sensitive_path_rule(&stripped.join("/")).is_some() {
-        return Err(PathRefusal::CredentialAlias);
+    if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&stripped.join("/")) {
+        return Err(PathRefusal::CredentialAlias(rule_id));
     }
     Err(PathRefusal::WindowsAlias)
 }

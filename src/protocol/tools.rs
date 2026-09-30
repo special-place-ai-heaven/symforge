@@ -2617,7 +2617,7 @@ fn matching_untracked_paths_for_search_text(
         .into_iter()
         .filter(|path| untracked_text_path_allowed(path, options))
         .filter(|path| {
-            crate::protocol::read_gate::admit_worktree_text(live, &repo, path)
+            crate::protocol::read_gate::admit_worktree_text_without_lines(live, &repo, path)
                 .ok()
                 .flatten()
                 .is_some_and(|content| {
@@ -2761,7 +2761,9 @@ fn admission_degradation_view_from_disk(
 /// The first refusal runs BEFORE any syscall, so the answer is a pure function
 /// of the requested path plus the manifest and is identical for a demoted file
 /// that exists and one that does not — otherwise the difference between this
-/// block and `File not found:` is a one-bit existence oracle. The second runs
+/// block and `File not found:` is a one-bit existence oracle. `refuse_by_policy`
+/// therefore names no finding lines; only the gate's read lane, which opens the
+/// file anyway, adds them. The second runs
 /// on the RESOLVED path, which can differ from the requested string (absolute
 /// arguments do not normalize against a catalog key) and is the only clause
 /// that catches a content-detected demotion reached that way.
@@ -3059,7 +3061,7 @@ fn tier2_reference_disclosure(
         // T045: this is a DISK OBSERVATION by name — the sweep wants what is on
         // disk right now, confined beneath the root. Manifest paths are
         // relative and catalogued, so the confine never fires on them.
-        match read_gate::observe_disk_beneath(live, root, path) {
+        match read_gate::observe_disk_beneath_without_lines(live, root, path) {
             Ok(bytes) => {
                 bytes_budget = bytes_budget.saturating_sub(bytes.len() as u64);
                 if String::from_utf8_lossy(&bytes).contains(name) {
@@ -8833,9 +8835,11 @@ impl SymForgeServer {
                 // seeds conservatively from the index rather than disclosing
                 // the demoted file's current symbol names or signatures.
                 let current_content =
-                    crate::protocol::read_gate::admit_worktree_text(&guard, &repo, path)
-                        .unwrap_or_default()
-                        .unwrap_or_default();
+                    crate::protocol::read_gate::admit_worktree_text_without_lines(
+                        &guard, &repo, path,
+                    )
+                    .unwrap_or_default()
+                    .unwrap_or_default();
 
                 // Unsupported/config languages return None from the extractor;
                 // we cannot body-diff them, so fall back to seeding every
@@ -9141,8 +9145,8 @@ impl SymForgeServer {
         // answering here keeps the refusal from depending on existence. The
         // estimate above is exempt by contract (Feature 020 R1/E1: aggregate
         // counts for a demoted file succeed).
-        if crate::knowledge::sensitive_path_rule(&input.path).is_some() {
-            return format::content_withheld_by_admission(&input.path);
+        if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&input.path) {
+            return format::content_withheld_by_path_rule(&input.path, rule_id);
         }
         if let Some(refusal) = read_gate::hard_scope_refusal(&input.path) {
             return refusal;
@@ -22060,7 +22064,10 @@ mod tests {
             crate::protocol::read_gate::refuse_by_policy(&index, ".env").expect("refused");
         assert_eq!(
             refusal,
-            crate::protocol::format::content_withheld_by_admission(".env"),
+            crate::protocol::format::content_withheld_by_path_rule(
+                ".env",
+                crate::knowledge::sensitive_path_rule(".env").expect("a credential path"),
+            ),
             "the sensitive path rule takes precedence"
         );
 
@@ -29938,6 +29945,8 @@ mod tests {
         assert!(super::edit::safe_repo_path(dir.path(), "sub/../.aws/credentials").is_err());
         assert!(super::safe_repo_path_for_freshen(dir.path(), "sub/../.aws/credentials").is_err());
 
+        let rule_id = crate::knowledge::sensitive_path_rule(".aws/credentials")
+            .expect("the fixture is a credential path");
         for alias in credential_alias_spellings(dir.path()) {
             let direct = super::edit::safe_repo_path(dir.path(), &alias);
             assert!(direct.is_err(), "safe_repo_path admitted alias {alias:?}");
@@ -29951,7 +29960,7 @@ mod tests {
             if !alias.contains(':') {
                 assert_eq!(
                     direct.unwrap_err(),
-                    super::format::content_withheld_by_admission(&alias),
+                    super::format::content_withheld_by_path_rule(&alias, rule_id),
                     "alias {alias:?} must get the canonical refusal"
                 );
             }
@@ -35308,8 +35317,12 @@ mod tests {
     /// chain. Same class of defect as the `is_error_output` duplication.
     #[test]
     fn oracle_d5_validate_file_syntax_refusal_is_not_reported_as_a_success() {
-        let refusal =
-            crate::protocol::format::content_withheld_by_admission("config/settings.toml");
+        let refusal = crate::protocol::format::content_withheld_by_admission(
+            "config/settings.toml",
+            &["secret.context-assignment"],
+            1,
+            &[(3, 3)],
+        );
         assert_eq!(
             super::classify_compact_tool_output("validate_file_syntax", &refusal),
             OutcomeClass::InvalidRequest,
@@ -35327,8 +35340,12 @@ mod tests {
     /// the phrase mid-text is a successful read, not a refusal.
     #[test]
     fn oracle_d6_d7_withheld_refusal_is_classified_only_when_anchored() {
-        let refusal =
-            crate::protocol::format::content_withheld_by_admission("config/settings.toml");
+        let refusal = crate::protocol::format::content_withheld_by_admission(
+            "config/settings.toml",
+            &["secret.context-assignment"],
+            1,
+            &[(3, 3)],
+        );
         assert_eq!(
             super::classify_compact_tool_output("get_file_content", &refusal),
             OutcomeClass::InvalidRequest,
@@ -36123,8 +36140,341 @@ mod tests {
         let path_refusal = crate::protocol::read_gate::admit_disk_read(&live, ".env", &path_rule)
             .expect_err("a path-rule exclusion must stay refused");
         assert!(
-            path_refusal.contains("reindex the repository"),
-            "E2 a path-rule exclusion must keep its recovery advice; got: {path_refusal}"
+            path_refusal.contains("path.environment-credentials")
+                && !path_refusal.contains("could not inspect"),
+            "E2 a path-rule exclusion must name its rule, not the unscanned wording; got: {path_refusal}"
+        );
+    }
+
+    /// A probe repository holding one content finding at line 2 of
+    /// `src/probe.rs` and the same bytes in a credential-path `.env`, plus a
+    /// ready index rooted there.
+    fn admission_probe_repo() -> (TempDir, LiveIndex) {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        let body = [
+            "fn a() {}\nlet ",
+            &kw_key(),
+            " = \"",
+            &oracle_opaque(),
+            "\";\n",
+        ]
+        .concat();
+        fs::write(repo.path().join("src/probe.rs"), &body).expect("write probe");
+        fs::write(repo.path().join(".env"), &body).expect("write dotenv");
+        let mut live = make_live_index_ready(vec![]);
+        live.indexed_root = Some(repo.path().to_path_buf());
+        (repo, live)
+    }
+
+    fn assert_names_rule_and_line_without_bypass(refusal: &str) {
+        assert!(refusal.starts_with(WITHHELD_REFUSAL_PREFIX));
+        for needle in [
+            "secret.context-assignment",
+            "matched 1 time at line 2",
+            "will not disclose",
+        ] {
+            assert!(
+                refusal.contains(needle),
+                "refusal must contain {needle:?}; shape: {}",
+                refusal_shape(refusal)
+            );
+        }
+        assert!(
+            !refusal.contains(&oracle_opaque()),
+            "the refusal must never echo the matched value"
+        );
+        assert!(
+            !refusal.contains("admission-allow") && !refusal.contains("reindex"),
+            "the refusal offers no self-service remedy; shape: {}",
+            refusal_shape(refusal)
+        );
+    }
+
+    /// Owner ruling 2026-09-29, decision 1. A content refusal names the rule,
+    /// the count and the line — never the value, and no self-service bypass. A
+    /// path refusal names its path rule.
+    #[test]
+    fn withheld_refusal_names_the_rule_and_the_lines() {
+        let (repo, live) = admission_probe_repo();
+        let refusal = crate::protocol::read_gate::admit_disk_read(
+            &live,
+            "src/probe.rs",
+            &repo.path().join("src/probe.rs"),
+        )
+        .expect_err("a content finding must be refused");
+        assert_names_rule_and_line_without_bypass(&refusal);
+
+        let path_refusal =
+            crate::protocol::read_gate::admit_disk_read(&live, ".env", &repo.path().join(".env"))
+                .expect_err("a credential path must be refused");
+        assert!(
+            path_refusal.starts_with(WITHHELD_REFUSAL_PREFIX)
+                && path_refusal.contains("path.environment-credentials"),
+            "path refusal must name its rule; shape: {}",
+            refusal_shape(&path_refusal)
+        );
+    }
+
+    /// A manifest entry recording a content demotion of `path` under `rule`.
+    fn recorded_content_demotion(path: &str, rule: &str) -> crate::domain::CatalogEntry {
+        crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            size: 40,
+            language: Some(LanguageId::Rust),
+            classification: crate::domain::FileClassification::for_code_path(path),
+            disposition: crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::SensitiveContent {
+                    rule_ids: vec![rule.to_string()],
+                    finding_count: 1,
+                },
+            },
+            content_hash: None,
+        }
+    }
+
+    /// A directory symlink, or on Windows without the symlink privilege a
+    /// junction; both are reparse points `symlink_metadata` reports as links.
+    fn link_dir_for_admission_test(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(target, link).is_err() {
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("run mklink");
+            assert!(status.success(), "mklink /J failed");
+        }
+    }
+
+    /// The no-bytes policy answer is a pure function of the path and the
+    /// manifest: identical for a demoted file that exists and one that does
+    /// not. The degradation view and the sweeps answer from it, so a difference
+    /// here is an existence oracle.
+    #[test]
+    fn policy_refusal_is_identical_whether_the_file_exists() {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let present = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
+            .expect("a recorded demotion must refuse");
+        fs::remove_file(repo.path().join("src/probe.rs")).expect("remove probe");
+        let absent = crate::protocol::read_gate::refuse_by_policy(&live, "src/probe.rs")
+            .expect("a recorded demotion must refuse");
+        assert_eq!(
+            refusal_shape(&present),
+            refusal_shape(&absent),
+            "the no-bytes refusal must not depend on the file existing"
+        );
+        assert_eq!(present, absent);
+    }
+
+    /// The gate's line re-read follows no link on ANY component, not only the
+    /// final one: a demoted path under a linked directory names no lines.
+    #[test]
+    fn recorded_demotion_lines_are_not_read_through_a_linked_directory() {
+        let (repo, mut live) = admission_probe_repo();
+        let outside = TempDir::new().expect("outside dir");
+        fs::copy(
+            repo.path().join("src/probe.rs"),
+            outside.path().join("probe.rs"),
+        )
+        .expect("copy probe");
+        link_dir_for_admission_test(outside.path(), &repo.path().join("linked"));
+        live.manifest_entries = vec![recorded_content_demotion(
+            "linked/probe.rs",
+            "secret.context-assignment",
+        )];
+        let refusal = crate::protocol::read_gate::admit_disk_read(
+            &live,
+            "linked/probe.rs",
+            &repo.path().join("linked/probe.rs"),
+        )
+        .expect_err("a recorded demotion must refuse");
+        assert!(
+            refusal.contains("secret.context-assignment") && !refusal.contains(" at line"),
+            "lines must not be read through a linked directory; shape: {}",
+            refusal_shape(&refusal)
+        );
+    }
+
+    /// A lane that drops the refusal asks the line-free twin: a recorded content
+    /// demotion is refused there without naming lines, while the rendering lane
+    /// beside it still names them from the same file.
+    #[test]
+    fn sweep_lanes_refuse_a_recorded_demotion_without_naming_lines() {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let swept = crate::protocol::read_gate::observe_disk_beneath_without_lines(
+            &live,
+            repo.path(),
+            "src/probe.rs",
+        )
+        .expect_err("a recorded demotion must refuse");
+        assert!(
+            swept.contains("secret.context-assignment") && !swept.contains(" at line"),
+            "the sweep twin must not re-read for lines; shape: {}",
+            refusal_shape(&swept)
+        );
+        let rendered =
+            crate::protocol::read_gate::observe_disk_beneath(&live, repo.path(), "src/probe.rs")
+                .expect_err("a recorded demotion must refuse");
+        assert_names_rule_and_line_without_bypass(&rendered);
+    }
+
+    /// Caller level: the degradation block for a recorded demotion is the same
+    /// with the file present and deleted, so it is no existence oracle.
+    #[test]
+    fn degradation_view_for_a_recorded_demotion_ignores_file_existence() {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let degrade = |live: &LiveIndex| {
+            super::admission_tier_degradation_for_path(
+                live,
+                Some(repo.path()),
+                "find_references",
+                "src/probe.rs",
+                "anything",
+            )
+        };
+        let present = degrade(&live).expect("a recorded demotion must be refused");
+        fs::remove_file(repo.path().join("src/probe.rs")).expect("remove probe");
+        let absent = degrade(&live).expect("a recorded demotion must be refused");
+        assert_eq!(
+            present, absent,
+            "the degradation view must not depend on existence"
+        );
+        assert!(
+            present.starts_with(WITHHELD_REFUSAL_PREFIX) && !present.contains(" at line"),
+            "shape: {}",
+            refusal_shape(&present)
+        );
+    }
+
+    /// A recorded demotion whose path is now a FIFO refuses at once: the gate
+    /// never opens a non-regular file for its line re-read, which would block
+    /// until a writer appeared.
+    #[cfg(unix)]
+    #[test]
+    fn recorded_demotion_refusal_does_not_open_a_fifo() {
+        let (repo, mut live) = admission_probe_repo();
+        let probe = repo.path().join("src/probe.rs");
+        fs::remove_file(&probe).expect("remove probe");
+        let status = crate::process_util::hidden_command("mkfifo")
+            .arg(&probe)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let refusal = crate::protocol::read_gate::admit_disk_read(&live, "src/probe.rs", &probe)
+            .expect_err("a recorded demotion must refuse");
+        assert!(
+            refusal.contains("secret.context-assignment") && !refusal.contains(" at line"),
+            "shape: {}",
+            refusal_shape(&refusal)
+        );
+    }
+
+    /// A RECORDED demotion carries no lines — the snapshot schema is unchanged —
+    /// so the gate recomputes them from its own read at refusal time. When the
+    /// file has moved on to a different verdict, the refusal still stands and
+    /// names the recorded rule, without lines from other content.
+    #[test]
+    fn recorded_demotion_refusal_recomputes_lines_through_the_gate() {
+        let (repo, mut live) = admission_probe_repo();
+        let recorded = |rule: &str| recorded_content_demotion("src/probe.rs", rule);
+        live.manifest_entries = vec![recorded("secret.context-assignment")];
+        let probe = repo.path().join("src/probe.rs");
+        let refusal = crate::protocol::read_gate::admit_disk_read(&live, "src/probe.rs", &probe)
+            .expect_err("a recorded demotion must refuse");
+        assert_names_rule_and_line_without_bypass(&refusal);
+
+        live.manifest_entries = vec![recorded("secret.uri-credentials")];
+        let moved = crate::protocol::read_gate::admit_disk_read(&live, "src/probe.rs", &probe)
+            .expect_err("a recorded demotion refuses whatever the file now holds");
+        assert!(
+            moved.contains("secret.uri-credentials") && !moved.contains(" at line"),
+            "lines from a different verdict must not be paired with the record; shape: {}",
+            refusal_shape(&moved)
+        );
+        drop(repo);
+    }
+
+    /// Owner ruling 2026-09-29, decision 4. An edit aimed at a withheld file
+    /// gets the withheld refusal, not "File not found" — the file exists, and
+    /// the refusal is what tells the caller why it cannot be edited here.
+    #[tokio::test]
+    async fn edit_tools_refuse_withheld_files_instead_of_reporting_them_missing() {
+        let mut live = make_live_index_ready(vec![]);
+        live.manifest_entries = vec![crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: "src/config.rs".to_string(),
+                normalized_utf8: Some("src/config.rs".to_string()),
+            },
+            size: 40,
+            language: Some(LanguageId::Rust),
+            classification: crate::domain::FileClassification::for_code_path("src/config.rs"),
+            disposition: crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::SensitiveContent {
+                    rule_ids: vec!["secret.context-assignment".to_string()],
+                    finding_count: 2,
+                },
+            },
+            content_hash: None,
+        }];
+        let server = make_server_with_root(live, None);
+        let edit = |path: &str| crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
+            path: path.to_string(),
+            name: "target".to_string(),
+            kind: None,
+            symbol_line: None,
+            new_body: "fn target() {}".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            if_match: None,
+            working_directory: None,
+        };
+        for path in ["src/config.rs", ".env"] {
+            let out = server.replace_symbol_body(Parameters(edit(path))).await;
+            assert!(
+                out.starts_with(WITHHELD_REFUSAL_PREFIX),
+                "{path}: edit must refuse as withheld; shape: {}",
+                refusal_shape(&out)
+            );
+        }
+        let out = server
+            .replace_symbol_body(Parameters(edit("src/config.rs")))
+            .await;
+        assert!(
+            out.contains("secret.context-assignment matched 2 times"),
+            "content refusal names the rule and count: {out}"
+        );
+        let missing = server
+            .replace_symbol_body(Parameters(edit("src/absent.rs")))
+            .await;
+        assert!(
+            missing.starts_with("File not found:"),
+            "a genuinely absent file keeps the not-found answer; shape: {}",
+            refusal_shape(&missing)
         );
     }
 
@@ -36277,7 +36627,10 @@ mod tests {
                 crate::knowledge::SecretScan::Sensitive {
                     rule_ids,
                     finding_count,
-                } => findings.push(format!("{relative} [{finding_count}] {rule_ids:?}")),
+                    line_ranges,
+                } => findings.push(format!(
+                    "{relative} [{finding_count}] {rule_ids:?} lines {line_ranges:?}"
+                )),
                 crate::knowledge::SecretScan::Indeterminate { reason } => {
                     findings.push(format!("{relative} [indeterminate {reason:?}]"));
                 }

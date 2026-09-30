@@ -43,8 +43,8 @@ pub(crate) fn resolve_repo_path(
              suffix or a trailing dot or space); use the file's own name"
         ),
         // The refusal the on-disk name gets from the read gate.
-        PathRefusal::CredentialAlias => {
-            crate::protocol::format::content_withheld_by_admission(relative_path)
+        PathRefusal::CredentialAlias(rule_id) => {
+            crate::protocol::format::content_withheld_by_path_rule(relative_path, rule_id)
         }
         PathRefusal::SpellingDiffers(None) => PATH_SPELLING_DIFFERS.to_string(),
         PathRefusal::SpellingDiffers(Some(canonical)) => {

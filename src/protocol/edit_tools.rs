@@ -24,6 +24,16 @@ use crate::watcher;
 use super::SymForgeServer;
 use super::tools::{is_error_output, is_index_unavailable_output, safe_repo_path_for_freshen};
 
+/// Why an edit target is absent from the index. A file withheld by admission
+/// policy is refused with the same message a read gets — naming the rule —
+/// rather than "not found", which sent callers looking for a file that exists.
+/// `refuse_by_policy` fixes the precedence: path rule, then content admission,
+/// then a row the snapshot verify withheld since restore.
+fn missing_file_refusal(live: &crate::live_index::LiveIndex, path: &str) -> String {
+    crate::protocol::read_gate::refuse_by_policy(live, path)
+        .unwrap_or_else(|| format::not_found_file(path))
+}
+
 macro_rules! loading_guard {
     ($guard:expr) => {
         match $guard.index_state() {
@@ -949,10 +959,7 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
-                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
-                    return format::unverified_since_restore(&params.0.path, reason);
-                }
-                return format::not_found_file(&params.0.path);
+                return missing_file_refusal(&guard, &params.0.path);
             }
         }
         let (abs_path, source_authority) = match prepare_exact_path_for_edit(self, &params.0.path) {
@@ -1265,10 +1272,7 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
-                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
-                    return format::unverified_since_restore(&params.0.path, reason);
-                }
-                return format::not_found_file(&params.0.path);
+                return missing_file_refusal(&guard, &params.0.path);
             }
         }
         let (abs_path, source_authority) = match prepare_exact_path_for_edit(self, &params.0.path) {
@@ -1490,10 +1494,7 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
-                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
-                    return format::unverified_since_restore(&params.0.path, reason);
-                }
-                return format::not_found_file(&params.0.path);
+                return missing_file_refusal(&guard, &params.0.path);
             }
         }
         let (abs_path, source_authority) = match prepare_exact_path_for_edit(self, &params.0.path) {
@@ -1712,10 +1713,7 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
             if guard.capture_shared_file(&params.0.path).is_none() {
-                if let Some(reason) = guard.unverified_since_restore(&params.0.path) {
-                    return format::unverified_since_restore(&params.0.path, reason);
-                }
-                return format::not_found_file(&params.0.path);
+                return missing_file_refusal(&guard, &params.0.path);
             }
         }
         let (abs_path, source_authority) = match prepare_exact_path_for_edit(self, &params.0.path) {

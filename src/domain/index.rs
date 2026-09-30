@@ -1497,10 +1497,10 @@ pub enum SkipReason {
     /// indexing. Non-git trees are unaffected (fail open: admit).
     GeneratedOutput,
     /// The admission policy withheld this file. Deliberately NEUTRAL: it does
-    /// not say whether a path rule or a content detector applied, because that
-    /// is the one content-derived bit a disclosed reason could still leak — the
-    /// same property `format::content_withheld_by_admission` protects on the
-    /// read path.
+    /// not say whether a path rule or a content detector applied. The read-path
+    /// refusal for one named file DOES say, with the rule id and finding lines
+    /// (owner ruling 2026-09-29), because that is what makes a false positive
+    /// diagnosable; this aggregate reason keeps its neutrality.
     ///
     /// It exists because withholding a reason and ASSERTING A FALSE ONE are not
     /// the same thing. These files previously reported `UnsupportedLanguage`,
@@ -1514,7 +1514,8 @@ pub enum SkipReason {
     /// answers it for any path on request, splitting `content_withheld_by_admission`
     /// from `content_withheld_unscanned` precisely because the recovery action
     /// differs. This surfaces the same bit a tool call earlier; it does not
-    /// create it. The bit that stays hidden is path-rule vs content-detector.
+    /// create it. The bit this reason keeps hidden is path-rule vs
+    /// content-detector; a per-file read refusal discloses it.
     PolicyWithheld,
     /// The file's bytes are not decodable as searchable text. Distinct from
     /// [`SkipReason::UnsupportedLanguage`], which means the extension maps to no
