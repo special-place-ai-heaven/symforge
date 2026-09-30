@@ -52,6 +52,20 @@ function whichAllSymforge(env, platform) {
   return found;
 }
 
+// Same file on disk: realpaths equal, so a symlinked npm bin shim
+// (`<prefix>/bin/symforge` -> `.../symforge/bin/symforge.js`) matches its target.
+// A path that cannot be resolved falls back to its absolute form.
+function sameFile(a, b) {
+  const real = (p) => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch (_err) {
+      return path.resolve(p);
+    }
+  };
+  return real(a) === real(b);
+}
+
 // True when `shadowPath` is THIS launcher's own npm bin shim, not a foreign
 // install. The thing on PATH is normally the npm-generated shim
 // (`symforge` / `symforge.cmd`), which lives in the npm prefix `bin` dir that
@@ -130,11 +144,14 @@ function maybeWarnPathShadow(consoleMod, env, platform, resolvedBinaryPath, self
   if (entries.length === 0) return;
 
   const first = entries[0];
-  const resolved = path.resolve(resolvedBinaryPath);
 
   // The launcher already "wins" when the first PATH symforge IS the resolved
-  // native binary, or is this launcher's own npm shim that dispatches here.
-  if (path.resolve(first) === resolved) return;
+  // native binary, IS this launcher itself (by realpath, so a symlinked bin
+  // shim in any prefix counts), or is this launcher's own npm shim that
+  // dispatches here.
+  if (sameFile(first, resolvedBinaryPath)) return;
+  if (sameFile(first, path.join(selfDir, "symforge.js"))) return;
+  if (sameFile(first, path.join(selfDir, "launcher.js"))) return;
   if (isOwnShim(first, selfDir)) return;
 
   const kind = classifyShadow(first, environ, platform);
