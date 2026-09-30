@@ -1435,6 +1435,39 @@ pub fn find_enclosing_symbol(symbols: &[SymbolRecord], ref_line: u32) -> Option<
     best.map(|(_, idx)| idx)
 }
 
+/// [`find_enclosing_symbol`] for every line in `lines`, in O((S + L) log S)
+/// rather than O(S * L). Lines are visited in ascending order while a heap
+/// holds the symbols started so far, ordered by the same rule (latest start,
+/// then lowest index); a symbol that ended before the current line can never
+/// enclose a later one, so it is dropped when it reaches the top.
+pub fn find_enclosing_symbols(symbols: &[SymbolRecord], lines: &[u32]) -> Vec<Option<u32>> {
+    use std::cmp::Reverse;
+
+    let mut by_start: Vec<usize> = (0..symbols.len()).collect();
+    by_start.sort_by_key(|&idx| symbols[idx].line_range.0);
+    let mut by_line: Vec<usize> = (0..lines.len()).collect();
+    by_line.sort_by_key(|&at| lines[at]);
+
+    let mut started = std::collections::BinaryHeap::new();
+    let mut next = 0;
+    let mut enclosing = vec![None; lines.len()];
+    for at in by_line {
+        let line = lines[at];
+        while let Some(&idx) = by_start.get(next)
+            && symbols[idx].line_range.0 <= line
+        {
+            let (start, end) = symbols[idx].line_range;
+            started.push((start, Reverse(idx as u32), end));
+            next += 1;
+        }
+        while started.peek().is_some_and(|&(_, _, end)| end < line) {
+            started.pop();
+        }
+        enclosing[at] = started.peek().map(|&(_, Reverse(idx), _)| idx);
+    }
+    enclosing
+}
+
 /// Admission tier — whether a file is eligible for indexing/parsing at all.
 /// Separate from NoiseClass (which is about ranking/filtering signal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2111,6 +2144,32 @@ mod tests {
         // Reference at line 0 is not inside any symbol
         let idx = find_enclosing_symbol(&symbols, 0);
         assert_eq!(idx, None, "should return None when not inside any symbol");
+    }
+
+    #[test]
+    fn test_find_enclosing_symbols_matches_single_line_rule() {
+        // Nested, disjoint, tied starts (lowest index wins) and an inverted range.
+        let symbols: Vec<SymbolRecord> = [(0, 40), (2, 9), (2, 9), (5, 6), (12, 20), (30, 25)]
+            .into_iter()
+            .map(|line_range| SymbolRecord {
+                name: "s".to_string(),
+                kind: SymbolKind::Function,
+                depth: 0,
+                sort_order: 0,
+                byte_range: (0, 1),
+                line_range,
+                doc_byte_range: None,
+                item_byte_range: None,
+            })
+            .collect();
+        let lines: Vec<u32> = [7, 0, 45, 5, 2, 20, 27, 9, 10, 6, 5].to_vec();
+        let expected: Vec<Option<u32>> = lines
+            .iter()
+            .map(|&line| find_enclosing_symbol(&symbols, line))
+            .collect();
+        assert_eq!(find_enclosing_symbols(&symbols, &lines), expected);
+        assert_eq!(expected[3], Some(3));
+        assert_eq!(expected[4], Some(1));
     }
 
     #[test]

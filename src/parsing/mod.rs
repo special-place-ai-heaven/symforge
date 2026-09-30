@@ -2152,4 +2152,81 @@ export function App() {
         assert_eq!(result.byte_len, source.len() as u64);
         assert!(!result.content_hash.is_empty());
     }
+
+    /// Rust shaped like `src/protocol/tools.rs`: one module of test functions
+    /// whose macro bodies drive the xref text fallback (plain and qualified
+    /// calls, parentheses and an escaped quote inside string literals).
+    fn synthetic_rust_module(target_bytes: usize) -> String {
+        let mut source = String::from("mod tests {\n    use super::*;\n");
+        let mut i = 0usize;
+        while source.len() < target_bytes {
+            source.push_str(&format!(
+                "    #[test]\n    fn case_{i}() {{\n        let value = helper_{i}(build(1), other::make(2));\n        let text = format!(\"{{}} (x(\", value.render(), crate::util::digest_{i}(value));\n        assert_eq!(text.len(), compute(value, {i}), \"msg(\\\" {{}}\", inner!(step(1), a::b::c(2)));\n        check_all(&[alpha(), beta(), gamma()]);\n    }}\n\n"
+            ));
+            i += 1;
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    fn index_rust(source: &str) -> (FileProcessingResult, crate::live_index::store::IndexedFile) {
+        let result = process_file("synthetic.rs", source.as_bytes(), LanguageId::Rust);
+        let indexed = crate::live_index::store::IndexedFile::from_parse_result(
+            result.clone(),
+            source.as_bytes().to_vec(),
+        );
+        (result, indexed)
+    }
+
+    /// Indexing one large Rust file was O(n^2): the xref macro fallback
+    /// rescanned the file prefix and every captured call for each `(`, and each
+    /// reference scanned every symbol for its enclosing one. A 1.5 MB file took
+    /// 3.3 s of which 2.8 s was that fallback. Linear work gives about 4x for 4x
+    /// the bytes; quadratic gives 16x.
+    #[test]
+    fn large_rust_file_indexing_is_linear_and_unchanged() {
+        use std::fmt::Write as _;
+
+        let small = synthetic_rust_module(400_000);
+        let (result, indexed) = index_rust(&small);
+        let mut rendered = format!("== synth-nested-400000 {:?}\n", result.outcome);
+        for symbol in &result.symbols {
+            writeln!(rendered, "S {symbol:?}").unwrap();
+        }
+        for reference in &result.references {
+            writeln!(rendered, "R {reference:?}").unwrap();
+        }
+        for reference in &indexed.references {
+            writeln!(
+                rendered,
+                "E {:?} {:?}",
+                reference.byte_range, reference.enclosing_symbol_index
+            )
+            .unwrap();
+        }
+        // SHA-256 of this rendering as produced by the quadratic code before
+        // the fix: symbols, references and enclosing indices must not move.
+        assert_eq!(
+            crate::hash::digest_hex(rendered.as_bytes()),
+            "8c606cbc0397333a89aefa7a0cb93965b28cb60a14d084bd56aebd8b7fccb456"
+        );
+
+        let large = synthetic_rust_module(1_600_000);
+        let fastest = |source: &str| {
+            (0..2)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    drop(index_rust(source));
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let small_time = fastest(&small);
+        let large_time = fastest(&large);
+        assert!(
+            large_time < small_time * 5,
+            "4x the bytes took {large_time:?} against {small_time:?}: indexing is superlinear again"
+        );
+    }
 }

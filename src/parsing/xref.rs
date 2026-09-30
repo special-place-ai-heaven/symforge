@@ -1274,6 +1274,77 @@ fn collect_rust_macro_ranges(root: &Node) -> Vec<(u32, u32)> {
     ranges
 }
 
+/// Byte spans sorted by start with the running maximum end, so the macro
+/// fallback's per-`(` span tests are binary searches, not scans.
+struct SpanIndex {
+    starts: Vec<u32>,
+    max_end: Vec<u32>,
+}
+
+impl SpanIndex {
+    fn new(mut spans: Vec<(u32, u32)>) -> Self {
+        spans.sort_unstable();
+        let mut max = 0;
+        let max_end = spans
+            .iter()
+            .map(|&(_, end)| {
+                max = max.max(end);
+                max
+            })
+            .collect();
+        Self {
+            starts: spans.into_iter().map(|(start, _)| start).collect(),
+            max_end,
+        }
+    }
+
+    /// Some span `(s, e)` has `s <= start && end <= e`.
+    fn covers(&self, start: u32, end: u32) -> bool {
+        let before = self.starts.partition_point(|&s| s <= start);
+        before > 0 && self.max_end[before - 1] >= end
+    }
+
+    /// Some span starts in `start..end`.
+    fn starts_within(&self, start: u32, end: u32) -> bool {
+        let first = self.starts.partition_point(|&s| s < start);
+        self.starts.get(first).is_some_and(|&s| s < end)
+    }
+}
+
+/// Count of `needle` in `bytes[..k]`. Queries arrive in non-decreasing `k`,
+/// so each resumes where the last stopped; a smaller `k` recounts from 0.
+struct PrefixCount<'a> {
+    bytes: &'a [u8],
+    needle: u8,
+    pos: usize,
+    count: usize,
+}
+
+impl<'a> PrefixCount<'a> {
+    fn new(bytes: &'a [u8], needle: u8) -> Self {
+        Self {
+            bytes,
+            needle,
+            pos: 0,
+            count: 0,
+        }
+    }
+
+    fn upto(&mut self, k: usize) -> usize {
+        if k < self.pos {
+            self.pos = 0;
+            self.count = 0;
+        }
+        let needle = self.needle;
+        self.count += self.bytes[self.pos..k]
+            .iter()
+            .filter(|&&b| b == needle)
+            .count();
+        self.pos = k;
+        self.count
+    }
+}
+
 /// Extract cross-references from a parsed tree-sitter tree.
 ///
 /// Returns `(Vec<ReferenceRecord>, HashMap<String, String>)` where the HashMap
@@ -1657,18 +1728,25 @@ pub fn extract_references(
     //     token tree, where whole-file scanning would be too imprecise
     //     (it would collide with definitions and ordinary already-captured calls).
     if *language == LanguageId::Rust {
-        let captured_call_ranges: Vec<(u32, u32)> = references
-            .iter()
-            .filter(|r| r.kind == ReferenceKind::Call)
-            .map(|r| r.byte_range)
-            .collect();
+        // Every `(` in the file asks the span and prefix questions below, so
+        // each must be sublinear: a scan per `(` made this pass O(n^2) and cost
+        // 2.8 s of a 3.3 s parse on a 1.5 MB file.
+        let captured_call_ranges = SpanIndex::new(
+            references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Call)
+                .map(|r| r.byte_range)
+                .collect(),
+        );
 
         // Byte ranges of macro invocations, used to scope plain-call recovery.
-        let macro_ranges = collect_rust_macro_ranges(root);
+        let macro_ranges = SpanIndex::new(collect_rust_macro_ranges(root));
 
         // Scan for `ident(` patterns; classify each as qualified (file-wide) or
         // plain (macro-scoped) below.
         let bytes = source.as_bytes();
+        let mut quotes_before = PrefixCount::new(bytes, b'"');
+        let mut lines_before = PrefixCount::new(bytes, b'\n');
         let len = bytes.len();
         let mut i = 0;
         while i < len {
@@ -1705,29 +1783,25 @@ pub fn extract_references(
                 let byte_end = name_end as u32;
 
                 // Only inside a macro invocation.
-                let in_macro = macro_ranges
-                    .iter()
-                    .any(|&(ms, me)| ms <= byte_start && byte_end <= me);
+                let in_macro = macro_ranges.covers(byte_start, byte_end);
                 // Skip the macro name itself (`format` in `format!(`): the token
                 // immediately before is `!`, and it is already a MacroUse ref.
                 let is_macro_name = name_end < bytes.len() && bytes[name_end] == b'!';
                 // Skip if already captured by a tree-sitter query match.
-                let already = captured_call_ranges.iter().any(|&(cs, ce)| {
-                    (cs <= byte_start && byte_end <= ce) || (byte_start <= cs && cs < byte_end)
-                });
+                let already = captured_call_ranges.covers(byte_start, byte_end)
+                    || captured_call_ranges.starts_within(byte_start, byte_end);
                 // Rough string-literal guard: even count of `"` before the name.
                 // ponytail: quote-parity heuristic, not a lexer — precision-favoring
                 // (matches the qualified-call fallback above; a name after an odd
                 // number of earlier quotes is skipped rather than risk a phantom
                 // ref). Upgrade to a real tokenizer only if a macro-heavy fixture
                 // shows a real miss. Known limitation logged in the verify-tools harness.
-                let outside_string = source[..name_start].matches('"').count().is_multiple_of(2);
+                let outside_string = quotes_before.upto(name_start).is_multiple_of(2);
 
                 if in_macro && !is_macro_name && !already && outside_string {
                     let name_text = &source[name_start..name_end];
                     if !name_text.is_empty() {
-                        let line =
-                            bytes[..name_start].iter().filter(|&&b| b == b'\n').count() as u32;
+                        let line = lines_before.upto(name_start) as u32;
                         references.push(ReferenceRecord {
                             name: name_text.to_string(),
                             qualified_name: None,
@@ -1774,7 +1848,7 @@ pub fn extract_references(
             if !qualified_text.contains("::")
                 || name_text.is_empty()
                 // Skip if inside a string literal (very rough: odd number of `"` before).
-                || !source[..path_start].matches('"').count().is_multiple_of(2)
+                || !quotes_before.upto(path_start).is_multiple_of(2)
             {
                 i += 1;
                 continue;
@@ -1784,12 +1858,11 @@ pub fn extract_references(
             let byte_end = name_end as u32;
 
             // Skip if already captured by a tree-sitter query match.
-            let already = captured_call_ranges.iter().any(|&(cs, ce)| {
-                (cs <= byte_start && byte_end <= ce) || (byte_start <= cs && cs < byte_end)
-            });
+            let already = captured_call_ranges.covers(byte_start, byte_end)
+                || captured_call_ranges.starts_within(byte_start, byte_end);
 
             if !already {
-                let line = bytes[..path_start].iter().filter(|&&b| b == b'\n').count() as u32;
+                let line = lines_before.upto(path_start) as u32;
                 references.push(ReferenceRecord {
                     name: name_text.to_string(),
                     qualified_name: Some(qualified_text.to_string()),
