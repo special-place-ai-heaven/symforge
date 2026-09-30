@@ -46,7 +46,11 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// Bumped to 5: `secret_access_key` (the INI credential-profile key) now
 /// reaches the context-assignment rule, so a v4 manifest admits files v5
 /// withholds.
-pub const SECRET_POLICY_VERSION: u32 = 5;
+///
+/// Bumped to 6: quoted credential keys (`"password": "…"`) now reach the
+/// context-assignment rule, with label-like and placeholder values exempted,
+/// so a v5 manifest admits files v6 withholds.
+pub const SECRET_POLICY_VERSION: u32 = 6;
 pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
@@ -170,17 +174,22 @@ fn compile_secret_rules() -> Result<Vec<SecretRule>, DetectorFailure> {
         (
             CONTEXT_ASSIGNMENT_RULE_ID,
             &[b"key", b"secret", b"token", b"password", b"passwd", b"pwd"],
-            // After the separator: an optional inline-array opener, then EITHER
+            // Optional quotes around the key so JSON / JS object literals
+            // (`"password": "…"`) match; unquoted keys keep working. After the
+            // separator: an optional inline-array opener, then EITHER
             // one-or-more short quoted elements (each under the capture floor,
             // so they could never match on their own) followed by a mandatory
-            // opening quote, OR the plain optional quote. The mandatory quote
-            // after a skip is load-bearing: without it the capture lands on the
-            // next unquoted run past the comma — in a YAML flow mapping that is
-            // the NEXT KEY (`{token: "ab", environment: production}` would
-            // capture `environment:`), the exact false-positive class the FO-5
-            // ruling refuses. Zero skips keeps the historical shape byte-for-byte.
-            r#"(?i)(?:api[_-]?key|secret(?:[_-]?access[_-]?key)?|token|password|passwd|pwd|client[_-]?secret)[ \t]*[:=][ \t]*(?:\[[ \t]*)?(?:(?:["'][^"'\n]{0,7}["'][ \t]*,[ \t]*)+["']|["']?)([^\s"'#]{8,})"#,
-            1,
+            // quoted value, OR a plain quoted value (spaces allowed — UI
+            // labels), OR an unquoted run. The mandatory quote after a skip is
+            // load-bearing: without it the capture lands on the next unquoted
+            // run past the comma — in a YAML flow mapping that is the NEXT KEY
+            // (`{token: "ab", environment: production}` would capture
+            // `environment:`), the exact false-positive class the FO-5 ruling
+            // refuses. Zero skips keeps the historical shape. Capture groups 1
+            // (array element), 2 (quoted value), 3 (unquoted) are mutually
+            // exclusive; the scanner takes the first that participated.
+            r#"(?i)["']?(?:api[_-]?key|access[_-]?key|private[_-]?key|secret(?:[_-]?access[_-]?key)?|token|password|passwd|pwd|client[_-]?secret)["']?[ \t]*[:=][ \t]*(?:\[[ \t]*)?(?:(?:["'][^"'\n]{0,7}["'][ \t]*,[ \t]*)+["']([^"'\n]{8,})["']|["']([^"'\n]{8,})["']|([^\s"'#]{8,}))"#,
+            3,
             true,
         ),
         (
@@ -289,6 +298,102 @@ fn is_placeholder_only_expression(value: &str) -> bool {
         return false;
     }
     matched_any
+}
+
+/// Byte offset of the credential KEY for context-assignment exemptions.
+///
+/// The pattern allows an optional quote before the keyword so JSON keys match.
+/// That quote is part of the overall regex match, but every downstream test
+/// (`assignment_is_code_expression`, value-equals-key) expects the keyword's
+/// first identifier byte — the same origin unquoted keys have always had.
+fn context_assignment_match_start(rule_id: &str, bytes: &[u8], match_start: usize) -> usize {
+    if rule_id != CONTEXT_ASSIGNMENT_RULE_ID {
+        return match_start;
+    }
+    match bytes.get(match_start) {
+        Some(b'"' | b'\'') => match_start + 1,
+        _ => match_start,
+    }
+}
+
+/// Keyword bytes between the match start and the assignment separator, with
+/// surrounding quotes and ASCII whitespace stripped. Used only to compare a
+/// capture against its own key (`"password": "password"`).
+fn matched_assignment_key(bytes: &[u8], match_start: usize, value_start: usize) -> &[u8] {
+    let head = bytes.get(match_start..value_start).unwrap_or(b"");
+    let sep = head
+        .iter()
+        .position(|byte| matches!(byte, b':' | b'='))
+        .unwrap_or(head.len());
+    let key = head[..sep].trim_ascii();
+    let key = match key.first().copied() {
+        Some(b'"' | b'\'') => &key[1..],
+        _ => key,
+    };
+    let key = match key.last().copied() {
+        Some(b'"' | b'\'') if !key.is_empty() => &key[..key.len() - 1],
+        _ => key,
+    };
+    key.trim_ascii()
+}
+
+/// True when a context-assignment capture is a UI / i18n label, not a secret:
+/// natural-language words or phrases with no digits (and no credential-like
+/// symbols). Title Case single words (`Password`) and spaced phrases
+/// (`Mot de passe`, `Enter your password`) are labels; mixed alphanumeric or
+/// symbol soup is not.
+fn is_natural_language_label(value: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(value) else {
+        return false;
+    };
+    if text.is_empty() || text.chars().any(|character| character.is_ascii_digit()) {
+        return false;
+    }
+    if !text.chars().all(|character| {
+        character.is_alphabetic()
+            || character.is_whitespace()
+            || matches!(character, '-' | '\'' | '.' | ',' | ':' | '!' | '?')
+    }) {
+        return false;
+    }
+    if !text.chars().any(|character| character.is_alphabetic()) {
+        return false;
+    }
+    if text.chars().any(|character| character.is_whitespace()) {
+        return true;
+    }
+    // Single token: Title Case pure letters (`Password`) reads as a UI label.
+    // All-lowercase (`mypassword`) and mixed-case alphabet soup stay on the
+    // default withhold path — value==key already covers `password`/`PASSWORD`.
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_uppercase()
+        && text.chars().all(|character| character.is_alphabetic())
+        && chars.all(|character| character.is_lowercase())
+}
+
+/// Context-assignment stage: after a match, withhold only when the capture
+/// still looks like a credential. Placeholders are handled by the shared
+/// placeholder path; this covers label-like values and value-equals-key.
+fn assignment_value_looks_like_credential(
+    bytes: &[u8],
+    match_start: usize,
+    value_start: usize,
+    value: &[u8],
+) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let key = matched_assignment_key(bytes, match_start, value_start);
+    if !key.is_empty() && value.eq_ignore_ascii_case(key) {
+        return false;
+    }
+    if is_natural_language_label(value) {
+        return false;
+    }
+    true
 }
 
 /// Where to resume inspecting a right-hand side after a capture ends.
@@ -866,11 +971,26 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
         // file.
         let (mut cursor, mut line) = (0_usize, 0_usize);
         for captures in rule.pattern.captures_iter(bytes) {
-            let Some(secret) = captures.get(rule.secret_capture) else {
+            // Context-assignment publishes up to three mutually exclusive
+            // capture groups (array element / quoted / unquoted); take the
+            // first that participated. Other rules keep a single index
+            // (including 0 for whole-match rules).
+            let Some(secret) = (if rule.secret_capture == 0 {
+                captures.get(0)
+            } else {
+                (1..=rule.secret_capture).find_map(|index| captures.get(index))
+            }) else {
                 return SecretScan::Indeterminate {
                     reason: DetectorFailure::Internal,
                 };
             };
+            let match_start = context_assignment_match_start(
+                rule.id,
+                bytes,
+                captures
+                    .get(0)
+                    .map_or(secret.start(), |whole| whole.start()),
+            );
             if rule.placeholders_allowed
                 && (is_placeholder(secret.as_bytes())
                     || is_angle_placeholder(bytes, secret.start()))
@@ -888,15 +1008,18 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                     continue;
                 }
             } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
-                && assignment_is_code_expression(
+                && (assignment_is_code_expression(
                     path,
                     bytes,
-                    captures
-                        .get(0)
-                        .map_or(secret.start(), |whole| whole.start()),
+                    match_start,
                     secret.start(),
                     secret.as_bytes(),
-                ))
+                ) || !assignment_value_looks_like_credential(
+                    bytes,
+                    match_start,
+                    secret.start(),
+                    secret.as_bytes(),
+                )))
                 || (rule.id == URI_CREDENTIALS_RULE_ID
                     && uri_credentials_are_placeholder(bytes, secret.start(), secret.end()))
             {
@@ -1593,6 +1716,9 @@ mod tests {
                 MxVerdict::Sensitive(1),
             ),
             (
+                // Two findings under v6: the placeholder password's RHS walk
+                // still catches the sibling literal, and bare `accesskey` is
+                // now a context-assignment keyword in its own right.
                 "K4 yaml accesskey sibling walk only",
                 "config.yaml",
                 [
@@ -1603,7 +1729,7 @@ mod tests {
                     "\"}",
                 ]
                 .concat(),
-                MxVerdict::Sensitive(1),
+                MxVerdict::Sensitive(2),
             ),
             (
                 "F5 env comma-joined list one key",
@@ -2117,28 +2243,68 @@ mod tests {
                 ["broker: amqp://app:", &password, "@mq-prod\n"].concat(),
                 MxVerdict::Sensitive(1),
             ),
-            // KNOWN FALSE NEGATIVE, pre-existing on v3 and unchanged here: the
-            // keyword must be followed by the separator, so a quoted JSON key
-            // (`"key": "value"`) never matches. Pinned so a deliberate widening
-            // flips this row rather than slipping in with a precision change.
             // The INI credential key: a code lookup stays clean, its literal
             // twin is caught.
             (
                 "AWS1 python secret access key from environment",
                 "src/probe.py",
-                ["aws_", &secret_kw, "_access_key = os.environ.get(KEY_NAME)\n"].concat(),
+                ["aws_", &secret_kw, "_access", "_key = os.environ.get(KEY_NAME)\n"].concat(),
                 MxVerdict::Clean,
             ),
             (
                 "AWS2 python secret access key literal",
                 "src/probe.py",
-                ["aws_", &secret_kw, "_access_key = \"", &real40, "\"\n"].concat(),
+                ["aws_", &secret_kw, "_access", "_key = \"", &real40, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Quoted credential keys (JSON / YAML / TOML / JS): withhold real
+            // values, admit UI labels and placeholders.
+            (
+                "PJ1 json quoted password with digits",
+                "config.json",
+                ["{\"", &password, "\": \"hunter2hunter2\"}\n"].concat(),
                 MxVerdict::Sensitive(1),
             ),
             (
-                "PJ1 json quoted key (known false negative)",
+                "PJ2 yaml password quoted secret",
+                "config.yaml",
+                [&password, ": \"S3cr3t!x\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "PJ3 toml quoted token",
+                "config.toml",
+                ["\"", &token, "\" = \"", &real, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "PJ4 i18n password label Password",
+                "i18n.json",
+                ["{\"", &password, "\":\"Password\"}\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PJ5 french password label",
+                "i18n.json",
+                ["{\"", &password, "\": \"Mot de passe\"}\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PJ6 env-style placeholder in json",
                 "config.json",
-                ["{\"", &password, "\": \"hunter2hunter2\"}\n"].concat(),
+                ["{\"", &password, "\": \"${DB_PASSWORD}\"}\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PJ7 angle placeholder in json",
+                "config.json",
+                ["{\"", &password, "\": \"<your-password>\"}\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "PJ8 empty quoted password value",
+                "config.json",
+                ["{\"", &password, "\": \"\"}\n"].concat(),
                 MxVerdict::Clean,
             ),
         ]
@@ -2327,7 +2493,8 @@ mod tests {
                 [
                     "[default]\naws_",
                     "sec",
-                    "ret_access_key = ",
+                    "ret_access",
+                    "_key = ",
                     &aws_secret,
                     "\n",
                 ]
@@ -2337,7 +2504,7 @@ mod tests {
             (
                 "aws secret access key ini upper",
                 "deploy/profile.cfg",
-                ["AWS_", "SEC", "RET_ACCESS_KEY=", &aws_secret, "\n"].concat(),
+                ["AWS_", "SEC", "RET_ACCESS", "_KEY=", &aws_secret, "\n"].concat(),
                 CONTEXT_ASSIGNMENT_RULE_ID,
             ),
         ];
