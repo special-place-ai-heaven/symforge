@@ -9145,8 +9145,8 @@ impl SymForgeServer {
         // answering here keeps the refusal from depending on existence. The
         // estimate above is exempt by contract (Feature 020 R1/E1: aggregate
         // counts for a demoted file succeed).
-        if crate::knowledge::sensitive_path_rule(&input.path).is_some() {
-            return format::content_withheld_by_admission(&input.path);
+        if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&input.path) {
+            return format::content_withheld_by_path_rule(&input.path, rule_id);
         }
         if let Some(refusal) = read_gate::hard_scope_refusal(&input.path) {
             return refusal;
@@ -29942,6 +29942,8 @@ mod tests {
         assert!(super::edit::safe_repo_path(dir.path(), "sub/../.aws/credentials").is_err());
         assert!(super::safe_repo_path_for_freshen(dir.path(), "sub/../.aws/credentials").is_err());
 
+        let rule_id = crate::knowledge::sensitive_path_rule(".aws/credentials")
+            .expect("the fixture is a credential path");
         for alias in credential_alias_spellings(dir.path()) {
             let direct = super::edit::safe_repo_path(dir.path(), &alias);
             assert!(direct.is_err(), "safe_repo_path admitted alias {alias:?}");
@@ -29955,7 +29957,7 @@ mod tests {
             if !alias.contains(':') {
                 assert_eq!(
                     direct.unwrap_err(),
-                    super::format::content_withheld_by_admission(&alias),
+                    super::format::content_withheld_by_path_rule(&alias, rule_id),
                     "alias {alias:?} must get the canonical refusal"
                 );
             }
