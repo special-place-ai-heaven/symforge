@@ -111,6 +111,11 @@ const STALE_SESSION_HEARTBEAT: Duration = Duration::from_secs(120);
 /// Reaper cadence ceiling: the pid rule must notice a dead adapter within
 /// about one stale window plus one tick, not one TTL quarter.
 const SESSION_REAP_TICK_SECS: u64 = 60;
+/// How long a project slot stays loaded, watcher running, after its last
+/// session closed. A session that opens the project within it reuses the live
+/// index instead of restoring or rebuilding it; the reaper unloads the slot
+/// once it passes. The cost is the idle index's memory for that long.
+const PROJECT_IDLE_GRACE: Duration = Duration::from_secs(15 * 60);
 
 fn session_ttl_from_env() -> std::time::Duration {
     let secs = std::env::var(SESSION_TTL_ENV)
@@ -384,6 +389,9 @@ struct ProjectInstance {
     /// the instance on eviction/retarget.
     symbol_cache: Arc<RwLock<SymbolSnapshotCache>>,
     session_ids: HashSet<String>,
+    /// When `session_ids` last became empty. An empty slot is idle from then,
+    /// and the reaper unloads it once [`PROJECT_IDLE_GRACE`] has passed.
+    idle_since: Option<std::time::Instant>,
     opened_at: SystemTime,
     activation_state: ActivationState,
 }
@@ -1403,12 +1411,12 @@ impl DaemonState {
         // Feature 012 (Phase 2): a session may now reference MORE THAN ONE project
         // (the active one plus any additively-opened ones in its working set), so
         // closing it must detach the session from EVERY project that lists it and
-        // tear down each whose `session_ids` then empties — not just the first
+        // mark each whose `session_ids` then empties idle — not just the first
         // match. Leaving an additively-opened project's `session_ids` pointing at a
         // closed session would leak the project forever. The reported `project_id`
         // / `remaining_sessions` / `project_removed` describe the session's ACTIVE
         // project (its primary association), preserving the wire contract; sibling
-        // additive projects are reaped silently.
+        // additive projects go idle silently.
         // Remove the session record FIRST so a concurrent additive open observes
         // the session as gone and undoes its own attach (recovered finding #16);
         // the membership sweep below then cannot miss a join recorded after the
@@ -1421,8 +1429,9 @@ impl DaemonState {
 
     /// Shared post-removal cleanup for a session record that has already been
     /// claimed out of the sessions map (interactive close or reaper expiry):
-    /// detach the session from EVERY project that lists it, tear down projects
-    /// whose membership empties, GC orphaned bases, and report the active
+    /// detach the session from EVERY project that lists it, mark projects whose
+    /// membership empties idle (the reaper unloads them after
+    /// [`PROJECT_IDLE_GRACE`]), GC orphaned bases, and report the active
     /// project's outcome.
     fn finish_removed_session(&self, session: SessionRecord) -> CloseSessionResponse {
         let session_id = session.session_id.clone();
@@ -1434,45 +1443,26 @@ impl DaemonState {
         drop(session);
 
         let mut active_remaining = 0usize;
-        let mut active_removed = false;
         let mut active_pid_seen = false;
-        let mut removed_slots = Vec::new();
         {
-            let mut projects = self.projects.write();
+            let projects = self.projects.write();
             // All projects that list this session (active + additive siblings).
-            let owning: Vec<String> = projects
-                .iter()
-                .filter(|(_, slot)| slot.metadata.read().session_ids.contains(&session_id))
-                .map(|(id, _)| id.clone())
-                .collect();
-
-            for pid in owning {
-                let is_active = active_project_id.as_deref() == Some(pid.as_str());
-                let remaining = {
-                    let Some(slot) = projects.get(&pid) else {
-                        continue;
-                    };
-                    let mut project = slot.metadata.write();
-                    project.session_ids.remove(&session_id);
-                    project.session_ids.len()
-                };
-                let removed = if remaining == 0 {
-                    if let Some(removed) = projects.remove(&pid) {
-                        removed_slots.push(removed);
-                    }
-                    true
-                } else {
-                    false
-                };
-                if is_active {
+            // A project whose last session this was stays loaded, idle, until
+            // the reaper unloads it after `PROJECT_IDLE_GRACE`.
+            for (pid, slot) in projects.iter() {
+                let mut project = slot.metadata.write();
+                if !project.session_ids.remove(&session_id) {
+                    continue;
+                }
+                let remaining = project.session_ids.len();
+                if remaining == 0 {
+                    project.idle_since = Some(std::time::Instant::now());
+                }
+                if active_project_id.as_deref() == Some(pid.as_str()) {
                     active_pid_seen = true;
                     active_remaining = remaining;
-                    active_removed = removed;
                 }
             }
-        }
-        for slot in removed_slots {
-            slot.stop();
         }
 
         // If this was the last session on a BaseKey, that map value is now a
@@ -1489,8 +1479,88 @@ impl DaemonState {
             session_id: closed_session_id,
             project_id,
             remaining_sessions: active_remaining,
-            project_removed: active_removed,
+            // Closing never unloads a project now; the idle reaper does.
+            project_removed: false,
         }
+    }
+
+    /// Unload every project slot that has had no session for `grace`, and
+    /// return how many it unloaded. The emptiness is re-checked under the
+    /// registry write lock that joins take, so a session that joined the slot
+    /// first keeps it.
+    fn unload_idle_projects(&self, grace: Duration) -> usize {
+        let unloaded: Vec<Arc<ProjectSlot>> = {
+            let mut projects = self.projects.write();
+            let expired: Vec<String> = projects
+                .iter()
+                .filter(|(_, slot)| {
+                    let project = slot.metadata.read();
+                    project.session_ids.is_empty()
+                        && project
+                            .idle_since
+                            .is_some_and(|since| since.elapsed() >= grace)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            expired
+                .iter()
+                .filter_map(|id| projects.remove(id))
+                .collect()
+        };
+        let count = unloaded.len();
+        for slot in unloaded {
+            slot.stop();
+        }
+        if count > 0 {
+            self.gc_orphaned_bases();
+        }
+        count
+    }
+
+    /// Whether a loaded project has no session: it is inside its idle grace,
+    /// and the daemon must stay up for a session that may reuse it.
+    fn holds_idle_project(&self) -> bool {
+        self.projects
+            .read()
+            .values()
+            .any(|slot| slot.metadata.read().session_ids.is_empty())
+    }
+
+    /// Loaded projects that no session holds, with the time left before the
+    /// reaper unloads each. `None` while every loaded project has a session.
+    fn render_idle_projects(&self) -> Option<String> {
+        let mut lines: Vec<String> = self
+            .projects
+            .read()
+            .values()
+            .filter_map(|slot| {
+                let project = slot.metadata.read();
+                let since = project
+                    .idle_since
+                    .filter(|_| project.session_ids.is_empty())?;
+                let minutes_left = PROJECT_IDLE_GRACE
+                    .saturating_sub(since.elapsed())
+                    .as_secs()
+                    .div_ceil(60);
+                let unloads = if minutes_left == 0 {
+                    "unloads at the next reaper sweep".to_string()
+                } else {
+                    format!("unloads in {minutes_left}m")
+                };
+                Some(format!(
+                    "{} name={} root={} idle, no sessions, {unloads}",
+                    project.project_id,
+                    project.project_name,
+                    normalized_path_string(&project.canonical_root),
+                ))
+            })
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        lines.sort();
+        lines.insert(0, "── idle projects ──".to_string());
+        Some(lines.join("\n"))
     }
 
     /// Task 9 reaper claim: re-check the SAME last-seen observation under the
@@ -1929,8 +1999,8 @@ impl DaemonState {
     ///   current index (the project was evicted and re-loaded since) is REPLACED,
     ///   never reused — a stale server would silently serve a dead index;
     /// - if the session closed while the attach was in flight, the membership
-    ///   join is undone (and the slot reaped if that was its last session), so a
-    ///   closed session cannot pin a project forever.
+    ///   join is undone (and the slot goes idle if that was its last session),
+    ///   so a closed session cannot pin a project forever.
     fn add_project_to_session(&self, session_id: &str, project_id: &str) -> bool {
         let Some(base) = self.intern_base_for_project(project_id) else {
             return false;
@@ -1972,28 +2042,18 @@ impl DaemonState {
         attached
     }
 
-    /// Remove `session_id` from `project_id`'s membership set, reaping the slot
-    /// when that membership was its last. Used to undo an attach that raced a
+    /// Remove `session_id` from `project_id`'s membership set, marking the slot
+    /// idle when that membership was its last. Used to undo an attach that raced a
     /// session close (recovered finding #16); safe to call when either side is
     /// already gone.
     fn detach_project_membership(&self, session_id: &str, project_id: &str) {
-        let removed = {
-            let mut projects = self.projects.write();
-            let Some(slot) = projects.get(project_id).cloned() else {
-                return;
-            };
-            let mut project = slot.metadata.write();
-            project.session_ids.remove(session_id);
-            let empty = project.session_ids.is_empty();
-            drop(project);
-            if empty {
-                projects.remove(project_id)
-            } else {
-                None
-            }
+        let projects = self.projects.write();
+        let Some(slot) = projects.get(project_id) else {
+            return;
         };
-        if let Some(slot) = removed {
-            slot.stop();
+        let mut project = slot.metadata.write();
+        if project.session_ids.remove(session_id) && project.session_ids.is_empty() {
+            project.idle_since = Some(std::time::Instant::now());
         }
     }
 
@@ -3430,20 +3490,30 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
-/// One reaper sweep, TTL rule then pid rule, run on the blocking pool: closing
-/// a session stops its project slot, which takes the mutation lock that a long
-/// `index_folder` reload holds, and that must not park a tokio worker.
-/// Returns `(ttl_reaped, dead_pid_reaped)`; a panicked sweep is logged and
-/// counts as zero rather than being reported as a clean pass.
+/// One reaper sweep, TTL rule then pid rule, then the idle-project unload, run
+/// on the blocking pool: unloading a project stops its slot, which takes the
+/// mutation lock that a long `index_folder` reload holds, and that must not
+/// park a tokio worker. Returns `(ttl_reaped, dead_pid_reaped)`; a panicked
+/// sweep is logged and counts as zero rather than being reported as a clean
+/// pass.
 async fn sweep_sessions_off_thread(
     state: SharedDaemonState,
     ttl: std::time::Duration,
 ) -> (usize, usize) {
     let sweep = tokio::task::spawn_blocking(move || {
-        (
+        let reaped = (
             state.reap_expired_sessions(ttl),
             state.reap_dead_pid_sessions(STALE_SESSION_HEARTBEAT),
-        )
+        );
+        let unloaded = state.unload_idle_projects(PROJECT_IDLE_GRACE);
+        if unloaded > 0 {
+            tracing::info!(
+                unloaded,
+                grace_secs = PROJECT_IDLE_GRACE.as_secs(),
+                "unloaded projects that had no session for the idle grace"
+            );
+        }
+        reaped
     });
     match sweep.await {
         Ok(counts) => counts,
@@ -3886,6 +3956,7 @@ impl ProjectInstance {
             token_stats,
             symbol_cache: Arc::new(RwLock::new(HashMap::new())),
             session_ids: HashSet::new(),
+            idle_since: None,
             opened_at: SystemTime::now(),
             activation_state: ActivationState::Inactive,
         })
@@ -4371,16 +4442,24 @@ impl ColdLoadJob {
             let handoff = Arc::clone(&handoff);
             runtime.spawn_blocking(move || {
                 let result = job.run(load);
-                {
+                let built = result.is_ok();
+                let unclaimed = {
                     let (state, ready) = &*handoff;
                     let mut state = state.lock();
                     if matches!(*state, ColdLoadHandoff::Waiting) {
                         *state = ColdLoadHandoff::Done(result);
                         ready.notify_one();
-                        return;
+                        None
+                    } else {
+                        Some(result)
                     }
+                };
+                if let Some(result) = unclaimed {
+                    job.finish(result);
                 }
-                job.finish(result);
+                if built {
+                    job.persist();
+                }
             });
         }
 
@@ -4421,8 +4500,37 @@ impl ColdLoadJob {
         self.index.mark_bootstrap_loading();
         runtime.spawn_blocking(move || {
             let result = self.run(load);
+            let built = result.is_ok();
             self.finish(result);
+            if built {
+                self.persist();
+            }
         });
+    }
+
+    /// Write the snapshot of a build that published, off the request path, so
+    /// the project's next open (a daemon restart, or a session after its slot
+    /// unloaded) restores instead of parsing the tree again. The checkpoint
+    /// itself refuses a generation it cannot vouch for.
+    fn persist(&self) {
+        if self.background.cancel.load(Ordering::Acquire)
+            || matches!(self.placement, StatePlacement::MemoryOnly { .. })
+        {
+            return;
+        }
+        match live_index::persist::checkpoint_shared_index(&self.index, &self.root, &self.placement)
+        {
+            Ok(report) => tracing::info!(
+                root = %self.root.display(),
+                files = report.files,
+                bytes = report.bytes,
+                "wrote the snapshot of the project's first build"
+            ),
+            Err(error) => tracing::warn!(
+                root = %self.root.display(),
+                "the snapshot of the project's first build was not written: {error:#}"
+            ),
+        }
     }
 
     fn run<L>(&self, load: L) -> anyhow::Result<()>
@@ -4890,7 +4998,11 @@ pub async fn spawn_daemon_at(
                 tracing::info!(dead, "session reaper closed sessions whose process exited");
             }
             if let Some(idle) = idle_shutdown_after {
-                if state.active_authenticated_requests.load(Ordering::Relaxed) > 0 {
+                // An idle project's grace outlives the idle window: shutting
+                // down inside it would drop the index the grace keeps for reuse.
+                if state.active_authenticated_requests.load(Ordering::Relaxed) > 0
+                    || state.holds_idle_project()
+                {
                     idle_fired = false;
                     continue;
                 }
@@ -5532,11 +5644,20 @@ async fn call_tool_handler(
             if matches!(
                 tool_name_for_panic.as_str(),
                 "health" | "health_compact" | "status"
-            ) && let Some(inventory) =
-                state.render_session_project_inventory_if_multi(&session_id)
-            {
-                result.push('\n');
-                result.push_str(&inventory);
+            ) {
+                if let Some(inventory) =
+                    state.render_session_project_inventory_if_multi(&session_id)
+                {
+                    result.push('\n');
+                    result.push_str(&inventory);
+                }
+                // A project kept loaded after its last session closed is
+                // daemon state this session can reuse; say so, and when it
+                // unloads.
+                if let Some(idle) = state.render_idle_projects() {
+                    result.push('\n');
+                    result.push_str(&idle);
+                }
             }
             let mut response = result.into_response();
             if has_explicit_project_set {
@@ -7702,6 +7823,51 @@ mod tests {
         handle.server_task.await.expect("daemon server task");
     }
 
+    /// The daemon idle window is shorter than a project's idle grace, so the
+    /// daemon must not shut down while it keeps an idle project for reuse.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_idle_shutdown_waits_for_idle_project_grace() {
+        let _guard = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _idle = EnvVarGuard::set_str(DAEMON_IDLE_SHUTDOWN_ENV, "60");
+        let project = project_dir("symforge-idle-grace-shutdown");
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let state = Arc::clone(&handle.state);
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "idle-grace".to_string(),
+                pid: None,
+            })
+            .expect("open project");
+        state.close_session(&opened.session_id).expect("close");
+        state
+            .last_activity_at
+            .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        // The sweep runs on the blocking pool, which holds the paused clock
+        // until it finishes; a one-second window covers the idle check after it.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), state.idle_shutdown.notified())
+                .await
+                .is_err(),
+            "idle shutdown must wait while an idle project is inside its grace"
+        );
+
+        state.unload_idle_projects(Duration::ZERO);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        state.idle_shutdown.notified().await;
+
+        handle.reaper_task.abort();
+        let _ = handle.shutdown_tx.send(());
+        handle.server_task.await.expect("daemon server task");
+    }
+
     #[test]
     fn project_instance_load_consumes_exported_team_artifact() {
         // A teammate who just `git clone`d has `.symforge/index.bin.zst` (the
@@ -9194,15 +9360,17 @@ mod tests {
         // Keep the shared TempDirs alive until all threads have joined.
         drop(shared_roots);
 
-        // After every session is closed, no projects or sessions should remain.
+        // After every session is closed, no sessions remain and every project
+        // is idle: nothing still holds a membership that would keep it loaded.
         assert_eq!(
             state.health().session_count,
             0,
             "all sessions closed after the stress loop"
         );
+        state.unload_idle_projects(Duration::ZERO);
         assert!(
             state.list_projects().is_empty(),
-            "all projects removed after their last session closed"
+            "all projects unload once idle past the grace after their last session closed"
         );
     }
 
@@ -10023,9 +10191,14 @@ mod tests {
         }
 
         assert!(state.close_session(&authorized.session_id).is_some());
+        assert_eq!(
+            state.unload_idle_projects(Duration::ZERO),
+            2,
+            "home and the protected project are both idle"
+        );
         assert!(
             state.list_projects().is_empty(),
-            "closing the last session must remove the live protected slot"
+            "unloading the idle slot must remove the live protected slot"
         );
         drop(state);
         assert!(
@@ -10482,10 +10655,14 @@ mod tests {
 
         drop(same_slot);
         drop(first_slot);
-        let closed = state
+        state
             .close_session(&first.session_id)
             .expect("close first project instance");
-        assert!(closed.project_removed);
+        assert_eq!(
+            state.unload_idle_projects(Duration::ZERO),
+            1,
+            "the idle first instance unloads once its grace has passed"
+        );
 
         let second = state
             .open_project_session(OpenProjectRequest {
@@ -10508,12 +10685,10 @@ mod tests {
             other => panic!("fresh instance must recover project-local durability, got {other:?}"),
         }
         assert!(project_state.is_dir());
-        assert!(
-            state
-                .close_session(&second.session_id)
-                .expect("close fresh project instance")
-                .project_removed
-        );
+        state
+            .close_session(&second.session_id)
+            .expect("close fresh project instance");
+        assert_eq!(state.unload_idle_projects(Duration::ZERO), 1);
     }
 
     #[tokio::test]
@@ -10573,12 +10748,10 @@ mod tests {
                 ref reason_codes,
             } if reason_codes == &[crate::domain::FreshnessReason::CatalogEntryCapacityExceeded]
         ));
-        assert!(
-            state
-                .close_session(&opened.session_id)
-                .expect("close capacity-refusal session")
-                .project_removed
-        );
+        state
+            .close_session(&opened.session_id)
+            .expect("close capacity-refusal session");
+        assert_eq!(state.unload_idle_projects(Duration::ZERO), 1);
     }
 
     #[test]
@@ -10618,9 +10791,9 @@ mod tests {
     //
     // The advertised multi-project leak fix: a session that additively opened a
     // SECOND project references BOTH (active A + additive B). Closing it must
-    // detach from EVERY referenced project and tear down each whose session set
-    // then empties — not just the active one. A leak would leave B in the project
-    // map (and its watcher running) forever. This runs under a multi-thread Tokio
+    // detach from EVERY referenced project so each whose session set then empties
+    // goes idle and unloads after the grace — not just the active one. A leak
+    // would leave B in the project map (and its watcher running) forever. This runs under a multi-thread Tokio
     // runtime so `activate()` actually spawns real watcher tasks (sync tests get
     // `None` watchers), letting us assert teardown via each project's `stop_token`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10697,7 +10870,16 @@ mod tests {
             "reported pid is the active project A"
         );
         assert_eq!(closed.remaining_sessions, 0);
-        assert!(closed.project_removed, "active project A reaped");
+        assert!(!closed.project_removed, "close leaves A loaded, idle");
+        assert!(
+            !token_a.load(Ordering::Acquire) && !token_b.load(Ordering::Acquire),
+            "idle projects keep their watchers until the grace passes"
+        );
+        assert_eq!(
+            state.unload_idle_projects(Duration::ZERO),
+            2,
+            "A and B are both idle once the session closed"
+        );
 
         // BOTH projects reaped (the leak fix): the map is empty, not just A gone.
         assert!(
@@ -10719,7 +10901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_close_session_removes_project_when_last_session_leaves() {
+    fn test_close_session_idles_project_when_last_session_leaves() {
         let project = project_dir("symforge-daemon-d");
         let state = DaemonState::new();
 
@@ -10749,8 +10931,347 @@ mod tests {
             .close_session(&second.session_id)
             .expect("close second session");
         assert_eq!(close_second.remaining_sessions, 0);
-        assert!(close_second.project_removed);
+        assert!(!close_second.project_removed);
+        assert_eq!(
+            state.list_projects().len(),
+            1,
+            "the idle project stays loaded"
+        );
+        assert_eq!(
+            state.unload_idle_projects(PROJECT_IDLE_GRACE),
+            0,
+            "a project idle for less than the grace stays loaded"
+        );
+        assert_eq!(state.unload_idle_projects(Duration::ZERO), 1);
         assert!(state.list_projects().is_empty());
+    }
+
+    fn published_generation(state: &DaemonState, project_id: &str) -> u64 {
+        state
+            .projects
+            .read()
+            .get(project_id)
+            .expect("loaded project")
+            .metadata
+            .read()
+            .index
+            .data_plane()
+            .current_project_generation()
+    }
+
+    /// A daemon proxy for a session opened over HTTP on `project`, the shape a
+    /// stdio adapter has when `notifications/initialized` arrives.
+    async fn proxy_session_for(
+        handle: &DaemonHandle,
+        home: &Path,
+        project: &Path,
+    ) -> (OpenProjectResponse, crate::protocol::SymForgeServer) {
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let opened = authed_client(handle)
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.display().to_string(),
+                client_name: "roots-client".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url,
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(home),
+        )
+        .with_project_root(project.to_path_buf());
+        (
+            opened,
+            crate::protocol::SymForgeServer::new_daemon_proxy(client),
+        )
+    }
+
+    /// Client roots naming the root the session is already bound to must not
+    /// re-index it: that was a second full build plus a snapshot write on
+    /// every roots-declaring session open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_client_roots_naming_the_bound_root_do_not_rebuild_it() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project = project_dir("symforge-roots-same");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn one() {}\n",
+        )
+        .expect("write source");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let (opened, server) = proxy_session_for(&handle, daemon_home.path(), project.path()).await;
+        let before = published_generation(&handle.state, &opened.project_id);
+
+        let outcome = server
+            .bind_declared_client_root(canonical_project_root(project.path()).expect("canonical"))
+            .await;
+
+        assert_eq!(outcome, None, "the same root must not reach index_folder");
+        assert_eq!(
+            published_generation(&handle.state, &opened.project_id),
+            before,
+            "the same root must not rebuild or republish the index"
+        );
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// Client roots naming a DIFFERENT root still retarget the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_client_roots_naming_another_root_retarget_the_session() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let launch = project_dir("symforge-roots-launch");
+        let declared = project_dir("symforge-roots-declared");
+        std::fs::write(
+            declared.path().join("src").join("lib.rs"),
+            "pub fn two() {}\n",
+        )
+        .expect("write source");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let (opened, server) = proxy_session_for(&handle, daemon_home.path(), launch.path()).await;
+        let declared_root = canonical_project_root(declared.path()).expect("canonical");
+        let declared_id = project_key(&declared_root);
+
+        let outcome = server
+            .bind_declared_client_root(declared_root)
+            .await
+            .expect("another root must reach index_folder");
+
+        assert!(outcome.starts_with("Indexed "), "retarget: {outcome}");
+        let session_active = handle
+            .state
+            .sessions
+            .read()
+            .get(&opened.session_id)
+            .map(|session| session.active_project_id.clone());
+        assert_eq!(session_active.as_deref(), Some(declared_id.as_str()));
+        let proxy_active = server
+            .daemon_client
+            .as_ref()
+            .expect("daemon proxy")
+            .read()
+            .await
+            .active_project_id();
+        assert_eq!(proxy_active, declared_id);
+        let _ = handle.shutdown_tx.send(());
+    }
+
+    /// A session-open cold build persists its snapshot, so the next open of
+    /// the project restores instead of parsing the tree again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_session_open_first_build_writes_a_restorable_snapshot() {
+        let project = project_dir("symforge-first-build-snapshot");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn one() {}\n",
+        )
+        .expect("write source");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "first-build".to_string(),
+                pid: None,
+            })
+            .expect("open project");
+        let (root, placement) = {
+            let projects = state.projects.read();
+            let project = projects
+                .get(&opened.project_id)
+                .expect("loaded project")
+                .metadata
+                .read();
+            (
+                project.canonical_root.clone(),
+                project.state_placement.clone(),
+            )
+        };
+        let snapshot = placement
+            .directory()
+            .expect("durable placement")
+            .as_path()
+            .join("index.bin");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !snapshot.is_file() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            snapshot.is_file(),
+            "the first build must write {}",
+            snapshot.display()
+        );
+        let restored = live_index::persist::load_snapshot(&root, &placement)
+            .expect("the written snapshot must restore");
+        assert_eq!(restored.files.len(), 1);
+        state.close_session(&opened.session_id);
+    }
+
+    /// A project whose last session closed stays loaded: a session that opens
+    /// it within the grace reuses the live index, and once the grace has
+    /// passed the reaper unloads it and stops its watcher.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_idle_project_is_reused_within_grace_and_unloaded_after_it() {
+        let project = project_dir("symforge-idle-grace");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn one() {}\n",
+        )
+        .expect("write source");
+        let state = DaemonState::new();
+        let open = |client: &str| {
+            state
+                .open_project_session(OpenProjectRequest {
+                    project_root: project.path().display().to_string(),
+                    client_name: client.to_string(),
+                    pid: None,
+                })
+                .expect("open project")
+        };
+        let first = open("first");
+        let slot = state
+            .projects
+            .read()
+            .get(&first.project_id)
+            .cloned()
+            .expect("loaded project");
+        let stop_token = Arc::clone(&slot.metadata.read().stop_token);
+        let generation = published_generation(&state, &first.project_id);
+
+        state.close_session(&first.session_id).expect("close first");
+        assert_eq!(
+            state.unload_idle_projects(PROJECT_IDLE_GRACE),
+            0,
+            "within the grace the idle project stays loaded"
+        );
+        assert!(
+            !stop_token.load(Ordering::Acquire),
+            "its watcher keeps running"
+        );
+
+        let second = open("second");
+        let reused = state
+            .projects
+            .read()
+            .get(&second.project_id)
+            .cloned()
+            .expect("loaded project");
+        assert!(
+            Arc::ptr_eq(&slot, &reused),
+            "a session within the grace joins the live slot"
+        );
+        assert_eq!(
+            published_generation(&state, &second.project_id),
+            generation,
+            "joining the live slot neither restores nor rebuilds it"
+        );
+
+        state
+            .close_session(&second.session_id)
+            .expect("close second");
+        drop(reused);
+        assert_eq!(
+            state.unload_idle_projects(Duration::ZERO),
+            1,
+            "past the grace the idle project unloads"
+        );
+        assert!(stop_token.load(Ordering::Acquire), "its watcher is stopped");
+        assert!(state.list_projects().is_empty());
+    }
+
+    /// health, health_compact and status report a loaded project no session
+    /// holds as idle, with when it unloads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_health_reports_an_idle_project() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let kept = project_dir("symforge-health-kept");
+        let idle = project_dir("symforge-health-idle");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let open = |root: &Path| {
+            client
+                .post(format!("{base_url}/v1/sessions/open"))
+                .json(&OpenProjectRequest {
+                    project_root: root.display().to_string(),
+                    client_name: "health-idle".to_string(),
+                    pid: Some(std::process::id()),
+                })
+                .send()
+        };
+        let kept_session = open(kept.path())
+            .await
+            .expect("open kept")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("kept body");
+        let idle_session = open(idle.path())
+            .await
+            .expect("open idle")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("idle body");
+        client
+            .delete(format!(
+                "{base_url}/v1/sessions/{}",
+                idle_session.session_id
+            ))
+            .send()
+            .await
+            .expect("close idle session")
+            .error_for_status()
+            .expect("close status");
+
+        let expected = format!(
+            "{} name={}",
+            idle_session.project_id, idle_session.project_name
+        );
+        for tool in ["health", "health_compact", "status"] {
+            let body = client
+                .post(format!(
+                    "{base_url}/v1/sessions/{}/tools/{tool}",
+                    kept_session.session_id
+                ))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .expect("tool request")
+                .error_for_status()
+                .expect("tool status")
+                .text()
+                .await
+                .expect("tool body");
+            let line = body
+                .lines()
+                .find(|line| line.starts_with(&expected))
+                .unwrap_or_else(|| panic!("{tool} must list the idle project: {body}"));
+            assert!(
+                line.ends_with("idle, no sessions, unloads in 15m"),
+                "{tool} idle line: {line}"
+            );
+        }
+        let _ = handle.shutdown_tx.send(());
     }
 
     #[test]
@@ -11451,8 +11972,9 @@ mod tests {
             .json::<CloseSessionResponse>()
             .await
             .expect("close body");
-        assert!(closed.project_removed);
+        assert!(!closed.project_removed, "the project stays loaded, idle");
         assert_eq!(closed.remaining_sessions, 0);
+        assert_eq!(handle.state.unload_idle_projects(Duration::ZERO), 1);
 
         let final_health = client
             .get(format!("{base_url}/health"))
@@ -15223,8 +15745,9 @@ mod tests {
             !state.sessions.read().contains_key(&opened.session_id),
             "claimed session is removed"
         );
-        assert!(
-            !state.projects.read().contains_key(&opened.project_id),
+        assert_eq!(
+            state.unload_idle_projects(Duration::ZERO),
+            1,
             "orphan project membership is removed once"
         );
         // A late heartbeat cannot resurrect the claimed session.
@@ -15352,9 +15875,10 @@ mod tests {
             reaped, 2,
             "only the stale sessions with a dead pid are reaped"
         );
+        state.unload_idle_projects(Duration::ZERO);
         assert!(
             !state.projects.read().contains_key(&lonely.project_id),
-            "a reaped session that was its project's last member retires the project slot"
+            "a reaped session that was its project's last member leaves the slot idle to unload"
         );
         assert_eq!(
             survived,
@@ -18150,7 +18674,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_last_session_cancels_the_project_background_load() {
+    fn unloading_an_idle_project_cancels_its_background_load() {
         let project = project_dir("symforge-daemon-cancel");
         let state = DaemonState::new();
         let opened = state
@@ -18173,10 +18697,15 @@ mod tests {
         assert!(!background.cancel.load(Ordering::Acquire));
 
         state.close_session(&opened.session_id).expect("closed");
+        assert!(
+            !background.cancel.load(Ordering::Acquire),
+            "an idle slot keeps loading, for the session that may reuse it"
+        );
 
+        state.unload_idle_projects(Duration::ZERO);
         assert!(
             background.cancel.load(Ordering::Acquire),
-            "a reaped slot must stop its background load"
+            "an unloaded slot must stop its background load"
         );
     }
 
