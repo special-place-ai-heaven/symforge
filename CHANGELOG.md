@@ -32,6 +32,18 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.7](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.6...v11.3.7) (2026-09-30)
+
+
+### Bug Fixes
+
+* **security:** refuse credential-directory roots, case-fold path rules, and match nested gitignore like git ([#732](https://github.com/special-place-ai-heaven/symforge/issues/732)) ([5a371ac](https://github.com/special-place-ai-heaven/symforge/commit/5a371acc7a0d0cff1e586a806a9fd8c1c56c5635))
+
+
+### Performance Improvements
+
+* **index:** parse the largest files first and remove the superlinear parse cost ([#730](https://github.com/special-place-ai-heaven/symforge/issues/730)) ([2b39769](https://github.com/special-place-ai-heaven/symforge/commit/2b3976946aeed630db9a4cfb547a35d6fec5ee65))
+
 ## [11.3.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.5...v11.3.6) (2026-09-30)
 
 
