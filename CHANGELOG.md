@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.4...v11.3.5) (2026-09-30)
+
+
+### Bug Fixes
+
+* **persist:** verify restored snapshots once, withhold what cannot be verified, and never persist an unverified seed ([#726](https://github.com/special-place-ai-heaven/symforge/issues/726)) ([1fef60c](https://github.com/special-place-ai-heaven/symforge/commit/1fef60c30791d478fea54f6a195e86340463f1df))
+
 ## [11.3.4](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.3...v11.3.4) (2026-09-30)
 
 
