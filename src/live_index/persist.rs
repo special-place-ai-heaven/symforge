@@ -2435,6 +2435,12 @@ fn stat_check_files_from_view(
         .files
         .iter()
         .map(|file| file.relative_path.as_str())
+        .chain(
+            verify_view
+                .terminal_catalog_paths
+                .iter()
+                .map(String::as_str),
+        )
         .collect();
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
@@ -2653,6 +2659,10 @@ struct VerifyFileView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifyIndexView {
     files: Vec<VerifyFileView>,
+    /// Paths accounted for by terminal catalog dispositions (metadata-only /
+    /// hard-skip). They hold no resident row, but must not be rediscovered as
+    /// "new" on every restore.
+    terminal_catalog_paths: Vec<String>,
 }
 
 fn capture_verify_view(index: &LiveIndex) -> VerifyIndexView {
@@ -2666,7 +2676,30 @@ fn capture_verify_view(index: &LiveIndex) -> VerifyIndexView {
         })
         .collect();
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    VerifyIndexView { files }
+    let mut terminal_catalog_paths: Vec<String> = index
+        .manifest_entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.disposition,
+                FileDisposition::MetadataOnly { .. } | FileDisposition::HardSkip { .. }
+            )
+        })
+        .map(|entry| {
+            entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .unwrap_or(entry.path.public_id.as_str())
+                .to_string()
+        })
+        .collect();
+    terminal_catalog_paths.sort();
+    terminal_catalog_paths.dedup();
+    VerifyIndexView {
+        files,
+        terminal_catalog_paths,
+    }
 }
 
 /// Convert captured live-index data to `IndexSnapshot`.
@@ -3100,6 +3133,8 @@ fn run_background_verify<F, C>(
                 .filter(|file| !flagged.contains(file.relative_path.as_str()))
                 .cloned()
                 .collect(),
+            // Spot-check only samples resident rows; terminals stay catalog-only.
+            terminal_catalog_paths: Vec::new(),
         };
         spot_verify_sample_from_view(&cleared, root, 0.10, Some(&progress), &|| {
             stopped("the spot check")
@@ -7565,6 +7600,184 @@ mod tests {
         assert!(
             result.new_files.contains(&"new.rs".to_string()),
             "new file should be detected"
+        );
+    }
+
+    /// Terminal catalog rows (metadata-only / hard-skip) hold no resident file
+    /// row. Verify must still treat them as known so an unchanged restore does
+    /// not rediscover and re-admit them as "new".
+    #[test]
+    fn stat_check_does_not_report_unchanged_terminal_catalog_entries_as_new() {
+        let tmp = TempDir::new().unwrap();
+        let meta_bytes = b"not-utf8-\xff-bytes";
+        let hard_bytes = vec![0u8; 64];
+        std::fs::write(tmp.path().join("legacy.txt"), meta_bytes).unwrap();
+        std::fs::write(tmp.path().join("oversized.bin"), &hard_bytes).unwrap();
+        // A genuinely new file must still be reported.
+        std::fs::write(tmp.path().join("brand_new.rs"), b"fn fresh() {}").unwrap();
+
+        let mut index = make_live_index_with_files(vec![]);
+        index.manifest_entries = vec![
+            CatalogEntry {
+                path: CatalogPath {
+                    public_id: "legacy.txt".to_string(),
+                    normalized_utf8: Some("legacy.txt".to_string()),
+                },
+                size: meta_bytes.len() as u64,
+                language: None,
+                classification: crate::domain::FileClassification::for_code_path("legacy.txt"),
+                disposition: FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::UnsupportedTextEncoding,
+                },
+                content_hash: None,
+            },
+            CatalogEntry {
+                path: CatalogPath {
+                    public_id: "oversized.bin".to_string(),
+                    normalized_utf8: Some("oversized.bin".to_string()),
+                },
+                size: hard_bytes.len() as u64,
+                language: None,
+                classification: crate::domain::FileClassification::for_code_path("oversized.bin"),
+                disposition: FileDisposition::HardSkip {
+                    reason: HardSkipReason::PerFileCeiling,
+                },
+                content_hash: None,
+            },
+        ];
+
+        let result = stat_check_files_from_view(
+            &capture_verify_view(&index),
+            &HashMap::new(),
+            tmp.path(),
+            &|| false,
+        )
+        .unwrap();
+        assert!(
+            !result
+                .new_files
+                .iter()
+                .any(|p| p == "legacy.txt" || p == "oversized.bin"),
+            "unchanged terminal catalog paths must not be rediscovered as new: {:?}",
+            result.new_files
+        );
+        assert!(
+            result.new_files.contains(&"brand_new.rs".to_string()),
+            "a path absent from both resident rows and the terminal catalog must still be new"
+        );
+        assert!(
+            result.changed.is_empty(),
+            "unchanged terminals are not changed"
+        );
+        assert!(
+            result.deleted.is_empty(),
+            "present terminals are not deleted"
+        );
+    }
+
+    /// Snapshot round-trip must keep terminal catalog entries, and a second
+    /// verify pass over an unchanged tree must report zero new files for them.
+    #[test]
+    fn restore_with_terminal_catalog_reports_zero_new_when_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let content = b"fn main() {}\n";
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), content).unwrap();
+        let meta_bytes = b"latin1-\xe9-text";
+        let hard_bytes = vec![0u8; 32];
+        std::fs::write(tmp.path().join("encoding.txt"), meta_bytes).unwrap();
+        std::fs::write(tmp.path().join("blob.bin"), &hard_bytes).unwrap();
+
+        let mut index = make_live_index_with_files(vec![("src/main.rs", content)]);
+        // Stamp the resident row with the on-disk mtime so the stat pass is quiet.
+        let mtime_secs = std::fs::metadata(tmp.path().join("src/main.rs"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let file = Arc::make_mut(index.files.get_mut("src/main.rs").unwrap());
+            file.mtime_secs = mtime_secs;
+        }
+        index.manifest_entries = vec![
+            CatalogEntry {
+                path: CatalogPath {
+                    public_id: "blob.bin".to_string(),
+                    normalized_utf8: Some("blob.bin".to_string()),
+                },
+                size: hard_bytes.len() as u64,
+                language: None,
+                classification: crate::domain::FileClassification::for_code_path("blob.bin"),
+                disposition: FileDisposition::HardSkip {
+                    reason: HardSkipReason::PerFileCeiling,
+                },
+                content_hash: None,
+            },
+            CatalogEntry {
+                path: CatalogPath {
+                    public_id: "encoding.txt".to_string(),
+                    normalized_utf8: Some("encoding.txt".to_string()),
+                },
+                size: meta_bytes.len() as u64,
+                language: None,
+                classification: crate::domain::FileClassification::for_code_path("encoding.txt"),
+                disposition: FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::UnsupportedTextEncoding,
+                },
+                content_hash: None,
+            },
+            CatalogEntry {
+                path: CatalogPath {
+                    public_id: "src/main.rs".to_string(),
+                    normalized_utf8: Some("src/main.rs".to_string()),
+                },
+                size: content.len() as u64,
+                language: LanguageId::from_extension("rs"),
+                classification: crate::domain::FileClassification::for_code_path("src/main.rs"),
+                disposition: FileDisposition::Indexed {
+                    targets: IndexTargets::CodeAndKnowledge,
+                    parse_status: crate::domain::index::ParseStatus::Parsed,
+                },
+                content_hash: Some(crate::hash::digest_hex(content)),
+            },
+        ];
+        let expected_terminals = index.manifest_entries.clone();
+
+        serialize_index(&index, tmp.path()).expect("serialize");
+        let snapshot = load_snapshot(tmp.path()).expect("load snapshot");
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
+        assert_eq!(
+            loaded.manifest_entries, expected_terminals,
+            "terminal catalog entries must survive the snapshot round-trip"
+        );
+
+        let snapshot_mtimes: HashMap<String, u64> = loaded
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect();
+        let result = stat_check_files_from_view(
+            &capture_verify_view(&loaded),
+            &snapshot_mtimes,
+            tmp.path(),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.new_files,
+            Vec::<String>::new(),
+            "second restore over an unchanged tree must report 0 new; got {:?}",
+            result.new_files
+        );
+        assert!(
+            result.changed.is_empty(),
+            "unchanged restore must report 0 changed"
+        );
+        assert!(
+            result.deleted.is_empty(),
+            "unchanged restore must report 0 deleted"
         );
     }
 
