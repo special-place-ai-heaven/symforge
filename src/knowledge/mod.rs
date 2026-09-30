@@ -50,7 +50,11 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// Bumped to 6: quoted credential keys (`"password": "…"`) now reach the
 /// context-assignment rule, with label-like and placeholder values exempted,
 /// so a v5 manifest admits files v6 withholds.
-pub const SECRET_POLICY_VERSION: u32 = 6;
+///
+/// Bumped to 7: the natural-language label exemption no longer admits
+/// Diceware-style multi-word or long Title-Case mashed passphrases under
+/// credential keys, so a v6 manifest admits files v7 withholds.
+pub const SECRET_POLICY_VERSION: u32 = 7;
 pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
@@ -337,11 +341,21 @@ fn matched_assignment_key(bytes: &[u8], match_start: usize, value_start: usize) 
     key.trim_ascii()
 }
 
+/// Max whitespace-separated tokens still treated as a UI label.
+/// Diceware / correct-horse passphrases are typically ≥4 words; short i18n
+/// phrases (`Mot de passe`, `Enter your password`) stay at ≤3. Prefer
+/// withhold on ambiguity rather than admit spaced passphrase material.
+const NATURAL_LANGUAGE_LABEL_MAX_WORDS: usize = 3;
+/// Max chars for a Title-Case single-token label (`Password`). Longer mashed
+/// Title-Case (`Correcthorsebatterystaple`) is withheld as a credential.
+const NATURAL_LANGUAGE_LABEL_MAX_SINGLE_TOKEN_CHARS: usize = 16;
+
 /// True when a context-assignment capture is a UI / i18n label, not a secret:
-/// natural-language words or phrases with no digits (and no credential-like
-/// symbols). Title Case single words (`Password`) and spaced phrases
-/// (`Mot de passe`, `Enter your password`) are labels; mixed alphanumeric or
-/// symbol soup is not.
+/// short natural-language words or phrases with no digits (and no
+/// credential-like symbols). Title Case single words (`Password`) and short
+/// spaced phrases (`Mot de passe`, `Enter your password`) are labels;
+/// Diceware-style multi-word phrases, long mashed Title-Case tokens, mixed
+/// alphanumeric, or symbol soup are not.
 fn is_natural_language_label(value: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(value) else {
         return false;
@@ -360,11 +374,16 @@ fn is_natural_language_label(value: &[u8]) -> bool {
         return false;
     }
     if text.chars().any(|character| character.is_whitespace()) {
-        return true;
+        let word_count = text.split_whitespace().count();
+        return (1..=NATURAL_LANGUAGE_LABEL_MAX_WORDS).contains(&word_count);
     }
-    // Single token: Title Case pure letters (`Password`) reads as a UI label.
-    // All-lowercase (`mypassword`) and mixed-case alphabet soup stay on the
+    // Single token: short Title Case pure letters (`Password`) reads as a UI
+    // label. Long mashed Title Case (`Correcthorsebatterystaple`),
+    // all-lowercase (`mypassword`), and mixed-case alphabet soup stay on the
     // default withhold path — value==key already covers `password`/`PASSWORD`.
+    if text.chars().count() > NATURAL_LANGUAGE_LABEL_MAX_SINGLE_TOKEN_CHARS {
+        return false;
+    }
     let mut chars = text.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -2306,6 +2325,26 @@ mod tests {
                 "config.json",
                 ["{\"", &password, "\": \"\"}\n"].concat(),
                 MxVerdict::Clean,
+            ),
+            // Digit-free Diceware / mashed passphrases under credential keys
+            // must stay Sensitive (narrow label exemption; not UI labels).
+            (
+                "PJ9 diceware correct-horse passphrase",
+                "config.json",
+                ["{\"", &password, "\": \"correct horse battery staple\"}\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "PJ10 diceware fruit-word passphrase",
+                "config.json",
+                ["{\"", &password, "\": \"apple banana cherry dragonfruit\"}\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "PJ11 title-case mashed passphrase",
+                "config.json",
+                ["{\"", &password, "\": \"Correcthorsebatterystaple\"}\n"].concat(),
+                MxVerdict::Sensitive(1),
             ),
         ]
     }

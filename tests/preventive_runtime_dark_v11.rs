@@ -1064,10 +1064,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // src/index_lifecycle.
 // Refreshed for quoted credential-key matching in src/knowledge/mod.rs:
 // no new file, no edge into src/index_lifecycle.
+// Refreshed for narrowed natural-language label exemption (Diceware FN)
+// in src/knowledge/mod.rs: no new file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "96bbe2c623ba83f02778363490f3db1b33e8518138a7e80d7506090889f49859",
+    "8ae9babc987d47721cfbfc6616867831717c8cc316f9e1d7f43bf2d94f77bfa2",
     199,
-    10_189_731,
+    10_191_760,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
