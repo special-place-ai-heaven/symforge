@@ -5565,6 +5565,128 @@ mod tests {
         }
     }
 
+    /// A new file whose canonical read fails is withheld with no row. The
+    /// verify runs with a scout failure injected for it.
+    #[cfg(feature = "server")]
+    fn withheld_new_file_without_a_row(root: &Path) -> crate::live_index::store::SharedIndex {
+        let (shared, snapshot_mtimes) = restored_with_offline_edits(root, 3, 0);
+        std::fs::write(root.join("n.rs"), "pub fn n() {}\n").unwrap();
+        *crate::live_index::single_file::test_scout_failure_path().lock() =
+            Some("n.rs".to_string());
+        block_on_background_verify_for_test(shared.clone(), root, snapshot_mtimes);
+        *crate::live_index::single_file::test_scout_failure_path().lock() = None;
+        {
+            let live = shared.read();
+            assert!(live.unverified_since_restore("n.rs").is_some());
+            assert!(!live.files.contains_key("n.rs"), "it never had a row");
+        }
+        shared
+    }
+
+    /// A withheld path with no row that is then deleted is settled by the
+    /// confirmed removal, not withheld forever.
+    #[cfg(feature = "server")]
+    #[test]
+    fn withheld_path_without_a_row_is_released_when_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let shared = withheld_new_file_without_a_row(tmp.path());
+        std::fs::remove_file(tmp.path().join("n.rs")).unwrap();
+
+        crate::live_index::single_file::maybe_reindex(
+            "n.rs",
+            &tmp.path().join("n.rs"),
+            &shared,
+            None::<LanguageId>,
+            shared.current_project_generation(),
+        );
+
+        let live = shared.read();
+        assert!(
+            live.unverified_since_restore("n.rs").is_none(),
+            "a deleted withheld path must be released"
+        );
+        assert!(crate::protocol::read_gate::refuse_by_policy(&live, "n.rs").is_none());
+    }
+
+    /// A complete sweep that no longer sees a withheld path settles it once
+    /// its absence is confirmed, even with no watcher event for the delete.
+    #[cfg(feature = "server")]
+    #[test]
+    fn complete_sweep_releases_a_withheld_path_it_no_longer_sees() {
+        let tmp = TempDir::new().unwrap();
+        let shared = withheld_new_file_without_a_row(tmp.path());
+        std::fs::remove_file(tmp.path().join("n.rs")).unwrap();
+
+        crate::watcher::reconcile_stale_files_with_stop(
+            tmp.path(),
+            &shared,
+            || false,
+            shared.current_project_generation(),
+            verify_observer(tmp.path()),
+        );
+
+        assert!(shared.read().unverified_since_restore("n.rs").is_none());
+    }
+
+    /// The fresh-instance sweep defers while the verify runs and claims no
+    /// reconcile for it. When the verify completes, one sweep runs at once,
+    /// long before the periodic interval, and admits a file created while
+    /// the daemon was down.
+    #[cfg(feature = "server")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watcher_sweeps_once_when_the_deferred_verify_completes() {
+        let tmp = TempDir::new().unwrap();
+        let (restored, _) = restored_with_offline_edits(tmp.path(), 3, 0);
+        std::fs::write(tmp.path().join("offline.rs"), "pub fn offline() {}\n").unwrap();
+        let generation = restored.current_project_generation();
+        assert!(restored.mark_snapshot_verify_started_at_generation(
+            generation,
+            SnapshotVerifyProgress::started(SystemTime::now(), 3),
+        ));
+        let info = Arc::new(parking_lot::Mutex::new(
+            crate::watcher::WatcherInfo::default(),
+        ));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = tokio::spawn(crate::watcher::run_watcher_with_stop(
+            tmp.path().to_path_buf(),
+            restored.clone(),
+            Arc::clone(&info),
+            Arc::clone(&stop),
+        ));
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        wait_for("the watcher to go active", &|| {
+            info.lock().state == crate::watcher::WatcherState::Active
+        });
+        assert!(
+            info.lock().last_reconcile_at.is_none(),
+            "a sweep that deferred observed nothing and must not claim a reconcile"
+        );
+        assert!(!restored.read().files.contains_key("offline.rs"));
+
+        assert!(restored.mark_snapshot_verify_completed_at_generation(
+            generation,
+            SnapshotVerifyReport::empty(),
+        ));
+        wait_for("the post-verify sweep", &|| {
+            restored.read().files.contains_key("offline.rs")
+        });
+        wait_for("the reconcile stamp", &|| {
+            info.lock().last_reconcile_at.is_some()
+        });
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("the watcher stops")
+            .expect("the watcher does not panic");
+    }
+
     /// A path withheld because its read failed is retried by every sweep, even
     /// after a published scout plan records it as unchanged on disk.
     #[cfg(feature = "server")]

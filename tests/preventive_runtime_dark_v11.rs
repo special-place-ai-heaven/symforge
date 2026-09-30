@@ -1036,7 +1036,8 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed at the tip of the snapshot-verify branch after its rebase: the
 // verify, its withheld rows, the checkpoint refusal and the sweep stand-down
 // add no edge into src/index_lifecycle. Refreshed once more for the withheld-
-// file lanes, the batch_rename refusal and the deferred sweep, likewise.
+// file lanes, the batch_rename refusal and the deferred sweep, likewise, and
+// for the withheld-file release and the post-verify sweep.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
     "bb64035d0b9480538812019b02c3bdc88bfc047ae3ad0737d43625537d12d62b",
     199,

@@ -1266,14 +1266,15 @@ impl SnapshotVerifyReport {
     /// Settle one withheld path. It leaves the unverified set, the mismatch
     /// count and the listed paths together, so status never reports a count
     /// that disagrees with what is withheld.
-    fn drop_unverified(&mut self, path: &str) {
+    fn drop_unverified(&mut self, path: &str) -> bool {
         if !self.unverified.contains_key(path) {
-            return;
+            return false;
         }
         Arc::make_mut(&mut self.unverified).remove(path);
         self.mismatch_count = self.mismatch_count.saturating_sub(1);
         self.mismatched_paths
             .retain(|mismatched| mismatched != path);
+        true
     }
 
     pub fn omitted_path_count(&self) -> usize {
@@ -6713,13 +6714,15 @@ impl LiveIndex {
     /// Returns whether the index actually HELD anything for this path — the
     /// caller that reports a removal (or publishes one) must know, not assume.
     pub fn remove_file(&mut self, path: &str) -> bool {
-        self.release_unverified(path);
+        // A withheld path the index holds no row for still holds its refusal:
+        // a confirmed removal settles it, and that settlement is published.
+        let released = self.release_unverified(path);
         let removed_file = self.remove_row(path);
         let removed_manifest = self.remove_manifest_entry(path);
         if removed_file || removed_manifest {
             self.loaded_at_system = SystemTime::now();
         }
-        removed_file || removed_manifest
+        released || removed_file || removed_manifest
     }
 
     /// Remove a row and its derived indices, leaving its catalog entry.
@@ -6755,9 +6758,10 @@ impl LiveIndex {
     }
 
     /// A write that reached this path through a canonical seam settles it.
-    fn release_unverified(&mut self, path: &str) {
-        if let SnapshotVerifyState::Completed(report) = &mut self.snapshot_verify_state {
-            report.drop_unverified(path);
+    fn release_unverified(&mut self, path: &str) -> bool {
+        match &mut self.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => report.drop_unverified(path),
+            _ => false,
         }
     }
 
@@ -6778,7 +6782,9 @@ impl LiveIndex {
                     withheld |= self.remove_row(&path);
                 }
                 // Another writer republished it since the stat pass.
-                _ => report.drop_unverified(&path),
+                _ => {
+                    report.drop_unverified(&path);
+                }
             }
         }
         self.snapshot_verify_state = SnapshotVerifyState::Completed(report);

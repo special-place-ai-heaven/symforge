@@ -2645,8 +2645,7 @@ fn with_withheld_note(live: &LiveIndex, scope: Option<&str>, mut output: String)
     if let Some(note) =
         format::withheld_not_searched_note(live.withheld_since_restore(), scope.as_deref())
     {
-        output.push_str("\n\n");
-        output.push_str(&note);
+        output = format!("{note}\n\n{output}");
     }
     output
 }
@@ -4770,12 +4769,17 @@ impl SymForgeServer {
             crate::protocol::knowledge_model::render_repository_knowledge_map(&published);
         output.push_str("\n\n");
         output.push_str(&knowledge_map);
+        let output = with_withheld_note(&published.live, None, output);
         self.session_context.record_summary_output(
             "get_repo_map",
             (output.len() / 4).min(u32::MAX as usize) as u32,
         );
-        let budget_summary = format!(
-            "Repository orientation budget summary\noutput_coverage=degraded\n{knowledge_map}\n\nCode topology omitted from the bounded summary; retrieve the full map through the CCR handle."
+        let budget_summary = with_withheld_note(
+            &published.live,
+            None,
+            format!(
+                "Repository orientation budget summary\noutput_coverage=degraded\n{knowledge_map}\n\nCode topology omitted from the bounded summary; retrieve the full map through the CCR handle."
+            ),
         );
         self.apply_ccr_budget_with_summary(
             "get_repo_map",
@@ -4795,6 +4799,21 @@ impl SymForgeServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_file_context(&self, params: Parameters<GetFileContextInput>) -> String {
+        let project_wide = params.0.sections.as_ref().is_none_or(|sections| {
+            sections.is_empty()
+                || sections
+                    .iter()
+                    .any(|section| section == "consumers" || section == "references")
+        });
+        let output = self.get_file_context_unnoted(params).await;
+        if project_wide {
+            self.with_withheld_note(output)
+        } else {
+            output
+        }
+    }
+
+    async fn get_file_context_unnoted(&self, params: Parameters<GetFileContextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
         }
@@ -5070,6 +5089,14 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn get_symbol_context(
+        &self,
+        params: Parameters<GetSymbolContextInput>,
+    ) -> String {
+        let output = self.get_symbol_context_unnoted(params).await;
+        self.with_withheld_note(output)
+    }
+
+    async fn get_symbol_context_unnoted(
         &self,
         params: Parameters<GetSymbolContextInput>,
     ) -> String {
@@ -5859,6 +5886,7 @@ impl SymForgeServer {
 
         let source_set = self.index.data_plane().published_source_set();
         let output = super::knowledge_search::search_scoped(&source_set, &params.0);
+        let output = self.with_withheld_note(output);
         self.apply_ccr_budget("search_knowledge", output, params.0.max_tokens)
     }
 
@@ -9530,11 +9558,11 @@ impl SymForgeServer {
                     );
                 }
             }
-            let result = with_withheld_note(&generation.live, None, result);
-            return match envelope {
+            let result = match envelope {
                 Some(envelope) => format!("{envelope}\n\n{result}"),
                 None => result,
             };
+            return with_withheld_note(&generation.live, None, result);
         }
 
         let limits =
@@ -9706,7 +9734,6 @@ impl SymForgeServer {
                     output.push_str("\n\n");
                     output.push_str(disclosure);
                 }
-                let output = with_withheld_note(&generation.live, None, output);
 
                 self.record_tool_savings_named(
                     "find_references",
@@ -9724,6 +9751,7 @@ impl SymForgeServer {
                     Some(envelope) => format!("{envelope}\n\n{output}"),
                     None => output,
                 };
+                let result = with_withheld_note(&generation.live, None, result);
                 self.apply_ccr_budget("find_references", result, params.0.max_tokens)
             }
             Err(error) => error,
@@ -10267,6 +10295,16 @@ impl SymForgeServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn explore(&self, params: Parameters<ExploreInput>) -> String {
+        let project_wide = params.0.depth.unwrap_or(1) >= 2;
+        let output = self.explore_unnoted(params).await;
+        if project_wide {
+            self.with_withheld_note(output)
+        } else {
+            output
+        }
+    }
+
+    async fn explore_unnoted(&self, params: Parameters<ExploreInput>) -> String {
         if let Some(result) = self.proxy_tool_call("explore", &params.0).await {
             return result;
         }
@@ -21928,6 +21966,63 @@ mod tests {
                 "Note: 1 files withheld as unverified since restore were not searched: src/held.rs"
             ),
             "a project-wide answer must say what it did not search: {references}"
+        );
+
+        for (lane, result) in [
+            (
+                "get_repo_map",
+                server.get_repo_map(input(serde_json::json!({}))).await,
+            ),
+            (
+                "get_symbol_context",
+                server
+                    .get_symbol_context(input(serde_json::json!({"name": "foo"})))
+                    .await,
+            ),
+            (
+                "explore depth 2",
+                server
+                    .explore(input(serde_json::json!({"query": "foo", "depth": 2})))
+                    .await,
+            ),
+            (
+                "get_file_context",
+                server
+                    .get_file_context(input(serde_json::json!({"path": "src/lib.rs"})))
+                    .await,
+            ),
+            (
+                "find_references under a tight budget",
+                server
+                    .find_references(input(serde_json::json!({"name": "foo", "max_tokens": 40})))
+                    .await,
+            ),
+        ] {
+            assert!(
+                result.starts_with(
+                    "Note: 1 files withheld as unverified since restore were not searched: src/held.rs"
+                ),
+                "{lane} must lead with the not-searched note: {result}"
+            );
+        }
+        let unverified = std::collections::BTreeMap::from([(
+            "src/held.rs".to_string(),
+            "it could not be read".to_string(),
+        )]);
+        assert!(
+            crate::protocol::format::withheld_not_searched_note(&unverified, Some("src")).is_some()
+        );
+        assert!(
+            crate::protocol::format::withheld_not_searched_note(&unverified, Some("src/held.rs"))
+                .is_some()
+        );
+        assert!(
+            crate::protocol::format::withheld_not_searched_note(&unverified, Some("sr")).is_none(),
+            "a scope matches whole path segments"
+        );
+        assert!(
+            crate::protocol::format::withheld_not_searched_note(&unverified, Some("src/held"))
+                .is_none()
         );
 
         let rename = server

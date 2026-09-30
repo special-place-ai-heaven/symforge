@@ -418,14 +418,18 @@ where
     // three states the sweep defers every path and never waits on the verify.
     // It publishes no plan either, so the first sweep after the verify still
     // compares every path against the resident rows.
-    if matches!(
-        shared.read().snapshot_verify_state,
-        crate::live_index::store::SnapshotVerifyState::Pending
-            | crate::live_index::store::SnapshotVerifyState::Running(_)
-            | crate::live_index::store::SnapshotVerifyState::Failed(_)
-    ) {
+    if snapshot_verify_unresolved(shared)
+        || matches!(
+            shared.read().snapshot_verify_state,
+            crate::live_index::store::SnapshotVerifyState::Failed(_)
+        )
+    {
         info!("reconciliation sweep deferred: the snapshot verify has not resolved");
-        return 0.into();
+        return ReconciliationAttempt {
+            repaired: 0,
+            retry_degraded: false,
+            deferred: true,
+        };
     }
     // Paths the resolved verify withheld. The set is small, and a sweep
     // re-reads each one every time, so a transient failure gets retried.
@@ -562,6 +566,36 @@ where
             }
         }
 
+        // A withheld path a complete scout no longer sees is gone: settle it
+        // once its absence is confirmed on disk, so it is not withheld forever.
+        if fresh_plan.coverage == crate::domain::CoverageStatus::Complete {
+            for relative_path in withheld
+                .iter()
+                .filter(|path| !fresh_paths.contains(path.as_str()))
+            {
+                if should_stop() {
+                    return stale_count.into();
+                }
+                let fence = shared.publication_fence();
+                if fence.project_generation != fence_gen {
+                    break;
+                }
+                if matches!(
+                    shared.remove_file_if_absent_at_publication_fence_with_receipt(
+                        relative_path,
+                        &repo_root.join(relative_path),
+                        fence,
+                    ),
+                    crate::live_index::store::FencedRemoval::Removed(_)
+                ) {
+                    repairs_applied += 1;
+                    if authority.observe_removal(observer, relative_path).is_err() {
+                        debug!("reconciliation: stale incarnation's removal observation refused");
+                    }
+                }
+            }
+        }
+
         if should_stop() {
             return stale_count.into();
         }
@@ -632,7 +666,18 @@ where
             || shared
                 .scout_plan()
                 .is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded),
+        deferred: false,
     }
+}
+
+/// Whether a snapshot verify still owns the restored rows, so a sweep now
+/// would defer to it.
+fn snapshot_verify_unresolved(shared: &SharedIndex) -> bool {
+    matches!(
+        shared.read().snapshot_verify_state,
+        crate::live_index::store::SnapshotVerifyState::Pending
+            | crate::live_index::store::SnapshotVerifyState::Running(_)
+    )
 }
 
 /// Holds the periodic-sweep flag while a sweep runs, and clears it when the
@@ -681,6 +726,9 @@ pub(crate) fn reconcile_stale_files(repo_root: &Path, shared: &SharedIndex) -> u
 struct ReconciliationAttempt {
     repaired: usize,
     retry_degraded: bool,
+    /// The sweep deferred to an unresolved snapshot verify and observed
+    /// nothing, so it must not be reported as a reconcile.
+    deferred: bool,
 }
 
 impl From<usize> for ReconciliationAttempt {
@@ -688,6 +736,7 @@ impl From<usize> for ReconciliationAttempt {
         Self {
             repaired,
             retry_degraded: false,
+            deferred: false,
         }
     }
 }
@@ -760,10 +809,12 @@ where
     let effective_generation = effective_fence_generation(shared, repo_root, expected_gen);
     let batch_belongs_to_active_project = effective_generation == active_generation;
     let mut repaired = 0usize;
+    let mut deferred = false;
     let mut delay = INITIAL_DEGRADED_DELAY;
     for attempt in 1..=MAX_DEGRADED_ATTEMPTS {
         let outcome: ReconciliationAttempt = reconcile_once().into();
         repaired = repaired.saturating_add(outcome.repaired);
+        deferred = outcome.deferred;
         if stop_token.load(Ordering::Acquire)
             || !batch_belongs_to_active_project
             || shared.current_project_generation() != active_generation
@@ -796,7 +847,10 @@ where
             info.last_overflow_at = Some(now);
         }
         info.stale_files_found += repaired as u64;
-        info.last_reconcile_at = Some(now);
+        // Reporting invariant: a sweep that deferred observed nothing.
+        if !deferred {
+            info.last_reconcile_at = Some(now);
+        }
     }
     // A settled, current result is skipped by the temporal queue. Calling on
     // every reconciliation also detects bytes-identical ref movement, which
@@ -1218,6 +1272,11 @@ pub async fn run_watcher_with_stop(
                     cancelled = true;
                     break 'watcher;
                 }
+                // The fresh-instance sweep deferred to a snapshot verify that
+                // still owns the restored rows. It runs again once the verify
+                // completes, whatever the periodic interval, even when that is
+                // off.
+                let mut sweep_after_verify = snapshot_verify_unresolved(&shared);
 
                 // `Active` means the watcher is ready to consume events, not
                 // merely that the OS handle exists. Keep the state at
@@ -1255,6 +1314,34 @@ pub async fn run_watcher_with_stop(
                     #[cfg(test)]
                     if FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.swap(false, Ordering::AcqRel) {
                         break;
+                    }
+
+                    if sweep_after_verify
+                        && matches!(
+                            shared.read().snapshot_verify_state,
+                            crate::live_index::store::SnapshotVerifyState::NotNeeded
+                                | crate::live_index::store::SnapshotVerifyState::Completed(_)
+                        )
+                        && let Some(single_flight) = SweepSingleFlight::try_start(&periodic_sweep)
+                    {
+                        sweep_after_verify = false;
+                        last_reconcile = Instant::now();
+                        let shared_clone = shared.clone();
+                        let root_clone = repo_root.clone();
+                        let watcher_info_clone = watcher_info.clone();
+                        let stop_for_reconcile = Arc::clone(&stop_token);
+                        tokio::task::spawn_blocking(move || {
+                            let _single_flight = single_flight;
+                            reconcile_for_cause(
+                                &root_clone,
+                                &shared_clone,
+                                &watcher_info_clone,
+                                &stop_for_reconcile,
+                                expected_gen,
+                                ReconciliationCause::FreshInstance,
+                                observer,
+                            );
+                        });
                     }
 
                     // Periodic reconciliation sweep (belt-and-suspenders against missed events).

@@ -3900,7 +3900,13 @@ fn withheld_listing(
     let in_scope: Vec<&str> = unverified
         .keys()
         .map(String::as_str)
-        .filter(|path| scope.is_none_or(|scope| path.starts_with(scope)))
+        .filter(|path| {
+            // Whole path segments: `src` covers `src/a.rs`, not `src2/a.rs`.
+            scope.is_none_or(|scope| {
+                path.strip_prefix(scope)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        })
         .collect();
     if in_scope.is_empty() {
         return None;
