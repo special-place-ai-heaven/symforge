@@ -1067,7 +1067,7 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for narrowed natural-language label exemption (Diceware FN)
 // in src/knowledge/mod.rs: no new file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8ae9babc987d47721cfbfc6616867831717c8cc316f9e1d7f43bf2d94f77bfa2",
+    "7bf774b3a56e7a79e6c17838ce066f631091c8ab3b045d8993731a7c53ed9463",
     199,
     10_191_760,
 );
