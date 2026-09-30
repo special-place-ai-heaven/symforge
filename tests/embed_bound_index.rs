@@ -1031,7 +1031,7 @@ fn index_progress_resets_before_each_reload() {
     });
     let first = handle.index_progress();
     assert!(first.files_parsed >= 6);
-    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+    let gate = symforge::live_index::store::hold_reload_after_discovery_for_test(repository.path());
     fs::write(
         repository.path().join("src/file_extra.rs"),
         b"pub fn extra() -> u32 { 9 }\n",
@@ -1044,7 +1044,8 @@ fn index_progress_resets_before_each_reload() {
     );
     let second = handle.index_progress();
     assert!(
-        second.files_parsed < first.files_parsed && second.files_parsed >= 1,
+        second.files_parsed < first.files_parsed
+            && second.files_discovered > first.files_discovered,
         "a new reload must reset parsed before it rises again, got {second:?} after first {first:?}"
     );
     drop(gate);

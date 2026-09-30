@@ -1023,10 +1023,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // plus a same-length FR-307 comment edit.
 // Refreshed once more for the dead-pid session reaper (daemon.rs, cli/entry.rs,
 // sidecar/port_file.rs), which adds no edge into src/index_lifecycle either.
+// Refreshed for the discovery-only reload hold (a `__test-internals` hook in
+// live_index/store.rs), likewise no edge into index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3b8921a3ae58c2dae94811c1d02ecf31ecfde95c8ee1abd3afe450a435b2e6f1",
+    "32ce0b8e2ff76d9a4c4ae847ba46e5f43e12d7e73bbd3a6bcf989d7a196259cb",
     199,
-    9_842_646,
+    9_844_037,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
