@@ -9060,6 +9060,15 @@ impl SymForgeServer {
             return format::not_found_file(&input.path);
         }
 
+        // A credential path is refused before any filesystem call, so an
+        // existing and a missing file get the same answer. Every lane below
+        // would refuse it anyway; answering here keeps the refusal from
+        // depending on existence. The estimate above is exempt by contract
+        // (Feature 020 R1/E1: aggregate counts for a demoted file succeed).
+        if crate::knowledge::sensitive_path_rule(&input.path).is_some() {
+            return format::content_withheld_by_admission(&input.path);
+        }
+
         let options = match file_content_options_from_input(&input) {
             Ok(options) => options,
             Err(message) => return message,
@@ -29605,9 +29614,18 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_case_and_short_name_aliases_of_ordinary_files_are_refused() {
+    /// Detected at runtime rather than by `cfg`, so the case-alias checks run on
+    /// every case-insensitive filesystem, including default macOS volumes.
+    fn filesystem_is_case_insensitive(dir: &Path) -> bool {
+        let probe = dir.join("case_probe.tmp");
+        std::fs::write(&probe, b"").unwrap();
+        let insensitive = dir.join("CASE_PROBE.TMP").exists();
+        std::fs::remove_file(&probe).unwrap();
+        insensitive
+    }
+
+    #[tokio::test]
+    async fn case_and_short_name_aliases_of_ordinary_files_are_refused() {
         let (dir, server) = setup_loaded_edit_test(&[
             ("src/lib.rs", "pub fn f() {}\n"),
             ("src/longer_module_name.rs", "pub fn g() {}\n"),
@@ -29615,8 +29633,15 @@ mod tests {
         ]);
         let root = dir.path();
         let differs = "path spelling differs from the on-disk name";
+        let case_insensitive = filesystem_is_case_insensitive(root);
 
-        let mut hinted = vec![("SRC/LIB.RS", "src/lib.rs"), ("src/Lib.rs", "src/lib.rs")];
+        let mut hinted = Vec::new();
+        if case_insensitive {
+            hinted.push(("SRC/LIB.RS", "src/lib.rs"));
+            hinted.push(("src/Lib.rs", "src/lib.rs"));
+        } else {
+            eprintln!("case-sensitive filesystem; case aliases skipped");
+        }
         if root.join("src").join("LONGER~1.RS").is_file() {
             hinted.push(("src/LONGER~1.RS", "src/longer_module_name.rs"));
         } else {
@@ -29642,12 +29667,72 @@ mod tests {
             );
         }
 
-        // A hard-scope-excluded canonical name gets no hint.
-        assert_eq!(
-            super::edit::safe_repo_path(root, ".GIT/config").unwrap_err(),
-            differs
-        );
+        if case_insensitive {
+            // A hard-scope-excluded on-disk name gets no hint, and neither
+            // spelling is served.
+            assert_eq!(
+                super::edit::safe_repo_path(root, ".GIT/config").unwrap_err(),
+                differs
+            );
+            for spelling in [".git/config", ".GIT/config"] {
+                let served = server
+                    .get_file_content(Parameters(get_file_content_input(spelling)))
+                    .await;
+                assert!(
+                    !served.contains("[core]"),
+                    "{spelling:?} served VCS internals: {served}"
+                );
+            }
+        }
         assert!(super::edit::safe_repo_path(root, "src/lib.rs").is_ok());
+    }
+
+    #[tokio::test]
+    async fn hard_scope_internals_are_not_served_from_disk() {
+        let (_dir, server) = setup_loaded_edit_test(&[
+            (".git/config", "[core]\n"),
+            (".symforge/state.txt", "state-fixture-body\n"),
+        ]);
+        for (spelling, body) in [
+            (".git/config", "[core]"),
+            (".symforge/state.txt", "state-fixture-body"),
+        ] {
+            let served = server
+                .get_file_content(Parameters(get_file_content_input(spelling)))
+                .await;
+            assert!(
+                !served.contains(body),
+                "{spelling:?} served hard-scope content: {served}"
+            );
+            let result = serialized_tool_result(
+                server
+                    .get_file_content_tool(Parameters(get_file_content_input(spelling)))
+                    .await,
+            );
+            assert_tool_result_status(&result, OutcomeClass::InvalidRequest);
+        }
+    }
+
+    /// A content read of a credential path's canonical spelling must not reveal
+    /// whether the file exists: an existing and a missing `.env` get the same
+    /// answer. Estimates are exempt by contract; see
+    /// `estimate_succeeds_for_demoted_file_while_content_selectors_refuse`.
+    #[tokio::test]
+    async fn credential_refusal_does_not_reveal_existence() {
+        let (_present_dir, present) = setup_loaded_edit_test(&[(".env", ALIAS_FIXTURE_BODY)]);
+        let (_absent_dir, absent) = setup_loaded_edit_test(&[]);
+
+        let from_present = present
+            .get_file_content(Parameters(get_file_content_input(".env")))
+            .await;
+        let from_absent = absent
+            .get_file_content(Parameters(get_file_content_input(".env")))
+            .await;
+        assert_eq!(from_present, from_absent);
+        assert!(
+            super::is_admission_refusal(&from_present),
+            "expected the admission refusal: {from_present}"
+        );
     }
 
     #[test]

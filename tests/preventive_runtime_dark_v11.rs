@@ -1029,9 +1029,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // normalize their root through the existing live_index normalize_root, plus
 // test-body edits; no new edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "e71a86a40e5b6ed3f9e6292bcb5d3d0690ce3300670823344f002c261f07328d",
+    "138971f94872607abaa3a839f682c0cc0e4861d3a3a33b25ac773b8df191d2f0",
     199,
-    9_846_865,
+    9_876_416,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

@@ -35,6 +35,10 @@ pub enum ReindexResult {
     /// File classified as Tier 2/3 by the admission gate — NOT parsed/inserted.
     /// Any prior Tier-1 entry was removed and a skip record recorded. The index
     /// remains free of this path's symbols.
+    ///
+    /// [`update_file_from_disk`] also returns this when it refuses the path
+    /// itself: it lies outside the root, or it is not the file's own on-disk
+    /// spelling. Nothing is read, removed or recorded in that case.
     Skipped,
     /// ENOENT observed by `read_and_index`; caller decides whether to retry or treat as confirmed-absent.
     NotFound,
@@ -222,12 +226,25 @@ fn project_root_from_paths(abs_path: &Path, relative_path: &str) -> Option<PathB
 /// repository or created by a checkout never publishes its target's bytes
 /// under the in-repository name.
 fn path_crosses_symlink(abs_path: &Path, relative: &Path) -> bool {
-    abs_path
-        .ancestors()
-        .take(relative.components().count())
-        .any(|path| {
-            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        })
+    // `.` components have no ancestor of their own; counting them would walk
+    // above the root.
+    let depth = relative
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .count();
+    abs_path.ancestors().take(depth).any(|path| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    })
+}
+
+/// A watcher event or freshen request can carry a spelling other than the
+/// file's own on-disk name, such as an 8.3 short name or a letter-case
+/// variant. Indexing it would publish the file under a second key that the
+/// gitignore, scope and credential rules judged by the alias, so the lane
+/// refuses any spelling the shared resolver refuses.
+fn path_spelling_is_refused(abs_path: &Path, relative_path: &str) -> bool {
+    project_root_from_paths(abs_path, relative_path)
+        .is_some_and(|root| crate::discovery::resolve_repo_path(&root, relative_path).is_err())
 }
 
 fn catalog_terminal_disposition(decision: &ScoutDecision) -> Option<FileDisposition> {
@@ -347,6 +364,7 @@ where
         || shared.is_source_excluded(relative)
         || shared.read().is_path_gitignored(relative_path)
         || path_crosses_symlink(abs_path, relative)
+        || path_spelling_is_refused(abs_path, relative_path)
     {
         if observed_at.project_generation != expected_gen {
             return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
@@ -696,6 +714,13 @@ pub fn update_file_from_disk(
     relative_path: &str,
 ) -> ReindexResult {
     let relative = relative_path.replace('\\', "/");
+    // The embedder's path is caller-supplied: an escape, an absolute path or
+    // another spelling of a file is refused before anything is read.
+    match crate::discovery::resolve_repo_path(repo_root, &relative) {
+        Ok(Some(_)) => {}
+        Ok(None) => return ReindexResult::NotFound,
+        Err(_) => return ReindexResult::Skipped,
+    }
     let abs_path = repo_root.join(&relative);
     let expected_gen = shared.current_project_generation();
     let outcome = admit_and_index_single_path(&relative, &abs_path, shared, expected_gen)
@@ -918,6 +943,116 @@ mod tests {
             assert!(
                 shared.read().get_file(relative).is_none(),
                 "{relative} was published through a symlink"
+            );
+        }
+    }
+
+    /// Detected at runtime rather than by `cfg`, so the case-alias checks run on
+    /// every case-insensitive filesystem, including default macOS volumes.
+    fn filesystem_is_case_insensitive(dir: &Path) -> bool {
+        let probe = dir.join("case_probe.tmp");
+        std::fs::write(&probe, b"").expect("case probe");
+        let insensitive = dir.join("CASE_PROBE.TMP").exists();
+        std::fs::remove_file(&probe).expect("remove case probe");
+        insensitive
+    }
+
+    /// The embed facade takes a caller-supplied path, so it must refuse every
+    /// spelling the server's entry points refuse: an escape, an absolute path,
+    /// and another spelling of a file, which would index it under a second key.
+    #[test]
+    fn facade_refuses_paths_that_are_not_the_files_own_name_beneath_the_root() {
+        let root = tempfile::TempDir::new().expect("root");
+        let outside = tempfile::TempDir::new().expect("outside");
+        std::fs::write(
+            outside.path().join("secret.txt"),
+            "placeholder-fixture-value\n",
+        )
+        .expect("outside file");
+        std::fs::create_dir_all(root.path().join(".aws")).expect("aws dir");
+        std::fs::write(
+            root.path().join(".aws/credentials"),
+            "placeholder-fixture-value\n",
+        )
+        .expect("credential fixture");
+        std::fs::write(root.path().join("lib.rs"), "pub fn first() {}\n").expect("seed");
+        let shared = LiveIndex::load(root.path()).expect("cold load");
+
+        let outside_name = outside
+            .path()
+            .file_name()
+            .expect("tempdir name")
+            .to_string_lossy()
+            .into_owned();
+        let mut refused = vec![
+            format!("../{outside_name}/secret.txt"),
+            outside
+                .path()
+                .join("secret.txt")
+                .to_string_lossy()
+                .into_owned(),
+            ".aws/credentials.".to_string(),
+        ];
+        if filesystem_is_case_insensitive(root.path()) {
+            refused.push("LIB.RS".to_string());
+        } else {
+            eprintln!("case-sensitive filesystem; case alias skipped");
+        }
+
+        for spelling in refused {
+            let result = update_file_from_disk(&shared, root.path(), &spelling);
+            assert!(
+                !matches!(result, ReindexResult::Reindexed | ReindexResult::HashSkip),
+                "{spelling:?} was admitted: {result:?}"
+            );
+            let key = spelling.replace('\\', "/");
+            assert!(
+                shared.read().get_file(&key).is_none(),
+                "{spelling:?} was published into the index"
+            );
+        }
+    }
+
+    /// A watcher event can carry a non-canonical spelling, such as an 8.3 short
+    /// name. The single-path lane must not index the file under that key.
+    #[test]
+    fn single_path_admission_refuses_non_canonical_spellings() {
+        let root = tempfile::TempDir::new().expect("root");
+        std::fs::create_dir_all(root.path().join("src")).expect("src");
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn first() {}\n").expect("seed");
+        std::fs::write(
+            root.path().join("src/longer_module_name.rs"),
+            "pub fn second() {}\n",
+        )
+        .expect("long name");
+        let shared = LiveIndex::load(root.path()).expect("cold load");
+
+        let mut aliases = Vec::new();
+        if filesystem_is_case_insensitive(root.path()) {
+            aliases.push("SRC/LIB.RS");
+        } else {
+            eprintln!("case-sensitive filesystem; case alias skipped");
+        }
+        if root.path().join("src/LONGER~1.RS").is_file() {
+            aliases.push("src/LONGER~1.RS");
+        } else {
+            eprintln!("8.3 short names are not generated here; short-name alias skipped");
+        }
+
+        for alias in aliases {
+            let outcome = admit_and_index_single_path(
+                alias,
+                &root.path().join(alias),
+                &shared,
+                shared.current_project_generation(),
+            );
+            assert!(
+                matches!(outcome, ReindexOutcome::Skipped),
+                "{alias} must be skipped, got {outcome:?}"
+            );
+            assert!(
+                shared.read().get_file(alias).is_none(),
+                "{alias} was published under a second key"
             );
         }
     }

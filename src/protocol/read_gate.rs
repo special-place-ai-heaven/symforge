@@ -92,9 +92,25 @@ pub fn observe_disk_beneath(
     }
     // `refuse_by_policy` inside the gate matches the caller's spelling only and
     // stays syscall-free; the spelling is judged on the resolved path here.
-    crate::protocol::edit::refuse_path_alias(workspace_root, relative_path)?;
+    refuse_disk_spelling(workspace_root, relative_path)?;
     let full_path = workspace_root.join(candidate);
     admit_disk_read(live, relative_path, &full_path)
+}
+
+/// The on-disk half of the gate's confinement, shared by both disk-reading
+/// entries. It refuses any spelling the shared resolver refuses: an escape
+/// through a symlink, or another spelling of a file. It also refuses VCS and
+/// runtime-state internals (`.git`, `.symforge`), which the cold walk never
+/// reads either.
+fn refuse_disk_spelling(root: &Path, relative_path: &str) -> Result<(), String> {
+    crate::protocol::edit::refuse_path_alias(root, relative_path)?;
+    if crate::discovery::path_is_hard_scope_excluded(Path::new(relative_path)) {
+        return Err(format!(
+            "{relative_path} [error: VCS and runtime-state internals are outside \
+             source scope; a disk observation never reads them]"
+        ));
+    }
+    Ok(())
 }
 
 /// Working-tree text for `relative_path`, admitted by [`admit_disk_read`].
@@ -128,7 +144,7 @@ pub(crate) fn admit_worktree_text(
     }
     // `is_file` follows links, so a tracked symlink to a file outside the work
     // tree reaches here; the resolved spelling decides before the read.
-    crate::protocol::edit::refuse_path_alias(workdir, relative_path)?;
+    refuse_disk_spelling(workdir, relative_path)?;
     // The gate owns the read: it classifies the exact buffer it just read and
     // returns it only on a permit, so no lane can classify one set of bytes and
     // then render another.

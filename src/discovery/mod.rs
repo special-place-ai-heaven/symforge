@@ -487,6 +487,123 @@ pub(crate) fn path_is_hard_scope_excluded(relative_path: &Path) -> bool {
     })
 }
 
+/// Why [`resolve_repo_path`] refused a caller-supplied spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PathRefusal {
+    /// The spelling escapes the root lexically, or its resolved target lies
+    /// outside the canonical root, which is how a committed symlink escapes.
+    OutsideRoot,
+    /// Something exists at the spelling but could not be resolved, such as a
+    /// dangling link. The check is never skipped, so this is a refusal.
+    Unresolvable(String),
+    /// A Windows alias component: a `:` stream suffix, or a trailing dot or
+    /// space. Such a name never denotes a distinct file there.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WindowsAlias,
+    /// Another spelling of a credential path; it gets that path's refusal.
+    CredentialAlias,
+    /// Another spelling of an in-repository file: a symlink, letter case or an
+    /// 8.3 short name. Carries the on-disk spelling to retry with, or `None`
+    /// when that name is hard-scope excluded and must not be suggested.
+    SpellingDiffers(Option<String>),
+}
+
+/// Resolve a caller-supplied `relative_path` beneath `root`, refusing any
+/// spelling that opens a file under a name other than its own.
+///
+/// Returns `Ok(None)` only when nothing exists at that spelling, and
+/// `Ok(Some(canonical))` only when the path the filesystem resolves is,
+/// component for component, exactly the caller's spelling. Any other spelling
+/// would publish the file under a second key while the credential, gitignore
+/// and scope rules judged the alias rather than the file.
+///
+/// Absolute paths, root or drive prefixes and `..` are refused lexically. On
+/// Windows an alias component is refused before any filesystem call, so the
+/// answer for those spellings does not depend on whether the file exists. On
+/// Unix such names are ordinary, distinct files and stay legal.
+pub(crate) fn resolve_repo_path(
+    root: &Path,
+    relative_path: &str,
+) -> std::result::Result<Option<PathBuf>, PathRefusal> {
+    use std::path::Component;
+
+    let requested = Path::new(relative_path);
+    if requested.is_absolute()
+        || requested.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(PathRefusal::OutsideRoot);
+    }
+    #[cfg(windows)]
+    refuse_windows_alias_components(requested)?;
+
+    // Resolve through the non-verbatim root: a `\\?\` root switches off the
+    // Win32 name normalization that turns an alias into the real file, so it
+    // would hide an alias that any non-verbatim reader would still open.
+    let joined = dunce::simplified(root).join(requested);
+    match std::fs::symlink_metadata(&joined) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(PathRefusal::Unresolvable(format!(
+                "cannot resolve path '{relative_path}': {error}"
+            )));
+        }
+        Ok(_) => {}
+    }
+    let canon_root = root
+        .canonicalize()
+        .map_err(|error| PathRefusal::Unresolvable(format!("cannot resolve repo root: {error}")))?;
+    let canon_path = joined.canonicalize().map_err(|error| {
+        PathRefusal::Unresolvable(format!("cannot resolve path '{relative_path}': {error}"))
+    })?;
+    let Ok(canonical) = canon_path.strip_prefix(&canon_root) else {
+        return Err(PathRefusal::OutsideRoot);
+    };
+    let spelled = requested
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir));
+    if canonical.components().eq(spelled) {
+        return Ok(Some(canon_path));
+    }
+
+    let canonical = canonical.to_string_lossy().replace('\\', "/");
+    if crate::knowledge::sensitive_path_rule(&canonical).is_some() {
+        return Err(PathRefusal::CredentialAlias);
+    }
+    if path_is_hard_scope_excluded(Path::new(&canonical)) {
+        return Err(PathRefusal::SpellingDiffers(None));
+    }
+    Err(PathRefusal::SpellingDiffers(Some(canonical)))
+}
+
+#[cfg(windows)]
+fn refuse_windows_alias_components(requested: &Path) -> std::result::Result<(), PathRefusal> {
+    let mut is_alias = false;
+    let mut stripped = Vec::new();
+    for component in requested.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        is_alias |= name.contains(':') || name.ends_with('.') || name.ends_with(' ');
+        let base = name.split(':').next().unwrap_or_default();
+        stripped.push(base.trim_end_matches(['.', ' ']).to_string());
+    }
+    if !is_alias {
+        return Ok(());
+    }
+    // The name Windows would open, so a credential file's alias gets that
+    // file's refusal whether or not it exists.
+    if crate::knowledge::sensitive_path_rule(&stripped.join("/")).is_some() {
+        return Err(PathRefusal::CredentialAlias);
+    }
+    Err(PathRefusal::WindowsAlias)
+}
+
 fn repository_walk(root: &Path, exclusions: &SourceExclusions) -> ignore::Walk {
     let filter_root = root.to_path_buf();
     let exclusions = exclusions.clone();
