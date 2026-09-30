@@ -32,6 +32,15 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.1...v11.3.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* **init:** stop pinning global harness configs to one project and honor CLAUDE_PROJECT_DIR ([#714](https://github.com/special-place-ai-heaven/symforge/issues/714)) ([79e1874](https://github.com/special-place-ai-heaven/symforge/commit/79e1874c53ee822ce7d610357e6f0456ffbd723b))
+* **stdio:** answer initialize before the daemon index is ready ([#716](https://github.com/special-place-ai-heaven/symforge/issues/716)) ([29b9153](https://github.com/special-place-ai-heaven/symforge/commit/29b91531dc37792a0788838e8fe7bf31e9f649ff))
+* **update:** keep live sessions alive and verify the new binary ([#715](https://github.com/special-place-ai-heaven/symforge/issues/715)) ([cf3a2ff](https://github.com/special-place-ai-heaven/symforge/commit/cf3a2ffed2d74c2fd9baaa835db20cf3a7b50895))
+
 ## [11.3.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.0...v11.3.1) (2026-09-29)
 
 
