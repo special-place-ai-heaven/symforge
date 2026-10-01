@@ -1,0 +1,252 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "SymForge runtime architecture",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1280, 580],
+    "repository": {
+      "url": "https://github.com/special-place-ai-heaven/symforge",
+      "revision": "4d4c49fc0f3441d1ff24e2cdab18162bbc4eabeb"
+    },
+    "views": [
+      {
+        "id": "request-path",
+        "label": "Primary tool path",
+        "focus": ["mcp-client", "stdio-adapter", "daemon", "live-index"],
+        "note": "Default coding-agent serve: stdio MCP, loopback Bearer /v1, in-memory LiveIndex."
+      },
+      {
+        "id": "disk-admission",
+        "label": "Disk admission",
+        "focus": ["daemon", "read-gate", "workspace"],
+        "note": "When a lane leaves the published generation, admit_disk_read owns the fetch."
+      },
+      {
+        "id": "freshness",
+        "label": "Index freshness",
+        "focus": ["watcher", "live-index", "snapshot"],
+        "note": "notify publishes into LiveIndex; .symforge/index.bin restores a generation."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "mcp-client",
+      "type": "external",
+      "label": "MCP Client",
+      "sublabel": "Cursor / Claude / Codex",
+      "pos": [40, 250],
+      "size": [140, 64]
+    },
+    {
+      "id": "stdio-adapter",
+      "type": "backend",
+      "label": "stdio adapter",
+      "sublabel": "rmcp transport::stdio",
+      "tag": "one client",
+      "pos": [340, 250],
+      "size": [150, 64],
+      "sources": [
+        { "path": "src/cli/entry.rs", "line": 233, "end_line": 293, "label": "stdio startup" },
+        { "path": "src/protocol/mod.rs", "line": 2197, "end_line": 2299, "label": "call_tool" },
+        { "path": "src/daemon.rs", "line": 2476, "end_line": 2525, "label": "proxy /v1 tools" }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "Daemon /v1",
+      "sublabel": "axum 127.0.0.1",
+      "tag": "Bearer",
+      "pos": [670, 250],
+      "size": [150, 64],
+      "sources": [
+        { "path": "src/daemon.rs", "line": 634, "end_line": 680, "label": "authorize" },
+        { "path": "src/daemon.rs", "line": 3861, "end_line": 3932, "label": "build_router" },
+        { "path": "src/daemon.rs", "line": 5892, "end_line": 5972, "label": "execute_tool_call" }
+      ]
+    },
+    {
+      "id": "live-index",
+      "type": "database",
+      "label": "LiveIndex",
+      "sublabel": "in-memory generation",
+      "pos": [1000, 250],
+      "size": [160, 64],
+      "sources": [
+        { "path": "src/live_index/store.rs", "line": 1215, "end_line": 1272, "label": "LiveIndex" }
+      ]
+    },
+    {
+      "id": "sidecar",
+      "type": "backend",
+      "label": "Sidecar",
+      "sublabel": "hooks + token stats",
+      "pos": [670, 70],
+      "size": [150, 64],
+      "sources": [
+        { "path": "src/sidecar/server.rs", "line": 34, "end_line": 90, "label": "spawn_sidecar" }
+      ]
+    },
+    {
+      "id": "watcher",
+      "type": "messagebus",
+      "label": "Watcher",
+      "sublabel": "notify debounce",
+      "pos": [1000, 70],
+      "size": [160, 64],
+      "sources": [
+        { "path": "src/watcher/mod.rs", "line": 730, "end_line": 758, "label": "start_watcher" }
+      ]
+    },
+    {
+      "id": "read-gate",
+      "type": "security",
+      "label": "Read gate",
+      "sublabel": "admit_disk_read",
+      "tag": "fail-closed",
+      "pos": [670, 450],
+      "size": [150, 64],
+      "sources": [
+        { "path": "src/protocol/read_gate.rs", "line": 1, "end_line": 28, "label": "gate contract" },
+        { "path": "src/protocol/read_gate.rs", "line": 260, "end_line": 282, "label": "admit_disk_read" }
+      ]
+    },
+    {
+      "id": "snapshot",
+      "type": "database",
+      "label": "Snapshot",
+      "sublabel": ".symforge/index.bin",
+      "pos": [1000, 450],
+      "size": [160, 64],
+      "sources": [
+        { "path": "src/live_index/persist.rs", "line": 42, "end_line": 44, "label": "index.bin" },
+        { "path": "src/live_index/persist.rs", "line": 666, "end_line": 683, "label": "checkpoint" }
+      ]
+    },
+    {
+      "id": "workspace",
+      "type": "external",
+      "label": "Workspace",
+      "sublabel": "git working tree",
+      "pos": [340, 450],
+      "size": [150, 64],
+      "sources": [
+        { "path": "src/git.rs", "line": 9, "end_line": 11, "label": "GitRepo" },
+        { "path": "src/git.rs", "line": 32, "end_line": 36, "label": "git2 discover" }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Untrusted MCP client",
+      "wraps": ["mcp-client"]
+    },
+    {
+      "kind": "security-group",
+      "label": "Loopback daemon + Bearer token",
+      "wraps": ["daemon", "live-index", "sidecar", "watcher"]
+    },
+    {
+      "kind": "security-group",
+      "label": "Disk admission",
+      "wraps": ["read-gate"]
+    },
+    {
+      "kind": "region",
+      "label": "Git working tree",
+      "wraps": ["workspace"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "client-to-adapter",
+      "from": "mcp-client",
+      "to": "stdio-adapter",
+      "label": "stdio MCP",
+      "variant": "emphasis"
+    },
+    {
+      "id": "adapter-to-daemon",
+      "from": "stdio-adapter",
+      "to": "daemon",
+      "label": "Bearer /v1/tools",
+      "variant": "security"
+    },
+    {
+      "id": "daemon-to-index",
+      "from": "daemon",
+      "to": "live-index",
+      "label": "in-memory query",
+      "variant": "emphasis"
+    },
+    {
+      "id": "daemon-to-gate",
+      "from": "daemon",
+      "to": "read-gate",
+      "label": "disk reopen",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "gate-to-workspace",
+      "from": "read-gate",
+      "to": "workspace",
+      "label": "owned fs::read",
+      "variant": "security"
+    },
+    {
+      "id": "watcher-to-index",
+      "from": "watcher",
+      "to": "live-index",
+      "label": "publish",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "index-to-snapshot",
+      "from": "live-index",
+      "to": "snapshot",
+      "label": "checkpoint",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "daemon-to-sidecar",
+      "from": "daemon",
+      "to": "sidecar",
+      "label": "hook HTTP",
+      "variant": "dashed",
+      "labelDy": -24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Primary path",
+      "items": [
+        "stdio connects to a shared daemon via connect_or_spawn_session",
+        "Most reads come from the published LiveIndex generation with no disk I/O"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Trust boundaries",
+      "items": [
+        "Daemon HTTP is fail-closed Bearer on 127.0.0.1",
+        "admit_disk_read and admit_git_text own the fetch; policy runs first"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "External dependencies",
+      "items": [
+        "rmcp 3.1, axum, notify, reqwest; tree-sitter parses into LiveIndex",
+        "git2/libgit2 for the working tree; rusqlite for stel-ledger.db, not index.bin"
+      ]
+    }
+  ]
+}

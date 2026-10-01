@@ -104,7 +104,7 @@ Failure should degrade safely:
 Current v8.14.0 recovery contract:
 
 - `checkpoint_now(verify_after_write=true)` is the explicit checkpoint path for
-  forcing `.symforge/index.bin` persistence before risky operations.
+  forcing persistence of the runtime-generated index snapshot before risky operations.
 - Use `health` or `health_compact` to inspect snapshot load source, background
   snapshot verification state, and mismatch summaries.
 - Bad or version-incompatible snapshots are preserved under
