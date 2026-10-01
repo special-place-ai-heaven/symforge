@@ -1412,7 +1412,20 @@ fn test_arcswap_concurrent_reads_under_writer_pressure() {
         })
     };
 
-    thread::sleep(Duration::from_millis(750));
+    // Issue #752: on a loaded Windows runner a fixed 750ms sleep ends before
+    // the first clone-mutate-swap returns, while readers have already
+    // finished. Wait until one swap is published (a stuck writer still fails
+    // at the deadline), then finish the original stress window when that
+    // swap arrived early. The reader tear checks above are unchanged.
+    let started = Instant::now();
+    let stress_window = Duration::from_millis(750);
+    let swap_deadline = Duration::from_secs(30);
+    while writer_swaps.load(Ordering::Relaxed) == 0 && started.elapsed() < swap_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if let Some(remaining) = stress_window.checked_sub(started.elapsed()) {
+        thread::sleep(remaining);
+    }
     stop.store(true, Ordering::Relaxed);
 
     for h in reader_handles {
@@ -1430,16 +1443,16 @@ fn test_arcswap_concurrent_reads_under_writer_pressure() {
     );
     assert!(
         swaps > 0,
-        "writer did not complete any swaps during the stress window (reads={reads})"
+        "writer published no snapshot within {swap_deadline:?} (reads={reads})"
     );
     assert!(
         reads > 0,
         "reader throughput was zero while the writer was active (swaps={swaps})"
     );
-    // With 8 readers over ~750ms against a concurrent writer, ArcSwap should
-    // deliver thousands of reads. A regression that re-introduces reader-side
-    // locking or otherwise starves readers would collapse this toward zero;
-    // require at least 100 reads as a lower floor that is robust on loaded CI.
+    // Eight readers over the stress window against a live writer should
+    // deliver far more than this. A regression that re-introduces reader-side
+    // locking or otherwise starves readers collapses toward zero; 100 is the
+    // floor that still holds on loaded CI.
     assert!(
         reads >= 100,
         "reader throughput suspiciously low: {reads} reads vs {swaps} swaps — possible reader starvation regression"
