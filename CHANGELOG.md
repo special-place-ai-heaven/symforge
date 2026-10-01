@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.4.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.11...v11.4.0) (2026-10-01)
+
+
+### Features
+
+* **034:** withheld meta + secret_remediate externalize MVP ([#745](https://github.com/special-place-ai-heaven/symforge/issues/745)) ([82de681](https://github.com/special-place-ai-heaven/symforge/commit/82de6812f0d3357557b21ecc4677af0ee0c213b3))
+
 ## [11.3.11](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.10...v11.3.11) (2026-10-01)
 
 
