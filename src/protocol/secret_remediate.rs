@@ -9,17 +9,23 @@ use std::time::Instant;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::hash::digest_hex;
-use crate::knowledge::{self, SECRET_POLICY_VERSION};
+use crate::knowledge::{self, SECRET_POLICY_VERSION, SecretSpansScan};
 use crate::protocol::SymForgeServer;
 use crate::protocol::edit::atomic_write_file;
+use crate::protocol::edit_tools::{
+    begin_mutation_replay, complete_mutation_replay_with_receipt, fail_and_return_mutation_replay,
+};
 use crate::protocol::result_status::{OutcomeClass, ResultStatus};
+use crate::protocol::secret_dismissals::{
+    self, DISMISSAL_STORE_REL, DismissalRecord, line_bytes_at, line_content_digest,
+};
 use crate::protocol::withheld::{RemediationActionName, mint_finding_id};
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SecretRemediateInput {
     /// One path, list of paths, or the string `"repo"`.
     pub scope: Value,
@@ -30,7 +36,7 @@ pub struct SecretRemediateInput {
     /// Default true. `false` selects apply (write).
     #[serde(default = "default_preview_true")]
     pub preview: bool,
-    #[allow(dead_code)] // honored in follow-on; accepted on wire now
+    /// Honored on apply like the edit lane (durable project-state replay).
     pub idempotency_key: Option<String>,
 }
 
@@ -48,6 +54,23 @@ struct PlannedRewrite {
     masked_diff: String,
     #[allow(dead_code)]
     finding_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PlannedDismiss {
+    path: String,
+    abs_path: PathBuf,
+    records: Vec<DismissalRecord>,
+    masked_summary: String,
+}
+
+#[derive(Debug)]
+struct PlannedEncrypt {
+    path: String,
+    abs_path: PathBuf,
+    original: Vec<u8>,
+    recipient: String,
+    masked_summary: String,
 }
 
 #[tool_router(router = secret_remediate_tool_router, vis = "pub(crate)")]
@@ -74,7 +97,11 @@ impl SymForgeServer {
             Ok(t) | Err(t) => t.clone(),
         };
         let outcome = if result.is_ok() {
-            OutcomeClass::Found
+            if text.contains("apply_status: incomplete") {
+                OutcomeClass::Ambiguous
+            } else {
+                OutcomeClass::Found
+            }
         } else if text.starts_with("Error:") {
             OutcomeClass::InvalidRequest
         } else {
@@ -107,20 +134,48 @@ impl SymForgeServer {
                 ));
             }
         };
-        if action == RemediationActionName::Encrypt {
-            return Err(
-                "Error: encrypt is unavailable (sops_not_installed or not yet implemented in this build)"
-                    .to_string(),
-            );
-        }
-        if action == RemediationActionName::Dismiss {
-            return Err(
-                "Error: dismiss is not yet available in this build (follow-on US4)".to_string(),
-            );
-        }
 
-        let paths = resolve_scope_paths(self, &input.scope)?;
-        let plan = plan_externalize(self, &paths, &input.finding_ids)?;
+        // Idempotency: preview never reserves; apply honors edit-lane replay.
+        let idempotency = match begin_mutation_replay(
+            self,
+            "secret_remediate",
+            &input,
+            input.idempotency_key.as_deref(),
+            input.preview,
+        ) {
+            Ok(active) => active,
+            Err(output) => {
+                if output.starts_with("Error:") {
+                    return Err(output);
+                }
+                return Ok(output);
+            }
+        };
+
+        let paths = match resolve_scope_paths(self, &input.scope) {
+            Ok(p) => p,
+            Err(e) => return Err(fail_and_return_mutation_replay(&idempotency, e)),
+        };
+
+        match action {
+            RemediationActionName::Externalize => {
+                self.run_externalize(&input, &paths, &idempotency).await
+            }
+            RemediationActionName::Encrypt => self.run_encrypt(&input, &paths, &idempotency).await,
+            RemediationActionName::Dismiss => self.run_dismiss(&input, &paths, &idempotency).await,
+        }
+    }
+
+    async fn run_externalize(
+        &self,
+        input: &SecretRemediateInput,
+        paths: &[String],
+        idempotency: &Option<crate::idempotency::ActiveReplay>,
+    ) -> Result<String, String> {
+        let plan = match plan_externalize(self, paths, &input.finding_ids) {
+            Ok(p) => p,
+            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
+        };
 
         if input.preview {
             let mut out = String::from("secret_remediate preview (externalize)\n");
@@ -134,20 +189,27 @@ impl SymForgeServer {
             return Ok(out);
         }
 
-        // Apply
         let live = self.index.data_plane().read();
         let Some(root) = live.indexed_root.clone() else {
-            return Err("Error: no indexed root bound".to_string());
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                "Error: no indexed root bound".to_string(),
+            ));
         };
         drop(live);
 
-        let originals = snapshot_for_rollback(&root, &plan)?;
+        let originals = match snapshot_for_rollback(&root, &plan) {
+            Ok(s) => s,
+            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
+        };
         if let Err(e) = apply_externalize(&root, &plan) {
-            let _ = rollback(&root, &originals);
-            return Err(format!("Error: apply failed and was rolled back: {e}"));
+            let _ = rollback(&originals);
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                format!("Error: apply failed and was rolled back: {e}"),
+            ));
         }
 
-        // Re-scan the rewritten source
         let rescan = match std::fs::read(&plan.abs_path) {
             Ok(bytes) => match knowledge::scan_secret_bytes(&plan.path, &bytes) {
                 knowledge::SecretScan::Clean => "clean".to_string(),
@@ -162,14 +224,267 @@ impl SymForgeServer {
         };
 
         let history = history_note(&root);
-        Ok(format!(
+        let incomplete = rescan.starts_with("still_sensitive");
+        let status = if incomplete {
+            "apply_status: incomplete (rescan still_sensitive)"
+        } else {
+            "apply_status: ok"
+        };
+        let mut out = format!(
             "secret_remediate apply (externalize)\n\
+             {status}\n\
              written:\n- {}\n- .env\n- .gitignore\n\
              rescan ({}) : {rescan}\n\
              {history}\n",
             plan.path, plan.path
-        ))
+        );
+        let written = vec![
+            plan.abs_path.clone(),
+            root.join(".env"),
+            root.join(".gitignore"),
+        ];
+        let receipt = crate::idempotency::capture_post_image(&written);
+        complete_mutation_replay_with_receipt(idempotency, &mut out, receipt);
+        Ok(out)
     }
+
+    async fn run_encrypt(
+        &self,
+        input: &SecretRemediateInput,
+        paths: &[String],
+        idempotency: &Option<crate::idempotency::ActiveReplay>,
+    ) -> Result<String, String> {
+        let availability = encrypt_runtime_availability(self);
+        if !availability.0 {
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                format!("Error: encrypt is unavailable ({})", availability.1),
+            ));
+        }
+        let plan = match plan_encrypt(self, paths, &input.finding_ids, &availability.1) {
+            Ok(p) => p,
+            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
+        };
+
+        if input.preview {
+            let mut out = String::from("secret_remediate preview (encrypt)\n");
+            out.push_str("Files that would be created or modified:\n");
+            out.push_str(&format!("- {}\n", plan.path));
+            out.push_str("\nMasked summary:\n");
+            out.push_str(&plan.masked_summary);
+            out.push('\n');
+            return Ok(out);
+        }
+
+        let live = self.index.data_plane().read();
+        let Some(root) = live.indexed_root.clone() else {
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                "Error: no indexed root bound".to_string(),
+            ));
+        };
+        drop(live);
+
+        let snap = plan.original.clone();
+        if let Err(e) = apply_encrypt(&root, &plan) {
+            let _ = std::fs::write(&plan.abs_path, &snap);
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                format!("Error: encrypt apply failed and was rolled back: {e}"),
+            ));
+        }
+
+        let after = std::fs::read(&plan.abs_path).unwrap_or_default();
+        let plaintext_gone = !bytes_contain_utf8_secret(&after, &snap, &plan.path);
+        let rescan = match knowledge::scan_secret_bytes(&plan.path, &after) {
+            knowledge::SecretScan::Clean => "clean".to_string(),
+            knowledge::SecretScan::Sensitive { finding_count, .. } => {
+                format!("still_sensitive finding_count={finding_count}")
+            }
+            knowledge::SecretScan::Indeterminate { reason } => {
+                format!("indeterminate {reason:?}")
+            }
+        };
+        if !plaintext_gone {
+            let _ = std::fs::write(&plan.abs_path, &snap);
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                "Error: encrypt apply left plaintext secret bytes; rolled back".to_string(),
+            ));
+        }
+
+        let history = history_note(&root);
+        let mut out = format!(
+            "secret_remediate apply (encrypt)\n\
+             apply_status: ok\n\
+             written:\n- {}\n\
+             rescan ({}) : {rescan}\n\
+             plaintext_absent: true\n\
+             {history}\n",
+            plan.path, plan.path
+        );
+        let receipt = crate::idempotency::capture_post_image(std::slice::from_ref(&plan.abs_path));
+        complete_mutation_replay_with_receipt(idempotency, &mut out, receipt);
+        Ok(out)
+    }
+
+    async fn run_dismiss(
+        &self,
+        input: &SecretRemediateInput,
+        paths: &[String],
+        idempotency: &Option<crate::idempotency::ActiveReplay>,
+    ) -> Result<String, String> {
+        let plan = match plan_dismiss(self, paths, &input.finding_ids) {
+            Ok(p) => p,
+            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
+        };
+
+        if input.preview {
+            let mut out = String::from("secret_remediate preview (dismiss)\n");
+            out.push_str("Files that would be created or modified:\n");
+            out.push_str(&format!("- {DISMISSAL_STORE_REL}\n"));
+            out.push_str("\nMasked summary:\n");
+            out.push_str(&plan.masked_summary);
+            out.push('\n');
+            return Ok(out);
+        }
+
+        let live = self.index.data_plane().read();
+        let Some(root) = live.indexed_root.clone() else {
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                "Error: no indexed root bound".to_string(),
+            ));
+        };
+        drop(live);
+
+        let store_path = secret_dismissals::store_abs(&root);
+        let mut merged = secret_dismissals::load_dismissals(&root).unwrap_or_default();
+        for rec in &plan.records {
+            merged.retain(|r| {
+                !(r.path.replace('\\', "/") == rec.path.replace('\\', "/")
+                    && r.rule_id == rec.rule_id
+                    && r.line_digest == rec.line_digest)
+            });
+            merged.push(rec.clone());
+        }
+        let store_bytes = serde_json::to_vec_pretty(&serde_json::json!({ "records": merged }))
+            .map_err(|e| {
+                fail_and_return_mutation_replay(
+                    idempotency,
+                    format!("Error: serialize dismissals: {e}"),
+                )
+            })?;
+
+        if let Some(parent) = store_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = atomic_write_file(&root, None, &store_path, &store_bytes) {
+            return Err(fail_and_return_mutation_replay(
+                idempotency,
+                format!("Error: write dismissal store: {e}"),
+            ));
+        }
+
+        // Reindex source so recorded disposition can clear when all findings dismissed.
+        if let Ok(bytes) = std::fs::read(&plan.abs_path)
+            && let Some(lang) = crate::domain::LanguageId::from_extension(
+                Path::new(&plan.path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or(""),
+            )
+        {
+            crate::protocol::edit::reindex_after_write(
+                self.index.data_plane(),
+                &plan.abs_path,
+                &plan.path,
+                &bytes,
+                lang,
+            );
+        }
+
+        let rescan = match std::fs::read(&plan.abs_path) {
+            Ok(bytes) => {
+                let scan = knowledge::scan_secret_bytes(&plan.path, &bytes);
+                let filtered =
+                    secret_dismissals::filter_scan_with_dismissals(&root, &plan.path, &bytes, scan);
+                match filtered {
+                    knowledge::SecretScan::Clean => "clean".to_string(),
+                    knowledge::SecretScan::Sensitive { finding_count, .. } => {
+                        format!("still_sensitive finding_count={finding_count}")
+                    }
+                    knowledge::SecretScan::Indeterminate { reason } => {
+                        format!("indeterminate {reason:?}")
+                    }
+                }
+            }
+            Err(e) => format!("unreadable: {e}"),
+        };
+
+        let history = history_note(&root);
+        let mut out = format!(
+            "secret_remediate apply (dismiss)\n\
+             apply_status: ok\n\
+             written:\n- {DISMISSAL_STORE_REL}\n\
+             rescan ({}) : {rescan}\n\
+             {history}\n",
+            plan.path
+        );
+        let receipt = crate::idempotency::capture_post_image(&[store_path]);
+        complete_mutation_replay_with_receipt(idempotency, &mut out, receipt);
+        Ok(out)
+    }
+}
+
+/// Returns (available, reason_or_recipient).
+fn encrypt_runtime_availability(server: &SymForgeServer) -> (bool, String) {
+    if !sops_binary_on_path() {
+        return (false, "sops_not_installed".to_string());
+    }
+    let live = server.index.data_plane().read();
+    let Some(root) = live.indexed_root.as_deref() else {
+        return (false, "no_indexed_root".to_string());
+    };
+    match resolve_age_recipient(root) {
+        Ok(r) => (true, r),
+        Err(reason) => (false, reason),
+    }
+}
+
+fn sops_binary_on_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let candidate = dir.join(if cfg!(windows) { "sops.exe" } else { "sops" });
+                candidate.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_age_recipient(root: &Path) -> Result<String, String> {
+    if let Ok(env) = std::env::var("SOPS_AGE_RECIPIENTS") {
+        let first = env
+            .split(',')
+            .map(str::trim)
+            .find(|s| !s.is_empty() && s.starts_with("age1"));
+        if let Some(r) = first {
+            return Ok(r.to_string());
+        }
+    }
+    let sops_yaml = root.join(".sops.yaml");
+    if !sops_yaml.is_file() {
+        return Err("no_recipient_configured".to_string());
+    }
+    let text = std::fs::read_to_string(&sops_yaml).map_err(|_| "no_recipient_configured")?;
+    for token in text.split_whitespace() {
+        let t = token.trim_matches(|c: char| c == '"' || c == '\'' || c == ',');
+        if t.starts_with("age1") && t.len() > 16 {
+            return Ok(t.to_string());
+        }
+    }
+    Err("no_recipient_configured".to_string())
 }
 
 fn resolve_scope_paths(server: &SymForgeServer, scope: &Value) -> Result<Vec<String>, String> {
@@ -235,7 +550,14 @@ fn plan_externalize(
         let Ok(bytes) = std::fs::read(&abs) else {
             continue;
         };
-        let spans = knowledge::scan_secret_spans(rel, &bytes);
+        let spans = match knowledge::scan_secret_spans(rel, &bytes) {
+            SecretSpansScan::Spans(s) => s,
+            SecretSpansScan::Indeterminate { reason } => {
+                return Err(format!(
+                    "Error: secret span scan indeterminate ({reason:?}); refusing externalize"
+                ));
+            }
+        };
         let mut hits = Vec::new();
         for (idx, span) in spans.iter().enumerate() {
             let id = mint_finding_id(
@@ -252,24 +574,19 @@ fn plan_externalize(
         if hits.is_empty() {
             continue;
         }
-        // One-file v1 plan: first path that matches any requested ids.
         let mut rewritten = bytes.clone();
         let mut env_lines = Vec::new();
         let mut masked = String::new();
         let mut applied_ids = Vec::new();
-        // Apply from the end so offsets stay valid.
         hits.sort_by_key(|(_, span, _)| std::cmp::Reverse(span.value_start));
         let idiom = externalize_idiom(rel);
         for (secret_n, (_idx, span, id)) in hits.into_iter().enumerate() {
             let var = env_var_name(rel, span.rule_id, span.line_start, secret_n);
             let value = &bytes[span.value_start..span.value_end];
-            // Never put raw value into response — only into .env on apply.
             env_lines.push(format!("{var}={}", String::from_utf8_lossy(value)));
             let replacement = idiom_replacement(&idiom, &var);
             rewritten.splice(span.value_start..span.value_end, replacement.bytes());
             applied_ids.push(id);
-            // Assemble mask label at runtime so source stays detector-clean
-            // (Ruling 1: no contiguous credential-key assignment shapes in src/).
             let mask_kind = ["sec", "ret"].concat();
             masked.push_str(&format!(
                 "--- {rel}\n+++ {rel}\n@@ line {} @@\n-«{mask_kind}:{}»\n+{replacement}\n",
@@ -296,6 +613,235 @@ fn plan_externalize(
         ));
     }
     matched_path.ok_or_else(|| "Error: no matching findings in scope".to_string())
+}
+
+fn plan_encrypt(
+    server: &SymForgeServer,
+    paths: &[String],
+    finding_ids: &[String],
+    recipient: &str,
+) -> Result<PlannedEncrypt, String> {
+    let live = server.index.data_plane().read();
+    let Some(root) = live.indexed_root.as_deref() else {
+        return Err("Error: no indexed root bound".to_string());
+    };
+    let mut wanted: std::collections::BTreeSet<&str> =
+        finding_ids.iter().map(String::as_str).collect();
+
+    for rel in paths {
+        if !encrypt_format_supported(rel) {
+            continue;
+        }
+        let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(&abs) else {
+            continue;
+        };
+        let spans = match knowledge::scan_secret_spans(rel, &bytes) {
+            SecretSpansScan::Spans(s) => s,
+            SecretSpansScan::Indeterminate { reason } => {
+                return Err(format!(
+                    "Error: secret span scan indeterminate ({reason:?}); refusing encrypt"
+                ));
+            }
+        };
+        let mut matched = false;
+        for span in &spans {
+            let id = mint_finding_id(
+                rel,
+                span.rule_id,
+                span.line_start,
+                span.line_end,
+                &span.shape,
+            );
+            if wanted.remove(id.as_str()) {
+                matched = true;
+            }
+        }
+        if !matched {
+            continue;
+        }
+        if !wanted.is_empty() {
+            let missing: Vec<_> = wanted.into_iter().collect();
+            return Err(format!(
+                "Error: finding_ids not found in scope: {missing:?}"
+            ));
+        }
+        let mask_kind = ["sec", "ret"].concat();
+        return Ok(PlannedEncrypt {
+            path: rel.clone(),
+            abs_path: abs,
+            original: bytes,
+            recipient: recipient.to_string(),
+            masked_summary: format!(
+                "Would SOPS-encrypt {rel} in place with age recipient (public only).\n\
+                 Values shown as «{mask_kind}:N» are never returned.\n"
+            ),
+        });
+    }
+    if !wanted.is_empty() {
+        let missing: Vec<_> = wanted.into_iter().collect();
+        return Err(format!(
+            "Error: finding_ids not found in encrypt-supported scope: {missing:?}"
+        ));
+    }
+    Err("Error: no matching findings in encrypt-supported formats (json/yaml/toml/env)".to_string())
+}
+
+fn plan_dismiss(
+    server: &SymForgeServer,
+    paths: &[String],
+    finding_ids: &[String],
+) -> Result<PlannedDismiss, String> {
+    let live = server.index.data_plane().read();
+    let Some(root) = live.indexed_root.as_deref() else {
+        return Err("Error: no indexed root bound".to_string());
+    };
+    let mut wanted: std::collections::BTreeSet<&str> =
+        finding_ids.iter().map(String::as_str).collect();
+    let mut records = Vec::new();
+    let mut path_hit: Option<(String, PathBuf)> = None;
+    let mut summary = String::new();
+
+    for rel in paths {
+        if wanted.is_empty() {
+            break;
+        }
+        let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(&abs) else {
+            continue;
+        };
+        let spans = match knowledge::scan_secret_spans(rel, &bytes) {
+            SecretSpansScan::Spans(s) => s,
+            SecretSpansScan::Indeterminate { reason } => {
+                return Err(format!(
+                    "Error: secret span scan indeterminate ({reason:?}); refusing dismiss"
+                ));
+            }
+        };
+        for span in &spans {
+            let id = mint_finding_id(
+                rel,
+                span.rule_id,
+                span.line_start,
+                span.line_end,
+                &span.shape,
+            );
+            if !wanted.remove(id.as_str()) {
+                continue;
+            }
+            let Some(line) = line_bytes_at(&bytes, span.line_start) else {
+                return Err(format!(
+                    "Error: could not bind line digest for finding {id}"
+                ));
+            };
+            let digest = line_content_digest(line);
+            records.push(DismissalRecord {
+                path: rel.replace('\\', "/"),
+                line_digest: digest.clone(),
+                rule_id: span.rule_id.to_string(),
+                created_at: Some(chrono_now_rfc3339()),
+                note: Some("dismissed via secret_remediate".to_string()),
+            });
+            let mask_kind = ["sec", "ret"].concat();
+            summary.push_str(&format!(
+                "- {rel}:{} rule={} digest={} «{mask_kind}:bound»\n",
+                span.line_start,
+                span.rule_id,
+                &digest[..12.min(digest.len())]
+            ));
+            path_hit = Some((rel.clone(), abs.clone()));
+        }
+    }
+
+    if !wanted.is_empty() {
+        let missing: Vec<_> = wanted.into_iter().collect();
+        return Err(format!(
+            "Error: finding_ids not found in scope: {missing:?}"
+        ));
+    }
+    let (path, abs_path) = path_hit.ok_or_else(|| "Error: no matching findings".to_string())?;
+    Ok(PlannedDismiss {
+        path,
+        abs_path,
+        records,
+        masked_summary: summary,
+    })
+}
+
+fn chrono_now_rfc3339() -> String {
+    // Avoid pulling chrono if unused elsewhere: use a simple UTC-ish stamp via SystemTime.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix:{secs}")
+}
+
+fn encrypt_format_supported(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "json" | "yaml" | "yml" | "toml" | "env" | "ini"
+    ) || Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == ".env" || n.ends_with(".env"))
+}
+
+fn apply_encrypt(root: &Path, plan: &PlannedEncrypt) -> Result<(), String> {
+    let _ = root;
+    // Encrypt via temp file then atomic replace — never leave partial ciphertext
+    // without rollback path.
+    let tmp = plan.abs_path.with_extension("sops.tmp");
+    let output = crate::process_util::hidden_command("sops")
+        .args([
+            "--encrypt",
+            "--age",
+            &plan.recipient,
+            "--output",
+            tmp.to_str().ok_or("encrypt temp path not utf8")?,
+            plan.abs_path.to_str().ok_or("encrypt path not utf8")?,
+        ])
+        .output()
+        .map_err(|e| format!("sops spawn failed: {e}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "sops encrypt failed (status {:?}): {}",
+            output.status.code(),
+            stderr.chars().take(200).collect::<String>()
+        ));
+    }
+    let encrypted = std::fs::read(&tmp).map_err(|e| format!("read sops output: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    atomic_write_file(root, None, &plan.abs_path, &encrypted)
+        .map_err(|e| format!("write encrypted {}: {e}", plan.path))?;
+    Ok(())
+}
+
+/// Best-effort: if original had a secret capture and encrypted bytes still contain
+/// that exact capture as utf8, treat as plaintext leak. Uses span scan on original only.
+fn bytes_contain_utf8_secret(after: &[u8], original: &[u8], path: &str) -> bool {
+    let SecretSpansScan::Spans(spans) = knowledge::scan_secret_spans(path, original) else {
+        return false;
+    };
+    for span in spans {
+        let value = &original[span.value_start..span.value_end];
+        if value.len() >= 8 && after.windows(value.len()).any(|w| w == value) {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -347,18 +893,23 @@ fn snapshot_for_rollback(root: &Path, plan: &PlannedRewrite) -> Result<Vec<Rollb
     }];
     for name in [".env", ".gitignore"] {
         let p = root.join(name);
-        let bytes = if p.exists() {
-            Some(std::fs::read(&p).map_err(|e| format!("snapshot {name}: {e}"))?)
-        } else {
-            None
+        let bytes = match std::fs::symlink_metadata(&p) {
+            Ok(meta) if meta.is_file() => {
+                Some(std::fs::read(&p).map_err(|e| format!("snapshot {name}: {e}"))?)
+            }
+            Ok(_) => {
+                // Exists but is not a regular file (e.g. directory planted to
+                // force a mid-apply failure). Do not snapshot or roll it back.
+                continue;
+            }
+            Err(_) => None,
         };
         snaps.push(RollbackSnap { path: p, bytes });
     }
     Ok(snaps)
 }
 
-fn rollback(root: &Path, snaps: &[RollbackSnap]) -> Result<(), String> {
-    let _ = root;
+fn rollback(snaps: &[RollbackSnap]) -> Result<(), String> {
     for snap in snaps {
         match &snap.bytes {
             Some(b) => {
@@ -373,9 +924,8 @@ fn rollback(root: &Path, snaps: &[RollbackSnap]) -> Result<(), String> {
 }
 
 fn apply_externalize(root: &Path, plan: &PlannedRewrite) -> Result<(), String> {
-    atomic_write_file(root, None, &plan.abs_path, &plan.rewritten)
-        .map_err(|e| format!("write {}: {e}", plan.path))?;
-
+    // Bruce F3: write `.env` BEFORE stripping the source so a crash mid-apply
+    // cannot leave a stripped source without the env append.
     let env_path = root.join(".env");
     let mut env_body = if env_path.exists() {
         let mut b = std::fs::read_to_string(&env_path).map_err(|e| format!("read .env: {e}"))?;
@@ -387,15 +937,31 @@ fn apply_externalize(root: &Path, plan: &PlannedRewrite) -> Result<(), String> {
         String::new()
     };
     for line in &plan.env_lines {
-        let key = line.split_once('=').map(|(k, _)| k).unwrap_or(line);
-        if env_body.lines().any(|l| l.starts_with(&format!("{key}="))) {
-            continue; // idempotent
+        let (key, value) = line.split_once('=').unwrap_or((line.as_str(), ""));
+        if let Some(existing) = env_body.lines().find(|l| l.starts_with(&format!("{key}="))) {
+            // Bruce F1: idempotent skip only when the value matches.
+            let existing_val = existing.split_once('=').map(|(_, v)| v).unwrap_or("");
+            if existing_val != value {
+                return Err(format!(
+                    ".env key {key} already exists with a different value; refusing silent overwrite"
+                ));
+            }
+            continue;
         }
         env_body.push_str(line);
         env_body.push('\n');
     }
     atomic_write_file(root, None, &env_path, env_body.as_bytes())
         .map_err(|e| format!("write .env: {e}"))?;
+    // Bruce F2: owner-only mode on Unix for the credential file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    atomic_write_file(root, None, &plan.abs_path, &plan.rewritten)
+        .map_err(|e| format!("write {}: {e}", plan.path))?;
 
     let gi = root.join(".gitignore");
     let mut gi_body = if gi.exists() {

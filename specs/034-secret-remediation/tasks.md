@@ -78,10 +78,10 @@
 **Goal**: SOPS/age encrypt with public recipient; unavailable when missing.  
 **Independent Test**: quickstart oracles 7–9.
 
-- [ ] T020 [P] [US3] RED oracles unavailable / apply / spawn guard
-- [ ] T021 [US3] Detect `sops` + recipient; mark action availability in meta + tool
-- [ ] T022 [US3] Encrypt apply via `hidden_command` only; supported formats only
-- [ ] T023 [US3] CI strategy: skip apply oracle when `sops` absent but keep unavailable oracle required
+- [x] T020 [P] [US3] RED oracles unavailable / apply / spawn guard
+- [x] T021 [US3] Detect `sops` + recipient; mark action availability in meta + tool
+- [x] T022 [US3] Encrypt apply via `hidden_command` only; supported formats only
+- [x] T023 [US3] CI strategy: skip apply oracle when `sops` absent but keep unavailable oracle required
 
 **Checkpoint**: Encrypt path honest about availability.
 
@@ -92,10 +92,10 @@
 **Goal**: Content-digest-bound dismissal without the five rejected allowlist modes.  
 **Independent Test**: quickstart oracles 10–13.
 
-- [ ] T024 [P] [US4] RED oracles digest bind / revocation / symlink+size / health
-- [ ] T025 [US4] Dismissal store format + loader invariants
-- [ ] T026 [US4] Integrate dismissal into admission decision (read lane, not refuse_by_policy syscalls)
-- [ ] T027 [US4] Ensure refusal text still offers no self-service bypass
+- [x] T024 [P] [US4] RED oracles digest bind / revocation / symlink+size / health
+- [x] T025 [US4] Dismissal store format + loader invariants
+- [x] T026 [US4] Integrate dismissal into admission decision (read lane, not refuse_by_policy syscalls)
+- [x] T027 [US4] Ensure refusal text still offers no self-service bypass
 
 **Checkpoint**: All US4 oracles green.
 
@@ -103,10 +103,10 @@
 
 ## Phase 7: Polish & Cross-Cutting
 
-- [ ] T028 [P] Prompt-injection / write-gate documentation + oracle 14 strategy
-- [ ] T029 Scope refusals oracle 15; syscall-free oracle 16
+- [x] T028 [P] Prompt-injection / write-gate documentation + oracle 14 strategy
+- [x] T029 Scope refusals oracle 15; syscall-free oracle 16
 - [x] T030 FULL_SOURCE_PIN_V1 refresh if `src/` changes require it (after rustfmt)
-- [ ] T031 Run full HANDOVER §4 gates; open implementation PR (do not merge without LINUS)
+- [x] T031 Run full HANDOVER §4 gates; open implementation PR (do not merge without LINUS)
 
 ---
 

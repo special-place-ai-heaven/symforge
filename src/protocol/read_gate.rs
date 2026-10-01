@@ -453,9 +453,26 @@ pub(crate) fn admit_bytes(
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     if let Some(refusal) = refuse_by_policy(live, relative_path) {
+        // 034 US4: dismiss can clear a recorded SensitiveContent demotion on
+        // the read/admit lane (bytes already held — no extra disk open for
+        // the source file; dismissal store load is bounded).
+        if let Some(root) = live.indexed_root.as_deref() {
+            let scan = crate::knowledge::scan_secret_bytes(relative_path, &bytes);
+            let filtered = crate::protocol::secret_dismissals::filter_scan_with_dismissals(
+                root,
+                relative_path,
+                &bytes,
+                scan,
+            );
+            if matches!(filtered, crate::knowledge::SecretScan::Clean)
+                && crate::knowledge::sensitive_path_rule(relative_path).is_none()
+            {
+                return Ok(bytes);
+            }
+        }
         return Err(refusal);
     }
-    if let Some(refusal) = classify_admitted_bytes(relative_path, &bytes) {
+    if let Some(refusal) = classify_admitted_bytes(live, relative_path, &bytes) {
         return Err(refusal);
     }
     Ok(bytes)
@@ -519,7 +536,15 @@ fn disk_read(
     // caller that renders the refusal, does the gate re-read a recorded content
     // demotion, bounded, to name its finding lines; those bytes never leave the
     // gate.
+    //
+    // Feature 034 US4: a recorded SensitiveContent demotion may be overridden
+    // on the READ LANE (not inside refuse_by_policy) when every finding's line
+    // content digest is dismissed. That keeps refuse_by_policy syscall-free.
     if let Some(refusal) = refuse_by_policy(live, relative_path) {
+        if let Some(bytes) = try_admit_dismissed_sensitive_content(live, relative_path, canon_path)
+        {
+            return Ok(bytes);
+        }
         return Err(if name_lines {
             recorded_refusal_naming_lines(live, relative_path).unwrap_or(refusal)
         } else {
@@ -534,14 +559,57 @@ fn disk_read(
         Ok(bytes) => bytes,
         Err(e) => return Err(format!("{relative_path} [error: could not read file: {e}]")),
     };
-    if let Some(refusal) = classify_admitted_bytes(relative_path, &bytes) {
+    if let Some(refusal) = classify_admitted_bytes(live, relative_path, &bytes) {
         return Err(refusal);
     }
     Ok(bytes)
 }
 
+/// Read-lane override for content-digest dismissals (034 US4).
+///
+/// Returns `Some(bytes)` only when the recorded disposition is SensitiveContent
+/// (not path-rule / indeterminate) AND a fresh scan filtered by the dismissal
+/// store is Clean. Never follows a symlink store (loader enforces).
+fn try_admit_dismissed_sensitive_content(
+    live: &LiveIndex,
+    relative_path: &str,
+    canon_path: &Path,
+) -> Option<Vec<u8>> {
+    if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
+        return None;
+    }
+    let Some(FileDisposition::MetadataOnly {
+        reason: MetadataOnlyReason::SensitiveContent { rule_ids, .. },
+    }) = live.capture_file_disposition(relative_path)
+    else {
+        return None;
+    };
+    if rule_ids
+        .iter()
+        .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID)
+    {
+        return None;
+    }
+    let root = live.indexed_root.as_deref()?;
+    let bytes = std::fs::read(canon_path).ok()?;
+    if crate::knowledge::exceeds_scan_limit(bytes.len()) {
+        return None;
+    }
+    let scan = crate::knowledge::scan_secret_bytes(relative_path, &bytes);
+    let filtered = crate::protocol::secret_dismissals::filter_scan_with_dismissals(
+        root,
+        relative_path,
+        &bytes,
+        scan,
+    );
+    match filtered {
+        crate::knowledge::SecretScan::Clean => Some(bytes),
+        _ => None,
+    }
+}
+
 /// Classify bytes the gate is holding. `None` admits them.
-fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> {
+fn classify_admitted_bytes(live: &LiveIndex, relative_path: &str, bytes: &[u8]) -> Option<String> {
     // Fail closed on bytes the detector cannot have inspected, and do it HERE so
     // the refusal MESSAGE can be honest. `classify_stable_content` demotes both
     // populations correctly on its own — it collapses the scan-budget refusal
@@ -587,6 +655,13 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
         bytes,
         |path, bytes| {
             let scan = crate::knowledge::scan_secret_bytes(path, bytes);
+            let scan = if let Some(root) = live.indexed_root.as_deref() {
+                crate::protocol::secret_dismissals::filter_scan_with_dismissals(
+                    root, path, bytes, scan,
+                )
+            } else {
+                scan
+            };
             if let crate::knowledge::SecretScan::Sensitive {
                 line_ranges,
                 findings,

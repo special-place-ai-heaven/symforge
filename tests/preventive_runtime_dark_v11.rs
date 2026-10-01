@@ -1082,10 +1082,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // same file count; byte churn in src/daemon.rs only.
 // Refreshed for MCP launch-pair repair (src/cli/init.rs, harness.rs,
 // update.rs, mod.rs): same file count, no edge into src/index_lifecycle.
+// Refreshed after 034 US3/US4 secret_remediate + dismissals (+ soft residuals)
+// rebased onto main: +1 src file (secret_dismissals.rs); no edges into
+// src/index_lifecycle. Pin recomputed for merged tree.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "71748d3fc22fc06b90935d3ef1a2529d4094f2703947d9cf3f32ceda1fd4935f",
-    201,
-    10_310_858,
+    "5c014abe5f2ea72496706e9d069689b1a3c5d52aa0c69d30e7abb19ca5be0a13",
+    202,
+    10_344_185,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
