@@ -121,6 +121,17 @@ pub enum DetectorFailure {
     Internal,
 }
 
+/// Safe per-finding descriptor for withheld `_meta` (034). Never carries secret bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretFindingDescriptor {
+    pub rule_id: &'static str,
+    /// Inclusive 1-based line of the capture start (end equals start today).
+    pub line_start: u32,
+    pub line_end: u32,
+    /// Shape string — length + charset class + rule id; never a substring of the value.
+    pub shape: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SecretScan {
     Clean,
@@ -134,10 +145,132 @@ pub enum SecretScan {
         /// positive, nothing of the value. Rendered by the read gate at refusal
         /// time and never persisted, so the snapshot schema does not change.
         line_ranges: Vec<(u32, u32)>,
+        /// Per-finding descriptors (capped like `line_ranges`) for actionable
+        /// refusal metadata. Shape strings only — never secret bytes.
+        findings: Vec<SecretFindingDescriptor>,
     },
     Indeterminate {
         reason: DetectorFailure,
     },
+}
+
+/// Describe a captured secret's form without embedding any of its bytes.
+///
+/// Output is stable for equal forms and is asserted by 034 oracles to omit the
+/// synthetic secret string from serialized results.
+pub fn describe_secret_shape(value: &[u8], rule_id: &str) -> String {
+    let len = value.len();
+    let has_digit = value.iter().any(u8::is_ascii_digit);
+    let has_upper = value.iter().any(u8::is_ascii_uppercase);
+    let has_lower = value.iter().any(u8::is_ascii_lowercase);
+    let has_symbol = value.iter().any(|b| !b.is_ascii_alphanumeric());
+    let charset = match (has_upper, has_lower, has_digit, has_symbol) {
+        (_, _, true, true) => "mixed alnum+symbol",
+        (true, true, true, false) => "mixed alnum",
+        (_, _, true, false) => "alnum with digits",
+        (_, _, false, true) => "alpha+symbol",
+        (true, true, false, false) => "alpha mixed case",
+        (false, true, false, false) => "lowercase alpha",
+        (true, false, false, false) => "uppercase alpha",
+        _ => "opaque bytes",
+    };
+    format!("{len}-char {charset} ({rule_id})")
+}
+
+/// Internal span for remediation rewrites. Held only in-process; never serialized
+/// to agents. `value_start`/`value_end` index the secret capture in `bytes`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretMatchSpan {
+    pub rule_id: &'static str,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub shape: String,
+    pub value_start: usize,
+    pub value_end: usize,
+}
+
+/// Like [`scan_secret_bytes`], but also returns byte spans for each kept finding
+/// so remediation can rewrite without a second detector. Spans never leave the
+/// remediation apply path as wire data.
+pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> Vec<SecretMatchSpan> {
+    if exceeds_scan_limit(bytes.len()) {
+        return Vec::new();
+    }
+    let rules = match SECRET_RULES.get_or_init(compile_secret_rules) {
+        Ok(rules) => rules,
+        Err(_) => return Vec::new(),
+    };
+    let mut spans = Vec::new();
+    for rule in rules {
+        if !rule
+            .keywords
+            .iter()
+            .any(|keyword| contains_ascii_case_insensitive(bytes, keyword))
+        {
+            continue;
+        }
+        let (mut cursor, mut line) = (0_usize, 0_usize);
+        for captures in rule.pattern.captures_iter(bytes) {
+            let Some(secret) = (if rule.secret_capture == 0 {
+                captures.get(0)
+            } else {
+                (1..=rule.secret_capture).find_map(|index| captures.get(index))
+            }) else {
+                return Vec::new();
+            };
+            let match_start = context_assignment_match_start(
+                rule.id,
+                bytes,
+                captures
+                    .get(0)
+                    .map_or(secret.start(), |whole| whole.start()),
+            );
+            if rule.placeholders_allowed
+                && (is_placeholder(secret.as_bytes())
+                    || is_angle_placeholder(bytes, secret.start()))
+            {
+                if right_hand_side_continuation(bytes, secret.start(), secret.end())
+                    .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false))
+                {
+                    continue;
+                }
+            } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
+                && (assignment_is_code_expression(
+                    path,
+                    bytes,
+                    match_start,
+                    secret.start(),
+                    secret.as_bytes(),
+                ) || !assignment_value_looks_like_credential(
+                    bytes,
+                    match_start,
+                    secret.start(),
+                    secret.as_bytes(),
+                )))
+                || (rule.id == URI_CREDENTIALS_RULE_ID
+                    && uri_credentials_are_placeholder(bytes, secret.start(), secret.end()))
+            {
+                continue;
+            }
+            line += bytes[cursor..secret.start()]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = secret.start();
+            if spans.len() < FINDING_LINE_RANGES_KEPT {
+                let line_1based = u32::try_from(line.saturating_add(1)).unwrap_or(u32::MAX);
+                spans.push(SecretMatchSpan {
+                    rule_id: rule.id,
+                    line_start: line_1based,
+                    line_end: line_1based,
+                    shape: describe_secret_shape(secret.as_bytes(), rule.id),
+                    value_start: secret.start(),
+                    value_end: secret.end(),
+                });
+            }
+        }
+    }
+    spans
 }
 
 struct SecretRule {
@@ -977,6 +1110,7 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
     // One bit per line, merged across rules. Bounded by the scan budget: at most
     // one bit per byte, so 512 KiB for a file of nothing but newlines.
     let mut line_bits: Vec<u64> = Vec::new();
+    let mut findings: Vec<SecretFindingDescriptor> = Vec::new();
     for rule in rules {
         if !rule
             .keywords
@@ -1058,6 +1192,15 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                 line_bits.resize(word + 1, 0);
             }
             line_bits[word] |= 1 << (line % 64);
+            if findings.len() < FINDING_LINE_RANGES_KEPT {
+                let line_1based = u32::try_from(line.saturating_add(1)).unwrap_or(u32::MAX);
+                findings.push(SecretFindingDescriptor {
+                    rule_id: rule.id,
+                    line_start: line_1based,
+                    line_end: line_1based,
+                    shape: describe_secret_shape(secret.as_bytes(), rule.id),
+                });
+            }
         }
     }
 
@@ -1068,6 +1211,7 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
             rule_ids,
             finding_count,
             line_ranges: first_line_ranges(&line_bits),
+            findings,
         }
     }
 }

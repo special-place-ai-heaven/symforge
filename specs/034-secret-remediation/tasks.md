@@ -24,18 +24,18 @@
 
 ## Phase 1: Setup (implementation PR)
 
-- [ ] T001 Confirm branch rebased onto current `origin/main`; `CLAUDE_PROJECT_DIR=` documented in PR body
-- [ ] T002 [P] Add contract fixture stubs under `tests/` (or in-module) named per quickstart oracles — expect RED
-- [ ] T003 [P] Register tool name placeholder in `scripts/verify-tools.cjs` / tool list pins (will fail until handler exists — sequence carefully)
+- [x] T001 Confirm branch rebased onto current `origin/main`; `CLAUDE_PROJECT_DIR=` documented in PR body
+- [x] T002 [P] Add contract fixture stubs under `tests/` (or in-module) named per quickstart oracles — expect RED
+- [x] T003 [P] Register tool name placeholder in `scripts/verify-tools.cjs` / tool list pins (will fail until handler exists — sequence carefully)
 
 ---
 
 ## Phase 2: Foundational
 
-- [ ] T004 Introduce `WITHHELD_META_KEY` and serde types in `src/protocol/result_status.rs` (or dedicated module) with no secret-byte fields
-- [ ] T005 Shape descriptor helper (synthetic-safe) reusable by meta attachment and tests
-- [ ] T006 Wire finding-id minting from admission scan identity (stable across preview→apply within the same scan generation)
-- [ ] T007 Ensure `refuse_by_policy` gains **no** new syscalls; attach meta only on lanes with existing finding evidence
+- [x] T004 Introduce `WITHHELD_META_KEY` and serde types in `src/protocol/result_status.rs` (or dedicated module) with no secret-byte fields
+- [x] T005 Shape descriptor helper (synthetic-safe) reusable by meta attachment and tests
+- [x] T006 Wire finding-id minting from admission scan identity (stable across preview→apply within the same scan generation)
+- [x] T007 Ensure `refuse_by_policy` gains **no** new syscalls; attach meta only on lanes with existing finding evidence
 
 **Checkpoint**: Types compile; refuse_by_policy syscall-free oracle still green.
 
@@ -46,11 +46,11 @@
 **Goal**: Withheld reads carry `_meta["symforge/withheld"]` without leaking bytes.  
 **Independent Test**: quickstart oracles 1–3.
 
-- [ ] T008 [P] [US1] RED oracle `admission_refusal_carries_withheld_meta_without_secret_bytes`
-- [ ] T009 [P] [US1] RED oracle `clean_read_omits_withheld_meta`
-- [ ] T010 [US1] Attach withheld meta at admission refusal seam(s) using live findings + line ranges
-- [ ] T011 [US1] Path-rule / unscanned honest availability (no invented content ids)
-- [ ] T012 [US1] Update `format.rs` docs that currently claim "offers no remedy" to point at the separate write tool (no self-service bypass in refusal text)
+- [x] T008 [P] [US1] RED oracle `admission_refusal_carries_withheld_meta_without_secret_bytes`
+- [x] T009 [P] [US1] RED oracle `clean_read_omits_withheld_meta`
+- [x] T010 [US1] Attach withheld meta at admission refusal seam(s) using live findings + line ranges
+- [x] T011 [US1] Path-rule / unscanned honest availability (no invented content ids)
+- [x] T012 [US1] Update `format.rs` docs that currently claim "offers no remedy" to point at the separate write tool (no self-service bypass in refusal text)
 
 **Checkpoint**: US1 oracles GREEN; secret string absent from serialized results.
 
@@ -61,13 +61,13 @@
 **Goal**: `secret_remediate` preview/apply externalize with masked diff, atomic writes, re-scan report.  
 **Independent Test**: quickstart oracles 4–6.
 
-- [ ] T013 [P] [US2] RED oracles for preview-no-write, apply+rescan, idempotent/rollback
-- [ ] T014 [US2] Implement tool handler skeleton in `src/protocol/secret_remediate.rs` (preview default true)
-- [ ] T015 [US2] Externalize rewriter for JS/TS, Python, Rust, `${X}` config
-- [ ] T016 [US2] `.env` create + `.gitignore` ensure; all paths via `resolve_repo_path`
-- [ ] T017 [US2] Reuse edit-lane atomic apply + idempotency patterns
-- [ ] T018 [US2] Honest apply report (written files, re-scan, history note)
-- [ ] T019 [US2] Register tool in `tools.rs` + verify-tools pins
+- [x] T013 [P] [US2] RED oracles for preview-no-write, apply+rescan, idempotent/rollback
+- [x] T014 [US2] Implement tool handler skeleton in `src/protocol/secret_remediate.rs` (preview default true)
+- [x] T015 [US2] Externalize rewriter for JS/TS, Python, Rust, `${X}` config
+- [x] T016 [US2] `.env` create + `.gitignore` ensure; all paths via `resolve_repo_path`
+- [x] T017 [US2] Reuse edit-lane atomic apply + idempotency patterns
+- [x] T018 [US2] Honest apply report (written files, re-scan, history note)
+- [x] T019 [US2] Register tool in `tools.rs` + verify-tools pins
 
 **Checkpoint**: Externalize MVP demoable; US1+US2 green.
 
@@ -105,7 +105,7 @@
 
 - [ ] T028 [P] Prompt-injection / write-gate documentation + oracle 14 strategy
 - [ ] T029 Scope refusals oracle 15; syscall-free oracle 16
-- [ ] T030 FULL_SOURCE_PIN_V1 refresh if `src/` changes require it (after rustfmt)
+- [x] T030 FULL_SOURCE_PIN_V1 refresh if `src/` changes require it (after rustfmt)
 - [ ] T031 Run full HANDOVER §4 gates; open implementation PR (do not merge without LINUS)
 
 ---

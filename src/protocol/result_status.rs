@@ -254,6 +254,15 @@ impl ResultStatus {
             meta.insert(PROJECT_EVIDENCE_META_KEY.to_string(), value);
         }
 
+        if let Some(withheld) = crate::protocol::withheld::take_pending_withheld()
+            && let Ok(value) = serde_json::to_value(&withheld)
+        {
+            meta.insert(
+                crate::protocol::withheld::WITHHELD_META_KEY.to_string(),
+                value,
+            );
+        }
+
         let content = vec![ContentBlock::text(human_text.into())];
         let result = if is_error {
             CallToolResult::error(content)

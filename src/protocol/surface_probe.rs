@@ -26,7 +26,7 @@ pub enum SurfaceProfile {
 pub fn surface_profile_from_env() -> SurfaceProfile {
     // Default surface is FULL (spike-gate verdict 2026-07-03: no target harness
     // rejected the then-36-tool full `tools/list`; see docs/reviews). The current
-    // full surface has 39 tools. `SYMFORGE_SURFACE=compact`
+    // full surface has 40 tools. `SYMFORGE_SURFACE=compact`
     // is the documented opt-in escape hatch (the compact-3 facade) for token-
     // sensitive setups; `meta` keeps its explicit measurement meaning. Only this
     // fallback arm changed — explicit `full`/`meta`/`compact` values are unchanged,
@@ -349,7 +349,7 @@ mod tests {
         let tools = list_tools_for_profile(SurfaceProfile::Full);
         assert_eq!(
             tools.len(),
-            39,
+            40,
             "full surface count changed; update the public inventory with any intentional change"
         );
         assert!(
