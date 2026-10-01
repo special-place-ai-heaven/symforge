@@ -5,6 +5,15 @@ edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
 repository = "https://github.com/special-place-ai-heaven/symforge"
+# crates.io rejects uploads at 10 MiB compressed. These paths are repo
+# material, not crate build inputs. Do not list vendor/: cargo already
+# omits those nested packages, and local [patch] builds still need them.
+exclude = [
+    "/docs/",
+    "/research/",
+    "/.cursor-plugin/",
+    "*.png",
+]
 
 [lints.rust]
 unsafe_code = "deny"

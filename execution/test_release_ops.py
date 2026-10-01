@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import release_ops
@@ -150,15 +152,65 @@ class ReleaseOpsTests(unittest.TestCase):
     def test_publish_cargo_crate_runs_publish_when_version_missing(self) -> None:
         root = release_ops.repo_root()
         with mock.patch("release_ops.cargo_version_exists", return_value=False):
-            with mock.patch("release_ops.run_checked") as run_checked:
-                result = release_ops.publish_cargo_crate(
-                    root,
-                    crate_name="symforge",
-                    version="4.9.8",
-                )
+            with mock.patch(
+                "release_ops.measure_packaged_crate_bytes", return_value=1000
+            ) as measure:
+                with mock.patch("release_ops.run_checked") as run_checked:
+                    result = release_ops.publish_cargo_crate(
+                        root,
+                        crate_name="symforge",
+                        version="4.9.8",
+                    )
 
         self.assertEqual(result, "published")
+        measure.assert_called_once_with(root, crate_name="symforge", version="4.9.8")
         run_checked.assert_called_once_with(["cargo", "publish"], cwd=root)
+
+    def test_publish_cargo_crate_refuses_oversized_package(self) -> None:
+        root = release_ops.repo_root()
+        with mock.patch("release_ops.cargo_version_exists", return_value=False):
+            with mock.patch(
+                "release_ops.measure_packaged_crate_bytes",
+                return_value=release_ops.CRATE_COMPRESSED_SIZE_LIMIT_BYTES,
+            ):
+                with mock.patch("release_ops.run_checked") as run_checked:
+                    with self.assertRaises(release_ops.ReleaseOpsError):
+                        release_ops.publish_cargo_crate(
+                            root,
+                            crate_name="symforge",
+                            version="4.9.8",
+                        )
+
+        run_checked.assert_not_called()
+
+    def test_assert_packaged_crate_size_rejects_at_guard(self) -> None:
+        limit = release_ops.CRATE_COMPRESSED_SIZE_LIMIT_BYTES
+        release_ops.assert_packaged_crate_size(limit - 1)
+        with self.assertRaises(release_ops.ReleaseOpsError):
+            release_ops.assert_packaged_crate_size(limit)
+
+    def test_measure_packaged_crate_bytes_reads_written_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "target" / "package" / "symforge-1.2.3.crate"
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b"x" * 10)
+            with mock.patch("release_ops.run_checked") as run_checked:
+                size = release_ops.measure_packaged_crate_bytes(
+                    root, crate_name="symforge", version="1.2.3"
+                )
+
+        self.assertEqual(size, 10)
+        run_checked.assert_called_once_with(["cargo", "package", "--no-verify"], cwd=root)
+
+    def test_measure_packaged_crate_bytes_raises_when_archive_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch("release_ops.run_checked"):
+                with self.assertRaises(release_ops.ReleaseOpsError):
+                    release_ops.measure_packaged_crate_bytes(
+                        root, crate_name="symforge", version="9.9.9"
+                    )
 
     def test_release_workflow_publishes_cargo_through_release_ops(self) -> None:
         root = release_ops.repo_root()
