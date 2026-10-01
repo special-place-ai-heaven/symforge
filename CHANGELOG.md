@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.4.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.4.1...v11.4.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* **init:** rewrite MCP command and args as one launch pair ([de873f9](https://github.com/special-place-ai-heaven/symforge/commit/de873f9e0dcd83b8be5e102e127ad6d6edd719ec))
+
 ## [11.4.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.4.0...v11.4.1) (2026-10-01)
 
 
