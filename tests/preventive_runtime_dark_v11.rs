@@ -1085,8 +1085,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed after 034 US3/US4 secret_remediate + dismissals (+ soft residuals)
 // rebased onto main: +1 src file (secret_dismissals.rs); no edges into
 // src/index_lifecycle. Pin recomputed for merged tree.
+// Digest corrected to the source-set oracle. That refresh recorded the
+// right census (202 files, 10_344_185 LF-normalized bytes) and a digest
+// the hasher does not produce. Re-reviewed the same src delta: added
+// secret_dismissals.rs; secret_remediate encrypt + dismiss; read_gate
+// dismissal override; SecretSpansScan::Indeterminate; withheld sops PATH
+// probe; edit replay helpers widened to pub(crate). No new token or call
+// edge into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "5c014abe5f2ea72496706e9d069689b1a3c5d52aa0c69d30e7abb19ca5be0a13",
+    "b1577878eac59bdaa68ac7eaa23774ae372b8ff1417e68bbaf162a91fcc1371e",
     202,
     10_344_185,
 );
