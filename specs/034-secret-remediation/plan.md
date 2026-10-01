@@ -1,6 +1,6 @@
 # Implementation Plan: Agent-Driven Secret Remediation
 
-**Branch**: `feat/034-secret-remediation` | **Date**: 2026-10-01 | **Spec**: [spec.md](./spec.md)
+**Branch**: `feat/034-secret-remediation-impl` (implement) · spec landed on main via #743 | **Date**: 2026-10-01 | **Spec**: [spec.md](./spec.md)
 
 **Input**: Feature specification from `specs/034-secret-remediation/spec.md`
 

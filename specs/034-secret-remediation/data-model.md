@@ -37,7 +37,7 @@ Inputs to `secret_remediate`.
 | Field | Notes |
 |---|---|
 | `scope` | One path, list of paths, or whole-repo sentinel — each path through `resolve_repo_path` |
-| `finding_ids` | Subset to act on; empty MAY mean all findings in scope if explicitly documented, else rejected |
+| `finding_ids` | Subset to act on; **required non-empty** — empty array is rejected (contract `secret-remediate.md`; no implicit "all in scope") |
 | `action` | `externalize` \| `encrypt` \| `dismiss` |
 | `preview` | Bool; **default true** |
 | `idempotency_key` | Optional; reuse edit-lane semantics on apply |

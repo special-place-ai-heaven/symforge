@@ -18,7 +18,7 @@
 - [x] T000c Author `plan.md`, `research.md`, `data-model.md`, `quickstart.md`, `contracts/*`
 - [x] T000d Author `tasks.md` (this file)
 - [x] T000e Author `analyze.md` cross-artifact review
-- [ ] T000f Open/update docs PR for LINUS review — **no merge until LINUS (+HOLMES if contested)**
+- [x] T000f Open/update docs PR for LINUS review — merged as #743 (`b870e659`, squash from aecdd03c)
 
 ---
 
