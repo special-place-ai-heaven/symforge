@@ -1768,6 +1768,36 @@ pub const WORKSPACE_ROOT_ENV: &str = "SYMFORGE_WORKSPACE_ROOT";
 /// not authoritative: a client-declared root may still retarget the session.
 pub const CLAUDE_PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 
+/// Test-only permit that allows `CLAUDE_PROJECT_DIR` consultation.
+///
+/// Under `__test-internals` (cargo test / integration suite) the suite ignores an
+/// inherited `CLAUDE_PROJECT_DIR` so discovery never binds a foreign Claude
+/// checkout. Deliberate tests that exercise the env hold this permit for the
+/// duration of their env mutation.
+#[cfg(feature = "__test-internals")]
+static CLAUDE_PROJECT_DIR_TEST_PERMIT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// RAII permit for deliberate `CLAUDE_PROJECT_DIR` tests.
+#[cfg(feature = "__test-internals")]
+pub struct ClaudeProjectDirTestPermit;
+
+#[cfg(feature = "__test-internals")]
+impl ClaudeProjectDirTestPermit {
+    /// Allow `claude_project_dir_start` to read the env until this permit drops.
+    pub fn enter() -> Self {
+        CLAUDE_PROJECT_DIR_TEST_PERMIT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for ClaudeProjectDirTestPermit {
+    fn drop(&mut self) {
+        CLAUDE_PROJECT_DIR_TEST_PERMIT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 enum WorkspaceRootEnvResolution {
     AbsentOrRecoverable,
     Resolved(PathBuf),
@@ -1820,11 +1850,42 @@ fn find_project_root_with(consult_claude_project_dir: bool) -> Option<PathBuf> {
     root_from_walk(&cwd, RootCandidateSource::LaunchCwd)
 }
 
+/// Blank an inherited `CLAUDE_PROJECT_DIR` once under the test door.
+///
+/// Deliberate tests hold [`ClaudeProjectDirTestPermit`] before setting the env,
+/// so this Once either already ran (harmless) or never runs for them.
+#[cfg(feature = "__test-internals")]
+#[allow(unsafe_code)] // test-isolation blank of inherited CLAUDE_PROJECT_DIR
+fn blank_inherited_claude_project_dir_once() {
+    use std::sync::Once;
+    static BLANK_INHERITED: Once = Once::new();
+    BLANK_INHERITED.call_once(|| {
+        // SAFETY: cargo test runs env-mutating suites with `--test-threads=1`;
+        // this Once fires only while no deliberate permit is held.
+        unsafe {
+            std::env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+        }
+    });
+}
+
 /// `CLAUDE_PROJECT_DIR` as a walk start, or `None` when it is unset, blank, not
 /// UTF-8, or not an existing directory. Every `None` falls through to the CWD
 /// walk: this is a hint about where the walk begins, never an operator override,
 /// so a bad value must not refuse discovery the way `SYMFORGE_WORKSPACE_ROOT` does.
 fn claude_project_dir_start() -> Option<PathBuf> {
+    // Test isolation (Task C): cargo-test builds enable `__test-internals` and
+    // must not inherit a shell's CLAUDE_PROJECT_DIR (Claude Code exports it into
+    // MCP sessions; the same shell then runs the suite). Without a deliberate
+    // permit the env is blanked once and ignored so roots stay in temp dirs /
+    // the test CWD. Production builds never enable `__test-internals`, so the
+    // resolution path below is unchanged for non-test binaries.
+    #[cfg(feature = "__test-internals")]
+    {
+        if CLAUDE_PROJECT_DIR_TEST_PERMIT.load(Ordering::SeqCst) == 0 {
+            blank_inherited_claude_project_dir_once();
+            return None;
+        }
+    }
     let raw = std::env::var_os(CLAUDE_PROJECT_DIR_ENV)?;
     if raw.to_str().is_none_or(|value| value.trim().is_empty()) {
         return None;
@@ -5394,12 +5455,20 @@ mod tests {
 
         /// Sets `CLAUDE_PROJECT_DIR` for one test and restores it on drop.
         /// Mutation is serialized by the `ENV_LOCK` the caller holds.
+        /// Holds [`ClaudeProjectDirTestPermit`] so discovery consults the env
+        /// despite suite-wide inheritance isolation under `__test-internals`.
         #[allow(unsafe_code)] // test-only env guard; mutation serialized by ENV_LOCK.
-        struct ClaudeDirGuard(Option<OsString>);
+        struct ClaudeDirGuard {
+            prev: Option<OsString>,
+            _permit: ClaudeProjectDirTestPermit,
+        }
 
         #[allow(unsafe_code)] // test-only env guard; mutation serialized by ENV_LOCK.
         impl ClaudeDirGuard {
             fn set(value: Option<&str>) -> Self {
+                // Enter the permit BEFORE mutating so a concurrent/earlier
+                // blanking Once cannot clear what we are about to set.
+                let permit = ClaudeProjectDirTestPermit::enter();
                 let prev = std::env::var_os(CLAUDE_PROJECT_DIR_ENV);
                 // SAFETY: serialized by ENV_LOCK held by the caller.
                 unsafe {
@@ -5408,7 +5477,10 @@ mod tests {
                         None => std::env::remove_var(CLAUDE_PROJECT_DIR_ENV),
                     }
                 }
-                Self(prev)
+                Self {
+                    prev,
+                    _permit: permit,
+                }
             }
         }
 
@@ -5417,7 +5489,7 @@ mod tests {
             fn drop(&mut self) {
                 // SAFETY: serialized by ENV_LOCK.
                 unsafe {
-                    match &self.0 {
+                    match &self.prev {
                         Some(v) => std::env::set_var(CLAUDE_PROJECT_DIR_ENV, v),
                         None => std::env::remove_var(CLAUDE_PROJECT_DIR_ENV),
                     }
@@ -5531,6 +5603,9 @@ mod tests {
             );
             let _ws = RootEnvGuard::set(None);
             let opaque = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+            // Hold the consultation permit so isolation does not blank this
+            // deliberate non-UTF-8 value before we read it.
+            let _permit = ClaudeProjectDirTestPermit::enter();
             // SAFETY: serialized by ENV_LOCK held above.
             unsafe {
                 std::env::set_var(CLAUDE_PROJECT_DIR_ENV, &opaque);
@@ -5543,6 +5618,63 @@ mod tests {
             assert_eq!(
                 found, baseline,
                 "a hint that cannot be read must fall through, unlike the explicit override"
+            );
+        }
+
+        /// RED→GREEN canary: an inherited `CLAUDE_PROJECT_DIR` must not bind the
+        /// canary as the project root and must leave the canary directory byte-
+        /// identical (no `.symforge/` ledger writes, no new entries).
+        #[allow(unsafe_code)] // test-only env mutation; serialized by ENV_LOCK.
+        #[test]
+        fn inherited_claude_project_dir_does_not_bind_or_mutate_canary() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let canary = TempDir::new().unwrap();
+            let marker = canary.path().join("CANARY_MARKER");
+            std::fs::write(&marker, b"keep").unwrap();
+            let entries_before: Vec<_> = std::fs::read_dir(canary.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+
+            // Clear workspace override so CLAUDE_PROJECT_DIR would otherwise win.
+            let _ws = RootEnvGuard::set(None);
+            // Simulate inheritance WITHOUT a deliberate-test permit.
+            // SAFETY: ENV_LOCK held.
+            unsafe {
+                std::env::set_var(CLAUDE_PROJECT_DIR_ENV, canary.path().as_os_str());
+            }
+
+            let resolved = find_project_root();
+            let canary_canon = canary.path().canonicalize().unwrap();
+            let resolved_canon = resolved
+                .as_ref()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+
+            // SAFETY: ENV_LOCK held; leave the var blank for subsequent tests.
+            unsafe {
+                std::env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+            }
+
+            assert_ne!(
+                resolved_canon,
+                Some(canary_canon),
+                "inherited CLAUDE_PROJECT_DIR must not bind the canary as project root; got {resolved:?}"
+            );
+            assert!(
+                marker.exists() && std::fs::read(&marker).unwrap() == b"keep",
+                "canary marker must be untouched"
+            );
+            assert!(
+                !canary.path().join(".symforge").exists(),
+                "canary must not receive a .symforge directory from the suite"
+            );
+            let entries_after: Vec<_> = std::fs::read_dir(canary.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                entries_before, entries_after,
+                "canary directory entries must be unchanged"
             );
         }
 
