@@ -49,7 +49,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: analytics::AnalyticsCommand,
     },
-    /// Install SymForge integration for Claude, Codex, Gemini, Kilo Code, or all
+    /// Install SymForge integration for one MCP harness, or all installed harnesses
     Init {
         /// Client to configure
         #[arg(long, value_enum, default_value_t = InitClient::All)]
@@ -109,6 +109,24 @@ pub enum InitClient {
     #[value(name = "kilo-code", alias = "kilo")]
     KiloCode,
     Cursor,
+    /// Oh My Pi (`omp`). User config is `~/.omp/agent/mcp.json`.
+    #[value(name = "omp", alias = "oh-my-pi")]
+    Omp,
+    /// Cline CLI `~/.cline/mcp.json`. The IDE globalStorage path is UNVERIFIED.
+    #[value(name = "cline")]
+    Cline,
+    /// Roo Code project `.roo/mcp.json`. The global `mcp_settings.json` path is UNVERIFIED.
+    #[value(name = "roo")]
+    Roo,
+    /// VS Code native `.vscode/mcp.json` (`servers`).
+    #[value(name = "vscode")]
+    VsCode,
+    /// VS Code portable user file `~/.copilot/mcp-config.json` (`mcpServers`).
+    #[value(name = "copilot", alias = "vscode-portable")]
+    Copilot,
+    /// Continue drop file `.continue/mcpServers/symforge.json`.
+    #[value(name = "continue")]
+    Continue,
     All,
 }
 
@@ -186,6 +204,39 @@ mod tests {
         match cli.command {
             Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::KiloCode),
             _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_accepts_omp_client() {
+        let cli = Cli::parse_from(["symforge", "init", "--client", "omp"]);
+        match cli.command {
+            Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::Omp),
+            _ => panic!("expected init command"),
+        }
+
+        let alias = Cli::parse_from(["symforge", "init", "--client", "oh-my-pi"]);
+        match alias.command {
+            Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::Omp),
+            _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_accepts_matrix_client_names() {
+        for (name, expected) in [
+            ("cline", InitClient::Cline),
+            ("roo", InitClient::Roo),
+            ("vscode", InitClient::VsCode),
+            ("copilot", InitClient::Copilot),
+            ("vscode-portable", InitClient::Copilot),
+            ("continue", InitClient::Continue),
+        ] {
+            let cli = Cli::parse_from(["symforge", "init", "--client", name]);
+            match cli.command {
+                Some(Commands::Init { client, .. }) => assert_eq!(client, expected, "{name}"),
+                _ => panic!("expected init command"),
+            }
         }
     }
 

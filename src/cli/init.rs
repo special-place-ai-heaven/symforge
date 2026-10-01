@@ -1,4 +1,4 @@
-//! `symforge init` command — client-aware Claude/Claude Desktop/Codex/Gemini/Kilo Code configuration.
+//! `symforge init` command — client-aware Claude/Claude Desktop/Codex/Gemini/Kilo Code/OMP configuration.
 //!
 //! Strategy:
 //! 1. Discover the absolute path of the running symforge binary.
@@ -8,7 +8,7 @@
 //! 4. For Claude Desktop, register the MCP server in `claude_desktop_config.json`.
 //!    On Windows, a `.cmd` wrapper is generated to fix the System32 CWD issue.
 //! 5. For Codex, register the MCP server in `~/.codex/config.toml`.
-//! 6. For Kilo Code, register the MCP server in `.kilocode/mcp.json` (workspace-local).
+//! 6. For Kilo Code, register the MCP server in `.kilo/kilo.jsonc` (`mcp` + command array).
 //! 7. Ensure runtime `.symforge/` state exists (global home when cwd is unsafe).
 //!
 //! Identification: any hook entry whose `hooks[].command` contains the substring
@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+use clap::Parser;
 use serde_json::{Value, json};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
@@ -41,9 +42,16 @@ struct InitPaths {
     gemini_settings: PathBuf,
     gemini_memory: PathBuf,
     gemini_trusted_folders: PathBuf,
-    kilo_vscode_config: PathBuf,
+    kilo_project_config: PathBuf,
+    kilo_user_config: PathBuf,
     kilo_rules_guidance: PathBuf,
+    cline_config: PathBuf,
+    roo_project_config: PathBuf,
+    vscode_project_config: PathBuf,
+    copilot_portable_config: PathBuf,
+    continue_drop: PathBuf,
     cursor_config: PathBuf,
+    omp_config: PathBuf,
 }
 
 impl InitPaths {
@@ -72,14 +80,68 @@ impl InitPaths {
             gemini_settings: home.join(".gemini").join("settings.json"),
             gemini_memory: home.join(".gemini").join("GEMINI.md"),
             gemini_trusted_folders: home.join(".gemini").join("trustedFolders.json"),
-            kilo_vscode_config: working_dir.join(".kilocode").join("mcp.json"),
+            kilo_project_config: kilo_project_config_path(working_dir),
+            kilo_user_config: kilo_user_config_path(home),
             kilo_rules_guidance: working_dir
                 .join(".kilocode")
                 .join("rules")
                 .join("symforge.md"),
+            cline_config: home.join(".cline").join("mcp.json"),
+            roo_project_config: working_dir.join(".roo").join("mcp.json"),
+            vscode_project_config: working_dir.join(".vscode").join("mcp.json"),
+            copilot_portable_config: home.join(".copilot").join("mcp-config.json"),
+            continue_drop: working_dir
+                .join(".continue")
+                .join("mcpServers")
+                .join("symforge.json"),
             cursor_config: home.join(".cursor").join("mcp.json"),
+            omp_config: home.join(".omp").join("agent").join("mcp.json"),
         }
     }
+}
+
+/// OMP is installed when its config exists or `~/.omp` does. The config's
+/// parent is `~/.omp/agent`, which is absent until the first user-scope write,
+/// so the generic parent-dir check would miss a fresh `~/.omp`.
+fn omp_installed(home: &std::path::Path, omp_config: &std::path::Path) -> bool {
+    omp_config.exists() || home.join(".omp").is_dir()
+}
+
+/// Project Kilo file. `.kilo/` wins over a root `kilo.jsonc` when that directory
+/// exists. A named init that finds neither creates `.kilo/kilo.jsonc`.
+fn kilo_project_config_path(working_dir: &std::path::Path) -> PathBuf {
+    let dot = working_dir.join(".kilo");
+    if dot.is_dir() || dot.join("kilo.jsonc").is_file() || dot.join("kilo.json").is_file() {
+        return kilo_config_file(&dot);
+    }
+    let root_jsonc = working_dir.join("kilo.jsonc");
+    if root_jsonc.is_file() {
+        return root_jsonc;
+    }
+    let root_json = working_dir.join("kilo.json");
+    if root_json.is_file() {
+        return root_json;
+    }
+    dot.join("kilo.jsonc")
+}
+
+fn kilo_user_config_path(home: &std::path::Path) -> PathBuf {
+    kilo_config_file(&home.join(".config").join("kilo"))
+}
+
+fn kilo_config_file(dir: &std::path::Path) -> PathBuf {
+    let jsonc = dir.join("kilo.jsonc");
+    let json = dir.join("kilo.json");
+    if json.is_file() && !jsonc.is_file() {
+        json
+    } else {
+        jsonc
+    }
+}
+
+fn kilo_user_installed(home: &std::path::Path) -> bool {
+    let dir = home.join(".config").join("kilo");
+    dir.is_dir() || dir.join("kilo.jsonc").is_file() || dir.join("kilo.json").is_file()
 }
 
 pub(crate) fn claude_desktop_config_path(
@@ -101,6 +163,10 @@ pub(crate) fn claude_desktop_config_path(
             .join("Claude")
             .join("claude_desktop_config.json")
     } else {
+        // Linux path is NOT in the MCP.org Desktop tutorial (macOS and Windows
+        // only). `~/.config/Claude/…` matches VS Code's discovery table and the
+        // Python MCP SDK, not an Anthropic-authored MCP path. UNVERIFIED as
+        // the Desktop app's real Linux file. Do not invent a second path.
         home.join(".config")
             .join("Claude")
             .join("claude_desktop_config.json")
@@ -291,8 +357,8 @@ const KILO_SKIPPED_LINE: &str = "skipped: Kilo Code (project-local config is wri
 // Gemini/Cursor/... settings, config, and guidance files under the home
 // directory) — outside any repository root, so permit-free by
 // classification. RECORDED RESIDUAL (T038 round-1 finding, not silently
-// dropped): the Kilo Code lane is the one exception — `kilo_vscode_config`
-// and `kilo_rules_guidance` write `.kilocode/mcp.json` and
+// dropped): the Kilo Code lane is the one exception — `kilo_project_config`
+// and `kilo_rules_guidance` write `.kilo/kilo.jsonc` and
 // `.kilocode/rules/symforge.md` under `working_dir`, i.e. INSIDE the
 // repository root, permit-free, same as every write here. `init` runs
 // standalone before any project index/admission exists, so routing it
@@ -433,16 +499,81 @@ fn run_init_with_paths(
         eprintln!("{KILO_SKIPPED_LINE}");
     }
     if client == InitClient::KiloCode {
-        register_kilo_mcp_server(&paths.kilo_vscode_config, &binary_path_str)?;
+        register_kilo_mcp_server(&paths.kilo_project_config, &binary_path_str)?;
         eprintln!(
             "Kilo Code MCP server registered in {}",
-            paths.kilo_vscode_config.display()
+            paths.kilo_project_config.display()
+        );
+        register_kilo_mcp_server(&paths.kilo_user_config, &binary_path_str)?;
+        eprintln!(
+            "Kilo Code MCP server registered in {}",
+            paths.kilo_user_config.display()
         );
 
         upsert_guidance_markdown(&paths.kilo_rules_guidance, &kilo_guidance_block())?;
         eprintln!(
             "Kilo Code guidance written to {}",
             paths.kilo_rules_guidance.display()
+        );
+    } else if client == InitClient::All && kilo_user_installed(home_dir) {
+        register_kilo_mcp_server(&paths.kilo_user_config, &binary_path_str)?;
+        eprintln!(
+            "Kilo Code MCP server registered in {}",
+            paths.kilo_user_config.display()
+        );
+    }
+
+    if targeted(
+        client,
+        InitClient::Cline,
+        "Cline",
+        "cline",
+        &paths.cline_config,
+        paths.cline_config.exists() || home_dir.join(".cline").is_dir(),
+    ) {
+        register_classic_mcp_servers(&paths.cline_config, &binary_path_str)?;
+        eprintln!(
+            "Cline MCP server registered in {}",
+            paths.cline_config.display()
+        );
+    }
+
+    if client == InitClient::Roo {
+        register_classic_mcp_servers(&paths.roo_project_config, &binary_path_str)?;
+        eprintln!(
+            "Roo Code MCP server registered in {}",
+            paths.roo_project_config.display()
+        );
+    }
+
+    if client == InitClient::VsCode {
+        register_vscode_mcp_server(&paths.vscode_project_config, &binary_path_str)?;
+        eprintln!(
+            "VS Code MCP server registered in {}",
+            paths.vscode_project_config.display()
+        );
+    }
+
+    if targeted(
+        client,
+        InitClient::Copilot,
+        "VS Code portable",
+        "copilot",
+        &paths.copilot_portable_config,
+        paths.copilot_portable_config.exists() || home_dir.join(".copilot").is_dir(),
+    ) {
+        register_classic_mcp_servers(&paths.copilot_portable_config, &binary_path_str)?;
+        eprintln!(
+            "VS Code portable MCP server registered in {}",
+            paths.copilot_portable_config.display()
+        );
+    }
+
+    if client == InitClient::Continue {
+        register_classic_mcp_servers(&paths.continue_drop, &binary_path_str)?;
+        eprintln!(
+            "Continue MCP drop written to {}",
+            paths.continue_drop.display()
         );
     }
 
@@ -460,6 +591,28 @@ fn run_init_with_paths(
             paths.cursor_config.display()
         );
     }
+
+    if targeted(
+        client,
+        InitClient::Omp,
+        "Oh My Pi",
+        "omp",
+        &paths.omp_config,
+        omp_installed(home_dir, &paths.omp_config),
+    ) {
+        register_omp_mcp_server(&paths.omp_config, &binary_path_str)?;
+        eprintln!(
+            "Oh My Pi MCP server registered in {}",
+            paths.omp_config.display()
+        );
+    }
+
+    // Project scope wins over the user file for Codex, Grok, Cursor, Gemini,
+    // Claude Code (`.mcp.json`), and OMP. Repair an entry that is already
+    // there. Do not create a project file: that would shadow the user server
+    // for a repo that never asked for one. Kilo stays named-only; its project
+    // file is the registration above.
+    repair_project_launch_pairs(client, working_dir, &binary_path_str)?;
 
     let gitignore_hygiene = match crate::discovery::resolve_root_candidate(
         working_dir,
@@ -781,22 +934,24 @@ fn merge_event_entries(
 // Shared JSON MCP-entry merge helpers (G-036 init/update coherence)
 // ---------------------------------------------------------------------------
 //
-// Every JSON harness (Claude Code, Claude Desktop, Cursor, Gemini, Kilo) writes
+// Every JSON harness (Claude Code, Claude Desktop, Cursor, Gemini, Kilo, OMP) writes
 // its `mcpServers.symforge` entry through these. Invariant: re-registration
 // (e.g. `symforge update` -> `symforge init --client all`) REFRESHES the managed
 // launcher path but never clobbers a user-set env value, allowlist entry, or
 // unknown field. The 8.10.1 update wiped `SYMFORGE_SURFACE=full`; merging into
 // the existing object in place instead of replacing it kills that defect class.
 
-/// Get (or create) the `mcpServers.symforge` entry as a mutable object so
-/// callers merge INTO the existing entry rather than replacing it wholesale.
-fn symforge_json_entry_mut(config: &mut Value) -> &mut serde_json::Map<String, Value> {
-    if !config["mcpServers"].is_object() {
-        config["mcpServers"] = json!({});
+/// Get (or create) `config[key].symforge` as a mutable object.
+fn json_server_entry_mut<'a>(
+    config: &'a mut Value,
+    key: &str,
+) -> &'a mut serde_json::Map<String, Value> {
+    if !config[key].is_object() {
+        config[key] = json!({});
     }
-    let servers = config["mcpServers"]
+    let servers = config[key]
         .as_object_mut()
-        .expect("mcpServers is an object");
+        .expect("server map is an object");
     let slot = servers.entry("symforge").or_insert_with(|| json!({}));
     if !slot.is_object() {
         *slot = json!({});
@@ -804,23 +959,365 @@ fn symforge_json_entry_mut(config: &mut Value) -> &mut serde_json::Map<String, V
     slot.as_object_mut().expect("symforge entry is an object")
 }
 
-/// Insert each `(key, value)` env default into the entry's `env` object ONLY
-/// when the key is absent — a present env key's value is preserved verbatim.
-fn insert_env_defaults(entry: &mut serde_json::Map<String, Value>, defaults: &[(&str, &str)]) {
+/// Get (or create) the `mcpServers.symforge` entry as a mutable object so
+/// callers merge INTO the existing entry rather than replacing it wholesale.
+fn symforge_json_entry_mut(config: &mut Value) -> &mut serde_json::Map<String, Value> {
+    json_server_entry_mut(config, "mcpServers")
+}
+
+/// Launch-argument ownership for a native stdio MCP server.
+///
+/// `command` and `args` are one pair. The stdio server is `symforge` with no
+/// subcommand (`Cli.command == None`), so the only supported arg list today is
+/// empty — that fact comes from `Cli::try_parse_from`, not from a handwritten
+/// allow-list. On every native registration the initializer:
+///
+/// - drops args that are only a wrapper's executable path (a path separator,
+///   an executable suffix, or the native binary's own path or file name);
+/// - keeps whatever remains when that list still parses as a no-subcommand
+///   launch;
+/// - refuses to write when anything else remains (`serve`, unknown flags,
+///   non-path words), so an intentional non-stdio invocation is neither
+///   deleted nor left as a broken pair.
+///
+/// An entry that already has a remote URL (`url`, `httpUrl`, `serverUrl`) or
+/// a remote `type` (`http`, `sse`, `ws`, `streamable-http`, `streamableHttp`,
+/// `remote`) is not a stdio launch. Callers leave its `command` and `args`
+/// alone; stdio init does not add a command to an HTTP server.
+fn stdio_launch_args_are_supported(args: &[String]) -> bool {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(std::ffi::OsString::from("symforge"));
+    argv.extend(args.iter().map(std::ffi::OsString::from));
+    super::Cli::try_parse_from(argv).is_ok_and(|cli| cli.command.is_none())
+}
+
+fn launch_file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn names_the_native_binary(arg: &str, native_command: &str) -> bool {
+    let arg_native = native_command_path(arg);
+    let command_native = native_command_path(native_command);
+    if arg_native == command_native {
+        return true;
+    }
+    let arg_name = launch_file_name(&arg_native);
+    let command_name = launch_file_name(&command_native);
+    if cfg!(windows) {
+        arg_name.eq_ignore_ascii_case(command_name)
+    } else {
+        arg_name == command_name
+    }
+}
+
+fn looks_like_executable_path(arg: &str) -> bool {
+    if arg.contains('/') || arg.contains('\\') {
+        return true;
+    }
+    let lower = arg.to_ascii_lowercase();
+    [".exe", ".cmd", ".bat", ".com", ".ps1"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// True when `arg` belongs to a wrapper launch (the executable path the wrapper
+/// forwarded) rather than to the native stdio server.
+fn is_stale_wrapper_arg(arg: &str, native_command: &str) -> bool {
+    if arg.starts_with('-') {
+        return false;
+    }
+    names_the_native_binary(arg, native_command) || looks_like_executable_path(arg)
+}
+
+fn reconcile_native_stdio_args(
+    existing: &[String],
+    native_command: &str,
+) -> anyhow::Result<Vec<String>> {
+    let kept: Vec<String> = existing
+        .iter()
+        .filter(|arg| !is_stale_wrapper_arg(arg, native_command))
+        .cloned()
+        .collect();
+    if stdio_launch_args_are_supported(&kept) {
+        return Ok(kept);
+    }
+    let command = native_command_path(native_command);
+    anyhow::bail!(
+        "refusing to rewrite the SymForge MCP launch pair for `{command}`: args {existing:?} are not a coherent stdio launch. Wrapper executable paths are removed automatically; remaining args {kept:?} are not accepted by `symforge` with no subcommand. Remove them, or leave an HTTP server on `url` without `command`."
+    )
+}
+
+/// Whether `symforge update` must re-run init for this entry. A command that
+/// already names the live binary is not enough: wrapper args left beside it
+/// still launch the wrong process.
+pub(crate) fn stdio_launch_args_need_rewrite(existing: &[String], native_command: &str) -> bool {
+    match reconcile_native_stdio_args(existing, native_command) {
+        Ok(next) => next != existing,
+        Err(_) => true,
+    }
+}
+
+fn json_launch_is_remote(entry: &serde_json::Map<String, Value>) -> bool {
+    // Remote type names are the ones the harness docs actually use. A local
+    // stdio entry (`stdio`, `local`, or no type) is not remote.
+    matches!(
+        entry.get("type").and_then(Value::as_str),
+        Some("http")
+            | Some("sse")
+            | Some("ws")
+            | Some("streamable-http")
+            | Some("streamableHttp")
+            | Some("remote")
+    ) || entry.get("url").and_then(Value::as_str).is_some()
+        || entry.get("httpUrl").and_then(Value::as_str).is_some()
+        || entry.get("serverUrl").and_then(Value::as_str).is_some()
+}
+
+fn is_package_runner(executable: &str) -> bool {
+    matches!(
+        launch_file_name(executable).to_ascii_lowercase().as_str(),
+        "npx" | "npx.cmd" | "npm" | "npm.cmd" | "node" | "node.exe"
+    )
+}
+
+fn json_arg_strings(entry: &serde_json::Map<String, Value>) -> anyhow::Result<Vec<String>> {
+    match entry.get("args") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => {
+            let mut args = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(text) = value.as_str() else {
+                    anyhow::bail!("SymForge MCP `args` must be an array of strings");
+                };
+                args.push(text.to_string());
+            }
+            Ok(args)
+        }
+        Some(_) => anyhow::bail!("SymForge MCP `args` must be an array of strings"),
+    }
+}
+
+fn refresh_json_stdio_launch_with_command(
+    entry: &mut serde_json::Map<String, Value>,
+    command_path: &str,
+    native_binary: &str,
+) -> anyhow::Result<()> {
+    if json_launch_is_remote(entry) {
+        return Ok(());
+    }
+    let existing = json_arg_strings(entry)?;
+    let args = reconcile_native_stdio_args(&existing, native_binary)?;
+    entry.insert(
+        "command".to_string(),
+        Value::String(command_path.to_string()),
+    );
+    entry.insert(
+        "args".to_string(),
+        Value::Array(args.into_iter().map(Value::String).collect()),
+    );
+    Ok(())
+}
+
+fn refresh_json_stdio_launch(
+    entry: &mut serde_json::Map<String, Value>,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    let command = native_command_path(binary_path);
+    refresh_json_stdio_launch_with_command(entry, &command, &command)
+}
+
+fn toml_launch_is_remote(server: &dyn toml_edit::TableLike) -> bool {
+    server.get("url").and_then(Item::as_str).is_some()
+}
+
+fn toml_arg_strings(item: Option<&Item>) -> anyhow::Result<Vec<String>> {
+    let Some(item) = item else {
+        return Ok(Vec::new());
+    };
+    let Some(array) = item.as_array() else {
+        anyhow::bail!("SymForge MCP `args` must be an array of strings");
+    };
+    let mut args = Vec::with_capacity(array.len());
+    for value in array {
+        let Some(text) = value.as_str() else {
+            anyhow::bail!("SymForge MCP `args` must be an array of strings");
+        };
+        args.push(text.to_string());
+    }
+    Ok(args)
+}
+
+fn refresh_toml_stdio_launch(
+    server: &mut dyn toml_edit::TableLike,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    if toml_launch_is_remote(server) {
+        return Ok(());
+    }
+    let existing = toml_arg_strings(server.get("args"))?;
+    let command = native_command_path(binary_path);
+    let args = reconcile_native_stdio_args(&existing, &command)?;
+    server.insert("command", value(command));
+    let mut array = Array::new();
+    for arg in &args {
+        array.push(arg.as_str());
+    }
+    server.insert("args", value(array));
+    Ok(())
+}
+
+fn toml_has_symforge(text: &str) -> bool {
+    text.parse::<DocumentMut>().ok().is_some_and(|doc| {
+        doc.get("mcp_servers")
+            .and_then(Item::as_table_like)
+            .is_some_and(|table| table.get("symforge").is_some())
+    })
+}
+
+fn json_has_symforge(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("mcpServers")
+                .and_then(|servers| servers.get("symforge"))
+                .is_some()
+        })
+}
+
+/// Re-register a project-scoped file only when it already has a SymForge entry.
+/// Creating a missing project file would shadow the user-level server.
+fn repair_if_symforge_present(
+    path: &std::path::Path,
+    present: fn(&str) -> bool,
+    register: impl FnOnce(&std::path::Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let Ok(text) = read_config_text(path) else {
+        return Ok(());
+    };
+    if present(&text) {
+        register(path)?;
+    }
+    Ok(())
+}
+
+fn repair_project_launch_pairs(
+    client: InitClient,
+    working_dir: &std::path::Path,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    let selected = |this: InitClient| client == this || client == InitClient::All;
+    if selected(InitClient::Claude) {
+        repair_if_symforge_present(&working_dir.join(".mcp.json"), json_has_symforge, |path| {
+            register_mcp_server(path, binary_path)
+        })?;
+    }
+    if selected(InitClient::Codex) {
+        repair_if_symforge_present(
+            &working_dir.join(".codex").join("config.toml"),
+            toml_has_symforge,
+            |path| register_codex_mcp_server(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::Grok) {
+        repair_if_symforge_present(
+            &working_dir.join(".grok").join("config.toml"),
+            toml_has_symforge,
+            |path| register_grok_mcp_server(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::Gemini) {
+        repair_if_symforge_present(
+            &working_dir.join(".gemini").join("settings.json"),
+            json_has_symforge,
+            |path| register_gemini_mcp_server(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::Cursor) {
+        repair_if_symforge_present(
+            &working_dir.join(".cursor").join("mcp.json"),
+            json_has_symforge,
+            |path| register_cursor_mcp_server(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::Omp) {
+        repair_if_symforge_present(
+            &working_dir.join(".omp").join("mcp.json"),
+            json_has_symforge,
+            |path| register_omp_mcp_server(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::KiloCode) {
+        repair_if_symforge_present(
+            &kilo_project_config_path(working_dir),
+            json_has_symforge,
+            |path| register_kilo_mcp_server(path, binary_path),
+        )?;
+        // Legacy `.kilocode/mcp.json` is still the HTTP-attach registry path.
+        // Repair its launch pair in place. Do not convert it to `mcp` and do
+        // not create it: residual `mcpServers` acceptance is UNVERIFIED.
+        repair_if_symforge_present(
+            &working_dir.join(".kilocode").join("mcp.json"),
+            json_has_symforge,
+            |path| register_classic_mcp_servers(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::Roo) {
+        repair_if_symforge_present(
+            &working_dir.join(".roo").join("mcp.json"),
+            json_has_symforge,
+            |path| register_classic_mcp_servers(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::VsCode) {
+        repair_if_symforge_present(
+            &working_dir.join(".vscode").join("mcp.json"),
+            json_has_symforge,
+            |path| register_vscode_mcp_server(path, binary_path),
+        )?;
+    }
+    if selected(InitClient::Continue) {
+        repair_if_symforge_present(
+            &working_dir
+                .join(".continue")
+                .join("mcpServers")
+                .join("symforge.json"),
+            json_has_symforge,
+            |path| register_classic_mcp_servers(path, binary_path),
+        )?;
+    }
+    Ok(())
+}
+
+/// Insert each `(key, value)` into `entry[field]` ONLY when the key is absent.
+fn insert_string_map_defaults(
+    entry: &mut serde_json::Map<String, Value>,
+    field: &str,
+    defaults: &[(&str, &str)],
+) {
     if defaults.is_empty() {
         return;
     }
-    if !entry.get("env").map(Value::is_object).unwrap_or(false) {
-        entry.insert("env".to_string(), json!({}));
+    if !entry.get(field).map(Value::is_object).unwrap_or(false) {
+        entry.insert(field.to_string(), json!({}));
     }
-    let env = entry
-        .get_mut("env")
+    let map = entry
+        .get_mut(field)
         .and_then(Value::as_object_mut)
-        .expect("env is an object");
+        .expect("string map is an object");
     for (key, val) in defaults {
-        env.entry((*key).to_string())
+        map.entry((*key).to_string())
             .or_insert_with(|| Value::String((*val).to_string()));
     }
+}
+
+/// Insert each `(key, value)` env default into the entry's `env` object ONLY
+/// when the key is absent — a present env key's value is preserved verbatim.
+fn insert_env_defaults(entry: &mut serde_json::Map<String, Value>, defaults: &[(&str, &str)]) {
+    insert_string_map_defaults(entry, "env", defaults);
 }
 
 /// Union `names` into the entry's `key` array (e.g. `alwaysAllow`), preserving
@@ -857,13 +1354,10 @@ pub fn register_mcp_server(
         json!({})
     };
 
-    // Use backslashes on Windows for the command path (Claude Code spawns natively, not via shell).
-    let command_path = native_command_path(binary_path);
-
     let entry = symforge_json_entry_mut(&mut config);
-    // Refresh the managed launcher path; preserve every other user-set field.
-    entry.insert("command".to_string(), Value::String(command_path));
-    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    // Refresh the managed launch pair; preserve every other user-set field.
+    // Windows command paths use backslashes (Claude Code spawns natively, not via shell).
+    refresh_json_stdio_launch(entry, binary_path)?;
     entry
         .entry("disabled".to_string())
         .or_insert_with(|| Value::Bool(false));
@@ -930,25 +1424,6 @@ fn register_claude_desktop_mcp_server_with_home(
     let workspace_root = crate::discovery::find_project_root_from_cwd();
     let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
 
-    let command_path = if cfg!(windows) {
-        // Generate a wrapper script that sets CWD before launching symforge.
-        // It lives in the Claude Desktop config dir (%APPDATA%\Claude) — a
-        // stable, symforge-managed injection point — NEVER next to the npm
-        // platform binary: npm wipes that bin dir on every package swap,
-        // which deleted the wrapper and left Desktop pointing at nothing.
-        let wrapper_dir = desktop_config_path
-            .parent()
-            .context("cannot determine Claude Desktop config directory")?;
-        let wrapper_path = create_desktop_wrapper_windows(
-            &desktop_binary_path_str,
-            workspace_root_str.as_deref(),
-            wrapper_dir,
-        )?;
-        native_command_path(&wrapper_path)
-    } else {
-        native_command_path(&desktop_binary_path_str)
-    };
-
     // Write a proven env instead of `{}` (TR-03 / FR-013):
     //  - SYMFORGE_SURFACE=compact pins the compact surface explicitly in the
     //    registered config (the token-sensitive escape hatch; the server default
@@ -963,10 +1438,36 @@ fn register_claude_desktop_mcp_server_with_home(
     }
 
     let entry = symforge_json_entry_mut(&mut config);
-    // Refresh the managed launcher path; preserve every other user-set field,
+    // Refresh the managed launch pair; preserve every other user-set field,
     // including a user-set env value or an existing SYMFORGE_WORKSPACE_ROOT.
-    entry.insert("command".to_string(), Value::String(command_path));
-    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    // On Windows the command is the `.cmd` wrapper and `%*` forwards args to
+    // the native binary, so args are reconciled against that binary. An HTTP
+    // entry (url / type http|sse) keeps its transport and does not get a wrapper.
+    if !json_launch_is_remote(entry) {
+        let stdio_command = if cfg!(windows) {
+            // Generate a wrapper script that sets CWD before launching symforge.
+            // It lives in the Claude Desktop config dir (%APPDATA%\Claude) — a
+            // stable, symforge-managed injection point — NEVER next to the npm
+            // platform binary: npm wipes that bin dir on every package swap,
+            // which deleted the wrapper and left Desktop pointing at nothing.
+            let wrapper_dir = desktop_config_path
+                .parent()
+                .context("cannot determine Claude Desktop config directory")?;
+            let wrapper_path = create_desktop_wrapper_windows(
+                &desktop_binary_path_str,
+                workspace_root_str.as_deref(),
+                wrapper_dir,
+            )?;
+            native_command_path(&wrapper_path)
+        } else {
+            native_command_path(&desktop_binary_path_str)
+        };
+        refresh_json_stdio_launch_with_command(
+            entry,
+            &stdio_command,
+            &native_command_path(&desktop_binary_path_str),
+        )?;
+    }
     insert_env_defaults(entry, &env_defaults);
 
     let pretty = serde_json::to_string_pretty(&config)?;
@@ -980,6 +1481,20 @@ fn binary_path_for_registration(
     binary_path: &std::path::Path,
     _home_dir: &std::path::Path,
 ) -> anyhow::Result<PathBuf> {
+    // `symforge-smoke-*` checkouts are disposable worktrees. Registering one
+    // writes that path into Cursor's global mcp.json, which Grok Bot also
+    // reads, and the entry dies when the tree is deleted.
+    if binary_path
+        .display()
+        .to_string()
+        .contains("symforge-smoke-")
+    {
+        anyhow::bail!(
+            "refusing to register MCP harnesses with disposable smoke-tree binary {}; \
+             run `npm install -g symforge` and then `symforge init` from that install",
+            binary_path.display()
+        );
+    }
     if !path_is_inside(&std::env::temp_dir(), binary_path) {
         return Ok(binary_path.to_path_buf());
     }
@@ -1109,7 +1624,7 @@ pub fn register_codex_mcp_server(
             .with_context(|| format!("parsing {}", codex_config_path.display()))?
     };
 
-    merge_symforge_codex_server(&mut config, binary_path);
+    merge_symforge_codex_server(&mut config, binary_path)?;
 
     crate::cli::harness_apply::atomic_write(codex_config_path, config.to_string().as_bytes())
         .with_context(|| format!("writing {}", codex_config_path.display()))?;
@@ -1178,8 +1693,19 @@ pub fn register_grok_mcp_server(
         .and_then(Item::as_table_like_mut)
         .expect("symforge server entry must be a table or inline table");
 
-    set_toml_item_preserving_decor(symforge, "command", value(native_command_path(binary_path)));
-    set_toml_item_preserving_decor(symforge, "args", value(Array::new()));
+    // ponytail: Grok replaces `args` with [] instead of `reconcile_native_stdio_args`.
+    // The stdio server accepts no args, and this writer already promised that
+    // replacement (the `--stale` fixture). A `url` entry is HTTP and is not
+    // given a command. Upgrade path: call the shared reconciler if Grok must
+    // keep a future no-subcommand flag instead of deleting it.
+    if !toml_launch_is_remote(symforge) {
+        set_toml_item_preserving_decor(
+            symforge,
+            "command",
+            value(native_command_path(binary_path)),
+        );
+        set_toml_item_preserving_decor(symforge, "args", value(Array::new()));
+    }
     set_toml_item_preserving_decor(symforge, "enabled", value(true));
     if symforge.get("env").is_none_or(|item| !item.is_table_like()) {
         symforge.insert("env", Item::Table(Table::new()));
@@ -1215,15 +1741,15 @@ fn remove_legacy_grok_workspace_pin(env: &mut dyn toml_edit::TableLike) {
     }
 }
 
-fn merge_symforge_codex_server(config: &mut DocumentMut, binary_path: &str) {
-    merge_symforge_codex_server_for_target_os(config, binary_path, std::env::consts::OS);
+fn merge_symforge_codex_server(config: &mut DocumentMut, binary_path: &str) -> anyhow::Result<()> {
+    merge_symforge_codex_server_for_target_os(config, binary_path, std::env::consts::OS)
 }
 
 fn merge_symforge_codex_server_for_target_os(
     config: &mut DocumentMut,
     binary_path: &str,
     target_os: &str,
-) {
+) -> anyhow::Result<()> {
     if !config.as_table().contains_key("mcp_servers") || !config["mcp_servers"].is_table() {
         config["mcp_servers"] = Item::Table(Table::new());
     }
@@ -1240,7 +1766,7 @@ fn merge_symforge_codex_server_for_target_os(
         .as_table_mut()
         .expect("symforge server entry must be a table");
 
-    symforge["command"] = value(native_command_path(binary_path));
+    refresh_toml_stdio_launch(symforge, binary_path)?;
     // No timeouts are seeded: Codex's own defaults (30 s startup, 300 s tool)
     // are what a seed could only match or shorten. A 120 s tool timeout written
     // by an earlier init equals the old seed, so it is removed; any other value
@@ -1255,6 +1781,7 @@ fn merge_symforge_codex_server_for_target_os(
     merge_codex_mcp_env_overrides(symforge, target_os);
 
     merge_codex_project_doc_fallbacks(config);
+    Ok(())
 }
 
 fn merge_codex_mcp_env_overrides(symforge: &mut Table, target_os: &str) {
@@ -1333,12 +1860,9 @@ pub fn register_gemini_mcp_server(
         json!({})
     };
 
-    let command_path = native_command_path(binary_path);
-
     let entry = symforge_json_entry_mut(&mut config);
-    // Refresh the managed launcher path; preserve every other user-set field.
-    entry.insert("command".to_string(), Value::String(command_path));
-    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    // Refresh the managed launch pair; preserve every other user-set field.
+    refresh_json_stdio_launch(entry, binary_path)?;
     // No `timeout` is seeded: Gemini's own default (600000 ms) is longer than
     // anything init would pick. The 120000 ms an earlier init seeded is removed;
     // any other value is the user's and stays.
@@ -1359,11 +1883,15 @@ pub fn register_gemini_mcp_server(
     Ok(())
 }
 
-/// Register symforge as an MCP server in `.kilocode/mcp.json` (workspace-local).
+/// Register symforge in a Kilo Code config (`kilo.jsonc` / `kilo.json`).
 ///
-/// Kilo Code (VS Code extension) stores MCP servers under `mcpServers` in a JSON
-/// config file. Unlike Claude/Codex/Gemini, this file lives in the project directory
-/// rather than the user's home directory.
+/// Current kilo.ai docs: top-level `mcp` (not `mcpServers`), `type: "local"`,
+/// `command` as an array (the executable plus its args), `environment` (not
+/// `env`). A prior `mcpServers.symforge` object in the same file is moved
+/// under `mcp` and that key is removed. Whether a Kilo build still reads
+/// `mcpServers` is UNVERIFIED; this writer does not keep emitting it.
+/// JSONC comments are not stripped: a file serde_json cannot parse is left
+/// untouched because the parse error aborts before the write.
 pub fn register_kilo_mcp_server(
     kilo_config_path: &std::path::Path,
     binary_path: &str,
@@ -1381,21 +1909,35 @@ pub fn register_kilo_mcp_server(
         json!({})
     };
 
-    let command_path = native_command_path(binary_path);
-
-    let entry = symforge_json_entry_mut(&mut config);
-    // Refresh the managed launcher path; preserve every other user-set field.
-    entry.insert("command".to_string(), Value::String(command_path));
-    entry.entry("args".to_string()).or_insert_with(|| json!([]));
-    entry
-        .entry("disabled".to_string())
-        .or_insert_with(|| Value::Bool(false));
-    // Kilo full-injects (~16k tokens/turn) but accepts all 36 tools (measured
-    // 2026-07-03); operator flipped init to full 2026-07-06. Grant the full
-    // names so the allowlist matches the served surface (spec §4);
-    // `SYMFORGE_SURFACE=compact` stays the documented escape hatch.
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
-    union_allow_names(entry, "alwaysAllow", CLAUDE_ALWAYS_ALLOW);
+    let legacy = take_legacy_kilo_symforge(&mut config);
+    let entry = json_server_entry_mut(&mut config, "mcp");
+    if let Some(legacy) = legacy
+        && entry.is_empty()
+    {
+        *entry = legacy;
+    }
+    if !json_launch_is_remote(entry) {
+        let existing_command = json_string_array(entry.get("command"))?;
+        let folded_args = json_string_array(entry.get("args"))?;
+        let command = kilo_native_command(&existing_command, &folded_args, binary_path)?;
+        entry.insert("command".to_string(), json!(command));
+        entry.remove("args");
+        if let Some(env) = entry.remove("env")
+            && !entry
+                .get("environment")
+                .map(Value::is_object)
+                .unwrap_or(false)
+        {
+            entry.insert("environment".to_string(), env);
+        }
+        entry
+            .entry("type".to_string())
+            .or_insert_with(|| json!("local"));
+        entry
+            .entry("enabled".to_string())
+            .or_insert_with(|| Value::Bool(true));
+        insert_string_map_defaults(entry, "environment", &[("SYMFORGE_SURFACE", "full")]);
+    }
 
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(kilo_config_path, pretty.as_bytes())
@@ -1403,7 +1945,164 @@ pub fn register_kilo_mcp_server(
     Ok(())
 }
 
+fn take_legacy_kilo_symforge(config: &mut Value) -> Option<serde_json::Map<String, Value>> {
+    let servers = config.get_mut("mcpServers")?.as_object_mut()?;
+    let entry = servers.remove("symforge")?;
+    if servers.is_empty() {
+        config.as_object_mut()?.remove("mcpServers");
+    }
+    match entry {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+fn json_string_array(value: Option<&Value>) -> anyhow::Result<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        // The pre-2026-10 writer stored Kilo's executable as a string.
+        Some(Value::String(text)) => Ok(vec![text.clone()]),
+        Some(Value::Array(values)) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(text) = value.as_str() else {
+                    anyhow::bail!("SymForge MCP command/args must be strings");
+                };
+                out.push(text.to_string());
+            }
+            Ok(out)
+        }
+        Some(_) => anyhow::bail!("SymForge MCP command/args must be an array of strings"),
+    }
+}
+
+/// Kilo's `command` array is the whole launch pair. A package runner (`npx`,
+/// `npm`, `node`) is a wrapper: its tail is not native stdio args.
+fn kilo_native_command(
+    existing_command: &[String],
+    extra_args: &[String],
+    binary_path: &str,
+) -> anyhow::Result<Vec<String>> {
+    let native = native_command_path(binary_path);
+    if existing_command
+        .first()
+        .is_some_and(|executable| is_package_runner(executable))
+    {
+        return Ok(vec![native]);
+    }
+    let mut tail = if existing_command.is_empty() {
+        Vec::new()
+    } else {
+        existing_command[1..].to_vec()
+    };
+    tail.extend(extra_args.iter().cloned());
+    let kept = reconcile_native_stdio_args(&tail, binary_path)?;
+    let mut command = vec![native];
+    command.extend(kept);
+    Ok(command)
+}
+
+/// Classic `mcpServers` stdio merge: Cursor, Claude Code, Claude Desktop,
+/// Gemini, Cline, Roo, OMP, Continue's JSON drop, VS Code portable, and
+/// Windsurf's stdio shape. Callers pass the file. Windsurf's two official
+/// paths and Amazon Q's `default.json` key layout are not chosen here.
+pub fn register_classic_mcp_servers(
+    config_path: &std::path::Path,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut config: Value = if config_path.exists() {
+        let text = read_config_text(config_path)?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?
+    } else {
+        json!({})
+    };
+    let entry = symforge_json_entry_mut(&mut config);
+    refresh_json_stdio_launch(entry, binary_path)?;
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    let pretty = serde_json::to_string_pretty(&config)?;
+    crate::cli::harness_apply::atomic_write(config_path, pretty.as_bytes())
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    Ok(())
+}
+
+/// VS Code Copilot native workspace file: top-level `servers`, not `mcpServers`.
+/// Portable `.mcp.json` / `~/.copilot/mcp-config.json` stay on
+/// [`register_classic_mcp_servers`].
+pub fn register_vscode_mcp_server(
+    config_path: &std::path::Path,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut config: Value = if config_path.exists() {
+        let text = read_config_text(config_path)?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?
+    } else {
+        json!({})
+    };
+    let entry = json_server_entry_mut(&mut config, "servers");
+    if !json_launch_is_remote(entry) {
+        entry
+            .entry("type".to_string())
+            .or_insert_with(|| json!("stdio"));
+    }
+    refresh_json_stdio_launch(entry, binary_path)?;
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    let pretty = serde_json::to_string_pretty(&config)?;
+    crate::cli::harness_apply::atomic_write(config_path, pretty.as_bytes())
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    Ok(())
+}
+
+/// Zed settings key `context_servers`. The settings file path is not fixed in
+/// the sourced docs (the UI writes it), so init does not guess one. Callers
+/// pass the file.
+pub fn register_zed_context_server(
+    config_path: &std::path::Path,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut config: Value = if config_path.exists() {
+        let text = read_config_text(config_path)?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?
+    } else {
+        json!({})
+    };
+    let entry = json_server_entry_mut(&mut config, "context_servers");
+    refresh_json_stdio_launch(entry, binary_path)?;
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    let pretty = serde_json::to_string_pretty(&config)?;
+    crate::cli::harness_apply::atomic_write(config_path, pretty.as_bytes())
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    Ok(())
+}
+
 /// Register symforge as an MCP server in Cursor's global `~/.cursor/mcp.json`.
+///
+/// Grok Bot on the shared Linux host has no MCP file of its own. It reads this
+/// same global Cursor file (`$HOME/.cursor/mcp.json`). Re-registration here is
+/// what repairs that bot. The command must be the stable install (npm global
+/// or the platform-native binary `init` is running), not a disposable
+/// `symforge-smoke-*` worktree. This function writes only `cursor_config_path`;
+/// callers pass a temp file in tests and never the machine's real home.
+///
+/// Host/guest: WSL is a Linux process (`std::env::consts::OS == "linux"`). This
+/// writer stores the path it is given and does not translate `/mnt/<drive>/...`
+/// into `C:\...` or the reverse. A Windows `command` left in a guest config is
+/// wrapper debris and is replaced by the guest binary passed in. The Windows
+/// host's `C:\Users\<name>\.cursor\mcp.json` is a different file; a WSL guest
+/// writes the Linux `$HOME` (or `/mnt/<drive>/Users/<name>` only when that path
+/// is the home it was given). Headless Linux uses the same file. No display is
+/// required.
 ///
 /// The file is GLOBAL: every Cursor window reads it, so it must carry no
 /// workspace at all. A literal `SYMFORGE_WORKSPACE_ROOT` would pin every window
@@ -1431,18 +2130,50 @@ pub fn register_cursor_mcp_server(
         json!({})
     };
 
-    let command_path = native_command_path(binary_path);
-
     let entry = symforge_json_entry_mut(&mut config);
-    // Refresh the managed launcher path; preserve every other user-set field.
-    entry.insert("command".to_string(), Value::String(command_path));
-    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    // Refresh the managed launch pair; preserve every other user-set field.
+    refresh_json_stdio_launch(entry, binary_path)?;
     remove_legacy_pinned_workspace(entry);
     insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(cursor_config_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", cursor_config_path.display()))?;
+    Ok(())
+}
+
+/// Register symforge in Oh My Pi's user MCP file `~/.omp/agent/mcp.json`.
+///
+/// OMP's stdio entry is `mcpServers.<name>.{command,args}` (type defaults to
+/// stdio). `url` plus `type` `http` or `sse` is a remote server and is not
+/// given a command: OMP rejects an entry that sets both. `enabled`, `timeout`,
+/// `cwd`, and every other server stay as the user wrote them. OMP does not
+/// read Claude's `alwaysAllow` / `disabled` keys, so this writer does not add
+/// them.
+pub fn register_omp_mcp_server(
+    omp_config_path: &std::path::Path,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = omp_config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let mut config: Value = if omp_config_path.exists() {
+        let config_json = read_config_text(omp_config_path)?;
+        serde_json::from_str(&config_json)
+            .with_context(|| format!("parsing {}", omp_config_path.display()))?
+    } else {
+        json!({})
+    };
+
+    let entry = symforge_json_entry_mut(&mut config);
+    refresh_json_stdio_launch(entry, binary_path)?;
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+
+    let pretty = serde_json::to_string_pretty(&config)?;
+    crate::cli::harness_apply::atomic_write(omp_config_path, pretty.as_bytes())
+        .with_context(|| format!("writing {}", omp_config_path.display()))?;
     Ok(())
 }
 
@@ -1687,9 +2418,10 @@ fn discover_binary_path() -> PathBuf {
             let s = path.display().to_string();
             // Warn if the binary is running from an unstable location.
             let is_npx_cache = s.contains("_npx") || s.contains("npx-cache");
-            if is_npx_cache || s.ends_with(".cmd") {
+            let is_smoke_tree = s.contains("symforge-smoke-");
+            if is_npx_cache || s.ends_with(".cmd") || is_smoke_tree {
                 eprintln!(
-                    "warning: binary is a temporary npm shim or npx cache entry ({s}); \
+                    "warning: binary is a temporary npm shim, npx cache entry, or disposable smoke tree ({s}); \
                      run: npm install -g symforge && symforge init --client all"
                 );
             }
@@ -2275,9 +3007,13 @@ mod tests {
         let config2: Value =
             serde_json::from_str(&std::fs::read_to_string(&path2).unwrap()).unwrap();
         assert_eq!(
-            config2["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
+            config2["mcp"]["symforge"]["environment"]["SYMFORGE_SURFACE"].as_str(),
             Some("compact"),
             "re-registration must preserve a user-set compact escape hatch on Kilo"
+        );
+        assert!(
+            config2.get("mcpServers").is_none(),
+            "Kilo writer must not keep emitting mcpServers: {config2}"
         );
     }
 
@@ -2424,66 +3160,174 @@ mod tests {
     }
 
     #[test]
-    fn test_kilo_fresh_registration_allowlist_is_exactly_full() {
+    fn test_kilo_fresh_registration_is_local_command_array() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp.json");
+        let path = dir.path().join("kilo.jsonc");
         register_kilo_mcp_server(&path, "/usr/bin/symforge").unwrap();
         let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let allow: Vec<&str> = config["mcpServers"]["symforge"]["alwaysAllow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert_eq!(allow, CLAUDE_ALWAYS_ALLOW.to_vec());
+        let entry = &config["mcp"]["symforge"];
+        assert_eq!(entry["type"].as_str(), Some("local"));
         assert_eq!(
-            config["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
-            Some("full"),
-            "fresh Kilo registration must make the full surface explicit"
+            entry["command"],
+            json!([native_command_path("/usr/bin/symforge")])
         );
+        assert!(entry.get("args").is_none(), "{entry}");
+        assert!(entry.get("alwaysAllow").is_none(), "{entry}");
+        assert_eq!(
+            entry["environment"]["SYMFORGE_SURFACE"].as_str(),
+            Some("full")
+        );
+        assert!(config.get("mcpServers").is_none(), "{config}");
     }
 
     #[test]
-    fn test_kilo_reregistration_unions_existing_allowlist() {
+    fn test_kilo_package_runner_becomes_native_command_array() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp.json");
+        let path = dir.path().join("kilo.jsonc");
         std::fs::write(
             &path,
             serde_json::to_string_pretty(&json!({
-                "mcpServers": {
+                "mcp": {
+                    "other": {"type": "local", "command": ["keep"]},
                     "symforge": {
-                        "command": "/old/symforge",
-                        "alwaysAllow": ["my_custom_tool"]
+                        "type": "local",
+                        "command": ["npx", "-y", "symforge"],
+                        "environment": {"KEEP_ENV": "sentinel"}
                     }
                 }
             }))
             .unwrap(),
         )
         .unwrap();
-        register_kilo_mcp_server(&path, "/new/symforge").unwrap();
+        register_kilo_mcp_server(&path, "/usr/local/bin/symforge").unwrap();
         let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let allow: Vec<&str> = config["mcpServers"]["symforge"]["alwaysAllow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(
-            allow.contains(&"my_custom_tool"),
-            "user entry dropped: {allow:?}"
+        assert_eq!(
+            config["mcp"]["symforge"]["command"],
+            json!([native_command_path("/usr/local/bin/symforge")])
         );
-        for name in ["symforge", "symforge_edit", "status"] {
-            assert!(
-                allow.contains(&name),
-                "missing compact name {name}: {allow:?}"
-            );
-        }
+        assert_eq!(
+            config["mcp"]["symforge"]["environment"]["KEEP_ENV"].as_str(),
+            Some("sentinel")
+        );
+        assert_eq!(config["mcp"]["other"]["command"], json!(["keep"]));
+    }
+
+    #[test]
+    fn test_kilo_remote_entry_is_not_given_a_stdio_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kilo.jsonc");
+        let original = json!({
+            "mcp": {"symforge": {"type": "remote", "url": "http://127.0.0.1:9/mcp", "enabled": true}}
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+        register_kilo_mcp_server(&path, "/usr/bin/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            config["mcp"]["symforge"].get("command").is_none(),
+            "{config}"
+        );
+        assert_eq!(
+            config["mcp"]["symforge"]["url"].as_str(),
+            Some("http://127.0.0.1:9/mcp")
+        );
+    }
+
+    #[test]
+    fn test_vscode_servers_and_zed_context_servers_rewrite_the_launch_pair() {
+        let stable = "/usr/local/bin/symforge";
+        let dir = tempfile::tempdir().unwrap();
+        let vscode = dir.path().join("mcp.json");
+        std::fs::write(
+            &vscode,
+            serde_json::to_string_pretty(&json!({
+                "servers": {
+                    "other": {"command": "keep"},
+                    "symforge": {"command": "/fixture/wrapper", "args": ["/fixture/old/symforge"]}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_vscode_mcp_server(&vscode, stable).unwrap();
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&vscode).unwrap()).unwrap();
+        assert_eq!(
+            config["servers"]["symforge"]["command"].as_str(),
+            Some(native_command_path(stable).as_str())
+        );
+        assert_eq!(config["servers"]["symforge"]["args"], json!([]));
+        assert_eq!(
+            config["servers"]["symforge"]["type"].as_str(),
+            Some("stdio")
+        );
+        assert_eq!(config["servers"]["other"]["command"].as_str(), Some("keep"));
+        assert!(config.get("mcpServers").is_none());
+
+        let zed = dir.path().join("settings.json");
+        std::fs::write(
+            &zed,
+            serde_json::to_string_pretty(&json!({
+                "context_servers": {
+                    "symforge": {"command": "/fixture/wrapper", "args": ["/fixture/old/symforge"]}
+                },
+                "theme": "keep"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_zed_context_server(&zed, stable).unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&zed).unwrap()).unwrap();
+        assert_eq!(
+            config["context_servers"]["symforge"]["command"].as_str(),
+            Some(native_command_path(stable).as_str())
+        );
+        assert_eq!(config["context_servers"]["symforge"]["args"], json!([]));
+        assert_eq!(config["theme"].as_str(), Some("keep"));
+    }
+
+    #[test]
+    fn test_classic_stdio_shape_covers_cline_roo_continue_and_windsurf() {
+        // Windsurf's stdio object matches this shape. Which of its two official
+        // files to write is UNVERIFIED, so this test only checks the fragment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "other": {"command": "keep"},
+                    "symforge": {
+                        "command": "/fixture/wrapper",
+                        "args": ["/fixture/old/symforge"],
+                        "env": {"KEEP_ENV": "sentinel"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_classic_mcp_servers(&path, "/usr/local/bin/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["symforge"]["command"].as_str(),
+            Some(native_command_path("/usr/local/bin/symforge").as_str())
+        );
+        assert_eq!(config["mcpServers"]["symforge"]["args"], json!([]));
+        assert_eq!(
+            config["mcpServers"]["symforge"]["env"]["KEEP_ENV"].as_str(),
+            Some("sentinel")
+        );
+        assert_eq!(
+            config["mcpServers"]["other"]["command"].as_str(),
+            Some("keep")
+        );
     }
 
     #[test]
     fn test_codex_fresh_registration_writes_only_keys_codex_reads() {
         let mut config = DocumentMut::new();
-        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "macos");
+        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "macos")
+            .unwrap();
         let content = config.to_string();
         for dead in [
             "allowed_tools",
@@ -2522,7 +3366,7 @@ mod tests {
     "#
         .parse::<DocumentMut>()
         .unwrap();
-        merge_symforge_codex_server_for_target_os(&mut config, "/new/symforge", "macos");
+        merge_symforge_codex_server_for_target_os(&mut config, "/new/symforge", "macos").unwrap();
         let content = config.to_string();
         assert!(
             content.contains("my_custom_tool"),
@@ -2557,7 +3401,7 @@ mod tests {
     "#
         .parse::<DocumentMut>()
         .unwrap();
-        merge_symforge_codex_server_for_target_os(&mut config, "/new/symforge", "macos");
+        merge_symforge_codex_server_for_target_os(&mut config, "/new/symforge", "macos").unwrap();
         let content = config.to_string();
         assert!(
             !content.contains("tool_timeout_sec"),
@@ -2572,7 +3416,8 @@ mod tests {
     #[test]
     fn test_codex_linux_registration_disables_daemon() {
         let mut config = DocumentMut::new();
-        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "linux");
+        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "linux")
+            .unwrap();
         let content = config.to_string();
 
         assert!(
@@ -2597,7 +3442,8 @@ EXISTING_FLAG = "keep"
         .parse::<DocumentMut>()
         .unwrap();
 
-        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "linux");
+        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "linux")
+            .unwrap();
         let content = config.to_string();
 
         assert!(
@@ -2620,7 +3466,8 @@ env = { EXISTING_FLAG = "keep" }
         .parse::<DocumentMut>()
         .unwrap();
 
-        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "linux");
+        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "linux")
+            .unwrap();
         let content = config.to_string();
 
         assert!(
@@ -2636,12 +3483,596 @@ env = { EXISTING_FLAG = "keep" }
     #[test]
     fn test_codex_non_linux_registration_does_not_add_daemon_override() {
         let mut config = DocumentMut::new();
-        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "windows");
+        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "windows")
+            .unwrap();
         let content = config.to_string();
 
         assert!(
             !content.contains("SYMFORGE_NO_DAEMON"),
             "non-Linux Codex config should keep daemon behavior unchanged: {content}"
+        );
+    }
+
+    fn toml_args(doc: &DocumentMut) -> Vec<String> {
+        doc["mcp_servers"]["symforge"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// The investigated Codex failure: production registration, temp file,
+    /// wrapper command, native-executable arg. Both the changed-path and
+    /// same-path shapes must come back as a native command with no args.
+    #[test]
+    fn codex_registration_drops_wrapper_args_and_keeps_user_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+model = "sentinel-model"
+
+[mcp_servers.other]
+command = "other.exe"
+args = ["keep-me"]
+
+[mcp_servers.symforge]
+command = 'C:\fixture\wrapper.exe'
+args = ['C:\fixture\program files\old\symforge.exe']
+startup_timeout_sec = 90
+tool_timeout_sec = 900
+required = true
+enabled = false
+
+[mcp_servers.symforge.env]
+SYMFORGE_SURFACE = 'full'
+KEEP_ENV = 'sentinel'
+"#,
+        )
+        .unwrap();
+
+        let stable = r"C:\fixture\program files\new\symforge.exe";
+        register_codex_mcp_server(&path, stable).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        let server = &doc["mcp_servers"]["symforge"];
+        assert!(toml_args(&doc).is_empty(), "wrapper arg survived: {text}");
+        assert!(
+            !text.contains("wrapper.exe") && !text.contains("old"),
+            "stale wrapper launch survived: {text}"
+        );
+        assert_eq!(server["command"].as_str(), Some(stable));
+        assert_eq!(server["required"].as_bool(), Some(true));
+        assert_eq!(server["enabled"].as_bool(), Some(false));
+        assert_eq!(server["startup_timeout_sec"].as_integer(), Some(90));
+        assert_eq!(server["tool_timeout_sec"].as_integer(), Some(900));
+        assert_eq!(server["env"]["SYMFORGE_SURFACE"].as_str(), Some("full"));
+        assert_eq!(server["env"]["KEEP_ENV"].as_str(), Some("sentinel"));
+        assert_eq!(
+            doc["mcp_servers"]["other"]["args"][0].as_str(),
+            Some("keep-me")
+        );
+        assert!(text.contains("sentinel-model"));
+
+        let once = text;
+        register_codex_mcp_server(&path, stable).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+
+        // Same executable path: the arg is the binary itself.
+        std::fs::write(
+            &path,
+            r#"
+[mcp_servers.symforge]
+command = '/fixture/program files/symforge'
+args = ['/fixture/program files/symforge']
+required = true
+"#,
+        )
+        .unwrap();
+        let same = "/fixture/program files/symforge";
+        register_codex_mcp_server(&path, same).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert!(toml_args(&doc).is_empty(), "{text}");
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["command"].as_str(),
+            Some(native_command_path(same).as_str())
+        );
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["required"].as_bool(),
+            Some(true)
+        );
+
+        // Already-native command, stale other-path arg.
+        std::fs::write(
+            &path,
+            r#"
+[mcp_servers.symforge]
+command = '/fixture/new/symforge'
+args = ['/fixture/old/symforge']
+"#,
+        )
+        .unwrap();
+        register_codex_mcp_server(&path, "/fixture/new/symforge").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert!(toml_args(&doc).is_empty(), "{text}");
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["command"].as_str(),
+            Some(native_command_path("/fixture/new/symforge").as_str()),
+            "{text}"
+        );
+        assert!(
+            !text.contains("old/symforge") && !text.contains("old\\symforge"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn native_stdio_launch_accepts_no_positional_args() {
+        assert!(stdio_launch_args_are_supported(&[]));
+        assert!(!stdio_launch_args_are_supported(&["--help".into()]));
+        assert!(!stdio_launch_args_are_supported(&["serve".into()]));
+        assert!(!stdio_launch_args_are_supported(&[
+            "/fixture/old/symforge".into()
+        ]));
+    }
+
+    #[test]
+    fn codex_registration_refuses_non_stdio_args_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = r#"
+[mcp_servers.symforge]
+command = '/fixture/wrapper'
+args = ['serve', '--listen', '127.0.0.1:9']
+required = true
+"#;
+        std::fs::write(&path, original).unwrap();
+        let err = register_codex_mcp_server(&path, "/fixture/new/symforge").unwrap_err();
+        assert!(
+            err.to_string().contains("serve"),
+            "conflict should name the leftover args: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn codex_registration_does_not_convert_http_to_stdio() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mcp_servers.symforge]
+url = 'http://127.0.0.1:9/mcp'
+required = true
+"#,
+        )
+        .unwrap();
+        register_codex_mcp_server(&path, "/fixture/new/symforge").unwrap();
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let server = &doc["mcp_servers"]["symforge"];
+        assert!(server.get("command").is_none(), "{server}");
+        assert!(server.get("args").is_none(), "{server}");
+        assert_eq!(server["url"].as_str(), Some("http://127.0.0.1:9/mcp"));
+        assert_eq!(server["required"].as_bool(), Some(true));
+    }
+
+    fn json_launch(config: &Value) -> (String, Vec<String>) {
+        let entry = &config["mcpServers"]["symforge"];
+        let command = entry["command"].as_str().unwrap_or("").to_string();
+        let args = entry["args"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (command, args)
+    }
+
+    #[test]
+    fn json_harnesses_drop_wrapper_args_and_keep_neighbors() {
+        let stable = "/fixture/program files/new/symforge";
+        let fixture = serde_json::json!({
+            "mcpServers": {
+                "other": {"command": "other-binary", "args": ["keep-me"]},
+                "symforge": {
+                    "command": "/fixture/wrapper",
+                    "args": ["/fixture/program files/old/symforge"],
+                    "env": {"SYMFORGE_SURFACE": "compact", "KEEP_ENV": "sentinel"},
+                    "enabled": false,
+                    "timeout": 900
+                }
+            },
+            "disabledServers": ["not-symforge"]
+        });
+        type Registrar = fn(&std::path::Path, &str) -> anyhow::Result<()>;
+        let registrars: &[(&str, Registrar)] = &[
+            ("claude", register_mcp_server),
+            ("gemini", register_gemini_mcp_server),
+            ("cursor", register_cursor_mcp_server),
+            ("omp", register_omp_mcp_server),
+        ];
+        for (name, register) in registrars {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{name}.json"));
+            std::fs::write(&path, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+            register(&path, stable).unwrap();
+            let config: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let (command, args) = json_launch(&config);
+            assert_eq!(args, Vec::<String>::new(), "{name}: {config}");
+            assert_eq!(command, native_command_path(stable), "{name}");
+            assert_eq!(
+                config["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
+                Some("compact"),
+                "{name}"
+            );
+            assert_eq!(
+                config["mcpServers"]["symforge"]["env"]["KEEP_ENV"].as_str(),
+                Some("sentinel"),
+                "{name}"
+            );
+            assert_eq!(
+                config["mcpServers"]["symforge"]["enabled"].as_bool(),
+                Some(false),
+                "{name}"
+            );
+            assert_eq!(
+                config["mcpServers"]["other"]["args"][0].as_str(),
+                Some("keep-me"),
+                "{name}"
+            );
+            if *name == "omp" {
+                assert_eq!(
+                    config["disabledServers"][0].as_str(),
+                    Some("not-symforge"),
+                    "{config}"
+                );
+            }
+            let once = std::fs::read_to_string(&path).unwrap();
+            register(&path, stable).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), once, "{name}");
+        }
+
+        // Claude Desktop: on Windows the command is the `.cmd` wrapper and
+        // `%*` forwards args to the native binary, so args must still be empty.
+        let home = tempfile::tempdir().unwrap();
+        let desktop_dir = tempfile::tempdir().unwrap();
+        let desktop = desktop_dir.path().join("claude_desktop_config.json");
+        std::fs::write(&desktop, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+        register_claude_desktop_mcp_server_with_home(&desktop, stable, home.path()).unwrap();
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&desktop).unwrap()).unwrap();
+        let (command, args) = json_launch(&config);
+        assert!(args.is_empty(), "desktop args: {args:?} command: {command}");
+        assert!(!command.contains("wrapper") && !command.contains("old"));
+        if !cfg!(windows) {
+            assert_eq!(command, native_command_path(stable));
+        }
+    }
+
+    /// Grok Bot reads Cursor's global mcp.json. The live box entry is a
+    /// smoke-tree command; re-registration onto a stable path must not keep
+    /// that command or its wrapper arg. The file under test is a temp copy.
+    #[test]
+    fn cursor_registration_replaces_smoke_tree_launch_with_stable_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "other": {"command": "keep"},
+                    "symforge": {
+                        "command": "/fixture/symforge-smoke-1138/target/debug/symforge",
+                        "args": ["/fixture/symforge-smoke-1138/target/debug/symforge"],
+                        "env": {"KEEP_ENV": "sentinel"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stable = "/usr/local/bin/symforge";
+        register_cursor_mcp_server(&path, stable).unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (command, args) = json_launch(&config);
+        assert_eq!(command, native_command_path(stable));
+        assert!(args.is_empty(), "{args:?}");
+        assert!(!config.to_string().contains("symforge-smoke-"));
+        assert_eq!(
+            config["mcpServers"]["other"]["command"].as_str(),
+            Some("keep")
+        );
+        assert_eq!(
+            config["mcpServers"]["symforge"]["env"]["KEEP_ENV"].as_str(),
+            Some("sentinel")
+        );
+    }
+
+    /// Host-class inventory for update/re-init. Every row uses a temp home.
+    /// Windows and WSL path shapes run here even when this process is native
+    /// Linux; booting those kernels is a separate gate.
+    #[test]
+    fn host_class_reinit_repairs_cursor_global_under_injected_home() {
+        struct Class {
+            name: &'static str,
+            wrapper_command: &'static str,
+            wrapper_arg: &'static str,
+            stable: &'static str,
+        }
+        let classes = [
+            Class {
+                name: "windows",
+                wrapper_command: r"C:\fixture\wrapper.exe",
+                wrapper_arg: r"C:\fixture\program files\old\symforge.exe",
+                stable: r"C:\Program Files\nodejs\symforge.exe",
+            },
+            Class {
+                name: "native-linux",
+                wrapper_command: "/fixture/wrapper",
+                wrapper_arg: "/fixture/program files/old/symforge",
+                stable: "/usr/local/bin/symforge",
+            },
+            Class {
+                name: "wsl-guest",
+                wrapper_command: r"C:\Users\fixture\AppData\npm\symforge.cmd",
+                wrapper_arg: r"C:\Users\fixture\AppData\npm\node_modules\symforge\symforge.exe",
+                stable: "/usr/local/bin/symforge",
+            },
+            Class {
+                name: "wsl-mnt-literal",
+                wrapper_command: "/mnt/c/fixture/wrapper",
+                wrapper_arg: "/mnt/c/fixture/old/symforge.exe",
+                stable: "/mnt/c/Users/fixture/.npm-global/bin/symforge",
+            },
+            Class {
+                name: "headless-linux",
+                wrapper_command: "/fixture/wrapper",
+                wrapper_arg: "/fixture/old/symforge",
+                stable: "/usr/local/bin/symforge",
+            },
+        ];
+        for class in classes {
+            let home = tempfile::tempdir().unwrap();
+            let cursor = home.path().join(".cursor").join("mcp.json");
+            std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+            std::fs::write(
+                &cursor,
+                serde_json::to_string_pretty(&json!({
+                    "mcpServers": {
+                        "other": {"command": "keep"},
+                        "symforge": {
+                            "command": class.wrapper_command,
+                            "args": [class.wrapper_arg],
+                            "env": {"KEEP_ENV": "sentinel"}
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let paths = InitPaths::from_current_environment(home.path(), home.path());
+            assert_eq!(
+                paths.cursor_config,
+                home.path().join(".cursor").join("mcp.json"),
+                "{}",
+                class.name
+            );
+            register_cursor_mcp_server(&cursor, class.stable).unwrap();
+            let config: Value =
+                serde_json::from_str(&std::fs::read_to_string(&cursor).unwrap()).unwrap();
+            let (command, args) = json_launch(&config);
+            assert!(args.is_empty(), "{}: {args:?}", class.name);
+            assert_eq!(command, native_command_path(class.stable), "{}", class.name);
+            assert!(
+                !command.contains("wrapper")
+                    && !config.to_string().contains("old\\symforge")
+                    && !config.to_string().contains("old/symforge"),
+                "{}: {config}",
+                class.name
+            );
+            if class.name.starts_with("wsl") {
+                assert!(
+                    !command.starts_with("C:"),
+                    "{} must not invent a Windows drive command: {command}",
+                    class.name
+                );
+            }
+            assert_eq!(
+                config["mcpServers"]["symforge"]["env"]["KEEP_ENV"].as_str(),
+                Some("sentinel"),
+                "{}",
+                class.name
+            );
+            assert_eq!(
+                config["mcpServers"]["other"]["command"].as_str(),
+                Some("keep"),
+                "{}",
+                class.name
+            );
+            assert!(cursor.starts_with(home.path()), "{}", class.name);
+        }
+
+        // Guest home that already is the Windows mount stays that path.
+        // A Linux process does not rewrite it to `C:\Users\...`.
+        if !cfg!(windows) {
+            let wsl_home = std::path::PathBuf::from("/mnt/c/Users/fixture");
+            let paths = InitPaths::from_current_environment(&wsl_home, &wsl_home);
+            assert_eq!(
+                paths.cursor_config,
+                wsl_home.join(".cursor").join("mcp.json")
+            );
+            assert!(!paths.cursor_config.display().to_string().contains("C:"));
+        }
+    }
+
+    #[test]
+    fn init_refuses_to_register_a_smoke_tree_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let smoke = std::path::PathBuf::from("/fixture/symforge-smoke-1138/symforge");
+        let err =
+            run_init_with_context(InitClient::Cursor, home.path(), cwd.path(), &smoke).unwrap_err();
+        assert!(err.to_string().contains("smoke-tree"), "{err}");
+        assert!(!home.path().join(".cursor").join("mcp.json").exists());
+    }
+
+    #[test]
+    fn json_registration_leaves_http_entries_on_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let original = json!({
+            "mcpServers": {
+                "symforge": {"type": "http", "url": "http://127.0.0.1:9/mcp", "enabled": true}
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+        register_cursor_mcp_server(&path, "/usr/bin/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(config["mcpServers"]["symforge"].get("command").is_none());
+        assert_eq!(
+            config["mcpServers"]["symforge"]["url"].as_str(),
+            Some("http://127.0.0.1:9/mcp")
+        );
+    }
+
+    #[test]
+    fn json_registration_refuses_non_stdio_args_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let original = serde_json::to_string_pretty(&json!({
+            "mcpServers": {"symforge": {"command": "/fixture/wrapper", "args": ["serve"]}}
+        }))
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let err = register_omp_mcp_server(&path, "/fixture/new/symforge").unwrap_err();
+        assert!(err.to_string().contains("serve"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn project_scope_wrapper_args_are_repaired_without_creating_missing_files() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let project = cwd.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            r#"
+[mcp_servers.symforge]
+command = '/fixture/wrapper'
+args = ['/fixture/old/symforge']
+required = true
+"#,
+        )
+        .unwrap();
+        let cursor = cwd.path().join(".cursor").join("mcp.json");
+        std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cursor,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "symforge": {
+                        "command": "/fixture/wrapper",
+                        "args": ["/fixture/old/symforge"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        run_init_with_context(
+            InitClient::All,
+            home.path(),
+            cwd.path(),
+            std::path::Path::new("/usr/local/bin/symforge"),
+        )
+        .unwrap();
+
+        let doc = std::fs::read_to_string(&project)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(toml_args(&doc).is_empty(), "{doc}");
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["required"].as_bool(),
+            Some(true)
+        );
+        let cursor_config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cursor).unwrap()).unwrap();
+        let (command, args) = json_launch(&cursor_config);
+        assert_eq!(command, native_command_path("/usr/local/bin/symforge"));
+        assert!(args.is_empty(), "{args:?}");
+        // `all` does not invent a project file for a harness that has none.
+        assert!(!cwd.path().join(".gemini").join("settings.json").exists());
+        assert!(!cwd.path().join(".omp").join("mcp.json").exists());
+        // User Cursor config is not created when Cursor is not installed.
+        assert!(!home.path().join(".cursor").join("mcp.json").exists());
+    }
+
+    #[test]
+    fn grok_registration_clears_wrapper_args_and_leaves_http_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mcp_servers.other]
+command = "other.exe"
+
+[mcp_servers.symforge]
+command = '/fixture/wrapper'
+args = ['/fixture/old/symforge']
+enabled = false
+custom = "keep"
+"#,
+        )
+        .unwrap();
+        register_grok_mcp_server(&path, "/usr/local/bin/symforge").unwrap();
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(toml_args(&doc).is_empty(), "{doc}");
+        assert_eq!(
+            doc["mcp_servers"]["other"]["command"].as_str(),
+            Some("other.exe")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["custom"].as_str(),
+            Some("keep")
+        );
+
+        std::fs::write(
+            &path,
+            r#"
+[mcp_servers.symforge]
+url = 'http://127.0.0.1:9/mcp'
+"#,
+        )
+        .unwrap();
+        register_grok_mcp_server(&path, "/usr/local/bin/symforge").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert!(
+            doc["mcp_servers"]["symforge"].get("command").is_none(),
+            "{text}"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["url"].as_str(),
+            Some("http://127.0.0.1:9/mcp")
         );
     }
 

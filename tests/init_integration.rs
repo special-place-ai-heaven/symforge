@@ -584,8 +584,8 @@ fn test_claude_code_presence_agrees_between_scan_and_all() {
 #[test]
 fn test_init_registers_kilo_mcp_server() {
     let dir = TempDir::new().unwrap();
-    let kilo_config_path = dir.path().join(".kilocode").join("mcp.json");
-    let binary_path = r"C:\\Users\\user\\.symforge\\bin\\symforge.exe";
+    let kilo_config_path = dir.path().join(".kilo").join("kilo.jsonc");
+    let binary_path = r"C:\Users\user\.symforge\bin\symforge.exe";
 
     register_kilo_mcp_server(&kilo_config_path, binary_path)
         .expect("register_kilo_mcp_server must succeed");
@@ -593,50 +593,29 @@ fn test_init_registers_kilo_mcp_server() {
     let config_json = std::fs::read_to_string(&kilo_config_path).unwrap();
     let config: serde_json::Value = serde_json::from_str(&config_json).unwrap();
 
-    let symforge = &config["mcpServers"]["symforge"];
-    assert_eq!(symforge["command"], binary_path);
-    assert_eq!(symforge["disabled"], false, "disabled must be false");
+    let symforge = &config["mcp"]["symforge"];
+    assert_eq!(symforge["type"].as_str(), Some("local"));
+    assert_eq!(symforge["command"], serde_json::json!([binary_path]));
+    assert!(symforge.get("args").is_none(), "{symforge}");
+    assert!(symforge.get("alwaysAllow").is_none(), "{symforge}");
     assert_eq!(
-        symforge["args"],
-        serde_json::json!([]),
-        "args must be empty"
-    );
-
-    // G-036 coherence: Kilo serves the full surface (2026-07-06 operator flip),
-    // so its allowlist grants the full-surface names and the env pins full.
-    assert_eq!(
-        symforge["env"]["SYMFORGE_SURFACE"].as_str(),
+        symforge["environment"]["SYMFORGE_SURFACE"].as_str(),
         Some("full"),
-        "Kilo env must make the full surface explicit"
+        "Kilo environment must make the full surface explicit"
     );
-    let always_allow = symforge["alwaysAllow"]
-        .as_array()
-        .expect("alwaysAllow must be an array");
-    let names: Vec<&str> = always_allow.iter().filter_map(|v| v.as_str()).collect();
-    for name in [
-        "symforge",
-        "symforge_edit",
-        "status",
-        "search_symbols",
-        "replace_symbol_body",
-    ] {
-        assert!(
-            names.contains(&name),
-            "alwaysAllow must grant full-surface name {name}: {names:?}"
-        );
-    }
+    assert!(config.get("mcpServers").is_none(), "{config}");
 }
 
 #[test]
 fn test_init_kilo_registration_preserves_other_servers() {
     let dir = TempDir::new().unwrap();
-    let kilo_config_path = dir.path().join(".kilocode").join("mcp.json");
+    let kilo_config_path = dir.path().join(".kilo").join("kilo.jsonc");
 
     let initial = serde_json::json!({
-        "mcpServers": {
+        "mcp": {
             "other-server": {
-                "command": "other-binary",
-                "args": ["stdio"]
+                "type": "local",
+                "command": ["other-binary"]
             }
         }
     });
@@ -653,11 +632,11 @@ fn test_init_kilo_registration_preserves_other_servers() {
     let config: serde_json::Value = serde_json::from_str(&config_json).unwrap();
 
     assert!(
-        config["mcpServers"]["other-server"].is_object(),
+        config["mcp"]["other-server"].is_object(),
         "other MCP servers must be preserved"
     );
     assert!(
-        config["mcpServers"]["symforge"].is_object(),
+        config["mcp"]["symforge"].is_object(),
         "symforge must be added"
     );
 }
@@ -1197,8 +1176,16 @@ fn test_run_init_kilo_only_updates_kilo_files() {
         .expect("kilo init must succeed");
 
     assert!(
-        cwd.path().join(".kilocode").join("mcp.json").exists(),
-        "Kilo config must be created"
+        cwd.path().join(".kilo").join("kilo.jsonc").exists(),
+        "Kilo project config must be created"
+    );
+    assert!(
+        home.path()
+            .join(".config")
+            .join("kilo")
+            .join("kilo.jsonc")
+            .exists(),
+        "Kilo user config must be created"
     );
     assert!(
         cwd.path()
@@ -1250,4 +1237,362 @@ fn test_run_init_kilo_writes_symforge_rules_guidance() {
         !raw.contains("## Agent Directives: Mechanical Overrides"),
         "Kilo guidance must not include Claude/Codex-only mechanical overrides: {raw}"
     );
+}
+
+/// Generated command+args from each stdio writer, then a real MCP session.
+/// Config files are temp copies. This does not read or write the runner's
+/// home directory (Grok Bot uses `~/.cursor/mcp.json`; the cursor case below
+/// is a temp stand-in for that file).
+#[test]
+fn generated_launch_pair_completes_mcp_initialize_tools_and_health() {
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_symforge"));
+    let binary_arg = binary.display().to_string();
+    let expected = if cfg!(windows) {
+        binary_arg.replace('/', "\\")
+    } else {
+        binary_arg.clone()
+    };
+
+    let mut launches = Vec::new();
+    launches.push(codex_launch(&binary_arg));
+    launches.push(json_launch("claude", &binary_arg, |path, bin| {
+        symforge::cli::init::register_mcp_server(path, bin)
+    }));
+    launches.push(json_launch("cursor", &binary_arg, |path, bin| {
+        symforge::cli::init::register_cursor_mcp_server(path, bin)
+    }));
+    launches.push(json_launch("gemini", &binary_arg, |path, bin| {
+        symforge::cli::init::register_gemini_mcp_server(path, bin)
+    }));
+    launches.push(kilo_launch(&binary_arg));
+    launches.push(json_launch("omp", &binary_arg, |path, bin| {
+        symforge::cli::init::register_omp_mcp_server(path, bin)
+    }));
+    launches.push(grok_launch(&binary_arg));
+    launches.push(desktop_launch(&binary_arg));
+
+    for (name, command, args) in &launches {
+        if *name == "claude-desktop" && cfg!(windows) {
+            // The registered command is `symforge-desktop.cmd`. Its temp dir
+            // is already dropped, and CreateProcess cannot run a `.cmd`. The
+            // shim is `cd` then `"<native>" %*`, so the handshake is the
+            // native binary with the args the shim forwards.
+            assert!(args.is_empty(), "{name}: {args:?}");
+            assert!(
+                command
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .is_some_and(|file| file.eq_ignore_ascii_case("symforge-desktop.cmd")),
+                "{command}"
+            );
+            drive_stdio_mcp(name, &expected, args);
+        } else {
+            assert_eq!(command, &expected, "{name}");
+            assert!(args.is_empty(), "{name}: {args:?}");
+            drive_stdio_mcp(name, command, args);
+        }
+    }
+}
+
+fn toml_arg_list(item: &toml_edit::Item) -> Vec<String> {
+    item.as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect()
+}
+
+fn codex_launch(binary: &str) -> (&'static str, String, Vec<String>) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+[mcp_servers.other]
+command = "other.exe"
+
+[mcp_servers.symforge]
+command = '/fixture/wrapper'
+args = ['/fixture/program files/old/symforge']
+required = true
+enabled = false
+"#,
+    )
+    .unwrap();
+    register_codex_mcp_server(&path, binary).unwrap();
+    let doc = read_text(&path).parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["mcp_servers"]["other"]["command"].as_str(),
+        Some("other.exe")
+    );
+    assert_eq!(
+        doc["mcp_servers"]["symforge"]["required"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        doc["mcp_servers"]["symforge"]["enabled"].as_bool(),
+        Some(false)
+    );
+    let server = &doc["mcp_servers"]["symforge"];
+    (
+        "codex",
+        server["command"].as_str().unwrap().to_string(),
+        toml_arg_list(&server["args"]),
+    )
+}
+
+fn json_launch(
+    name: &'static str,
+    binary: &str,
+    register: fn(&std::path::Path, &str) -> anyhow::Result<()>,
+) -> (&'static str, String, Vec<String>) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mcp.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "other": {"command": "other-binary"},
+                "symforge": {
+                    "command": "/fixture/wrapper",
+                    "args": ["/fixture/program files/old/symforge"],
+                    "env": {"KEEP_ENV": "sentinel"}
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    register(&path, binary).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&read_text(&path)).unwrap();
+    assert_eq!(
+        config["mcpServers"]["other"]["command"].as_str(),
+        Some("other-binary")
+    );
+    assert_eq!(
+        config["mcpServers"]["symforge"]["env"]["KEEP_ENV"].as_str(),
+        Some("sentinel")
+    );
+    let entry = &config["mcpServers"]["symforge"];
+    let args = entry["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    (name, entry["command"].as_str().unwrap().to_string(), args)
+}
+
+fn kilo_launch(binary: &str) -> (&'static str, String, Vec<String>) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("kilo.jsonc");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mcp": {
+                "symforge": {
+                    "type": "local",
+                    "command": ["npx", "-y", "symforge"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    symforge::cli::init::register_kilo_mcp_server(&path, binary).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&read_text(&path)).unwrap();
+    let command = config["mcp"]["symforge"]["command"].as_array().unwrap();
+    let executable = command[0].as_str().unwrap().to_string();
+    let args = command
+        .iter()
+        .skip(1)
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    ("kilo", executable, args)
+}
+
+fn grok_launch(binary: &str) -> (&'static str, String, Vec<String>) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[mcp_servers.symforge]\ncommand = '/fixture/wrapper'\nargs = ['/fixture/old/symforge']\n",
+    )
+    .unwrap();
+    symforge::cli::init::register_grok_mcp_server(&path, binary).unwrap();
+    let doc = read_text(&path).parse::<toml_edit::DocumentMut>().unwrap();
+    let server = &doc["mcp_servers"]["symforge"];
+    (
+        "grok",
+        server["command"].as_str().unwrap().to_string(),
+        toml_arg_list(&server["args"]),
+    )
+}
+
+fn desktop_launch(binary: &str) -> (&'static str, String, Vec<String>) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("claude_desktop_config.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "symforge": {
+                    "command": "/fixture/wrapper",
+                    "args": ["/fixture/old/symforge"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Public entry resolves home only to reject a temp binary. The config
+    // path is the temp file above, not the runner's Claude Desktop config.
+    symforge::cli::init::register_claude_desktop_mcp_server(&path, binary).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&read_text(&path)).unwrap();
+    let entry = &config["mcpServers"]["symforge"];
+    let args = entry["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    (
+        "claude-desktop",
+        entry["command"].as_str().unwrap().to_string(),
+        args,
+    )
+}
+
+fn drive_stdio_mcp(name: &str, command: &str, args: &[String]) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let cwd = TempDir::new().unwrap();
+    let mut child = symforge::process_util::hidden_command(command)
+        .args(args)
+        .current_dir(cwd.path())
+        .env("SYMFORGE_AUTO_INDEX", "false")
+        .env_remove("SYMFORGE_WORKSPACE_ROOT")
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("{name}: spawn {command}: {err}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut text);
+        text
+    });
+
+    let fail = |child: &mut std::process::Child, why: String| -> ! {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{name}: {why}");
+    };
+
+    let write_line = |stdin: &mut std::process::ChildStdin, line: &str| {
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+    };
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"symforge-launch-pair","version":"1"}}}"#,
+    );
+    let init = recv_id(&rx, 1, Duration::from_secs(20));
+    if init
+        .get("result")
+        .and_then(|result| result.get("protocolVersion"))
+        .is_none()
+    {
+        fail(&mut child, format!("initialize failed: {init}"));
+    }
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    let tools = recv_id(&rx, 2, Duration::from_secs(20));
+    if tools["result"]["tools"].as_array().is_none() {
+        fail(&mut child, format!("tools/list failed: {tools}"));
+    }
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"health"),
+        "{name}: health missing from {names:?}"
+    );
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"health","arguments":{}}}"#,
+    );
+    let health = recv_id(&rx, 3, Duration::from_secs(20));
+    if health.get("error").is_some() || health["result"]["isError"].as_bool() == Some(true) {
+        fail(&mut child, format!("health failed: {health}"));
+    }
+
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                fail(
+                    &mut child,
+                    "server did not exit after stdin closed".to_string(),
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => fail(&mut child, format!("wait: {err}")),
+        }
+    }
+    let _ = stderr_thread.join();
+}
+
+fn recv_id(
+    rx: &std::sync::mpsc::Receiver<String>,
+    id: u64,
+    timeout: std::time::Duration,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("timed out waiting for json-rpc id {id}; saw {seen:?}");
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                    && value.get("id").and_then(|value| value.as_u64()) == Some(id)
+                {
+                    return value;
+                }
+                seen.push(line);
+            }
+            Err(_) => panic!("stdio closed waiting for id {id}; saw {seen:?}"),
+        }
+    }
 }
