@@ -249,6 +249,9 @@ pub(crate) fn disk_read_would_refuse(
 pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
     // Current path rule — no read needed.
     if let Some(rule_id) = crate::knowledge::sensitive_path_rule(relative_path) {
+        crate::protocol::withheld::record_pending_withheld(
+            crate::protocol::withheld::WithheldMeta::path_rule_only(relative_path, rule_id),
+        );
         return Some(format::content_withheld_by_path_rule(
             relative_path,
             rule_id,
@@ -269,9 +272,15 @@ pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<
                     .iter()
                     .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID) =>
             {
+                crate::protocol::withheld::record_pending_withheld(
+                    crate::protocol::withheld::WithheldMeta::unscanned(relative_path),
+                );
                 return Some(format::content_withheld_unscanned(relative_path));
             }
             MetadataOnlyReason::SensitivePath { rule_id } => {
+                crate::protocol::withheld::record_pending_withheld(
+                    crate::protocol::withheld::WithheldMeta::path_rule_only(relative_path, rule_id),
+                );
                 return Some(format::content_withheld_by_path_rule(
                     relative_path,
                     rule_id,
@@ -347,7 +356,15 @@ fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Optio
     {
         return None;
     }
-    let line_ranges = recorded_finding_lines(live, relative_path, rule_ids);
+    let (line_ranges, findings) = recorded_finding_evidence(live, relative_path, rule_ids);
+    if !findings.is_empty() {
+        crate::protocol::withheld::record_pending_withheld(
+            crate::protocol::withheld::WithheldMeta::from_content_findings(
+                relative_path,
+                &findings,
+            ),
+        );
+    }
     (!line_ranges.is_empty()).then(|| {
         format::content_withheld_by_admission(relative_path, rule_ids, *finding_count, &line_ranges)
     })
@@ -368,51 +385,55 @@ fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Optio
 /// root, a regular file opened once, and no more than the scan budget read
 /// from that one handle. Any doubt yields no lines, and the refusal itself
 /// never depends on this read.
-fn recorded_finding_lines(
+fn recorded_finding_evidence(
     live: &LiveIndex,
     relative_path: &str,
     recorded: &[String],
-) -> Vec<(u32, u32)> {
+) -> (
+    Vec<(u32, u32)>,
+    Vec<crate::knowledge::SecretFindingDescriptor>,
+) {
     let Some(root) = live.indexed_root.as_deref() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     // The shared resolver admits only a spelling whose canonical path is,
     // component for component, the spelling itself beneath the root: no link
     // on any component, no alias, no escape.
     let Ok(Some(full_path)) = crate::discovery::resolve_repo_path(root, relative_path) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     // Only a regular file is opened: opening a FIFO for reading blocks until a
     // writer appears, which would hang the refusal.
     if !std::fs::symlink_metadata(&full_path).is_ok_and(|metadata| metadata.is_file()) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let Ok(file) = std::fs::File::open(&full_path) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut bytes = Vec::new();
     let budget = crate::knowledge::SECRET_SCAN_MAX_BYTES as u64 + 1;
     if std::io::Read::read_to_end(&mut std::io::Read::take(file, budget), &mut bytes).is_err()
         || crate::knowledge::exceeds_scan_limit(bytes.len())
     {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     match crate::knowledge::scan_secret_bytes(relative_path, &bytes) {
         crate::knowledge::SecretScan::Sensitive {
             rule_ids,
             line_ranges,
+            findings,
             ..
         } if rule_ids.len() == recorded.len()
             && rule_ids
                 .iter()
                 .all(|rule| recorded.iter().any(|seen| seen == rule)) =>
         {
-            line_ranges
+            (line_ranges, findings)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     }
 }
 
@@ -533,6 +554,9 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
     if crate::knowledge::exceeds_scan_limit(bytes.len())
         || crate::knowledge::decode_searchable_text(bytes).is_err()
     {
+        crate::protocol::withheld::record_pending_withheld(
+            crate::protocol::withheld::WithheldMeta::unscanned(relative_path),
+        );
         return Some(format::content_withheld_unscanned(relative_path));
     }
     let language = Path::new(relative_path)
@@ -551,6 +575,7 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
     // The scan's finding lines are kept beside the verdict for the refusal
     // text; they are never part of the recorded disposition.
     let mut finding_lines = Vec::new();
+    let mut finding_descriptors: Vec<crate::knowledge::SecretFindingDescriptor> = Vec::new();
     if let crate::knowledge::StableContentAdmission::MetadataOnly(
         MetadataOnlyReason::SensitiveContent {
             rule_ids,
@@ -562,8 +587,14 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
         bytes,
         |path, bytes| {
             let scan = crate::knowledge::scan_secret_bytes(path, bytes);
-            if let crate::knowledge::SecretScan::Sensitive { line_ranges, .. } = &scan {
+            if let crate::knowledge::SecretScan::Sensitive {
+                line_ranges,
+                findings,
+                ..
+            } = &scan
+            {
                 finding_lines.clone_from(line_ranges);
+                finding_descriptors.clone_from(findings);
             }
             scan
         },
@@ -573,8 +604,19 @@ fn classify_admitted_bytes(relative_path: &str, bytes: &[u8]) -> Option<String> 
                 .iter()
                 .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID)
             {
+                crate::protocol::withheld::record_pending_withheld(
+                    crate::protocol::withheld::WithheldMeta::unscanned(relative_path),
+                );
                 format::content_withheld_unscanned(relative_path)
             } else {
+                if !finding_descriptors.is_empty() {
+                    crate::protocol::withheld::record_pending_withheld(
+                        crate::protocol::withheld::WithheldMeta::from_content_findings(
+                            relative_path,
+                            &finding_descriptors,
+                        ),
+                    );
+                }
                 format::content_withheld_by_admission(
                     relative_path,
                     &rule_ids,

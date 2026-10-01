@@ -315,7 +315,7 @@ Already have MCP configs scattered around? `symforge init --scan` reports per-cl
 
 ## The tool surface
 
-SymForge advertises **39 tools** over MCP `tools/list`. Forty are registered; the fortieth is the compact-surface `symforge` facade, which the full profile filters out because `symforge_retrieve` is its full-surface equivalent. A client reporting 39 is correct.
+SymForge advertises **40 tools** over MCP `tools/list`. Forty-one are registered; the forty-first is the compact-surface `symforge` facade, which the full profile filters out because `symforge_retrieve` is its full-surface equivalent. A client reporting 40 is correct.
 
 | Group | Tools |
 |---|---|

@@ -9170,6 +9170,9 @@ impl SymForgeServer {
         // paths by contract (Feature 020 R1/E1: aggregate counts for a demoted
         // file succeed).
         if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&input.path) {
+            crate::protocol::withheld::record_pending_withheld(
+                crate::protocol::withheld::WithheldMeta::path_rule_only(&input.path, rule_id),
+            );
             return format::content_withheld_by_path_rule(&input.path, rule_id);
         }
         if let Some(refusal) = read_gate::hard_scope_refusal(&input.path) {
@@ -36729,6 +36732,7 @@ mod tests {
                     rule_ids,
                     finding_count,
                     line_ranges,
+                    ..
                 } => findings.push(format!(
                     "{relative} [{finding_count}] {rule_ids:?} lines {line_ranges:?}"
                 )),

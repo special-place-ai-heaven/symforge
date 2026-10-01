@@ -23,10 +23,12 @@ pub mod resources;
 pub mod result_status;
 pub(crate) mod search_format;
 pub(crate) mod search_tools;
+pub(crate) mod secret_remediate;
 pub mod session;
 pub mod smart_query;
 pub mod surface_probe;
 pub mod tools;
+pub mod withheld;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -320,7 +322,7 @@ fn estimate_tokens(response_bytes: u64) -> u64 {
 
 impl SymForgeServer {
     pub(crate) fn tool_router() -> ToolRouter<Self> {
-        Self::core_tool_router() + Self::edit_tool_router()
+        Self::core_tool_router() + Self::edit_tool_router() + Self::secret_remediate_tool_router()
     }
 
     /// Create a new server with the given shared index, project name, and watcher state.
@@ -2063,6 +2065,17 @@ impl SymForgeServer {
         tool_name: &str,
         params: serde_json::Value,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // Feature 034: mirror production call_tool withheld scope so unit
+        // harnesses observe `symforge/withheld` meta on admission refusals.
+        withheld::with_withheld_scope(self.dispatch_tool_result_for_tests_inner(tool_name, params))
+            .await
+    }
+
+    async fn dispatch_tool_result_for_tests_inner(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use rmcp::handler::server::wrapper::Parameters;
 
         fn invalid_request_result(
@@ -2120,6 +2133,12 @@ impl SymForgeServer {
                 call_statused!(symforge_edit_facade_tool, crate::stel::StelEditRequest)
             }
             "status" => call_statused!(status_stel_tool, crate::stel::StelStatusRequest),
+            "secret_remediate" => {
+                call_statused!(
+                    secret_remediate_tool,
+                    secret_remediate::SecretRemediateInput
+                )
+            }
             other => {
                 let text = format!(
                     "Unsupported tool `{other}` in public conformance harness.\nRecovery: add a statused dispatcher branch before adding the case, or remove the case from the public corpus."
@@ -2313,73 +2332,82 @@ impl ServerHandler for SymForgeServer {
         // overwrites it with the daemon's receipt when it answers. Statused
         // results attach whatever is current at render time.
         result_status::with_project_evidence_scope(initial_project_evidence, async {
-            let response = self.tool_router.call(tcc).await;
-            // FR-319 central evidence attachment (plan D1): statused results
-            // already attached evidence inside `into_call_tool_result`
-            // (single-writer wins — this seam never overwrites); plain-String
-            // tools gain it here, and an unbound server discloses the explicit
-            // unbound marker. Runs INSIDE the scope so a daemon receipt
-            // recorded during the call is what gets attached. Wildcard arm per
-            // FR-A2: this server only ever emits `Complete`.
-            response.map(|response| match response {
-                rmcp::model::CallToolResponse::Complete(mut result) => {
-                    result_status::attach_project_evidence_meta(&mut result.meta);
-                    if result.is_error == Some(true) {
-                        append_required_fields_hint(self.tool_router.get(&tool_name), &mut result);
-                    }
-                    // Semantic-error typing (worktree-routing incident): most
-                    // primitive tools return plain String bodies, so a
-                    // routing refusal or tool error reached the wire as
-                    // isError:false — an authoritative-looking "failure read
-                    // as success". Reclassify centrally via the ONE shared
-                    // error-shape predicate so every tool inherits it without
-                    // per-handler signature churn.
-                    if !admitted_raw_measurement_relay && result.is_error != Some(true) {
-                        let body = result
-                            .content
-                            .iter()
-                            .filter_map(|block| block.as_text().map(|text| text.text.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if !body.is_empty() && tools::is_error_output(&body) {
-                            result.is_error = Some(true);
-                        } else if tools::is_index_unavailable_output(&body) {
-                            // The index could not serve (loading, not loaded,
-                            // degraded), so the call did not run. Statused tools
-                            // already type this `internal_failure`; a plain-String
-                            // tool reached the wire as isError:false, which reads
-                            // exactly like a real empty answer. Never overwrite a
-                            // status a statused tool wrote itself.
-                            result.is_error = Some(true);
-                            result
-                                .meta
-                                .get_or_insert_with(Default::default)
-                                .0
-                                .entry(result_status::RESULT_STATUS_META_KEY.to_string())
-                                .or_insert_with(|| {
-                                    serde_json::to_value(result_status::ResultStatus::new(
-                                        OutcomeClass::InternalFailure,
-                                    ))
-                                    .expect("ResultStatus must serialize to JSON")
-                                });
+            withheld::with_withheld_scope(async {
+                let response = self.tool_router.call(tcc).await;
+                // FR-319 central evidence attachment (plan D1): statused results
+                // already attached evidence inside `into_call_tool_result`
+                // (single-writer wins — this seam never overwrites); plain-String
+                // tools gain it here, and an unbound server discloses the explicit
+                // unbound marker. Runs INSIDE the scope so a daemon receipt
+                // recorded during the call is what gets attached. Wildcard arm per
+                // FR-A2: this server only ever emits `Complete`.
+                response.map(|response| match response {
+                    rmcp::model::CallToolResponse::Complete(mut result) => {
+                        result_status::attach_project_evidence_meta(&mut result.meta);
+                        if result.is_error == Some(true) {
+                            append_required_fields_hint(
+                                self.tool_router.get(&tool_name),
+                                &mut result,
+                            );
                         }
-                    }
-                    // Feature 032 (US1): AFTER evidence attachment (the
-                    // tracker reads the evidence this response actually
-                    // carries) and AFTER the error reclassification (the
-                    // notice text must never reach `is_error_output`). The
-                    // lock is taken and released right here, synchronously.
-                    if let Some(key) = repeat_key {
-                        let observation = repeat::ServeObservation::from_result(&result);
-                        let notice = self.repeat_tracker.lock().record_serve(key, observation);
-                        if let Some(notice) = notice {
-                            notice.attach(&mut result);
+                        // Semantic-error typing (worktree-routing incident): most
+                        // primitive tools return plain String bodies, so a
+                        // routing refusal or tool error reached the wire as
+                        // isError:false — an authoritative-looking "failure read
+                        // as success". Reclassify centrally via the ONE shared
+                        // error-shape predicate so every tool inherits it without
+                        // per-handler signature churn.
+                        if !admitted_raw_measurement_relay && result.is_error != Some(true) {
+                            let body = result
+                                .content
+                                .iter()
+                                .filter_map(|block| block.as_text().map(|text| text.text.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !body.is_empty() && tools::is_error_output(&body) {
+                                result.is_error = Some(true);
+                            } else if tools::is_index_unavailable_output(&body) {
+                                // The index could not serve (loading, not loaded,
+                                // degraded), so the call did not run. Statused tools
+                                // already type this `internal_failure`; a plain-String
+                                // tool reached the wire as isError:false, which reads
+                                // exactly like a real empty answer. Never overwrite a
+                                // status a statused tool wrote itself.
+                                result.is_error = Some(true);
+                                result
+                                    .meta
+                                    .get_or_insert_with(Default::default)
+                                    .0
+                                    .entry(result_status::RESULT_STATUS_META_KEY.to_string())
+                                    .or_insert_with(|| {
+                                        serde_json::to_value(result_status::ResultStatus::new(
+                                            OutcomeClass::InternalFailure,
+                                        ))
+                                        .expect("ResultStatus must serialize to JSON")
+                                    });
+                            }
                         }
+                        // Feature 032 (US1): AFTER evidence attachment (the
+                        // tracker reads the evidence this response actually
+                        // carries) and AFTER the error reclassification (the
+                        // notice text must never reach `is_error_output`). The
+                        // lock is taken and released right here, synchronously.
+                        if let Some(key) = repeat_key {
+                            let observation = repeat::ServeObservation::from_result(&result);
+                            let notice = self.repeat_tracker.lock().record_serve(key, observation);
+                            if let Some(notice) = notice {
+                                notice.attach(&mut result);
+                            }
+                        }
+                        // Feature 034: plain-String tools may still hold pending
+                        // withheld meta (statused path already drained it).
+                        withheld::drain_pending_into_meta(&mut result.meta);
+                        rmcp::model::CallToolResponse::Complete(result)
                     }
-                    rmcp::model::CallToolResponse::Complete(result)
-                }
-                other => other,
+                    other => other,
+                })
             })
+            .await
         })
         .await
     }

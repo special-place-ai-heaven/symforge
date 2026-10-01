@@ -604,6 +604,7 @@ const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__status",
     "mcp__symforge__symforge",
     "mcp__symforge__symforge_edit",
+    "mcp__symforge__secret_remediate",
 ];
 
 const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
@@ -638,6 +639,7 @@ const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
     "batch_edit",
     "batch_rename",
     "batch_insert",
+    "secret_remediate",
     "ask",
     "conventions",
     "edit_plan",

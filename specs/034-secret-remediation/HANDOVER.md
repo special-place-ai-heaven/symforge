@@ -12,10 +12,9 @@ Its first duty is to NEVER disclose secret bytes to an agent.
 You work on your OWN cloud machine, in your own clone. The owner's machine and other agents'
 branches are never touched.
 
-1. Clone and check out the branch this file lives on (it is yours):
-   `git clone https://github.com/special-place-ai-heaven/symforge.git && cd symforge && git checkout feat/034-secret-remediation`
-   Deliverable 1 goes on a second branch you create from latest main:
-   `git fetch origin && git checkout -b fix/secret-scan-json-password origin/main`
+1. Clone from latest `main` (spec docs already merged via #743). Implement on a fresh branch:
+   `git clone https://github.com/special-place-ai-heaven/symforge.git && cd symforge && git fetch origin && git checkout -b feat/034-secret-remediation-impl origin/main`
+   Deliverable 1 is already on `main` (#738) — do not reopen it. Do not reuse the closed spec branch name `feat/034-secret-remediation`.
 2. Install symforge itself (for its MCP code-navigation tools) into ONE npm prefix, and make sure
    that prefix's bin is on PATH. Cloud VMs often set `NPM_CONFIG_PREFIX` to a different folder than
    `~/.npmrc`, which silently installs updates where PATH never looks. Be explicit:
@@ -46,32 +45,15 @@ release-please):
 `gh pr merge <N> --squash --delete-branch --subject "<conventional title> (#<N>)" --body "<one short plain paragraph, no colons at line starts, no parentheses>"`
 Release-please then cuts a release automatically; do not hand-edit versions or CHANGELOG.
 
-## 2. Deliverable 1: withhold plaintext credential values under quoted keys (small PR, do first)
+## 2. Deliverable 1: withhold plaintext credential values under quoted keys — DONE on main
 
-Owner decision: a plaintext password in a repository file must be withheld from the agent.
+**Status (implement track):** landed on `main` via #738 (`d8ee3d0c`). Do **not** re-implement.
+Quoted credential keys (`"password": "…"` and peers) are withheld when the value looks like a
+credential; label-like / placeholder values stay Clean. `SECRET_POLICY_VERSION` is 7. Precision
+matrix row `PJ1` is Sensitive.
 
-Today the context-assignment rule in `src/knowledge/mod.rs` does not match a QUOTED key such as
-`"password": "value"`. It is pinned as known false negative row `PJ1` in the precision matrix test
-`precision_ruling_matrix_pins` (same file).
-
-Implement:
-- Match quoted credential keys (password, passwd, pwd, secret, api_key/apikey/api-key, token,
-  access_key, private_key, client_secret; case and separator variants) followed by `:` or `=` and a
-  quoted string value, in JSON, YAML, TOML, and JS/TS object literals.
-- Withhold ONLY when the value looks like a credential:
-  - Exempt label-like values: natural-language words and phrases with no digits (`"Password"`,
-    `"Mot de passe"`, `"Enter your password"`).
-  - Exempt a value equal to its key, existing placeholders (whole `<...>`, `${...}`, `changeme`,
-    `your_*`), and empty strings.
-  - Withhold mixed letters with digits or symbols, high-entropy strings of 8 or more characters,
-    and known token shapes.
-  - Reuse the scanner's existing placeholder and entropy helpers.
-- Flip `PJ1` to Sensitive. Add Sensitive rows (JSON password with digits, YAML
-  `password: "S3cr3t!x"`, TOML token) and Clean rows (i18n `"password": "Password"`, a French
-  label, `"${DB_PASSWORD}"`, `"<your-password>"`, `""`).
-- Bump `SECRET_POLICY_VERSION`.
-- The whole true-positive corpus test and the existing matrix stay green.
-PR title: `fix(knowledge): withhold plaintext credential values under quoted keys without flagging UI labels`
+Owner decision (historical): a plaintext password in a repository file must be withheld from the
+agent. That work is complete; this HANDOVER's remaining track is Deliverable 2 (§3 / feature 034).
 
 ## 3. Deliverable 2: agent-driven secret remediation (spec-kit feature 034)
 

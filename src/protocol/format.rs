@@ -3849,9 +3849,10 @@ pub fn path_outside_repo(path: &str) -> String {
 /// Names the rule ids, the finding count and, when the gate could compute them,
 /// the 1-based finding lines — never a byte of the file — so a false positive
 /// can be located and reported (owner ruling 2026-09-29; an earlier revision
-/// named nothing, which left every false positive undiagnosable). It offers no
-/// remedy: a reindex gives the same verdict on the same bytes, and a
-/// self-service override is deliberately not part of this surface.
+/// named nothing, which left every false positive undiagnosable). The refusal
+/// text itself offers no self-service bypass; actionable remediation is a
+/// separate write tool (`secret_remediate`) reached via `_meta["symforge/withheld"]`
+/// (feature 034). A reindex still gives the same verdict on the same bytes.
 pub fn content_withheld_by_admission<S: AsRef<str>>(
     path: &str,
     rule_ids: &[S],
