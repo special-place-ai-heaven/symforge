@@ -1920,8 +1920,12 @@ impl DaemonState {
         let target_project_id = &binding.root_id.0;
         let target_root = &binding.canonical_root;
         let target_slot = self.ensure_project_slot_for_binding(session_id, binding)?;
-        target_slot.activate();
+        // Reload while the slot can still be Inactive so the first observer is
+        // the post-reload watcher. activate()-then-reload used to start a
+        // watcher only to hard-abort it under spawn_blocking, which raced the
+        // cooperative WatcherUnavailable latch (see abort_watcher_task).
         let (file_count, symbol_count) = target_slot.reload_for_binding(binding)?;
+        target_slot.activate();
 
         let (index, source_access_mode, state_placement, persistence_health) = {
             let project = target_slot.metadata.read();
@@ -3976,15 +3980,21 @@ impl ProjectInstance {
         }
         self.activation_state = ActivationState::Activating;
 
-        self.stop_token = Arc::new(AtomicBool::new(false));
-        self.watcher_task = start_project_watcher(
-            self.canonical_root.clone(),
-            self.index.shared(),
-            Arc::clone(&self.watcher_info),
-            Arc::clone(&self.stop_token),
-        );
+        // `open_project_for_session` reloads before activate, so a post-reload
+        // watcher may already be installed. Do not spawn a second observer or
+        // reset its stop token — that would orphan the reload's watcher.
+        if self.watcher_task.is_none() {
+            self.stop_token = Arc::new(AtomicBool::new(false));
+            self.watcher_task = start_project_watcher(
+                self.canonical_root.clone(),
+                self.index.shared(),
+                Arc::clone(&self.watcher_info),
+                Arc::clone(&self.stop_token),
+            );
+        }
 
         // Kick off background git temporal analysis (non-blocking).
+        // Reload also spawns this; the enqueue path de-dupes a current fence.
         let expected_gen = self.index.data_plane().current_project_generation();
         live_index::git_temporal::spawn_git_temporal_computation(
             self.index.shared(),
@@ -4820,13 +4830,31 @@ fn abort_watcher_task(
     task: &mut Option<tokio::task::JoinHandle<()>>,
     stop_token: &Arc<AtomicBool>,
 ) -> bool {
-    stop_token.store(true, Ordering::Release);
-    if let Some(task) = task.take() {
+    // Hard-abort FIRST, then raise the stop token.
+    //
+    // `reload_with` / project stop run under `spawn_blocking` while the
+    // watcher lives on the async runtime. If the stop token is raised before
+    // abort, the runtime can poll the watcher between the two stores: the
+    // watcher observes the token, takes the cooperative `cancelled` latch
+    // path, and plants a permanent `WatcherUnavailable` on the index. Reload
+    // then retains that latch by design ("a latched observer gap outlives a
+    // reload"), so every sidecar read of the active project answers 503 —
+    // which is exactly what reddened `test_daemon_sidecar_enforces_caller_root_guard`
+    // under CI load (active caller_root=B served 503).
+    //
+    // Aborting first cancels the task at its next `.await` without running the
+    // cooperative latch tail. The stop token still stops any in-flight
+    // `spawn_blocking` reconcile the aborted parent was awaiting. Failed
+    // reloads latch explicitly in `reload_with` because hard abort skips the
+    // watcher's own gap report.
+    let aborted = if let Some(task) = task.take() {
         task.abort();
         true
     } else {
         false
-    }
+    };
+    stop_token.store(true, Ordering::Release);
+    aborted
 }
 
 pub fn build_router(state: SharedDaemonState) -> Router {
@@ -14216,21 +14244,35 @@ mod tests {
             project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
         let publication_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let generations = handle.state.projects.read().get(&project_b_id).map(|slot| {
+            let snapshot = handle.state.projects.read().get(&project_b_id).map(|slot| {
                 let project = slot.metadata.read();
                 let data_plane = project.index.data_plane();
+                let published = data_plane.published_generation();
+                let watcher_unavailable = matches!(
+                    published.freshness.as_ref(),
+                    crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                        if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+                );
                 (
-                    data_plane.published_generation().project_generation,
+                    published.project_generation,
                     data_plane.current_project_generation(),
+                    published.freshness.as_ref().clone(),
+                    watcher_unavailable,
                 )
             });
-            if matches!(generations, Some((published, current)) if published == current) {
+            // Generations matching is necessary but not sufficient: a false
+            // WatcherUnavailable latch from a planned reload abort leaves the
+            // index permanently non-queryable while generations still match.
+            if matches!(
+                snapshot,
+                Some((published, current, _, watcher_unavailable))
+                    if published == current && !watcher_unavailable
+            ) {
                 break;
             }
             assert!(
                 std::time::Instant::now() < publication_deadline,
-                "B's publication never caught up with its project generation within 30s; \
-                 (published, current) = {generations:?}"
+                "B never became queryable within 30s; (published, current, freshness, watcher_unavailable) = {snapshot:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -14274,6 +14316,120 @@ mod tests {
         assert!(
             unpinned.status().is_success(),
             "a request without caller_root stays unguarded"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
+    /// Regression: planned reload succession must not leave the active project
+    /// permanently non-queryable via a false `WatcherUnavailable` latch.
+    ///
+    /// `open_project_for_session` used to activate (spawn watcher) then reload
+    /// (hard-abort that watcher under `spawn_blocking`). Raising the stop token
+    /// before abort let the async runtime plant the cooperative cancellation
+    /// latch; reload retained it, so sidecar reads of the newly activated
+    /// project answered 503 forever. Reproduce under a multi-thread runtime
+    /// where the race is schedulable, and assert B stays queryable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn index_folder_activation_does_not_latch_watcher_unavailable_on_active_project() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-reload-latch-home-a");
+        let project_b = project_dir("symforge-reload-latch-open-b");
+        std::fs::write(project_a.path().join("src").join("a.rs"), "fn a() {}\n")
+            .expect("write source a");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reload-latch".to_string(),
+                pid: Some(89),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        // Hammer default-open B: each attempt reloads under spawn_blocking on a
+        // multi-thread runtime — the historical race window.
+        for _ in 0..8 {
+            client
+                .post(format!(
+                    "{base_url}/v1/sessions/{}/tools/index_folder",
+                    opened.session_id
+                ))
+                .json(&IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                    allow_protected_root: None,
+                })
+                .send()
+                .await
+                .expect("open B request")
+                .error_for_status()
+                .expect("open B status");
+        }
+
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+        let published = handle
+            .state
+            .projects
+            .read()
+            .get(&project_b_id)
+            .expect("B loaded")
+            .metadata
+            .read()
+            .index
+            .data_plane()
+            .published_generation();
+        assert!(
+            !matches!(
+                published.freshness.as_ref(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+            ),
+            "planned reload succession must not latch WatcherUnavailable on B; freshness={:?}",
+            published.freshness
+        );
+
+        let response = client
+            .get(format!(
+                "{base_url}/v1/sessions/{}/sidecar/repo-map?caller_root={}",
+                opened.session_id,
+                project_b.path().display()
+            ))
+            .send()
+            .await
+            .expect("matched request");
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<body unreadable: {error}>"));
+        assert!(
+            status.is_success(),
+            "active caller_root=B must be served after reload succession, got {status}: {body}"
         );
 
         let _ = handle.shutdown_tx.send(());

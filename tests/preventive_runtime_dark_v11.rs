@@ -1078,10 +1078,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // same file count; byte churn from discovery isolation + 034 src.
 // Refreshed after CI must-fix (detector-clean fixtures + tool-surface 40):
 // no new file, no edge into src/index_lifecycle.
+// Refreshed after daemon reload/abort WatcherUnavailable 503 fix (PR #745):
+// same file count; byte churn in src/daemon.rs only.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "56da73a36c6034a58bf25f9379522199a932df1e1a09cacff0f702b0c2b8a526",
+    "7bf459cc1850ac95479666a3e88e64d5199afcee6f523d1aacb611d1136a1c1b",
     201,
-    10_242_320,
+    10_249_443,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
