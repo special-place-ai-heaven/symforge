@@ -3599,8 +3599,15 @@ args = ['/fixture/old/symforge']
         let text = std::fs::read_to_string(&path).unwrap();
         let doc = text.parse::<DocumentMut>().unwrap();
         assert!(toml_args(&doc).is_empty(), "{text}");
-        assert!(text.contains("/fixture/new/symforge"));
-        assert!(!text.contains("/fixture/old/symforge"));
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["command"].as_str(),
+            Some(native_command_path("/fixture/new/symforge").as_str()),
+            "{text}"
+        );
+        assert!(
+            !text.contains("old/symforge") && !text.contains("old\\symforge"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -1273,13 +1273,24 @@ fn generated_launch_pair_completes_mcp_initialize_tools_and_health() {
 
     for (name, command, args) in &launches {
         if *name == "claude-desktop" && cfg!(windows) {
+            // The registered command is `symforge-desktop.cmd`. Its temp dir
+            // is already dropped, and CreateProcess cannot run a `.cmd`. The
+            // shim is `cd` then `"<native>" %*`, so the handshake is the
+            // native binary with the args the shim forwards.
             assert!(args.is_empty(), "{name}: {args:?}");
-            assert!(std::path::Path::new(command).is_file(), "{command}");
+            assert!(
+                command
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .is_some_and(|file| file.eq_ignore_ascii_case("symforge-desktop.cmd")),
+                "{command}"
+            );
+            drive_stdio_mcp(name, &expected, args);
         } else {
             assert_eq!(command, &expected, "{name}");
             assert!(args.is_empty(), "{name}: {args:?}");
+            drive_stdio_mcp(name, command, args);
         }
-        drive_stdio_mcp(name, command, args);
     }
 }
 
