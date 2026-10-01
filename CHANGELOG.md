@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.10](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.9...v11.3.10) (2026-10-01)
+
+
+### Bug Fixes
+
+* **knowledge:** withhold plaintext credential values under quoted keys without flagging UI labels ([#738](https://github.com/special-place-ai-heaven/symforge/issues/738)) ([d8ee3d0](https://github.com/special-place-ai-heaven/symforge/commit/d8ee3d0c5e2bb1e75731e8e0e539851b43e55de8))
+
 ## [11.3.9](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.8...v11.3.9) (2026-09-30)
 
 
