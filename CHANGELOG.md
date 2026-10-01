@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.3.11](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.10...v11.3.11) (2026-10-01)
+
+
+### Bug Fixes
+
+* **persist:** keep terminal catalog entries across snapshot restore ([#739](https://github.com/special-place-ai-heaven/symforge/issues/739)) ([17e2831](https://github.com/special-place-ai-heaven/symforge/commit/17e28312e9b3916c70e6b5ee65ca046b3a4b57c4))
+
 ## [11.3.10](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.9...v11.3.10) (2026-10-01)
 
 
