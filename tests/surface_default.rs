@@ -187,17 +187,17 @@ async fn full_default_allows_legacy_tool_call_at_dispatch() {
     }
 }
 
-/// FR-015 / M-003: the default full advertised surface is EXACTLY 39 tools.
+/// FR-015 / M-003: the default full advertised surface is EXACTLY 40 tools.
 ///
 /// `assert_full_surface` only floors the count at 30; this pins the exact
 /// contract number so adding or dropping a `#[tool]` without a matching
-/// surface/spec update fails here. The 39 is tied to its cause: the advertised
-/// full surface is the registered router (`tool_definitions`, 40 tools including
+/// surface/spec update fails here. The 40 is tied to its cause: the advertised
+/// full surface is the registered router (`tool_definitions`, 41 tools including
 /// the `symforge` compact facade) with exactly `symforge` filtered out. Combined
 /// with `tests/conformance.rs` (registered set == `EXPECTED_TOOLS`, which tracks
 /// `SYMFORGE_TOOL_NAMES`), this pins advertised == allowlist minus `symforge`.
 #[tokio::test]
-async fn full_surface_advertises_exactly_39_tools() {
+async fn full_surface_advertises_exactly_40_tools() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::clear_symforge_surface();
 
@@ -210,8 +210,8 @@ async fn full_surface_advertises_exactly_39_tools() {
     let advertised = advertised_names(SurfaceProfile::Full);
     assert_eq!(
         advertised.len(),
-        39,
-        "default full surface must advertise exactly 39 tools (FR-015); got {}: {:?}",
+        40,
+        "default full surface must advertise exactly 40 tools (FR-015); got {}: {:?}",
         advertised.len(),
         advertised
     );

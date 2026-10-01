@@ -70,6 +70,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "status",
     "symforge",
     "symforge_edit",
+    "secret_remediate",
 ];
 
 const PUBLIC_CONFORMANCE_CORPUS_VERSION: u8 = 1;
@@ -622,7 +623,7 @@ fn all_tools_have_annotations() {
     // (idempotent). `index_folder` LEFT this bucket with the worktree-routing
     // fix: it is now honestly non-destructive — the working set is retained
     // and only the per-session ACTIVE pointer moves on the default spelling.
-    const DESTRUCTIVE_IDEMPOTENT_STATE: &[&str] = &["curate_knowledge"];
+    const DESTRUCTIVE_IDEMPOTENT_STATE: &[&str] = &["curate_knowledge", "secret_remediate"];
 
     let tools = SymForgeServer::tool_definitions();
 

@@ -1074,10 +1074,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // no new file, no edge into src/index_lifecycle.
 // Refreshed for 034 secret_remediate + withheld meta (src/protocol + tests):
 // +2 files, no edge into src/index_lifecycle.
+// Refreshed after CI must-fix (detector-clean fixtures + tool-surface 40):
+// no new file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "f1d3294084e48772870153a7a419a423de6996809c3b783a45c148136acbac8b",
+    "351bfcf63c21fe732c72bfdb6927b83267601c3a329dd6741319e063bb470d6d",
     201,
-    10_227_838,
+    10_236_590,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
