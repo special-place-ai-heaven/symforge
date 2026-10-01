@@ -318,6 +318,9 @@ fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateD
 pub(crate) struct HarnessScan {
     statuses: Vec<HarnessStatus>,
     grok_config_present: bool,
+    /// `~/.omp/agent/mcp.json` exists. OMP is registrable by `init` but is not
+    /// in the HTTP harness registry, same as Grok.
+    omp_config_present: bool,
     /// Harnesses whose registered command already runs the live binary.
     already_current: Vec<HarnessId>,
     /// Harnesses attached over HTTP: no binary path to repoint.
@@ -378,6 +381,12 @@ fn plan_reregistration(scan: &HarnessScan, swapped: bool) -> (Vec<HarnessId>, Ve
     if scan.grok_config_present {
         skipped.push(
             "skipped: Grok (the harness scan does not cover it; run `symforge init --client grok` if Grok uses SymForge)"
+                .to_string(),
+        );
+    }
+    if scan.omp_config_present {
+        skipped.push(
+            "skipped: Oh My Pi (the harness scan does not cover it; run `symforge init --client omp` if OMP uses SymForge)"
                 .to_string(),
         );
     }
@@ -802,7 +811,17 @@ impl UpdateOps for RealUpdateOps {
                 continue;
             }
             match crate::cli::harness::registered_command(status) {
-                Some(command) if self.runs_live_binary(&command) => {
+                // Command identity is not enough. A native command beside a
+                // wrapper's leftover args still fails the MCP handshake, so
+                // update re-inits that harness.
+                Some(command)
+                    if self.runs_live_binary(&command)
+                        && crate::cli::harness::registered_stdio_args(status).is_some_and(
+                            |args| {
+                                !crate::cli::init::stdio_launch_args_need_rewrite(&args, &command)
+                            },
+                        ) =>
+                {
                     already_current.push(status.id);
                 }
                 Some(_) => {}
@@ -812,6 +831,12 @@ impl UpdateOps for RealUpdateOps {
         HarnessScan {
             statuses,
             grok_config_present: self.home.join(".grok").join("config.toml").exists(),
+            omp_config_present: self
+                .home
+                .join(".omp")
+                .join("agent")
+                .join("mcp.json")
+                .exists(),
             already_current,
             http_attached,
         }
@@ -1900,6 +1925,7 @@ mod tests {
                 })
                 .collect(),
             grok_config_present: false,
+            omp_config_present: false,
             already_current: Vec::new(),
             http_attached: Vec::new(),
         }
@@ -2591,6 +2617,7 @@ mod tests {
             (HarnessId::KiloCode, HarnessState::PresentCurrent),
         ]);
         scan.grok_config_present = true;
+        scan.omp_config_present = true;
 
         let (targets, skipped) = plan_reregistration(&scan, true);
 
@@ -2609,6 +2636,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Grok"), "{text}");
+        assert!(
+            text.contains("Oh My Pi") && text.contains("--client omp"),
+            "{text}"
+        );
         assert!(
             !text.contains("Gemini") && !text.contains("Cursor"),
             "{text}"
@@ -3222,6 +3253,53 @@ mod tests {
         assert_eq!(scan.already_current, vec![HarnessId::ClaudeCode]);
         assert_eq!(scan.http_attached, vec![HarnessId::Gemini]);
         assert_eq!(plan_reregistration(&scan, false).0, vec![HarnessId::Cursor]);
+    }
+
+    #[test]
+    fn harness_scan_reregisters_when_the_live_command_still_has_wrapper_args() {
+        let (prefix, modules) = fake_install();
+        write_file(&installed_binary(&modules.join(TEST_PACKAGE)), "old-binary");
+        let home = tempfile::tempdir().unwrap();
+        let mut ops = RealUpdateOps::new(
+            std::env::consts::OS,
+            TEST_PACKAGE,
+            prefix.path().to_path_buf(),
+            home.path().to_path_buf(),
+        );
+        let live = ops.live_binary.display().to_string();
+        write_file(
+            &home.path().join(".cursor").join("mcp.json"),
+            &serde_json::json!({
+                "mcpServers": {
+                    "symforge": {
+                        "command": &live,
+                        "args": [r"C:\fixture\program files\old\symforge.exe"]
+                    }
+                }
+            })
+            .to_string(),
+        );
+        write_file(
+            &home.path().join(".codex").join("config.toml"),
+            &format!("[mcp_servers.symforge]\ncommand = {live:?}\nargs = []\n"),
+        );
+
+        let scan = ops.harness_scan();
+        let (targets, _) = plan_reregistration(&scan, false);
+        assert!(
+            targets.contains(&HarnessId::Cursor),
+            "stale wrapper args must be re-registered: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&HarnessId::Codex),
+            "a live command with empty args stays unchanged: {targets:?}"
+        );
+        assert!(
+            home.path()
+                .join(".cursor")
+                .join("mcp.json")
+                .starts_with(home.path())
+        );
     }
 
     #[test]
