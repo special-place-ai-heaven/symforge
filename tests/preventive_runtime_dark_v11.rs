@@ -1066,10 +1066,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // no new file, no edge into src/index_lifecycle.
 // Refreshed for narrowed natural-language label exemption (Diceware FN)
 // in src/knowledge/mod.rs: no new file, no edge into src/index_lifecycle.
+// Refreshed for daemon proxy home-evidence test isolation (protocol/mod.rs):
+// no new file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "7bf774b3a56e7a79e6c17838ce066f631091c8ab3b045d8993731a7c53ed9463",
+    "4ff5ac5edc06af1c36fe062a45329cb5c33714518a902eda825e2fa93393c9aa",
     199,
-    10_191_760,
+    10_195_179,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
