@@ -2565,7 +2565,12 @@ mod tests {
 
     async fn spawn_fake_tool_server(
         body: &str,
-    ) -> (String, tokio::sync::oneshot::Sender<()>, Arc<AtomicUsize>) {
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake daemon tool server");
@@ -2582,7 +2587,9 @@ mod tests {
             )
             .with_state(state);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        // Join handle: callers await after shutdown so the listen socket is gone
+        // before the next suite-ordered test rebinds (SO_REUSEADDR race).
+        let server_task = tokio::spawn(async move {
             let shutdown = async move {
                 let _ = shutdown_rx.await;
             };
@@ -2590,7 +2597,7 @@ mod tests {
                 .with_graceful_shutdown(shutdown)
                 .await;
         });
-        (base_url, shutdown_tx, calls)
+        (base_url, shutdown_tx, calls, server_task)
     }
 
     #[derive(Clone)]
@@ -2732,6 +2739,7 @@ mod tests {
         String,
         tokio::sync::oneshot::Sender<()>,
         Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        tokio::task::JoinHandle<()>,
     ) {
         spawn_project_echo_tool_server_with_policy(None, None, None, None, None).await
     }
@@ -2742,6 +2750,7 @@ mod tests {
         String,
         tokio::sync::oneshot::Sender<()>,
         Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        tokio::task::JoinHandle<()>,
     ) {
         spawn_project_echo_tool_server_with_policy(
             evidence_project_override,
@@ -2763,6 +2772,7 @@ mod tests {
         String,
         tokio::sync::oneshot::Sender<()>,
         Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        tokio::task::JoinHandle<()>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2783,7 +2793,9 @@ mod tests {
                 incoherent_evidence_for_tool: incoherent_evidence_for_tool.map(str::to_string),
             });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        // Join handle: callers await after shutdown so the listen socket is gone
+        // before the next suite-ordered test rebinds (SO_REUSEADDR race).
+        let server_task = tokio::spawn(async move {
             let shutdown = async move {
                 let _ = shutdown_rx.await;
             };
@@ -2791,7 +2803,7 @@ mod tests {
                 .with_graceful_shutdown(shutdown)
                 .await;
         });
-        (base_url, shutdown_tx, requests)
+        (base_url, shutdown_tx, requests, server_task)
     }
 
     #[derive(Clone)]
@@ -2874,7 +2886,7 @@ mod tests {
             "fixture must exercise a relative caller spelling: {relative}"
         );
 
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, requests, server_task) = spawn_project_echo_tool_server().await;
         let client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -2946,6 +2958,7 @@ mod tests {
         );
 
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
@@ -3084,7 +3097,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_proxy_ask_routes_the_whole_query_after_the_local_no_echo_guard() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, requests, server_task) = spawn_project_echo_tool_server().await;
         let client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -3128,18 +3141,19 @@ mod tests {
         assert!(rejected.contains("sensitive query rejected"), "{rejected}");
         assert!(!rejected.contains(&canary), "sensitive input must not echo");
 
-        let captured = requests.lock();
-        assert_eq!(
-            captured.len(),
-            2,
-            "the safety guard must reject before the daemon hop"
-        );
-        assert!(captured.iter().all(|(tool, _)| tool == "ask"));
-        assert_eq!(captured[0].1["project"], "foreign-project");
-        assert!(captured[1].1["project"].is_null());
-
-        drop(captured);
+        {
+            let captured = requests.lock();
+            assert_eq!(
+                captured.len(),
+                2,
+                "the safety guard must reject before the daemon hop"
+            );
+            assert!(captured.iter().all(|(tool, _)| tool == "ask"));
+            assert_eq!(captured[0].1["project"], "foreign-project");
+            assert!(captured[1].1["project"].is_null());
+        }
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
@@ -3374,19 +3388,32 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_proxy_success_without_receipt_does_not_reuse_home_evidence() {
-        let (base_url, shutdown, calls) =
+        // Isolation: seed coherent HOME evidence (project_id == project_key(root))
+        // so a missed clear-at-hop cannot hide behind validate()'s incoherence
+        // reject. Use a private control-state dir via new_for_test_at so this
+        // case never shares the process-global OnceLock placement with sibling
+        // daemon tests. Await the fake server JoinHandle after shutdown so the
+        // listen socket is gone before the next suite-ordered test rebinds.
+        let control_home = tempfile::TempDir::new().expect("isolated control-state home");
+        let control_state = crate::domain::ControlStateDir::new(control_home.path().to_path_buf());
+        let (base_url, shutdown, calls, server_task) =
             spawn_fake_tool_server("daemon-read-without-receipt").await;
-        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test_at(
             base_url,
             "home-project-id".to_string(),
             "session-id".to_string(),
             "home-project".to_string(),
+            control_state,
         );
         let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let home_root = tempfile::TempDir::new().expect("coherent home root");
+        let home_root_path = home_root.path().to_path_buf();
+        let home_id = crate::daemon::project_key(&home_root_path);
+        let home_canon = crate::daemon::normalized_path_string(&home_root_path);
         let home_evidence = crate::protocol::result_status::ProjectEvidence {
-            project_id: "home-project-id".to_string(),
+            project_id: home_id,
             project_name: "home-project".to_string(),
-            canonical_root: Some("C:/HOME_ROOT/home-project".to_string()),
+            canonical_root: Some(home_canon),
             generation: 3,
             index_state: "Ready".to_string(),
             load_source: "home-seed".to_string(),
@@ -3399,19 +3426,22 @@ mod tests {
                 .proxy_tool_call("find_references", &serde_json::json!({ "name": "cfg_if" }))
                 .await;
             assert_eq!(body.as_deref(), Some("daemon-read-without-receipt"));
+            let leftover = crate::protocol::result_status::current_project_evidence();
             assert!(
-                crate::protocol::result_status::current_project_evidence().is_none(),
-                "a successful proxy response without a daemon receipt must not reuse HOME"
+                leftover.is_none(),
+                "a successful proxy response without a daemon receipt must not reuse HOME; leftover={leftover:?}"
             );
         })
         .await;
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         let _ = shutdown.send(());
+        server_task.await.expect("fake tool server task");
+        drop((control_home, home_root));
     }
 
     #[tokio::test]
     async fn daemon_proxy_rejects_mismatched_or_set_valued_project_evidence() {
-        let (base_url, shutdown, requests) =
+        let (base_url, shutdown, requests, server_task) =
             spawn_project_echo_tool_server_with_evidence_project(Some("home-project")).await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
@@ -3490,11 +3520,12 @@ mod tests {
         }
         assert_eq!(requests.lock().len(), 6);
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
     async fn daemon_proxy_binds_an_omitted_selector_to_the_active_project() {
-        let (base_url, shutdown, requests) =
+        let (base_url, shutdown, requests, server_task) =
             spawn_project_echo_tool_server_with_evidence_project(Some("home-project")).await;
         let active = tempfile::TempDir::new().expect("active sibling root");
         let client = crate::daemon::DaemonSessionClient::new_for_test(
@@ -3572,21 +3603,23 @@ mod tests {
                 .expect("fake daemon response");
             assert!(body.contains(&format!("tool={tool_name}")), "{body}");
         }
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 10);
-        for (tool_name, args) in requests.iter().skip(1) {
-            assert_eq!(
-                args[crate::daemon::PRIVATE_PROJECT_ROUTE_PIN],
-                expected_active_id,
-                "selector-less {tool_name} must carry the canonical ACTIVE snapshot"
-            );
-            assert!(
-                args.get("project").is_none(),
-                "the private route pin must not widen the public {tool_name} schema"
-            );
+        {
+            let requests = requests.lock();
+            assert_eq!(requests.len(), 10);
+            for (tool_name, args) in requests.iter().skip(1) {
+                assert_eq!(
+                    args[crate::daemon::PRIVATE_PROJECT_ROUTE_PIN],
+                    expected_active_id,
+                    "selector-less {tool_name} must carry the canonical ACTIVE snapshot"
+                );
+                assert!(
+                    args.get("project").is_none(),
+                    "the private route pin must not widen the public {tool_name} schema"
+                );
+            }
         }
-        drop(requests);
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
@@ -3616,7 +3649,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_proxy_rejects_a_coherent_receipt_for_an_unresolved_selector() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, requests, server_task) = spawn_project_echo_tool_server().await;
         let active = tempfile::TempDir::new().expect("active sibling root");
         let client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
@@ -3648,6 +3681,7 @@ mod tests {
         .await;
         assert_eq!(requests.lock().len(), 1);
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
@@ -3778,7 +3812,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_degraded_clears_on_next_success() {
-        let (base_url, shutdown, calls) = spawn_fake_tool_server("daemon-ok").await;
+        let (base_url, shutdown, calls, server_task) = spawn_fake_tool_server("daemon-ok").await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "project-id".to_string(),
@@ -3795,6 +3829,7 @@ mod tests {
             .proxy_tool_call("health", &serde_json::json!({}))
             .await;
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
 
         assert_eq!(result.as_deref(), Some("daemon-ok"));
         assert_eq!(
@@ -3945,7 +3980,7 @@ mod tests {
     async fn daemon_proxy_with_durable_store_records_symforge_event_through() {
         // Fake daemon returns a non-empty body for any proxied primitive so the
         // serve path produces a real served body to finalize.
-        let (base_url, shutdown, _calls) =
+        let (base_url, shutdown, _calls, server_task) =
             spawn_fake_tool_server("references to cfg_if:\n  src/lib.rs:1").await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
@@ -3978,6 +4013,7 @@ mod tests {
             .await
             .expect("symforge_stel_handler dispatch");
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
 
         // The in-memory ledger recorded one event synchronously...
         assert_eq!(
@@ -4011,7 +4047,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_facade_omission_routes_active_selectorless_steps_without_public_project() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, requests, server_task) = spawn_project_echo_tool_server().await;
         let active = tempfile::tempdir().expect("active project root");
         let active_root = active.path().canonicalize().expect("canonical active root");
         let active_id = crate::daemon::project_key(&active_root);
@@ -4055,6 +4091,7 @@ mod tests {
         }
 
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
         let captured = requests.lock();
         assert_eq!(captured.len(), 2, "both selectorless plans must dispatch");
         assert_eq!(captured[0].0, "detect_impact");
@@ -4081,7 +4118,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_facade_routes_foreign_project_into_served_primitive() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, requests, server_task) = spawn_project_echo_tool_server().await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -4127,6 +4164,7 @@ mod tests {
             "typed evidence must carry the selected daemon root: {serialized}"
         );
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
 
         let requests = requests.lock();
         assert_eq!(
@@ -4149,7 +4187,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_facade_never_reuses_home_evidence_when_foreign_receipt_is_missing() {
-        let (base_url, shutdown, calls) =
+        let (base_url, shutdown, calls, server_task) =
             spawn_fake_tool_server("references to cfg_if:\n  foreign/src/lib.rs:1").await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
@@ -4211,11 +4249,12 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
     async fn daemon_facade_rejects_a_mismatched_foreign_project_receipt() {
-        let (base_url, shutdown, requests) =
+        let (base_url, shutdown, requests, server_task) =
             spawn_project_echo_tool_server_with_evidence_project(Some("home-project")).await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
@@ -4261,18 +4300,20 @@ mod tests {
         );
         assert_eq!(requests.lock().len(), 1);
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
     async fn daemon_facade_requires_one_consistent_receipt_for_every_foreign_step() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
-            None,
-            Some("search_files"),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let (base_url, shutdown, requests, server_task) =
+            spawn_project_echo_tool_server_with_policy(
+                None,
+                Some("search_files"),
+                None,
+                None,
+                None,
+            )
+            .await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -4316,23 +4357,27 @@ mod tests {
             }),
             "the public seam must disclose unavailable aggregate evidence exactly: {serialized}"
         );
-        let captured = requests.lock();
-        assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].0, "search_files");
-        assert_eq!(captured[1].0, "search_text");
+        {
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 2);
+            assert_eq!(captured[0].0, "search_files");
+            assert_eq!(captured[1].0, "search_text");
+        }
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
     async fn daemon_facade_requires_one_consistent_receipt_for_every_home_step() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
-            None,
-            Some("search_files"),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let (base_url, shutdown, requests, server_task) =
+            spawn_project_echo_tool_server_with_policy(
+                None,
+                Some("search_files"),
+                None,
+                None,
+                None,
+            )
+            .await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -4361,16 +4406,19 @@ mod tests {
             }),
             "one unattested HOME step makes the aggregate receipt unavailable: {serialized}"
         );
-        let captured = requests.lock();
-        assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].0, "search_files");
-        assert_eq!(captured[1].0, "search_text");
+        {
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 2);
+            assert_eq!(captured[0].0, "search_files");
+            assert_eq!(captured[1].0, "search_text");
+        }
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
     async fn daemon_facade_rejects_same_project_receipts_from_different_generations() {
-        let (base_url, shutdown, requests) =
+        let (base_url, shutdown, requests, server_task) =
             spawn_project_echo_tool_server_with_policy(None, None, Some("search_text"), None, None)
                 .await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
@@ -4411,23 +4459,27 @@ mod tests {
             }),
             "cross-generation aggregate evidence must be unavailable: {serialized}"
         );
-        let captured = requests.lock();
-        assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].0, "search_files");
-        assert_eq!(captured[1].0, "search_text");
+        {
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 2);
+            assert_eq!(captured[0].0, "search_files");
+            assert_eq!(captured[1].0, "search_text");
+        }
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
     async fn daemon_facade_does_not_reuse_home_evidence_for_a_malformed_receipt() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
-            None,
-            None,
-            None,
-            Some("find_references"),
-            None,
-        )
-        .await;
+        let (base_url, shutdown, requests, server_task) =
+            spawn_project_echo_tool_server_with_policy(
+                None,
+                None,
+                None,
+                Some("find_references"),
+                None,
+            )
+            .await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -4481,18 +4533,20 @@ mod tests {
         );
         assert_eq!(requests.lock().len(), 1);
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
     async fn daemon_facade_rejects_a_selector_matching_receipt_with_an_incoherent_root() {
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server_with_policy(
-            None,
-            None,
-            None,
-            None,
-            Some("find_references"),
-        )
-        .await;
+        let (base_url, shutdown, requests, server_task) =
+            spawn_project_echo_tool_server_with_policy(
+                None,
+                None,
+                None,
+                None,
+                Some("find_references"),
+            )
+            .await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -4533,6 +4587,7 @@ mod tests {
         );
         assert_eq!(requests.lock().len(), 1);
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
@@ -4542,7 +4597,7 @@ mod tests {
             GitTemporalStats,
         };
 
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, requests, server_task) = spawn_project_echo_tool_server().await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -4637,6 +4692,7 @@ mod tests {
         );
 
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
         let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, "find_dependents");
@@ -4660,7 +4716,7 @@ mod tests {
         )
         .expect("home anchor source");
 
-        let (base_url, shutdown, requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, requests, server_task) = spawn_project_echo_tool_server().await;
         let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
             base_url,
             "home-project-id".to_string(),
@@ -4752,6 +4808,7 @@ mod tests {
         );
 
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     #[tokio::test]
@@ -4762,7 +4819,7 @@ mod tests {
         source.push_str("pub fn shared() {}\n");
         std::fs::write(home_root.path().join("src/shared.rs"), source).expect("large home source");
 
-        let (base_url, shutdown, _requests) = spawn_project_echo_tool_server().await;
+        let (base_url, shutdown, _requests, server_task) = spawn_project_echo_tool_server().await;
         let make_server = || {
             let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
                 base_url.clone(),
@@ -4833,6 +4890,7 @@ mod tests {
         );
 
         let _ = shutdown.send(());
+        server_task.await.expect("fake daemon server task");
     }
 
     // ── ensure_local_index: root-mismatch invalidation (M2) ──────────────────
