@@ -1068,10 +1068,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // in src/knowledge/mod.rs: no new file, no edge into src/index_lifecycle.
 // Refreshed for daemon proxy home-evidence test isolation (protocol/mod.rs):
 // no new file, no edge into src/index_lifecycle.
+// Refreshed for terminal-catalog restore across snapshot verify (persist):
+// no new file, no edge into src/index_lifecycle.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "4ff5ac5edc06af1c36fe062a45329cb5c33714518a902eda825e2fa93393c9aa",
+    "82bf84d3c2078e143b2e9170a9a5acd4cf22d69b45c929b73f3483280af9e8e8",
     199,
-    10_195_179,
+    10_203_713,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
