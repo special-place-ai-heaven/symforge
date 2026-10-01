@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.4.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.4.0...v11.4.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **publish:** shrink the crates.io package under 10 MiB ([fade2c3](https://github.com/special-place-ai-heaven/symforge/commit/fade2c3c863305ae1271fd67de5255d4608955e6))
+
 ## [11.4.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.3.11...v11.4.0) (2026-10-01)
 
 
