@@ -1412,7 +1412,16 @@ fn test_arcswap_concurrent_reads_under_writer_pressure() {
         })
     };
 
-    thread::sleep(Duration::from_millis(750));
+    // Issue #752: a fixed sleep is a scheduling race. Readers can finish
+    // hundreds of consistent snapshots before the first clone-mutate-swap
+    // returns, which fails `swaps > 0` with `inconsistent == 0`. Wait until
+    // one swap is published, then stop. The deadline only detects a hung
+    // writer. Tear checks in the reader loop are unchanged.
+    let started = Instant::now();
+    let swap_deadline = Duration::from_secs(30);
+    while writer_swaps.load(Ordering::Relaxed) == 0 && started.elapsed() < swap_deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
     stop.store(true, Ordering::Relaxed);
 
     for h in reader_handles {
@@ -1430,16 +1439,14 @@ fn test_arcswap_concurrent_reads_under_writer_pressure() {
     );
     assert!(
         swaps > 0,
-        "writer did not complete any swaps during the stress window (reads={reads})"
+        "writer published no snapshot within {swap_deadline:?} (reads={reads})"
     );
     assert!(
         reads > 0,
         "reader throughput was zero while the writer was active (swaps={swaps})"
     );
-    // With 8 readers over ~750ms against a concurrent writer, ArcSwap should
-    // deliver thousands of reads. A regression that re-introduces reader-side
-    // locking or otherwise starves readers would collapse this toward zero;
-    // require at least 100 reads as a lower floor that is robust on loaded CI.
+    // Readers are already in flight when the first swap lands. A reader-side
+    // lock collapses this toward zero; 100 stays the floor.
     assert!(
         reads >= 100,
         "reader throughput suspiciously low: {reads} reads vs {swaps} swaps — possible reader starvation regression"
