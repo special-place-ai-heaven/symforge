@@ -12,6 +12,10 @@ import sys
 from pathlib import Path
 
 CANONICAL_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+# crates.io hard-rejects uploads at 10485760 bytes. Fail at 9.5 MiB so a
+# small addition cannot land a publish on the 413 line.
+CRATE_COMPRESSED_SIZE_LIMIT_BYTES = 9_961_472
+CRATES_IO_UPLOAD_LIMIT_BYTES = 10_485_760
 
 
 class ReleaseOpsError(RuntimeError):
@@ -290,11 +294,44 @@ def cargo_version_exists(crate_name: str, version: str) -> bool:
     return True
 
 
+def packaged_crate_path(root: Path, *, crate_name: str, version: str) -> Path:
+    return root / "target" / "package" / f"{crate_name}-{version}.crate"
+
+
+def measure_packaged_crate_bytes(root: Path, *, crate_name: str, version: str) -> int:
+    """Package without compiling and return the .crate size in bytes.
+
+    That size is the compressed upload crates.io measures. Missing archive
+    is a failure, not a size of zero.
+    """
+    run_checked(["cargo", "package", "--no-verify"], cwd=root)
+    crate_path = packaged_crate_path(root, crate_name=crate_name, version=version)
+    if not crate_path.is_file():
+        raise ReleaseOpsError(f"cargo package did not write {crate_path}")
+    return crate_path.stat().st_size
+
+
+def assert_packaged_crate_size(size: int) -> None:
+    if size >= CRATE_COMPRESSED_SIZE_LIMIT_BYTES:
+        raise ReleaseOpsError(
+            f"packaged crate is {size} bytes, at or above the "
+            f"{CRATE_COMPRESSED_SIZE_LIMIT_BYTES}-byte release guard "
+            f"(crates.io limit is {CRATES_IO_UPLOAD_LIMIT_BYTES})"
+        )
+
+
 def publish_cargo_crate(root: Path, *, crate_name: str, version: str) -> str:
     if cargo_version_exists(crate_name, version):
         print(f"{crate_name}@{version} already exists on crates.io; skipping publish.")
         return "skipped"
 
+    size = measure_packaged_crate_bytes(root, crate_name=crate_name, version=version)
+    assert_packaged_crate_size(size)
+    print(
+        f"{crate_name}-{version}.crate is {size} bytes "
+        f"(guard {CRATE_COMPRESSED_SIZE_LIMIT_BYTES}, "
+        f"crates.io limit {CRATES_IO_UPLOAD_LIMIT_BYTES})."
+    )
     run_checked(["cargo", "publish"], cwd=root)
     return "published"
 

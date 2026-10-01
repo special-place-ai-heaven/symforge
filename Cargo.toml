@@ -5,6 +5,43 @@ edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
 repository = "https://github.com/special-place-ai-heaven/symforge"
+# crates.io rejects uploads at 10 MiB compressed. docs/fixtures stays
+# (GOLDEN_ROUTES_FIXTURE). vendor/ is already omitted as nested packages.
+exclude = [
+  "symforge-banner.png",
+  "docs/diagrams/**",
+  "docs/reviews/**",
+  "docs/research/**",
+  "docs/superpowers/**",
+  "docs/archived/**",
+  "docs/dogfood/**",
+  "docs/solutions/**",
+  "docs/plans/**",
+  "docs/speckit/**",
+  "docs/*.md",
+  "docs/archive/**",
+  "docs/migrations/**",
+  "specs/**",
+  "research/**",
+  "scripts/**",
+  "execution/**",
+  "tasks/**",
+  "plans/**",
+  "npm/**",
+  ".agent/**",
+  ".cursor-plugin/**",
+  ".claude/**",
+  ".github/**",
+  ".specify/**",
+  "013-HANDOFF.md",
+  "SELF_UPDATE_PROCEDURE.md",
+  "CONTEXT.md",
+  "CLAUDE.md",
+  "AGENTS.md",
+  "diff.txt",
+  "setup.bat",
+  "CHANGELOG.md",
+]
 
 [lints.rust]
 unsafe_code = "deny"
