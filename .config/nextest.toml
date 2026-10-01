@@ -61,3 +61,19 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = "binary(hook_root_guard)"
 threads-required = "num-cpus"
+
+# ArcSwap writer-progress stress (tests/live_index_integration.rs). On
+# windows-native the writer can finish zero update_file swaps inside the
+# fixed ~750ms window while readers still complete and inconsistencies stay
+# zero: suite contention plus eight spinning readers, not a torn snapshot.
+# Class TIMING, issue #752. See docs/ci/known-flakes.md.
+#
+# The binary overrides above use threads-required = "num-cpus". That fills
+# this profile's test-threads = 8 pool only when the host has at least 8
+# logical CPUs. windows-native has fewer, so num-cpus would leave other
+# tests running. num-test-threads reserves every slot, which is nextest's
+# machine-exclusive value. Profile retries stay at 1; both attempts already
+# failed, and a higher global retry count is not the fix.
+[[profile.default.overrides]]
+filter = "binary(live_index_integration) and test(=test_arcswap_concurrent_reads_under_writer_pressure)"
+threads-required = "num-test-threads"
