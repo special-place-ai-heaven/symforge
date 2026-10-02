@@ -37,7 +37,14 @@ use crate::domain::ParseDiagnostic;
 // path is a PRIOR-FORMAT SEED: it never restores, its original bytes are
 // preserved in place for rollback, and a copy is quarantined under the
 // `.symforge/v11/` migration namespace (see `try_quarantine_v10_seed`).
-const CURRENT_VERSION: u32 = 8;
+//
+// 8 → 9 persists the trigram index. A version below current is peeked from
+// the leading postcard varint and refused before a full decode, so a prior
+// schema cannot decode as corrupt or load as this format. A higher varint is
+// not a future snapshot by itself: arbitrary bytes often begin with a
+// one-byte varint (`b'n'` is 110). That payload is a version mismatch only
+// when it still decodes; otherwise it is corrupt.
+const CURRENT_VERSION: u32 = 9;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -175,7 +182,8 @@ fn resolved_snapshot_state<'a>(
 /// Serializable snapshot of all per-file data in a `LiveIndex`.
 ///
 /// Does NOT include non-serializable fields (Instant, AtomicUsize, RwLock).
-/// Reverse index and trigram index are rebuilt from snapshot on load.
+/// The trigram index is stored (format 9). The reverse index is still rebuilt
+/// from snapshot references on load.
 #[derive(Serialize, Deserialize)]
 pub struct IndexSnapshot {
     pub version: u32,
@@ -184,6 +192,7 @@ pub struct IndexSnapshot {
     pub files: HashMap<String, IndexedFileSnapshot>,
     pub manifest: RepositoryManifest,
     pub code_signals: PersistedCodeSignals,
+    pub trigrams: super::trigram::PersistedTrigramIndex,
 }
 
 /// Serializable provenance for the immutable code-signal slice of a published generation.
@@ -282,6 +291,7 @@ fn capture_snapshot_build_input(index: &LiveIndex) -> SnapshotBuildInput {
         manifest_entries: index.manifest_entries.clone(),
         manifest: None,
         code_signals: None,
+        trigrams: index.trigram_index.to_persisted(),
     }
 }
 
@@ -675,6 +685,7 @@ pub fn checkpoint_shared_index(
             code_signals: Some(PersistedCodeSignals::from_published(
                 published.code_signals.as_ref(),
             )),
+            trigrams: published.live.trigram_index.to_persisted(),
         }
     };
     serialize_captured_snapshot(snapshot_input, project_root, state_placement)
@@ -737,49 +748,56 @@ pub fn reset_snapshot_state(
         .map_err(|_| anyhow::anyhow!("snapshot path lock poisoned"))?;
 
     if let Ok(existing_bytes) = std::fs::read(&snapshot_path) {
-        let mismatch = match postcard::from_bytes::<IndexSnapshot>(&existing_bytes) {
-            Ok(existing) if existing.version != CURRENT_VERSION => Some((
+        let mismatch = if let Some(version) = peeked_prior_format_version(&existing_bytes) {
+            Some((
                 "version-mismatch",
-                format!(
-                    "snapshot version {}, expected {}",
-                    existing.version, CURRENT_VERSION
-                ),
-            )),
-            Ok(existing)
-                if existing.manifest.secret_policy_version
-                    != crate::knowledge::SECRET_POLICY_VERSION =>
-            {
-                Some((
-                    "secret-policy-mismatch",
+                format!("snapshot version {version}, expected {CURRENT_VERSION}"),
+            ))
+        } else {
+            match postcard::from_bytes::<IndexSnapshot>(&existing_bytes) {
+                Ok(existing) if existing.version != CURRENT_VERSION => Some((
+                    "version-mismatch",
                     format!(
-                        "snapshot secret policy {}, expected {}",
-                        existing.manifest.secret_policy_version,
-                        crate::knowledge::SECRET_POLICY_VERSION
+                        "snapshot version {}, expected {}",
+                        existing.version, CURRENT_VERSION
                     ),
-                ))
-            }
-            Ok(existing) if existing.project_id != expected_project_id => Some((
-                "project-id-mismatch",
-                format!(
-                    "snapshot project {}, expected {}",
-                    existing.project_id.0, expected_project_id.0
-                ),
-            )),
-            Ok(existing) => {
-                let current = capture_snapshot_source_identity(
-                    project_root,
-                    expected_project_id.clone(),
-                    existing.source_identity.manifest_digest.clone(),
-                    existing.source_identity.indexed_content_digest.clone(),
-                );
-                match current.and_then(|current| {
-                    verify_snapshot_lineage_continuity(&existing, &current, project_root)
-                }) {
-                    Ok(()) => None,
-                    Err(error) => Some(("source-lineage-mismatch", error.to_string())),
+                )),
+                Ok(existing)
+                    if existing.manifest.secret_policy_version
+                        != crate::knowledge::SECRET_POLICY_VERSION =>
+                {
+                    Some((
+                        "secret-policy-mismatch",
+                        format!(
+                            "snapshot secret policy {}, expected {}",
+                            existing.manifest.secret_policy_version,
+                            crate::knowledge::SECRET_POLICY_VERSION
+                        ),
+                    ))
                 }
+                Ok(existing) if existing.project_id != expected_project_id => Some((
+                    "project-id-mismatch",
+                    format!(
+                        "snapshot project {}, expected {}",
+                        existing.project_id.0, expected_project_id.0
+                    ),
+                )),
+                Ok(existing) => {
+                    let current = capture_snapshot_source_identity(
+                        project_root,
+                        expected_project_id.clone(),
+                        existing.source_identity.manifest_digest.clone(),
+                        existing.source_identity.indexed_content_digest.clone(),
+                    );
+                    match current.and_then(|current| {
+                        verify_snapshot_lineage_continuity(&existing, &current, project_root)
+                    }) {
+                        Ok(()) => None,
+                        Err(error) => Some(("source-lineage-mismatch", error.to_string())),
+                    }
+                }
+                Err(error) => Some(("deserialize-error", error.to_string())),
             }
-            Err(error) => Some(("deserialize-error", error.to_string())),
         };
         if let Some((reason, detail)) = mismatch {
             let quarantine_path = quarantine_bad_snapshot_locked(
@@ -1230,6 +1248,21 @@ fn read_verified_artifact(project_root: &Path) -> Option<VerifiedArtifact> {
         return None;
     }
 
+    if let Some(version) = peeked_prior_format_version(&raw) {
+        warn!(
+            "team artifact snapshot version mismatch: got {version}, expected {CURRENT_VERSION} — will cold re-index"
+        );
+        try_quarantine_bad_artifact(
+            project_root,
+            &artifact_path,
+            &metadata_path,
+            &compressed,
+            "version-mismatch",
+            format!("snapshot version {version}, expected {CURRENT_VERSION}"),
+        );
+        return None;
+    }
+
     match postcard::from_bytes::<IndexSnapshot>(&raw) {
         Ok(snapshot)
             if snapshot.version == CURRENT_VERSION
@@ -1580,35 +1613,42 @@ fn write_snapshot(
 
     match std::fs::read(&final_path) {
         Ok(existing_bytes) => {
-            let mismatch = match postcard::from_bytes::<IndexSnapshot>(&existing_bytes) {
-                Ok(existing) => {
-                    if existing.version != CURRENT_VERSION {
-                        Some((
-                            "version-mismatch",
-                            format!(
-                                "snapshot version {}, expected {}",
-                                existing.version, CURRENT_VERSION
-                            ),
-                        ))
-                    } else if existing.project_id != snapshot.project_id {
-                        Some((
-                            "project-id-mismatch",
-                            format!(
-                                "snapshot project {}, expected {}",
-                                existing.project_id.0, snapshot.project_id.0
-                            ),
-                        ))
-                    } else {
-                        verify_snapshot_lineage_continuity(
-                            &existing,
-                            &snapshot.source_identity,
-                            project_root,
-                        )
-                        .err()
-                        .map(|error| ("source-identity-mismatch", error.to_string()))
+            let mismatch = if let Some(version) = peeked_prior_format_version(&existing_bytes) {
+                Some((
+                    "version-mismatch",
+                    format!("snapshot version {version}, expected {CURRENT_VERSION}"),
+                ))
+            } else {
+                match postcard::from_bytes::<IndexSnapshot>(&existing_bytes) {
+                    Ok(existing) => {
+                        if existing.version != CURRENT_VERSION {
+                            Some((
+                                "version-mismatch",
+                                format!(
+                                    "snapshot version {}, expected {}",
+                                    existing.version, CURRENT_VERSION
+                                ),
+                            ))
+                        } else if existing.project_id != snapshot.project_id {
+                            Some((
+                                "project-id-mismatch",
+                                format!(
+                                    "snapshot project {}, expected {}",
+                                    existing.project_id.0, snapshot.project_id.0
+                                ),
+                            ))
+                        } else {
+                            verify_snapshot_lineage_continuity(
+                                &existing,
+                                &snapshot.source_identity,
+                                project_root,
+                            )
+                            .err()
+                            .map(|error| ("source-identity-mismatch", error.to_string()))
+                        }
                     }
+                    Err(error) => Some(("deserialize-error", error.to_string())),
                 }
-                Err(error) => Some(("deserialize-error", error.to_string())),
             };
             if let Some((reason, detail)) = mismatch {
                 let quarantine_path = quarantine_bad_snapshot_locked(
@@ -1662,6 +1702,7 @@ fn write_snapshot(
     info!(
         bytes = bytes.len(),
         files = file_count,
+        trigram_postings = snapshot.trigrams.posting_count(),
         path = %final_path.display(),
         "index serialized to project data dir"
     );
@@ -1889,6 +1930,33 @@ fn try_quarantine_bad_snapshot(
     }
 }
 
+/// Postcard writes `IndexSnapshot.version` as the first varint and no struct
+/// header. Peek it so a prior-format payload is a version mismatch even when
+/// the rest of the schema no longer decodes.
+fn peek_snapshot_version(bytes: &[u8]) -> Option<u32> {
+    let mut value: u64 = 0;
+    for i in 0..5 {
+        let byte = *bytes.get(i)?;
+        value |= u64::from(byte & 0x7F) << (7 * i);
+        if byte & 0x80 == 0 {
+            return u32::try_from(value).ok();
+        }
+    }
+    None
+}
+
+/// `Some(version)` when the leading varint names a snapshot format older than
+/// [`CURRENT_VERSION`]. Those payloads are refused before decode.
+///
+/// `None` when the varint matches current, cannot be read, or is newer. A
+/// newer varint is not a future snapshot until the payload decodes with a
+/// different version field. Garbage often starts with a one-byte varint, and
+/// treating that as a version mismatch mislabels corrupt bytes.
+fn peeked_prior_format_version(bytes: &[u8]) -> Option<u32> {
+    let version = peek_snapshot_version(bytes)?;
+    (version < CURRENT_VERSION).then_some(version)
+}
+
 /// Load an `IndexSnapshot` from the project's data directory.
 ///
 /// Returns `None` (not panic) on:
@@ -1925,6 +1993,27 @@ pub fn load_snapshot(
         }
     };
 
+    if let Some(version) = peeked_prior_format_version(&bytes) {
+        // Frozen 020:T065: a prior-format snapshot is an untrusted seed —
+        // it confers no authority, its original bytes stay in place as the
+        // rollback artifact, and a copy lands in the `.symforge/v11/`
+        // migration quarantine. Rebuild fallback follows. The version is
+        // peeked so a schema this process can no longer decode still takes
+        // this path instead of a corrupt-deserialize quarantine. A higher
+        // varint is left for the decode below: only a payload that still
+        // decodes is a version mismatch.
+        warn!(
+            "index snapshot carries prior format {version} (current {CURRENT_VERSION}) — preserved in place, will re-index"
+        );
+        try_quarantine_v10_seed(
+            state_dir,
+            &path,
+            &bytes,
+            format!("snapshot format {version}, current {CURRENT_VERSION}"),
+        );
+        return None;
+    }
+
     let snapshot: IndexSnapshot = match postcard::from_bytes(&bytes) {
         Ok(s) => s,
         Err(e) => {
@@ -1941,13 +2030,10 @@ pub fn load_snapshot(
     };
 
     if snapshot.version != CURRENT_VERSION {
+        // Defense if the leading varint ever disagrees with the decoded field.
         if snapshot.version < CURRENT_VERSION {
-            // Frozen 020:T065: a prior-format (V10) snapshot is an untrusted
-            // seed — it confers no authority under V11, its original bytes
-            // stay in place as the rollback artifact, and a copy lands in the
-            // `.symforge/v11/` migration quarantine. Rebuild fallback follows.
             warn!(
-                "index snapshot carries retired format {} (current {}) — preserved as V10 seed, will re-index",
+                "index snapshot carries prior format {} (current {}) — preserved in place, will re-index",
                 snapshot.version, CURRENT_VERSION
             );
             try_quarantine_v10_seed(
@@ -2340,6 +2426,7 @@ pub fn snapshot_to_live_index_with_code_signals(
         files: snapshot_files,
         manifest,
         code_signals,
+        trigrams,
         ..
     } = snapshot;
     let manifest_entries = manifest.entries;
@@ -2377,8 +2464,24 @@ pub fn snapshot_to_live_index_with_code_signals(
     );
 
     let phase = Instant::now();
-    let trigram_index = super::trigram::TrigramIndex::build_from_files(&files);
-    tracing::info!("warm restore: trigram index built in {:?}", phase.elapsed());
+    let trigram_index = match super::trigram::TrigramIndex::from_persisted(trigrams) {
+        Some(index) if index.covers_files(&files) => {
+            tracing::info!(
+                "warm restore: trigram index loaded from snapshot ({} postings) in {:?}",
+                index.posting_count(),
+                phase.elapsed()
+            );
+            index
+        }
+        _ => {
+            tracing::warn!(
+                "warm restore: persisted trigram index unusable; rebuilding from restored files"
+            );
+            let index = super::trigram::TrigramIndex::build_from_files(&files);
+            tracing::info!("warm restore: trigram index built in {:?}", phase.elapsed());
+            index
+        }
+    };
 
     let mut index = LiveIndex {
         files,
@@ -2647,6 +2750,7 @@ pub(crate) struct SnapshotBuildInput {
     manifest_entries: Vec<CatalogEntry>,
     manifest: Option<RepositoryManifest>,
     code_signals: Option<PersistedCodeSignals>,
+    trigrams: super::trigram::PersistedTrigramIndex,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2713,6 +2817,7 @@ fn build_snapshot(
         manifest_entries,
         manifest,
         code_signals,
+        trigrams,
     } = snapshot_input;
     let mut snap_files = HashMap::with_capacity(files.len());
 
@@ -2828,6 +2933,7 @@ fn build_snapshot(
         files: snap_files,
         manifest,
         code_signals,
+        trigrams,
     })
 }
 
@@ -6579,10 +6685,12 @@ mod tests {
     // src/live_index/persist.rs"). Format-7 files are preserved V10 seeds —
     // never restored, never destroyed
     // (`a_v10_format_snapshot_is_a_preserved_seed_never_authority`).
+    // 8 → 9 persists the trigram index so warm restore does not rebuild it.
+    // Format 8 and earlier stay prior-format seeds (`prior_format_snapshot_is_peeked_and_not_restored`).
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 8,
+            CURRENT_VERSION, 9,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );
@@ -6869,6 +6977,111 @@ mod tests {
         };
         files.sort();
         files
+    }
+
+    #[test]
+    fn warm_restore_uses_persisted_trigrams_instead_of_rebuilding() {
+        let tmp = TempDir::new().unwrap();
+        let content = b"fn unique_token_xyzzy() {}\n";
+        std::fs::write(tmp.path().join("a.rs"), content).unwrap();
+        let index = make_live_index_with_files(vec![("a.rs", content)]);
+        serialize_index(&index, tmp.path()).expect("serialize");
+
+        let snapshot = load_snapshot(tmp.path()).expect("load");
+        assert_eq!(
+            snapshot.trigrams,
+            index.trigram_index.to_persisted(),
+            "snapshot must carry the in-memory trigram index"
+        );
+        assert_eq!(
+            super::peek_snapshot_version(
+                &std::fs::read(tmp.path().join(".symforge").join("index.bin")).unwrap()
+            ),
+            Some(CURRENT_VERSION)
+        );
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
+        let mut found = loaded
+            .trigram_index
+            .search(b"unique_token_xyzzy", &loaded.files);
+        found.sort();
+        assert_eq!(found, vec!["a.rs".to_string()]);
+
+        // A posting list that cannot come from these bytes. If warm restore
+        // rebuilt from file content, the query would hit.
+        let mut poisoned = load_snapshot(tmp.path()).expect("reload snapshot");
+        let id = poisoned.trigrams.paths[0].0;
+        poisoned.trigrams.postings = vec![(0, vec![id])];
+        let poisoned_index = snapshot_to_live_index(poisoned, tmp.path());
+        assert!(
+            poisoned_index
+                .trigram_index
+                .search(b"unique_token_xyzzy", &poisoned_index.files)
+                .is_empty(),
+            "warm restore must serve persisted trigrams, not rebuild them from file bytes"
+        );
+    }
+
+    /// Format 8 is the last schema that rebuilt trigrams on load. Its body is
+    /// not a format-9 snapshot; the leading varint alone must refuse it and
+    /// preserve the original, the same way a decodable older version is a seed.
+    #[test]
+    fn prior_format_snapshot_is_peeked_and_not_restored() {
+        let tmp = TempDir::new().unwrap();
+        let bytes = vec![8u8];
+        let dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.bin"), &bytes).unwrap();
+
+        assert!(
+            load_snapshot(tmp.path()).is_none(),
+            "a format-8 payload must not restore as format 9"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("index.bin")).unwrap(),
+            bytes,
+            "prior-format original must be preserved, not quarantined as corrupt"
+        );
+        let v11_quarantine = dir.join("v11").join("quarantine").join("index-snapshots");
+        let metadata: Vec<PathBuf> = std::fs::read_dir(&v11_quarantine)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(metadata.len(), 1);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata[0]).unwrap()).unwrap();
+        assert_eq!(metadata["reason"], "v10-format-seed");
+        assert!(
+            metadata["detail"].as_str().unwrap().contains("format 8"),
+            "detail should name the peeked version: {}",
+            metadata["detail"]
+        );
+    }
+
+    /// A bare varint above the current format is not a snapshot. The same
+    /// encoding is how arbitrary bytes begin (`b"not valid..."` peeks as 110),
+    /// so an undecodable higher varint quarantines as corrupt. A coherent
+    /// higher version still decodes and is `version-mismatch`
+    /// (`test_version_mismatch_quarantines_snapshot_and_returns_none`).
+    #[test]
+    fn future_truncated_varint_is_corrupt_not_a_version_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        // postcard varint 999: 999 = 0x3E7 → 0xE7, 0x07
+        let bytes = vec![0xE7, 0x07];
+        let dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.bin"), &bytes).unwrap();
+
+        assert!(load_snapshot(tmp.path()).is_none());
+        assert!(
+            !dir.join("index.bin").exists(),
+            "undecodable bytes are quarantined and removed"
+        );
+        let quarantine_metadata = quarantine_files_with_extension(tmp.path(), "json");
+        assert_eq!(quarantine_metadata.len(), 1);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&quarantine_metadata[0]).unwrap()).unwrap();
+        assert_eq!(metadata["reason"], "deserialize-error");
     }
 
     #[test]
@@ -7372,7 +7585,8 @@ mod tests {
     fn test_corrupt_bytes_quarantined_and_returns_none_no_panic() {
         let tmp = TempDir::new().unwrap();
 
-        // Write random garbage
+        // Write random garbage. The leading byte is `n` (postcard varint 110),
+        // which must not be read as a future snapshot format.
         let dir = tmp.path().join(".symforge");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
