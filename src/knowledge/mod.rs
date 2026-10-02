@@ -192,13 +192,26 @@ pub struct SecretMatchSpan {
 /// Like [`scan_secret_bytes`], but also returns byte spans for each kept finding
 /// so remediation can rewrite without a second detector. Spans never leave the
 /// remediation apply path as wire data.
-pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> Vec<SecretMatchSpan> {
+/// Result of [`scan_secret_spans`]. Capture-miss / compile / limit failures are
+/// [`Indeterminate`](SecretSpansScan::Indeterminate) — matching [`scan_secret_bytes`] —
+/// never an empty span list that would look Clean.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecretSpansScan {
+    Spans(Vec<SecretMatchSpan>),
+    Indeterminate { reason: DetectorFailure },
+}
+
+pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
     if exceeds_scan_limit(bytes.len()) {
-        return Vec::new();
+        return SecretSpansScan::Indeterminate {
+            reason: DetectorFailure::ResourceLimit,
+        };
     }
     let rules = match SECRET_RULES.get_or_init(compile_secret_rules) {
         Ok(rules) => rules,
-        Err(_) => return Vec::new(),
+        Err(reason) => {
+            return SecretSpansScan::Indeterminate { reason: *reason };
+        }
     };
     let mut spans = Vec::new();
     for rule in rules {
@@ -216,7 +229,9 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> Vec<SecretMatchSpan> {
             } else {
                 (1..=rule.secret_capture).find_map(|index| captures.get(index))
             }) else {
-                return Vec::new();
+                return SecretSpansScan::Indeterminate {
+                    reason: DetectorFailure::Internal,
+                };
             };
             let match_start = context_assignment_match_start(
                 rule.id,
@@ -270,7 +285,7 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> Vec<SecretMatchSpan> {
             }
         }
     }
-    spans
+    SecretSpansScan::Spans(spans)
 }
 
 struct SecretRule {

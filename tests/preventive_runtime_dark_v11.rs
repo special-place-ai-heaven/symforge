@@ -1082,10 +1082,24 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // same file count; byte churn in src/daemon.rs only.
 // Refreshed for MCP launch-pair repair (src/cli/init.rs, harness.rs,
 // update.rs, mod.rs): same file count, no edge into src/index_lifecycle.
+// Refreshed after 034 US3/US4 secret_remediate + dismissals (+ soft residuals)
+// rebased onto main: +1 src file (secret_dismissals.rs); no edges into
+// src/index_lifecycle. Pin recomputed for merged tree.
+// Digest corrected to the source-set oracle. That refresh recorded the
+// right census (202 files, 10_344_185 LF-normalized bytes) and a digest
+// the hasher does not produce. Re-reviewed the same src delta: added
+// secret_dismissals.rs; secret_remediate encrypt + dismiss; read_gate
+// dismissal override; SecretSpansScan::Indeterminate; withheld sops PATH
+// probe; edit replay helpers widened to pub(crate). No new token or call
+// edge into src/index_lifecycle or server_api.rs.
+// Refreshed after the read-gate special-file fail-closed fix: regular-file
+// open in read_gate (dismissal override and disclosure read), dismissal
+// store read, and secret_remediate caller-path reads. No new file, no edge
+// into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "71748d3fc22fc06b90935d3ef1a2529d4094f2703947d9cf3f32ceda1fd4935f",
-    201,
-    10_310_858,
+    "34cd935f8cb2ba37e77f2ecfae6516038f5369ed65a6c5d9a0bbd9da1926e499",
+    202,
+    10_348_961,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

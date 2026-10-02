@@ -23,7 +23,7 @@ pub enum RemediationActionName {
 }
 
 impl RemediationActionName {
-    pub const fn as_str(self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Externalize => "externalize",
             Self::Encrypt => "encrypt",
@@ -119,17 +119,47 @@ fn default_content_actions() -> Vec<RemediationActionAvailability> {
             available: true,
             reason: None,
         },
-        RemediationActionAvailability {
-            name: RemediationActionName::Encrypt,
-            available: false,
-            reason: Some("sops_not_installed".to_string()),
-        },
+        encrypt_action_availability(),
         RemediationActionAvailability {
             name: RemediationActionName::Dismiss,
             available: true,
             reason: None,
         },
     ]
+}
+
+/// Encrypt availability for withheld meta: PATH probe only (no `.sops.yaml` read
+/// here — recipient is verified on the remediation tool path).
+pub fn encrypt_action_availability() -> RemediationActionAvailability {
+    if sops_on_path() {
+        RemediationActionAvailability {
+            name: RemediationActionName::Encrypt,
+            available: true,
+            reason: Some("recipient_verified_at_tool".to_string()),
+        }
+    } else {
+        RemediationActionAvailability {
+            name: RemediationActionName::Encrypt,
+            available: false,
+            reason: Some("sops_not_installed".to_string()),
+        }
+    }
+}
+
+fn sops_on_path() -> bool {
+    // Cached per-process: meta attaches on many refusals; PATH does not thrash.
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths).any(|dir| {
+                    let candidate = dir.join(if cfg!(windows) { "sops.exe" } else { "sops" });
+                    candidate.is_file()
+                })
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn unavailable_all(reason: &str) -> Vec<RemediationActionAvailability> {

@@ -656,7 +656,7 @@ fn prepare_project_wide_rename(
     }
 }
 
-fn begin_mutation_replay<T: Serialize>(
+pub(crate) fn begin_mutation_replay<T: Serialize>(
     server: &SymForgeServer,
     tool_name: &str,
     input: &T,
@@ -808,7 +808,7 @@ fn complete_mutation_replay(
 /// Complete a replay record from a receipt already built off bytes the
 /// caller wrote itself (T038 round-1: the single-target edit tools — no
 /// re-read, no post-permit window).
-fn complete_mutation_replay_with_receipt(
+pub(crate) fn complete_mutation_replay_with_receipt(
     idempotency: &Option<crate::idempotency::ActiveReplay>,
     output: &mut String,
     post_image: Option<crate::idempotency::PostImageReceipt>,
@@ -822,13 +822,16 @@ fn complete_mutation_replay_with_receipt(
     }
 }
 
-fn fail_mutation_replay(idempotency: &Option<crate::idempotency::ActiveReplay>, output: &str) {
+pub(crate) fn fail_mutation_replay(
+    idempotency: &Option<crate::idempotency::ActiveReplay>,
+    output: &str,
+) {
     if let Some(idempotency) = idempotency {
         let _ = idempotency.fail(output.to_string());
     }
 }
 
-fn fail_and_return_mutation_replay(
+pub(crate) fn fail_and_return_mutation_replay(
     idempotency: &Option<crate::idempotency::ActiveReplay>,
     output: String,
 ) -> String {
