@@ -915,12 +915,6 @@ async fn dismiss_apply_refuses_when_store_cannot_be_loaded() {
     std::fs::create_dir(dir.path().join(".git")).unwrap();
     let body = format!("{{\n  \"password\": \"{SYNTHETIC_SECRET}\"\n}}\n");
     write_file(dir.path(), "config/app.json", &body);
-    let prior = b"KEEP-ME-UNTOUCHED";
-    write_file(
-        dir.path(),
-        ".symforge/secret-dismissals.json",
-        std::str::from_utf8(prior).unwrap(),
-    );
     let server = server_for_repo(dir.path());
     let refusal = dispatch(
         &server,
@@ -932,6 +926,12 @@ async fn dismiss_apply_refuses_when_store_cannot_be_loaded() {
         .as_str()
         .unwrap()
         .to_string();
+    let prior = b"KEEP-ME-UNTOUCHED";
+    write_file(
+        dir.path(),
+        ".symforge/secret-dismissals.json",
+        std::str::from_utf8(prior).unwrap(),
+    );
     let apply = dispatch(
         &server,
         "secret_remediate",
