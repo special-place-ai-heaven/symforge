@@ -443,6 +443,9 @@ fn lane_readiness_text(readiness: Option<KnowledgeLaneReadiness>) -> &'static st
         Some(KnowledgeLaneReadiness::IndexScoutingOrVerifying) => {
             "index_scouting_or_verifying; retry after the current publication completes"
         }
+        Some(KnowledgeLaneReadiness::KnowledgeBridgeLoading) => {
+            "knowledge_bridge_loading; retry after the knowledge bridge publication completes"
+        }
         Some(KnowledgeLaneReadiness::NoValidSource) => {
             "no_valid_source; run index_folder to rebuild from repository source"
         }
@@ -658,6 +661,7 @@ fn derived_coverage_label(coverage: &DerivedCoverage) -> &'static str {
     match coverage {
         DerivedCoverage::Complete => "complete",
         DerivedCoverage::Truncated { .. } => "truncated",
+        DerivedCoverage::Loading => "loading",
     }
 }
 
@@ -1308,6 +1312,55 @@ mod tests {
                 && degraded_hit.contains("freshness=verifying")
                 && degraded_hit.contains("overall_coverage=degraded"),
             "last-valid evidence may be served only with degraded provenance: {degraded_hit}"
+        );
+    }
+
+    #[test]
+    fn loading_knowledge_bridge_does_not_claim_a_complete_miss() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("docs")).expect("docs");
+        std::fs::write(
+            project.path().join("docs").join("recovery.md"),
+            "# Recovery\nRetained evidence remains available.\n",
+        )
+        .expect("document");
+        let shared = LiveIndex::load(project.path()).expect("load generation");
+        shared.install_loading_knowledge_for_test();
+        let loading = shared.published_source_set().current_generation();
+        assert!(matches!(
+            loading.bridge.coverage,
+            crate::live_index::knowledge_bridge::DerivedCoverage::Loading
+        ));
+        let output = search_current(&loading, &input("retained evidence"));
+        assert!(
+            output.contains("knowledge_bridge_loading")
+                && output.contains("bridge_coverage=loading")
+                && !output.contains("no_evidence_complete")
+                && !output.contains("docs/recovery.md"),
+            "a loading bridge must not serve hits or claim complete absence: {output}"
+        );
+        let review = crate::protocol::knowledge_review::review_current(
+            &loading,
+            &crate::protocol::search_tools::ReviewKnowledgeInput {
+                mode: crate::protocol::search_tools::ReviewKnowledgeMode::Summary,
+                path: None,
+                path_prefix: None,
+                source_scope: Some(KnowledgeSourceScope::Current),
+                project: None,
+                projects: None,
+                limit: Some(1),
+                max_tokens: None,
+            },
+        );
+        let review = review.expect_err("review must refuse a loading bridge");
+        assert!(
+            review.contains("knowledge_bridge_loading"),
+            "review refusal must name the loading bridge: {review}"
+        );
+        let map = crate::protocol::knowledge_model::render_repository_knowledge_map(&loading);
+        assert!(
+            map.contains("bridge=loading") && map.contains("still publishing"),
+            "knowledge map must not look like an empty complete corpus: {map}"
         );
     }
 

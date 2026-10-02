@@ -173,6 +173,18 @@ pub(crate) fn review_current(
         }
         _ => {}
     }
+    if matches!(
+        generation.bridge.coverage,
+        crate::live_index::knowledge_bridge::DerivedCoverage::Loading
+    ) || matches!(
+        generation.authority.coverage,
+        crate::live_index::knowledge_bridge::DerivedCoverage::Loading
+    ) {
+        return Err(
+            "Readiness: knowledge_bridge_loading; retry after the knowledge bridge publication completes."
+                .to_string(),
+        );
+    }
     let envelope = generation.source_response_envelope().ok_or_else(|| {
         "Readiness: no_valid_source; source envelope is unavailable and no evidence was served."
             .to_string()
@@ -1310,6 +1322,7 @@ fn derived_coverage_label(
 ) -> String {
     match coverage {
         crate::live_index::knowledge_bridge::DerivedCoverage::Complete => "complete".to_string(),
+        crate::live_index::knowledge_bridge::DerivedCoverage::Loading => "loading".to_string(),
         crate::live_index::knowledge_bridge::DerivedCoverage::Truncated { breaches } => format!(
             "truncated([{}])",
             breaches

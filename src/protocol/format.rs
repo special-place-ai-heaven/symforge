@@ -2483,6 +2483,7 @@ fn derived_coverage_label(coverage: &DerivedCoverage) -> String {
             let omitted: u64 = breaches.iter().map(|breach| breach.omitted).sum();
             format!("truncated({omitted} omitted)")
         }
+        DerivedCoverage::Loading => "loading".to_string(),
     }
 }
 
@@ -2537,6 +2538,11 @@ fn policy_status_label(status: &PolicyLedgerStatus) -> String {
 }
 
 fn render_authority_hygiene_line(authority: &KnowledgeAuthorityView) -> String {
+    // Policy status is not observed while the bridge is still publishing.
+    // Printing Absent here would claim a ledger read that did not happen.
+    if matches!(authority.coverage, DerivedCoverage::Loading) {
+        return "Authority hygiene: coverage=loading curation_eligible=false".to_string();
+    }
     format!(
         "Authority hygiene: rule_version={} policy_version={} secret_policy_version={} policy_status={} curation_eligible={} records={} filtered_suppressions={} coverage={}",
         authority.versions.authority_rule_version,

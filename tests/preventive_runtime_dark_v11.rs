@@ -1007,10 +1007,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // index_progress, and search_knowledge on the handle. Same 20 excluded
 // paths; contents of embedded.rs / public_api.rs / process_runtime.rs /
 // registry.rs / snapshot.rs / activation.rs grew.
+// Refreshed for deferred knowledge-bridge publication: embedded.rs labels
+// DerivedCoverage::Loading. Same 20 paths. No new inbound call edge into
+// src/index_lifecycle; the arm is inside the excluded file.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "39b3fc66fe0d49a1cf70ac82b58b966491f5cbf000c1b08e5c4232c1fd40dfcc",
+    "cecbd130ae4acdc419712c6e06a9bff6cf16784b53e5de14efadd1f1888270e4",
     20,
-    465_068,
+    465_164,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1101,10 +1104,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // dismiss apply refuses when the dismissal store cannot be loaded. Same 202
 // files; byte churn is src/protocol/secret_remediate.rs only. No new token
 // or call edge into src/index_lifecycle or server_api.rs.
+// Refreshed for deferred knowledge-bridge publication off the Ready path
+// (store, daemon, serve, cli, knowledge search/review/model, authority).
+// Same 202 files. The only index_lifecycle edit is the Loading label arm
+// inside embedded.rs; no new inbound call edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "6c0f56c63612e696ec109243e8635a5f9a45e1ecbe2d93c6f56e3a08cc92d3e2",
+    "453598dcf3241853693e49e841c81b403a5909f3add3e478df137ed8086e69fc",
     202,
-    10_352_819,
+    10_374_174,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

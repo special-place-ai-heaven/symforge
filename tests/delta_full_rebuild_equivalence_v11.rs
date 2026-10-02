@@ -156,6 +156,7 @@ fn variant_tag<T: std::fmt::Debug>(value: &T) -> String {
 fn coverage_row(coverage: &DerivedCoverage) -> String {
     match coverage {
         DerivedCoverage::Complete => "coverage:complete".to_string(),
+        DerivedCoverage::Loading => "coverage:loading".to_string(),
         DerivedCoverage::Truncated { breaches } => {
             let mut kinds: Vec<String> = breaches
                 .iter()

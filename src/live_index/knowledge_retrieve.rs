@@ -52,6 +52,8 @@ pub enum KnowledgeWithheldReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnowledgeLaneReadiness {
     IndexScoutingOrVerifying,
+    /// The code index may already be Ready. The knowledge bridge is not.
+    KnowledgeBridgeLoading,
     NoValidSource,
     EnvelopeUnavailable,
     EvidenceWithheld,
@@ -483,6 +485,19 @@ fn extract_lane(
             );
         }
         _ => {}
+    }
+
+    // Code tools may already be Ready. An empty loading bridge is not a
+    // searched corpus: refuse rather than report a complete absence.
+    if matches!(generation.bridge.coverage, DerivedCoverage::Loading)
+        || matches!(generation.authority.coverage, DerivedCoverage::Loading)
+    {
+        return empty(
+            Some(KnowledgeLaneReadiness::KnowledgeBridgeLoading),
+            None,
+            0,
+            Vec::new(),
+        );
     }
 
     let Some(envelope) = generation.source_response_envelope() else {

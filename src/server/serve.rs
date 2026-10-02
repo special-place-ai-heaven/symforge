@@ -398,7 +398,7 @@ fn load_serve_index(
                     snapshot_verify_state = ?live.snapshot_verify_state(),
                     "serve: loaded serialized index from .symforge/index.bin"
                 );
-                let shared = crate::live_index::SharedIndexHandle::shared_for_state_placement_with_code_signals(
+                let shared = crate::live_index::SharedIndexHandle::shared_restored_for_state_placement_with_code_signals(
                     live,
                     &root,
                     &state_placement,

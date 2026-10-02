@@ -201,6 +201,12 @@ pub enum DerivedCoverage {
     Truncated {
         breaches: Vec<LimitBreach>,
     },
+    /// Cards have not been built for this publication yet.
+    ///
+    /// An empty card list with this coverage is not a complete absence of
+    /// knowledge. Restart-restore publishes it so code tools can become Ready
+    /// while the bridge fills; readers must keep saying the bridge is loading.
+    Loading,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -212,6 +218,16 @@ pub struct KnowledgeBridge {
     pub knowledge_links: Vec<KnowledgeKnowledgeLink>,
     pub reverse_knowledge: BTreeMap<KnowledgeAnchorId, Vec<u32>>,
     pub coverage: DerivedCoverage,
+}
+
+impl KnowledgeBridge {
+    /// Placeholder published before the background bridge build finishes.
+    pub(crate) fn loading() -> Self {
+        Self {
+            coverage: DerivedCoverage::Loading,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1522,7 +1538,7 @@ mod tests {
 
     fn breach_kinds(bridge: &KnowledgeBridge) -> BTreeSet<DerivedLimitKind> {
         match &bridge.coverage {
-            DerivedCoverage::Complete => BTreeSet::new(),
+            DerivedCoverage::Complete | DerivedCoverage::Loading => BTreeSet::new(),
             DerivedCoverage::Truncated { breaches } => {
                 breaches.iter().map(|breach| breach.kind).collect()
             }

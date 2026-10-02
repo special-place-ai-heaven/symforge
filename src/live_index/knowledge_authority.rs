@@ -196,7 +196,10 @@ pub fn summarize_code_evidence(mut facts: CodeEvidenceFacts) -> CodeEvidenceSumm
         CodeEvidenceDisplay::RelevantCodeChangedSinceDocument
     } else if !facts.review_signal_ids.is_empty() {
         CodeEvidenceDisplay::ReviewDue
-    } else if matches!(facts.coverage, DerivedCoverage::Truncated { .. }) {
+    } else if matches!(
+        facts.coverage,
+        DerivedCoverage::Truncated { .. } | DerivedCoverage::Loading
+    ) {
         CodeEvidenceDisplay::Partial
     } else if facts.unresolved_semantics {
         CodeEvidenceDisplay::Unresolved
@@ -802,6 +805,11 @@ pub fn build_knowledge_authority(
     secret_policy_version: u32,
     limits: &AuthorityLimits,
 ) -> KnowledgeAuthorityView {
+    // A startup placeholder has no cards yet. Building authority from it would
+    // report a complete empty ledger. Keep the loading coverage instead.
+    if matches!(bridge.coverage, DerivedCoverage::Loading) {
+        return KnowledgeAuthorityView::loading(content_generation);
+    }
     let mut units = collect_authority_units(live, source, content_generation);
     let policy = evaluate_policy(live, &units);
     apply_policy(&mut units, &policy);
@@ -1669,7 +1677,7 @@ fn authority_record_metadata_bytes(record: &KnowledgeAuthorityRecord) -> usize {
 
 fn coverage_breaches(coverage: &DerivedCoverage) -> Vec<LimitBreach> {
     match coverage {
-        DerivedCoverage::Complete => Vec::new(),
+        DerivedCoverage::Complete | DerivedCoverage::Loading => Vec::new(),
         DerivedCoverage::Truncated { breaches } => breaches.clone(),
     }
 }
@@ -1692,6 +1700,21 @@ fn normalize_breaches(breaches: &mut Vec<LimitBreach>) {
         }
     }
     *breaches = normalized;
+}
+
+impl KnowledgeAuthorityView {
+    /// Authority has not been derived yet because the bridge is still loading.
+    ///
+    /// `curation_eligible` stays false so a curation plan cannot commit against
+    /// an empty stand-in ledger. Policy status is not observed here.
+    pub(crate) fn loading(content_generation: u64) -> Self {
+        Self {
+            content_generation,
+            coverage: DerivedCoverage::Loading,
+            curation_eligible: false,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for KnowledgeAuthorityView {

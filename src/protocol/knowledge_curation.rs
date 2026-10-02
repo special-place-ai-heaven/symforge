@@ -389,6 +389,9 @@ impl KnowledgeCurationCoordinator {
         let lock_file = open_and_lock(&curation_dir.join(LOCK_FILE))
             .map_err(|error| durable_state_error(&error))?;
         let result = (|| {
+            // Replay needs the real ledger. The no-replay path returned above
+            // and does not wait. Code-tool Ready does not wait either.
+            index.wait_until_knowledge_bridge_published();
             let generation = index.published_source_set().current_generation();
             // The fail-closed re-validation, under the lock, against the
             // generation observed inside it.
