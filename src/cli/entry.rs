@@ -607,7 +607,7 @@ async fn run_local_mcp_server_async(
                 "loaded serialized index from .symforge/index.bin"
             );
             let shared: live_index::SharedIndex =
-                live_index::SharedIndexHandle::shared_for_state_placement_with_code_signals(
+                live_index::SharedIndexHandle::shared_restored_for_state_placement_with_code_signals(
                     live,
                     &root,
                     &state_placement,

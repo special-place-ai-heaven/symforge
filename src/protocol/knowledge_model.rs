@@ -25,6 +25,15 @@ pub(crate) fn render_code_knowledge_context(
     target: &CodeAnchorId,
     include_when_empty: bool,
 ) -> Option<String> {
+    if matches!(published.bridge.coverage, DerivedCoverage::Loading)
+        || matches!(published.authority.coverage, DerivedCoverage::Loading)
+    {
+        return Some(
+            "Knowledge evidence:\n  coverage bridge=loading authority=loading\n\
+             The knowledge bridge is still publishing; this is not a complete absence of knowledge."
+                .to_string(),
+        );
+    }
     let mut selected = BTreeSet::new();
     if let Some(indices) = published.bridge.reverse_exact.get(target) {
         selected.extend(indices.iter().copied());
@@ -334,6 +343,14 @@ fn bridge_resolution_label(resolution: &BridgeResolution) -> String {
 }
 
 pub(crate) fn render_repository_knowledge_map(published: &PublishedGeneration) -> String {
+    if matches!(published.bridge.coverage, DerivedCoverage::Loading)
+        || matches!(published.authority.coverage, DerivedCoverage::Loading)
+    {
+        return "Repository knowledge map unavailable: knowledge bridge is loading\n\
+                 Coverage: bridge=loading authority=loading\n\
+                 The knowledge bridge is still publishing; this is not a complete absence of knowledge."
+            .to_string();
+    }
     let record_by_unit = published
         .authority
         .records
@@ -614,6 +631,7 @@ fn voice_label(voice: KnowledgeVoice) -> &'static str {
 fn derived_coverage_label(coverage: &DerivedCoverage) -> String {
     match coverage {
         DerivedCoverage::Complete => "complete".to_string(),
+        DerivedCoverage::Loading => "loading".to_string(),
         DerivedCoverage::Truncated { breaches } => format!(
             "truncated({})",
             breaches

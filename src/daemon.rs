@@ -4716,7 +4716,7 @@ fn restore_project_snapshot(
             "daemon bootstrap restored index from .symforge snapshot/team artifact"
         );
         let shared: SharedIndex =
-            live_index::SharedIndexHandle::shared_with_source_exclusions_and_code_signals(
+            live_index::SharedIndexHandle::shared_restored_with_source_exclusions_and_code_signals(
                 live,
                 source_exclusions.clone(),
                 code_signals,

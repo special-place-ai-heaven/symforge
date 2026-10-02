@@ -780,6 +780,7 @@ fn knowledge_coverage_label(
 ) -> String {
     match coverage {
         crate::live_index::knowledge_bridge::DerivedCoverage::Complete => "complete".to_string(),
+        crate::live_index::knowledge_bridge::DerivedCoverage::Loading => "loading".to_string(),
         crate::live_index::knowledge_bridge::DerivedCoverage::Truncated { .. } => {
             "truncated".to_string()
         }

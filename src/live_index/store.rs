@@ -14,7 +14,10 @@ use tracing::{debug, error, info, warn};
 use super::knowledge_authority::{
     AuthorityLimits, AuthorityTemporalIndex, KnowledgeAuthorityView, build_knowledge_authority,
 };
-use super::knowledge_bridge::{BridgeLimits, KnowledgeBridge, build_knowledge_bridge};
+use super::knowledge_bridge::{
+    BridgeLimits, DerivedCoverage, DerivedLimitKind, KnowledgeBridge, LimitBreach,
+    build_knowledge_bridge,
+};
 use super::query::RepoOutlineView;
 use crate::domain::ParseDiagnostic;
 use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
@@ -1727,6 +1730,90 @@ pub struct PreparedKnowledgeAuthority {
     authority: Arc<KnowledgeAuthorityView>,
 }
 
+struct PreparedDeferredKnowledge {
+    fence: PublicationFence,
+    bridge: Arc<KnowledgeBridge>,
+    authority: Arc<KnowledgeAuthorityView>,
+}
+
+fn spawn_deferred_knowledge_publication(handle: &Arc<SharedIndexHandle>) {
+    if !matches!(
+        handle.published_generation().bridge.coverage,
+        DerivedCoverage::Loading
+    ) {
+        return;
+    }
+    let background = Arc::clone(handle);
+    if let Err(error) = std::thread::Builder::new()
+        .name("symforge-knowledge-bridge".to_string())
+        .spawn(move || {
+            let filled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fill_deferred_knowledge_bridge(&background);
+            }));
+            if filled.is_err() {
+                error!("knowledge bridge publication panicked; leaving partial coverage");
+                background.abandon_loading_knowledge_as_partial();
+            }
+        })
+    {
+        error!(%error, "failed to spawn knowledge bridge publication");
+        handle.abandon_loading_knowledge_as_partial();
+    }
+}
+
+fn fill_deferred_knowledge_bridge(handle: &SharedIndexHandle) {
+    for _ in 0..4 {
+        let published = handle.published_generation();
+        if !matches!(published.bridge.coverage, DerivedCoverage::Loading) {
+            return;
+        }
+        let Some(source) = published.source.as_deref() else {
+            handle.abandon_loading_knowledge_as_partial();
+            return;
+        };
+        let fence = PublicationFence::from_published(&published);
+        let bridge_phase = Instant::now();
+        let bridge = Arc::new(build_knowledge_bridge(
+            &published.live,
+            source,
+            published.content_generation,
+            &BridgeLimits::default(),
+        ));
+        let bridge_elapsed = bridge_phase.elapsed();
+        let cards = bridge.cards.len();
+        let authority_phase = Instant::now();
+        let authority = build_published_authority(
+            &published.live,
+            published.source.as_deref(),
+            published.source_version.as_deref(),
+            published.content_generation,
+            &bridge,
+            &published.code_signals,
+            published.manifest.as_deref(),
+        );
+        let authority_elapsed = authority_phase.elapsed();
+        if handle.publish_deferred_knowledge(PreparedDeferredKnowledge {
+            fence,
+            bridge,
+            authority,
+        }) {
+            info!(
+                "publication/knowledge bridge ({} cards) in {:?}",
+                cards, bridge_elapsed
+            );
+            info!("publication/authority in {:?}", authority_elapsed);
+            return;
+        }
+    }
+    if matches!(
+        handle.published_generation().bridge.coverage,
+        DerivedCoverage::Loading
+    ) {
+        error!("deferred knowledge bridge publication did not install; leaving partial coverage");
+        handle.abandon_loading_knowledge_as_partial();
+    }
+}
+
 fn capture_published_manifest(
     live: &LiveIndex,
     scout_plan: Option<&discovery::ScoutPlan>,
@@ -1869,6 +1956,13 @@ fn build_published_authority(
     code_signals: &CodeSignalsSnapshot,
     manifest: Option<&RepositoryManifest>,
 ) -> Arc<KnowledgeAuthorityView> {
+    // Retaining publishes (verify completion, freshness) clone a loading
+    // bridge. Building authority from it walks every knowledge file and would
+    // put that cost back on the Ready path, and an empty complete ledger
+    // would claim the bridge had been read.
+    if matches!(bridge.coverage, DerivedCoverage::Loading) {
+        return Arc::new(KnowledgeAuthorityView::loading(content_generation));
+    }
     let (Some(source), Some(source_version)) = (source, source_version) else {
         return Arc::new(KnowledgeAuthorityView::default());
     };
@@ -2144,13 +2238,14 @@ impl SharedIndexHandle {
         index: LiveIndex,
         scout_plan: Option<Arc<discovery::ScoutPlan>>,
     ) -> Self {
-        Self::new_with_scout_plan_and_code_signals(index, scout_plan, None)
+        Self::new_with_scout_plan_and_code_signals(index, scout_plan, None, false)
     }
 
     fn new_with_scout_plan_and_code_signals(
         index: LiveIndex,
         scout_plan: Option<Arc<discovery::ScoutPlan>>,
         code_signals: Option<CodeSignalsSnapshot>,
+        defer_knowledge_bridge: bool,
     ) -> Self {
         // Publication is a real startup phase, not an Arc wrap: manifest
         // capture, the knowledge bridge, and published authority all walk the
@@ -2228,34 +2323,54 @@ impl SharedIndexHandle {
         info!("publication/repo outline in {:?}", phase.elapsed());
 
         let phase = Instant::now();
-        let bridge = source
-            .as_deref()
-            .map(|source| {
-                Arc::new(build_knowledge_bridge(
-                    &index,
-                    source,
-                    0,
-                    &BridgeLimits::default(),
-                ))
-            })
-            .unwrap_or_else(|| Arc::new(KnowledgeBridge::default()));
-        info!(
-            "publication/knowledge bridge ({} cards) in {:?}",
-            bridge.cards.len(),
-            phase.elapsed()
-        );
+        // Restart-restore defers the bridge: it is the multi-second stage
+        // before verify can start, and verify is what gates code-tool Ready.
+        // The placeholder coverage is Loading, never Complete-with-zero-cards.
+        let defer_bridge = defer_knowledge_bridge && source.is_some();
+        let bridge = if defer_bridge {
+            Arc::new(KnowledgeBridge::loading())
+        } else {
+            source
+                .as_deref()
+                .map(|source| {
+                    Arc::new(build_knowledge_bridge(
+                        &index,
+                        source,
+                        0,
+                        &BridgeLimits::default(),
+                    ))
+                })
+                .unwrap_or_else(|| Arc::new(KnowledgeBridge::default()))
+        };
+        if defer_bridge {
+            info!("publication/knowledge bridge deferred (loading)");
+        } else {
+            info!(
+                "publication/knowledge bridge ({} cards) in {:?}",
+                bridge.cards.len(),
+                phase.elapsed()
+            );
+        }
 
         let phase = Instant::now();
-        let authority = build_published_authority(
-            &index,
-            source.as_deref(),
-            source_version.as_deref(),
-            0,
-            &bridge,
-            &code_signals,
-            manifest.as_deref(),
-        );
-        info!("publication/authority in {:?}", phase.elapsed());
+        let authority = if defer_bridge {
+            Arc::new(KnowledgeAuthorityView::loading(0))
+        } else {
+            build_published_authority(
+                &index,
+                source.as_deref(),
+                source_version.as_deref(),
+                0,
+                &bridge,
+                &code_signals,
+                manifest.as_deref(),
+            )
+        };
+        if defer_bridge {
+            info!("publication/authority deferred with the knowledge bridge");
+        } else {
+            info!("publication/authority in {:?}", phase.elapsed());
+        }
         let live = Arc::new(index);
         let published_generation = Arc::new(PublishedGeneration {
             publication_generation: 0,
@@ -2283,10 +2398,17 @@ impl SharedIndexHandle {
             current_source_id,
             sources,
         });
-        info!(
-            "index publication (manifest + bridge + authority) in {:?}",
-            publication_started.elapsed()
-        );
+        if defer_bridge {
+            info!(
+                "index publication (manifest; knowledge bridge deferred) in {:?}",
+                publication_started.elapsed()
+            );
+        } else {
+            info!(
+                "index publication (manifest + bridge + authority) in {:?}",
+                publication_started.elapsed()
+            );
+        }
         Self {
             live: ArcSwap::new(live),
             published_source_set: ArcSwap::new(published_source_set),
@@ -2524,6 +2646,14 @@ impl SharedIndexHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn shared_deferring_knowledge_bridge(index: LiveIndex) -> Arc<Self> {
+        let handle = Self::new_with_scout_plan_and_code_signals(index, None, None, true);
+        let shared = Arc::new(handle);
+        spawn_deferred_knowledge_publication(&shared);
+        shared
+    }
+
+    #[cfg(test)]
     pub(crate) fn shared_with_code_signals(
         index: LiveIndex,
         code_signals: CodeSignalsSnapshot,
@@ -2532,17 +2662,44 @@ impl SharedIndexHandle {
             index,
             None,
             Some(code_signals),
+            false,
         ))
     }
 
-    pub(crate) fn shared_with_source_exclusions_and_code_signals(
+    /// Snapshot restore: publish code-index state now and fill the knowledge
+    /// bridge off the Ready path. Health and knowledge tools stay on Loading
+    /// coverage until that fill publishes.
+    pub(crate) fn shared_restored_with_source_exclusions_and_code_signals(
         index: LiveIndex,
         source_exclusions: discovery::SourceExclusions,
         code_signals: CodeSignalsSnapshot,
     ) -> Arc<Self> {
-        let handle = Self::new_with_scout_plan_and_code_signals(index, None, Some(code_signals));
+        Self::shared_with_source_exclusions_and_code_signals_inner(
+            index,
+            source_exclusions,
+            code_signals,
+            true,
+        )
+    }
+
+    fn shared_with_source_exclusions_and_code_signals_inner(
+        index: LiveIndex,
+        source_exclusions: discovery::SourceExclusions,
+        code_signals: CodeSignalsSnapshot,
+        defer_knowledge_bridge: bool,
+    ) -> Arc<Self> {
+        let handle = Self::new_with_scout_plan_and_code_signals(
+            index,
+            None,
+            Some(code_signals),
+            defer_knowledge_bridge,
+        );
         handle.source_exclusions.store(Arc::new(source_exclusions));
-        Arc::new(handle)
+        let shared = Arc::new(handle);
+        if defer_knowledge_bridge {
+            spawn_deferred_knowledge_publication(&shared);
+        }
+        shared
     }
 
     fn shared_with_scout_plan(
@@ -2573,13 +2730,36 @@ impl SharedIndexHandle {
         Arc::new(handle)
     }
 
-    pub fn shared_for_state_placement_with_code_signals(
+    /// Snapshot restore for the stdio/serve placement. The knowledge bridge
+    /// fills after the handle is returned.
+    pub(crate) fn shared_restored_for_state_placement_with_code_signals(
         index: LiveIndex,
         root: &Path,
         state_placement: &StatePlacement,
         code_signals: CodeSignalsSnapshot,
     ) -> Arc<Self> {
-        let handle = Self::new_with_scout_plan_and_code_signals(index, None, Some(code_signals));
+        Self::shared_for_state_placement_with_code_signals_inner(
+            index,
+            root,
+            state_placement,
+            code_signals,
+            true,
+        )
+    }
+
+    fn shared_for_state_placement_with_code_signals_inner(
+        index: LiveIndex,
+        root: &Path,
+        state_placement: &StatePlacement,
+        code_signals: CodeSignalsSnapshot,
+        defer_knowledge_bridge: bool,
+    ) -> Arc<Self> {
+        let handle = Self::new_with_scout_plan_and_code_signals(
+            index,
+            None,
+            Some(code_signals),
+            defer_knowledge_bridge,
+        );
         handle
             .source_exclusions
             .store(Arc::new(discovery::SourceExclusions::for_state_placement(
@@ -2589,7 +2769,11 @@ impl SharedIndexHandle {
         handle
             .project_state_dir
             .store(state_placement.directory().cloned().map(Arc::new));
-        Arc::new(handle)
+        let shared = Arc::new(handle);
+        if defer_knowledge_bridge {
+            spawn_deferred_knowledge_publication(&shared);
+        }
+        shared
     }
 
     #[must_use]
@@ -3126,6 +3310,139 @@ impl SharedIndexHandle {
                 published_generation,
             )));
         true
+    }
+
+    /// Install a background-built bridge over a still-loading placeholder.
+    ///
+    /// Retaining publishes (verify, freshness) may advance
+    /// `publication_generation` while cloning the placeholder. That is not a
+    /// content change, so the prepared bridge is still the one for this
+    /// generation. A content publish builds its own bridge and clears Loading;
+    /// this install then refuses.
+    fn publish_deferred_knowledge(&self, prepared: PreparedDeferredKnowledge) -> bool {
+        let _write_guard = self.write_mutex.lock();
+        let previous_source_set = self.published_source_set.load_full();
+        let previous = previous_source_set.current_generation();
+        if !matches!(previous.bridge.coverage, DerivedCoverage::Loading) {
+            return false;
+        }
+        if previous.content_generation != prepared.fence.content_generation
+            || previous.project_generation != prepared.fence.project_generation
+        {
+            self.rejected_stale_mutations.fetch_add(1, Ordering::AcqRel);
+            return false;
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let published_generation = Arc::new(PublishedGeneration {
+            publication_generation: generation,
+            content_generation: previous.content_generation,
+            project_generation: previous.project_generation,
+            source: previous.source.clone(),
+            source_version: previous.source_version.clone(),
+            freshness: Arc::clone(&previous.freshness),
+            manifest: previous.manifest.clone(),
+            code_signals: Arc::clone(&previous.code_signals),
+            bridge: prepared.bridge,
+            authority: prepared.authority,
+            live: Arc::clone(&previous.live),
+            health: Arc::clone(&previous.health),
+            outline: Arc::clone(&previous.outline),
+        });
+        self.published_source_set
+            .store(Arc::new(previous_source_set.next_after_current_publish(
+                previous_source_set.current_source_id.clone(),
+                published_generation,
+            )));
+        true
+    }
+
+    /// Block until the placeholder bridge is replaced.
+    ///
+    /// Used by curation recovery when a replay directory actually needs the
+    /// ledger. The no-replay startup path does not call this, so it does not
+    /// sit on Ready.
+    pub(crate) fn wait_until_knowledge_bridge_published(&self) {
+        while matches!(
+            self.published_generation().bridge.coverage,
+            DerivedCoverage::Loading
+        ) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The filler panicked or could not be spawned. Leave partial coverage so
+    /// waiters unblock and nobody reads the placeholder as a complete bridge.
+    fn abandon_loading_knowledge_as_partial(&self) {
+        // ponytail: one synthetic card breach stands in for a failed build.
+        // Upgrade path: a typed Unavailable coverage if callers need to
+        // distinguish "budget truncated" from "publication failed".
+        let partial = DerivedCoverage::Truncated {
+            breaches: vec![LimitBreach {
+                kind: DerivedLimitKind::Cards,
+                omitted: 1,
+            }],
+        };
+        let _write_guard = self.write_mutex.lock();
+        let previous_source_set = self.published_source_set.load_full();
+        let previous = previous_source_set.current_generation();
+        if !matches!(previous.bridge.coverage, DerivedCoverage::Loading) {
+            return;
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut authority = (*previous.authority).clone();
+        authority.coverage = partial.clone();
+        authority.curation_eligible = false;
+        let published_generation = Arc::new(PublishedGeneration {
+            publication_generation: generation,
+            content_generation: previous.content_generation,
+            project_generation: previous.project_generation,
+            source: previous.source.clone(),
+            source_version: previous.source_version.clone(),
+            freshness: Arc::clone(&previous.freshness),
+            manifest: previous.manifest.clone(),
+            code_signals: Arc::clone(&previous.code_signals),
+            bridge: Arc::new(KnowledgeBridge {
+                coverage: partial,
+                ..KnowledgeBridge::default()
+            }),
+            authority: Arc::new(authority),
+            live: Arc::clone(&previous.live),
+            health: Arc::clone(&previous.health),
+            outline: Arc::clone(&previous.outline),
+        });
+        self.published_source_set
+            .store(Arc::new(previous_source_set.next_after_current_publish(
+                previous_source_set.current_source_id.clone(),
+                published_generation,
+            )));
+    }
+
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn install_loading_knowledge_for_test(&self) {
+        let _write_guard = self.write_mutex.lock();
+        let previous_source_set = self.published_source_set.load_full();
+        let previous = previous_source_set.current_generation();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let published_generation = Arc::new(PublishedGeneration {
+            publication_generation: generation,
+            content_generation: previous.content_generation,
+            project_generation: previous.project_generation,
+            source: previous.source.clone(),
+            source_version: previous.source_version.clone(),
+            freshness: Arc::clone(&previous.freshness),
+            manifest: previous.manifest.clone(),
+            code_signals: Arc::clone(&previous.code_signals),
+            bridge: Arc::new(KnowledgeBridge::loading()),
+            authority: Arc::new(KnowledgeAuthorityView::loading(previous.content_generation)),
+            live: Arc::clone(&previous.live),
+            health: Arc::clone(&previous.health),
+            outline: Arc::clone(&previous.outline),
+        });
+        self.published_source_set
+            .store(Arc::new(previous_source_set.next_after_current_publish(
+                previous_source_set.current_source_id.clone(),
+                published_generation,
+            )));
     }
 
     pub fn refresh_source_metadata(&self) -> bool {
@@ -4584,6 +4901,11 @@ impl SharedIndexHandle {
         // order_and_ids` pins exactly that determinism. On a retaining-content
         // publish none of those three move, so rebuilding every card reproduces
         // the value already held.
+        //
+        // A Loading placeholder is the exception: it is not that pure result.
+        // Cloning it here is deliberate. Rebuilding would put the multi-second
+        // bridge back on verify and freshness, which gate Ready. The deferred
+        // filler replaces the placeholder when it finishes.
         //
         // Worth doing rather than filing as micro-optimization: publication is
         // the dominant cost on BOTH the cold and warm paths, and the bridge is
@@ -10951,5 +11273,42 @@ mod tests {
         assert_eq!(stats.parsed_count, 1);
         assert_eq!(stats.partial_parse_count, 1);
         assert_eq!(stats.failed_count, 1);
+    }
+
+    #[test]
+    fn deferred_knowledge_bridge_matches_the_synchronous_bridge() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("docs")).unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("docs").join("guide.md"),
+            "# Guide\n\n[library](../src/lib.rs)\n\n`launch` is exact.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("src").join("lib.rs"),
+            "pub fn launch() {}\n",
+        )
+        .unwrap();
+
+        let sync = LiveIndex::load(root.path()).unwrap();
+        let live = (*sync.read()).clone();
+        let deferred = SharedIndexHandle::shared_deferring_knowledge_bridge(live);
+        deferred.wait_until_knowledge_bridge_published();
+
+        let sync_bridge = Arc::clone(&sync.published_generation().bridge);
+        let deferred_published = deferred.published_generation();
+        let deferred_bridge = &deferred_published.bridge;
+        assert!(
+            !matches!(deferred_bridge.coverage, DerivedCoverage::Loading),
+            "deferred publication must leave the loading placeholder"
+        );
+        assert_eq!(sync_bridge.cards, deferred_bridge.cards);
+        assert_eq!(sync_bridge.forward, deferred_bridge.forward);
+        assert_eq!(sync_bridge.coverage, deferred_bridge.coverage);
+        assert!(matches!(
+            deferred.published_generation().authority.coverage,
+            DerivedCoverage::Complete | DerivedCoverage::Truncated { .. }
+        ));
     }
 }
