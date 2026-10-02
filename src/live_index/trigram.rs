@@ -7,7 +7,26 @@
 /// Short queries (< 3 bytes) fall back to linear scan of file content.
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::live_index::store::IndexedFile;
+
+/// Trigram postings stored in the snapshot (format 9+).
+///
+/// Paths and posting lists are sorted so the postcard bytes do not follow
+/// `HashMap` iteration order. File ids inside a posting list stay sorted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedTrigramIndex {
+    pub(crate) next_id: u64,
+    pub(crate) paths: Vec<(u64, String)>,
+    pub(crate) postings: Vec<(u32, Vec<u64>)>,
+}
+
+impl PersistedTrigramIndex {
+    pub(crate) fn posting_count(&self) -> usize {
+        self.postings.iter().map(|(_, ids)| ids.len()).sum()
+    }
+}
 
 /// Trigram-based posting list index.
 ///
@@ -208,6 +227,84 @@ impl TrigramIndex {
         id
     }
 
+    /// Snapshot form of this index. Cheap relative to [`Self::build_from_files`]:
+    /// it copies postings that already exist instead of scanning file bytes.
+    pub(crate) fn to_persisted(&self) -> PersistedTrigramIndex {
+        let mut paths: Vec<(u64, String)> = self
+            .id_to_path
+            .iter()
+            .map(|(&id, path)| (id, path.clone()))
+            .collect();
+        paths.sort_by_key(|(id, _)| *id);
+        let mut postings: Vec<(u32, Vec<u64>)> = self
+            .map
+            .iter()
+            .map(|(trigram, ids)| (pack_trigram(*trigram), ids.clone()))
+            .collect();
+        postings.sort_by_key(|(key, _)| *key);
+        PersistedTrigramIndex {
+            next_id: self.next_id,
+            paths,
+            postings,
+        }
+    }
+
+    /// Inverse of [`Self::to_persisted`]. `None` when the blob breaks an
+    /// invariant the search path assumes (sorted unique ids, known paths).
+    pub(crate) fn from_persisted(persisted: PersistedTrigramIndex) -> Option<Self> {
+        let mut id_to_path = HashMap::with_capacity(persisted.paths.len());
+        let mut path_to_id = HashMap::with_capacity(persisted.paths.len());
+        for (id, path) in persisted.paths {
+            if id >= persisted.next_id {
+                return None;
+            }
+            if path_to_id.insert(path.clone(), id).is_some() {
+                return None;
+            }
+            if id_to_path.insert(id, path).is_some() {
+                return None;
+            }
+        }
+        let mut map = HashMap::with_capacity(persisted.postings.len());
+        for (key, ids) in persisted.postings {
+            let trigram = unpack_trigram(key)?;
+            if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return None;
+            }
+            if ids.iter().any(|id| !id_to_path.contains_key(id)) {
+                return None;
+            }
+            if map.insert(trigram, ids).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            map,
+            id_to_path,
+            path_to_id,
+            next_id: persisted.next_id,
+        })
+    }
+
+    /// Every restored file is tracked, and a file long enough to have trigrams
+    /// is not paired with an empty posting map.
+    pub(crate) fn covers_files<V>(&self, files: &HashMap<String, V>) -> bool
+    where
+        V: AsRef<IndexedFile>,
+    {
+        if self.path_to_id.len() != files.len()
+            || files.keys().any(|path| !self.path_to_id.contains_key(path))
+        {
+            return false;
+        }
+        let needs_postings = files.values().any(|file| file.as_ref().content.len() >= 3);
+        !needs_postings || !self.map.is_empty()
+    }
+
+    pub(crate) fn posting_count(&self) -> usize {
+        self.map.values().map(Vec::len).sum()
+    }
+
     /// Insert a file without clearing old trigrams first (used in build_from_files).
     fn insert_file(&mut self, path: &str, content: &[u8]) {
         let file_id = self.get_or_alloc_id(path);
@@ -234,6 +331,17 @@ impl Default for TrigramIndex {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn pack_trigram(trigram: [u8; 3]) -> u32 {
+    u32::from(trigram[0]) | (u32::from(trigram[1]) << 8) | (u32::from(trigram[2]) << 16)
+}
+
+fn unpack_trigram(key: u32) -> Option<[u8; 3]> {
+    if key > 0x00FF_FFFF {
+        return None;
+    }
+    Some([key as u8, (key >> 8) as u8, (key >> 16) as u8])
 }
 
 /// Extract the set of unique 3-byte windows from `bytes`.
@@ -584,6 +692,25 @@ mod tests {
             assert_eq!(tracked, files.keys().collect(), "step {step}");
             assert_eq!(idx.id_to_path.len(), idx.path_to_id.len(), "step {step}");
         }
+    }
+
+    #[test]
+    fn persisted_round_trip_preserves_search() {
+        let files = make_files(&[
+            ("src/a.rs", b"fn parse_file() {}"),
+            ("src/b.rs", b"fn render() {}"),
+        ]);
+        let idx = TrigramIndex::build_from_files(&files);
+        let persisted = idx.to_persisted();
+        let restored = TrigramIndex::from_persisted(persisted.clone()).expect("round-trip");
+        assert_eq!(restored.to_persisted(), persisted);
+        assert!(restored.covers_files(&files));
+        let mut before = idx.search(b"parse_file", &files);
+        let mut after = restored.search(b"parse_file", &files);
+        before.sort();
+        after.sort();
+        assert_eq!(before, after);
+        assert_eq!(before, vec!["src/a.rs".to_string()]);
     }
 
     // ── extract_trigrams ─────────────────────────────────────────────────────

@@ -1108,10 +1108,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // (store, daemon, serve, cli, knowledge search/review/model, authority).
 // Same 202 files. The only index_lifecycle edit is the Loading label arm
 // inside embedded.rs; no new inbound call edge.
+// Refreshed for format-9 trigram persistence (src/live_index/persist.rs,
+// src/live_index/trigram.rs). Same 202 files. Added PersistedTrigramIndex,
+// snapshot peek of a prior-format varint, and warm-restore load of stored
+// postings. No new token or call edge into src/index_lifecycle or
+// server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "453598dcf3241853693e49e841c81b403a5909f3add3e478df137ed8086e69fc",
+    "6150231332c6c92e1205024f226cc0d49caadf6dab9e61acf1dca6ef2ef9772c",
     202,
-    10_374_174,
+    10_388_268,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
