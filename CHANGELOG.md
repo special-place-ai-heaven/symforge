@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.5.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.0...v11.5.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* **034:** close secret_remediate post-clear honesty gaps ([ccbf853](https://github.com/special-place-ai-heaven/symforge/commit/ccbf853fabdee74ac9bc6e794c15683246ab9d46))
+
 ## [11.5.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.4.2...v11.5.0) (2026-10-02)
 
 
