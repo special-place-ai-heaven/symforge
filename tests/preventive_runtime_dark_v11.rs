@@ -1113,10 +1113,16 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // snapshot peek of a prior-format varint, and warm-restore load of stored
 // postings. No new token or call edge into src/index_lifecycle or
 // server_api.rs.
+// Refreshed for the cold session-open Ready tail (store, daemon, cli entry,
+// knowledge_bridge, trigram). Same 202 files. The armed cold first publish
+// installs a Loading knowledge bridge and fills it off code-tool Ready.
+// Trigram postings are appended and sorted once, with a parallel byte scan
+// at 64 files. No new token or call edge into src/index_lifecycle or
+// server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "6150231332c6c92e1205024f226cc0d49caadf6dab9e61acf1dca6ef2ef9772c",
+    "e4d8047da07bef70349cf45936e98616a6b09e6f89a06f1e7c68d079c07cb2ef",
     202,
-    10_388_268,
+    10_398_152,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

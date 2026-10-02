@@ -204,8 +204,9 @@ pub enum DerivedCoverage {
     /// Cards have not been built for this publication yet.
     ///
     /// An empty card list with this coverage is not a complete absence of
-    /// knowledge. Restart-restore publishes it so code tools can become Ready
-    /// while the bridge fills; readers must keep saying the bridge is loading.
+    /// knowledge. Restart-restore and the armed cold first publish install it
+    /// so code tools can become Ready while the bridge fills; readers must
+    /// keep saying the bridge is loading.
     Loading,
 }
 

@@ -4446,6 +4446,7 @@ impl ColdLoadJob {
         L: FnOnce(&SharedIndex, &AtomicBool) -> anyhow::Result<()> + Send + 'static,
     {
         self.index.mark_bootstrap_loading();
+        self.index.arm_deferred_cold_knowledge();
         let handoff = Arc::new((Mutex::new(ColdLoadHandoff::Waiting), Condvar::new()));
         {
             let job = self.clone();
@@ -4508,6 +4509,7 @@ impl ColdLoadJob {
     {
         self.index.set_local_empty_reason(None);
         self.index.mark_bootstrap_loading();
+        self.index.arm_deferred_cold_knowledge();
         runtime.spawn_blocking(move || {
             let result = self.run(load);
             let built = result.is_ok();

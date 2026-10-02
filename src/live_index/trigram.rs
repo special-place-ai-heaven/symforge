@@ -7,6 +7,7 @@
 /// Short queries (< 3 bytes) fall back to linear scan of file content.
 use std::collections::{HashMap, HashSet};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::live_index::store::IndexedFile;
@@ -54,13 +55,45 @@ impl TrigramIndex {
     }
 
     /// Build a trigram index from all files in the given map.
+    ///
+    /// Posting lists are appended, then sorted once. Inserting each file into
+    /// an already-sorted list memmoves every shared trigram and dominated the
+    /// cold derived-index tail. File ids follow the same map iteration order
+    /// as before, so search order is unchanged.
     pub fn build_from_files<V>(files: &HashMap<String, V>) -> Self
     where
         V: AsRef<IndexedFile>,
     {
         let mut idx = Self::new();
+        let mut contents: Vec<&[u8]> = Vec::with_capacity(files.len());
         for (path, file) in files {
-            idx.insert_file(path, &file.as_ref().content);
+            idx.get_or_alloc_id(path);
+            contents.push(file.as_ref().content.as_slice());
+            debug_assert_eq!(idx.path_to_id.len(), contents.len());
+        }
+        // ponytail: parallel byte scan only at 64+ files. The rebuild test
+        // loops a handful of files, where the pool's dispatch costs more than
+        // the scan. Upgrade path: drop the cutoff if a small-repo bench cares.
+        let shards: Vec<HashSet<[u8; 3]>> = if contents.len() >= 64 {
+            contents
+                .par_iter()
+                .map(|content| trigrams_of(content))
+                .collect()
+        } else {
+            contents
+                .iter()
+                .map(|content| trigrams_of(content))
+                .collect()
+        };
+        for (file_id, trigrams) in shards.into_iter().enumerate() {
+            let file_id = file_id as u64;
+            for trigram in trigrams {
+                idx.map.entry(trigram).or_default().push(file_id);
+            }
+        }
+        for list in idx.map.values_mut() {
+            list.sort_unstable();
+            list.dedup();
         }
         idx
     }
@@ -305,7 +338,7 @@ impl TrigramIndex {
         self.map.values().map(Vec::len).sum()
     }
 
-    /// Insert a file without clearing old trigrams first (used in build_from_files).
+    /// Insert a file without clearing old trigrams first (incremental updates).
     fn insert_file(&mut self, path: &str, content: &[u8]) {
         let file_id = self.get_or_alloc_id(path);
         for tg in trigrams_of(content) {
