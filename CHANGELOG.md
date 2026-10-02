@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.5.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.2...v11.5.3) (2026-10-02)
+
+
+### Performance Improvements
+
+* **live_index:** cut the cold session-open Ready tail ([322ddbe](https://github.com/special-place-ai-heaven/symforge/commit/322ddbe7522376f7e379429301aa94364015a837))
+
 ## [11.5.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.1...v11.5.2) (2026-10-02)
 
 
