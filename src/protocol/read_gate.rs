@@ -370,6 +370,55 @@ fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Optio
     })
 }
 
+/// Bytes of a regular file, or an error that did not block.
+///
+/// FIFO, socket, and device opens block until a peer appears. `symlink_metadata`
+/// refuses those before `open`. On Unix the open itself is `O_NONBLOCK`, so a
+/// replacement between the check and the open cannot hang the caller either.
+/// Symlinks are not followed: `symlink_metadata` sees the link, not its target.
+pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_regular_file_limited(path, None)
+}
+
+fn read_regular_file_limited(path: &Path, limit: Option<u64>) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut file = open_for_gate_read(path)?;
+    if !file.metadata().is_ok_and(|opened| opened.is_file()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    if let Some(limit) = limit {
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, limit), &mut bytes)?;
+    } else {
+        std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    }
+    Ok(bytes)
+}
+
+fn open_for_gate_read(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// Finding lines for a RECORDED content demotion, computed at refusal time.
 ///
 /// The manifest records the verdict (rule ids, count) but not where the
@@ -402,22 +451,11 @@ fn recorded_finding_evidence(
     let Ok(Some(full_path)) = crate::discovery::resolve_repo_path(root, relative_path) else {
         return (Vec::new(), Vec::new());
     };
-    // Only a regular file is opened: opening a FIFO for reading blocks until a
-    // writer appears, which would hang the refusal.
-    if !std::fs::symlink_metadata(&full_path).is_ok_and(|metadata| metadata.is_file()) {
-        return (Vec::new(), Vec::new());
-    }
-    let Ok(file) = std::fs::File::open(&full_path) else {
+    let budget = crate::knowledge::SECRET_SCAN_MAX_BYTES as u64 + 1;
+    let Ok(bytes) = read_regular_file_limited(&full_path, Some(budget)) else {
         return (Vec::new(), Vec::new());
     };
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return (Vec::new(), Vec::new());
-    }
-    let mut bytes = Vec::new();
-    let budget = crate::knowledge::SECRET_SCAN_MAX_BYTES as u64 + 1;
-    if std::io::Read::read_to_end(&mut std::io::Read::take(file, budget), &mut bytes).is_err()
-        || crate::knowledge::exceeds_scan_limit(bytes.len())
-    {
+    if crate::knowledge::exceeds_scan_limit(bytes.len()) {
         return (Vec::new(), Vec::new());
     }
     match crate::knowledge::scan_secret_bytes(relative_path, &bytes) {
@@ -554,8 +592,10 @@ fn disk_read(
 
     // The one read, and the classification of exactly those bytes. Required
     // even when the manifest is clean or says Indexed: a clean manifest cannot
-    // authorize bytes that changed after it was published.
-    let bytes = match std::fs::read(canon_path) {
+    // authorize bytes that changed after it was published. Same regular-file
+    // rule as the dismissal re-read: a FIFO, socket, or device must not block
+    // the gate.
+    let bytes = match read_regular_file(canon_path) {
         Ok(bytes) => bytes,
         Err(e) => return Err(format!("{relative_path} [error: could not read file: {e}]")),
     };
@@ -569,7 +609,9 @@ fn disk_read(
 ///
 /// Returns `Some(bytes)` only when the recorded disposition is SensitiveContent
 /// (not path-rule / indeterminate) AND a fresh scan filtered by the dismissal
-/// store is Clean. Never follows a symlink store (loader enforces).
+/// store is Clean. The source is read only as a regular file: a FIFO, socket,
+/// or device returns `None` without blocking, and the caller keeps the policy
+/// refusal. Never follows a symlink store (loader enforces).
 fn try_admit_dismissed_sensitive_content(
     live: &LiveIndex,
     relative_path: &str,
@@ -591,7 +633,7 @@ fn try_admit_dismissed_sensitive_content(
         return None;
     }
     let root = live.indexed_root.as_deref()?;
-    let bytes = std::fs::read(canon_path).ok()?;
+    let bytes = read_regular_file(canon_path).ok()?;
     if crate::knowledge::exceeds_scan_limit(bytes.len()) {
         return None;
     }

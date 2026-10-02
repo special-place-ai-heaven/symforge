@@ -210,7 +210,7 @@ impl SymForgeServer {
             ));
         }
 
-        let rescan = match std::fs::read(&plan.abs_path) {
+        let rescan = match read_regular_bytes(&plan.abs_path) {
             Ok(bytes) => match knowledge::scan_secret_bytes(&plan.path, &bytes) {
                 knowledge::SecretScan::Clean => "clean".to_string(),
                 knowledge::SecretScan::Sensitive { finding_count, .. } => {
@@ -294,7 +294,20 @@ impl SymForgeServer {
             ));
         }
 
-        let after = std::fs::read(&plan.abs_path).unwrap_or_default();
+        let after = match read_regular_bytes(&plan.abs_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Do not open a FIFO for the rollback write; that blocks with
+                // no reader. A regular-file read error still attempts restore.
+                if e.kind() != std::io::ErrorKind::InvalidInput {
+                    let _ = std::fs::write(&plan.abs_path, &snap);
+                }
+                return Err(fail_and_return_mutation_replay(
+                    idempotency,
+                    format!("Error: encrypt apply could not re-read {}: {e}", plan.path),
+                ));
+            }
+        };
         let plaintext_gone = !bytes_contain_utf8_secret(&after, &snap, &plan.path);
         let rescan = match knowledge::scan_secret_bytes(&plan.path, &after) {
             knowledge::SecretScan::Clean => "clean".to_string(),
@@ -387,7 +400,7 @@ impl SymForgeServer {
         }
 
         // Reindex source so recorded disposition can clear when all findings dismissed.
-        if let Ok(bytes) = std::fs::read(&plan.abs_path)
+        if let Ok(bytes) = read_regular_bytes(&plan.abs_path)
             && let Some(lang) = crate::domain::LanguageId::from_extension(
                 Path::new(&plan.path)
                     .extension()
@@ -404,7 +417,7 @@ impl SymForgeServer {
             );
         }
 
-        let rescan = match std::fs::read(&plan.abs_path) {
+        let rescan = match read_regular_bytes(&plan.abs_path) {
             Ok(bytes) => {
                 let scan = knowledge::scan_secret_bytes(&plan.path, &bytes);
                 let filtered =
@@ -547,7 +560,7 @@ fn plan_externalize(
         let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(&abs) else {
+        let Ok(bytes) = read_regular_bytes(&abs) else {
             continue;
         };
         let spans = match knowledge::scan_secret_spans(rel, &bytes) {
@@ -635,7 +648,7 @@ fn plan_encrypt(
         let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(&abs) else {
+        let Ok(bytes) = read_regular_bytes(&abs) else {
             continue;
         };
         let spans = match knowledge::scan_secret_spans(rel, &bytes) {
@@ -711,7 +724,7 @@ fn plan_dismiss(
         let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(&abs) else {
+        let Ok(bytes) = read_regular_bytes(&abs) else {
             continue;
         };
         let spans = match knowledge::scan_secret_spans(rel, &bytes) {
@@ -822,7 +835,7 @@ fn apply_encrypt(root: &Path, plan: &PlannedEncrypt) -> Result<(), String> {
             stderr.chars().take(200).collect::<String>()
         ));
     }
-    let encrypted = std::fs::read(&tmp).map_err(|e| format!("read sops output: {e}"))?;
+    let encrypted = read_regular_bytes(&tmp).map_err(|e| format!("read sops output: {e}"))?;
     let _ = std::fs::remove_file(&tmp);
     atomic_write_file(root, None, &plan.abs_path, &encrypted)
         .map_err(|e| format!("write encrypted {}: {e}", plan.path))?;
@@ -881,6 +894,20 @@ fn env_var_name(path: &str, rule_id: &str, line: u32, n: usize) -> String {
     format!("SYMFORGE_SECRET_{}", hex[..8].to_ascii_uppercase())
 }
 
+fn read_regular_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    crate::protocol::read_gate::read_regular_file(path)
+}
+
+/// Missing path is empty. A FIFO, socket, device, or symlink is an error
+/// rather than a blocking read.
+fn read_optional_regular_text(path: &Path, label: &str) -> Result<String, String> {
+    match read_regular_bytes(path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|err| format!("read {label}: {err}")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(format!("read {label}: {err}")),
+    }
+}
+
 struct RollbackSnap {
     path: PathBuf,
     bytes: Option<Vec<u8>>,
@@ -895,7 +922,7 @@ fn snapshot_for_rollback(root: &Path, plan: &PlannedRewrite) -> Result<Vec<Rollb
         let p = root.join(name);
         let bytes = match std::fs::symlink_metadata(&p) {
             Ok(meta) if meta.is_file() => {
-                Some(std::fs::read(&p).map_err(|e| format!("snapshot {name}: {e}"))?)
+                Some(read_regular_bytes(&p).map_err(|e| format!("snapshot {name}: {e}"))?)
             }
             Ok(_) => {
                 // Exists but is not a regular file (e.g. directory planted to
@@ -927,15 +954,10 @@ fn apply_externalize(root: &Path, plan: &PlannedRewrite) -> Result<(), String> {
     // Bruce F3: write `.env` BEFORE stripping the source so a crash mid-apply
     // cannot leave a stripped source without the env append.
     let env_path = root.join(".env");
-    let mut env_body = if env_path.exists() {
-        let mut b = std::fs::read_to_string(&env_path).map_err(|e| format!("read .env: {e}"))?;
-        if !b.ends_with('\n') && !b.is_empty() {
-            b.push('\n');
-        }
-        b
-    } else {
-        String::new()
-    };
+    let mut env_body = read_optional_regular_text(&env_path, ".env")?;
+    if !env_body.ends_with('\n') && !env_body.is_empty() {
+        env_body.push('\n');
+    }
     for line in &plan.env_lines {
         let (key, value) = line.split_once('=').unwrap_or((line.as_str(), ""));
         if let Some(existing) = env_body.lines().find(|l| l.starts_with(&format!("{key}="))) {
@@ -964,11 +986,7 @@ fn apply_externalize(root: &Path, plan: &PlannedRewrite) -> Result<(), String> {
         .map_err(|e| format!("write {}: {e}", plan.path))?;
 
     let gi = root.join(".gitignore");
-    let mut gi_body = if gi.exists() {
-        std::fs::read_to_string(&gi).map_err(|e| format!("read .gitignore: {e}"))?
-    } else {
-        String::new()
-    };
+    let mut gi_body = read_optional_regular_text(&gi, ".gitignore")?;
     if !gi_body.lines().any(|l| l.trim() == ".env") {
         if !gi_body.is_empty() && !gi_body.ends_with('\n') {
             gi_body.push('\n');

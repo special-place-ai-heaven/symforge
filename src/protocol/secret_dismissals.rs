@@ -88,7 +88,8 @@ pub fn load_dismissals(root: &Path) -> Result<Vec<DismissalRecord>, String> {
             "dismissal store exceeds size cap ({DISMISSAL_STORE_MAX_BYTES} bytes)"
         ));
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("read dismissal store: {e}"))?;
+    let bytes = crate::protocol::read_gate::read_regular_file(&path)
+        .map_err(|e| format!("read dismissal store: {e}"))?;
     if bytes.len() as u64 > DISMISSAL_STORE_MAX_BYTES {
         return Err("dismissal store exceeds size cap after read".to_string());
     }

@@ -1092,10 +1092,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // dismissal override; SecretSpansScan::Indeterminate; withheld sops PATH
 // probe; edit replay helpers widened to pub(crate). No new token or call
 // edge into src/index_lifecycle or server_api.rs.
+// Refreshed after the read-gate special-file fail-closed fix: regular-file
+// open in read_gate (dismissal override and disclosure read), dismissal
+// store read, and secret_remediate caller-path reads. No new file, no edge
+// into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "b1577878eac59bdaa68ac7eaa23774ae372b8ff1417e68bbaf162a91fcc1371e",
+    "34cd935f8cb2ba37e77f2ecfae6516038f5369ed65a6c5d9a0bbd9da1926e499",
     202,
-    10_344_185,
+    10_348_961,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

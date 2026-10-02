@@ -36470,9 +36470,38 @@ mod tests {
         );
     }
 
+    /// `admit_disk_read` on a worker, so a FIFO open fails the test instead of
+    /// pinning the suite. The budget is far above a metadata refusal and far
+    /// below a blocked `open`.
+    #[cfg(unix)]
+    fn admit_disk_read_within(
+        live: LiveIndex,
+        relative_path: &str,
+        canon_path: PathBuf,
+        budget: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let relative_path = relative_path.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                crate::protocol::read_gate::admit_disk_read(&live, &relative_path, &canon_path);
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(budget) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("admit_disk_read blocked for {budget:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("admit_disk_read ended without a verdict")
+            }
+        }
+    }
+
     /// A recorded demotion whose path is now a FIFO refuses at once: the gate
-    /// never opens a non-regular file for its line re-read, which would block
-    /// until a writer appeared.
+    /// never opens a non-regular file, which would block until a writer
+    /// appeared. The same path with no demotion must fail closed on the
+    /// disclosure read rather than blocking there instead.
     #[cfg(unix)]
     #[test]
     fn recorded_demotion_refusal_does_not_open_a_fifo() {
@@ -36488,10 +36517,40 @@ mod tests {
             "src/probe.rs",
             "secret.context-assignment",
         )];
-        let refusal = crate::protocol::read_gate::admit_disk_read(&live, "src/probe.rs", &probe)
+        let budget = Duration::from_secs(5);
+        let refusal = admit_disk_read_within(live.clone(), "src/probe.rs", probe.clone(), budget)
             .expect_err("a recorded demotion must refuse");
         assert!(
             refusal.contains("secret.context-assignment") && !refusal.contains(" at line"),
+            "shape: {}",
+            refusal_shape(&refusal)
+        );
+
+        live.manifest_entries.clear();
+        let plain = admit_disk_read_within(live, "src/probe.rs", probe, budget)
+            .expect_err("a fifo is not admissible content");
+        assert!(
+            plain.contains("not a regular file"),
+            "shape: {}",
+            refusal_shape(&plain)
+        );
+    }
+
+    /// `/dev/zero` is a character device. An unguarded `read_to_end` never
+    /// returns. The disclosure lane must refuse it from metadata.
+    #[cfg(unix)]
+    #[test]
+    fn disk_read_of_a_char_device_does_not_block() {
+        let zero = PathBuf::from("/dev/zero");
+        if !zero.exists() {
+            return;
+        }
+        let mut live = make_live_index_ready(vec![]);
+        live.indexed_root = Some(PathBuf::from("/"));
+        let refusal = admit_disk_read_within(live, "dev/zero", zero, Duration::from_secs(5))
+            .expect_err("a device is not admissible content");
+        assert!(
+            refusal.contains("not a regular file"),
             "shape: {}",
             refusal_shape(&refusal)
         );
