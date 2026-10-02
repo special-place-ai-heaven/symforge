@@ -541,6 +541,7 @@ fn spawn_local_cold_load(
     root: std::path::PathBuf,
     placement: crate::domain::StatePlacement,
 ) -> tokio::task::JoinHandle<()> {
+    index.arm_deferred_cold_knowledge();
     tokio::task::spawn_blocking(move || {
         tracing::info!("cold-start indexing in background");
         let result =

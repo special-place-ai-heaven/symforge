@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+#[cfg(test)]
+use parking_lot::Condvar;
 use parking_lot::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1736,7 +1738,54 @@ struct PreparedDeferredKnowledge {
     authority: Arc<KnowledgeAuthorityView>,
 }
 
+#[cfg(test)]
+struct ColdKnowledgeFillGate {
+    open: Mutex<bool>,
+    cv: Condvar,
+}
+
+#[cfg(test)]
+fn cold_knowledge_fill_gate() -> &'static ColdKnowledgeFillGate {
+    static GATE: OnceLock<ColdKnowledgeFillGate> = OnceLock::new();
+    GATE.get_or_init(|| ColdKnowledgeFillGate {
+        open: Mutex::new(true),
+        cv: Condvar::new(),
+    })
+}
+
+/// Test hook: hold the cold-publish filler before it builds cards.
+#[cfg(test)]
+fn hold_cold_knowledge_fill_gate() {
+    *cold_knowledge_fill_gate().open.lock() = false;
+}
+
+#[cfg(test)]
+fn release_cold_knowledge_fill_gate() {
+    let gate = cold_knowledge_fill_gate();
+    *gate.open.lock() = true;
+    gate.cv.notify_all();
+}
+
+fn wait_for_cold_knowledge_fill_gate() {
+    #[cfg(test)]
+    {
+        let gate = cold_knowledge_fill_gate();
+        let mut open = gate.open.lock();
+        while !*open {
+            gate.cv.wait(&mut open);
+        }
+    }
+}
+
 fn spawn_deferred_knowledge_publication(handle: &Arc<SharedIndexHandle>) {
+    spawn_deferred_knowledge_publication_inner(handle, false);
+}
+
+/// `write_locked` is set when the caller already holds `write_mutex`. Thread
+/// spawn failure then installs partial coverage without locking again:
+/// `parking_lot::Mutex` is not reentrant, and the cold publish runs inside
+/// that lock.
+fn spawn_deferred_knowledge_publication_inner(handle: &Arc<SharedIndexHandle>, write_locked: bool) {
     if !matches!(
         handle.published_generation().bridge.coverage,
         DerivedCoverage::Loading
@@ -1757,11 +1806,16 @@ fn spawn_deferred_knowledge_publication(handle: &Arc<SharedIndexHandle>) {
         })
     {
         error!(%error, "failed to spawn knowledge bridge publication");
-        handle.abandon_loading_knowledge_as_partial();
+        if write_locked {
+            handle.abandon_loading_knowledge_as_partial_locked();
+        } else {
+            handle.abandon_loading_knowledge_as_partial();
+        }
     }
 }
 
 fn fill_deferred_knowledge_bridge(handle: &SharedIndexHandle) {
+    wait_for_cold_knowledge_fill_gate();
     for _ in 0..4 {
         let published = handle.published_generation();
         if !matches!(published.bridge.coverage, DerivedCoverage::Loading) {
@@ -2153,6 +2207,14 @@ pub struct SharedIndexHandle {
     /// already running, a second caller skips, because the running pass already
     /// reflects the newest refs.
     ref_reconcile_lock: Mutex<()>,
+    /// Set when this handle lives in an `Arc`, so a cold publish can own a
+    /// clone on the bridge thread. Stack-allocated test handles leave it empty
+    /// and build that bridge inline.
+    self_weak: OnceLock<Weak<SharedIndexHandle>>,
+    /// Armed by the session-open and local cold-start paths. Consumed by the
+    /// first content publish that leaves the empty bootstrap, which installs a
+    /// Loading knowledge bridge instead of building it before code-tool Ready.
+    defer_cold_knowledge: AtomicBool,
 }
 
 /// Write guard that republishes lightweight handle state when mutated data is released.
@@ -2430,6 +2492,8 @@ impl SharedIndexHandle {
             git_temporal_jobs: Mutex::new(super::git_temporal::GitTemporalJobQueue::default()),
             pre_update_snapshots: Mutex::new(HashMap::new()),
             ref_reconcile_lock: Mutex::new(()),
+            self_weak: OnceLock::new(),
+            defer_cold_knowledge: AtomicBool::new(false),
         }
     }
 
@@ -2642,7 +2706,22 @@ impl SharedIndexHandle {
     }
 
     pub fn shared(index: LiveIndex) -> Arc<Self> {
-        Arc::new(Self::new(index))
+        Self::share_handle(Self::new(index))
+    }
+
+    fn share_handle(handle: Self) -> Arc<Self> {
+        let shared = Arc::new(handle);
+        let _ = shared.self_weak.set(Arc::downgrade(&shared));
+        shared
+    }
+
+    /// The next content publish that leaves the empty bootstrap installs a
+    /// Loading knowledge bridge and fills it off the code-tool Ready path.
+    ///
+    /// Session-open and the local cold start arm this. Other reloads, including
+    /// `index_folder` on an already-loaded project, keep the synchronous bridge.
+    pub(crate) fn arm_deferred_cold_knowledge(&self) {
+        self.defer_cold_knowledge.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -3373,6 +3452,11 @@ impl SharedIndexHandle {
     /// The filler panicked or could not be spawned. Leave partial coverage so
     /// waiters unblock and nobody reads the placeholder as a complete bridge.
     fn abandon_loading_knowledge_as_partial(&self) {
+        let _write_guard = self.write_mutex.lock();
+        self.abandon_loading_knowledge_as_partial_locked();
+    }
+
+    fn abandon_loading_knowledge_as_partial_locked(&self) {
         // ponytail: one synthetic card breach stands in for a failed build.
         // Upgrade path: a typed Unavailable coverage if callers need to
         // distinguish "budget truncated" from "publication failed".
@@ -3382,7 +3466,6 @@ impl SharedIndexHandle {
                 omitted: 1,
             }],
         };
-        let _write_guard = self.write_mutex.lock();
         let previous_source_set = self.published_source_set.load_full();
         let previous = previous_source_set.current_generation();
         if !matches!(previous.bridge.coverage, DerivedCoverage::Loading) {
@@ -4896,6 +4979,22 @@ impl SharedIndexHandle {
                 coverage: history_coverage,
             })
         };
+        // The first content publish out of an empty bootstrap is the cold
+        // session-open (and local cold-start) path. The knowledge bridge is the
+        // multi-second stage after `build_reload_data`; code-tool Ready does
+        // not read it. The flag is consumed only on that transition, so a later
+        // edit or reload still builds its bridge inline and knowledge does not
+        // flip back to loading on every save. No `Arc` (a stack test handle)
+        // falls back to the inline build.
+        let leaving_bootstrap = content_changed
+            && previous.live.load_source() == IndexLoadSource::EmptyBootstrap
+            && !live.is_empty
+            && self.defer_cold_knowledge.swap(false, Ordering::AcqRel);
+        let deferred_owner = if leaving_bootstrap && source.is_some() {
+            self.self_weak.get().and_then(Weak::upgrade)
+        } else {
+            None
+        };
         // The bridge is a pure function of (live content, source identity,
         // content_generation) — `repeated_equal_generations_produce_identical_
         // order_and_ids` pins exactly that determinism. On a retaining-content
@@ -4918,27 +5017,35 @@ impl SharedIndexHandle {
         // snapshot when its input is unchanged; the source-identity equality is
         // belt-and-braces, since a content-preserving publish should not move
         // the source either.
-        let bridge = match source.as_deref() {
-            Some(source) if !content_changed && previous.source.as_deref() == Some(source) => {
-                Arc::clone(&previous.bridge)
+        let bridge = if deferred_owner.is_some() {
+            Arc::new(KnowledgeBridge::loading())
+        } else {
+            match source.as_deref() {
+                Some(source) if !content_changed && previous.source.as_deref() == Some(source) => {
+                    Arc::clone(&previous.bridge)
+                }
+                Some(source) => Arc::new(build_knowledge_bridge(
+                    &live,
+                    source,
+                    content_generation,
+                    &BridgeLimits::default(),
+                )),
+                None => Arc::new(KnowledgeBridge::default()),
             }
-            Some(source) => Arc::new(build_knowledge_bridge(
-                &live,
-                source,
-                content_generation,
-                &BridgeLimits::default(),
-            )),
-            None => Arc::new(KnowledgeBridge::default()),
         };
-        let authority = build_published_authority(
-            &live,
-            source.as_deref(),
-            source_version.as_deref(),
-            content_generation,
-            &bridge,
-            &code_signals,
-            manifest.as_deref(),
-        );
+        let authority = if deferred_owner.is_some() {
+            Arc::new(KnowledgeAuthorityView::loading(content_generation))
+        } else {
+            build_published_authority(
+                &live,
+                source.as_deref(),
+                source_version.as_deref(),
+                content_generation,
+                &bridge,
+                &code_signals,
+                manifest.as_deref(),
+            )
+        };
         let live = Arc::new(live);
         let published_generation = Arc::new(PublishedGeneration {
             publication_generation: generation,
@@ -4966,6 +5073,10 @@ impl SharedIndexHandle {
         after_live_swap();
         self.published_state.store(published_state);
         self.published_source_set.store(published_source_set);
+        if let Some(owner) = deferred_owner {
+            info!("publication/knowledge bridge deferred on cold publish (loading)");
+            spawn_deferred_knowledge_publication_inner(&owner, true);
+        }
     }
 
     /// Lock-free read of the git temporal index.
@@ -5422,12 +5533,20 @@ impl DerivedIndices {
         cancel: Option<&AtomicBool>,
     ) -> anyhow::Result<Self> {
         check_reload_cancelled(cancel)?;
+        let trigram_phase = Instant::now();
         let trigram_index = super::trigram::TrigramIndex::build_from_files(files);
+        let trigram_elapsed = trigram_phase.elapsed();
         check_reload_cancelled(cancel)?;
         pause_between_derived_stages(cancel)?;
+        let rest_phase = Instant::now();
         let reverse_index = build_reverse_index_from_files(files);
         check_reload_cancelled(cancel)?;
         let (files_by_basename, files_by_dir_component) = build_path_indices_from_files(files);
+        info!(
+            "derived/trigram in {:?}; reverse+paths in {:?}",
+            trigram_elapsed,
+            rest_phase.elapsed()
+        );
         check_reload_cancelled(cancel)?;
         Ok(Self {
             trigram_index,
@@ -11310,5 +11429,105 @@ mod tests {
             deferred.published_generation().authority.coverage,
             DerivedCoverage::Complete | DerivedCoverage::Truncated { .. }
         ));
+    }
+
+    struct ColdFillGateGuard;
+
+    impl Drop for ColdFillGateGuard {
+        fn drop(&mut self) {
+            super::release_cold_knowledge_fill_gate();
+        }
+    }
+
+    fn knowledge_fixture(root: &Path) {
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("docs").join("guide.md"),
+            "# Guide\n\n[library](../src/lib.rs)\n\n`launch` is exact.\n",
+        )
+        .unwrap();
+        fs::write(root.join("src").join("lib.rs"), "pub fn launch() {}\n").unwrap();
+    }
+
+    #[test]
+    fn cold_publish_from_empty_bootstrap_is_ready_before_the_knowledge_bridge() {
+        let _release = ColdFillGateGuard;
+        super::hold_cold_knowledge_fill_gate();
+
+        let root = TempDir::new().unwrap();
+        knowledge_fixture(root.path());
+
+        let index = LiveIndex::empty();
+        index.arm_deferred_cold_knowledge();
+        index.reload(root.path()).unwrap();
+
+        let published = index.published_generation();
+        assert_eq!(
+            published.live.index_state(),
+            IndexState::Ready,
+            "code tools become Ready while the cold bridge is still loading"
+        );
+        assert!(
+            matches!(published.bridge.coverage, DerivedCoverage::Loading),
+            "the cold bridge must be the loading placeholder, not an empty complete bridge"
+        );
+        assert!(matches!(
+            published.authority.coverage,
+            DerivedCoverage::Loading
+        ));
+        assert!(published.live.file_count() > 0);
+
+        super::release_cold_knowledge_fill_gate();
+        index.wait_until_knowledge_bridge_published();
+
+        let published = index.published_generation();
+        let source = published
+            .source
+            .as_deref()
+            .expect("cold publish captured a source");
+        let expected = super::build_knowledge_bridge(
+            &published.live,
+            source,
+            published.content_generation,
+            &super::BridgeLimits::default(),
+        );
+        assert_eq!(published.bridge.cards, expected.cards);
+        assert_eq!(published.bridge.forward, expected.forward);
+        assert_eq!(published.bridge.coverage, expected.coverage);
+        assert!(!matches!(
+            published.authority.coverage,
+            DerivedCoverage::Loading
+        ));
+
+        // The flag is one-shot. A second reload is an already-loaded project
+        // and must not go back through the loading placeholder.
+        super::hold_cold_knowledge_fill_gate();
+        index.reload(root.path()).unwrap();
+        let again = index.published_generation();
+        assert_eq!(again.live.index_state(), IndexState::Ready);
+        assert!(
+            !matches!(again.bridge.coverage, DerivedCoverage::Loading),
+            "a reload of an already-loaded project keeps the synchronous bridge"
+        );
+    }
+
+    #[test]
+    fn unarmed_empty_reload_publishes_the_knowledge_bridge_inline() {
+        let _release = ColdFillGateGuard;
+        super::hold_cold_knowledge_fill_gate();
+
+        let root = TempDir::new().unwrap();
+        knowledge_fixture(root.path());
+        let index = LiveIndex::empty();
+        index.reload(root.path()).unwrap();
+
+        let published = index.published_generation();
+        assert_eq!(published.live.index_state(), IndexState::Ready);
+        assert!(
+            !matches!(published.bridge.coverage, DerivedCoverage::Loading),
+            "only the armed cold start defers the bridge"
+        );
+        assert!(!published.bridge.cards.is_empty());
     }
 }
