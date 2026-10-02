@@ -1412,14 +1412,20 @@ fn test_arcswap_concurrent_reads_under_writer_pressure() {
         })
     };
 
-    // Issue #752: a fixed sleep is a scheduling race. Readers can finish
-    // hundreds of consistent snapshots before the first clone-mutate-swap
-    // returns, which fails `swaps > 0` with `inconsistent == 0`. Wait until
-    // one swap is published, then stop. The deadline only detects a hung
-    // writer. Tear checks in the reader loop are unchanged.
+    // Issue #752: a fixed sleep is a scheduling race, and so is stopping at
+    // the first swap. Readers can finish hundreds of consistent snapshots
+    // before the first clone-mutate-swap returns (`swaps == 0`), and Windows
+    // CI run 36965288358 stopped at 36 reads / 2 swaps in well under a second,
+    // under the 100-read floor. Wait until one swap is published AND readers
+    // have reached that floor, then stop. The deadline only detects a hang.
+    // Tear checks in the reader loop are unchanged.
+    const READ_FLOOR: usize = 100;
     let started = Instant::now();
-    let swap_deadline = Duration::from_secs(30);
-    while writer_swaps.load(Ordering::Relaxed) == 0 && started.elapsed() < swap_deadline {
+    let deadline = Duration::from_secs(30);
+    while started.elapsed() < deadline
+        && (writer_swaps.load(Ordering::Relaxed) == 0
+            || reader_reads.load(Ordering::Relaxed) < READ_FLOOR)
+    {
         thread::sleep(Duration::from_millis(1));
     }
     stop.store(true, Ordering::Relaxed);
@@ -1439,16 +1445,16 @@ fn test_arcswap_concurrent_reads_under_writer_pressure() {
     );
     assert!(
         swaps > 0,
-        "writer published no snapshot within {swap_deadline:?} (reads={reads})"
+        "writer published no snapshot within {deadline:?} (reads={reads})"
     );
     assert!(
         reads > 0,
         "reader throughput was zero while the writer was active (swaps={swaps})"
     );
-    // Readers are already in flight when the first swap lands. A reader-side
-    // lock collapses this toward zero; 100 stays the floor.
+    // Same floor the wait enforces. A reader-side lock keeps the count from
+    // reaching it before the hang ceiling.
     assert!(
-        reads >= 100,
+        reads >= READ_FLOOR,
         "reader throughput suspiciously low: {reads} reads vs {swaps} swaps — possible reader starvation regression"
     );
 }
