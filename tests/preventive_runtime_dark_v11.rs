@@ -1096,10 +1096,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // open in read_gate (dismissal override and disclosure read), dismissal
 // store read, and secret_remediate caller-path reads. No new file, no edge
 // into src/index_lifecycle or server_api.rs.
+// Refreshed for the post-clear secret_remediate honesty fixes: .env chmod
+// failure is returned, encrypt/dismiss apply_status follows the rescan, and
+// dismiss apply refuses when the dismissal store cannot be loaded. Same 202
+// files; byte churn is src/protocol/secret_remediate.rs only. No new token
+// or call edge into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "34cd935f8cb2ba37e77f2ecfae6516038f5369ed65a6c5d9a0bbd9da1926e499",
+    "6c0f56c63612e696ec109243e8635a5f9a45e1ecbe2d93c6f56e3a08cc92d3e2",
     202,
-    10_348_961,
+    10_352_819,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

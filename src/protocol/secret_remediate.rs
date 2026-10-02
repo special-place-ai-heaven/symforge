@@ -224,12 +224,7 @@ impl SymForgeServer {
         };
 
         let history = history_note(&root);
-        let incomplete = rescan.starts_with("still_sensitive");
-        let status = if incomplete {
-            "apply_status: incomplete (rescan still_sensitive)"
-        } else {
-            "apply_status: ok"
-        };
+        let status = apply_status_for_rescan(&rescan);
         let mut out = format!(
             "secret_remediate apply (externalize)\n\
              {status}\n\
@@ -327,9 +322,10 @@ impl SymForgeServer {
         }
 
         let history = history_note(&root);
+        let status = apply_status_for_rescan(&rescan);
         let mut out = format!(
             "secret_remediate apply (encrypt)\n\
-             apply_status: ok\n\
+             {status}\n\
              written:\n- {}\n\
              rescan ({}) : {rescan}\n\
              plaintext_absent: true\n\
@@ -372,7 +368,19 @@ impl SymForgeServer {
         drop(live);
 
         let store_path = secret_dismissals::store_abs(&root);
-        let mut merged = secret_dismissals::load_dismissals(&root).unwrap_or_default();
+        // A load error must not merge onto an empty set: that rewrite would
+        // drop every prior record. Missing store is Ok(empty) and still applies.
+        let mut merged = match secret_dismissals::load_dismissals(&root) {
+            Ok(records) => records,
+            Err(err) => {
+                return Err(fail_and_return_mutation_replay(
+                    idempotency,
+                    format!(
+                        "Error: dismiss apply refused; dismissal store could not be loaded: {err}"
+                    ),
+                ));
+            }
+        };
         for rec in &plan.records {
             merged.retain(|r| {
                 !(r.path.replace('\\', "/") == rec.path.replace('\\', "/")
@@ -436,9 +444,10 @@ impl SymForgeServer {
         };
 
         let history = history_note(&root);
+        let status = apply_status_for_rescan(&rescan);
         let mut out = format!(
             "secret_remediate apply (dismiss)\n\
-             apply_status: ok\n\
+             {status}\n\
              written:\n- {DISMISSAL_STORE_REL}\n\
              rescan ({}) : {rescan}\n\
              {history}\n",
@@ -975,12 +984,10 @@ fn apply_externalize(root: &Path, plan: &PlannedRewrite) -> Result<(), String> {
     }
     atomic_write_file(root, None, &env_path, env_body.as_bytes())
         .map_err(|e| format!("write .env: {e}"))?;
-    // Bruce F2: owner-only mode on Unix for the credential file.
+    // Owner-only mode. A failed chmod, or a mode that is still not 0o600,
+    // fails the apply (caller rolls the .env write back).
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
-    }
+    ensure_env_owner_only(&env_path)?;
 
     atomic_write_file(root, None, &plan.abs_path, &plan.rewritten)
         .map_err(|e| format!("write {}: {e}", plan.path))?;
@@ -998,9 +1005,110 @@ fn apply_externalize(root: &Path, plan: &PlannedRewrite) -> Result<(), String> {
     Ok(())
 }
 
+/// Same honesty rule for externalize, encrypt, and dismiss: a rescan that
+/// is still sensitive is not `ok`.
+fn apply_status_for_rescan(rescan: &str) -> &'static str {
+    if rescan.starts_with("still_sensitive") {
+        "apply_status: incomplete (rescan still_sensitive)"
+    } else {
+        "apply_status: ok"
+    }
+}
+
+/// Unix credential mode after chmod. File-type bits above `0o777` are ignored.
+#[cfg(unix)]
+fn reject_non_owner_env_mode(mode: u32) -> Result<(), String> {
+    let mode = mode & 0o777;
+    if mode == 0o600 {
+        Ok(())
+    } else {
+        Err(format!(
+            ".env mode is {mode:#o} after chmod; expected owner-only 0o600"
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn ensure_env_owner_only(env_path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod .env 0o600 failed: {e}"))?;
+    let meta = std::fs::symlink_metadata(env_path)
+        .map_err(|e| format!("stat .env after chmod failed: {e}"))?;
+    if !meta.is_file() {
+        return Err("stat .env after chmod: not a regular file".to_string());
+    }
+    reject_non_owner_env_mode(meta.permissions().mode())
+}
+
 fn history_note(root: &Path) -> String {
     match crate::git::head_sha(root) {
         Ok(sha) => format!("history_note: old value may remain in git history since commit {sha}"),
         Err(_) => "history_note: working tree / uncommitted — no commit SHA observed".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_status_for_rescan;
+
+    #[test]
+    fn still_sensitive_rescan_is_incomplete() {
+        assert_eq!(
+            apply_status_for_rescan("still_sensitive finding_count=1"),
+            "apply_status: incomplete (rescan still_sensitive)"
+        );
+        assert_eq!(apply_status_for_rescan("clean"), "apply_status: ok");
+        assert_eq!(
+            apply_status_for_rescan("indeterminate TooLarge"),
+            "apply_status: ok"
+        );
+        assert_eq!(
+            apply_status_for_rescan("unreadable after write: boom"),
+            "apply_status: ok"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_owner_env_mode_is_a_failure() {
+        use super::reject_non_owner_env_mode;
+        let err = reject_non_owner_env_mode(0o644).unwrap_err();
+        assert!(err.contains("0o644"), "{err}");
+        assert!(reject_non_owner_env_mode(0o666).is_err());
+        assert!(reject_non_owner_env_mode(0o600).is_ok());
+        // `Permissions::mode` includes the file type above the permission bits.
+        assert!(reject_non_owner_env_mode(0o100600).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chmod_failure_on_missing_env_is_surfaced() {
+        use super::ensure_env_owner_only;
+        let missing =
+            std::env::temp_dir().join(format!("symforge-missing-env-{}", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        let err = ensure_env_owner_only(&missing).unwrap_err();
+        assert!(err.contains("chmod .env 0o600 failed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_chmod_lands_0600() {
+        use super::ensure_env_owner_only;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, b"K=v\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        ensure_env_owner_only(&path).unwrap();
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

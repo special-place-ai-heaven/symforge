@@ -513,6 +513,14 @@ async fn encrypt_apply_with_sops_leaves_no_plaintext_value() {
         return;
     }
     assert!(text.contains("plaintext_absent: true"), "{text}");
+    if text.contains("still_sensitive") {
+        assert!(
+            text.contains("apply_status: incomplete (rescan still_sensitive)"),
+            "{text}"
+        );
+    } else {
+        assert!(text.contains("apply_status: ok"), "{text}");
+    }
     let on_disk = std::fs::read_to_string(dir.path().join("config/app.json")).unwrap();
     assert!(!on_disk.contains(SYNTHETIC_SECRET), "plaintext remained");
 }
@@ -829,4 +837,122 @@ async fn externalize_env_file_is_owner_only_on_unix() {
             & 0o777;
         assert_eq!(mode, 0o600, "expected 0o600, got {mode:#o}");
     }
+}
+
+/// Encrypt, dismiss, and externalize share one rescan status line.
+#[test]
+fn encrypt_and_dismiss_share_externalize_apply_status() {
+    let src = include_str!("../src/protocol/secret_remediate.rs");
+    assert_eq!(
+        src.matches("apply_status_for_rescan(&rescan)").count(),
+        3,
+        "externalize, encrypt, and dismiss must share one status line"
+    );
+}
+
+/// Dismissing one of two findings leaves the other sensitive, so apply_status
+/// is incomplete rather than ok.
+#[tokio::test]
+async fn dismiss_apply_is_incomplete_when_rescan_still_sensitive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let second = "OtherValue9xYz";
+    let body =
+        format!("{{\n  \"token\": \"{SYNTHETIC_SECRET}\"\n  \"password\": \"{second}\"\n}}\n");
+    write_file(dir.path(), "config/app.json", &body);
+    let server = server_for_repo(dir.path());
+    let refusal = dispatch(
+        &server,
+        "get_file_content",
+        json!({ "path": "config/app.json" }),
+    )
+    .await;
+    let findings = refusal["_meta"][WITHHELD_META_KEY]["findings"]
+        .as_array()
+        .expect("findings");
+    assert!(
+        findings.len() >= 2,
+        "fixture needs two content findings, got {}",
+        findings.len()
+    );
+    let id = findings[0]["id"].as_str().unwrap().to_string();
+    let apply = dispatch(
+        &server,
+        "secret_remediate",
+        json!({
+            "scope": "config/app.json",
+            "finding_ids": [id],
+            "action": "dismiss",
+            "preview": false
+        }),
+    )
+    .await;
+    let text = result_text(&apply);
+    assert!(
+        text.contains("apply_status: incomplete (rescan still_sensitive)"),
+        "{text}"
+    );
+    assert!(text.contains("still_sensitive"), "{text}");
+    assert!(!text.contains(SYNTHETIC_SECRET), "{text}");
+    assert!(!text.contains(second), "{text}");
+    assert_eq!(
+        apply["_meta"][RESULT_STATUS_META_KEY]["outcome_class"], "ambiguous",
+        "{apply}"
+    );
+    assert_eq!(apply["isError"], json!(true), "{apply}");
+    let store =
+        std::fs::read_to_string(dir.path().join(".symforge/secret-dismissals.json")).unwrap();
+    assert!(
+        store.contains("\"records\""),
+        "dismiss must still record the one finding"
+    );
+}
+
+/// A dismissal store that cannot be loaded must not be replaced from empty.
+#[tokio::test]
+async fn dismiss_apply_refuses_when_store_cannot_be_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let body = format!("{{\n  \"password\": \"{SYNTHETIC_SECRET}\"\n}}\n");
+    write_file(dir.path(), "config/app.json", &body);
+    let server = server_for_repo(dir.path());
+    let refusal = dispatch(
+        &server,
+        "get_file_content",
+        json!({ "path": "config/app.json" }),
+    )
+    .await;
+    let id = refusal["_meta"][WITHHELD_META_KEY]["findings"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prior = b"KEEP-ME-UNTOUCHED";
+    write_file(
+        dir.path(),
+        ".symforge/secret-dismissals.json",
+        std::str::from_utf8(prior).unwrap(),
+    );
+    let apply = dispatch(
+        &server,
+        "secret_remediate",
+        json!({
+            "scope": "config/app.json",
+            "finding_ids": [id],
+            "action": "dismiss",
+            "preview": false
+        }),
+    )
+    .await;
+    let text = result_text(&apply);
+    assert!(
+        text.contains("dismiss apply refused") && text.contains("could not be loaded"),
+        "{text}"
+    );
+    let store = dir.path().join(".symforge/secret-dismissals.json");
+    assert_eq!(std::fs::read(&store).unwrap(), prior);
+    let source = std::fs::read_to_string(dir.path().join("config/app.json")).unwrap();
+    assert!(
+        source.contains(SYNTHETIC_SECRET),
+        "source must stay unchanged"
+    );
 }
