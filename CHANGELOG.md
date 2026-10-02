@@ -32,6 +32,14 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.5.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.1...v11.5.2) (2026-10-02)
+
+
+### Performance Improvements
+
+* **live_index:** defer knowledge bridge off restart-restore Ready ([24fcd4c](https://github.com/special-place-ai-heaven/symforge/commit/24fcd4cda911abe589ef0d1361e3691e5b5aebcb))
+* **live_index:** persist trigram index in snapshots ([34cd856](https://github.com/special-place-ai-heaven/symforge/commit/34cd8560f667f631ff5f80d1bffcabb00611b218))
+
 ## [11.5.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.0...v11.5.1) (2026-10-02)
 
 
