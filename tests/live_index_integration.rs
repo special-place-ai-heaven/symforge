@@ -3,6 +3,7 @@
 // file keeps `--no-default-features --features embed --all-targets` compiling.
 #![cfg(feature = "server")]
 
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 /// Integration tests for the LiveIndex startup pipeline.
 ///
@@ -12,8 +13,6 @@ use serde::Deserialize;
 /// Phase 2 tests cover: LIDX-05 (performance), INFR-02 (auto-index behavior),
 /// INFR-05 (no v1 tools), tool format verification end-to-end, and RELY-04.
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::thread;
@@ -22,6 +21,14 @@ use symforge::domain::ControlStateDir;
 use symforge::live_index::persist;
 use symforge::live_index::{IndexState, LiveIndex, ParseStatus};
 use tempfile::tempdir;
+
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .expect("build bounded sidecar test HTTP client")
+});
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -77,29 +84,14 @@ fn symforge_binary_path() -> Option<PathBuf> {
     binary_unix.exists().then_some(binary_unix)
 }
 
-/// Make a synchronous raw HTTP GET request to `127.0.0.1:{port}{path}`.
-fn raw_http_get(port: u16, path: &str) -> anyhow::Result<String> {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    let timeout = Duration::from_millis(500);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes())?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("")
-        .to_string();
-    Ok(body)
+/// Return the fully drained body from a bounded HTTP GET request.
+async fn raw_http_get(port: u16, path: &str) -> anyhow::Result<String> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let response = HTTP_CLIENT.get(url).send().await?;
+    Ok(response.text().await?)
 }
 
-fn fetch_startup_surface(
+async fn fetch_startup_surface(
     project_root: &Path,
     control_state: &ControlStateDir,
 ) -> Option<StartupSurface> {
@@ -113,7 +105,7 @@ fn fetch_startup_surface(
         .as_ref()
         .map(|session_id| format!("/v1/sessions/{session_id}/sidecar/health"))
         .unwrap_or_else(|| "/health".to_string());
-    let body = raw_http_get(port, &path).ok()?;
+    let body = raw_http_get(port, &path).await.ok()?;
     let health: StartupHealthResponse = serde_json::from_str(&body).ok()?;
     Some(match session_id {
         Some(session_id) => StartupSurface::Daemon { session_id, health },
@@ -209,8 +201,8 @@ fn test_startup_loads_all_files() {
     );
 }
 
-#[test]
-fn test_startup_binary_reports_branch_health() {
+#[tokio::test]
+async fn test_startup_binary_reports_branch_health() {
     let dir = tempdir().unwrap();
     let control_home = tempdir().unwrap();
     let control_state = ControlStateDir::new(control_home.path().to_path_buf());
@@ -248,7 +240,7 @@ fn test_startup_binary_reports_branch_health() {
             panic!("startup process exited before health probe completed: {status}");
         }
 
-        if let Some(surface) = fetch_startup_surface(dir.path(), &control_state) {
+        if let Some(surface) = fetch_startup_surface(dir.path(), &control_state).await {
             if first_surface.is_none() {
                 first_surface = Some(surface.clone());
             }

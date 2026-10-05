@@ -3,6 +3,7 @@ pub mod config_extractors;
 #[cfg(test)]
 mod inline_tests;
 pub mod languages;
+pub(crate) mod reference_evidence;
 // ponytail: Program 015 SP-0C spike module — same-file + use-import Rust resolver.
 #[cfg(feature = "cbm-spike")]
 pub mod resolver;
@@ -313,14 +314,8 @@ fn error_candidate_is_better(
     candidate.is_missing() && !current.is_missing()
 }
 
-pub(crate) fn parse_source(
-    source: &str,
-    language: &LanguageId,
-    is_tsx: bool,
-) -> Result<ParseSourceOutput, String> {
-    let mut parser = Parser::new();
-
-    let ts_language = match language {
+fn tree_sitter_language(language: &LanguageId, is_tsx: bool) -> tree_sitter::Language {
+    match language {
         LanguageId::Rust => tree_sitter_rust::LANGUAGE.into(),
         LanguageId::Python => tree_sitter_python::LANGUAGE.into(),
         LanguageId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
@@ -349,15 +344,32 @@ pub(crate) fn parse_source(
         LanguageId::Html => tree_sitter_html::LANGUAGE.into(),
         LanguageId::Css => tree_sitter_css::LANGUAGE.into(),
         LanguageId::Scss => tree_sitter_scss::language(),
-    };
+    }
+}
+
+pub(crate) fn parse_source_tree(
+    source: &str,
+    language: &LanguageId,
+    is_tsx: bool,
+) -> Result<tree_sitter::Tree, String> {
+    let mut parser = Parser::new();
+    let ts_language = tree_sitter_language(language, is_tsx);
 
     parser
         .set_language(&ts_language)
         .map_err(|e| format!("failed to set language: {e}"))?;
 
-    let tree = parser
+    parser
         .parse(source, None)
-        .ok_or_else(|| "tree-sitter parse returned None".to_string())?;
+        .ok_or_else(|| "tree-sitter parse returned None".to_string())
+}
+
+pub(crate) fn parse_source(
+    source: &str,
+    language: &LanguageId,
+    is_tsx: bool,
+) -> Result<ParseSourceOutput, String> {
+    let tree = parse_source_tree(source, language, is_tsx)?;
 
     let root = tree.root_node();
     let has_error = root.has_error();

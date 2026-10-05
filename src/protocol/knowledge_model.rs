@@ -25,14 +25,34 @@ pub(crate) fn render_code_knowledge_context(
     target: &CodeAnchorId,
     include_when_empty: bool,
 ) -> Option<String> {
+    let source = published.source.as_deref();
+    let identity = format!(
+        "source={} publication={} content={} target={}",
+        source.map_or("unknown", |value| value.source_id.as_str()),
+        published.publication_generation,
+        published.content_generation,
+        code_anchor_id_label(target),
+    );
+    // A path or source id can itself trigger the secret guard. Keep the
+    // provenance shape while withholding those fields in that case.
+    let safe_identity = match guard_hit(&identity, &[identity.as_str()]) {
+        Ok(safe) => safe.into_inner().clone(),
+        Err(_) => format!(
+            "source=withheld publication={} content={} target=withheld",
+            published.publication_generation, published.content_generation,
+        ),
+    };
+    let coverage = format!(
+        "coverage bridge={} authority={}",
+        derived_coverage_label(&published.bridge.coverage),
+        derived_coverage_label(&published.authority.coverage),
+    );
     if matches!(published.bridge.coverage, DerivedCoverage::Loading)
         || matches!(published.authority.coverage, DerivedCoverage::Loading)
     {
-        return Some(
-            "Knowledge evidence:\n  coverage bridge=loading authority=loading\n\
-             The knowledge bridge is still publishing; this is not a complete absence of knowledge."
-                .to_string(),
-        );
+        return Some(format!(
+            "Knowledge evidence:\n  {safe_identity}\n  counts unavailable=knowledge publication is loading\n  {coverage}\n  Knowledge publication is still loading; evidence absence is unknown."
+        ));
     }
     let mut selected = BTreeSet::new();
     if let Some(indices) = published.bridge.reverse_exact.get(target) {
@@ -96,24 +116,13 @@ pub(crate) fn render_code_knowledge_context(
     let shown = total.min(5);
     let overflow = total.saturating_sub(shown);
 
-    let source = published.source.as_deref();
     let mut lines = vec!["Knowledge evidence:".to_string()];
-    lines.push(format!(
-        "  source={} publication={} content={} target={}",
-        source.map_or("unknown", |value| value.source_id.as_str()),
-        published.publication_generation,
-        published.content_generation,
-        code_anchor_id_label(target),
-    ));
+    lines.push(format!("  {safe_identity}"));
     lines.push(format!(
         "  counts total={} shown={} overflow={} ambiguous={} missing={}",
         total, shown, overflow, ambiguous, missing,
     ));
-    lines.push(format!(
-        "  coverage bridge={} authority={}",
-        derived_coverage_label(&published.bridge.coverage),
-        derived_coverage_label(&published.authority.coverage),
-    ));
+    lines.push(format!("  {coverage}"));
 
     for (ordinal, (index, link)) in links.into_iter().take(5).enumerate() {
         let authority = authority_for_evidence(published, &link.evidence);
@@ -141,7 +150,7 @@ pub(crate) fn render_code_knowledge_context(
     match guard_hit(&rendered, &[rendered.as_str()]) {
         Ok(safe) => Some(safe.into_inner().clone()),
         Err(failure) => Some(format!(
-            "Knowledge evidence withheld by secret policy v{} ({} finding(s)).",
+            "Knowledge evidence:\n  {safe_identity}\n  counts unavailable=withheld by secret policy\n  {coverage}\n  Knowledge evidence withheld by secret policy v{} ({} finding(s)).",
             failure.policy_version, failure.finding_count
         )),
     }
@@ -156,9 +165,18 @@ pub(crate) fn render_budgeted_code_knowledge_only(
     rendered: Option<&str>,
     max_tokens: Option<u64>,
 ) -> String {
+    render_budgeted_code_knowledge_only_with_mode(published, rendered, max_tokens, false)
+}
+
+fn render_budgeted_code_knowledge_only_with_mode(
+    published: &PublishedGeneration,
+    rendered: Option<&str>,
+    max_tokens: Option<u64>,
+    prefer_summary: bool,
+) -> String {
     let source = published.source.as_deref();
     let fallback = format!(
-        "Knowledge evidence:\n  source={} publication={} content={} target=unresolved\n  counts total=0 shown=0 overflow=0 ambiguous=0 missing=0\n  coverage bridge={} authority={}",
+        "Knowledge evidence:\n  source={} publication={} content={} target=unavailable\n  counts unavailable=rendered evidence is absent\n  coverage bridge={} authority={}",
         source.map_or("unknown", |value| value.source_id.as_str()),
         published.publication_generation,
         published.content_generation,
@@ -166,40 +184,124 @@ pub(crate) fn render_budgeted_code_knowledge_only(
         derived_coverage_label(&published.authority.coverage),
     );
     let rendered = rendered.unwrap_or(&fallback);
+    let freshness = format!("{:?}", published.freshness.as_ref());
     let normal = format!(
-        "Trust: exact source evidence | publication {} | content {} | current\nScope: requested code anchor\nEvidence: reverse knowledge bridge\n\n{rendered}",
-        published.publication_generation, published.content_generation,
+        "Trust: source-scoped knowledge evidence | freshness={freshness} | bridge={} authority={}\nScope: requested code anchor\nEvidence: reverse knowledge bridge\n\n{rendered}",
+        derived_coverage_label(&published.bridge.coverage),
+        derived_coverage_label(&published.authority.coverage),
     );
     let Some(max_tokens) = max_tokens.filter(|value| *value > 0) else {
         return normal;
     };
-    if normal.len() <= (max_tokens as usize).saturating_mul(4) {
+    if !prefer_summary && normal.len() <= (max_tokens as usize).saturating_mul(4) {
         return normal;
     }
 
+    let identity = rendered
+        .lines()
+        .find(|line| line.trim_start().starts_with("source=") && line.contains("target="))
+        .map(str::trim_start)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "source={} publication={} content={} target=unavailable",
+                source.map_or("unknown", |value| value.source_id.as_str()),
+                published.publication_generation,
+                published.content_generation
+            )
+        });
     let counts = rendered
         .lines()
         .find(|line| line.trim_start().starts_with("counts "))
-        .map(str::trim_start)
-        .unwrap_or("counts total=0 shown=0 overflow=0 ambiguous=0 missing=0");
+        .map(str::trim_start);
+    let count_value = |key: &str| {
+        counts.and_then(|line| {
+            line.split_whitespace().find_map(|field| {
+                field
+                    .strip_prefix(&format!("{key}="))
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+        })
+    };
+    let counts_summary = match (
+        count_value("total"),
+        count_value("shown"),
+        count_value("overflow"),
+        count_value("ambiguous"),
+        count_value("missing"),
+    ) {
+        (Some(total), Some(available), Some(overflow), Some(ambiguous), Some(missing)) => format!(
+            "counts total={total} emitted=0 omitted={total} available_in_full_result={available} overflow={overflow} ambiguous={ambiguous} missing={missing}"
+        ),
+        _ => "counts unavailable (rendered evidence did not include complete counts)".to_string(),
+    };
+    let lean_counts = match (
+        count_value("total"),
+        count_value("shown"),
+        count_value("overflow"),
+        count_value("ambiguous"),
+        count_value("missing"),
+    ) {
+        (Some(total), Some(_), Some(overflow), Some(ambiguous), Some(missing)) => format!(
+            "counts total={total} emitted=0 omitted={total} overflow={overflow} ambiguous={ambiguous} missing={missing}"
+        ),
+        _ => "counts unavailable (not zero)".to_string(),
+    };
     let coverage = rendered
         .lines()
         .find(|line| line.trim_start().starts_with("coverage "))
         .map(str::trim_start)
-        .unwrap_or("coverage bridge=unknown authority=unknown");
+        .unwrap_or_else(|| "coverage unavailable");
+    let withheld_or_unavailable = rendered
+        .lines()
+        .filter(|line| {
+            let line = line.to_ascii_lowercase();
+            !line.trim_start().starts_with("coverage ")
+                && !line.trim_start().starts_with("counts ")
+                && [
+                    "loading",
+                    "publishing",
+                    "withheld",
+                    "unavailable",
+                    "disabled",
+                    "failed",
+                ]
+                .iter()
+                .any(|state| line.contains(state))
+        })
+        .take(1)
+        .collect::<Vec<_>>()
+        .join("\n");
     let compact = format!(
-        "Trust: exact source evidence | current | output_coverage=degraded\nIdentity: source={} publication={} content={}\nScope: requested code anchor\nEvidence: reverse knowledge bridge\n\nKnowledge evidence:\n  {counts}\n  {coverage}",
-        source.map_or("unknown", |value| value.source_id.as_str()),
-        published.publication_generation,
-        published.content_generation,
+        "Knowledge summary: details omitted by budget; freshness={freshness} | bridge={} authority={}\nIdentity: {identity}\nScope: requested code anchor\nEvidence: reverse knowledge bridge\n\nKnowledge evidence:\n  {counts_summary}\n  {coverage}{state_suffix}\n  Continuation: request sections=[\"knowledge\"] with a higher max_tokens value.",
+        derived_coverage_label(&published.bridge.coverage),
+        derived_coverage_label(&published.authority.coverage),
+        state_suffix = if withheld_or_unavailable.is_empty() {
+            String::new()
+        } else {
+            format!("\n{withheld_or_unavailable}")
+        },
+        freshness = freshness,
     );
     if compact.len() <= (max_tokens as usize).saturating_mul(4) {
         compact
     } else {
-        let minimum_tokens = compact.len().div_ceil(4);
-        format!(
-            "Error: max_tokens is too small for atomic knowledge provenance; minimum_tokens={minimum_tokens}."
-        )
+        let lean = format!(
+            "Trust: budget-limited\nKnowledge evidence:\n  {identity}\n  {lean_counts}\n  {coverage}{state_suffix}\n  Continuation: request sections=[\"knowledge\"] with higher max_tokens.",
+            state_suffix = if withheld_or_unavailable.is_empty() {
+                String::new()
+            } else {
+                format!("\n{withheld_or_unavailable}")
+            },
+        );
+        if lean.len() <= (max_tokens as usize).saturating_mul(4) {
+            lean
+        } else {
+            let minimum_tokens = lean.len().div_ceil(4);
+            format!(
+                "Error: max_tokens is too small for atomic knowledge provenance; minimum_tokens={minimum_tokens}. Continuation: retry sections=[\"knowledge\"] with a higher max_tokens."
+            )
+        }
     }
 }
 
@@ -210,37 +312,336 @@ pub(crate) fn render_budgeted_code_knowledge_only(
 pub(crate) fn enforce_budgeted_code_context_with_knowledge(
     published: &PublishedGeneration,
     assembled: String,
+    knowledge_start: Option<usize>,
     rendered: Option<&str>,
     max_tokens: Option<u64>,
 ) -> (String, bool) {
+    let code_context = max_tokens
+        .filter(|limit| {
+            *limit > 0
+                && assembled.len()
+                    > usize::try_from(*limit)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(4)
+        })
+        .and_then(|_| knowledge_start.and_then(|start| assembled.get(..start)))
+        .map(str::to_owned);
     let (budgeted, truncated) =
         crate::protocol::format::enforce_token_budget_flagged(assembled, max_tokens);
     if !truncated || rendered.is_none() {
         return (budgeted, truncated);
     }
 
-    let complete_provenance =
-        budgeted
-            .split_once("Knowledge evidence:")
-            .is_some_and(|(_, section)| {
-                section.contains("source=")
-                    && section.contains("publication=")
-                    && section.contains("content=")
-                    && section.contains("counts total=")
-                    && section.contains("overflow=")
-                    && section.contains("ambiguous=")
-                    && section.contains("missing=")
-                    && section.contains("coverage bridge=")
-                    && section.contains("authority=")
-            });
-    if complete_provenance {
+    // The code portion may itself contain the heading or row-like text. Only
+    // the caller-known appended knowledge span can satisfy this contract.
+    let knowledge_section = knowledge_start
+        .and_then(|start| budgeted.get(start..))
+        .filter(|section| section.starts_with("Knowledge evidence:"));
+    let complete_provenance = knowledge_section.is_some_and(|section| {
+        section.contains("source=")
+            && section.contains("publication=")
+            && section.contains("content=")
+            && section.contains("counts total=")
+            && section.contains("overflow=")
+            && section.contains("ambiguous=")
+            && section.contains("missing=")
+            && section.contains("coverage bridge=")
+            && section.contains("authority=")
+    });
+    let emitted_anchor_rows = knowledge_section
+        .into_iter()
+        .flat_map(str::lines)
+        .filter(|line| {
+            let Some((ordinal, _)) = line.trim_start().split_once(". ") else {
+                return false;
+            };
+            ordinal.parse::<usize>().is_ok()
+                && [
+                    "bytes=",
+                    "content_hash=",
+                    "source=",
+                    "generation=",
+                    "link_id=",
+                    "bridge_index=",
+                    "resolution=",
+                    "lifecycle=",
+                    "voice=",
+                ]
+                .iter()
+                .all(|marker| line.contains(marker))
+        })
+        .count();
+    let declared_anchor_rows = rendered.and_then(|rendered| {
+        rendered.lines().find_map(|line| {
+            let line = line.trim_start();
+            if !line.starts_with("counts ") {
+                return None;
+            }
+            line.split_whitespace().find_map(|field| {
+                field
+                    .strip_prefix("shown=")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+        })
+    });
+    if complete_provenance
+        && declared_anchor_rows.is_some_and(|declared| declared == emitted_anchor_rows)
+    {
         (budgeted, true)
     } else {
-        (
-            render_budgeted_code_knowledge_only(published, rendered, max_tokens),
-            true,
-        )
+        let summary =
+            render_budgeted_code_knowledge_only_with_mode(published, rendered, max_tokens, true);
+        let continuation = "\nRequested code and knowledge sections may be incomplete; retry with higher max_tokens.";
+        let short_continuation = "\nCode section omitted; retry with higher max_tokens.";
+        let max_bytes = max_tokens
+            .filter(|limit| *limit > 0)
+            .map(|limit| {
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(4)
+            })
+            .unwrap_or(usize::MAX);
+        if !summary.starts_with("Error:")
+            && let Some(code_context) = code_context
+        {
+            // The known append offset separates code from knowledge even if code
+            // itself contains a line that looks like a knowledge heading.
+            let code_context = code_context.trim_end_matches('\n');
+            let reserve = summary
+                .len()
+                .saturating_add(continuation.len())
+                .saturating_add(34);
+            let mut code_budget = max_bytes.saturating_sub(reserve) / 4;
+            while code_budget > 0 {
+                let (code, _) = crate::protocol::format::enforce_token_budget_flagged(
+                    code_context.to_string(),
+                    Some(code_budget as u64),
+                );
+                let code =
+                    crate::protocol::format::downgrade_full_completeness_after_truncation(&code);
+                let combined = format!("{code}\n\n{summary}{continuation}");
+                if combined.len() <= max_bytes && !code.trim().is_empty() {
+                    return (combined, true);
+                }
+                code_budget /= 2;
+            }
+        }
+        if summary.len().saturating_add(continuation.len()) <= max_bytes {
+            (format!("{summary}{continuation}"), true)
+        } else if summary.len().saturating_add(short_continuation.len()) <= max_bytes {
+            (format!("{summary}{short_continuation}"), true)
+        } else {
+            (
+                "Error: max_tokens is too small for requested code and knowledge sections. Continuation: retry the same sections with a higher max_tokens."
+                    .to_string(),
+                true,
+            )
+        }
     }
+}
+
+/// A post-render note or trust-envelope rewrite can grow an already bounded
+/// response. If the final response no longer fits, return an explicit error
+/// with the requested identities rather than cutting evidence mid-row or
+/// implying that omitted knowledge is absent. The caller can retry the same
+/// sections at a higher budget; no hidden full-result handle is assumed.
+pub(crate) fn bound_final_code_context_output(
+    output: String,
+    max_tokens: Option<u64>,
+    target: &str,
+    requested_sections: Option<&[String]>,
+    knowledge_requested: bool,
+    withheld_files: bool,
+    cache_hit_handle: Option<&str>,
+) -> String {
+    let Some(limit) = max_tokens.filter(|limit| *limit > 0) else {
+        return output;
+    };
+    let max_bytes = usize::try_from(limit)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    if output.len() <= max_bytes {
+        return output;
+    }
+
+    // The caller supplies this handle only from a real session cache hit. Do
+    // not infer a handle from source text that resembles a cache-hit response.
+    if output.starts_with("Decision: cache_hit\n")
+        && let Some(handle) = cache_hit_handle
+            .filter(|value| value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        let withheld_note = if withheld_files {
+            "\nWithheld files were not searched."
+        } else {
+            ""
+        };
+        return format!(
+            "Decision: cache_hit\nretrieve: symforge_retrieve with hash=\"{handle}\"\nPrior bytes were served on this MCP connection; redeem the hash if they are missing from context.{withheld_note}"
+        );
+    }
+
+    if !knowledge_requested && !withheld_files {
+        const NOTE: &str = "\n[Requested sections incomplete; retry with a higher max_tokens.]";
+        let reserve = NOTE.len().saturating_add(64);
+        if let Some(prefix) = output.get(..max_bytes.saturating_sub(reserve))
+            && let Some(last_line) = prefix.rfind('\n')
+        {
+            let mut bounded = crate::protocol::format::downgrade_full_completeness_after_truncation(
+                &output[..last_line],
+            );
+            bounded.push_str(NOTE);
+            if bounded.len() <= max_bytes {
+                return bounded;
+            }
+        }
+    }
+
+    let target_owned = target.to_string();
+    let safe_target = match guard_hit(&target_owned, &[target]) {
+        Ok(safe) => safe.into_inner().clone(),
+        Err(_) => "withheld by secret policy".to_string(),
+    };
+    let sections = requested_sections
+        .filter(|sections| !sections.is_empty())
+        .map(|sections| sections.join(","))
+        .unwrap_or_else(|| "default".to_string());
+    let knowledge = if knowledge_requested {
+        "Knowledge evidence: unavailable within this budget; counts unavailable (not zero).\n"
+    } else {
+        ""
+    };
+    let withheld = if withheld_files {
+        "Withheld files were not searched.\n"
+    } else {
+        ""
+    };
+    let incompleteness = if knowledge_requested {
+        "Requested code and knowledge sections may be incomplete."
+    } else {
+        "Requested code sections may be incomplete."
+    };
+    let diagnostic = format!(
+        "Error: max_tokens is too small for complete requested context.\nTrust: budget-limited\nTarget: {safe_target}\nRequested sections: [{sections}]\n{knowledge}{withheld}{incompleteness} Continuation: retry the same sections with a higher max_tokens."
+    );
+    if diagnostic.len() <= max_bytes {
+        return diagnostic;
+    }
+    // A complete inability diagnostic is outside an impossibly tiny evidence
+    // budget. Preserve the requested identities and a usable retry instruction.
+    diagnostic
+}
+
+/// When a default `get_file_context` response exceeds its budget, preserve the
+/// code context first and replace bulky auxiliary knowledge backlinks with the
+/// same atomic source/count/coverage summary used by knowledge-only reads.
+/// Explicit section requests continue through
+/// `enforce_budgeted_code_context_with_knowledge`.
+pub(crate) fn enforce_budgeted_code_context_prioritizing_code(
+    published: &PublishedGeneration,
+    assembled: String,
+    code_context_len: usize,
+    rendered: Option<&str>,
+    max_tokens: Option<u64>,
+) -> (String, bool) {
+    const TOTAL_PROVENANCE_RESERVE_TOKENS: u64 = 320;
+    const SUMMARY_BUDGET_TOKENS: u64 = 215;
+
+    let (budgeted, truncated) =
+        crate::protocol::format::enforce_token_budget_flagged(assembled.clone(), max_tokens);
+    if !truncated || rendered.is_none() {
+        return (budgeted, truncated);
+    }
+
+    let Some(limit) = max_tokens.filter(|limit| *limit > 0) else {
+        return enforce_budgeted_code_context_with_knowledge(
+            published,
+            assembled,
+            Some(code_context_len.saturating_add(2)),
+            rendered,
+            max_tokens,
+        );
+    };
+    let Some(code_context) = assembled.get(..code_context_len) else {
+        return enforce_budgeted_code_context_with_knowledge(
+            published,
+            assembled,
+            Some(code_context_len.saturating_add(2)),
+            rendered,
+            max_tokens,
+        );
+    };
+
+    let reserve_tokens = if limit >= 600 {
+        TOTAL_PROVENANCE_RESERVE_TOKENS
+    } else {
+        (limit / 4).max(1)
+    };
+    let code_budget = limit.saturating_sub(reserve_tokens).max(1);
+    let summary_budget = SUMMARY_BUDGET_TOKENS.min((limit / 4).max(1));
+    let (code, _) = crate::protocol::format::enforce_token_budget_flagged(
+        code_context.to_string(),
+        Some(code_budget),
+    );
+    let knowledge = render_budgeted_code_knowledge_only(published, rendered, Some(summary_budget));
+    if knowledge.starts_with("Error:") {
+        let fallback = render_budgeted_code_knowledge_only(published, rendered, Some(limit));
+        if fallback.starts_with("Error:") {
+            return (
+                "Error: max_tokens is too small for code and knowledge provenance. Continuation: retry the same sections with a higher max_tokens."
+                    .to_string(),
+                true,
+            );
+        }
+        let code_note =
+            "\nCode context omitted by budget; retry same sections with higher max_tokens.";
+        if fallback.len().saturating_add(code_note.len()) <= (limit as usize).saturating_mul(4) {
+            return (format!("{fallback}{code_note}"), true);
+        }
+        return (fallback, true);
+    }
+    const KNOWLEDGE_OMITTED_NOTE: &str = "Knowledge details omitted to prioritize default code context; request sections=[\"knowledge\"] with a higher max_tokens value.";
+    let mut output = format!("{code}\n\n{knowledge}");
+    if knowledge.contains("output_coverage=degraded") || knowledge.starts_with("Error:") {
+        output.push_str(&format!("\n\n{KNOWLEDGE_OMITTED_NOTE}"));
+    }
+
+    // The code slice has its own visible truncation footer. The remaining
+    // reserved bytes cover the atomic provenance summary, omission note, and
+    // separators, keeping the complete response within the caller's budget.
+    let max_bytes = (limit as usize).saturating_mul(4);
+    if output.len() > max_bytes {
+        // Provenance can itself be unusually large (for example, a very long
+        // source path). Keep the source summary atomic: if it cannot fit with
+        // the default code slice, omit that summary and say how to retrieve it.
+        let note = format!("\n\n{KNOWLEDGE_OMITTED_NOTE}");
+        let code_budget = limit.saturating_sub(reserve_tokens).max(1);
+        let (code, _) = crate::protocol::format::enforce_token_budget_flagged(
+            code_context.to_string(),
+            Some(code_budget),
+        );
+        output = format!("{code}{note}");
+    }
+
+    if output.len() > max_bytes {
+        // Last-resort byte cap for pathological path/provenance inputs. Keep
+        // a UTF-8-safe prefix (which starts with the source trust envelope)
+        // and a visible retrieval/truncation notice at the end.
+        let note = "\n\n[Truncated to max_tokens; request sections=[\"knowledge\"] or increase max_tokens.]";
+        if max_bytes >= note.len() {
+            let prefix_budget = max_bytes.saturating_sub(note.len());
+            let mut boundary = prefix_budget.min(output.len());
+            while !output.is_char_boundary(boundary) {
+                boundary = boundary.saturating_sub(1);
+            }
+            output.truncate(boundary);
+            output.push_str(note);
+        } else {
+            output = "Error: max_tokens is too small for code and knowledge provenance. Continuation: retry the same sections with a higher max_tokens."
+                .to_string();
+        }
+    }
+
+    (output, true)
 }
 
 pub(crate) fn resolve_symbol_code_anchor(
@@ -662,11 +1063,364 @@ fn snake_debug(value: &impl std::fmt::Debug) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
     use super::*;
     use crate::live_index::LiveIndex;
+
+    fn with_coverage(
+        current: &PublishedGeneration,
+        bridge_coverage: DerivedCoverage,
+        authority_coverage: DerivedCoverage,
+    ) -> PublishedGeneration {
+        let mut bridge = (*current.bridge).clone();
+        bridge.coverage = bridge_coverage;
+        let mut authority = (*current.authority).clone();
+        authority.coverage = authority_coverage;
+        PublishedGeneration {
+            publication_generation: current.publication_generation,
+            content_generation: current.content_generation,
+            project_generation: current.project_generation,
+            source: current.source.clone(),
+            source_version: current.source_version.clone(),
+            freshness: current.freshness.clone(),
+            manifest: current.manifest.clone(),
+            code_signals: current.code_signals.clone(),
+            bridge: Arc::new(bridge),
+            authority: Arc::new(authority),
+            live: current.live.clone(),
+            health: current.health.clone(),
+            outline: current.outline.clone(),
+        }
+    }
+
+    #[test]
+    fn loading_code_knowledge_keeps_each_coverage_axis_and_requested_identity() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn launch() {}\n").unwrap();
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let current = shared.published_generation();
+        let target = CodeAnchorId::File {
+            path: "src/lib.rs".to_string(),
+        };
+        for (bridge, authority, expected) in [
+            (
+                DerivedCoverage::Loading,
+                DerivedCoverage::Complete,
+                "bridge=loading authority=complete",
+            ),
+            (
+                DerivedCoverage::Complete,
+                DerivedCoverage::Loading,
+                "bridge=complete authority=loading",
+            ),
+        ] {
+            let published = with_coverage(&current, bridge, authority);
+            let rendered = render_code_knowledge_context(&published, &target, true).unwrap();
+            assert!(rendered.contains("target=file:src/lib.rs"), "{rendered}");
+            assert!(
+                rendered.contains("publication=") && rendered.contains("content="),
+                "{rendered}"
+            );
+            assert!(rendered.contains("counts unavailable="), "{rendered}");
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains("counts total=0"), "{rendered}");
+
+            let enlarged = format!(
+                "{rendered}\n{}",
+                "unavailable while publishing\n".repeat(60)
+            );
+            let compact =
+                render_budgeted_code_knowledge_only(&published, Some(&enlarged), Some(240));
+            assert!(compact.contains("target=file:src/lib.rs"), "{compact}");
+            assert!(compact.contains("counts unavailable"), "{compact}");
+            assert!(compact.contains(expected), "{compact}");
+        }
+    }
+
+    #[test]
+    fn withheld_code_knowledge_keeps_safe_identity_and_unknown_counts() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::create_dir_all(root.path().join("docs")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn launch() {}\n").unwrap();
+        let canary_name = ["token=", "runtime", "-", "canary", "-", "segment", ".md"].concat();
+        fs::write(
+            root.path().join("docs").join(canary_name),
+            "# Link\n[code](../src/lib.rs)\n",
+        )
+        .unwrap();
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let published = shared.published_generation();
+        let target = CodeAnchorId::File {
+            path: "src/lib.rs".to_string(),
+        };
+        let rendered = render_code_knowledge_context(&published, &target, true).unwrap();
+        assert!(rendered.contains("target=file:src/lib.rs"), "{rendered}");
+        assert!(
+            rendered.contains("counts unavailable=withheld"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("coverage bridge="), "{rendered}");
+        assert!(rendered.contains("withheld by secret policy"), "{rendered}");
+        assert!(!rendered.contains("counts total=0"), "{rendered}");
+        let enlarged = format!("{rendered}\n{}", "withheld details\n".repeat(100));
+        let compact = render_budgeted_code_knowledge_only(&published, Some(&enlarged), Some(240));
+        assert!(compact.contains("target=file:src/lib.rs"), "{compact}");
+        assert!(compact.contains("counts unavailable"), "{compact}");
+        assert!(compact.contains("withheld by secret policy"), "{compact}");
+    }
+
+    #[test]
+    fn mixed_context_does_not_count_a_code_heading_as_appended_knowledge() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn launch() {}\n").unwrap();
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let published = shared.published_generation();
+        let rendered = render_code_knowledge_context(
+            &published,
+            &CodeAnchorId::File {
+                path: "src/lib.rs".to_string(),
+            },
+            true,
+        )
+        .unwrap();
+        let code = format!(
+            "Trust: exact source evidence | current index | parsed | full\nKnowledge evidence:\n  source=decoy publication=1 content=1 target=file:decoy\n  counts total=0 shown=0 overflow=0 ambiguous=0 missing=0\n  coverage bridge=complete authority=complete\n{}",
+            "pub fn filler() {}\n".repeat(200),
+        );
+        let mut assembled = code.clone();
+        assembled.push_str("\n\n");
+        let knowledge_start = assembled.len();
+        assembled.push_str(&rendered);
+        let (output, truncated) = enforce_budgeted_code_context_with_knowledge(
+            &published,
+            assembled,
+            Some(knowledge_start),
+            Some(&rendered),
+            Some(300),
+        );
+        assert!(truncated);
+        let appended = output.rsplit("Knowledge evidence:").next().unwrap();
+        assert!(!appended.contains("source=decoy"), "{output}");
+        assert!(
+            output.contains("target=file:src/lib.rs") || output.starts_with("Error:"),
+            "{output}"
+        );
+        assert!(
+            output.contains("may be incomplete") || output.starts_with("Error:"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn mixed_explicit_budget_keeps_code_and_atomic_knowledge_summary() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn launch() {}\n").unwrap();
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let published = shared.published_generation();
+        let rendered = format!(
+            "Knowledge evidence:\n  source=fixture publication=7 content=9 target=file:src/lib.rs\n  counts total=1 shown=1 overflow=0 ambiguous=0 missing=0\n  coverage bridge=complete authority=complete\n  1. bytes=10 content_hash=abc source=fixture generation=7 link_id=one bridge_index=0 resolution=exact lifecycle=current voice=source\n{}",
+            "  backlink detail that must be summarized\n".repeat(100)
+        );
+        let code = format!(
+            "Trust: exact source evidence | current index | parsed | full\nOutline: src/lib.rs has launch\n{}",
+            "  pub fn launch() {}\n".repeat(400)
+        );
+        let mut assembled = code;
+        assembled.push_str("\n\n");
+        let knowledge_start = assembled.len();
+        assembled.push_str(&rendered);
+        let (output, truncated) = enforce_budgeted_code_context_with_knowledge(
+            &published,
+            assembled,
+            Some(knowledge_start),
+            Some(&rendered),
+            Some(400),
+        );
+        assert!(truncated, "{output}");
+        assert!(
+            output.starts_with("Trust: exact source evidence"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Outline: src/lib.rs has launch"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Knowledge summary: details omitted by budget"),
+            "{output}"
+        );
+        assert!(
+            output.contains("counts total=1 emitted=0 omitted=1"),
+            "{output}"
+        );
+        assert!(
+            output.contains("coverage bridge=complete authority=complete"),
+            "{output}"
+        );
+        assert!(output.contains("may be incomplete"), "{output}");
+        assert!(!output.contains("link_id=one"), "{output}");
+        assert!(output.len() <= 400 * 4, "{output}");
+    }
+
+    #[test]
+    fn bounded_cache_hit_keeps_redeemable_ccr_handle() {
+        let meta = crate::protocol::session::SessionCacheHitMeta {
+            kind: "file_context",
+            path: "src/lib.rs".to_string(),
+            name: String::new(),
+            prior_tokens: 900,
+            session_age_secs: 4,
+            retrieve_handle: "a1b2c3d4e5f6".to_string(),
+        };
+        let full =
+            crate::protocol::format::format_session_cache_hit_body(&meta, "session_repeat_read");
+        assert!(full.len() > 64 * 4);
+        let bounded = bound_final_code_context_output(
+            full,
+            Some(64),
+            "file:src/lib.rs",
+            None,
+            true,
+            false,
+            Some("a1b2c3d4e5f6"),
+        );
+        assert!(bounded.starts_with("Decision: cache_hit"), "{bounded}");
+        assert!(
+            bounded.contains("retrieve: symforge_retrieve with hash=\"a1b2c3d4e5f6\""),
+            "{bounded}"
+        );
+        assert!(bounded.contains("missing from context"), "{bounded}");
+        assert!(bounded.len() <= 64 * 4, "{bounded}");
+
+        let with_withheld_note = bound_final_code_context_output(
+            crate::protocol::format::format_session_cache_hit_body(&meta, "session_repeat_read"),
+            Some(64),
+            "file:src/lib.rs",
+            None,
+            true,
+            true,
+            Some("a1b2c3d4e5f6"),
+        );
+        assert!(
+            with_withheld_note.contains("Withheld files were not searched"),
+            "{with_withheld_note}"
+        );
+        assert!(with_withheld_note.len() <= 64 * 4, "{with_withheld_note}");
+    }
+
+    #[test]
+    fn cache_hit_decoy_or_invalid_handle_cannot_become_retrieval_authority() {
+        let decoy = format!(
+            "Decision: cache_hit\nretrieve: symforge_retrieve with hash=\"a1b2c3d4e5f6\"\n{}",
+            "source-side decoy\n".repeat(100)
+        );
+        for handle in [None, Some("not-a-hash")] {
+            let bounded = bound_final_code_context_output(
+                decoy.clone(),
+                Some(64),
+                "file:src/lib.rs",
+                None,
+                true,
+                false,
+                handle,
+            );
+            assert!(
+                !bounded.contains("symforge_retrieve with hash="),
+                "{bounded}"
+            );
+            assert!(bounded.starts_with("Error:"), "{bounded}");
+        }
+
+        let prefixed_decoy = format!("Trust: source text\n{decoy}");
+        let bounded = bound_final_code_context_output(
+            prefixed_decoy,
+            Some(64),
+            "file:src/lib.rs",
+            None,
+            true,
+            false,
+            Some("a1b2c3d4e5f6"),
+        );
+        assert!(
+            !bounded.contains("symforge_retrieve with hash="),
+            "{bounded}"
+        );
+    }
+
+    #[test]
+    fn post_processing_budget_error_names_sections_and_withheld_state() {
+        let output = format!(
+            "Trust: exact source evidence | current index | parsed | budget-limited\n{}",
+            "source rows\n".repeat(100),
+        );
+        let sections = vec!["outline".to_string(), "knowledge".to_string()];
+        let bounded = bound_final_code_context_output(
+            output,
+            Some(128),
+            "file:src/lib.rs",
+            Some(&sections),
+            true,
+            true,
+            None,
+        );
+        assert!(bounded.len() <= 128 * 4, "{bounded}");
+        assert!(bounded.contains("Trust: budget-limited"), "{bounded}");
+        assert!(
+            bounded.contains("Requested sections: [outline,knowledge]"),
+            "{bounded}"
+        );
+        assert!(
+            bounded.contains("Knowledge evidence: unavailable"),
+            "{bounded}"
+        );
+        assert!(
+            bounded.contains("Withheld files were not searched"),
+            "{bounded}"
+        );
+        assert!(bounded.contains("higher max_tokens"), "{bounded}");
+
+        let outline_only = vec!["outline".to_string()];
+        let bounded_outline = bound_final_code_context_output(
+            "oversized".repeat(100),
+            Some(128),
+            "file:src/lib.rs",
+            Some(&outline_only),
+            false,
+            true,
+            None,
+        );
+        assert!(bounded_outline.len() <= 128 * 4);
+        assert!(bounded_outline.contains("Requested sections: [outline]"));
+        assert!(bounded_outline.contains("Requested code sections may be incomplete"));
+        assert!(!bounded_outline.contains("code and knowledge sections"));
+
+        let tiny = bound_final_code_context_output(
+            "oversized".repeat(100),
+            Some(8),
+            "file:src/lib.rs",
+            Some(&sections),
+            true,
+            true,
+            None,
+        );
+        assert!(
+            tiny.len() > 32,
+            "the complete inability diagnostic is outside an impossible evidence budget"
+        );
+        assert!(tiny.starts_with("Error:"), "{tiny}");
+        assert!(
+            tiny.contains("Requested sections: [outline,knowledge]"),
+            "{tiny}"
+        );
+        assert!(tiny.contains("higher max_tokens"), "{tiny}");
+    }
 
     #[test]
     fn repository_map_reports_current_intent_missing_roles_hygiene_and_coverage() {
@@ -809,5 +1563,210 @@ mod tests {
         );
         assert!(rendered.contains("bytes="), "{rendered}");
         assert!(rendered.contains("content_hash="), "{rendered}");
+    }
+
+    #[test]
+    fn code_priority_preserves_code_and_provenance_under_small_budget() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "// café\r\npub fn launch() {}\r\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("docs")).unwrap();
+        for ordinal in 0..12 {
+            fs::write(
+                root.path().join(format!("docs/link-{ordinal}.md")),
+                format!("# Link {ordinal}\r\n[code](../src/lib.rs)\r\n"),
+            )
+            .unwrap();
+        }
+
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let published = shared.published_generation();
+        let rendered = render_code_knowledge_context(
+            &published,
+            &CodeAnchorId::File {
+                path: "src/lib.rs".to_string(),
+            },
+            true,
+        )
+        .unwrap();
+        let code_context = format!(
+            "Trust: exact source evidence | current index | parsed | full\nOutline: café / launch\n\nSource text may contain this delimiter:\n\nKnowledge evidence:\nThis remains part of the code context.\n{}\n",
+            "  pub fn launch() {}\n".repeat(1_000)
+        );
+        let code_context_len = code_context.len();
+        let assembled = format!("{code_context}\n\n{rendered}");
+
+        let (output, code_truncated) = enforce_budgeted_code_context_prioritizing_code(
+            &published,
+            assembled,
+            code_context_len,
+            Some(&rendered),
+            Some(900),
+        );
+
+        assert!(
+            code_truncated,
+            "the oversized outline should disclose truncation"
+        );
+        assert!(
+            output.starts_with("Trust: exact source evidence"),
+            "{output}"
+        );
+        assert!(output.contains("Outline: café / launch"), "{output}");
+        assert!(
+            output.contains("This remains part of the code context."),
+            "{output}"
+        );
+        assert!(output.contains("Original output is ~"), "{output}");
+        assert!(output.contains("Knowledge evidence:"), "{output}");
+        assert!(output.contains("source="), "{output}");
+        assert!(output.contains("counts total="), "{output}");
+        assert!(output.contains("coverage bridge="), "{output}");
+        assert!(
+            output.contains("Knowledge summary: details omitted by budget"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("link_id="),
+            "bulky backlinks should be summarized"
+        );
+        assert!(
+            output.len() <= 900 * 4,
+            "final output exceeded max_tokens budget: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn compact_knowledge_summary_preserves_freshness_identity_states_and_emitted_counts() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn launch() {}\n").unwrap();
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let current = shared.published_generation();
+        let verifying = PublishedGeneration {
+            publication_generation: current.publication_generation,
+            content_generation: current.content_generation,
+            project_generation: current.project_generation,
+            source: current.source.clone(),
+            source_version: current.source_version.clone(),
+            freshness: std::sync::Arc::new(crate::domain::index::FreshnessStatus::Verifying),
+            manifest: current.manifest.clone(),
+            code_signals: current.code_signals.clone(),
+            bridge: current.bridge.clone(),
+            authority: current.authority.clone(),
+            live: current.live.clone(),
+            health: current.health.clone(),
+            outline: current.outline.clone(),
+        };
+        let long_details = "  backlink details omitted by a bounded summary.\n".repeat(100);
+
+        let loading = format!(
+            "Knowledge evidence:\n  source=fixture-source publication=7 content=9 target=file:src/lib.rs\n  counts total=3 shown=2 overflow=1 ambiguous=1 missing=0\n  coverage bridge=loading authority=complete\n  The knowledge bridge is still publishing; this is not a complete absence of knowledge.\n{long_details}"
+        );
+        let compact_loading =
+            render_budgeted_code_knowledge_only(&verifying, Some(&loading), Some(256));
+        assert!(
+            compact_loading.contains("freshness=Verifying"),
+            "{compact_loading}"
+        );
+        assert!(
+            compact_loading.contains("target=file:src/lib.rs"),
+            "{compact_loading}"
+        );
+        assert!(compact_loading.contains("counts total=3 emitted=0 omitted=3 available_in_full_result=2 overflow=1 ambiguous=1 missing=0"), "{compact_loading}");
+        assert!(
+            compact_loading.contains("coverage bridge=loading authority=complete"),
+            "{compact_loading}"
+        );
+        assert!(
+            compact_loading.contains("still publishing"),
+            "{compact_loading}"
+        );
+        assert!(
+            !compact_loading.contains("shown=2"),
+            "summary cannot count un-emitted rows as shown: {compact_loading}"
+        );
+        assert!(
+            !compact_loading.contains("| current"),
+            "verifying snapshot cannot be called current: {compact_loading}"
+        );
+
+        let withheld = format!(
+            "Knowledge evidence withheld by secret policy v7 (3 finding(s)).\n{long_details}"
+        );
+        let compact_withheld =
+            render_budgeted_code_knowledge_only(&verifying, Some(&withheld), Some(256));
+        assert!(
+            compact_withheld.contains("withheld by secret policy"),
+            "{compact_withheld}"
+        );
+        assert!(
+            compact_withheld.contains("counts unavailable"),
+            "{compact_withheld}"
+        );
+        assert!(
+            !compact_withheld.contains("counts total=0"),
+            "withheld evidence cannot be presented as empty: {compact_withheld}"
+        );
+
+        let unknown_counts = format!(
+            "Knowledge evidence:\n  source=fixture-source publication=7 content=9 target=symbol:src/lib.rs:launch\n  coverage bridge=complete authority=complete\n{long_details}"
+        );
+        let compact_unknown =
+            render_budgeted_code_knowledge_only(&verifying, Some(&unknown_counts), Some(256));
+        assert!(
+            compact_unknown.contains("target=symbol:src/lib.rs:launch"),
+            "{compact_unknown}"
+        );
+        assert!(
+            compact_unknown.contains("counts unavailable"),
+            "{compact_unknown}"
+        );
+        assert!(
+            !compact_unknown.contains("counts total=0"),
+            "unknown counts cannot become zero: {compact_unknown}"
+        );
+
+        let no_rendered = render_budgeted_code_knowledge_only(&verifying, None, None);
+        assert!(no_rendered.contains("target=unavailable"), "{no_rendered}");
+        assert!(no_rendered.contains("counts unavailable"), "{no_rendered}");
+        assert!(
+            !no_rendered.contains("counts total=0"),
+            "absence of rendered evidence cannot become an empty count: {no_rendered}"
+        );
+
+        let pathological_path = format!(
+            "Knowledge evidence:\n  source=fixture publication=1 content=1 target=file:{}\n  counts total=1 shown=1 overflow=0 ambiguous=0 missing=0\n  coverage bridge=complete authority=complete\n{}",
+            "segment/".repeat(700),
+            "detail ".repeat(1000)
+        );
+        let code = format!(
+            "Trust: exact source evidence | current index | parsed | full\nOutline: launch\n{}",
+            "pub fn generated() {}\n".repeat(1000)
+        );
+        let code_len = code.len();
+        let assembled = format!("{code}\n\n{pathological_path}");
+        let (bounded, incomplete) = enforce_budgeted_code_context_prioritizing_code(
+            &verifying,
+            assembled,
+            code_len,
+            Some(&pathological_path),
+            Some(24),
+        );
+        assert!(
+            incomplete,
+            "pathological provenance must be marked incomplete"
+        );
+        if bounded.starts_with("Error:") {
+            assert!(bounded.contains("higher max_tokens"), "{bounded}");
+        } else {
+            assert!(bounded.len() <= 24 * 4);
+            assert!(bounded.contains("Truncated to max_tokens"), "{bounded}");
+        }
     }
 }

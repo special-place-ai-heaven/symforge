@@ -17,8 +17,6 @@
 /// Note: Tests bind sidecar ports on loopback. Run with `--test-threads=1` to avoid
 /// port races and CWD mutation conflicts.
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +30,14 @@ use symforge::{
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
+
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .expect("build bounded sidecar test HTTP client")
+});
 
 // ---------------------------------------------------------------------------
 // Serialize all tests that manipulate process cwd.
@@ -144,48 +150,35 @@ fn control_state(root: &std::path::Path) -> ControlStateDir {
     ControlStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
 }
 
-/// Make a synchronous raw HTTP GET request to `127.0.0.1:{port}{path}?{query}`.
-/// Returns (status_code_line, body).
-fn raw_http_get_with_status(
+/// Make a bounded HTTP GET request to `127.0.0.1:{port}{path}?{query}`.
+/// Returns the original-style status line and fully drained response body.
+async fn raw_http_get_with_status(
     port: u16,
     path: &str,
     query: &str,
 ) -> anyhow::Result<(String, String)> {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    let timeout = Duration::from_millis(1000);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    let request_path = if query.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{query}")
-    };
-
-    let request = format!(
-        "GET {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    let mut url = format!("http://127.0.0.1:{port}{path}");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let response = HTTP_CLIENT.get(url).send().await?;
+    let status_code = response.status();
+    let status = format!(
+        "HTTP/1.1 {} {}",
+        status_code.as_u16(),
+        status_code.canonical_reason().unwrap_or_default()
     );
-    stream.write_all(request.as_bytes())?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-
-    let status_line = response.lines().next().unwrap_or("").to_string();
-
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .unwrap_or("")
-        .to_string();
-
-    Ok((status_line, body))
+    let body = response.text().await?;
+    Ok((status, body))
 }
 
-/// Make a synchronous raw HTTP GET request to `127.0.0.1:{port}{path}?{query}`.
+/// Return the fully drained body from a bounded HTTP GET request.
 /// Returns the response body or an error.
-fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
-    raw_http_get_with_status(port, path, query).map(|(_, body)| body)
+async fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
+    raw_http_get_with_status(port, path, query)
+        .await
+        .map(|(_, body)| body)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -218,6 +211,7 @@ async fn loading_sidecar_refuses_all_content_routes_without_mutation() {
     .expect("spawn source-unbound empty sidecar");
     tokio::time::sleep(Duration::from_millis(20)).await;
     let (empty_status, empty_body) = raw_http_get_with_status(empty_handle.port, "/repo-map", "")
+        .await
         .expect("GET /repo-map against source-unbound Empty");
     assert!(empty_status.contains(" 503 "));
     assert!(empty_body.is_empty());
@@ -275,6 +269,7 @@ async fn loading_sidecar_refuses_all_content_routes_without_mutation() {
     ];
     for (path, query) in routes {
         let (status, body) = raw_http_get_with_status(handle.port, path, query)
+            .await
             .unwrap_or_else(|error| panic!("GET {path}?{query} failed: {error}"));
         assert!(
             status.contains(" 503 "),
@@ -286,15 +281,17 @@ async fn loading_sidecar_refuses_all_content_routes_without_mutation() {
         );
     }
 
-    let (health_status, health_body) =
-        raw_http_get_with_status(handle.port, "/health", "").expect("GET /health");
+    let (health_status, health_body) = raw_http_get_with_status(handle.port, "/health", "")
+        .await
+        .expect("GET /health");
     assert!(health_status.contains(" 200 "));
     let health: serde_json::Value =
         serde_json::from_str(&health_body).expect("health body is JSON");
     assert_eq!(health["index_state"], "Loading");
 
-    let (stats_status, stats_body) =
-        raw_http_get_with_status(handle.port, "/stats", "").expect("GET /stats");
+    let (stats_status, stats_body) = raw_http_get_with_status(handle.port, "/stats", "")
+        .await
+        .expect("GET /stats");
     assert!(stats_status.contains(" 200 "));
     let stats: serde_json::Value = serde_json::from_str(&stats_body).expect("stats body is JSON");
     for field in ["read_fires", "edit_fires", "write_fires", "grep_fires"] {
@@ -352,6 +349,7 @@ async fn test_read_hook_returns_formatted_outline() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let body = raw_http_get(handle.port, "/outline", "path=src/foo.rs")
+        .await
         .expect("GET /outline must succeed");
 
     // Must be plain text, not a JSON array.
@@ -404,6 +402,7 @@ async fn test_read_hook_noop_for_missing_file() {
 
     let (status_line, _body) =
         raw_http_get_with_status(handle.port, "/outline", "path=nonexistent.rs")
+            .await
             .expect("GET /outline for missing file must not error at transport level");
 
     assert!(
@@ -459,6 +458,7 @@ async fn test_read_hook_budget_enforced() {
 
     // max_tokens=10 → max 40 bytes — only the header line can fit, the rest must be truncated.
     let body = raw_http_get(handle.port, "/outline", "path=src/big.rs&max_tokens=10")
+        .await
         .expect("GET /outline with budget must succeed");
 
     // The non-footer portion must be under 40 bytes (10 tokens * 4 bytes/token).
@@ -506,6 +506,7 @@ async fn test_edit_hook_impact_diff() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let body = raw_http_get(handle.port, "/impact", "path=src/edit_test.rs")
+        .await
         .expect("GET /impact must succeed");
 
     // The diff must show that the old symbol was removed and/or new was added.
@@ -566,8 +567,9 @@ async fn test_edit_hook_shows_callers() {
 
     // Trigger impact for a.rs — helper_func is in its pre-state.
     // The handler will re-read a.rs from disk and compare.
-    let body =
-        raw_http_get(handle.port, "/impact", "path=src/a.rs").expect("GET /impact must succeed");
+    let body = raw_http_get(handle.port, "/impact", "path=src/a.rs")
+        .await
+        .expect("GET /impact must succeed");
 
     // Response should contain reference to b.rs as a caller (or show no callers if no diff).
     // The key assertion is that the response is formatted text.
@@ -638,6 +640,7 @@ async fn test_write_hook_confirms_index() {
         "/impact",
         "path=src/new_module.rs&new_file=true",
     )
+    .await
     .expect("GET /impact?new_file=true must succeed");
 
     // Response must confirm indexing.
@@ -659,6 +662,7 @@ async fn test_write_hook_confirms_index() {
     .unwrap();
     let (edited_status, edited) =
         raw_http_get_with_status(handle.port, "/impact", "path=src/new_module.rs")
+            .await
             .expect("the first edit after new-file admission must succeed");
     assert!(
         edited_status.contains(" 200 "),
@@ -734,6 +738,7 @@ async fn test_grep_hook_annotates_matches() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let body = raw_http_get(handle.port, "/symbol-context", "name=helper")
+        .await
         .expect("GET /symbol-context must succeed");
 
     // Must be plain text (not JSON array).
@@ -795,6 +800,7 @@ async fn test_grep_hook_caps_at_10() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let body = raw_http_get(handle.port, "/symbol-context", "name=target_symbol")
+        .await
         .expect("GET /symbol-context must succeed");
 
     // Should indicate cap — either "showing 10 of" or "truncated".
@@ -841,7 +847,9 @@ async fn test_session_start_repo_map() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let body = raw_http_get(handle.port, "/repo-map", "").expect("GET /repo-map must succeed");
+    let body = raw_http_get(handle.port, "/repo-map", "")
+        .await
+        .expect("GET /repo-map must succeed");
 
     // Must be plain text (not a JSON array).
     assert!(
@@ -902,7 +910,9 @@ async fn test_repo_map_under_500_tokens() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let body = raw_http_get(handle.port, "/repo-map", "").expect("GET /repo-map must succeed");
+    let body = raw_http_get(handle.port, "/repo-map", "")
+        .await
+        .expect("GET /repo-map must succeed");
 
     // 500 tokens * 4 bytes = 2000 bytes.
     assert!(
@@ -949,14 +959,18 @@ async fn test_token_stats_after_hooks() {
 
     // Fire /outline (Read hook).
     let _ = raw_http_get(handle.port, "/outline", "path=src/stats_test.rs")
+        .await
         .expect("GET /outline for stats test must succeed");
 
     // Fire /impact (Edit hook).
     let _ = raw_http_get(handle.port, "/impact", "path=src/stats_test.rs")
+        .await
         .expect("GET /impact for stats test must succeed");
 
     // Query /stats.
-    let stats_body = raw_http_get(handle.port, "/stats", "").expect("GET /stats must succeed");
+    let stats_body = raw_http_get(handle.port, "/stats", "")
+        .await
+        .expect("GET /stats must succeed");
 
     let stats: serde_json::Value =
         serde_json::from_str(&stats_body).expect("/stats must return valid JSON");
@@ -1016,6 +1030,7 @@ async fn test_token_savings_footer() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let body = raw_http_get(handle.port, "/outline", "path=src/service.rs")
+        .await
         .expect("GET /outline must succeed");
 
     // Must contain a competent-manual savings footer.

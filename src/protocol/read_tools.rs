@@ -258,16 +258,13 @@ where
 /// Input for `get_symbol`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct GetSymbolInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
-    /// Relative path to the file. OPTIONAL: when omitted, the symbol is resolved
-    /// by an exact `name` search across the index (pass `symbol_line`/`kind` to
-    /// disambiguate a common name). Provide `path` to skip the search and go
-    /// straight to that file. Ignored when `targets` is provided.
+    /// Optional file path. If omitted, resolve `name` by exact index search; use
+    /// `symbol_line`/`kind` to disambiguate. If set, open that file directly.
+    /// Ignored when `targets` is provided.
     #[serde(default)]
     pub path: String,
     /// Symbol name to look up (required for single lookup; ignored when `targets` is provided).
@@ -284,11 +281,10 @@ pub struct GetSymbolInput {
     #[serde(default, deserialize_with = "lenient_option_vec")]
     #[schemars(with = "Vec<SymbolTarget>")]
     pub targets: Option<Vec<SymbolTarget>>,
-    /// When true, return an approximate token cost estimate instead of actual content.
-    /// Useful for budget planning before fetching large symbols.
+    /// When true, estimate output tokens before fetching large symbols.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response (~1000 default when unset).
+    /// Response token budget; defaults to about 1,000 when unset.
     #[serde(default)]
     pub max_tokens: Option<u64>,
     /// When true, bypass session cache-hit and return a fresh payload.
@@ -322,10 +318,8 @@ pub struct SymbolTarget {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetFileContentInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative path to the file.
@@ -369,7 +363,7 @@ pub struct GetFileContentInput {
     /// Prepend a stable path or path-plus-range header for ordinary full-file or explicit-range reads.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub header: Option<bool>,
-    /// When true, return an approximate token count for the file instead of content.
+    /// When true, estimate file tokens instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
     /// Alias for `start_line` using the Read-tool idiom: 0-based line count to skip.
@@ -383,7 +377,7 @@ pub struct GetFileContentInput {
     /// Cannot be combined with the fields listed under `offset`.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default)]
     pub max_tokens: Option<u64>,
     /// When true, bypass session cache-hit and return a fresh payload.
@@ -400,10 +394,8 @@ pub struct SymforgeRetrieveInput {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct ValidateFileSyntaxInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     pub path: String,
@@ -412,19 +404,15 @@ pub(crate) struct ValidateFileSyntaxInput {
 /// Input for `find_dependents`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct FindDependentsInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative file path to find dependents for.
     pub path: String,
-    /// Symbol name. NOT a valid parameter for file-level dependents — present
-    /// only to detect a symbol-shaped misuse: if you pass `name` (symbol-level)
-    /// alongside `path`, the handler returns an explicit redirect to
-    /// `find_references`, which answers "who calls this symbol?". Leave unset for
-    /// the file-level dependency graph ("what imports this file?").
+    /// Optional symbol name, accepted only to catch misuse: with `path`, it
+    /// redirects to `find_references` (symbol callers). Omit it for the file-level
+    /// graph of files that import `path`.
     #[serde(default)]
     pub name: Option<String>,
     /// Maximum number of dependent files to show (default 20, capped at 100).
@@ -440,10 +428,10 @@ pub struct FindDependentsInput {
     /// (60-75% smaller). Best for hub files with many dependents.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub compact: Option<bool>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
@@ -451,10 +439,8 @@ pub struct FindDependentsInput {
 /// Input for `get_repo_map`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct GetRepoMapInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Detail level: "compact" (default — ~500 token project overview), "full" (complete symbol outline of every file), "tree" (browsable file tree with per-file stats).
@@ -467,10 +453,10 @@ pub struct GetRepoMapInput {
     /// Maximum number of files to include in the output (only used when detail="full", default: 200).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_files: Option<u32>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
@@ -479,10 +465,8 @@ pub struct GetRepoMapInput {
 #[derive(Serialize, JsonSchema)]
 #[schemars(transform = add_file_context_schema)]
 pub struct GetFileContextInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative path to the file.
@@ -494,7 +478,7 @@ pub struct GetFileContextInput {
     #[serde(default, deserialize_with = "lenient_option_vec")]
     #[schemars(with = "Vec<String>")]
     pub sections: Option<Vec<String>>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
     /// When true, bypass session cache-hit and return a fresh payload.
@@ -537,10 +521,8 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
 #[derive(Serialize, JsonSchema)]
 #[schemars(transform = add_symbol_context_schema)]
 pub struct GetSymbolContextInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Symbol name to inspect.
@@ -554,26 +536,27 @@ pub struct GetSymbolContextInput {
     /// Optional selected symbol line from `search_symbols`.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub symbol_line: Option<u32>,
-    /// Output verbosity: "summary" (one-line natural language summary ~90% smaller), "signature" (name+params+return only, ~80% smaller), "compact" (signature + first doc line), "full" (default — complete body). Applies to all three modes: default (controls the definition body), bundle (controls the main symbol body; dependency types always show full definitions), and sections/trace (controls the definition shown in the trace header).
+    /// Output verbosity: `summary` (one-line, ~90% smaller), `signature`
+    /// (name/params/return, ~80% smaller), `compact` (signature + first doc line),
+    /// or `full` (complete body; default). Applies to default mode's definition,
+    /// bundle mode's main symbol (dependency types stay full), and the definition
+    /// in a sections/trace header.
     pub verbosity: Option<String>,
     /// When true, switch to bundle mode: returns symbol body + full definitions of all referenced custom types, resolved recursively. Best for edit preparation. Requires path.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub bundle: Option<bool>,
-    /// Optional trace-analysis sections. When provided, switches to trace mode: definition,
-    /// callers, callees, implementations, type dependencies, git activity.
-    /// Valid values: "dependents", "siblings", "implementations", "git", "knowledge".
-    /// Omit for default symbol-context mode. Pass empty array for all trace sections.
+    /// When provided, switches to trace mode (definition, callers, callees,
+    /// implementations, type dependencies, git activity). Values: `dependents`,
+    /// `siblings`, `implementations`, `git`, `knowledge`. Omit for default mode;
+    /// an empty array selects all trace sections.
     #[serde(default, deserialize_with = "lenient_option_vec")]
     #[schemars(with = "Vec<String>")]
     pub sections: Option<Vec<String>>,
-    /// Optional max token budget for bundle mode. When set, preserves the main
-    /// symbol body and sections, then includes type dependencies in priority
-    /// order (direct first, then transitive) until the approximate budget
-    /// (~4 chars per token) is exhausted.
+    /// Bundle token budget. Preserve the main body and sections, then include
+    /// direct before transitive type dependencies until exhausted (~4 chars/token).
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
-    /// When true, return an approximate token cost estimate instead of actual content.
-    /// Shows estimated tokens for body, callers, bundle, and raw file.
+    /// When true, estimate output tokens for the body, callers, bundle, and raw file.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
 }
@@ -642,10 +625,10 @@ pub struct TraceSymbolInput {
     pub sections: Option<Vec<String>>,
     /// Output verbosity: "summary" (one-line natural language summary ~90% smaller), "signature" (name+params+return only, ~80% smaller), "compact" (signature + first doc line), "full" (default — complete body).
     pub verbosity: Option<String>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
 }
@@ -664,10 +647,10 @@ pub struct InspectMatchInput {
     /// Maximum number of siblings to show (default 10). Use 0 to hide siblings entirely.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub sibling_limit: Option<u32>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }

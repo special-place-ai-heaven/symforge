@@ -4193,9 +4193,11 @@ pub fn find_references_result_view(
     limits: &OutputLimits,
 ) -> String {
     if view.total_refs == 0 {
-        return format!(
+        let mut lines = vec![format!(
             "No references found for \"{name}\". Either the name is misspelled (try search_symbols(query={name})), it has no callers (public API, entry point, or dead code), or you wanted implementors (try find_references with mode=implementations)."
-        );
+        )];
+        append_reference_target_candidates(&mut lines, view, true);
+        return lines.join("\n");
     }
 
     let total = view.total_refs;
@@ -4216,6 +4218,17 @@ pub fn find_references_result_view(
         ));
     }
     lines.push(String::new()); // blank line
+    append_reference_target_candidates(&mut lines, view, true);
+    if view
+        .files
+        .iter()
+        .any(|file| file.caller_declaration_count > 0 || file.caller_header_unavailable_count > 0)
+    {
+        lines.push(
+            "Caller declaration line numbers are 1-based; definition ranges are inclusive."
+                .to_string(),
+        );
+    }
 
     let mut total_emitted = 0usize;
     for file in view.files.iter().take(limits.max_files) {
@@ -4223,6 +4236,7 @@ pub fn find_references_result_view(
             break;
         }
         lines.push(file.file_path.clone());
+        append_caller_declarations(&mut lines, file, true);
         let mut hit_count = 0usize;
         let mut truncated_hits = 0usize;
         for hit in &file.hits {
@@ -4265,6 +4279,115 @@ pub fn find_references_result_view(
     lines.join("\n")
 }
 
+fn append_reference_target_candidates(
+    lines: &mut Vec<String>,
+    view: &FindReferencesView,
+    include_header_text: bool,
+) {
+    if view.target_candidate_count == 0 {
+        lines.push(format!(
+            "No exact-name definitions currently indexed; indexed-file parse coverage {}.",
+            if view.target_indexed_file_parse_coverage_complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
+        ));
+        return;
+    }
+    lines.push(format!(
+        "Target definition candidates: {} exact-name indexed symbols; indexed-file parse coverage {}. Unique among indexed records: {} (compiler resolution not available).",
+        view.target_candidate_count,
+        if view.target_indexed_file_parse_coverage_complete {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        if view.target_indexed_file_parse_coverage_complete && view.target_candidate_count == 1 {
+            "yes"
+        } else {
+            "no / unproven"
+        },
+    ));
+    for candidate in &view.target_candidates {
+        lines.push(format!(
+            "  {}:L{} [{}] bytes {}..{}",
+            candidate.path,
+            candidate.line_range.0.saturating_add(1),
+            candidate.kind,
+            candidate.byte_range.0,
+            candidate.byte_range.1,
+        ));
+        if include_header_text && let Some(header) = &candidate.header {
+            lines.extend(header.lines().map(|line| format!("    {line}")));
+        } else if include_header_text {
+            lines.push("    declaration header unavailable or ambiguous".to_string());
+        }
+    }
+    let omitted = view
+        .target_candidate_count
+        .saturating_sub(view.target_candidates.len());
+    if omitted > 0 {
+        lines.push(format!(
+            "  ... {omitted} more candidates omitted by the display cap"
+        ));
+    }
+}
+
+fn append_caller_declarations(
+    lines: &mut Vec<String>,
+    file: &crate::live_index::ReferenceFileView,
+    include_header_text: bool,
+) {
+    if file.caller_declaration_count == 0 && file.caller_header_unavailable_count == 0 {
+        return;
+    }
+    lines.push(format!(
+        "  AST declaration headers for returned sites: {} distinct (showing {}; {} omitted by metadata cap; {} caller headers unavailable; final response token budget may truncate):",
+        file.caller_declaration_count,
+        file.caller_declarations.len(),
+        file.caller_declarations_omitted,
+        file.caller_header_unavailable_count,
+    ));
+    for declaration in &file.caller_declarations {
+        let signature_start = match (declaration.is_callable, declaration.signature_start_line) {
+            (true, Some(line)) => format!("; signature start L{line}"),
+            (true, None) => "; signature start unavailable".to_string(),
+            (false, _) => String::new(),
+        };
+        lines.push(format!(
+            "    {}: definition L{}-{} bytes {}..{}; [{}] header L{} bytes {}..{}{}",
+            declaration.scope,
+            declaration.definition_line_range.0,
+            declaration.definition_line_range.1,
+            declaration.definition_byte_range.0,
+            declaration.definition_byte_range.1,
+            declaration.node_kind,
+            declaration.line_number,
+            declaration.byte_range.0,
+            declaration.byte_range.1,
+            signature_start,
+        ));
+        if include_header_text {
+            lines.extend(declaration.text.lines().map(|line| format!("      {line}")));
+        }
+        if declaration.scope == "caller" && declaration.is_callable {
+            // Only the verified AST name node is eligible as a caller identity.
+            match &declaration.identity {
+                Some(identity) if include_header_text => {
+                    lines.push(format!("      declared caller: {}", identity.name));
+                }
+                Some(identity) => lines.push(format!(
+                    "      caller identity: {} bytes {}..{}",
+                    identity.name, identity.byte_range.0, identity.byte_range.1
+                )),
+                None if include_header_text => {}
+                None => lines.push("      caller identity unavailable".to_string()),
+            }
+        }
+    }
+}
+
 /// Render a compact find_references result: file:line \[kind\] in symbol — no source text.
 pub fn find_references_compact_view(
     view: &FindReferencesView,
@@ -4272,9 +4395,11 @@ pub fn find_references_compact_view(
     limits: &OutputLimits,
 ) -> String {
     if view.total_refs == 0 {
-        return format!(
+        let mut lines = vec![format!(
             "No references found for \"{name}\". Either the name is misspelled (try search_symbols(query={name})), it has no callers (public API, entry point, or dead code), or you wanted implementors (try find_references with mode=implementations)."
-        );
+        )];
+        append_reference_target_candidates(&mut lines, view, false);
+        return lines.join("\n");
     }
 
     let total_files = view.total_files;
@@ -4290,6 +4415,7 @@ pub fn find_references_compact_view(
             view.total_refs, name, total_files
         )]
     };
+    append_reference_target_candidates(&mut lines, view, false);
     if view.total_refs > 50 {
         lines.push(format!(
             "Note: '{}' is a very common identifier — results may include unrelated symbols. \
@@ -4304,6 +4430,7 @@ pub fn find_references_compact_view(
             break;
         }
         lines.push(file.file_path.clone());
+        append_caller_declarations(&mut lines, file, false);
         let mut hit_count = 0usize;
         let mut truncated_hits = 0usize;
         for hit in &file.hits {

@@ -87,6 +87,41 @@ impl KnowledgeFixture {
         );
         Self { _dir: dir, server }
     }
+
+    fn large_context() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join("src")).expect("source dir");
+        fs::create_dir_all(root.join("docs")).expect("docs dir");
+
+        let mut code = String::from("pub fn checkpoint_anchor() {}\n");
+        for ordinal in 0..300 {
+            code.push_str(&format!(
+                "pub fn generated_context_symbol_{ordinal:03}() {{ let _value = {ordinal}; }}\n"
+            ));
+        }
+        fs::write(root.join("src/lib.rs"), code).expect("large source fixture");
+
+        for ordinal in 0..16 {
+            fs::write(
+                root.join(format!("docs/link-{ordinal:02}.md")),
+                format!(
+                    "# Linked evidence {ordinal}\ncode_path = \"src/lib.rs\"\nCall `checkpoint_anchor`.\nEvidence backlink {ordinal}.\n"
+                ),
+            )
+            .expect("knowledge backlink fixture");
+        }
+
+        let index = LiveIndex::load(&root).expect("LiveIndex::load large context fixture");
+        let server = SymForgeServer::new(
+            index,
+            "file_context_budget_test".to_string(),
+            Arc::new(Mutex::new(WatcherInfo::default())),
+            Some(root),
+            None,
+        );
+        Self { _dir: dir, server }
+    }
 }
 
 /// Sub-lines every complete `search_knowledge` hit block carries after
@@ -920,6 +955,147 @@ async fn file_context_knowledge_section_preserves_only_default_and_empty_section
 }
 
 #[tokio::test]
+async fn default_file_context_budgets_prioritize_code_and_keep_explicit_sections() {
+    let fixture = KnowledgeFixture::large_context();
+
+    for request in [
+        json!({"path": "src/lib.rs", "force_refresh": true}),
+        json!({"path": "src/lib.rs", "max_tokens": 0, "force_refresh": true}),
+        json!({"path": "src/lib.rs", "max_tokens": 900, "force_refresh": true}),
+        json!({"path": "src/lib.rs", "sections": [], "max_tokens": 900, "force_refresh": true}),
+        json!({"path": "src/lib.rs", "include_tests": true, "max_tokens": 900, "force_refresh": true}),
+    ] {
+        let output = fixture
+            .server
+            .dispatch_tool_for_tests("get_file_context", request)
+            .await;
+        assert!(
+            output.contains("Source authority: current index")
+                && output.contains("Completeness: budget-limited"),
+            "current-source trust envelope missing: {output}"
+        );
+        assert!(
+            output.contains("checkpoint_anchor"),
+            "code outline missing: {output}"
+        );
+        assert!(
+            output.contains("Original output is ~"),
+            "truncation is not disclosed: {output}"
+        );
+        assert!(
+            output.contains("Knowledge evidence:"),
+            "knowledge summary is missing: {output}"
+        );
+        assert!(
+            output.contains("higher max_tokens"),
+            "budgeted details need a truthful continuation: {output}"
+        );
+        assert!(
+            !output.contains("redeem the full context handle"),
+            "default file context does not retain a fuller unbudgeted result: {output}"
+        );
+        assert!(
+            output.len() <= 900 * 4 + 2048,
+            "bounded context unexpectedly large"
+        );
+    }
+
+    let knowledge_only = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "get_file_context",
+            json!({"path": "src/lib.rs", "sections": ["knowledge"], "max_tokens": 900}),
+        )
+        .await;
+    assert!(
+        knowledge_only.contains("Knowledge evidence:"),
+        "{knowledge_only}"
+    );
+    assert!(
+        knowledge_only.contains("docs/link-"),
+        "backlink sources were lost: {knowledge_only}"
+    );
+    assert!(
+        !knowledge_only.contains("generated_context_symbol_"),
+        "explicit knowledge-only request included code: {knowledge_only}"
+    );
+
+    let outline_only = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "get_file_context",
+            json!({"path": "src/lib.rs", "sections": ["outline"], "max_tokens": 900}),
+        )
+        .await;
+    assert!(
+        outline_only.contains("checkpoint_anchor"),
+        "explicit outline was lost: {outline_only}"
+    );
+    assert!(
+        !outline_only.contains("Knowledge evidence:"),
+        "explicit outline request gained knowledge: {outline_only}"
+    );
+
+    let mixed = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "get_file_context",
+            json!({
+                "path": "src/lib.rs",
+                "sections": ["outline", "knowledge"],
+                "max_tokens": 128
+            }),
+        )
+        .await;
+    assert!(
+        mixed.contains("Knowledge evidence:")
+            || mixed.contains("max_tokens is too small for atomic knowledge provenance"),
+        "mixed sections should retain knowledge identity or name the required continuation: {mixed}"
+    );
+    assert!(
+        mixed.contains("Requested code section(s) in this mixed response may be incomplete")
+            || mixed.contains("Requested code and knowledge sections may be incomplete"),
+        "mixed sections need an explicit continuation when budgeted: {mixed}"
+    );
+    assert!(
+        mixed.len() <= 128 * 4,
+        "mixed response overran its budget: {} bytes",
+        mixed.len()
+    );
+
+    let moderate_mixed = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "get_file_context",
+            json!({
+                "path": "src/lib.rs",
+                "sections": ["outline", "knowledge"],
+                "max_tokens": 900,
+                "force_refresh": true
+            }),
+        )
+        .await;
+    assert!(
+        moderate_mixed.contains("checkpoint_anchor"),
+        "mixed budget lost code evidence: {moderate_mixed}"
+    );
+    assert!(
+        moderate_mixed.contains("Knowledge summary: details omitted by budget"),
+        "mixed budget lost atomic provenance: {moderate_mixed}"
+    );
+    assert!(moderate_mixed.contains("counts total="), "{moderate_mixed}");
+    assert!(
+        moderate_mixed.contains("coverage bridge="),
+        "{moderate_mixed}"
+    );
+    assert!(
+        moderate_mixed.contains("may be incomplete"),
+        "{moderate_mixed}"
+    );
+    assert!(moderate_mixed.len() <= 900 * 4, "{moderate_mixed}");
+}
+
+#[tokio::test]
 async fn symbol_context_knowledge_section_preserves_only_default_empty_and_bundle_modes() {
     let fixture = KnowledgeFixture::new();
     let knowledge_only = fixture
@@ -1039,6 +1215,74 @@ async fn default_and_empty_context_budgets_keep_atomic_knowledge_provenance() {
 }
 
 #[tokio::test]
+async fn impossible_context_budgets_return_explicit_retry_diagnostics() {
+    let fixture = KnowledgeFixture::new();
+    for max_tokens in [1, 2] {
+        for (tool, request) in [
+            (
+                "get_file_context",
+                json!({
+                    "path": "src/lib.rs",
+                    "max_tokens": max_tokens,
+                    "force_refresh": true
+                }),
+            ),
+            (
+                "get_file_context",
+                json!({
+                    "path": "src/lib.rs",
+                    "include_tests": true,
+                    "max_tokens": max_tokens,
+                    "force_refresh": true
+                }),
+            ),
+            (
+                "get_file_context",
+                json!({
+                    "path": "src/lib.rs",
+                    "sections": ["knowledge"],
+                    "max_tokens": max_tokens,
+                    "force_refresh": true
+                }),
+            ),
+            (
+                "get_file_context",
+                json!({
+                    "path": "src/lib.rs",
+                    "sections": ["outline", "knowledge"],
+                    "max_tokens": max_tokens,
+                    "force_refresh": true
+                }),
+            ),
+            (
+                "get_symbol_context",
+                json!({
+                    "path": "src/lib.rs",
+                    "name": "checkpoint_anchor",
+                    "sections": ["knowledge"],
+                    "max_tokens": max_tokens
+                }),
+            ),
+        ] {
+            let output = fixture.server.dispatch_tool_for_tests(tool, request).await;
+            assert!(output.starts_with("Error:"), "{tool}: {output}");
+            assert!(output.contains("higher max_tokens"), "{tool}: {output}");
+            assert!(
+                output.contains("Requested sections:")
+                    || output.contains("sections=[\"knowledge\"]"),
+                "{tool}: {output}"
+            );
+            assert!(!output.contains("Completeness: full"), "{tool}: {output}");
+            assert_ne!(output, "…", "{tool}: opaque diagnostic");
+            assert!(
+                !output.chars().all(|character| character == '.'),
+                "{tool}: opaque diagnostic"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn file_context_repeat_cache_invalidates_after_targeted_publication() {
     let fixture = KnowledgeFixture::new();
     let request = json!({"path": "src/lib.rs", "sections": []});
@@ -1065,6 +1309,41 @@ async fn file_context_repeat_cache_invalidates_after_targeted_publication() {
     assert!(second.contains("replacement_anchor"), "{second}");
     assert!(!second.contains("checkpoint_anchor"), "{second}");
     assert!(!second.contains("session_repeat_read"), "{second}");
+}
+
+#[tokio::test]
+async fn small_budget_file_context_repeat_keeps_redeemable_handle() {
+    let fixture = KnowledgeFixture::new();
+    let request = json!({"path": "src/lib.rs", "max_tokens": 64});
+    let first = fixture
+        .server
+        .dispatch_tool_for_tests("get_file_context", request.clone())
+        .await;
+    assert!(!first.starts_with("Decision: cache_hit"), "{first}");
+
+    let second = fixture
+        .server
+        .dispatch_tool_for_tests("get_file_context", request)
+        .await;
+    assert!(second.starts_with("Decision: cache_hit"), "{second}");
+    let hash = second
+        .split("retrieve: symforge_retrieve with hash=\"")
+        .nth(1)
+        .and_then(|suffix| suffix.split('"').next())
+        .expect("bounded cache hit retains a retrieval hash");
+    assert_eq!(hash.len(), 12, "{second}");
+    assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(second.len() <= 64 * 4, "{second}");
+
+    let retrieved = fixture
+        .server
+        .dispatch_tool_for_tests("symforge_retrieve", json!({"hash": hash}))
+        .await;
+    assert!(
+        !retrieved.contains("stale or expired handle"),
+        "{retrieved}"
+    );
+    assert!(!retrieved.starts_with("Decision: cache_hit"), "{retrieved}");
 }
 
 #[tokio::test]

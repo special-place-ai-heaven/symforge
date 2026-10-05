@@ -1020,6 +1020,24 @@ impl SymForgeServer {
         format::enforce_token_budget(result, budget)
     }
 
+    /// Apply the normal CCR policy and report whether its exact byte threshold
+    /// caused truncation. This is used by callers whose leading metadata makes
+    /// a completeness claim that must be downgraded after a post-assembly cut.
+    pub(crate) fn apply_ccr_budget_with_truncation_status(
+        &self,
+        tool_name: &str,
+        result: String,
+        max_tokens: Option<u64>,
+    ) -> (String, bool) {
+        let budget = ccr::resolve_tool_max_tokens(tool_name, max_tokens);
+        let truncated = budget
+            .is_some_and(|tokens| tokens > 0 && result.len() > (tokens as usize).saturating_mul(4));
+        (
+            self.apply_ccr_budget(tool_name, result, max_tokens),
+            truncated,
+        )
+    }
+
     /// Apply a token budget using a caller-provided, block-safe summary before
     /// CCR stores the complete output. This is used by structured multi-line
     /// results whose generic line cut could otherwise expose half a record.
@@ -2587,7 +2605,10 @@ mod tests {
         body: Arc<String>,
     }
 
-    async fn fake_tool_handler(State(state): State<FakeToolState>) -> String {
+    async fn fake_tool_handler(
+        State(state): State<FakeToolState>,
+        _body: axum::body::Bytes,
+    ) -> String {
         state.calls.fetch_add(1, Ordering::Relaxed);
         state.body.as_ref().clone()
     }
