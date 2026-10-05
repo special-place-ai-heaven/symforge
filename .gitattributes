@@ -17,3 +17,7 @@ tests/fixtures/verify-tools/** text eol=lf
 tests/fixtures/verify-tools-real/** text eol=lf
 execution/*.sh text eol=lf
 src/**/*.rs text eol=lf
+
+# Literal AST declaration headers retain the source space before the opening brace.
+# Preserve those snapshot bytes while keeping other whitespace checks enabled.
+tests/fixtures/verify-tools-real/snapshots/find_references.tally.snap whitespace=-blank-at-eol
