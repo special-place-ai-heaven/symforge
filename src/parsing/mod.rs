@@ -314,8 +314,8 @@ fn error_candidate_is_better(
     candidate.is_missing() && !current.is_missing()
 }
 
-fn tree_sitter_language(language: &LanguageId, is_tsx: bool) -> tree_sitter::Language {
-    match language {
+fn tree_sitter_language(language: &LanguageId, is_tsx: bool) -> Option<tree_sitter::Language> {
+    Some(match language {
         LanguageId::Rust => tree_sitter_rust::LANGUAGE.into(),
         LanguageId::Python => tree_sitter_python::LANGUAGE.into(),
         LanguageId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
@@ -340,11 +340,11 @@ fn tree_sitter_language(language: &LanguageId, is_tsx: bool) -> tree_sitter::Lan
         | LanguageId::Yaml
         | LanguageId::Markdown
         | LanguageId::Text
-        | LanguageId::Env => unreachable!("config types are handled before parse_source"),
+        | LanguageId::Env => return None,
         LanguageId::Html => tree_sitter_html::LANGUAGE.into(),
         LanguageId::Css => tree_sitter_css::LANGUAGE.into(),
         LanguageId::Scss => tree_sitter_scss::language(),
-    }
+    })
 }
 
 pub(crate) fn parse_source_tree(
@@ -353,7 +353,10 @@ pub(crate) fn parse_source_tree(
     is_tsx: bool,
 ) -> Result<tree_sitter::Tree, String> {
     let mut parser = Parser::new();
-    let ts_language = tree_sitter_language(language, is_tsx);
+    // Configuration and narrative formats use their dedicated extractors.
+    // Optional AST evidence can reach this helper for any indexed language.
+    let ts_language = tree_sitter_language(language, is_tsx)
+        .ok_or_else(|| format!("no tree-sitter source grammar for {}", language.name()))?;
 
     parser
         .set_language(&ts_language)

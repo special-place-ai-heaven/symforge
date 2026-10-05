@@ -394,6 +394,25 @@ fn is_type_kind(kind: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_and_text_languages_do_not_claim_ast_evidence() {
+        for (language, source) in [
+            (LanguageId::Json, "{\"name\":\"sample\"}"),
+            (LanguageId::Toml, "name = \"sample\"\n"),
+            (LanguageId::Yaml, "name: sample\n"),
+            (LanguageId::Markdown, "# Sample\n"),
+            (LanguageId::Text, "sample\n"),
+            (LanguageId::Env, "NAME=sample\n"),
+        ] {
+            assert!(
+                ReferenceEvidenceIndex::new(source.as_bytes(), &language, false).is_none(),
+                "{} must not provide code AST evidence",
+                language.name()
+            );
+            assert!(crate::parsing::parse_source_tree(source, &language, false).is_err());
+        }
+    }
+
     fn evidence(source: &str, query: &str, language: LanguageId) -> ReferenceEvidence {
         let index = ReferenceEvidenceIndex::new(source.as_bytes(), &language, false).unwrap();
         let at = source.find(query).unwrap();

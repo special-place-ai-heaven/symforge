@@ -1120,9 +1120,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // at 64 files. No new token or call edge into src/index_lifecycle or
 // server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "5921e3f31eb85316c9f8309e68bbb1616e5c41ea34a793d1d2288ae5035e9123",
+    "a3d474a386189f3ab8aacb60aff2b787dda6df41df7f00fa59bcad60ddb5f4bf",
     203,
-    10_522_872,
+    10_523_831,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
