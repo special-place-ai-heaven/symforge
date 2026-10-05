@@ -32,6 +32,16 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.5.4](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.3...v11.5.4) (2026-10-05)
+
+
+### Bug Fixes
+
+* preserve retrieval evidence and frame hook HTTP responses ([7e1ae3c](https://github.com/special-place-ai-heaven/symforge/commit/7e1ae3c399b0b72ad0921241985d34e9d6e7e1f0))
+* preserve retrieval evidence and frame hook HTTP responses ([594d3e4](https://github.com/special-place-ai-heaven/symforge/commit/594d3e458d2911b582949c656f9c01b6d385dfb2))
+* skip AST evidence for configuration formats ([d2a90de](https://github.com/special-place-ai-heaven/symforge/commit/d2a90de7e50a492619501af306f31edce5448977))
+* skip config AST evidence and align tool snapshots ([#772](https://github.com/special-place-ai-heaven/symforge/issues/772)) ([8d190e3](https://github.com/special-place-ai-heaven/symforge/commit/8d190e3a431e9f56d7f3914fbd05f621239dc4c9))
+
 ## [11.5.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.2...v11.5.3) (2026-10-02)
 
 
