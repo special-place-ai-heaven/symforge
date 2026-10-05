@@ -365,7 +365,10 @@ fn run_hook_local_http_500_fails_open_as_http_failure_without_restart_hint() {
         serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
     assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
     assert!(!stdout.contains(ERROR_MARKER));
-    assert!(log.contains("\tsource-read\tsidecar-error"));
+    assert!(
+        log.contains("\tsource-read\tsidecar-error"),
+        "a live sidecar's 500 must use the HTTP-error lane; stderr:\n{stderr}\nlog:\n{log}"
+    );
     assert!(!log.contains("sidecar_port_stale"));
     assert!(stderr.contains("outcome=SidecarError reason=http_failure"));
     assert!(!stderr.contains("sidecar not running"));
@@ -1512,6 +1515,10 @@ fn serve_mock_http_response(listener: TcpListener, status: &str, body: &str) {
             .write_all(response.as_bytes())
             .expect("write mock HTTP response");
         stream.flush().expect("flush mock HTTP response");
+        // Keep the final frame alive until the client closes, so server-side
+        // teardown cannot race this fixture's framed response. This terminal
+        // wait cannot delay a later request.
+        wait_for_mock_client_close(&mut stream);
         return;
     }
     panic!("hook never sent an HTTP request to the mock sidecar before the deadline");
