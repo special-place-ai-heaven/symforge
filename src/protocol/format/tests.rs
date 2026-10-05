@@ -3233,8 +3233,31 @@ fn test_find_references_result_groups_by_file_and_shows_context() {
         "reference name missing, got: {result}"
     );
     assert!(
-        result.contains("[in fn handle]"),
-        "enclosing annotation missing, got: {result}"
+        result.contains("fn handle()"),
+        "AST-validated caller declaration header missing, got: {result}"
+    );
+    assert!(
+        result.contains("signature start L1"),
+        "distinct callable signature anchor missing, got: {result}"
+    );
+    assert!(
+        result.contains("declared caller: handle"),
+        "validated caller identity missing, got: {result}"
+    );
+    assert!(
+        result.contains(
+            "Caller declaration line numbers are 1-based; definition ranges are inclusive."
+        ),
+        "caller declaration range legend missing, got: {result}"
+    );
+    assert_eq!(
+        result
+            .matches(
+                "Caller declaration line numbers are 1-based; definition ranges are inclusive."
+            )
+            .count(),
+        1,
+        "caller range legend should appear once per response: {result}"
     );
 }
 
@@ -3390,6 +3413,123 @@ fn test_find_references_compact_view_total_limit_caps_across_files() {
     assert!(
         !result.contains("src/file_2.rs"),
         "file_2 should be skipped in compact view, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_find_references_compact_view_keeps_byte_verified_caller_identity() {
+    let source = b"fn beta() { alpha(); }\n";
+    let reference = ReferenceRecord {
+        name: "alpha".to_string(),
+        qualified_name: None,
+        kind: ReferenceKind::Call,
+        byte_range: (12, 17),
+        line_range: (0, 0),
+        enclosing_symbol_index: None,
+    };
+    let (key, file) = make_file_with_refs("src/lib.rs", source, vec![], vec![reference]);
+    let index = make_index_with_reverse(vec![(key, file)]);
+    let view = index.capture_find_references_view("alpha", None, 10);
+    let limits = OutputLimits {
+        max_files: 10,
+        max_per_file: 10,
+        total_hits: 10,
+    };
+
+    let result = find_references_compact_view(&view, "alpha", &limits);
+
+    assert!(
+        result.contains("caller identity: beta bytes 3..7"),
+        "{result}"
+    );
+    assert!(!result.contains("declared caller:"), "{result}");
+    assert!(
+        !result.contains(
+            "Caller declaration line numbers are 1-based; definition ranges are inclusive."
+        ),
+        "compact output must not include the full-view range legend: {result}"
+    );
+    assert!(!result.contains("fn beta()"), "{result}");
+    assert!(
+        !result.contains("alpha();"),
+        "compact output must not restore the caller body: {result}"
+    );
+}
+
+#[test]
+fn test_find_references_compact_view_never_renders_declaration_source_text() {
+    let view = FindReferencesView {
+        total_refs: 1,
+        total_files: 1,
+        files: vec![crate::live_index::ReferenceFileView {
+            file_path: "src/sample.rs".to_string(),
+            hits: vec![crate::live_index::ReferenceHitView {
+                context_lines: vec![crate::live_index::ReferenceContextLineView {
+                    line_number: 4,
+                    text: "target();".to_string(),
+                    is_reference_line: true,
+                    enclosing_annotation: Some("[caller]".to_string()),
+                }],
+            }],
+            caller_declarations: vec![crate::live_index::query::ReferenceDeclarationView {
+                definition_byte_range: (0, 39),
+                definition_line_range: (1, 3),
+                byte_range: (0, 14),
+                line_number: 1,
+                signature_start_line: Some(1),
+                is_callable: true,
+                node_kind: "function_item".to_string(),
+                scope: "caller".to_string(),
+                identity: None,
+                text: "fn caller() ".to_string(),
+            }],
+            caller_declaration_count: 1,
+            caller_declarations_omitted: 0,
+            caller_header_unavailable_count: 0,
+        }],
+        target_candidate_count: 1,
+        target_candidates: vec![crate::live_index::query::ReferenceTargetCandidateView {
+            path: "src/lib.rs".to_string(),
+            name: "target".to_string(),
+            kind: "function".to_string(),
+            line_range: (0, 1),
+            byte_range: (0, 14),
+            header: Some("fn target() {}".to_string()),
+        }],
+        target_indexed_file_parse_coverage_complete: true,
+    };
+    let result = find_references_compact_view(&view, "target", &OutputLimits::default());
+    assert!(
+        !result.contains("fn caller"),
+        "compact output leaked caller source: {result}"
+    );
+    assert!(result.contains("caller identity unavailable"), "{result}");
+    assert!(!result.contains("declared caller:"), "{result}");
+    assert!(
+        !result.contains(
+            "Caller declaration line numbers are 1-based; definition ranges are inclusive."
+        ),
+        "compact output must not include the full-view range legend: {result}"
+    );
+    assert!(
+        !result.contains("fn target"),
+        "compact output leaked candidate source: {result}"
+    );
+
+    let mut multi_file_view = view.clone();
+    let mut second_file = view.files[0].clone();
+    second_file.file_path = "src/second.rs".to_string();
+    multi_file_view.files.push(second_file);
+    multi_file_view.total_refs = 2;
+    multi_file_view.total_files = 2;
+    let full = find_references_result_view(&multi_file_view, "target", &OutputLimits::default());
+    assert_eq!(
+        full.matches(
+            "Caller declaration line numbers are 1-based; definition ranges are inclusive."
+        )
+        .count(),
+        1,
+        "full caller range legend should appear once across files: {full}"
     );
 }
 

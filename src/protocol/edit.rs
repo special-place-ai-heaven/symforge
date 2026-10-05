@@ -1508,11 +1508,9 @@ pub(crate) fn try_whitespace_flexible_replace(
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct ReplaceSymbolBodyInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. The whole call is single-project: cross-project
-    /// mixtures are rejected rather than distributed. Local/embedded servers
-    /// are bound to one project and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project. Each call targets one project; cross-project mixtures are rejected.
+    /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative file path.
@@ -1542,20 +1540,12 @@ pub struct ReplaceSymbolBodyInput {
     /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// Optimistic-concurrency guard (TR-06 / FR-009). Threaded from
-    /// `StelEditRequest.if_match` through the edit planner.
-    ///
-    /// At THIS (write) layer the field is a PRESENCE-triggered change-detection
-    /// guard, NOT a value comparison: the write path does not compare this
-    /// STRING against anything. Its presence (`Some`) turns on the write-time
-    /// re-read in `guarded_atomic_write_file`, which compares the whole-file
-    /// `base` (the bytes the splice was computed against) to the bytes actually
-    /// on disk and rejects the apply on divergence. The VALUE match
-    /// (`if_match == current_symbol_body`) is the STEL pre-flight's
-    /// responsibility (`run_pre_apply_gates`); `base == disk` is the stronger
-    /// splice-integrity invariant enforced here. On divergence the apply is
-    /// rejected without writing — a concurrent change between the caller's read
-    /// and this write is never silently clobbered.
+    /// Optimistic-concurrency guard (TR-06/FR-009), forwarded from
+    /// `StelEditRequest.if_match`. Presence enables a write-time whole-file check:
+    /// compare the bytes used to plan the splice with current disk bytes; reject
+    /// without writing if they differ. This string is not compared here; STEL
+    /// preflight checks it against the current symbol body. The whole-file check
+    /// prevents clobbering changes made after the caller's read.
     #[serde(default)]
     pub if_match: Option<String>,
     /// Caller's working directory (absolute path). Consumed by the
@@ -1568,11 +1558,9 @@ pub struct ReplaceSymbolBodyInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct InsertSymbolInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. The whole call is single-project: cross-project
-    /// mixtures are rejected rather than distributed. Local/embedded servers
-    /// are bound to one project and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project. Each call targets one project; cross-project mixtures are rejected.
+    /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative file path.
@@ -1605,11 +1593,9 @@ pub struct InsertSymbolInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct DeleteSymbolInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. The whole call is single-project: cross-project
-    /// mixtures are rejected rather than distributed. Local/embedded servers
-    /// are bound to one project and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project. Each call targets one project; cross-project mixtures are rejected.
+    /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative file path.
@@ -1637,11 +1623,9 @@ pub struct DeleteSymbolInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct EditWithinSymbolInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. The whole call is single-project: cross-project
-    /// mixtures are rejected rather than distributed. Local/embedded servers
-    /// are bound to one project and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project. Each call targets one project; cross-project mixtures are rejected.
+    /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative file path.
@@ -1690,11 +1674,9 @@ pub struct EditWithinSymbolInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BatchEditInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. The whole call is single-project: cross-project
-    /// mixtures are rejected rather than distributed. Local/embedded servers
-    /// are bound to one project and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project. Each call targets one project; cross-project mixtures are rejected.
+    /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// List of individual edits to apply atomically.
@@ -2321,11 +2303,9 @@ pub(crate) fn execute_batch_edit(
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BatchRenameInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. The whole call is single-project: cross-project
-    /// mixtures are rejected rather than distributed. Local/embedded servers
-    /// are bound to one project and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project. Each call targets one project; cross-project mixtures are rejected.
+    /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative file path containing the symbol definition.
@@ -2923,11 +2903,9 @@ pub(crate) fn execute_batch_rename(
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BatchInsertInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. The whole call is single-project: cross-project
-    /// mixtures are rejected rather than distributed. Local/embedded servers
-    /// are bound to one project and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project. Each call targets one project; cross-project mixtures are rejected.
+    /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Code to insert at each target location.

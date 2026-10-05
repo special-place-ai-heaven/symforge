@@ -234,12 +234,10 @@ pub enum StelStatusDetail {
 pub struct StelStatusRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<StelStatusDetail>,
-    /// Feature 013 FR-011 operator reset: when `true`, clear accumulated
-    /// calibration (the active tuned constants AND the current-estimator sample
-    /// rows) before rendering, so the calibration surface returns to `Deferred`.
-    /// MCP-native — a mode/param on the existing `status` tool, never injected
-    /// context. Does NOT rebuild the index; only the calibration tables are
-    /// cleared. No-op on a build/surface with no durable store wired.
+    /// When true, clear tuned constants and current-estimator samples before
+    /// rendering; calibration returns to `Deferred`. This `status` parameter
+    /// never rebuilds the index and clears only calibration tables. No-op when
+    /// no durable store is wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_calibration: Option<bool>,
     /// Surface actually served on the connection this request arrived on, as a

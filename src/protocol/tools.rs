@@ -520,16 +520,13 @@ pub struct IndexFolderInput {
     /// Optional key used to replay an identical `index_folder` request safely.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// When true, OPEN this folder ADDITIVELY in the current session's
-    /// working set WITHOUT changing the active project. Default/omitted:
-    /// open the folder AND make it the session's ACTIVE project — unqualified
-    /// reads on this connection target it from then on (FR-006 retarget,
-    /// per-session; other connections are unaffected, and the previous
-    /// project stays in the working set, so nothing is discarded). The
-    /// active project enables cross-project reads (`project`/`projects` on
-    /// `search_symbols`/`search_text`/`find_references`) across the whole
-    /// working set. Multi-project requires the daemon; on stdio/embed (no
-    /// daemon) an `add:true` call honestly refuses (Principle VII).
+    /// If true, open this folder in the session's working set without making it
+    /// active. Otherwise (default), open and activate it for this connection;
+    /// unqualified reads then target it, while other connections are unaffected
+    /// and prior projects remain open. The active project enables cross-project
+    /// `project`/`projects` reads for search_symbols, search_text, and
+    /// find_references. Multi-project requires the daemon; stdio/embed refuses
+    /// `add:true`.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub add: Option<bool>,
     /// Direct, per-request authority to index the exact protected root in
@@ -630,10 +627,8 @@ impl HealthInput {
 /// Input for `what_changed`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct WhatChangedInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Optional Unix timestamp (seconds since epoch). Files newer than this are returned.
@@ -658,10 +653,10 @@ pub struct WhatChangedInput {
     /// In uncommitted mode, diffs HEAD against the working tree.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_symbol_diff: Option<bool>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
@@ -701,12 +696,9 @@ const DETECT_IMPACT_MAX_RETURNED: usize = 200;
 /// Input for `detect_impact` (contracts/detect-impact.md, frozen 2026-06-30).
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct DetectImpactInput {
-    /// Base branch/ref to diff against HEAD when `since` is not set. Defaults
-    /// to `main` when neither `base_branch` nor `since` is set
-    /// (contracts/detect-impact.md § Input); on a repo whose default branch is
-    /// not `main`, pass this (or `since`) explicitly — an absent `main` surfaces
-    /// an "Invalid git ref" error. Uncommitted working-tree changes are always
-    /// merged in per `include_untracked`.
+    /// Base ref for HEAD when `since` is unset; defaults to `main` if both are
+    /// omitted. On repos without `main`, pass this or `since` (otherwise an
+    /// invalid-ref error). Uncommitted changes are merged per `include_untracked`.
     pub base_branch: Option<String>,
     /// Git ref to diff against HEAD; overrides `base_branch` when set. Pass
     /// the literal value `WORKTREE` to diff tracked working-tree changes
@@ -726,10 +718,9 @@ pub struct DetectImpactInput {
         deserialize_with = "lenient_bool_required"
     )]
     pub include_untracked: bool,
-    /// Include non-source data files (e.g. JSON/YAML/TOML) in the changed-set
-    /// that seeds the blast radius. Default false (018 US1 / FR-001): the
-    /// impact walk is source-focused so untracked data files and their
-    /// key-symbols don't dominate. Set true to restore full inclusion.
+    /// Include data files (JSON/YAML/TOML) in the blast-radius seed. Default
+    /// false keeps untracked data and key symbols from dominating the source-
+    /// focused walk; true restores full inclusion.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_data: Option<bool>,
 }
@@ -737,10 +728,8 @@ pub struct DetectImpactInput {
 /// Input for `analyze_file_impact`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct AnalyzeFileImpactInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Relative path to the file to re-read from disk.
@@ -754,7 +743,7 @@ pub struct AnalyzeFileImpactInput {
     /// Maximum co-changing files to return (default 10). Only used when include_co_changes=true.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub co_changes_limit: Option<u32>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
 }
@@ -762,10 +751,8 @@ pub struct AnalyzeFileImpactInput {
 /// Input for `explore`.
 #[derive(Deserialize, Serialize, JsonSchema, Default)]
 pub struct ExploreInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Natural-language concept or topic to explore (e.g., "error handling", "concurrency", "database").
@@ -794,37 +781,33 @@ pub struct ExploreInput {
     pub language: Option<String>,
     /// Optional relative path prefix scope (e.g., "src/", "backend/").
     pub path_prefix: Option<String>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct SmartQueryInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Natural language question about the codebase. Examples:
     /// "who calls optimize_deterministic", "where is LiveIndex defined",
     /// "how does the parser work", "what changed", "find file tools.rs"
     pub query: String,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct EditPlanInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// The symbol name or file path you want to edit.
@@ -833,10 +816,8 @@ pub struct EditPlanInput {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct InvestigationInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Optional focus area to filter suggestions.
@@ -846,10 +827,8 @@ pub struct InvestigationInput {
 /// Input for `diff_symbols`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct DiffSymbolsInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
     /// Base git ref to compare from (default: "main").
@@ -872,10 +851,10 @@ pub struct DiffSymbolsInput {
     /// counts) without any per-file detail. Useful for quick change-scope assessment.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub summary_only: Option<bool>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
@@ -3193,6 +3172,10 @@ fn merge_qualified_usages_into_view(
             view.files.push(ReferenceFileView {
                 file_path: usage.file_path.clone(),
                 hits: vec![hit],
+                caller_declarations: Vec::new(),
+                caller_declaration_count: 0,
+                caller_declarations_omitted: 0,
+                caller_header_unavailable_count: 0,
             });
         }
         known_files.insert(usage.file_path);
@@ -4806,18 +4789,42 @@ impl SymForgeServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_file_context(&self, params: Parameters<GetFileContextInput>) -> String {
-        let project_wide = params.0.sections.as_ref().is_none_or(|sections| {
+        let visible_requested_sections = visible_sections(&params.0.sections);
+        let final_max_tokens = params.0.max_tokens;
+        let final_target = format!("file:{}", params.0.path);
+        let final_knowledge_requested =
+            visible_requested_sections.as_ref().is_none_or(|sections| {
+                sections.is_empty() || sections.iter().any(|section| section == "knowledge")
+            });
+        let project_wide = visible_requested_sections.as_ref().is_none_or(|sections| {
             sections.is_empty()
                 || sections
                     .iter()
                     .any(|section| section == "consumers" || section == "references")
         });
         let mut served = None;
-        let output = self.get_file_context_unnoted(params, &mut served).await;
-        match served {
-            Some(live) if project_wide => with_withheld_note(&live, None, output),
-            _ => output,
-        }
+        let mut cache_hit_handle = None;
+        let output = self
+            .get_file_context_unnoted(params, &mut served, &mut cache_hit_handle)
+            .await;
+        let (output, withheld_files) = match served {
+            Some(live) if project_wide => {
+                let withheld =
+                    format::withheld_not_searched_note(live.withheld_since_restore(), None)
+                        .is_some();
+                (with_withheld_note(&live, None, output), withheld)
+            }
+            _ => (output, false),
+        };
+        crate::protocol::knowledge_model::bound_final_code_context_output(
+            output,
+            final_max_tokens,
+            &final_target,
+            visible_requested_sections.as_deref(),
+            final_knowledge_requested,
+            withheld_files,
+            cache_hit_handle.as_deref(),
+        )
     }
 
     /// `served` receives the index the answer is rendered from, once captured.
@@ -4825,6 +4832,7 @@ impl SymForgeServer {
         &self,
         params: Parameters<GetFileContextInput>,
         served: &mut Option<Arc<LiveIndex>>,
+        cache_hit_handle: &mut Option<String>,
     ) -> String {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
@@ -4861,6 +4869,7 @@ impl SymForgeServer {
             force_refresh,
         ) && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
         {
+            *cache_hit_handle = Some(meta.retrieve_handle);
             return hit;
         }
         // Honest Tier-2/Tier-3 response: the path may EXIST on disk but be
@@ -4915,13 +4924,16 @@ impl SymForgeServer {
                 .unwrap_or((false, 0, 0, 0, 0))
         };
         let is_small_file = format::is_small_indexed_file(raw_chars, line_count);
+        let requested_sections = visible_sections(&params.0.sections);
+        let visible_default_sections = requested_sections
+            .as_ref()
+            .is_none_or(|sections| sections.is_empty());
         let large_default_summary = !is_small_file
-            && params.0.sections.is_none()
+            && visible_default_sections
             && (raw_chars > 200_000 || symbol_count > 250 || reference_count > 800);
 
         let state = sidecar_state_for_server(self);
         let include_tests = include_tests_from_sections(params.0.sections.as_ref());
-        let requested_sections = visible_sections(&params.0.sections);
         let knowledge_requested = requested_sections.as_ref().is_none_or(|sections| {
             sections.is_empty() || sections.iter().any(|section| section == "knowledge")
         });
@@ -4935,7 +4947,7 @@ impl SymForgeServer {
                 .cloned()
                 .collect::<Vec<_>>()
         });
-        let sections = if is_small_file {
+        let sections = if is_small_file && visible_default_sections {
             Some(vec!["outline".to_string()])
         } else if large_default_summary {
             Some(vec!["outline".to_string(), "imports".to_string()])
@@ -5007,19 +5019,67 @@ impl SymForgeServer {
                         format!("{note}\n\n{result}")
                     };
                 }
+                let code_context_len = result.len();
                 let mut body = result;
+                let mut knowledge_start = None;
                 if let Some(knowledge) = &knowledge_section {
                     body.push_str("\n\n");
+                    knowledge_start = Some(body.len());
                     body.push_str(knowledge);
                 }
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                let (mut output, truncated_after_assembly) =
+                let budgeted_context = if requested_sections
+                    .as_ref()
+                    .is_none_or(|sections| sections.is_empty())
+                {
+                    crate::protocol::knowledge_model::enforce_budgeted_code_context_prioritizing_code(
+                        &published,
+                        format!("{body}{footer}"),
+                        code_context_len,
+                        knowledge_section.as_deref(),
+                        context_max_tokens,
+                    )
+                } else {
                     crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
                         &published,
                         format!("{body}{footer}"),
+                        knowledge_start,
                         knowledge_section.as_deref(),
                         context_max_tokens,
-                    );
+                    )
+                };
+                let (mut output, truncated_after_assembly) = budgeted_context;
+                let mixed_knowledge_sections =
+                    requested_sections.as_ref().is_some_and(|sections| {
+                        sections.iter().any(|section| section == "knowledge")
+                            && sections.iter().any(|section| section != "knowledge")
+                    });
+                if truncated_after_assembly
+                    && mixed_knowledge_sections
+                    && !output.contains("Requested code section(s)")
+                    && !output.contains("Requested code and knowledge sections")
+                    && !output.contains("Code section omitted")
+                {
+                    let continuation = "\n\nRequested code and knowledge sections may be incomplete at this budget; retry the same sections with a higher max_tokens.";
+                    output.push_str(continuation);
+                    if let Some(limit) = context_max_tokens {
+                        let max_bytes = usize::try_from(limit)
+                            .unwrap_or(usize::MAX)
+                            .saturating_mul(4);
+                        if output.len() > max_bytes {
+                            output =
+                                crate::protocol::knowledge_model::bound_final_code_context_output(
+                                    output,
+                                    context_max_tokens,
+                                    &format!("file:{}", params.0.path),
+                                    requested_sections.as_deref(),
+                                    true,
+                                    false,
+                                    None,
+                                );
+                        }
+                    }
+                }
                 if truncated_after_assembly {
                     // The sidecar stamped the trust envelope (possibly
                     // `Completeness: full`) BEFORE this post-assembly cut —
@@ -5105,12 +5165,41 @@ impl SymForgeServer {
         &self,
         params: Parameters<GetSymbolContextInput>,
     ) -> String {
+        let final_max_tokens = params.0.max_tokens;
+        let final_target = format!(
+            "symbol:{}:{}",
+            params
+                .0
+                .path
+                .as_deref()
+                .or(params.0.file.as_deref())
+                .unwrap_or("unresolved"),
+            params.0.name,
+        );
+        let requested_sections = visible_sections(&params.0.sections);
+        let knowledge_requested = requested_sections.as_ref().is_none_or(|sections| {
+            sections.is_empty() || sections.iter().any(|section| section == "knowledge")
+        });
         let mut served = None;
         let output = self.get_symbol_context_unnoted(params, &mut served).await;
-        match served {
-            Some(live) => with_withheld_note(&live, None, output),
-            None => output,
-        }
+        let (output, withheld_files) = match served {
+            Some(live) => {
+                let withheld =
+                    format::withheld_not_searched_note(live.withheld_since_restore(), None)
+                        .is_some();
+                (with_withheld_note(&live, None, output), withheld)
+            }
+            None => (output, false),
+        };
+        crate::protocol::knowledge_model::bound_final_code_context_output(
+            output,
+            final_max_tokens,
+            &final_target,
+            requested_sections.as_deref(),
+            knowledge_requested,
+            withheld_files,
+            None,
+        )
     }
 
     /// `served` receives the index the answer is rendered from, once captured.
@@ -5339,15 +5428,18 @@ impl SymForgeServer {
                 trace_verbosity,
                 trace_input.max_tokens,
             );
+            let mut knowledge_start = None;
             if knowledge_requested && let Some(knowledge) = &knowledge {
                 trace_result.push_str("\n\n");
+                knowledge_start = Some(trace_result.len());
                 trace_result.push_str(knowledge);
             }
             let (trace_result, _) =
                 crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
                     &published,
                     trace_result,
-                    knowledge.as_deref(),
+                    knowledge_start,
+                    knowledge_start.and(knowledge.as_deref()),
                     params
                         .0
                         .max_tokens
@@ -5458,8 +5550,10 @@ impl SymForgeServer {
                 if !impl_block_tip.is_empty() {
                     output.push_str(impl_block_tip.trim_start_matches('\n'));
                 }
+                let mut knowledge_start = None;
                 if let Some(knowledge) = &knowledge_section {
                     output.push_str("\n\n");
+                    knowledge_start = Some(output.len());
                     output.push_str(knowledge);
                 }
                 let footer = format::compact_savings_footer(output.len(), raw_chars);
@@ -5480,6 +5574,7 @@ impl SymForgeServer {
                 crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
                     &published,
                     format!("{output}{footer}"),
+                    knowledge_start,
                     knowledge_section.as_deref(),
                     max_tokens,
                 )
@@ -5496,8 +5591,10 @@ impl SymForgeServer {
                         body.push('\n');
                         body.push_str(impl_block_tip.trim_start_matches('\n'));
                     }
+                    let mut knowledge_start = None;
                     if let Some(knowledge) = &knowledge_section {
                         body.push_str("\n\n");
+                        knowledge_start = Some(body.len());
                         body.push_str(knowledge);
                     }
                     let footer = format::compact_savings_footer(body.len(), raw_chars);
@@ -5536,6 +5633,7 @@ impl SymForgeServer {
                     crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
                         &published,
                         output,
+                        knowledge_start,
                         knowledge_section.as_deref(),
                         max_tokens,
                     )
@@ -5839,7 +5937,7 @@ impl SymForgeServer {
     /// NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).
     #[tool(
         name = "search_text",
-        description = "CODE-scoped search with enclosing-symbol context (literal/regex/AST); tests excluded (include_tests=true). Not Markdown/docs (search_knowledge), names (search_symbols), or paths (search_files).",
+        description = "CODE-scoped search with context (literal/regex/AST); tests excluded unless include_tests=true. For indexed call sites, prefer find_references. Not docs, names, or paths.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_text_tool(
@@ -6352,7 +6450,7 @@ impl SymForgeServer {
     /// Inspect a specific line in full symbol context: shows the enclosing symbol, parent chain,
     /// and siblings. Works standalone with just path + line, or after search_text to deep-dive a match.
     #[tool(
-        description = "Inspect one path+line: enclosing symbol, parent chain, siblings. After search_text to deep-dive a hit; not all occurrences (search_text) or callers (get_symbol_context).",
+        description = "Inspect one path+line: enclosing symbol, parent, siblings. Deep-dive search_text hits; not all matches or callers. For indexed call sites, prefer find_references.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn inspect_match(&self, params: Parameters<InspectMatchInput>) -> String {
@@ -9482,7 +9580,7 @@ impl SymForgeServer {
     /// NOT for full refactoring context (use get_symbol_context with sections=[...]).
     #[tool(
         name = "find_references",
-        description = "Find call sites, imports, and type usages; mode=implementations for trait/interface implementors. Not file-level imports (find_dependents) or a full trace (get_symbol_context).",
+        description = "Sites/imports/types; best-effort direct caller/site ranges; may be incomplete. Same-name ambiguity: scope path/symbol_kind. mode=implementations: trait implementors; file imports: find_dependents.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn find_references_tool(
@@ -9783,7 +9881,16 @@ impl SymForgeServer {
                     None => output,
                 };
                 let result = with_withheld_note(&generation.live, None, result);
-                self.apply_ccr_budget("find_references", result, params.0.max_tokens)
+                let (result, truncated) = self.apply_ccr_budget_with_truncation_status(
+                    "find_references",
+                    result,
+                    params.0.max_tokens,
+                );
+                if truncated {
+                    format::downgrade_full_completeness_after_truncation(&result)
+                } else {
+                    result
+                }
             }
             Err(error) => error,
         }
@@ -16577,6 +16684,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_small_file_imports_and_knowledge_sections_are_preserved() {
+        let caller = make_symbol("caller", SymbolKind::Function, 2, 2);
+        let caller_content = b"use crate::target;\npub fn caller() { target(); }\n";
+        let caller_file = make_file_with_refs(
+            "src/caller.rs",
+            caller_content,
+            vec![caller],
+            vec![ReferenceRecord {
+                name: "target".to_string(),
+                qualified_name: Some("crate::target".to_string()),
+                kind: ReferenceKind::Import,
+                byte_range: (4, 10),
+                line_range: (0, 0),
+                enclosing_symbol_index: None,
+            }],
+        );
+        let target = make_symbol("target", SymbolKind::Function, 1, 1);
+        let target_file = make_file("src/target.rs", b"pub fn target() {}\n", vec![target]);
+        let server = make_server(make_live_index_ready(vec![caller_file, target_file]));
+
+        let output = server
+            .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
+                path: "src/caller.rs".to_string(),
+                max_tokens: Some(900),
+                sections: Some(vec!["imports".to_string(), "knowledge".to_string()]),
+                estimate: None,
+                force_refresh: None,
+            }))
+            .await;
+
+        assert!(
+            output.contains("Imports from"),
+            "small-file imports section was replaced: {output}"
+        );
+        assert!(
+            output.contains("crate::target"),
+            "explicit import evidence was lost: {output}"
+        );
+        assert!(
+            output.contains("Knowledge evidence:"),
+            "explicit knowledge section was lost: {output}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_file_context_shows_imports_and_used_by_sections() {
         let callee = make_symbol("target", SymbolKind::Function, 1, 3);
         let caller = make_symbol("caller", SymbolKind::Function, 1, 3);
@@ -22112,6 +22265,36 @@ mod tests {
                 ),
                 "{lane} must lead with the not-searched note: {result}"
             );
+        }
+        for (lane, result) in [
+            (
+                "get_file_context",
+                server
+                    .get_file_context(input(serde_json::json!({
+                        "path": "src/lib.rs", "max_tokens": 128
+                    })))
+                    .await,
+            ),
+            (
+                "get_symbol_context",
+                server
+                    .get_symbol_context(input(serde_json::json!({
+                        "path": "src/lib.rs", "name": "foo", "max_tokens": 128
+                    })))
+                    .await,
+            ),
+        ] {
+            assert!(result.len() <= 128 * 4, "{lane} exceeded budget: {result}");
+            assert!(
+                result.to_ascii_lowercase().contains("withheld"),
+                "{lane} lost withheld state: {result}"
+            );
+            if lane == "get_file_context" {
+                assert!(
+                    result.contains("Trust:") || result.starts_with("Error:"),
+                    "{lane} lost trust state: {result}"
+                );
+            }
         }
         let unverified = std::collections::BTreeMap::from([(
             "src/held.rs".to_string(),
@@ -28500,6 +28683,36 @@ mod tests {
         assert!(
             !result.contains("definitions named"),
             "single definition must not trigger the disclosure; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_budget_truncation_downgrades_full_envelope() {
+        let definition = make_symbol("solitary_fn", SymbolKind::Function, 1, 1);
+        let caller = make_symbol("caller", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/only.rs",
+            b"fn solitary_fn() {}\nfn caller() { solitary_fn(); }\n",
+            vec![definition, caller],
+            vec![make_ref(
+                "solitary_fn",
+                None,
+                ReferenceKind::Call,
+                1,
+                Some(1),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let mut input = find_references_input("solitary_fn");
+        input.max_tokens = Some(40);
+        let result = server.find_references(Parameters(input)).await;
+        assert!(
+            result.contains("budget-limited (was: full for current scope"),
+            "post-assembly token truncation must downgrade the stamped envelope: {result}"
+        );
+        assert!(
+            result.contains("symforge_retrieve"),
+            "truncation keeps CCR retrieval: {result}"
         );
     }
 

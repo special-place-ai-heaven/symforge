@@ -62,7 +62,8 @@ pub struct SearchKnowledgeInput {
     /// Authority/retrieval voice filter. Defaults to `default`.
     #[serde(default)]
     pub authority_scope: Option<KnowledgeAuthorityScope>,
-    /// One open project id/alias; mutually exclusive with `projects`.
+    /// Optional open-project ID/alias; exclusive with `projects`. Omit both for
+    /// the active project.
     #[serde(default)]
     pub project: Option<String>,
     /// Explicit open-project ids/aliases or `["*"]`; mutually exclusive with `project`.
@@ -72,7 +73,7 @@ pub struct SearchKnowledgeInput {
     /// Maximum number of complete hits. Defaults to ten and is server-bounded.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
-    /// Bounded response budget; truncation preserves complete provenance.
+    /// Response budget; truncation preserves full provenance.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
@@ -103,7 +104,8 @@ pub struct ReviewKnowledgeInput {
     #[serde(default)]
     #[schemars(with = "AdvertisedSearchKnowledgeSourceScope")]
     pub source_scope: Option<KnowledgeSourceScope>,
-    /// One open project id/alias; mutually exclusive with `projects`.
+    /// Optional open-project ID/alias; exclusive with `projects`. Omit both for
+    /// the active project.
     #[serde(default)]
     pub project: Option<String>,
     /// Explicit open-project ids/aliases or `["*"]`; mutually exclusive with `project`.
@@ -113,7 +115,7 @@ pub struct ReviewKnowledgeInput {
     /// Maximum number of complete dossiers. Defaults to ten and is server-bounded.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
-    /// Bounded response budget; complete-plan hashes are computed before budgeting.
+    /// Response budget; compute complete-plan hashes before applying it.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
 }
@@ -257,17 +259,15 @@ pub struct SearchSymbolsInput {
     /// Default false -- personal sidecars rarely answer codebase symbol questions.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_personal_tooling: Option<bool>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
-    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias instead of
-    /// the session's active project. Mutually exclusive with `projects`. Must be a
-    /// project id/alias, NEVER a filesystem path (a path is rejected with a
-    /// corrective error pointing at `index_folder(add:true)`). Omitting both
-    /// `project` and `projects` targets the active project (today's behavior).
+    /// Optional open-project ID/alias; exclusive with `projects`. Omit both for
+    /// the active project. IDs/aliases only, never paths; path selectors error
+    /// with guidance to `index_folder(add:true)`.
     #[serde(default)]
     pub project: Option<String>,
     /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
@@ -348,10 +348,10 @@ pub struct SearchTextInput {
     /// rather than simple match count. Default: false.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub ranked: Option<bool>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response. Output is truncated at a line boundary if exceeded.
+    /// Response token budget; output truncates at a line boundary.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
     /// When true, interpret `query` as an ast-grep structural pattern instead of a text search.
@@ -359,9 +359,8 @@ pub struct SearchTextInput {
     /// and `$$$` for multi-node wildcards. Example: `fn $NAME($$$) { $$$ }`.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub structural: Option<bool>,
-    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias instead of
-    /// the session's active project. Mutually exclusive with `projects`; must be a
-    /// project id/alias, never a path. Omitting both targets the active project.
+    /// Optional open-project ID/alias; exclusive with `projects`. Omit both for
+    /// the active project. IDs/aliases only, never paths.
     #[serde(default)]
     pub project: Option<String>,
     /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
@@ -379,16 +378,13 @@ pub struct SearchTextInput {
 /// Input for `search_files`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct SearchFilesInput {
-    /// Optional explicit project selector (daemon sessions with multiple open
-    /// projects): an open project ID or unique project name. Omit for the
-    /// session's active project. Local/embedded servers are bound to one project
-    /// and refuse a non-matching selector.
+    /// Optional open-project ID or unique name (daemon). Omit for the active
+    /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
-    /// Target an EXPLICIT subset of open projects by id/name, or `["*"]` for
-    /// every open project. Mutually exclusive with `project`. Plain fuzzy
-    /// query mode only — resolve/coupling modes stay single-project.
-    /// Daemon-only.
+    /// Daemon only: select open projects by ID/name or `["*"]` for all. Exclusive
+    /// with `project`; applies only to plain fuzzy queries. Resolve/coupling modes
+    /// stay single-project.
     // `#[schemars(with = "Vec<String>")]` keeps this a plain `type: "array"`
     // schema, NOT the `type: ["array", "null"]` union that strict MCP clients
     // reject (mirrors the sibling discovery verbs; enforced by
@@ -412,28 +408,23 @@ pub struct SearchFilesInput {
     /// Set to true for exact path resolution mode: resolves an ambiguous filename or partial path to one exact project path.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub resolve: Option<bool>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
     /// When true, append a compact ranking explanation unless ranking diagnostics are disabled by policy.
     /// Missing values default off; `SYMFORGE_DEBUG_RANKING=1` may still default diagnostics on operationally.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub debug_ranking: Option<bool>,
-    /// Optional ranking mode. `"frecency"` requests call-time frecency
-    /// resolution: available session or persistent history is fused with
-    /// path ranking, otherwise the response includes explicit fallback,
-    /// unavailable, or disabled-by-policy evidence.
-    /// `"path+cochange"` fuses path match with the coupling store when
-    /// `anchor_path` is set and ready coupling data exists; otherwise the
-    /// response reports call-time preparation, fallback, unavailable, stale,
-    /// or disabled-by-policy evidence.
-    /// Any other value (including `None`) preserves the default
-    /// tier-based ordering exactly.
-    ///
-    /// The separate `changed_with=` branch is preserved for compatibility.
+    /// Optional ranking: `"frecency"` fuses available session/persistent history
+    /// with path ranking; otherwise the response reports fallback, unavailable,
+    /// or policy-disabled evidence. `"path+cochange"` fuses path match with
+    /// coupling when `anchor_path` is set and data is ready; otherwise it reports
+    /// preparation, fallback, unavailable, stale, or policy-disabled evidence.
+    /// Other values (including `None`) keep default tier ordering. The separate
+    /// `changed_with=` branch remains compatible.
     #[serde(default)]
     pub rank_by: Option<String>,
     /// Anchor file used as the co-change pivot when `rank_by="path+cochange"`.
@@ -480,15 +471,14 @@ pub struct FindReferencesInput {
     /// Search direction for implementations mode: "trait" (find implementors), "type" (find traits a type implements), or "auto" (default: search both).
     #[serde(default)]
     pub direction: Option<String>,
-    /// When true, return an approximate token cost estimate instead of actual content.
+    /// When true, estimate token cost instead of returning content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
-    /// Optional maximum token budget for the response.
+    /// Response token budget.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
-    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias instead of
-    /// the session's active project. Mutually exclusive with `projects`; must be a
-    /// project id/alias, never a path. Omitting both targets the active project.
+    /// Optional open-project ID/alias; exclusive with `projects`. Omit both for
+    /// the active project. IDs/aliases only, never paths.
     #[serde(default)]
     pub project: Option<String>,
     /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by

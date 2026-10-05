@@ -15,8 +15,6 @@
 /// tests that mutate cwd acquire `CWD_LOCK` which is a `tokio::sync::Mutex` so it can be
 /// held across await points on the multi-thread runtime.
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,6 +37,13 @@ use tokio::sync::Mutex;
 // tokio::sync::Mutex is Send so it can be held across await points.
 // ---------------------------------------------------------------------------
 static CWD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .expect("build bounded sidecar test HTTP client")
+});
 
 fn has_savings_footer(body: &str) -> bool {
     body.contains("whole-file read") || body.contains("windowed read")
@@ -93,44 +98,33 @@ fn control_state(root: &Path) -> ControlStateDir {
     ControlStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
 }
 
-/// Make a synchronous raw HTTP GET request to `127.0.0.1:{port}{path}?{query}`.
-/// Returns the response body or an error.
-fn raw_http_get_with_status(
+/// Make a bounded HTTP GET request to `127.0.0.1:{port}{path}?{query}`.
+/// Returns the original-style status line and fully drained response body.
+async fn raw_http_get_with_status(
     port: u16,
     path: &str,
     query: &str,
 ) -> anyhow::Result<(String, String)> {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    let timeout = Duration::from_millis(500);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    let request_path = if query.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{query}")
-    };
-
-    let request = format!(
-        "GET {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    let mut url = format!("http://127.0.0.1:{port}{path}");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let response = HTTP_CLIENT.get(url).send().await?;
+    let status_code = response.status();
+    let status = format!(
+        "HTTP/1.1 {} {}",
+        status_code.as_u16(),
+        status_code.canonical_reason().unwrap_or_default()
     );
-    stream.write_all(request.as_bytes())?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-
-    let status = response.lines().next().unwrap_or_default().to_string();
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .unwrap_or("")
-        .to_string();
+    let body = response.text().await?;
     Ok((status, body))
 }
 
-fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
-    raw_http_get_with_status(port, path, query).map(|(_, body)| body)
+async fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
+    raw_http_get_with_status(port, path, query)
+        .await
+        .map(|(_, body)| body)
 }
 
 fn stable_cwd() -> PathBuf {
@@ -241,7 +235,9 @@ async fn test_health_endpoint_responds() {
     // assertion here measured the shared CI runner, not the server, and
     // flaked at 111 ms on a loaded host (2026-08-24). Latency is a
     // distribution, measured by `health_latency_p95_smoke` below.
-    let body = raw_http_get(handle.port, "/health", "").expect("GET /health must succeed");
+    let body = raw_http_get(handle.port, "/health", "")
+        .await
+        .expect("GET /health must succeed");
 
     let parsed: serde_json::Value =
         serde_json::from_str(&body).expect("health response must be valid JSON");
@@ -290,7 +286,9 @@ async fn health_latency_p95_smoke() {
     let mut latencies = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let start = Instant::now();
-        raw_http_get(handle.port, "/health", "").expect("GET /health must succeed");
+        raw_http_get(handle.port, "/health", "")
+            .await
+            .expect("GET /health must succeed");
         latencies.push(start.elapsed());
     }
     latencies.sort();
@@ -340,6 +338,7 @@ async fn test_outline_endpoint() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let body = raw_http_get(handle.port, "/outline", "path=src/foo.rs")
+        .await
         .expect("GET /outline must succeed");
 
     assert!(
@@ -380,9 +379,11 @@ async fn test_workflow_source_read_endpoint_matches_outline() {
 
     let (canonical_status, canonical) =
         raw_http_get_with_status(handle.port, "/outline", "path=src/foo.rs")
+            .await
             .expect("GET /outline must succeed");
     let (workflow_status, workflow) =
         raw_http_get_with_status(handle.port, "/workflows/source-read", "path=src/foo.rs")
+            .await
             .expect("GET /workflows/source-read must succeed");
     assert!(canonical_status.contains(" 200 "));
     assert!(workflow_status.contains(" 200 "));
@@ -420,7 +421,9 @@ async fn test_shared_index_mutation() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Verify initial state via sidecar.
-    let body = raw_http_get(handle.port, "/health", "").expect("GET /health must succeed");
+    let body = raw_http_get(handle.port, "/health", "")
+        .await
+        .expect("GET /health must succeed");
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed["file_count"], 1, "initially 1 file");
 
@@ -432,8 +435,9 @@ async fn test_shared_index_mutation() {
     }
 
     // Sidecar should now report 2 files (same Arc).
-    let body2 =
-        raw_http_get(handle.port, "/health", "").expect("GET /health after mutation must succeed");
+    let body2 = raw_http_get(handle.port, "/health", "")
+        .await
+        .expect("GET /health after mutation must succeed");
     let parsed2: serde_json::Value = serde_json::from_str(&body2).unwrap();
     assert_eq!(
         parsed2["file_count"], 2,
@@ -442,6 +446,7 @@ async fn test_shared_index_mutation() {
 
     // Outline for the new file must also be visible.
     let outline = raw_http_get(handle.port, "/outline", "path=src/b.rs")
+        .await
         .expect("GET /outline for new file must succeed");
     assert!(
         outline.contains("src/b.rs"),
@@ -644,7 +649,9 @@ async fn test_repo_map_endpoint() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let body = raw_http_get(handle.port, "/repo-map", "").expect("GET /repo-map must succeed");
+    let body = raw_http_get(handle.port, "/repo-map", "")
+        .await
+        .expect("GET /repo-map must succeed");
 
     assert!(
         body.contains("3 files"),
@@ -691,10 +698,12 @@ async fn test_workflow_repo_start_endpoint_matches_repo_map() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let (canonical_status, canonical) =
-        raw_http_get_with_status(handle.port, "/repo-map", "").expect("GET /repo-map must succeed");
+    let (canonical_status, canonical) = raw_http_get_with_status(handle.port, "/repo-map", "")
+        .await
+        .expect("GET /repo-map must succeed");
     let (workflow_status, workflow) =
         raw_http_get_with_status(handle.port, "/workflows/repo-start", "")
+            .await
             .expect("GET /workflows/repo-start must succeed");
     assert!(canonical_status.contains(" 200 "));
     assert!(workflow_status.contains(" 200 "));
@@ -732,6 +741,7 @@ async fn test_prompt_context_endpoint_prefers_file_hint() {
         "/prompt-context",
         "text=please%20inspect%20src%2Ffoo.rs",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -769,9 +779,11 @@ async fn test_workflow_prompt_context_endpoint_matches_prompt_context() {
     let query = "text=please%20inspect%20src%2Ffoo.rs";
     let (canonical_status, canonical) =
         raw_http_get_with_status(handle.port, "/prompt-context", query)
+            .await
             .expect("GET /prompt-context must succeed");
     let (workflow_status, workflow) =
         raw_http_get_with_status(handle.port, "/workflows/prompt-context", query)
+            .await
             .expect("GET /workflows/prompt-context must succeed");
     assert!(canonical_status.contains(" 200 "));
     assert!(workflow_status.contains(" 200 "));
@@ -937,6 +949,7 @@ async fn test_prompt_context_endpoint_extensionless_path_line_hint_disambiguates
         "/prompt-context",
         "text=inspect%20src%2Fdb%3A2%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -1108,6 +1121,7 @@ async fn test_prompt_context_endpoint_module_alias_line_hint_disambiguates_exact
         "/prompt-context",
         "text=inspect%20crate%3A%3Adb%3A2%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -1267,6 +1281,7 @@ async fn test_prompt_context_endpoint_module_alias_without_line_prefers_exact_fi
         "/prompt-context",
         "text=inspect%20crate%3A%3Adb%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -1403,6 +1418,7 @@ async fn test_prompt_context_endpoint_slash_module_alias_without_line_prefers_ex
         "/prompt-context",
         "text=inspect%20src/utils%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -1551,6 +1567,7 @@ async fn test_prompt_context_endpoint_slash_module_alias_line_hint_disambiguates
         "/prompt-context",
         "text=inspect%20src%2Futils%3A4%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -1665,6 +1682,7 @@ async fn test_prompt_context_endpoint_qualified_symbol_alias_prefers_exact_selec
         "/prompt-context",
         "text=inspect%20crate%3A%3Adb%3A%3Aconnect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -1797,6 +1815,7 @@ async fn test_prompt_context_endpoint_dotted_qualified_symbol_alias_prefers_exac
         "/prompt-context",
         "text=inspect%20pkg.db.connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -1929,6 +1948,7 @@ async fn test_prompt_context_endpoint_slash_qualified_symbol_alias_prefers_exact
         "/prompt-context",
         "text=inspect%20src/utils/connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -2074,6 +2094,7 @@ async fn test_prompt_context_endpoint_slash_qualified_symbol_alias_line_hint_dis
         "/prompt-context",
         "text=inspect%20src/utils/connect:4",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -2223,6 +2244,7 @@ async fn test_prompt_context_endpoint_dotted_qualified_symbol_alias_line_hint_di
         "/prompt-context",
         "text=inspect%20pkg.db.connect:5",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -2337,6 +2359,7 @@ async fn test_prompt_context_endpoint_combined_hint_uses_exact_selector() {
         "/prompt-context",
         "text=inspect%20src%2Fdb.rs%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -2451,6 +2474,7 @@ async fn test_prompt_context_endpoint_line_hint_disambiguates_exact_selector() {
         "/prompt-context",
         "text=inspect%20src%2Fdb.rs%20connect%20line%202",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -2565,6 +2589,7 @@ async fn test_prompt_context_endpoint_path_line_hint_disambiguates_exact_selecto
         "/prompt-context",
         "text=inspect%20src%2Fdb.rs%3A2%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -2679,6 +2704,7 @@ async fn test_prompt_context_endpoint_basename_line_hint_disambiguates_exact_sel
         "/prompt-context",
         "text=inspect%20db.rs%3A2%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(
@@ -2823,6 +2849,7 @@ async fn test_prompt_context_endpoint_extensionless_alias_line_hint_disambiguate
         "/prompt-context",
         "text=inspect%20db%3A2%20connect",
     )
+    .await
     .expect("GET /prompt-context must succeed");
 
     assert!(

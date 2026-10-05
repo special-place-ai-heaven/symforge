@@ -605,6 +605,26 @@ fn run_hook_initial_daemon_index_not_ready_fails_open_without_retry() {
         &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
     );
     let daemon_requests = daemon_thread.join().expect("mock daemon thread joins");
+    let safe_routes = daemon_requests
+        .iter()
+        .map(|path| {
+            let route = path.split('?').next().unwrap_or(path);
+            if route == "/v1/projects" {
+                "/v1/projects"
+            } else if route.starts_with("/v1/projects/") && route.ends_with("/sessions") {
+                "/v1/projects/{id}/sessions"
+            } else if route.starts_with("/v1/sessions/") && route.ends_with("/sidecar/outline") {
+                "/v1/sessions/{id}/sidecar/outline"
+            } else {
+                "<other-route>"
+            }
+        })
+        .collect::<Vec<_>>();
+    let safe_events = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.split('\t').take(4).collect::<Vec<_>>().join("|"))
+        .collect::<Vec<_>>();
 
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("hook output must be valid fail-open JSON");
@@ -612,7 +632,7 @@ fn run_hook_initial_daemon_index_not_ready_fails_open_without_retry() {
     assert!(!stdout.contains(DAEMON_PARTIAL));
     assert!(
         log.contains("mock-session\tsource-read\tsidecar-error"),
-        "the initially selected daemon's 503 must use its own session; got:\n{log}"
+        "the initially selected daemon's 503 must use its own session; routes={safe_routes:?}; events={safe_events:?}"
     );
     assert!(!log.contains("sidecar_port_stale"));
     let project_sessions_route = format!("/v1/projects/{expected_project_id}/sessions");
@@ -1112,6 +1132,7 @@ fn serve_recording_descriptor_endpoint(
         .expect("set descriptor endpoint non-blocking");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
+    let mut held_connections = Vec::new();
 
     while Instant::now() < deadline {
         let (mut stream, _) = match listener.accept() {
@@ -1139,11 +1160,13 @@ fn serve_recording_descriptor_endpoint(
 
         if route == "/health" {
             let health = r#"{"project_count":0,"session_count":1,"daemon_version":"10.0.3","executable_path":"mock","auth_required":true,"pid":0}"#;
-            write_http_ok(&mut stream, health);
+            write_http_frame(&mut stream, "200 OK", health);
+            retain_mock_connection(&mut held_connections, stream);
             continue;
         }
 
-        write_http_response(&mut stream, enrichment_status, enrichment_body);
+        write_http_frame(&mut stream, enrichment_status, enrichment_body);
+        wait_for_mock_client_close(&mut stream);
         return requests;
     }
 
@@ -1164,6 +1187,7 @@ fn serve_recording_daemon(
         .expect("set recording daemon non-blocking");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
+    let mut held_connections = Vec::new();
     let expected_enrichment_route = format!("/v1/sessions/{expected_session_id}/sidecar/outline");
 
     while Instant::now() < deadline {
@@ -1196,19 +1220,23 @@ fn serve_recording_daemon(
                 project_id,
                 canonical_root.replace('"', "\\\"")
             );
-            write_http_ok(&mut stream, &body);
+            write_http_frame(&mut stream, "200 OK", &body);
+            retain_mock_connection(&mut held_connections, stream);
         } else if route == format!("/v1/projects/{project_id}/sessions") {
-            write_http_ok(&mut stream, sessions_json);
+            write_http_frame(&mut stream, "200 OK", sessions_json);
+            retain_mock_connection(&mut held_connections, stream);
         } else if route == expected_enrichment_route {
             let body = format!(r#"{{"enriched":"{ENRICHED_MARKER}"}}"#);
-            write_http_ok(&mut stream, &body);
+            write_http_frame(&mut stream, "200 OK", &body);
+            wait_for_mock_client_close(&mut stream);
             return requests;
         } else {
-            write_http_response(
+            write_http_frame(
                 &mut stream,
                 "404 Not Found",
                 "unexpected recording-daemon route",
             );
+            wait_for_mock_client_close(&mut stream);
             return requests;
         }
     }
@@ -1239,6 +1267,7 @@ fn serve_mock_daemon_with_enrichment(
         .set_nonblocking(true)
         .expect("set mock daemon listener non-blocking");
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut held_connections = Vec::new();
     while Instant::now() < deadline {
         let (mut stream, _) = match listener.accept() {
             Ok(pair) => pair,
@@ -1278,14 +1307,17 @@ fn serve_mock_daemon_with_enrichment(
         } else if route == "/v1/sessions/mock-session/sidecar/outline"
             && path.contains("caller_root=")
         {
-            write_http_response(&mut stream, enrichment_status, enrichment_body);
+            write_http_frame(&mut stream, enrichment_status, enrichment_body);
+            wait_for_mock_client_close(&mut stream);
             return;
         } else {
-            write_http_response(&mut stream, "404 Not Found", "unexpected mock-daemon route");
+            write_http_frame(&mut stream, "404 Not Found", "unexpected mock-daemon route");
+            retain_mock_connection(&mut held_connections, stream);
             continue;
         };
 
-        write_http_ok(&mut stream, &body);
+        write_http_frame(&mut stream, "200 OK", &body);
+        retain_mock_connection(&mut held_connections, stream);
     }
 }
 
@@ -1304,6 +1336,7 @@ fn serve_initially_discovered_loading_daemon(
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut first_enrichment_at: Option<Instant> = None;
     let mut requests = Vec::new();
+    let mut held_connections = Vec::new();
 
     while Instant::now() < deadline {
         if first_enrichment_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(750)) {
@@ -1338,24 +1371,25 @@ fn serve_initially_discovered_loading_daemon(
                 project_id,
                 canonical_root.replace('"', "\\\"")
             );
-            write_http_ok(&mut stream, &body);
+            write_http_frame(&mut stream, "200 OK", &body);
         } else if route == format!("/v1/projects/{project_id}/sessions") {
             let body = serde_json::json!([
                 {"session_id":"mock-session","project_id":project_id,"last_seen_at_unix_secs":1}
             ])
             .to_string();
-            write_http_ok(&mut stream, &body);
+            write_http_frame(&mut stream, "200 OK", &body);
         } else if route == "/v1/sessions/mock-session/sidecar/outline"
             && path.contains("caller_root=")
         {
             first_enrichment_at.get_or_insert_with(Instant::now);
-            write_http_response(&mut stream, "503 Service Unavailable", enrichment_body);
+            write_http_frame(&mut stream, "503 Service Unavailable", enrichment_body);
         } else {
-            write_http_response(&mut stream, "404 Not Found", "unexpected mock-daemon route");
+            write_http_frame(&mut stream, "404 Not Found", "unexpected mock-daemon route");
         }
+        retain_mock_connection(&mut held_connections, stream);
     }
 
-    panic!("hook never sent enrichment to the initially discovered daemon; requests={requests:?}")
+    requests
 }
 
 /// Serve a daemon selected directly from a session descriptor and keep it
@@ -1374,6 +1408,7 @@ fn serve_descriptor_selected_loading_daemon(
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut first_enrichment_at: Option<Instant> = None;
     let mut enrichment_requests = 0usize;
+    let mut held_connections = Vec::new();
 
     while Instant::now() < deadline {
         if first_enrichment_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(750)) {
@@ -1402,32 +1437,34 @@ fn serve_descriptor_selected_loading_daemon(
 
         if route == "/health" {
             let health = r#"{"project_count":0,"session_count":1,"daemon_version":"10.0.3","executable_path":"mock","auth_required":true,"pid":0}"#;
-            write_http_ok(&mut stream, health);
+            write_http_frame(&mut stream, "200 OK", health);
         } else if route == "/v1/projects" {
             let body = format!(
                 r#"[{{"project_id":"{}","canonical_root":"{}","session_count":1}}]"#,
                 project_id,
                 canonical_root.replace('"', "\\\"")
             );
-            write_http_ok(&mut stream, &body);
+            write_http_frame(&mut stream, "200 OK", &body);
         } else if route.starts_with("/v1/projects/") && route.contains("/sessions") {
             let body = serde_json::json!([
                 {"session_id":"mock-session","project_id":project_id,"last_seen_at_unix_secs":1}
             ])
             .to_string();
-            write_http_ok(&mut stream, &body);
+            write_http_frame(&mut stream, "200 OK", &body);
         } else if route == "/v1/sessions/mock-session/sidecar/outline"
             && path.contains("caller_root=")
         {
             enrichment_requests += 1;
             first_enrichment_at.get_or_insert_with(Instant::now);
-            write_http_response(&mut stream, "503 Service Unavailable", enrichment_body);
+            write_http_frame(&mut stream, "503 Service Unavailable", enrichment_body);
             if enrichment_requests > 1 {
+                wait_for_mock_client_close(&mut stream);
                 return enrichment_requests;
             }
         } else {
-            write_http_response(&mut stream, "404 Not Found", "unexpected mock-daemon route");
+            write_http_frame(&mut stream, "404 Not Found", "unexpected mock-daemon route");
         }
+        retain_mock_connection(&mut held_connections, stream);
     }
 
     panic!("hook never sent an enrichment request to the descriptor-selected daemon")
@@ -1520,6 +1557,62 @@ fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &st
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+fn write_http_frame(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("mock HTTP response should be written");
+    stream
+        .flush()
+        .expect("mock HTTP response should be flushed");
+}
+
+fn retain_mock_connection(held: &mut Vec<std::net::TcpStream>, stream: std::net::TcpStream) {
+    assert!(
+        held.len() < 16,
+        "mock daemon exceeded bounded held connections"
+    );
+    held.push(stream);
+}
+
+fn wait_for_mock_client_close(stream: &mut std::net::TcpStream) {
+    const MAX_DRAIN_BYTES: usize = 16 * 1024;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut drained = 0usize;
+    let mut discard = [0u8; 1024];
+    while drained < MAX_DRAIN_BYTES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            break;
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .expect("mock close wait should have a bounded timeout");
+        let capacity = (MAX_DRAIN_BYTES - drained).min(discard.len());
+        match stream.read(&mut discard[..capacity]) {
+            Ok(0) => break,
+            Ok(read) => drained += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("mock close wait failed: {error}"),
+        }
+    }
 }
 
 /// Spawn `symforge hook` in `cwd`, pipe `payload` on stdin, wait for exit,

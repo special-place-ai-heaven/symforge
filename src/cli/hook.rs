@@ -1300,12 +1300,15 @@ fn sync_http_response_with_timeout(
     query: String,
     timeout: Duration,
 ) -> anyhow::Result<HttpResponse> {
+    const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+    const MAX_HTTP_BODY_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_HTTP_WIRE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
     let addr = format!("127.0.0.1:{port}");
     let sock_addr: std::net::SocketAddr = addr.parse()?;
+    let deadline = std::time::Instant::now() + timeout;
 
     let mut stream = TcpStream::connect_timeout(&sock_addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
 
     let request_path = if query.is_empty() {
         path.to_string()
@@ -1323,43 +1326,117 @@ fn sync_http_response_with_timeout(
         "GET {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_header}Connection: close\r\n\r\n"
     );
 
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    anyhow::ensure!(!remaining.is_zero(), "HTTP request timed out");
+    stream.set_write_timeout(Some(remaining))?;
     stream.write_all(request.as_bytes())?;
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "HTTP response timed out");
+        stream.set_read_timeout(Some(remaining))?;
+        let count = match stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if count > 0 {
+            response.extend_from_slice(&chunk[..count]);
+            anyhow::ensure!(
+                response.len() <= MAX_HTTP_HEADER_BYTES + MAX_HTTP_WIRE_BODY_BYTES,
+                "HTTP response exceeds size limit"
+            );
+        }
 
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response: no header/body separator"))?;
+        let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            anyhow::ensure!(
+                response.len() <= MAX_HTTP_HEADER_BYTES,
+                "HTTP headers exceed size limit"
+            );
+            anyhow::ensure!(count != 0, "malformed HTTP response: incomplete headers");
+            continue;
+        };
+        anyhow::ensure!(
+            header_end + 4 <= MAX_HTTP_HEADER_BYTES,
+            "HTTP headers exceed size limit"
+        );
+        let headers = std::str::from_utf8(&response[..header_end])?;
+        let status_line = headers
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("malformed HTTP response: empty headers"))?;
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow::anyhow!("malformed HTTP status line"))?
+            .parse()
+            .map_err(|_| anyhow::anyhow!("non-numeric HTTP status code"))?;
 
-    let status_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response: empty headers"))?;
-
-    // Status line format: "HTTP/1.1 200 OK"
-    let status_code: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("malformed HTTP status line: {status_line}"))?
-        .parse()
-        .map_err(|_| anyhow::anyhow!("non-numeric HTTP status code in: {status_line}"))?;
-
-    // Check for chunked transfer-encoding. The sidecar uses hyper which may
-    // send chunked responses. Since we use Connection: close and read_to_string,
-    // the raw body includes chunk framing that must be decoded.
-    let is_chunked = headers.lines().any(|line| {
-        let lower = line.to_lowercase();
-        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
-    });
-
-    let body = if is_chunked {
-        decode_chunked_body(body)
-    } else {
-        body.to_string()
-    };
-
-    Ok(HttpResponse { status_code, body })
+        let mut content_length = None;
+        let mut transfer_encoding = None;
+        for line in headers.lines().skip(1) {
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("malformed HTTP header"))?;
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                let length: usize = value.parse()?;
+                anyhow::ensure!(
+                    content_length.is_none_or(|previous| previous == length),
+                    "conflicting HTTP content lengths"
+                );
+                content_length = Some(length);
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                anyhow::ensure!(
+                    transfer_encoding.is_none(),
+                    "duplicate HTTP transfer encoding"
+                );
+                transfer_encoding = Some(value);
+            }
+        }
+        anyhow::ensure!(
+            content_length.is_none() || transfer_encoding.is_none(),
+            "ambiguous HTTP body framing"
+        );
+        let body_start = header_end + 4;
+        let wire_body = &response[body_start..];
+        let body = if let Some(encoding) = transfer_encoding {
+            anyhow::ensure!(
+                encoding.eq_ignore_ascii_case("chunked"),
+                "unsupported HTTP transfer encoding"
+            );
+            decode_chunked_body(wire_body, MAX_HTTP_BODY_BYTES)?
+        } else if let Some(length) = content_length {
+            anyhow::ensure!(
+                length <= MAX_HTTP_BODY_BYTES,
+                "HTTP body exceeds size limit"
+            );
+            (wire_body.len() >= length).then(|| wire_body[..length].to_vec())
+        } else if count == 0 {
+            anyhow::ensure!(
+                wire_body.len() <= MAX_HTTP_BODY_BYTES,
+                "HTTP body exceeds size limit"
+            );
+            Some(wire_body.to_vec())
+        } else {
+            anyhow::ensure!(
+                wire_body.len() <= MAX_HTTP_BODY_BYTES,
+                "HTTP body exceeds size limit"
+            );
+            None
+        };
+        if let Some(body) = body {
+            let body = String::from_utf8(body)?;
+            anyhow::ensure!(
+                std::time::Instant::now() <= deadline,
+                "HTTP response timed out"
+            );
+            return Ok(HttpResponse { status_code, body });
+        }
+        anyhow::ensure!(count != 0, "malformed HTTP response: incomplete body");
+    }
 }
 
 /// Like `sync_http_get` but with a configurable timeout.
@@ -1397,34 +1474,48 @@ fn sync_enrichment_http_get_with_timeout(
     }
 }
 
-/// Decode a chunked transfer-encoding body into a plain string.
-/// Each chunk is: `<hex-size>\r\n<data>\r\n`, terminated by `0\r\n\r\n`.
-fn decode_chunked_body(raw: &str) -> String {
-    let mut result = String::new();
-    let mut remainder = raw;
-    while let Some(size_end) = remainder.find("\r\n") {
-        // Find chunk size line
-        let size_str = remainder[..size_end].trim();
-        let chunk_size = match usize::from_str_radix(size_str, 16) {
-            Ok(0) => break, // Terminal chunk
-            Ok(n) => n,
-            Err(_) => break, // Malformed — return what we have
+/// Decode a complete chunked body, including its terminating chunk and trailers.
+/// An incomplete frame needs more bytes; a malformed frame fails the request.
+fn decode_chunked_body(raw: &[u8], max_body_bytes: usize) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    let mut position = 0;
+    loop {
+        let Some(line_end) = raw[position..]
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+        else {
+            return Ok(None);
         };
-        let data_start = size_end + 2; // skip \r\n
-        if data_start + chunk_size > remainder.len() {
-            // Incomplete chunk — append what's available
-            result.push_str(&remainder[data_start..]);
-            break;
+        let size_line = &raw[position..position + line_end];
+        let size_text = std::str::from_utf8(size_line.split(|byte| *byte == b';').next().unwrap())?;
+        let size = usize::from_str_radix(size_text.trim(), 16)?;
+        position += line_end + 2;
+        if size == 0 {
+            // An empty trailer is CRLF; named trailers end with an empty line.
+            let trailer = &raw[position..];
+            if trailer.starts_with(b"\r\n") || trailer.windows(4).any(|bytes| bytes == b"\r\n\r\n")
+            {
+                return Ok(Some(body));
+            }
+            return Ok(None);
         }
-        result.push_str(&remainder[data_start..data_start + chunk_size]);
-        // Skip past chunk data + trailing \r\n
-        let next = data_start + chunk_size + 2;
-        if next > remainder.len() {
-            break;
+        anyhow::ensure!(
+            size <= max_body_bytes - body.len(),
+            "HTTP body exceeds size limit"
+        );
+        let Some(data_end) = position.checked_add(size) else {
+            anyhow::bail!("HTTP chunk size overflow");
+        };
+        let Some(frame_end) = data_end.checked_add(2) else {
+            anyhow::bail!("HTTP chunk size overflow");
+        };
+        if raw.len() < frame_end {
+            return Ok(None);
         }
-        remainder = &remainder[next..];
+        anyhow::ensure!(&raw[data_end..frame_end] == b"\r\n", "malformed HTTP chunk");
+        body.extend_from_slice(&raw[position..data_end]);
+        position = frame_end;
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,6 +1955,93 @@ mod tests {
             }),
             EnrichmentHttpResult::Success("trusted context".to_string())
         );
+    }
+
+    fn fixture_http_response(response: Vec<u8>, hold_open: bool) -> anyhow::Result<HttpResponse> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept hook request");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("fixture request timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).expect("read hook request");
+                assert!(count > 0, "complete hook request");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            stream.write_all(&response).expect("write fixture response");
+            stream.flush().expect("flush complete response");
+            if hold_open {
+                std::thread::sleep(Duration::from_millis(200));
+            } else {
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("finish fixture response");
+                // Keep the read half alive until the hook consumes the FIN.
+                let _ = stream.read(&mut chunk);
+            }
+        });
+        let result = sync_http_response_with_timeout(
+            port,
+            "/v1/context",
+            String::new(),
+            Duration::from_millis(50),
+        );
+        server.join().expect("fixture server");
+        result
+    }
+
+    #[test]
+    fn framed_http_response_completes_before_connection_close() {
+        let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+        let result = fixture_http_response(response.to_vec(), true).expect("complete 503 frame");
+        assert_eq!(
+            classify_enrichment_response(result),
+            EnrichmentHttpResult::IndexNotReady
+        );
+    }
+
+    #[test]
+    fn framed_http_body_preserves_crlf_blank_lines_and_utf8() {
+        let body = "first\r\n\r\nživa\nlast";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        );
+        let result = fixture_http_response(response.into_bytes(), true).expect("complete body");
+        assert_eq!(result.body, body);
+    }
+
+    #[test]
+    fn framed_chunked_http_response_completes_before_connection_close() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let result = fixture_http_response(response.to_vec(), true).expect("complete chunks");
+        assert_eq!(result.body, "hello");
+    }
+
+    #[test]
+    fn incomplete_framed_http_response_is_rejected() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi";
+        assert!(fixture_http_response(response.to_vec(), false).is_err());
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhi";
+        assert!(fixture_http_response(response.to_vec(), false).is_err());
+    }
+
+    #[test]
+    fn eof_delimited_http_response_preserves_body() {
+        let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello\r\nworld";
+        let result = fixture_http_response(response.to_vec(), false).expect("EOF body");
+        assert_eq!(result.body, "hello\r\nworld");
+    }
+
+    #[test]
+    fn unframed_open_http_response_respects_deadline() {
+        let response = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\npartial";
+        assert!(fixture_http_response(response.to_vec(), true).is_err());
     }
 
     // --- parse_stdin_input ---

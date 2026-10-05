@@ -11,14 +11,21 @@
 //! daemon, which resolves the project BY ROOT) — never a false "not found"
 //! report from the wrong project.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use symforge::live_index::LiveIndex;
 use symforge::sidecar::spawn_sidecar;
 use tempfile::TempDir;
+
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .expect("build bounded sidecar test HTTP client")
+});
 
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -33,34 +40,25 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-fn raw_http_get_with_status(
+async fn http_get_with_status(
     port: u16,
     path: &str,
     query: &str,
 ) -> anyhow::Result<(String, String)> {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    let timeout = Duration::from_millis(1000);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let request_path = if query.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{query}")
-    };
-    let request = format!(
-        "GET {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    let mut url = format!("http://127.0.0.1:{port}{path}");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let response = HTTP_CLIENT.get(url).send().await?;
+    let status_code = response.status();
+    let status = format!(
+        "HTTP/1.1 {} {}",
+        status_code.as_u16(),
+        status_code.canonical_reason().unwrap_or_default()
     );
-    stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    let status_line = response.lines().next().unwrap_or("").to_string();
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .unwrap_or("")
-        .to_string();
-    Ok((status_line, body))
+    let body = response.text().await?;
+    Ok((status, body))
 }
 
 async fn spawn_repo_sidecar() -> (TempDir, symforge::sidecar::SidecarHandle) {
@@ -72,7 +70,6 @@ async fn spawn_repo_sidecar() -> (TempDir, symforge::sidecar::SidecarHandle) {
     let handle = spawn_sidecar(Arc::clone(&index), "127.0.0.1", None, Some(control_state))
         .await
         .expect("spawn_sidecar");
-    tokio::time::sleep(Duration::from_millis(20)).await;
     (dir, handle)
 }
 
@@ -85,8 +82,9 @@ async fn mismatched_caller_root_gets_409_not_wrong_project_answer() {
         "path=src/lib.rs&caller_root={}",
         url_encode(&other.path().to_string_lossy())
     );
-    let (status, body) =
-        raw_http_get_with_status(handle.port, "/outline", &query).expect("GET /outline");
+    let (status, body) = http_get_with_status(handle.port, "/outline", &query)
+        .await
+        .expect("GET /outline");
     assert!(
         status.contains("409"),
         "a wrong-root caller must get 409, not an answer from another project; got {status}: {body}"
@@ -104,8 +102,9 @@ async fn matching_caller_root_passes_through() {
         "path=src/lib.rs&caller_root={}",
         url_encode(&repo.path().to_string_lossy())
     );
-    let (status, _body) =
-        raw_http_get_with_status(handle.port, "/outline", &query).expect("GET /outline");
+    let (status, _body) = http_get_with_status(handle.port, "/outline", &query)
+        .await
+        .expect("GET /outline");
     assert!(
         status.contains("200"),
         "the caller's own root must pass the guard; got {status}"
@@ -115,8 +114,9 @@ async fn matching_caller_root_passes_through() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_caller_root_stays_backward_compatible() {
     let (_repo, handle) = spawn_repo_sidecar().await;
-    let (status, _body) =
-        raw_http_get_with_status(handle.port, "/outline", "path=src/lib.rs").expect("GET /outline");
+    let (status, _body) = http_get_with_status(handle.port, "/outline", "path=src/lib.rs")
+        .await
+        .expect("GET /outline");
     assert!(
         status.contains("200"),
         "requests without caller_root must behave as before; got {status}"
@@ -131,8 +131,9 @@ async fn health_is_exempt_from_root_guard() {
         "caller_root={}",
         url_encode(&other.path().to_string_lossy())
     );
-    let (status, _body) =
-        raw_http_get_with_status(handle.port, "/health", &query).expect("GET /health");
+    let (status, _body) = http_get_with_status(handle.port, "/health", &query)
+        .await
+        .expect("GET /health");
     assert!(
         status.contains("200"),
         "/health must stay root-agnostic (liveness + hook fail-open target); got {status}"

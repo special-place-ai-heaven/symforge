@@ -14,8 +14,6 @@
 //! path the MCP tool surface uses (minus daemon proxy transport).
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +28,14 @@ use symforge::protocol::SymForgeServer;
 use symforge::sidecar::spawn_sidecar;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
+
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .expect("build bounded sidecar test HTTP client")
+});
 use tokio::sync::Mutex as AsyncMutex;
 
 static CWD_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
@@ -317,14 +323,10 @@ impl PolicyEngine {
 
 // ─── Sidecar /impact hook parity (HOOK-05 path) ─────────────────────────────
 
-fn raw_http_get(port: u16, path: &str, query: &str) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))?;
-    let request =
-        format!("GET {path}?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+async fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
+    let url = format!("http://127.0.0.1:{port}{path}?{query}");
+    let response = HTTP_CLIENT.get(url).send().await?;
+    Ok(response.text().await?)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -358,6 +360,7 @@ async fn sidecar_impact_prefix_comment_matches_mcp_handler() {
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let body = raw_http_get(handle.port, "/impact", &format!("path={rel}"))
+        .await
         .expect("GET /impact must succeed");
 
     handle.shutdown_and_join().await;

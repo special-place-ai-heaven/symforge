@@ -149,20 +149,23 @@ async fn start_mcp(runtime: ServerRuntime) -> TestServer {
     }
 }
 
-async fn tools_list_status(url: &str, bearer: &str) -> reqwest::StatusCode {
+async fn mcp_status(
+    url: &str,
+    bearer: &str,
+    body: Option<serde_json::Value>,
+) -> reqwest::StatusCode {
     let client = reqwest::Client::new();
-    client
+    let request = client
         .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
-        .header("Authorization", format!("Bearer {bearer}"))
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
-        }))
-        .send()
-        .await
-        .expect("request sent")
-        .status()
+        .header("Authorization", format!("Bearer {bearer}"));
+    let request = if let Some(body) = body {
+        request.json(&body)
+    } else {
+        request.body(String::new())
+    };
+    request.send().await.expect("request sent").status()
 }
 
 #[tokio::test]
@@ -174,8 +177,19 @@ async fn minted_key_authenticates_at_mcp_revoked_rejected() {
     let runtime = runtime_with_store(Arc::clone(&store));
     let server = start_mcp(runtime).await;
 
-    // Minted key authenticates at /mcp (not 401).
-    let status = tools_list_status(&server.mcp_url(), &raw).await;
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "symforge-api-key-test", "version": "1.0"}
+        }
+    });
+
+    // A real initialize payload exercises authenticated MCP dispatch.
+    let status = mcp_status(&server.mcp_url(), &raw, Some(initialize.clone())).await;
     assert_ne!(
         status,
         reqwest::StatusCode::UNAUTHORIZED,
@@ -184,16 +198,18 @@ async fn minted_key_authenticates_at_mcp_revoked_rejected() {
     assert!(status.is_success());
 
     // Bootstrap key also still authenticates.
-    let status = tools_list_status(&server.mcp_url(), "bootstrap-key").await;
+    let status = mcp_status(&server.mcp_url(), "bootstrap-key", Some(initialize)).await;
     assert_ne!(status, reqwest::StatusCode::UNAUTHORIZED);
 
     // Wrong key is rejected.
-    let status = tools_list_status(&server.mcp_url(), "sf_not_a_key").await;
+    // Auth rejects from request headers before parsing MCP; an empty body
+    // avoids an in-flight upload being reset when the 401 closes the connection.
+    let status = mcp_status(&server.mcp_url(), "sf_not_a_key", None).await;
     assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
 
     // Revoke the minted key → it stops authenticating.
     store.revoke(minted.record.id).expect("revoke");
-    let status = tools_list_status(&server.mcp_url(), &raw).await;
+    let status = mcp_status(&server.mcp_url(), &raw, None).await;
     assert_eq!(
         status,
         reqwest::StatusCode::UNAUTHORIZED,

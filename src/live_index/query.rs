@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::domain::index::FileClassification;
-use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolRecord};
-
 pub use super::context_bundle::{
     ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
     ContextBundleView, ImplBlockSuggestionView, TypeDependencyView,
@@ -13,6 +10,8 @@ use super::disambiguation::kind_disambiguation_tier;
 pub(crate) use super::disambiguation::{
     SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
 };
+use crate::domain::index::FileClassification;
+use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolRecord};
 // Only consumed by the server-gated `plan_edit` (protocol::edit_plan); gate the
 // re-export so the engine-only `embed` build stays free of an unused-import
 // error under `warnings = "deny"` (the consumer is absent when `server` is off).
@@ -35,6 +34,11 @@ pub use super::health_view::{
 };
 use super::search::{NoiseClass, NoisePolicy, PathScope};
 use super::store::{IndexLoadSource, IndexedFile, LiveIndex, SnapshotVerifyState};
+
+const MAX_REFERENCE_METADATA_HEADERS: usize = 32;
+const MAX_REFERENCE_METADATA_HEADER_BYTES: usize = 8 * 1024;
+const MAX_REFERENCE_TARGET_CANDIDATES: usize = 32;
+const MAX_REFERENCE_TARGET_BYTES: usize = 6 * 1024;
 
 // ---------------------------------------------------------------------------
 // Module path resolution for find_dependents
@@ -1039,6 +1043,28 @@ pub struct ReferenceContextLineView {
     pub enclosing_annotation: Option<String>,
 }
 
+fn reference_context_annotation(
+    evidence: &crate::parsing::reference_evidence::ReferenceEvidence,
+) -> Option<String> {
+    let caller = evidence.caller.as_ref()?;
+    let signature_start = caller
+        .signature_start_line
+        .map(|line| format!("signature start L{line}"))
+        .unwrap_or_else(|| "signature start unavailable".to_string());
+    Some(format!(
+        "  [AST caller {} definition L{}-{} bytes {}..{}; header L{} bytes {}..{}; {}]",
+        caller.node_kind,
+        caller.definition_line_range.0,
+        caller.definition_line_range.1,
+        caller.definition_byte_range.0,
+        caller.definition_byte_range.1,
+        caller.line_number,
+        caller.byte_range.0,
+        caller.byte_range.1,
+        signature_start,
+    ))
+}
+
 /// One reference hit with its surrounding context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceHitView {
@@ -1050,6 +1076,43 @@ pub struct ReferenceHitView {
 pub struct ReferenceFileView {
     pub file_path: String,
     pub hits: Vec<ReferenceHitView>,
+    pub caller_declarations: Vec<ReferenceDeclarationView>,
+    pub caller_declaration_count: usize,
+    pub caller_declarations_omitted: usize,
+    pub caller_header_unavailable_count: usize,
+}
+
+/// One exact source declaration header associated with a reference caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceDeclarationView {
+    pub definition_byte_range: (u32, u32),
+    pub definition_line_range: (u32, u32),
+    pub byte_range: (u32, u32),
+    pub line_number: u32,
+    pub signature_start_line: Option<u32>,
+    pub is_callable: bool,
+    pub node_kind: String,
+    pub scope: String,
+    pub identity: Option<ReferenceDeclarationIdentityView>,
+    pub text: String,
+}
+
+/// Grammar-declared caller name, coupled to its exact indexed-source bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceDeclarationIdentityView {
+    pub name: String,
+    pub byte_range: (u32, u32),
+}
+
+/// One exact indexed definition candidate for a requested target name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceTargetCandidateView {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub line_range: (u32, u32),
+    pub byte_range: (u32, u32),
+    pub header: Option<String>,
 }
 
 /// Owned grouped view for `find_references`.
@@ -1058,6 +1121,9 @@ pub struct FindReferencesView {
     pub total_refs: usize,
     pub total_files: usize,
     pub files: Vec<ReferenceFileView>,
+    pub target_candidate_count: usize,
+    pub target_candidates: Vec<ReferenceTargetCandidateView>,
+    pub target_indexed_file_parse_coverage_complete: bool,
 }
 
 /// One entry in an implementations-mode `find_references` result.
@@ -2023,7 +2089,7 @@ impl LiveIndex {
     ) -> FindReferencesView {
         let kind_enum = parse_reference_kind_filter(kind_filter);
         let refs = self.find_references_for_name(name, kind_enum, false);
-        self.build_find_references_view(&refs, total_limit)
+        self.build_find_references_view(&refs, total_limit, name)
     }
 
     /// Find all implementations of a trait/interface, or all traits a type implements.
@@ -2089,7 +2155,7 @@ impl LiveIndex {
         let kind_enum = parse_reference_kind_filter(kind_filter);
         let refs =
             self.find_exact_references_for_symbol(path, name, symbol_kind, symbol_line, kind_enum)?;
-        Ok(self.build_find_references_view(&refs, total_limit))
+        Ok(self.build_find_references_view(&refs, total_limit, name))
     }
 
     pub fn find_exact_references_for_symbol<'a>(
@@ -2287,6 +2353,7 @@ impl LiveIndex {
         &self,
         refs: &[(&str, &ReferenceRecord)],
         total_limit: usize,
+        target_name: &str,
     ) -> FindReferencesView {
         let mut by_file: HashMap<String, Vec<&ReferenceRecord>> = HashMap::new();
         for (file_path, reference) in refs {
@@ -2305,6 +2372,8 @@ impl LiveIndex {
 
         let mut files: Vec<ReferenceFileView> = Vec::new();
         let mut built = 0usize;
+        let mut metadata_headers_remaining = MAX_REFERENCE_METADATA_HEADERS;
+        let mut metadata_header_bytes_remaining = MAX_REFERENCE_METADATA_HEADER_BYTES;
 
         for file_path in ordered_paths {
             if built >= total_limit {
@@ -2318,8 +2387,15 @@ impl LiveIndex {
             };
             let content = String::from_utf8_lossy(&file.content);
             let content_lines: Vec<&str> = content.lines().collect();
+            let evidence_index = crate::parsing::reference_evidence::ReferenceEvidenceIndex::new(
+                &file.content,
+                &file.language,
+                file.relative_path.ends_with(".tsx"),
+            );
 
             let mut hits = Vec::new();
+            let mut declarations = HashMap::<(u32, u32), ReferenceDeclarationView>::new();
+            let mut caller_header_unavailable_count = 0usize;
             for reference in file_refs {
                 if built >= total_limit {
                     break;
@@ -2331,10 +2407,62 @@ impl LiveIndex {
                 } else {
                     (ref_line_0 + 1).min(content_lines.len() - 1)
                 };
-                let enclosing_annotation = reference
-                    .enclosing_symbol_index
-                    .and_then(|idx| file.symbols.get(idx as usize))
-                    .map(|sym| format!("  [in {} {}]", sym.kind, sym.name));
+                let evidence = evidence_index
+                    .as_ref()
+                    .map(|index| index.for_reference(reference.byte_range))
+                    .unwrap_or_default();
+                let enclosing_annotation = reference_context_annotation(&evidence);
+                if let Some(caller) = evidence.caller {
+                    let caller_view = ReferenceDeclarationView {
+                        definition_byte_range: caller.definition_byte_range,
+                        definition_line_range: caller.definition_line_range,
+                        byte_range: caller.byte_range,
+                        line_number: caller.line_number,
+                        signature_start_line: caller.signature_start_line,
+                        is_callable: caller.is_callable,
+                        node_kind: caller.node_kind,
+                        scope: "caller".to_string(),
+                        identity: caller.identity.map(|identity| {
+                            ReferenceDeclarationIdentityView {
+                                name: identity.name,
+                                byte_range: identity.byte_range,
+                            }
+                        }),
+                        text: caller.text,
+                    };
+                    declarations
+                        .entry(caller.byte_range)
+                        .and_modify(|existing| *existing = caller_view.clone())
+                        .or_insert(caller_view);
+                } else {
+                    caller_header_unavailable_count += 1;
+                }
+                for declaration in evidence.lexical_parents {
+                    declarations.entry(declaration.byte_range).or_insert(
+                        ReferenceDeclarationView {
+                            definition_byte_range: declaration.definition_byte_range,
+                            definition_line_range: declaration.definition_line_range,
+                            byte_range: declaration.byte_range,
+                            line_number: declaration.line_number,
+                            signature_start_line: declaration.signature_start_line,
+                            is_callable: declaration.is_callable,
+                            node_kind: declaration.node_kind,
+                            scope: if declaration.is_callable {
+                                "lexical parent function"
+                            } else {
+                                "lexical parent type"
+                            }
+                            .to_string(),
+                            identity: declaration.identity.map(|identity| {
+                                ReferenceDeclarationIdentityView {
+                                    name: identity.name,
+                                    byte_range: identity.byte_range,
+                                }
+                            }),
+                            text: declaration.text,
+                        },
+                    );
+                }
 
                 let context_lines = if content_lines.is_empty() {
                     Vec::new()
@@ -2363,7 +2491,98 @@ impl LiveIndex {
             }
 
             if !hits.is_empty() {
-                files.push(ReferenceFileView { file_path, hits });
+                let mut all_declarations: Vec<_> = declarations.into_values().collect();
+                all_declarations.sort_by_key(|declaration| {
+                    (declaration.scope != "caller", declaration.byte_range)
+                });
+                let caller_declaration_count = all_declarations.len();
+                let mut caller_declarations = Vec::new();
+                let mut visible_bytes = 0usize;
+                for declaration in all_declarations {
+                    let cost = declaration.text.len() + declaration.node_kind.len() + 48;
+                    if caller_declarations.len() < metadata_headers_remaining
+                        && cost <= metadata_header_bytes_remaining.saturating_sub(visible_bytes)
+                    {
+                        visible_bytes += cost;
+                        caller_declarations.push(declaration);
+                    }
+                }
+                let shown_headers = caller_declarations.len();
+                metadata_headers_remaining =
+                    metadata_headers_remaining.saturating_sub(shown_headers);
+                metadata_header_bytes_remaining =
+                    metadata_header_bytes_remaining.saturating_sub(visible_bytes);
+                files.push(ReferenceFileView {
+                    file_path,
+                    hits,
+                    caller_declarations,
+                    caller_declaration_count,
+                    caller_declarations_omitted: caller_declaration_count - shown_headers,
+                    caller_header_unavailable_count,
+                });
+            }
+        }
+
+        let mut target_candidates = Vec::new();
+        let mut target_indexed_file_parse_coverage_complete =
+            self.metadata_only_skipped_paths().next().is_none();
+        for (path, indexed_file) in self.all_files() {
+            if !matches!(
+                indexed_file.parse_status,
+                crate::live_index::store::ParseStatus::Parsed
+            ) {
+                target_indexed_file_parse_coverage_complete = false;
+            }
+            let matching_symbols: Vec<_> = indexed_file
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name == target_name)
+                .collect();
+            let evidence_index = (!matching_symbols.is_empty())
+                .then(|| {
+                    crate::parsing::reference_evidence::ReferenceEvidenceIndex::new(
+                        &indexed_file.content,
+                        &indexed_file.language,
+                        indexed_file.relative_path.ends_with(".tsx"),
+                    )
+                })
+                .flatten();
+            for symbol in matching_symbols {
+                target_candidates.push(ReferenceTargetCandidateView {
+                    path: path.clone(),
+                    name: symbol.name.clone(),
+                    kind: symbol.kind.to_string(),
+                    line_range: symbol.line_range,
+                    byte_range: symbol.byte_range,
+                    header: evidence_index
+                        .as_ref()
+                        .and_then(|index| index.for_declaration(symbol.byte_range))
+                        .map(|header| header.text),
+                });
+            }
+        }
+        target_candidates.sort_by(|left, right| {
+            (&left.path, left.byte_range, &left.kind, &left.name).cmp(&(
+                &right.path,
+                right.byte_range,
+                &right.kind,
+                &right.name,
+            ))
+        });
+        let target_candidate_count = target_candidates.len();
+        let mut visible_target_candidates = Vec::new();
+        let mut visible_target_bytes = 0usize;
+        for candidate in target_candidates {
+            let cost = candidate.path.len()
+                + candidate.name.len()
+                + candidate.kind.len()
+                + candidate.header.as_ref().map_or(32, String::len)
+                + 48;
+            if visible_target_candidates.len() < MAX_REFERENCE_TARGET_CANDIDATES
+                && visible_target_bytes + cost <= MAX_REFERENCE_TARGET_BYTES
+            {
+                visible_target_bytes += cost;
+                visible_target_candidates.push(candidate);
             }
         }
 
@@ -2371,6 +2590,9 @@ impl LiveIndex {
             total_refs: refs.len(),
             total_files,
             files,
+            target_candidate_count,
+            target_candidates: visible_target_candidates,
+            target_indexed_file_parse_coverage_complete,
         }
     }
 
@@ -4540,6 +4762,216 @@ mod tests {
     }
 
     #[test]
+    fn find_references_includes_zero_hit_target_and_exact_header() {
+        let content = "fn target() {}";
+        let symbol = make_symbol_with_kind_line_and_bytes(
+            "target",
+            SymbolKind::Function,
+            0,
+            (0, content.len() as u32),
+        );
+        let file = make_file_with_refs_and_content(
+            "src/target.rs",
+            LanguageId::Rust,
+            content,
+            vec![],
+            vec![symbol],
+        );
+        let index = make_index(vec![("src/target.rs", file)], false);
+        let view = index.capture_find_references_view("target", Some("call"), 10);
+
+        assert_eq!(view.total_refs, 0);
+        assert_eq!(view.target_candidate_count, 1);
+        assert!(view.target_indexed_file_parse_coverage_complete);
+        assert!(
+            view.target_candidates[0]
+                .header
+                .as_deref()
+                .is_some_and(|header| header.contains("fn target()"))
+        );
+        #[cfg(feature = "server")]
+        {
+            let rendered = crate::protocol::format::find_references_result_view(
+                &view,
+                "target",
+                &crate::protocol::format::OutputLimits::default(),
+            );
+            assert!(rendered.contains("Unique among indexed records: yes"));
+            assert!(rendered.contains("fn target()"));
+        }
+    }
+
+    #[test]
+    fn find_references_counts_all_exact_candidates_before_display_cap() {
+        let mut content = String::new();
+        let mut symbols = Vec::new();
+        for line in 0..40 {
+            let start = content.len();
+            content.push_str("fn target() {}\n");
+            let end = content.len() - 1;
+            symbols.push(make_symbol_with_kind_line_and_bytes(
+                "target",
+                SymbolKind::Function,
+                line,
+                (start as u32, end as u32),
+            ));
+        }
+        let file = make_file_with_refs_and_content(
+            "src/overloads.rs",
+            LanguageId::Rust,
+            &content,
+            vec![],
+            symbols,
+        );
+        let index = make_index(vec![("src/overloads.rs", file)], false);
+        let view = index.capture_find_references_view("target", Some("call"), 10);
+        assert_eq!(view.total_refs, 0);
+        assert_eq!(view.target_candidate_count, 40);
+        assert_eq!(view.target_candidates.len(), 32);
+        #[cfg(feature = "server")]
+        {
+            let rendered = crate::protocol::format::find_references_result_view(
+                &view,
+                "target",
+                &crate::protocol::format::OutputLimits::default(),
+            );
+            assert!(rendered.contains("8 more candidates omitted"));
+            assert!(rendered.contains("Unique among indexed records: no / unproven"));
+        }
+    }
+
+    #[test]
+    fn find_references_bounds_many_caller_headers_with_truthful_omission_count() {
+        let mut content = String::new();
+        let mut symbols = Vec::new();
+        let mut references = Vec::new();
+        for index in 0..40 {
+            let start = content.len();
+            content.push_str(&format!("fn caller_{index}() {{ target(); }}\n"));
+            let end = content.len() - 1;
+            let call_start = content[start..end].find("target").unwrap() + start;
+            symbols.push(make_symbol_with_kind_line_and_bytes(
+                &format!("caller_{index}"),
+                SymbolKind::Function,
+                index,
+                (start as u32, end as u32),
+            ));
+            references.push(make_call_ref_lines(
+                "target",
+                call_start as u32,
+                index,
+                Some(index),
+            ));
+        }
+        let file = make_file_with_refs_and_content(
+            "src/callers.rs",
+            LanguageId::Rust,
+            &content,
+            references,
+            symbols,
+        );
+        let index = make_index(vec![("src/callers.rs", file)], false);
+        let view = index.capture_find_references_view("target", Some("call"), 100);
+        assert_eq!(view.total_refs, 40);
+        assert_eq!(view.files[0].caller_declaration_count, 40);
+        assert_eq!(view.files[0].caller_declarations.len(), 32);
+        assert_eq!(view.files[0].caller_declarations_omitted, 8);
+        #[cfg(feature = "server")]
+        {
+            let rendered = crate::protocol::format::find_references_result_view(
+                &view,
+                "target",
+                &crate::protocol::format::OutputLimits::default(),
+            );
+            assert!(rendered.contains("8 omitted by metadata cap"));
+        }
+    }
+
+    #[test]
+    fn find_references_respects_aggregate_caller_header_byte_cap() {
+        let mut content = String::new();
+        let mut symbols = Vec::new();
+        let mut references = Vec::new();
+        for index in 0..10 {
+            let start = content.len();
+            let params = (0..19)
+                .map(|parameter| {
+                    format!("arg{parameter}: SomeReallyLongParameterTypeName{parameter}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            content.push_str(&format!("fn caller_{index}({params}) {{ target(); }}\n"));
+            let end = content.len() - 1;
+            let call_start = content[start..end].find("target").unwrap() + start;
+            symbols.push(make_symbol_with_kind_line_and_bytes(
+                &format!("caller_{index}"),
+                SymbolKind::Function,
+                index,
+                (start as u32, end as u32),
+            ));
+            references.push(make_call_ref_lines(
+                "target",
+                call_start as u32,
+                index,
+                Some(index),
+            ));
+        }
+        let file = make_file_with_refs_and_content(
+            "src/long-callers.rs",
+            LanguageId::Rust,
+            &content,
+            references,
+            symbols,
+        );
+        let index = make_index(vec![("src/long-callers.rs", file)], false);
+        let view = index.capture_find_references_view("target", Some("call"), 1000);
+        let headers = &view.files[0].caller_declarations;
+        assert!(
+            headers.len() < 10,
+            "aggregate cap should omit at least one header"
+        );
+        let cost = headers
+            .iter()
+            .map(|header| header.text.len() + header.node_kind.len() + 48)
+            .sum::<usize>();
+        assert!(cost <= super::MAX_REFERENCE_METADATA_HEADER_BYTES);
+        assert_eq!(
+            view.files[0].caller_declarations_omitted,
+            10 - headers.len()
+        );
+    }
+
+    #[test]
+    fn nested_scope_is_promoted_to_caller_when_it_has_its_own_reference() {
+        let content = "fn outer() { fn inner() { target(); } target(); }\n";
+        let first_call = content.find("target").unwrap();
+        let second_call = content.rfind("target").unwrap();
+        let file = make_file_with_refs_and_content(
+            "src/nested.rs",
+            LanguageId::Rust,
+            content,
+            vec![
+                make_call_ref_lines("target", first_call as u32, 0, Some(0)),
+                make_call_ref_lines("target", second_call as u32, 0, Some(0)),
+            ],
+            vec![make_symbol_with_kind_line_and_bytes(
+                "outer",
+                SymbolKind::Function,
+                0,
+                (0, content.len() as u32),
+            )],
+        );
+        let index = make_index(vec![("src/nested.rs", file)], false);
+        let view = index.capture_find_references_view("target", Some("call"), 1000);
+        let outer = view.files[0]
+            .caller_declarations
+            .iter()
+            .find(|declaration| declaration.text.starts_with("fn outer"))
+            .expect("outer caller is retained");
+        assert_eq!(outer.scope, "caller");
+    }
+
+    #[test]
     fn test_capture_find_references_view_groups_context_lines() {
         let target = make_file_with_refs_and_content(
             "src/lib.rs",
@@ -4568,7 +5000,7 @@ mod tests {
                 depth: 0,
                 sort_order: 0,
                 byte_range: (0, 28),
-                line_range: (0, 2),
+                line_range: (0, 1),
                 doc_byte_range: None,
                 item_byte_range: None,
             }],
@@ -4586,12 +5018,317 @@ mod tests {
                 .text
                 .contains("process")
         );
+        assert!(view.files[0].caller_declarations.is_empty());
+        assert_eq!(view.files[0].caller_header_unavailable_count, 1);
+    }
+
+    #[test]
+    fn test_find_references_annotation_accepts_proven_eof_row_boundary() {
+        let content = "fn caller() { hit(); }\n";
+        let call_start = content.find("hit").unwrap();
+        let caller = make_file_with_refs_and_content(
+            "src/eof.rs",
+            LanguageId::Rust,
+            content,
+            vec![make_call_ref_lines("hit", call_start as u32, 0, None)],
+            vec![SymbolRecord {
+                name: "caller".to_string(),
+                kind: SymbolKind::Function,
+                depth: 0,
+                sort_order: 0,
+                byte_range: (0, content.len() as u32),
+                line_range: (0, 1),
+                doc_byte_range: None,
+                item_byte_range: None,
+            }],
+        );
+        let index = make_index(vec![("src/eof.rs", caller)], false);
+
+        let view = index.capture_find_references_view("hit", Some("call"), 10);
+        let reference_line = view.files[0].hits[0]
+            .context_lines
+            .iter()
+            .find(|line| line.is_reference_line)
+            .unwrap();
+
+        assert_eq!(view.total_refs, 1);
         assert!(
-            view.files[0].hits[0].context_lines[1]
+            reference_line
                 .enclosing_annotation
                 .as_deref()
-                .unwrap_or("")
-                .contains("run")
+                .is_some_and(|annotation| annotation.contains("AST caller function_item"))
+        );
+        assert_eq!(view.files[0].caller_header_unavailable_count, 0);
+    }
+
+    #[test]
+    fn test_find_references_annotation_selects_callable_inside_nested_impl() {
+        let content = "fn outer(){ impl Local { fn inner(){ hit(); } } }";
+        let inner_start = content.find("fn inner").unwrap();
+        let inner_end = content[inner_start..].find("}").unwrap() + inner_start + 1;
+        let impl_start = content.find("impl Local").unwrap();
+        let impl_end = content[impl_start..].find("} }").unwrap() + impl_start + 1;
+        let call_start = content.find("hit").unwrap();
+        let symbols = vec![
+            make_symbol_with_kind_line_and_bytes(
+                "outer",
+                SymbolKind::Function,
+                0,
+                (0, content.len() as u32),
+            ),
+            make_symbol_with_kind_line_and_bytes(
+                "Local",
+                SymbolKind::Impl,
+                0,
+                (impl_start as u32, impl_end as u32),
+            ),
+            make_symbol_with_kind_line_and_bytes(
+                "inner",
+                SymbolKind::Function,
+                0,
+                (inner_start as u32, inner_end as u32),
+            ),
+        ];
+        let caller = make_file_with_refs_and_content(
+            "src/caller.rs",
+            LanguageId::Rust,
+            content,
+            vec![make_call_ref_lines("hit", call_start as u32, 0, Some(1))],
+            symbols,
+        );
+        let index = make_index(vec![("src/caller.rs", caller)], false);
+
+        let view = index.capture_find_references_view("hit", Some("call"), 10);
+        let hit = &view.files[0].hits[0];
+        let annotation = hit.context_lines[0]
+            .enclosing_annotation
+            .as_deref()
+            .unwrap();
+
+        assert_eq!(view.total_refs, 1);
+        assert_eq!(hit.context_lines[0].line_number, 1);
+        assert_eq!(hit.context_lines[0].text, content);
+        assert!(annotation.contains("AST caller function_item"));
+        let headers = &view.files[0].caller_declarations;
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.scope == "caller" && header.text.contains("fn inner"))
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.scope == "lexical parent type"
+                    && header.text.contains("impl Local"))
+        );
+        assert!(headers.iter().any(|header| {
+            header.scope == "lexical parent function" && header.text.contains("fn outer")
+        }));
+    }
+
+    #[test]
+    fn test_find_references_annotation_distinguishes_duplicate_overload_names() {
+        let content = "impl First { fn value() { hit(); } }\nimpl Second { fn value() { hit(); } }";
+        let method_starts: Vec<usize> = content
+            .match_indices("fn value")
+            .map(|(index, _)| index)
+            .collect();
+        let impl_starts: Vec<usize> = content
+            .match_indices("impl ")
+            .map(|(index, _)| index)
+            .collect();
+        let method_end = |start: usize| content[start..].find('}').unwrap() + start + 1;
+        let first_call = content.find("hit").unwrap();
+        let second_call = content.rfind("hit").unwrap();
+        let first_method_end = method_end(method_starts[0]);
+        let second_method_end = method_end(method_starts[1]);
+        let first_impl_end = content[impl_starts[0]..].find(" }").unwrap() + impl_starts[0] + 2;
+        let second_impl_end = content[impl_starts[1]..].find(" }").unwrap() + impl_starts[1] + 2;
+        let symbols = vec![
+            make_symbol_with_kind_line_and_bytes(
+                "First",
+                SymbolKind::Impl,
+                0,
+                (impl_starts[0] as u32, first_impl_end as u32),
+            ),
+            make_symbol_with_kind_line_and_bytes(
+                "value",
+                SymbolKind::Method,
+                0,
+                (method_starts[0] as u32, first_method_end as u32),
+            ),
+            make_symbol_with_kind_line_and_bytes(
+                "Second",
+                SymbolKind::Impl,
+                1,
+                (impl_starts[1] as u32, second_impl_end as u32),
+            ),
+            make_symbol_with_kind_line_and_bytes(
+                "value",
+                SymbolKind::Method,
+                1,
+                (method_starts[1] as u32, second_method_end as u32),
+            ),
+        ];
+        let caller = make_file_with_refs_and_content(
+            "src/overloads.rs",
+            LanguageId::Rust,
+            content,
+            vec![
+                make_call_ref_lines("hit", first_call as u32, 0, Some(0)),
+                make_call_ref_lines("hit", second_call as u32, 1, Some(2)),
+            ],
+            symbols,
+        );
+        let index = make_index(vec![("src/overloads.rs", caller)], false);
+
+        let view = index.capture_find_references_view("hit", Some("call"), 10);
+        let annotation_for = |hit: &super::ReferenceHitView| {
+            hit.context_lines
+                .iter()
+                .find(|line| line.is_reference_line)
+                .and_then(|line| line.enclosing_annotation.clone())
+                .unwrap()
+        };
+        let first = annotation_for(&view.files[0].hits[0]);
+        let second = annotation_for(&view.files[0].hits[1]);
+
+        assert_eq!(view.total_refs, 2);
+        assert_eq!(
+            view.files[0].hits[0]
+                .context_lines
+                .iter()
+                .find(|line| line.is_reference_line)
+                .unwrap()
+                .line_number,
+            1,
+        );
+        assert_eq!(
+            view.files[0].hits[1]
+                .context_lines
+                .iter()
+                .find(|line| line.is_reference_line)
+                .unwrap()
+                .line_number,
+            2,
+        );
+        assert!(first.contains("AST caller function_item"));
+        assert!(second.contains("AST caller function_item"));
+        let headers = &view.files[0].caller_declarations;
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.scope == "caller" && header.text.contains("fn value()"))
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.scope == "lexical parent type"
+                    && header.text.contains("impl First"))
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.scope == "lexical parent type"
+                    && header.text.contains("impl Second"))
+        );
+    }
+
+    #[test]
+    fn test_find_references_annotation_omits_ambiguous_callable_tie() {
+        let content = "fn outer(){ fn first(){ hit(); } }";
+        let outer_end = content.len() as u32;
+        let inner_start = content.find("fn first").unwrap();
+        let inner_end = content[inner_start..].find("}").unwrap() + inner_start + 1;
+        let call_start = content.find("hit").unwrap();
+        let ambiguous_range = (inner_start as u32, inner_end as u32);
+        let caller = make_file_with_refs_and_content(
+            "src/ambiguous.rs",
+            LanguageId::Rust,
+            content,
+            vec![make_call_ref_lines("hit", call_start as u32, 0, Some(0))],
+            vec![
+                make_symbol_with_kind_line_and_bytes(
+                    "outer",
+                    SymbolKind::Function,
+                    0,
+                    (0, outer_end),
+                ),
+                make_symbol_with_kind_line_and_bytes(
+                    "first",
+                    SymbolKind::Function,
+                    0,
+                    ambiguous_range,
+                ),
+                make_symbol_with_kind_line_and_bytes(
+                    "other",
+                    SymbolKind::Function,
+                    0,
+                    ambiguous_range,
+                ),
+            ],
+        );
+        let index = make_index(vec![("src/ambiguous.rs", caller)], false);
+
+        let view = index.capture_find_references_view("hit", Some("call"), 10);
+        let reference_line = view.files[0].hits[0]
+            .context_lines
+            .iter()
+            .find(|line| line.is_reference_line)
+            .unwrap();
+
+        assert_eq!(view.total_refs, 1);
+        assert_eq!(reference_line.line_number, 1);
+        assert!(
+            reference_line
+                .enclosing_annotation
+                .as_deref()
+                .is_some_and(|annotation| { annotation.contains("AST caller function_item") })
+        );
+    }
+    #[test]
+    fn test_find_references_annotation_uses_byte_containment_for_same_line_scopes() {
+        let content = "fn outer(){fn inner(){ hit(); }}";
+        let outer_start = content.find("fn outer").unwrap();
+        let inner_start = content.find("fn inner").unwrap();
+        let inner_end = content.rfind("}").unwrap();
+        let call_start = content.find("hit").unwrap();
+        let caller = make_file_with_refs_and_content(
+            "src/same_line.rs",
+            LanguageId::Rust,
+            content,
+            vec![make_call_ref_lines("hit", call_start as u32, 0, Some(0))],
+            vec![
+                make_symbol_with_kind_line_and_bytes(
+                    "outer",
+                    SymbolKind::Function,
+                    0,
+                    (outer_start as u32, content.len() as u32),
+                ),
+                make_symbol_with_kind_line_and_bytes(
+                    "inner",
+                    SymbolKind::Function,
+                    0,
+                    (inner_start as u32, inner_end as u32 + 1),
+                ),
+            ],
+        );
+        let index = make_index(vec![("src/same_line.rs", caller)], false);
+
+        let view = index.capture_find_references_view("hit", Some("call"), 10);
+        let annotation = view.files[0].hits[0].context_lines[0]
+            .enclosing_annotation
+            .as_deref()
+            .unwrap();
+
+        assert_eq!(view.total_refs, 1);
+        assert_eq!(view.files[0].hits[0].context_lines[0].line_number, 1);
+        assert!(annotation.contains("AST caller function_item"));
+        assert!(
+            view.files[0]
+                .caller_declarations
+                .iter()
+                .any(|header| { header.scope == "caller" && header.text.contains("fn inner") })
         );
     }
 

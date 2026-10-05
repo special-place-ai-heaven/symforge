@@ -34,8 +34,6 @@
 //! contract from ADR 0001 for the sidecar layer.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +55,13 @@ use tokio::sync::Mutex;
 // ---------------------------------------------------------------------------
 
 static CWD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .expect("build bounded sidecar test HTTP client")
+});
 
 // ---------------------------------------------------------------------------
 // Golden-file plumbing
@@ -235,33 +240,14 @@ fn control_state(root: &Path) -> ControlStateDir {
 // HTTP + cwd helpers
 // ---------------------------------------------------------------------------
 
-fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    let timeout = Duration::from_millis(1000);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    let request_path = if query.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{query}")
-    };
-
-    let request = format!(
-        "GET {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes())?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .unwrap_or("")
-        .to_string();
-    Ok(body)
+async fn raw_http_get(port: u16, path: &str, query: &str) -> anyhow::Result<String> {
+    let mut url = format!("http://127.0.0.1:{port}{path}");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let response = HTTP_CLIENT.get(url).send().await?;
+    Ok(response.text().await?)
 }
 
 fn stable_cwd() -> PathBuf {
@@ -333,7 +319,9 @@ async fn test_health_contract_golden() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let body = raw_http_get(handle.port, "/health", "").expect("GET /health");
+    let body = raw_http_get(handle.port, "/health", "")
+        .await
+        .expect("GET /health");
     let normalized = normalize_health_json(&body);
     assert_golden("health.json", &normalized);
 
@@ -369,7 +357,9 @@ async fn test_health_contract_golden_bootstrap_placeholder() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let body = raw_http_get(handle.port, "/health", "").expect("GET /health");
+    let body = raw_http_get(handle.port, "/health", "")
+        .await
+        .expect("GET /health");
     let normalized = normalize_health_json(&body);
     assert_golden("health_bootstrap_placeholder.json", &normalized);
 
@@ -402,7 +392,9 @@ async fn test_stats_contract_golden() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Hit /stats FIRST, before any other endpoint, so counters stay at zero.
-    let body = raw_http_get(handle.port, "/stats", "").expect("GET /stats");
+    let body = raw_http_get(handle.port, "/stats", "")
+        .await
+        .expect("GET /stats");
     let normalized = normalize_stats_json(&body);
     assert_golden("stats.json", &normalized);
 
@@ -442,8 +434,11 @@ async fn test_outline_contract_golden() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let canonical = raw_http_get(handle.port, "/outline", "path=src/lib.rs").expect("GET /outline");
+    let canonical = raw_http_get(handle.port, "/outline", "path=src/lib.rs")
+        .await
+        .expect("GET /outline");
     let workflow = raw_http_get(handle.port, "/workflows/source-read", "path=src/lib.rs")
+        .await
         .expect("GET /workflows/source-read");
 
     assert_eq!(
@@ -497,15 +492,19 @@ async fn test_impact_edit_contract_golden() {
     // are idempotent. Run one warmup call before locking the golden so the
     // workflow-alias comparison is a fair byte-equal check against a stable
     // post-reconciliation response shape.
-    let _warmup =
-        raw_http_get(handle.port, "/impact", "path=src/edit.rs").expect("warmup GET /impact");
+    let _warmup = raw_http_get(handle.port, "/impact", "path=src/edit.rs")
+        .await
+        .expect("warmup GET /impact");
 
-    let canonical = raw_http_get(handle.port, "/impact", "path=src/edit.rs").expect("GET /impact");
+    let canonical = raw_http_get(handle.port, "/impact", "path=src/edit.rs")
+        .await
+        .expect("GET /impact");
     let workflow = raw_http_get(
         handle.port,
         "/workflows/post-edit-impact",
         "path=src/edit.rs",
     )
+    .await
     .expect("GET /workflows/post-edit-impact");
 
     assert_eq!(
@@ -552,6 +551,7 @@ async fn test_impact_new_file_contract_golden() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let body = raw_http_get(handle.port, "/impact", "path=src/fresh.rs&new_file=true")
+        .await
         .expect("GET /impact?new_file=true");
     assert_golden("impact_new_file.txt", &body);
 
@@ -589,13 +589,15 @@ async fn test_symbol_context_contract_golden() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let canonical =
-        raw_http_get(handle.port, "/symbol-context", "name=do_thing").expect("GET /symbol-context");
+    let canonical = raw_http_get(handle.port, "/symbol-context", "name=do_thing")
+        .await
+        .expect("GET /symbol-context");
     let workflow = raw_http_get(
         handle.port,
         "/workflows/search-hit-expansion",
         "name=do_thing",
     )
+    .await
     .expect("GET /workflows/search-hit-expansion");
 
     assert_eq!(
@@ -639,9 +641,12 @@ async fn test_repo_map_contract_golden() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let canonical = raw_http_get(handle.port, "/repo-map", "").expect("GET /repo-map");
-    let workflow =
-        raw_http_get(handle.port, "/workflows/repo-start", "").expect("GET /workflows/repo-start");
+    let canonical = raw_http_get(handle.port, "/repo-map", "")
+        .await
+        .expect("GET /repo-map");
+    let workflow = raw_http_get(handle.port, "/workflows/repo-start", "")
+        .await
+        .expect("GET /workflows/repo-start");
 
     assert_eq!(
         normalize_newlines(&workflow),
@@ -685,9 +690,11 @@ async fn test_prompt_context_contract_golden() {
 
     // Fixed text that triggers the "exact path" hint path — stable output.
     let query = "text=please%20inspect%20src%2Flib.rs";
-    let canonical =
-        raw_http_get(handle.port, "/prompt-context", query).expect("GET /prompt-context");
+    let canonical = raw_http_get(handle.port, "/prompt-context", query)
+        .await
+        .expect("GET /prompt-context");
     let workflow = raw_http_get(handle.port, "/workflows/prompt-context", query)
+        .await
         .expect("GET /workflows/prompt-context");
 
     assert_eq!(
