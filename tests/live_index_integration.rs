@@ -1175,9 +1175,10 @@ fn test_persist_round_trip() {
         .expect("snapshot should be loadable after serialize");
 
     assert_eq!(
-        snapshot.version, 9,
+        snapshot.version, 10,
         "snapshot version should match current schema (8 -> 9: persisted trigram \
-         index — see src/live_index/persist.rs::CURRENT_VERSION)"
+         index; 9 -> 10: dismissal store state in snapshot — see \
+         src/live_index/persist.rs::CURRENT_VERSION)"
     );
     assert_eq!(snapshot.files.len(), 2, "snapshot should contain 2 files");
     assert!(

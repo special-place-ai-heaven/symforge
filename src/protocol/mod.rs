@@ -23,7 +23,7 @@ pub mod resources;
 pub mod result_status;
 pub(crate) mod search_format;
 pub(crate) mod search_tools;
-pub mod secret_dismissals;
+pub use crate::knowledge::secret_dismissals;
 pub(crate) mod secret_remediate;
 pub mod session;
 pub mod smart_query;

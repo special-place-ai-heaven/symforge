@@ -527,9 +527,17 @@ pub(crate) fn reindex_after_write(
     // `on_disk` is classified here and then moved into `IndexedFile`, so no lane
     // classifies one buffer and publishes another.
     let targets = crate::domain::IndexTargets::for_path(relative_path, Some(&language));
-    if let crate::knowledge::StableContentAdmission::MetadataOnly(_) =
-        crate::knowledge::classify_stable_content(relative_path, targets, &on_disk)
-    {
+    let root = index.read().indexed_root.clone();
+    let admission = match root {
+        Some(root) => crate::knowledge::classify_stable_content_for_root(
+            &root,
+            relative_path,
+            targets,
+            &on_disk,
+        ),
+        None => crate::knowledge::classify_stable_content(relative_path, targets, &on_disk),
+    };
+    if let crate::knowledge::StableContentAdmission::MetadataOnly(_) = admission {
         // Same disposition cold load and the watcher take: a demoted verdict
         // EVICTS the path from Tier-1 instead of publishing it. `remove_file`
         // drops the resident content AND its manifest entry, so no stale

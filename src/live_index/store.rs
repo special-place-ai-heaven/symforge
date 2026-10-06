@@ -3688,7 +3688,7 @@ impl SharedIndexHandle {
         // Build new index data OUTSIDE the write lock (file I/O + parsing).
         // Only the final swap acquires the mutex, reducing block time from
         // seconds (full I/O) to milliseconds (in-memory index rebuild).
-        let data = LiveIndex::build_reload_data_for_binding_with_exclusions_cancellable(
+        let mut data = LiveIndex::build_reload_data_for_binding_with_exclusions_cancellable(
             root,
             project_state_dir.as_ref(),
             &source_exclusions,
@@ -3728,6 +3728,7 @@ impl SharedIndexHandle {
             observed_replacement || self.physical_replacement_latched.load(Ordering::Acquire);
         let scout_plan = Arc::clone(&data.scout_plan);
         let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
+        let dismissals = std::mem::take(&mut data.dismissals);
         let mut live = LiveIndex::from_reload_data(data);
         // Deterministic test observation point: the replacement is built but the
         // write lock is not yet held, so the live index remains mutable.
@@ -3783,6 +3784,10 @@ impl SharedIndexHandle {
         // a late impact request cannot consume a replacement project's state.
         self.pre_update_snapshots.lock().clear();
         self.swap_and_publish(live);
+        // Recorded only now that these verdicts are installed: every early
+        // return above (cancel, merge refusal) keeps the old index and its
+        // held dismissal state.
+        crate::knowledge::secret_dismissals::set_held_dismissals(root, dismissals);
         self.last_reset_project_generation
             .store(0, Ordering::Release);
         Ok(())
@@ -5581,6 +5586,9 @@ pub(crate) struct ReloadData {
     /// `apply_reload_data` can record it on the live index (root-mismatch
     /// invalidation in `ensure_local_index`).
     pub indexed_root: PathBuf,
+    /// Secret-dismissal state the verdicts were classified under; recorded
+    /// as held only once this data is installed.
+    pub dismissals: crate::knowledge::secret_dismissals::HeldDismissals,
 }
 
 /// Build a reverse index from a file map (standalone, no `&self` needed).
@@ -5873,6 +5881,9 @@ pub(crate) struct AdmitParseResult {
     pub terminal_dispositions: Vec<(String, crate::domain::FileDisposition)>,
     pub coverage: crate::domain::CoverageStatus,
     pub cb_state: CircuitBreakerState,
+    /// Secret-dismissal state the verdicts were classified under; recorded
+    /// as held only by the caller that installs this result.
+    pub dismissals: crate::knowledge::secret_dismissals::HeldDismissals,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -6098,6 +6109,7 @@ fn admit_and_parse_entries(
 
     check_reload_cancelled(cancel)?;
     let cancelled_during_parse = AtomicBool::new(false);
+    let dismissals_before = crate::knowledge::secret_dismissals::observe_dismissals(&source_scope);
 
     // Transient bytes and staged resident bytes are governed independently.
     // The immutable scout plan fixes both the per-entry stamp and the maximum
@@ -6261,7 +6273,8 @@ fn admit_and_parse_entries(
                 // owned buffer here, so positive or indeterminate detector bytes
                 // cannot reach any resident, snapshot, search, or analytics lane.
                 if let crate::knowledge::StableContentAdmission::MetadataOnly(reason) =
-                    crate::knowledge::classify_stable_content(
+                    crate::knowledge::classify_stable_content_for_root(
+                        &source_scope,
                         &entry.relative_path,
                         planned.targets,
                         &bytes,
@@ -6423,11 +6436,31 @@ fn admit_and_parse_entries(
         crate::domain::CoverageStatus::Complete
     };
 
+    // The dismissal state these verdicts were classified under. A store that
+    // moved mid-pass leaves a digest no snapshot can match and names both
+    // record sets, so the next reconcile re-admits every path either touched.
+    // Callers record it only where they install this result: a cancelled or
+    // failed reload keeps the old index, and the old held state with it.
+    let dismissals_after = crate::knowledge::secret_dismissals::observe_dismissals(&source_scope);
+    let dismissals = if dismissals_after == dismissals_before {
+        dismissals_before
+    } else {
+        crate::knowledge::secret_dismissals::HeldDismissals {
+            digest: crate::knowledge::secret_dismissals::UNKNOWN_DISMISSAL_DIGEST.to_string(),
+            paths: dismissals_before
+                .paths
+                .into_iter()
+                .chain(dismissals_after.paths)
+                .collect(),
+        }
+    };
+
     Ok(AdmitParseResult {
         files,
         terminal_dispositions,
         coverage,
         cb_state: cb_state.unwrap_or_else(CircuitBreakerState::from_env),
+        dismissals,
     })
 }
 
@@ -6507,6 +6540,7 @@ impl LiveIndex {
             mut terminal_dispositions,
             coverage,
             cb_state,
+            dismissals,
         } = admit_and_parse_entries(
             &all_entries,
             &ingest_plans,
@@ -6600,6 +6634,8 @@ impl LiveIndex {
         // no frecency footprint.
         crate::live_index::frecency::ensure_bump_hook_registered();
 
+        // The handle built below installs these verdicts.
+        crate::knowledge::secret_dismissals::set_held_dismissals(root, dismissals);
         Ok(SharedIndexHandle::shared_with_scout_plan(
             index,
             scout_plan,
@@ -6922,6 +6958,7 @@ impl LiveIndex {
             mut terminal_dispositions,
             coverage,
             cb_state: new_cb,
+            dismissals,
         } = admit_and_parse_entries(
             &all_entries,
             &ingest_plans,
@@ -6975,6 +7012,7 @@ impl LiveIndex {
             // Record the normalized root so the reloaded index advertises which
             // project it now serves (root-mismatch invalidation).
             indexed_root: normalize_root(root),
+            dismissals,
         })
     }
 
@@ -7015,8 +7053,10 @@ impl LiveIndex {
     /// `build_reload_data` outside the lock and then `apply_reload_data` under
     /// the lock when called via `SharedIndexHandle::reload`.
     pub fn reload(&mut self, root: &Path) -> anyhow::Result<()> {
-        let data = Self::build_reload_data(root)?;
+        let mut data = Self::build_reload_data(root)?;
+        let dismissals = std::mem::take(&mut data.dismissals);
         self.apply_reload_data(data);
+        crate::knowledge::secret_dismissals::set_held_dismissals(root, dismissals);
         Ok(())
     }
 

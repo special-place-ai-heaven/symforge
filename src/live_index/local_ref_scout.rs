@@ -326,6 +326,10 @@ fn classify_ref_blob(entry: &RefBlobEntry, bytes: &[u8]) -> RefBlobRoute {
         return RefBlobRoute::Withheld(MetadataOnlyReason::Binary);
     }
     let targets = IndexTargets::for_path(&entry.relative_path, entry.language.as_ref());
+    // Deliberately root-unaware: secret dismissals live in the WORKING TREE's
+    // `.symforge/secret-dismissals.json`, while a ref-source index has no
+    // filesystem root and its blobs belong to another revision whose store (if
+    // any) may differ. Ref blobs therefore stay withheld on every finding.
     match classify_stable_content(&entry.relative_path, targets, bytes) {
         StableContentAdmission::MetadataOnly(reason) => RefBlobRoute::Withheld(reason),
         StableContentAdmission::Admitted => {

@@ -44,7 +44,13 @@ use crate::domain::ParseDiagnostic;
 // not a future snapshot by itself: arbitrary bytes often begin with a
 // one-byte varint (`b'n'` is 110). That payload is a version mismatch only
 // when it still decodes; otherwise it is corrupt.
-const CURRENT_VERSION: u32 = 9;
+//
+// 9 → 10 records the secret-dismissal store digest the verdicts were taken
+// under (`IndexSnapshot::dismissal_store_digest`). Orchestrator-approved
+// (034 dismissal index wiring, 2026-10-06): a format-9 snapshot carries no
+// dismissal digest, so treating it as stale is the honest outcome and a
+// one-time cold parse per user is acceptable.
+const CURRENT_VERSION: u32 = 10;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -193,6 +199,13 @@ pub struct IndexSnapshot {
     pub manifest: RepositoryManifest,
     pub code_signals: PersistedCodeSignals,
     pub trigrams: super::trigram::PersistedTrigramIndex,
+    /// Digest of the secret-dismissal store the recorded admission verdicts
+    /// were classified under (not the store on disk at write time). A local
+    /// snapshot whose digest differs from the repository's store re-scouts.
+    pub dismissal_store_digest: String,
+    /// Paths that store's records named. A team artifact restored under a
+    /// different store re-reads exactly these plus the local store's paths.
+    pub dismissal_paths: Vec<String>,
 }
 
 /// Serializable provenance for the immutable code-signal slice of a published generation.
@@ -670,6 +683,12 @@ pub fn checkpoint_shared_index(
     project_root: &Path,
     state_placement: &StatePlacement,
 ) -> anyhow::Result<SnapshotWriteReport> {
+    // A dismissal store edited since the live verdicts were classified (no
+    // watcher, or its event not yet processed) is reconciled first, so the
+    // snapshot below carries verdicts and a digest that agree.
+    if crate::knowledge::secret_dismissals::held_dismissals(project_root).is_some() {
+        crate::live_index::single_file::reconcile_secret_dismissals(shared, project_root);
+    }
     let snapshot_input = {
         let published = shared.published_generation();
         refuse_unverified_seed(&published.live)?;
@@ -1359,6 +1378,17 @@ fn import_artifact(project_root: &Path, expected_project_id: &ProjectId) -> Opti
         );
         return None;
     }
+    // A teammate's artifact carries the verdicts of THEIR dismissal store.
+    // Record that as the held state: background verify re-reads every path
+    // either store names before the seed becomes queryable, instead of
+    // discarding the whole artifact whenever the stores differ.
+    crate::knowledge::secret_dismissals::set_held_dismissals(
+        project_root,
+        crate::knowledge::secret_dismissals::HeldDismissals {
+            digest: snapshot.dismissal_store_digest.clone(),
+            paths: snapshot.dismissal_paths.iter().cloned().collect(),
+        },
+    );
     Some(snapshot)
 }
 
@@ -2117,6 +2147,30 @@ pub fn load_snapshot(
         );
         return None;
     }
+
+    // Checked after identity, so a foreign snapshot is quarantined for being
+    // foreign. A local snapshot's verdicts answer to the dismissal store they
+    // were classified under; a different store here makes them stale.
+    if snapshot.dismissal_store_digest
+        != crate::knowledge::secret_dismissals::dismissal_store_digest(project_root)
+    {
+        warn!("index snapshot secret dismissals changed — will re-scout");
+        try_quarantine_bad_snapshot(
+            state_dir,
+            &path,
+            &bytes,
+            "secret-dismissals-mismatch",
+            "snapshot secret dismissals differ from the repository's".to_string(),
+        );
+        return None;
+    }
+    crate::knowledge::secret_dismissals::set_held_dismissals(
+        project_root,
+        crate::knowledge::secret_dismissals::HeldDismissals {
+            digest: snapshot.dismissal_store_digest.clone(),
+            paths: snapshot.dismissal_paths.iter().cloned().collect(),
+        },
+    );
 
     Some(snapshot)
 }
@@ -2919,6 +2973,15 @@ fn build_snapshot(
         content_digest,
     );
 
+    // Persist the dismissal state the captured verdicts were classified under,
+    // never the store as it reads now: a store edited and not yet reconciled
+    // must not launder the old verdicts into a snapshot that looks current.
+    // ponytail: no held state means no cold load, reload or restore ran for
+    // this root in this process (an index assembled by hand); the store as it
+    // reads now is the only witness left.
+    let held_dismissals = crate::knowledge::secret_dismissals::held_dismissals(project_root)
+        .unwrap_or_else(|| crate::knowledge::secret_dismissals::observe_dismissals(project_root));
+
     let code_signals = code_signals.unwrap_or_else(|| PersistedCodeSignals {
         temporal: super::git_temporal::GitTemporalIndex::pending(),
         computed_for_content_generation: 0,
@@ -2934,6 +2997,8 @@ fn build_snapshot(
         manifest,
         code_signals,
         trigrams,
+        dismissal_store_digest: held_dismissals.digest,
+        dismissal_paths: held_dismissals.paths.into_iter().collect(),
     })
 }
 
@@ -3252,6 +3317,34 @@ fn run_background_verify<F, C>(
     drop(verify_view);
     let spot_count = spot_mismatches.len();
 
+    // Restored verdicts were classified under the dismissal store recorded
+    // with the snapshot (a team artifact may carry a teammate's). When the
+    // store here differs, every path either record set names is re-read, so
+    // the single publication below carries verdicts taken under THIS store.
+    // With no recorded state, every restored path is re-read.
+    let dismissals_now = crate::knowledge::secret_dismissals::observe_dismissals(root);
+    let dismissal_paths: Vec<String> = {
+        let candidates: std::collections::BTreeSet<String> =
+            match crate::knowledge::secret_dismissals::held_dismissals(root) {
+                Some(held) if held.digest == dismissals_now.digest => Default::default(),
+                Some(held) => held
+                    .paths
+                    .into_iter()
+                    .chain(dismissals_now.paths.iter().cloned())
+                    .collect(),
+                None => base
+                    .files
+                    .keys()
+                    .cloned()
+                    .chain(dismissals_now.paths.iter().cloned())
+                    .collect(),
+            };
+        candidates
+            .into_iter()
+            .filter(|path| matches!(crate::discovery::resolve_repo_path(root, path), Ok(Some(_))))
+            .collect()
+    };
+
     // Reported whatever the re-read does. Freshness degrades on them instead
     // of asserting a currency nothing established.
     #[cfg_attr(feature = "server", allow(unused_mut))]
@@ -3285,6 +3378,7 @@ fn run_background_verify<F, C>(
             .chain(&stat_result.new_files)
             .chain(&spot_mismatches)
             .chain(&spot_unreadable)
+            .chain(&dismissal_paths)
             .cloned()
             .collect();
         to_reparse.sort();
@@ -3297,6 +3391,16 @@ fn run_background_verify<F, C>(
         reported.extend(stat_result.changed.iter().cloned());
         reported.extend(stat_result.new_files.iter().cloned());
         reported.extend(spot_unreadable.iter().cloned());
+        // Withheld, not merely reported: these rows were admitted under
+        // another dismissal store, and this build cannot re-classify them.
+        for path in &dismissal_paths {
+            unreconciled.insert(
+                path.clone(),
+                "it was admitted under another secret-dismissal store, and this build \
+                 does not re-read"
+                    .to_string(),
+            );
+        }
         (Vec::<String>::new(), not_reparsed, spot_unreadable.len())
     };
     // Rows the stat pass saw, for every path the verify may leave
@@ -3308,6 +3412,7 @@ fn run_background_verify<F, C>(
     let base_rows: HashMap<String, Arc<IndexedFile>> = to_reparse
         .iter()
         .chain(&stat_result.deleted)
+        .chain(&dismissal_paths)
         .filter_map(|path| {
             base.files
                 .get(path)
@@ -3517,6 +3622,15 @@ fn run_background_verify<F, C>(
             final_report.mismatch_count,
             final_report.reason.as_deref().unwrap_or("unknown")
         );
+    }
+    // The verdicts now answer to this store, unless a re-read dismissal path
+    // stayed unreconciled or this build cannot re-read at all.
+    if cfg!(feature = "server")
+        && dismissal_paths
+            .iter()
+            .all(|path| !unreconciled.contains_key(path))
+    {
+        crate::knowledge::secret_dismissals::set_held_dismissals(root, dismissals_now);
     }
     info!(
         "background verify complete: {} changed, {} deleted, {} new, {} spot-check mismatches, {} reported mismatches, {} withheld as unverified in {:?}",
@@ -6690,7 +6804,7 @@ mod tests {
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 9,
+            CURRENT_VERSION, 10,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );

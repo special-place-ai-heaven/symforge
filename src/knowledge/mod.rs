@@ -3,6 +3,8 @@
 //! Knowledge reuses the live index's byte store and Markdown section records;
 //! this module owns only policy and projection seams, never a second corpus.
 
+pub mod secret_dismissals;
+
 /// UTF-8 byte-order mark accepted by the v1 searchable-text contract.
 pub const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
 
@@ -1337,6 +1339,23 @@ pub fn classify_stable_content(
     bytes: &[u8],
 ) -> StableContentAdmission {
     classify_stable_content_with(path, targets, bytes, scan_secret_bytes)
+}
+
+/// [`classify_stable_content`] with the dismissal store at `root` applied: a
+/// content-rule verdict whose EVERY finding is dismissed (path + rule + line
+/// content digest) is admitted. A changed line, a new finding elsewhere, an
+/// indeterminate scan, a sensitive path, or an unloadable store stays withheld.
+/// Every working-tree publication route uses this, so a dismissed file gets
+/// symbols and search hits, not only raw reads.
+pub fn classify_stable_content_for_root(
+    root: &std::path::Path,
+    path: &str,
+    targets: crate::domain::IndexTargets,
+    bytes: &[u8],
+) -> StableContentAdmission {
+    classify_stable_content_with(path, targets, bytes, |path, bytes| {
+        secret_dismissals::scan_with_dismissals(root, path, bytes)
+    })
 }
 
 /// `_targets` is retained so every publication route keeps declaring what it is
