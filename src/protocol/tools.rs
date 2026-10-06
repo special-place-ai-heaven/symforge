@@ -7562,6 +7562,8 @@ impl SymForgeServer {
             "── Worktree-awareness misuse ──\nedit tool calls without working_directory (last hour): {}",
             self.worktree_misuse.current_window_count(),
         ));
+        result.push('\n');
+        result.push_str(&Self::secret_dismissals_line(rk_root.as_deref()));
 
         // Append frecency diagnostics when SYMFORGE_FRECENCY=1. The feature-flag
         // guard mirrors the one in `frecency::bump`; when the flag is unset,
@@ -7733,6 +7735,8 @@ impl SymForgeServer {
             &source_set,
             &binding_view,
         ));
+        result.push('\n');
+        result.push_str(&Self::secret_dismissals_line(rk_root.as_deref()));
 
         if let Some(drift) = crate::version_registry::drift_banner_default() {
             result.push('\n');
@@ -12333,6 +12337,16 @@ impl SymForgeServer {
         statused_tool_result(body, OutcomeClass::Found)
     }
 
+    /// One health/status line carrying ONLY the secret-dismissal record count:
+    /// never paths, rule ids, digests, or notes (034 no-echo contract).
+    fn secret_dismissals_line(root: Option<&Path>) -> String {
+        match root.map(crate::knowledge::secret_dismissals::dismissal_count) {
+            None => "secret_dismissals: unbound".to_string(),
+            Some(Some(count)) => format!("secret_dismissals: {count}"),
+            Some(None) => "secret_dismissals: store unreadable (all findings withheld)".to_string(),
+        }
+    }
+
     /// Render the `status` body from THIS server's own index, ledger, and
     /// durable store — no proxy, no surface-env gate.
     ///
@@ -12451,6 +12465,10 @@ impl SymForgeServer {
             body.push('\n');
             body.push_str(&line);
         }
+        body.push('\n');
+        body.push_str(&Self::secret_dismissals_line(
+            self.capture_repo_root().as_deref(),
+        ));
         match reset_note {
             Some(note) => format!("{body}\n{note}"),
             None => body,
@@ -18157,6 +18175,61 @@ mod tests {
             health.contains("index_id=index-"),
             "health should keep index identity assertable after reindex, got: {health}"
         );
+    }
+
+    /// Health, compact health, and status carry the secret-dismissal COUNT and
+    /// nothing else from the store: no paths, rule ids, digests, or notes.
+    #[tokio::test]
+    async fn health_and_status_report_secret_dismissal_count_only() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join(".git")).expect("git marker");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(repo.path().join("src/lib.rs"), "pub fn ok() {}\n").expect("source");
+        fs::create_dir_all(repo.path().join(".symforge")).expect("state dir");
+        fs::write(
+            repo.path().join(crate::knowledge::secret_dismissals::DISMISSAL_STORE_REL),
+            r#"{"records": [
+      {"path": "cfg/first.json", "line_digest": "digest-one", "rule_id": "secret.context-assignment", "note": "NOTE_MARKER_9f3a"},
+      {"path": "cfg/second.json", "line_digest": "digest-two", "rule_id": "secret.context-assignment"}
+    ]}"#,
+        )
+        .expect("store");
+        let server = SymForgeServer::new(
+            crate::live_index::LiveIndex::load(repo.path()).expect("index"),
+            "dismissal-count".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(repo.path().to_path_buf()),
+            None,
+        );
+        let full = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
+        let compact = server.health_compact().await;
+        let status = server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
+        for (surface, text) in [
+            ("health", &full),
+            ("health_compact", &compact),
+            ("status", &status),
+        ] {
+            assert!(
+                text.contains("secret_dismissals: 2"),
+                "{surface} must report the count: {text}"
+            );
+            for leaked in [
+                "cfg/first.json",
+                "cfg/second.json",
+                "secret.context-assignment",
+                "digest-one",
+                "NOTE_MARKER_9f3a",
+            ] {
+                assert!(
+                    !text.contains(leaked),
+                    "{surface} echoed `{leaked}`: {text}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

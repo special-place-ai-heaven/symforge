@@ -969,6 +969,7 @@ pub(crate) fn process_events(
     // newer destination hint waits behind it, and bounds digest/publication
     // work to once per path per batch.
     let mut pending_paths: HashMap<String, PendingPath> = HashMap::new();
+    let mut dismissal_store_changed = false;
     for event in events {
         if should_stop() {
             break;
@@ -999,6 +1000,13 @@ pub(crate) fn process_events(
             // index already holds is one of those.
             // ponytail: a file first tracked under a build dir mid-session waits
             // for the next reload, as the walk's git-tracked set is not re-read.
+            // The secret-dismissal store is the one `.symforge/` file whose
+            // change moves admission verdicts: it is never indexed itself,
+            // but a change re-admits every path its records name.
+            if relative_path == crate::knowledge::secret_dismissals::DISMISSAL_STORE_REL {
+                dismissal_store_changed = true;
+                continue;
+            }
             let relative = Path::new(&relative_path);
             if crate::discovery::path_is_hard_scope_excluded(relative)
                 || shared.is_source_excluded(relative)
@@ -1125,6 +1133,13 @@ pub(crate) fn process_events(
         if let Some(debounce_ms) = debounce_ms {
             info.debounce_window_ms = debounce_ms;
         }
+    }
+
+    if dismissal_store_changed
+        && !should_stop()
+        && shared.current_project_generation() == expected_gen
+    {
+        crate::live_index::single_file::reconcile_secret_dismissals(shared, repo_root);
     }
 
     // Evict burst trackers that have been idle longer than 2 × QUIET_SECS to

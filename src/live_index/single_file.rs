@@ -221,6 +221,23 @@ fn project_root_from_paths(abs_path: &Path, relative_path: &str) -> Option<PathB
     abs_path.ancestors().nth(depth).map(|p| p.to_path_buf())
 }
 
+/// Stable-content admission with the project's secret dismissals applied. The
+/// root is recovered from the event paths; if that ever fails the plain
+/// classifier runs, which can only withhold more, never admit more.
+fn classify_for_project(
+    abs_path: &Path,
+    relative_path: &str,
+    targets: crate::domain::IndexTargets,
+    bytes: &[u8],
+) -> crate::knowledge::StableContentAdmission {
+    match project_root_from_paths(abs_path, relative_path) {
+        Some(root) => {
+            crate::knowledge::classify_stable_content_for_root(&root, relative_path, targets, bytes)
+        }
+        None => crate::knowledge::classify_stable_content(relative_path, targets, bytes),
+    }
+}
+
 /// How many ancestors of the absolute path the relative path spans. `.`
 /// components have no ancestor of their own; counting them would walk above
 /// the root.
@@ -403,7 +420,7 @@ pub(crate) fn prepare_snapshot_verify_admission(
         _ => return None,
     };
     if let crate::knowledge::StableContentAdmission::MetadataOnly(reason) =
-        crate::knowledge::classify_stable_content(relative_path, targets, &bytes)
+        classify_for_project(abs_path, relative_path, targets, &bytes)
     {
         return Some(terminal(scouted, FileDisposition::MetadataOnly { reason }));
     }
@@ -721,7 +738,7 @@ where
         // by cold load. Terminal outcomes are published before hashing or parsing,
         // and the owned byte buffer is discarded on every non-admitted path.
         if let crate::knowledge::StableContentAdmission::MetadataOnly(reason) =
-            crate::knowledge::classify_stable_content(relative_path, targets, &bytes)
+            classify_for_project(abs_path, relative_path, targets, &bytes)
         {
             if let Some(published) = shared.publish_terminal_disposition_at_generation(
                 relative_path,
@@ -863,6 +880,67 @@ pub fn update_file_from_disk(
             .observe_admission_active(&relative);
     }
     outcome
+}
+
+/// Bring the index in line with the secret-dismissal store at `repo_root`.
+///
+/// When the store differs from the one the live verdicts were classified
+/// under, every path named by the old or the new records is re-admitted
+/// through the canonical single-file seam, which classifies with the current
+/// store, so the index lane and the read lane agree again. With no held state
+/// recorded, every indexed path is re-admitted. The held state advances only
+/// when every re-admission reached a publication boundary; otherwise it keeps
+/// a digest no snapshot can match, so the next trigger retries.
+pub(crate) fn reconcile_secret_dismissals(
+    shared: &SharedIndex,
+    repo_root: &Path,
+) -> std::collections::BTreeMap<String, ReindexOutcome> {
+    use crate::knowledge::secret_dismissals as dismissals;
+    let current = dismissals::observe_dismissals(repo_root);
+    let held = dismissals::held_dismissals(repo_root);
+    let mut outcomes = std::collections::BTreeMap::new();
+    if held
+        .as_ref()
+        .is_some_and(|held| held.digest == current.digest)
+    {
+        return outcomes;
+    }
+    let mut paths = current.paths.clone();
+    match held {
+        Some(held) => paths.extend(held.paths),
+        None => paths.extend(shared.read().files.keys().cloned()),
+    }
+    let expected_gen = shared.current_project_generation();
+    for relative in paths.iter().cloned() {
+        // Record paths are store text: only a path that is its own canonical
+        // spelling beneath the root is re-admitted.
+        if !matches!(
+            crate::discovery::resolve_repo_path(repo_root, &relative),
+            Ok(Some(_))
+        ) {
+            continue;
+        }
+        let abs_path = repo_root.join(&relative);
+        let outcome = admit_and_index_single_path(&relative, &abs_path, shared, expected_gen);
+        if matches!(outcome, ReindexOutcome::Reindexed) {
+            crate::live_index::index_lifecycle::activation::project_source_authority(repo_root)
+                .observe_admission_active(&relative);
+        }
+        outcomes.insert(relative, outcome);
+    }
+    let settled = !outcomes
+        .values()
+        .any(|outcome| matches!(outcome, ReindexOutcome::PublicationRejected));
+    let held = if settled {
+        current
+    } else {
+        dismissals::HeldDismissals {
+            digest: dismissals::UNKNOWN_DISMISSAL_DIGEST.to_string(),
+            paths,
+        }
+    };
+    dismissals::set_held_dismissals(repo_root, held);
+    outcomes
 }
 
 /// Remove one file from the live index (embed facade; task #24 / AAP ask 3).

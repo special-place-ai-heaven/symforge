@@ -1119,10 +1119,29 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Trigram postings are appended and sorted once, with a parallel byte scan
 // at 64 files. No new token or call edge into src/index_lifecycle or
 // server_api.rs.
+// Refreshed for 034 dismissal index wiring: secret_dismissals.rs moved from
+// src/protocol to src/knowledge (same 203 files), root-aware classifier at the
+// store/single_file/edit publication sites, read-gate dismissal override
+// removed, snapshot format 10 carries the dismissal-store digest, dismiss
+// re-admits via update_file_from_disk (existing caller of the activation
+// observation lane), persist format pin test moved 9 -> 10 with the
+// orchestrator approval recorded beside CURRENT_VERSION. No new token or
+// call edge into src/index_lifecycle or server_api.rs.
+// Refreshed for 034 review round 1: held dismissal state (process registry in
+// knowledge::secret_dismissals), reconcile_secret_dismissals in single_file
+// (its admission observation mirrors update_file_from_disk), watcher reacts to
+// the store file, verify re-reads dismissal paths, artifact carries dismissal
+// paths, truncated scans and private-key envelopes never filtered. Same 203
+// files. No new token or call edge into src/index_lifecycle or server_api.rs
+// beyond single_file.rs's existing one.
+// Refreshed for 034 review round 2: held dismissal state is carried in
+// AdmitParseResult/ReloadData and recorded only where the result is
+// installed; embed verify withholds dismissal paths as unreconciled. Same
+// 203 files, no new edge into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "a3d474a386189f3ab8aacb60aff2b787dda6df41df7f00fa59bcad60ddb5f4bf",
+    "ea5f4d677223e61a6b02353ba678128db4bccd3a995d7d18dced67a250a5af14",
     203,
-    10_523_831,
+    10_550_745,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

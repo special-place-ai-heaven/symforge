@@ -407,29 +407,44 @@ impl SymForgeServer {
             ));
         }
 
-        // Reindex source so recorded disposition can clear when all findings dismissed.
-        if let Ok(bytes) = read_regular_bytes(&plan.abs_path)
-            && let Some(lang) = crate::domain::LanguageId::from_extension(
-                Path::new(&plan.path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or(""),
-            )
-        {
-            crate::protocol::edit::reindex_after_write(
-                self.index.data_plane(),
-                &plan.abs_path,
+        // Reconcile the index with the store just written: every path the old
+        // or new records name is re-admitted through the watcher's single-file
+        // seam, which classifies with the current store. When every finding is
+        // dismissed the file is published with symbols and search content;
+        // otherwise it stays withheld. Covers every file type, not only those
+        // with a parser language. A lost publication race is retried once and
+        // otherwise reported, never folded into "withheld".
+        use crate::live_index::single_file::{
+            ReindexOutcome, admit_and_index_single_path, reconcile_secret_dismissals,
+        };
+        let shared = self.index.data_plane();
+        let readmit = || {
+            admit_and_index_single_path(
                 &plan.path,
-                &bytes,
-                lang,
-            );
+                &plan.abs_path,
+                shared,
+                shared.current_project_generation(),
+            )
+        };
+        let mut outcome = reconcile_secret_dismissals(shared, &root)
+            .remove(&plan.path)
+            .unwrap_or_else(readmit);
+        if matches!(outcome, ReindexOutcome::PublicationRejected) {
+            outcome = readmit();
         }
+        let index_outcome = match outcome {
+            ReindexOutcome::Reindexed | ReindexOutcome::HashSkip => "indexed",
+            ReindexOutcome::Skipped => "withheld",
+            ReindexOutcome::NotFound | ReindexOutcome::Removed => "absent",
+            ReindexOutcome::ReadError(_) => "unreadable",
+            ReindexOutcome::PublicationRejected => {
+                "publication rejected by a concurrent index change; index unchanged"
+            }
+        };
 
         let rescan = match read_regular_bytes(&plan.abs_path) {
             Ok(bytes) => {
-                let scan = knowledge::scan_secret_bytes(&plan.path, &bytes);
-                let filtered =
-                    secret_dismissals::filter_scan_with_dismissals(&root, &plan.path, &bytes, scan);
+                let filtered = secret_dismissals::scan_with_dismissals(&root, &plan.path, &bytes);
                 match filtered {
                     knowledge::SecretScan::Clean => "clean".to_string(),
                     knowledge::SecretScan::Sensitive { finding_count, .. } => {
@@ -450,8 +465,9 @@ impl SymForgeServer {
              {status}\n\
              written:\n- {DISMISSAL_STORE_REL}\n\
              rescan ({}) : {rescan}\n\
+             index ({}) : {index_outcome}\n\
              {history}\n",
-            plan.path
+            plan.path, plan.path
         );
         let receipt = crate::idempotency::capture_post_image(&[store_path]);
         complete_mutation_replay_with_receipt(idempotency, &mut out, receipt);
@@ -754,6 +770,14 @@ fn plan_dismiss(
             );
             if !wanted.remove(id.as_str()) {
                 continue;
+            }
+            if !secret_dismissals::rule_is_dismissable(span.rule_id) {
+                return Err(format!(
+                    "Error: finding {id} ({}) cannot be dismissed: the rule matches only the \
+                     key's BEGIN header, so a dismissal could not bind the key material. \
+                     Remove the key from the repository or externalize it instead.",
+                    span.rule_id
+                ));
             }
             let Some(line) = line_bytes_at(&bytes, span.line_start) else {
                 return Err(format!(

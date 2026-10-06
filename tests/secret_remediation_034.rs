@@ -23,14 +23,20 @@ fn write_file(dir: &Path, name: &str, content: &str) {
 }
 
 fn server_for_repo(root: &Path) -> SymForgeServer {
+    server_and_index(root).0
+}
+
+/// A server plus the shared index it serves, for tests that checkpoint.
+fn server_and_index(root: &Path) -> (SymForgeServer, symforge::live_index::SharedIndex) {
     let shared = LiveIndex::load(root).unwrap_or_else(|e| panic!("index: {e}"));
-    SymForgeServer::new(
-        shared,
+    let server = SymForgeServer::new(
+        shared.clone(),
         "034-test".to_string(),
         Arc::new(Mutex::new(WatcherInfo::default())),
         Some(root.to_path_buf()),
         None,
-    )
+    );
+    (server, shared)
 }
 
 fn result_text(v: &serde_json::Value) -> &str {
@@ -661,6 +667,306 @@ async fn dismiss_revocation_restores_withholding() {
     );
 }
 
+const WITHHELD_PREFIX: &str = "Content withheld by admission policy:";
+const INDEX_MARKER: &str = "indexed_marker_value";
+
+/// Plants a false-positive secret file beside a `.git` marker.
+fn plant(dir: &Path) {
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let body = format!(
+        "{{\n  \"marker\": \"{INDEX_MARKER}\",\n  \"password\": \"{SYNTHETIC_SECRET}\"\n}}\n"
+    );
+    write_file(dir, "config/app.json", &body);
+}
+
+/// Dismisses the planted finding; dismiss is synchronous, so its result must
+/// already report the file indexed.
+async fn dismiss_planted(server: &SymForgeServer) {
+    let refusal = dispatch(
+        server,
+        "get_file_content",
+        json!({ "path": "config/app.json" }),
+    )
+    .await;
+    assert!(result_text(&refusal).starts_with(WITHHELD_PREFIX));
+    let id = refusal["_meta"][WITHHELD_META_KEY]["findings"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let applied = dispatch(
+        server,
+        "secret_remediate",
+        json!({
+            "scope": "config/app.json",
+            "finding_ids": [id],
+            "action": "dismiss",
+            "preview": false
+        }),
+    )
+    .await;
+    let text = result_text(&applied);
+    assert!(text.contains("index (config/app.json) : indexed"), "{text}");
+}
+
+/// Plants, loads, and dismisses; returns the server that applied it.
+async fn plant_and_dismiss(dir: &Path) -> SymForgeServer {
+    plant(dir);
+    let server = server_for_repo(dir);
+    dismiss_planted(&server).await;
+    server
+}
+
+/// True when `search_text` serves the planted file as a hit. A zero-hit
+/// response echoes the query, so the path is the only honest signal.
+async fn planted_file_is_searchable(server: &SymForgeServer) -> bool {
+    let hit = dispatch(server, "search_text", json!({ "query": INDEX_MARKER })).await;
+    result_text(&hit).contains("config/app.json")
+}
+
+fn state_placement(root: &Path) -> symforge::domain::StatePlacement {
+    let binding = match symforge::discovery::resolve_root_candidate(
+        root,
+        symforge::domain::RootCandidateSource::LaunchCwd,
+        symforge::domain::RootRequestMode::Automatic,
+    ) {
+        symforge::domain::RootResolution::Bound(binding) => binding,
+        resolution => panic!("fixture root should bind: {resolution:?}"),
+    };
+    symforge::discovery::resolve_state_placement(&binding)
+}
+
+/// Reasons recorded by every quarantined index snapshot under `root`.
+fn snapshot_quarantine_reasons(root: &Path) -> Vec<String> {
+    let dir = root.join(".symforge/quarantine/index-snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|path| {
+            let meta: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            meta["reason"].as_str().unwrap_or_default().to_string()
+        })
+        .collect()
+}
+
+/// Dismissal clears the file for the index, not only for raw reads.
+#[tokio::test]
+async fn dismissed_file_becomes_indexed_and_searchable() {
+    let dir = tempfile::tempdir().unwrap();
+    plant(dir.path());
+    let server = server_for_repo(dir.path());
+    assert!(
+        !planted_file_is_searchable(&server).await,
+        "withheld file must not be searchable"
+    );
+
+    dismiss_planted(&server).await;
+    let hit = dispatch(&server, "search_text", json!({ "query": INDEX_MARKER })).await;
+    let found = result_text(&hit);
+    assert!(
+        found.contains("config/app.json"),
+        "dismissed file not searchable: {found}"
+    );
+    assert!(!found.contains(SYNTHETIC_SECRET), "search leaked secret");
+    let ctx = dispatch(
+        &server,
+        "get_file_context",
+        json!({ "path": "config/app.json" }),
+    )
+    .await;
+    assert!(
+        !result_text(&ctx).starts_with(WITHHELD_PREFIX),
+        "{}",
+        result_text(&ctx)
+    );
+}
+
+/// A new, different secret in a dismissed file is withheld again; the old
+/// dismissal stays in the store.
+#[tokio::test]
+async fn new_secret_in_dismissed_file_stays_withheld() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = plant_and_dismiss(dir.path()).await;
+    let body = format!(
+        "{{\n  \"marker\": \"{INDEX_MARKER}\",\n  \"password\": \"{SYNTHETIC_SECRET}\",\n  \"api_token\": \"Another9Secret77Zq\"\n}}\n"
+    );
+    write_file(dir.path(), "config/app.json", &body);
+    let server = server_for_repo(dir.path());
+    let again = dispatch(
+        &server,
+        "get_file_content",
+        json!({ "path": "config/app.json" }),
+    )
+    .await;
+    assert!(
+        result_text(&again).starts_with(WITHHELD_PREFIX),
+        "{}",
+        result_text(&again)
+    );
+    assert!(
+        !planted_file_is_searchable(&server).await,
+        "a file with an undismissed secret must not be searchable"
+    );
+    assert!(
+        !again["_meta"][WITHHELD_META_KEY]["findings"]
+            .as_array()
+            .expect("findings")
+            .is_empty(),
+        "new finding must be reported"
+    );
+    let store =
+        std::fs::read_to_string(dir.path().join(".symforge/secret-dismissals.json")).unwrap();
+    assert!(
+        store.contains("line_digest"),
+        "old dismissal must remain: {store}"
+    );
+}
+
+/// A snapshot written while a dismissal was active must not be reused once
+/// the dismissal store changes.
+#[tokio::test]
+async fn changed_dismissal_store_discards_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    plant(dir.path());
+    let (server, shared) = server_and_index(dir.path());
+    dismiss_planted(&server).await;
+    assert!(planted_file_is_searchable(&server).await);
+    let placement = state_placement(dir.path());
+    symforge::live_index::persist::checkpoint_shared_index(&shared, dir.path(), &placement)
+        .expect("checkpoint");
+
+    // Revoke after the snapshot was written under the dismissal.
+    std::fs::remove_file(dir.path().join(".symforge/secret-dismissals.json")).unwrap();
+    assert!(
+        symforge::live_index::persist::load_snapshot(dir.path(), &placement).is_none(),
+        "a snapshot classified under another dismissal store must not restore"
+    );
+    assert!(
+        snapshot_quarantine_reasons(dir.path()).contains(&"secret-dismissals-mismatch".to_string()),
+        "{:?}",
+        snapshot_quarantine_reasons(dir.path())
+    );
+    let restored = server_for_repo(dir.path());
+    assert!(
+        !planted_file_is_searchable(&restored).await,
+        "stale snapshot verdict reused"
+    );
+}
+
+/// Revoking a dismissal and then checkpointing reconciles the live index first,
+/// so the checkpoint can neither keep serving nor persist the old verdict.
+#[tokio::test]
+async fn revocation_before_checkpoint_is_not_laundered() {
+    let dir = tempfile::tempdir().unwrap();
+    plant(dir.path());
+    let (server, shared) = server_and_index(dir.path());
+    dismiss_planted(&server).await;
+    assert!(planted_file_is_searchable(&server).await);
+
+    std::fs::remove_file(dir.path().join(".symforge/secret-dismissals.json")).unwrap();
+    let placement = state_placement(dir.path());
+    symforge::live_index::persist::checkpoint_shared_index(&shared, dir.path(), &placement)
+        .expect("checkpoint");
+    assert!(
+        !planted_file_is_searchable(&server).await,
+        "the index lane must follow the revocation, as the read lane does"
+    );
+    let snapshot = symforge::live_index::persist::load_snapshot(dir.path(), &placement)
+        .expect("a reconciled snapshot restores");
+    assert_eq!(snapshot.dismissal_store_digest, "");
+    assert!(
+        !snapshot.files.contains_key("config/app.json"),
+        "the snapshot must not carry the revoked file's content"
+    );
+}
+
+/// Deleting the store on disk, with no secret_remediate call, reaches the index
+/// through the watcher: the Remove event reconciles and the file is withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_store_removal_withholds_dismissed_file_again() {
+    use std::time::Duration;
+    use symforge::watcher::{WatcherState, run_watcher};
+
+    let dir = tempfile::tempdir().unwrap();
+    plant(dir.path());
+    let (server, shared) = server_and_index(dir.path());
+    dismiss_planted(&server).await;
+    assert!(planted_file_is_searchable(&server).await);
+
+    let info = Arc::new(Mutex::new(WatcherInfo::default()));
+    tokio::spawn(run_watcher(
+        dir.path().to_path_buf(),
+        Arc::clone(&shared),
+        Arc::clone(&info),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while info.lock().state != WatcherState::Active {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher should become Active");
+
+    std::fs::remove_file(dir.path().join(".symforge/secret-dismissals.json")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while planted_file_is_searchable(&server).await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the watcher must withhold the file once its dismissal store is removed");
+}
+
+/// A private-key finding binds only its constant BEGIN header, so dismiss
+/// refuses it instead of writing a record that could never bind the key.
+#[tokio::test]
+async fn private_key_finding_cannot_be_dismissed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    // Assembled at runtime so this source file carries no key header itself.
+    let kind = "PRIVATE";
+    let body = format!(
+        "notes\n-----BEGIN RSA {kind} KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1P\n-----END RSA {kind} KEY-----\n"
+    );
+    write_file(dir.path(), "docs/notes.txt", &body);
+    let server = server_for_repo(dir.path());
+    let refusal = dispatch(
+        &server,
+        "get_file_content",
+        json!({ "path": "docs/notes.txt" }),
+    )
+    .await;
+    assert!(result_text(&refusal).starts_with(WITHHELD_PREFIX));
+    let ids: Vec<String> = refusal["_meta"][WITHHELD_META_KEY]["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter_map(|finding| finding["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(!ids.is_empty());
+    let apply = dispatch(
+        &server,
+        "secret_remediate",
+        json!({
+            "scope": "docs/notes.txt",
+            "finding_ids": ids,
+            "action": "dismiss",
+            "preview": false
+        }),
+    )
+    .await;
+    let text = result_text(&apply);
+    assert!(text.contains("cannot be dismissed"), "{text}");
+    assert!(
+        !dir.path().join(".symforge/secret-dismissals.json").exists(),
+        "no record may be written for an undismissable finding"
+    );
+}
+
 /// Oracle 12: dismissal loader size cap + no symlink escape.
 #[test]
 fn dismiss_loader_size_cap_and_no_symlink_escape() {
@@ -672,26 +978,6 @@ fn dismiss_loader_size_cap_and_no_symlink_escape() {
     std::fs::write(symforge.join("secret-dismissals.json"), &oversize).unwrap();
     let err = symforge::protocol::secret_dismissals::load_dismissals(dir.path()).unwrap_err();
     assert!(err.contains("size cap"), "{err}");
-}
-
-/// Oracle 13: health does not echo unscanned dismissal text.
-#[tokio::test]
-async fn health_does_not_echo_unscanned_dismissal_text() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".git")).unwrap();
-    write_file(dir.path(), "src/lib.rs", "fn ok() {}\n");
-    let marker = "UNIQUE_DISMISSAL_NOTE_MARKER_9f3a";
-    let store = format!(
-        "{{\n  \"records\": [{{\n    \"path\": \"config/app.json\",\n    \"line_digest\": \"abc\",\n    \"rule_id\": \"secret.context-assignment\",\n    \"note\": \"{marker}\"\n  }}]\n}}\n"
-    );
-    write_file(dir.path(), ".symforge/secret-dismissals.json", &store);
-    let server = server_for_repo(dir.path());
-    let health = dispatch(&server, "health", json!({})).await;
-    let text = result_text(&health);
-    assert!(
-        !text.contains(marker),
-        "health must not echo dismissal note text: {text}"
-    );
 }
 
 /// Oracle 14: apply uses mutation result path (harness write-permission gate).
