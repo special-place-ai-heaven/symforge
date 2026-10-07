@@ -1138,10 +1138,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // AdmitParseResult/ReloadData and recorded only where the result is
 // installed; embed verify withholds dismissal paths as unreconciled. Same
 // 203 files, no new edge into src/index_lifecycle or server_api.rs.
+// Refreshed for the Windows read-gate named-pipe refusal: GetFileType after
+// open, before any read. Same 203 files. Private helpers only. No new token
+// or call edge into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ea5f4d677223e61a6b02353ba678128db4bccd3a995d7d18dced67a250a5af14",
+    "05b0e1dcb82288853ec2f268de44821d52332449290c8344f725314cbfed7713",
     203,
-    10_550_745,
+    10_558_921,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
