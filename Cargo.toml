@@ -196,6 +196,12 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# Named-pipe server for the read-gate hang test. `CreateNamedPipeW` is gated
+# on `Win32_Security` as well as the pipes module. Test-only: production opens
+# use `GetFileType` from `Win32_Storage_FileSystem`.
+windows = { version = "0.62", features = ["Win32_System_Pipes", "Win32_Security"] }
+
 [dev-dependencies]
 # Self-dependency: integration tests and benches build the lib with the
 # repo-internal test door open (feature unification applies dev-dep

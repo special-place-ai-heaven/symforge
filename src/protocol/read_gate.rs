@@ -375,7 +375,11 @@ fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Optio
 /// FIFO, socket, and device opens block until a peer appears. `symlink_metadata`
 /// refuses those before `open`. On Unix the open itself is `O_NONBLOCK`, so a
 /// replacement between the check and the open cannot hang the caller either.
-/// Symlinks are not followed: `symlink_metadata` sees the link, not its target.
+/// On Windows `is_file` is true for a named pipe and for a character device
+/// (`CON`, `COM1`, …). `CreateFile` on a listening pipe returns immediately —
+/// `ReadFile` is what blocks — and `open_for_gate_read` refuses a non-disk
+/// handle before that read. Symlinks are not followed: `symlink_metadata` sees
+/// the link, not its target.
 pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
     read_regular_file_limited(path, None)
 }
@@ -413,10 +417,43 @@ fn open_for_gate_read(path: &Path) -> std::io::Result<std::fs::File> {
             .custom_flags(libc::O_NONBLOCK)
             .open(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // `FILE_FLAG_OVERLAPPED` would make a later `std::fs::File` read fail
+        // (`ERROR_INVALID_PARAMETER`); std does not drive overlapped I/O. The
+        // open itself does not wait for a pipe peer — classify the handle and
+        // refuse anything that is not a disk file before the caller reads.
+        let file = std::fs::File::open(path)?;
+        if !windows_handle_is_disk_file(&file) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::File::open(path)
     }
+}
+
+/// `GetFileType` of an opened handle, ignoring `FILE_TYPE_REMOTE`.
+///
+/// Fail closed: `FILE_TYPE_UNKNOWN` (the failure return) is not a disk file.
+/// A remote disk file is `FILE_TYPE_DISK | FILE_TYPE_REMOTE` and still passes.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_handle_is_disk_file(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_REMOTE, GetFileType};
+
+    // SAFETY: `file` owns a live kernel handle for the duration of the call.
+    // `GetFileType` only classifies that handle; it does not read bytes or wait
+    // for a pipe peer.
+    let kind = unsafe { GetFileType(HANDLE(file.as_raw_handle())) };
+    kind.0 & !FILE_TYPE_REMOTE.0 == FILE_TYPE_DISK.0
 }
 
 /// Finding lines for a RECORDED content demotion, computed at refusal time.
@@ -748,5 +785,146 @@ mod tests {
             vec![("protocol/read_gate.rs".to_string(), "disk_read".to_string())],
             "the line re-read must be reached only through the disk-read lane"
         );
+    }
+
+    #[test]
+    fn read_regular_file_reads_bytes_of_a_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, b"hello").expect("write");
+        let bytes = super::read_regular_file(&path).expect("regular file");
+        assert_eq!(bytes, b"hello");
+    }
+
+    /// A listening named pipe is the Windows stand-in for a Unix FIFO.
+    /// `CreateFile` connects without waiting for a writer; `ReadFile` would
+    /// block until that writer appears. The pre-open `symlink_metadata` check
+    /// can refuse without ever opening, so this calls `open_for_gate_read`
+    /// directly — the TOCTOU path the metadata check does not cover.
+    #[cfg(windows)]
+    #[test]
+    fn open_for_gate_read_does_not_block_on_a_named_pipe() {
+        let pipe = IdleOutboundPipe::listen("open");
+        let path = pipe.path.clone();
+        let result = finish_within(
+            std::time::Duration::from_secs(5),
+            "open_for_gate_read",
+            move || super::open_for_gate_read(&path),
+        );
+        let err = result.expect_err("a named pipe is not a regular file");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    /// The full read, including the metadata pre-check, must also return.
+    /// Metadata may refuse before the open; either way the call must not block
+    /// and must not yield the pipe's bytes.
+    #[cfg(windows)]
+    #[test]
+    fn read_regular_file_does_not_block_on_a_named_pipe() {
+        let pipe = IdleOutboundPipe::listen("read");
+        let path = pipe.path.clone();
+        let result = finish_within(
+            std::time::Duration::from_secs(5),
+            "read_regular_file",
+            move || super::read_regular_file(&path),
+        );
+        // Any error is a completed refusal. The budget above is the hang check:
+        // a synchronous read of this pipe would still be blocked.
+        let err = result.expect_err("a named pipe is not admissible content");
+        assert!(
+            err.to_string().contains("not a regular file") || err.raw_os_error().is_some(),
+            "unexpected refusal: {err:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn finish_within<T: Send + 'static>(
+        budget: std::time::Duration,
+        label: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        match rx.recv_timeout(budget) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{label} blocked for {budget:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{label} ended without a result")
+            }
+        }
+    }
+
+    /// Server end of a byte-mode outbound pipe. No writer ever produces bytes,
+    /// so a synchronous client read blocks. Drop closes the instance.
+    #[cfg(windows)]
+    struct IdleOutboundPipe {
+        handle: windows::Win32::Foundation::HANDLE,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl IdleOutboundPipe {
+        #[allow(unsafe_code)]
+        fn listen(label: &str) -> Self {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::Storage::FileSystem::{
+                FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_OUTBOUND,
+            };
+            use windows::Win32::System::Pipes::{
+                CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+                PIPE_WAIT,
+            };
+
+            let path = std::path::PathBuf::from(format!(
+                r"\\.\pipe\symforge-read-gate-{}-{label}",
+                std::process::id()
+            ));
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: `wide` is NUL-terminated and outlives this call. Default
+            // security (null attributes) lets this process open the client end.
+            // The returned handle is owned by `IdleOutboundPipe`.
+            let handle: HANDLE = unsafe {
+                CreateNamedPipeW(
+                    windows::core::PCWSTR(wide.as_ptr()),
+                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    None,
+                )
+            };
+            assert!(
+                !handle.is_invalid(),
+                "CreateNamedPipeW({}): {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+            Self { handle, path }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for IdleOutboundPipe {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            use windows::Win32::Foundation::CloseHandle;
+            // SAFETY: `handle` came from `CreateNamedPipeW` and is closed once,
+            // here. Closing it unblocks a client still stuck in `ReadFile`.
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+        }
     }
 }
