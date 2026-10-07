@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.5.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.5...v11.5.6) (2026-10-07)
+
+
+### Bug Fixes
+
+* **read-gate:** refuse Windows named pipes before a blocking read ([#776](https://github.com/special-place-ai-heaven/symforge/issues/776)) ([1698cc6](https://github.com/special-place-ai-heaven/symforge/commit/1698cc62a7783135e91865ccf27480d2d7df4e75)), closes [#761](https://github.com/special-place-ai-heaven/symforge/issues/761)
+
 ## [11.5.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.4...v11.5.5) (2026-10-06)
 
 
