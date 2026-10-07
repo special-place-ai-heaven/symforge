@@ -447,13 +447,26 @@ fn open_for_gate_read(path: &Path) -> std::io::Result<std::fs::File> {
 fn windows_handle_is_disk_file(file: &std::fs::File) -> bool {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_REMOTE, GetFileType};
+    use windows::Win32::Storage::FileSystem::GetFileType;
 
     // SAFETY: `file` owns a live kernel handle for the duration of the call.
     // `GetFileType` only classifies that handle; it does not read bytes or wait
     // for a pipe peer.
     let kind = unsafe { GetFileType(HANDLE(file.as_raw_handle())) };
-    kind.0 & !FILE_TYPE_REMOTE.0 == FILE_TYPE_DISK.0
+    file_type_is_disk(kind.0)
+}
+
+/// Disk file per Win32 `GetFileType`. `FILE_TYPE_REMOTE` (0x8000) is a flag
+/// or'd onto the type, so a remote disk file is `1 | 0x8000`, not `1`.
+/// `FILE_TYPE_UNKNOWN` (0), pipes (3), and character devices (2) fail closed.
+///
+/// The numeric values are the Win32 constants. The predicate stays out of the
+/// `windows` crate so a Linux test can lock the mask.
+#[cfg(any(windows, test))]
+fn file_type_is_disk(kind: u32) -> bool {
+    const FILE_TYPE_DISK: u32 = 1;
+    const FILE_TYPE_REMOTE: u32 = 0x8000;
+    kind & !FILE_TYPE_REMOTE == FILE_TYPE_DISK
 }
 
 /// Finding lines for a RECORDED content demotion, computed at refusal time.
@@ -788,6 +801,16 @@ mod tests {
     }
 
     #[test]
+    fn file_type_is_disk_accepts_remote_disk_and_rejects_pipes() {
+        assert!(super::file_type_is_disk(1));
+        assert!(super::file_type_is_disk(1 | 0x8000));
+        assert!(!super::file_type_is_disk(2));
+        assert!(!super::file_type_is_disk(3));
+        assert!(!super::file_type_is_disk(3 | 0x8000));
+        assert!(!super::file_type_is_disk(0));
+    }
+
+    #[test]
     fn read_regular_file_reads_bytes_of_a_regular_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("note.txt");
@@ -876,10 +899,7 @@ mod tests {
             use windows::Win32::Storage::FileSystem::{
                 FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_OUTBOUND,
             };
-            use windows::Win32::System::Pipes::{
-                CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-                PIPE_WAIT,
-            };
+            use windows::Win32::System::Pipes::{CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS};
 
             let path = std::path::PathBuf::from(format!(
                 r"\\.\pipe\symforge-read-gate-{}-{label}",
@@ -893,11 +913,14 @@ mod tests {
             // SAFETY: `wide` is NUL-terminated and outlives this call. Default
             // security (null attributes) lets this process open the client end.
             // The returned handle is owned by `IdleOutboundPipe`.
+            // Byte mode and `PIPE_WAIT` are the zero defaults; only the
+            // non-zero mode flag is passed, so a later `| 0` cannot trip
+            // clippy. A synchronous client read of this instance blocks.
             let handle: HANDLE = unsafe {
                 CreateNamedPipeW(
                     windows::core::PCWSTR(wide.as_ptr()),
                     PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    PIPE_REJECT_REMOTE_CLIENTS,
                     1,
                     4096,
                     4096,
@@ -922,9 +945,7 @@ mod tests {
             use windows::Win32::Foundation::CloseHandle;
             // SAFETY: `handle` came from `CreateNamedPipeW` and is closed once,
             // here. Closing it unblocks a client still stuck in `ReadFile`.
-            unsafe {
-                let _ = CloseHandle(self.handle);
-            }
+            unsafe { CloseHandle(self.handle) }.ok();
         }
     }
 }
