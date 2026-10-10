@@ -211,3 +211,87 @@ Remaining differences, with evidence:
 - An idempotent `symforge_edit` replay writes nothing and reports `replayed: true`, but its text is a replay notice, not the original answer: the embedded replay store keeps only response and post-image digests (`ReplayOutcome` in `src/embed/parity/replay.rs`), where MCP's `FileReplayStore` keeps the response text. A same-key conflict refuses with the same class; its text names each store's own request hashes.
 - A facade step whose native lane refuses (for example a missing file) reports the typed refusal as its body (`Error: <tool> refused: <kind>`) with MCP's outcome class, where the MCP primitive renders its own message.
 - The CCR handle a facade search step offloads to lives in the embedded session's CCR store, so its footer hash differs from MCP's for the same bytes.
+
+## Status update: edit answers, replay text and change/query goldens (appended 2026-10-10)
+
+The MCP edit answer is now one shared composition, `guidance::edit_body`, which
+the MCP handlers call and every embedded edit lane renders through. Its four
+parts beyond the operation summary, and where the embedded lanes get them:
+
+- **Tee snapshot.** `Tee::snapshot` copies the original file into
+  `<project state>/tee/<millis>-<counter>-<name>` before the write, and the
+  answer reports `Tee snapshot: ... preserves ...`. Embedded applies already
+  wrote it through the guarded writer into the lane's admitted state directory
+  but dropped the report. The report is now kept, and batch writes tee through
+  `EmbeddedBatchIo::with_tee` as `ProtocolBatchIo` does. An apply needs a durable
+  state directory for replay anyway, so a memory-only source refuses the apply
+  before any tee is due.
+- **Stale-reference warnings.** `replace_symbol_body` only. The signature's
+  first line is compared, and references to the name in other files of the
+  same language are listed. They read the index with the post-image
+  substituted, or the bound index when the edit was rerouted.
+- **Trust suffix.** When the project carries `.symforge/config.toml`, the
+  verdict of the project-config trust store is reported. The embedded lanes
+  read the host's store at
+  `<replay_control_directory>/embed-host/edit-safety/trust.json`, which is
+  the embedded counterpart of MCP's process control state.
+- **Impact footer.** It reports the dependent-file count and the top
+  co-change partners. It reads the post-edit index, MCP's index after
+  `reindex_after_write`, or the bound index for a rerouted edit, as MCP leaves
+  that index untouched.
+
+| Row | Status | Fixture |
+|---|---|---|
+| 32-38 edit tools | FULL: every preview and apply of the seven tools, unrouted, through `EditRoute::render_body` and as routed batches, returns `EditBody` with MCP's bytes. Only the timestamped tee path is compared as `<tee>` | `tests/embed_edit_bodies.rs` (16 cases) and `tests/embed_edit_route.rs` (6 routed cases); MCP goldens `edit_tool_answers_match_embed_parity_golden` in `tests/edit_body_parity.rs` and `routed_edit_answers_match_embed_parity_golden` in `tests/worktree_awareness.rs`; shared fixtures `tests/fixtures/edit_parity/tools.json` and `routed.json` |
+| 40 symforge_edit | FULL: the step body is the lane's MCP answer, and a refused step reports MCP's resolver or edit-within message. The golden now compares the body section | `tests/embed_symforge.rs`; MCP golden `symforge_edit_matches_embed_parity_golden`; `tests/fixtures/stel_facade/edit_parity.json` |
+| 22 what_changed | FULL | `tests/embed_query_goldens.rs`; MCP golden `change_queries_match_embed_parity_golden`; `tests/fixtures/query_parity/changes.json` |
+| 23 diff_symbols | FULL | same |
+| 24 detect_impact | FULL: `DetectImpactResult::rendered` carries MCP's text | same |
+| 25 explore | FULL: `Exploration::rendered` carries MCP's text, including the hidden-noise note and ranking footer | same |
+| 30 ask | FULL: rendered answers for the caller, symbol and tool-help routes | same |
+| repo/changes/uncommitted resource | FULL | same, read through a host room |
+
+MCP output changes, each proven wrong by a test before the fix:
+
+- `batch_edit` and `batch_rename` listed files in hash-map order, so one
+  multi-file batch rendered differently from call to call. They now use path
+  order, as `batch_insert` always has. The proof is
+  `multi_file_batch_edit_lists_files_in_path_order_every_time`, which failed on
+  the old order.
+- `detect_impact` seeded changed symbols from hash-map iteration. Two identical
+  repositories listed them in different orders within one test run. They now
+  follow source order.
+- The tee hint showed a file under the root as absolute when the path was
+  spelled differently from the root: the Windows `\\?\` form, through a
+  pass-through `working_directory` edit. Linux printed it relative, so one
+  shared golden could not hold for both. Both spellings now simplify before
+  the prefix comparison.
+
+Replay (row 40, and the replays of rows 32-38). The response text is not
+stored, and this is a proven limit set by the contract.
+`docs/contracts/embed-replay-v1.md:50` says "`ReplayOutcome` stores only a
+fixed outcome kind, a response digest, and a post-image digest. It never stores
+a response body". Line 57 says "This database is an execution guard, not a
+response cache." A same-key replay therefore answers with a replay notice
+naming the tool, the path and the verified post-image digest. Outcome class and
+bytes still match MCP.
+
+Row census after this batch (59 surfaces): every tool, resource and prompt row
+is FULL with the fixtures recorded in this file. The exceptions are listed
+explicitly:
+
+1. Replay text, rows 32-38 and 40. This is the contract limit above.
+2. The tee snapshot path is timestamped on both sides and compared as `<tee>`.
+   A rerouted embedded edit tees into the routed worktree's own admitted
+   state. MCP tees into the indexed project's state. The answer reports the
+   preserved original identically.
+3. The trust suffix does not read process environment policy: the enforce mode
+   (`SYMFORGE_PROJECT_CONFIG_TRUST_MODE`) and the CI override
+   (`SYMFORGE_TRUST_PROJECT_CONFIG`). This follows the batch constraint against
+   process-global state, as with `SYMFORGE_WORKTREE_AWARE`. Embedded edits
+   therefore never refuse on an untrusted config, and the answer says
+   `mode=LOG_ONLY`. With no host control directory, the store is reported
+   unavailable in MCP's own words.
+4. A routed `batch_rename` reads its impact footer from the routed worktree's
+   post-image index. MCP reads the bound index after reindexing the written
+   files. They agree whenever the untouched files of the two worktrees agree.
