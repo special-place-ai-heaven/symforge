@@ -39,6 +39,8 @@ pub mod capacity;
 #[cfg(feature = "embed")]
 mod embed_batch;
 #[cfg(feature = "embed")]
+mod embed_changes;
+#[cfg(feature = "embed")]
 pub(crate) mod embed_federation;
 #[cfg(feature = "embed")]
 mod embed_file_search;

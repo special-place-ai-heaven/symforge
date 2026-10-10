@@ -994,6 +994,8 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
             super::guidance::filters::parse_language_filter(options.language.as_deref())
                 .map_err(|_| QueryRefusalKind::UnsupportedOption)?;
         }
+        QueryRequest::WhatChanged(input) => super::embed_changes::validate_what_changed(input)?,
+        QueryRequest::DiffSymbols(input) => super::embed_changes::validate_diff_symbols(input)?,
         QueryRequest::Conventions | QueryRequest::ContextInventory => {}
         QueryRequest::InvestigationSuggest { focus } => {
             if focus
@@ -1385,6 +1387,12 @@ fn project(
             .retrieve(snapshot, handle, *offset, budget)
             .map(QueryOutput::RetrievedOutput),
         QueryRequest::Explore(options) => super::embed_guidance::explore(live, options, budget),
+        QueryRequest::WhatChanged(input) => {
+            super::embed_changes::what_changed(snapshot, input, budget)
+        }
+        QueryRequest::DiffSymbols(input) => {
+            super::embed_changes::diff_symbols(snapshot, input, budget)
+        }
         QueryRequest::Conventions => super::embed_guidance::conventions(live, budget),
         QueryRequest::File {
             path,

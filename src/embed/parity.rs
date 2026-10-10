@@ -6,6 +6,7 @@
 //! when resuming; a refresh refuses that continuation instead of mixing rows.
 //! The original V11 facade remains source-compatible.
 
+pub mod changes;
 pub mod edit;
 pub mod federation;
 pub mod guidance;
@@ -98,6 +99,8 @@ pub enum QueryOperationKind {
     ContextInventory,
     InvestigationSuggest,
     Retrieve,
+    WhatChanged,
+    DiffSymbols,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -188,6 +191,10 @@ pub enum QueryRequest {
         handle: String,
         offset: u64,
     },
+    /// Timestamp, working-tree or git-ref change report (MCP `what_changed`).
+    WhatChanged(changes::WhatChangedRequest),
+    /// Repository-wide symbol delta between two refs (MCP `diff_symbols`).
+    DiffSymbols(changes::DiffSymbolsRequest),
 }
 
 impl QueryRequest {
@@ -222,6 +229,8 @@ impl QueryRequest {
             Self::ContextInventory => QueryOperationKind::ContextInventory,
             Self::InvestigationSuggest { .. } => QueryOperationKind::InvestigationSuggest,
             Self::Retrieve { .. } => QueryOperationKind::Retrieve,
+            Self::WhatChanged(_) => QueryOperationKind::WhatChanged,
+            Self::DiffSymbols(_) => QueryOperationKind::DiffSymbols,
         }
     }
 }
@@ -428,4 +437,6 @@ pub enum QueryOutput {
         diff: QuerySymbolDiff,
         dependents: Vec<QueryReference>,
     },
+    WhatChanged(changes::WhatChangedResult),
+    DiffSymbols(changes::DiffSymbolsResult),
 }

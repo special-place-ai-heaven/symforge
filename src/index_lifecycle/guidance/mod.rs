@@ -1,6 +1,5 @@
 //! Transport-independent guidance shared by MCP and embedded hosts.
 
-#[cfg(feature = "server")]
 pub(crate) mod changes;
 pub mod conventions;
 pub(crate) mod exploration;

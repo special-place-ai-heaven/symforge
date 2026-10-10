@@ -856,140 +856,11 @@ pub struct DiffSymbolsInput {
     pub max_tokens: Option<u64>,
 }
 
-enum WhatChangedMode {
-    Timestamp(i64),
-    GitRef(String),
-    Uncommitted,
-}
-
-fn determine_what_changed_mode(
-    input: &WhatChangedInput,
-    has_repo_root: bool,
-) -> Result<WhatChangedMode, String> {
-    if let Some(git_ref) = input
-        .git_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|git_ref| !git_ref.is_empty())
-    {
-        return if has_repo_root {
-            Ok(WhatChangedMode::GitRef(
-                git_ref
-                    .strip_prefix("branch:")
-                    .unwrap_or(git_ref)
-                    .to_string(),
-            ))
-        } else {
-            Err("Git change detection unavailable; pass `since` for timestamp mode.".to_string())
-        };
-    }
-
-    if input.uncommitted.unwrap_or(false) || (input.since.is_none() && has_repo_root) {
-        return if has_repo_root {
-            Ok(WhatChangedMode::Uncommitted)
-        } else {
-            Err("Git change detection unavailable; pass `since` for timestamp mode.".to_string())
-        };
-    }
-
-    if let Some(since) = input.since {
-        Ok(WhatChangedMode::Timestamp(since))
-    } else {
-        Err(
-            "what_changed requires either `since`, `git_ref`, or an available repo root."
-                .to_string(),
-        )
-    }
-}
-
-fn filter_paths_by_prefix_and_language(
-    paths: Vec<String>,
-    path_prefix: Option<&str>,
-    language: Option<&str>,
-    code_only: bool,
-) -> Result<Vec<String>, String> {
-    let lang_filter = parse_language_filter(language)?;
-    let prefix = path_prefix
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            p.replace('\\', "/")
-                .trim_start_matches("./")
-                .trim_start_matches('/')
-                .trim_end_matches('/')
-                .to_string()
-        });
-
-    Ok(paths
-        .into_iter()
-        .filter(|path| {
-            if let Some(ref pfx) = prefix
-                && !path.starts_with(pfx.as_str())
-            {
-                return false;
-            }
-            if let Some(ref lang) = lang_filter {
-                let ext = path.rsplit('.').next().unwrap_or("");
-                if crate::domain::index::LanguageId::from_extension(ext).as_ref() != Some(lang) {
-                    return false;
-                }
-            }
-            if code_only && lang_filter.is_none() {
-                let ext = path.rsplit('.').next().unwrap_or("");
-                match crate::domain::index::LanguageId::from_extension(ext) {
-                    // Recovered finding #3: an unknown extension is not proof of
-                    // "data" — SQL, shell, PowerShell, Proto, Terraform,
-                    // Dockerfile, Makefile are legitimate source SymForge just
-                    // cannot parse. Keep them under code_only.
-                    None => return is_unparsed_source_path(path),
-                    Some(lang) => {
-                        if crate::parsing::config_extractors::is_config_language(&lang) {
-                            return false;
-                        }
-                    }
-                }
-            }
-            true
-        })
-        .collect())
-}
-
-/// Source formats with no `LanguageId` parser that are nonetheless
-/// unambiguously source, not data — they must survive `code_only` filtering
-/// (recovered finding #3). Deliberately small allowlist; extend as real
-/// misclassifications surface.
-fn is_unparsed_source_path(path: &str) -> bool {
-    let file_name = path.rsplit('/').next().unwrap_or(path);
-    let lower = file_name.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "dockerfile" | "makefile" | "gnumakefile" | "justfile"
-    ) {
-        return true;
-    }
-    let Some((_, ext)) = lower.rsplit_once('.') else {
-        return false;
-    };
-    matches!(
-        ext,
-        "sql"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "ps1"
-            | "psm1"
-            | "psd1"
-            | "bat"
-            | "cmd"
-            | "proto"
-            | "tf"
-            | "tfvars"
-            | "cmake"
-            | "gradle"
-            | "dockerfile"
-    )
-}
-
+use crate::index_lifecycle::guidance::changes::{
+    WhatChangedMode, WhatChangedOptions, changed_paths_completeness_label,
+    determine_what_changed_mode, filter_paths_by_prefix_and_language, search_paths_evidence,
+    what_changed_parse_state_label, what_changed_scope_summary, what_changed_source_authority,
+};
 use crate::index_lifecycle::guidance::file_search::normalize_exact_path;
 
 /// Find up to 5 similar file paths for "file not found" suggestions.
@@ -1562,18 +1433,6 @@ fn search_symbols_evidence(result: &search::SymbolSearchResult) -> String {
         .map(|hit| format!("{}:{}", hit.path, hit.line))
         .collect();
     anchored_search_evidence(anchors, "symbol anchors")
-}
-
-fn search_paths_evidence<'a, I>(paths: I) -> String
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    let anchors = paths
-        .into_iter()
-        .take(3)
-        .map(std::borrow::ToOwned::to_owned)
-        .collect();
-    anchored_search_evidence(anchors, "paths")
 }
 
 fn normalize_untracked_search_path(raw: &str) -> String {
@@ -2185,80 +2044,6 @@ use crate::index_lifecycle::guidance::exploration::{
     concept_text_query_matches_on_boundary, explore_path_penalty,
 };
 
-fn changed_paths_completeness_label(before_filter: usize, after_filter: usize) -> String {
-    if before_filter == after_filter {
-        "full for current scope".to_string()
-    } else {
-        format!("full for filtered scope ({after_filter} of {before_filter} path(s) shown)")
-    }
-}
-
-fn what_changed_scope_summary(input: &WhatChangedInput, mode: &WhatChangedMode) -> String {
-    let mut parts = Vec::new();
-    match mode {
-        WhatChangedMode::Timestamp(since_ts) => parts.push(format!("timestamp since `{since_ts}`")),
-        WhatChangedMode::Uncommitted => parts.push("uncommitted working tree".to_string()),
-        WhatChangedMode::GitRef(git_ref) => {
-            parts.push(format!("git diff from `{git_ref}` to `HEAD`"))
-        }
-    }
-    if let Some(path_prefix) = input
-        .path_prefix
-        .as_deref()
-        .filter(|prefix| !prefix.trim().is_empty())
-    {
-        parts.push(format!(
-            "path prefix `{}`",
-            normalize_exact_path(path_prefix)
-        ));
-    }
-    if let Some(language) = input.language.as_deref() {
-        parts.push(format!("language `{language}`"));
-    }
-    // US1 (018) III trust: disclose the code-only filter whenever it is
-    // actually applied. Uncommitted mode now defaults it on (FR-001), so the
-    // effective default is mode-scoped and must match the handler's sites.
-    let code_only_default = matches!(mode, WhatChangedMode::Uncommitted);
-    if input.code_only.unwrap_or(code_only_default) {
-        parts.push("code-only filter".to_string());
-    }
-    if input.include_symbol_diff.unwrap_or(false) {
-        parts.push("symbol diff appended".to_string());
-    }
-    parts.join("; ")
-}
-
-fn what_changed_source_authority(
-    mode: &WhatChangedMode,
-    freshness: &crate::domain::FreshnessStatus,
-) -> search_format::SourceAuthority {
-    match mode {
-        // T045: the Timestamp arm used to assert the literal "current index",
-        // collapsing the envelope regardless of measured freshness — the same
-        // forgeable-axis defect as the context lane, closed the same way.
-        WhatChangedMode::Timestamp(_) => search_format::SourceAuthority::from_freshness(freshness),
-        WhatChangedMode::Uncommitted => {
-            search_format::SourceAuthority::never_collapse("git working tree")
-        }
-        WhatChangedMode::GitRef(_) => {
-            search_format::SourceAuthority::never_collapse("git ref diff")
-        }
-    }
-}
-
-fn what_changed_parse_state_label(
-    mode: &WhatChangedMode,
-    include_symbol_diff: bool,
-) -> &'static str {
-    match mode {
-        WhatChangedMode::Timestamp(_) => "parsed",
-        _ if include_symbol_diff => {
-            "degraded (git path diff + lexical symbol diff — regex extraction may miss nested symbols)"
-        }
-        _ => "not-applicable (git path diff)",
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn render_diff_symbols_output(
     base: &str,
@@ -2273,41 +2058,16 @@ fn render_diff_symbols_output(
     language: Option<&str>,
     code_only: bool,
 ) -> String {
-    let mut scope_parts = vec![format!("git diff `{base}`...`{target}`")];
-    if let Some(path_prefix) = path_prefix.filter(|prefix| !prefix.trim().is_empty()) {
-        scope_parts.push(format!(
-            "path prefix `{}`",
-            normalize_exact_path(path_prefix)
-        ));
-    }
-    if let Some(language) = language {
-        scope_parts.push(format!("language `{language}`"));
-    }
-    if code_only {
-        scope_parts.push("code-only filter".to_string());
-    }
-    if compact {
-        scope_parts.push("compact output".to_string());
-    }
-    if summary_only {
-        scope_parts.push("summary-only output".to_string());
-    }
-    let completeness = if changed_files.len() == all_changed_files {
-        "full for filtered git delta".to_string()
-    } else {
-        format!(
-            "full for filtered git delta ({} of {} changed file(s) shown)",
-            changed_files.len(),
-            all_changed_files
-        )
-    };
-    let envelope = search_format::format_search_envelope(
-        "exact (git ref diff)",
-        search_format::SourceAuthority::never_collapse("git ref diff"),
-        "high (tree-sitter AST extraction for supported languages, regex fallback for others)",
-        &completeness,
-        &scope_parts.join("; "),
-        &search_paths_evidence(changed_files.iter().copied()),
+    let envelope = crate::index_lifecycle::guidance::changes::diff_symbols_envelope(
+        base,
+        target,
+        all_changed_files,
+        changed_files,
+        compact,
+        summary_only,
+        path_prefix,
+        language,
+        code_only,
     );
     let output = format::diff_symbols_result_view(
         base,
@@ -6478,12 +6238,10 @@ impl SymForgeServer {
             return refusal;
         }
         if params.0.estimate == Some(true) {
-            let with_diff = params.0.include_symbol_diff.unwrap_or(false);
-            let est = if with_diff { 500 } else { 200 };
-            return format!(
-                "Estimate for what_changed: ~{} tokens (include_symbol_diff={})",
-                est, with_diff
-            );
+            return crate::index_lifecycle::guidance::changes::what_changed_estimate(
+                params.0.include_symbol_diff.unwrap_or(false),
+            )
+            .1;
         }
         let effective_repo_root = self.effective_repo_root_for_git_tools();
         let requested_git_mode = params.0.uncommitted.unwrap_or(false)
@@ -6508,7 +6266,16 @@ impl SymForgeServer {
             };
             return format!("No repo root attached; {attach} or pass since=...");
         }
-        let mode = match determine_what_changed_mode(&params.0, effective_repo_root.is_some()) {
+        let options = WhatChangedOptions {
+            since: params.0.since,
+            git_ref: params.0.git_ref.as_deref(),
+            uncommitted: params.0.uncommitted,
+            path_prefix: params.0.path_prefix.as_deref(),
+            language: params.0.language.as_deref(),
+            code_only: params.0.code_only,
+            include_symbol_diff: params.0.include_symbol_diff,
+        };
+        let mode = match determine_what_changed_mode(&options, effective_repo_root.is_some()) {
             Ok(mode) => mode,
             Err(message) => return message,
         };
@@ -6551,7 +6318,7 @@ impl SymForgeServer {
                                         view.paths.len(),
                                         filtered.len(),
                                     ),
-                                    &what_changed_scope_summary(&params.0, &mode),
+                                    &what_changed_scope_summary(&options, &mode),
                                     &search_paths_evidence(
                                         filtered.iter().map(|path| path.as_str()),
                                     ),
@@ -6642,7 +6409,7 @@ impl SymForgeServer {
                                     ),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, filtered.len()),
-                                    &what_changed_scope_summary(&params.0, &mode),
+                                    &what_changed_scope_summary(&options, &mode),
                                     &search_paths_evidence(
                                         filtered.iter().map(|path| path.as_str()),
                                     ),
@@ -6723,7 +6490,7 @@ impl SymForgeServer {
                                     ),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, filtered.len()),
-                                    &what_changed_scope_summary(&params.0, &mode),
+                                    &what_changed_scope_summary(&options, &mode),
                                     &search_paths_evidence(
                                         filtered.iter().map(|path| path.as_str()),
                                     ),
@@ -10005,19 +9772,11 @@ impl SymForgeServer {
             return refusal;
         }
         if params.0.estimate == Some(true) {
-            let compact = params.0.compact.unwrap_or(false);
-            let summary = params.0.summary_only.unwrap_or(false);
-            let est = if summary {
-                50
-            } else if compact {
-                200
-            } else {
-                500
-            };
-            return format!(
-                "Estimate for diff_symbols: ~{} tokens (compact={}, summary_only={})",
-                est, compact, summary
-            );
+            return crate::index_lifecycle::guidance::changes::diff_symbols_estimate(
+                params.0.compact.unwrap_or(false),
+                params.0.summary_only.unwrap_or(false),
+            )
+            .1;
         }
         let base = params.0.base.as_deref().unwrap_or("main");
         let target = params.0.target.as_deref().unwrap_or("HEAD");
@@ -10045,41 +9804,17 @@ impl SymForgeServer {
         };
 
         // Apply path_prefix + language filter
-        let lang_filter = match parse_language_filter(params.0.language.as_deref()) {
-            Ok(f) => f,
-            Err(e) => return e,
-        };
         let code_only = params.0.code_only.unwrap_or(false);
-        let changed_files: Vec<&str> = changed_files_owned
-            .iter()
-            .map(|s| s.as_str())
-            .filter(|p| {
-                if let Some(ref prefix) = params.0.path_prefix
-                    && !p.starts_with(prefix.as_str())
-                {
-                    return false;
-                }
-                if let Some(ref lang) = lang_filter {
-                    let ext = p.rsplit('.').next().unwrap_or("");
-                    if crate::domain::index::LanguageId::from_extension(ext).as_ref() != Some(lang)
-                    {
-                        return false;
-                    }
-                }
-                if code_only && lang_filter.is_none() {
-                    let ext = p.rsplit('.').next().unwrap_or("");
-                    match crate::domain::index::LanguageId::from_extension(ext) {
-                        None => return false,
-                        Some(lang) => {
-                            if crate::parsing::config_extractors::is_config_language(&lang) {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                true
-            })
-            .collect();
+        let changed_files =
+            match crate::index_lifecycle::guidance::changes::filter_diff_symbol_paths(
+                &changed_files_owned,
+                params.0.path_prefix.as_deref(),
+                params.0.language.as_deref(),
+                code_only,
+            ) {
+                Ok(paths) => paths,
+                Err(e) => return e,
+            };
 
         if changed_files.is_empty() {
             return format!("No file changes found between {base} and {target}.");

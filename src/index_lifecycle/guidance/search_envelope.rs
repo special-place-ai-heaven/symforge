@@ -43,7 +43,6 @@ impl SourceAuthority {
     /// An authority that never collapses the envelope: disk-refreshed reads,
     /// composite stores, git-object diffs. The label is display only and
     /// cannot buy the compact banner, whatever it says.
-    #[cfg(any(feature = "server", test))]
     pub(crate) fn never_collapse(label: &'static str) -> Self {
         Self {
             label,

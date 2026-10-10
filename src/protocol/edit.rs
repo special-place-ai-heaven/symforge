@@ -23,39 +23,11 @@ pub(crate) fn safe_repo_path(repo_root: &Path, relative_path: &str) -> Result<Pa
         .ok_or_else(|| format!("cannot resolve path '{relative_path}': not found on disk"))
 }
 
-/// Leading text of the refusal for a spelling that reaches a file whose
-/// on-disk name is different. Callers match on it to surface the hint.
-pub(crate) const PATH_SPELLING_DIFFERS: &str = "path spelling differs from the on-disk name";
-
-/// [`crate::discovery::resolve_repo_path`] with its refusal rendered as the
-/// caller-facing message. `Ok(None)` means nothing exists at that spelling.
-pub(crate) fn resolve_repo_path(
-    repo_root: &Path,
-    relative_path: &str,
-) -> Result<Option<PathBuf>, String> {
-    use crate::discovery::PathRefusal;
-    crate::discovery::resolve_repo_path(repo_root, relative_path).map_err(|refusal| match refusal {
-        PathRefusal::OutsideRoot => format!("path '{relative_path}' is outside the repository"),
-        PathRefusal::Unresolvable(message) => message,
-        PathRefusal::WindowsAlias => format!(
-            "path '{relative_path}' is an alias spelling on Windows (a ':' stream \
-             suffix or a trailing dot or space); use the file's own name"
-        ),
-        // The refusal the on-disk name gets from the read gate.
-        PathRefusal::CredentialAlias(rule_id) => {
-            crate::protocol::format::content_withheld_by_path_rule(relative_path, rule_id)
-        }
-        PathRefusal::SpellingDiffers(None) => PATH_SPELLING_DIFFERS.to_string(),
-        PathRefusal::SpellingDiffers(Some(canonical)) => {
-            format!("{PATH_SPELLING_DIFFERS}; retry with `{canonical}`")
-        }
-    })
-}
-
-/// [`resolve_repo_path`] for lanes that only need its verdict.
-pub(crate) fn refuse_path_alias(repo_root: &Path, relative_path: &str) -> Result<(), String> {
-    resolve_repo_path(repo_root, relative_path).map(|_| ())
-}
+/// The refusal-rendering resolver and its spelling-hint prefix live with the
+/// shared read gate so the embedded lanes confine paths identically.
+pub(crate) use crate::index_lifecycle::guidance::read_gate::{
+    PATH_SPELLING_DIFFERS, resolve_repo_path,
+};
 
 // Shared structural byte planning for MCP and embedded edits.
 #[cfg(test)]

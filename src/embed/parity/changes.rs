@@ -72,4 +72,3 @@ pub struct DiffSymbolsResult {
     pub rendered: String,
     pub estimated_tokens: Option<u64>,
 }
-

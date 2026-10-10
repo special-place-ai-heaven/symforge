@@ -42,7 +42,7 @@ use crate::live_index::{
 };
 use crate::live_index::{
     FileOutlineView, HealthStats, IndexLoadSource, IndexedFile, LiveIndex, PublishedIndexState,
-    RepoOutlineFileView, RepoOutlineView, SnapshotVerifyState, WhatChangedTimestampView, search,
+    RepoOutlineFileView, RepoOutlineView, SnapshotVerifyState, search,
 };
 use crate::protocol::surface_probe::{SurfaceProfile, connection_surface_or_env};
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
@@ -2045,18 +2045,6 @@ pub fn what_changed_result(index: &LiveIndex, since_ts: i64) -> String {
     what_changed_timestamp_view(&view, since_ts)
 }
 
-pub fn what_changed_timestamp_view(view: &WhatChangedTimestampView, since_ts: i64) -> String {
-    if since_ts < view.loaded_secs {
-        // Entire index is newer — list all files
-        if view.paths.is_empty() {
-            return "Index is empty — no files tracked.".to_string();
-        }
-        view.paths.join("\n")
-    } else {
-        "No changes detected since last index load.".to_string()
-    }
-}
-
 /// Render `detect_impact`'s JSON payload wrapped in a short plain-text
 /// summary. MCP tool responses here are always text, never raw JSON (house
 /// convention — see `tools.rs` module doc); the exact contract shape
@@ -2110,35 +2098,12 @@ pub fn detect_impact_result(
     out
 }
 
+pub(crate) use crate::index_lifecycle::guidance::changes::{
+    what_changed_paths_result, what_changed_timestamp_view,
+};
 /// Fix 3 (Wave 1): cap the changed/uncommitted-path listing. On a large repo the
 /// working-tree listing reached ~100 KB of raw paths; bound it and disclose the
 /// omitted count with the house truncation marker.
-const WHAT_CHANGED_MAX_PATHS: usize = 200;
-
-pub fn what_changed_paths_result(paths: &[String], empty_message: &str) -> String {
-    let mut normalized_paths: Vec<String> =
-        paths.iter().map(|path| path.replace('\\', "/")).collect();
-    normalized_paths.sort();
-    normalized_paths.dedup();
-
-    if normalized_paths.is_empty() {
-        return empty_message.to_string();
-    }
-
-    let total = normalized_paths.len();
-    if total > WHAT_CHANGED_MAX_PATHS {
-        let omitted = total - WHAT_CHANGED_MAX_PATHS;
-        normalized_paths.truncate(WHAT_CHANGED_MAX_PATHS);
-        let mut out = normalized_paths.join("\n");
-        out.push_str(&format!(
-            "\n{CANONICAL_TRUNCATION_MARKER} {WHAT_CHANGED_MAX_PATHS} of {total} paths shown; {omitted} more omitted."
-        ));
-        return out;
-    }
-
-    normalized_paths.join("\n")
-}
-
 pub use crate::index_lifecycle::guidance::search_render::search_files_resolve_result_view;
 
 pub fn search_files(index: &LiveIndex, query: &str, limit: usize) -> String {

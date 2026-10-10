@@ -66,7 +66,7 @@ pub fn resolve_generation_bytes<'a>(
 ///
 /// Confinement refuses BEFORE any read. Lexically, an absolute path, a drive or
 /// root prefix, or any `..` component is an escape however it is spelled. On
-/// disk, [`crate::protocol::edit::refuse_path_alias`] refuses a symlink that
+/// disk, [`crate::index_lifecycle::guidance::read_gate::refuse_disk_spelling`] refuses a symlink that
 /// resolves outside the root and any spelling whose resolved name differs.
 /// The refusal never carries the escaped content.
 // ponytail: resolve-then-read, not open-by-handle — a link swapped in between
@@ -116,31 +116,23 @@ fn observe_beneath(
     disk_read(live, relative_path, &full_path, name_lines)
 }
 
-/// The on-disk half of the gate's confinement, shared by both disk-reading
-/// entries. It refuses any spelling the shared resolver refuses: an escape
-/// through a symlink, or another spelling of a file. It also refuses VCS and
-/// runtime-state internals (`.git`, `.symforge`), which the cold walk never
-/// reads either.
-fn refuse_disk_spelling(root: &Path, relative_path: &str) -> Result<(), String> {
-    crate::protocol::edit::refuse_path_alias(root, relative_path)?;
-    if let Some(refusal) = hard_scope_refusal(relative_path) {
-        return Err(refusal);
-    }
-    if let Some(rule_id) =
-        crate::knowledge::sensitive_path_rule_at(relative_path, &root.join(relative_path))
-    {
-        return Err(format::content_withheld_by_path_rule(
-            relative_path,
-            rule_id,
-        ));
-    }
-    Ok(())
-}
-
 /// The refusal for a path under VCS or runtime-state internals (`.git`,
 /// `.symforge`). Lexical and case-insensitive, so it needs no filesystem call
 /// and answers the same whether or not the path exists.
 pub(crate) use crate::index_lifecycle::guidance::read_gate::hard_scope_refusal;
+
+/// The on-disk half of the gate's confinement, shared with the embedded lanes.
+use crate::index_lifecycle::guidance::read_gate::refuse_disk_spelling;
+
+#[cfg(test)]
+use crate::index_lifecycle::guidance::read_gate::file_type_is_disk;
+#[cfg(all(test, windows))]
+use crate::index_lifecycle::guidance::read_gate::open_for_gate_read;
+/// Regular-file reads that cannot block on a FIFO, socket, or device; the
+/// shared gate owns them so the embedded lanes read through the same door.
+#[cfg(test)]
+use crate::index_lifecycle::guidance::read_gate::read_regular_file;
+use crate::index_lifecycle::guidance::read_gate::read_regular_file_limited;
 
 /// Working-tree text for `relative_path`, admitted by [`admit_disk_read`].
 ///
@@ -184,21 +176,14 @@ fn worktree_text(
     relative_path: &str,
     name_lines: bool,
 ) -> Result<Option<String>, String> {
-    let Some(workdir) = repo.workdir() else {
-        return Err("bare repository has no working directory".to_string());
-    };
-    let full_path = workdir.join(relative_path);
-    if !full_path.is_file() {
-        return Ok(None);
-    }
-    // `is_file` follows links, so a tracked symlink to a file outside the work
-    // tree reaches here; the resolved spelling decides before the read.
-    refuse_disk_spelling(workdir, relative_path)?;
     // The gate owns the read: it classifies the exact buffer it just read and
     // returns it only on a permit, so no lane can classify one set of bytes and
     // then render another.
-    let bytes = disk_read(live, relative_path, &full_path, name_lines)?;
-    Ok(String::from_utf8(bytes).ok())
+    crate::index_lifecycle::guidance::read_gate::worktree_text_with(
+        repo,
+        relative_path,
+        &mut |full_path| disk_read(live, relative_path, full_path, name_lines),
+    )
 }
 
 /// Predict — WITHOUT reading any bytes — whether [`admit_disk_read`] would
@@ -298,105 +283,6 @@ fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Optio
     })
 }
 
-/// Bytes of a regular file, or an error that did not block.
-///
-/// FIFO, socket, and device opens block until a peer appears. `symlink_metadata`
-/// refuses those before `open`. On Unix the open itself is `O_NONBLOCK`, so a
-/// replacement between the check and the open cannot hang the caller either.
-/// On Windows `is_file` is true for a named pipe and for a character device
-/// (`CON`, `COM1`, …). `CreateFile` on a listening pipe returns immediately —
-/// `ReadFile` is what blocks — and `open_for_gate_read` refuses a non-disk
-/// handle before that read. Symlinks are not followed: `symlink_metadata` sees
-/// the link, not its target.
-pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    read_regular_file_limited(path, None)
-}
-
-fn read_regular_file_limited(path: &Path, limit: Option<u64>) -> std::io::Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    let mut file = open_for_gate_read(path)?;
-    if !file.metadata().is_ok_and(|opened| opened.is_file()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    let mut bytes = Vec::new();
-    if let Some(limit) = limit {
-        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, limit), &mut bytes)?;
-    } else {
-        std::io::Read::read_to_end(&mut file, &mut bytes)?;
-    }
-    Ok(bytes)
-}
-
-fn open_for_gate_read(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-    }
-    #[cfg(windows)]
-    {
-        // `FILE_FLAG_OVERLAPPED` would make a later `std::fs::File` read fail
-        // (`ERROR_INVALID_PARAMETER`); std does not drive overlapped I/O. The
-        // open itself does not wait for a pipe peer — classify the handle and
-        // refuse anything that is not a disk file before the caller reads.
-        let file = std::fs::File::open(path)?;
-        if !windows_handle_is_disk_file(&file) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
-        Ok(file)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        std::fs::File::open(path)
-    }
-}
-
-/// `GetFileType` of an opened handle, ignoring `FILE_TYPE_REMOTE`.
-///
-/// Fail closed: `FILE_TYPE_UNKNOWN` (the failure return) is not a disk file.
-/// A remote disk file is `FILE_TYPE_DISK | FILE_TYPE_REMOTE` and still passes.
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn windows_handle_is_disk_file(file: &std::fs::File) -> bool {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::GetFileType;
-
-    // SAFETY: `file` owns a live kernel handle for the duration of the call.
-    // `GetFileType` only classifies that handle; it does not read bytes or wait
-    // for a pipe peer.
-    let kind = unsafe { GetFileType(HANDLE(file.as_raw_handle())) };
-    file_type_is_disk(kind.0)
-}
-
-/// Disk file per Win32 `GetFileType`. `FILE_TYPE_REMOTE` (0x8000) is a flag
-/// or'd onto the type, so a remote disk file is `1 | 0x8000`, not `1`.
-/// `FILE_TYPE_UNKNOWN` (0), pipes (3), and character devices (2) fail closed.
-///
-/// The numeric values are the Win32 constants. The predicate stays out of the
-/// `windows` crate so a Linux test can lock the mask.
-#[cfg(any(windows, test))]
-fn file_type_is_disk(kind: u32) -> bool {
-    const FILE_TYPE_DISK: u32 = 1;
-    const FILE_TYPE_REMOTE: u32 = 0x8000;
-    kind & !FILE_TYPE_REMOTE == FILE_TYPE_DISK
-}
-
 /// Finding lines for a RECORDED content demotion, computed at refusal time.
 ///
 /// The manifest records the verdict (rule ids, count) but not where the
@@ -440,31 +326,8 @@ fn recorded_finding_evidence(
     )
 }
 
-/// Admit bytes the caller ALREADY HOLDS — a git blob, not a disk read.
-///
-/// The disk lane and the git-object lane differ in exactly one step: where the
-/// bytes come from. Policy (path rule, recorded disposition) and content
-/// classification are identical, so they live here and both lanes share them.
-///
-/// This exists because `diff_symbols` gated its working-tree read and left the
-/// two `file_at_ref` reads beside it ungated, which disclosed a demoted file's
-/// symbol names and signatures out of git objects. A lane that holds repository
-/// bytes must admit them, whatever object store they came from.
-pub(crate) fn admit_bytes(
-    live: &LiveIndex,
-    relative_path: &str,
-    bytes: Vec<u8>,
-) -> Result<Vec<u8>, String> {
-    if let Some(refusal) = refuse_by_policy(live, relative_path) {
-        return Err(refusal);
-    }
-    if let Some(refusal) = classify_admitted_bytes(live, relative_path, &bytes) {
-        return Err(refusal);
-    }
-    Ok(bytes)
-}
-
-/// Text for `relative_path` as of `git_ref`, admitted by [`admit_bytes`].
+/// Text for `relative_path` as of `git_ref`, admitted by the shared gate's
+/// byte admission (`admit_bytes_with`).
 ///
 /// The gated replacement for a bare `GitRepo::file_at_ref` in a disclosure
 /// lane. Return shape MIRRORS `file_at_ref` so refusal stays distinguishable
@@ -479,15 +342,14 @@ pub(crate) fn admit_git_text(
     relative_path: &str,
 ) -> Result<Option<String>, String> {
     // Policy first: a path-ruled file is refused without touching the object
-    // store at all.
-    if let Some(refusal) = refuse_by_policy(live, relative_path) {
-        return Err(refusal);
-    }
-    let Some(text) = repo.file_at_ref(git_ref, relative_path)? else {
-        return Ok(None);
-    };
-    let admitted = admit_bytes(live, relative_path, text.into_bytes())?;
-    Ok(String::from_utf8(admitted).ok())
+    // store at all. The shared gate owns that order and the classification.
+    crate::index_lifecycle::guidance::read_gate::admit_git_text_with(
+        live,
+        repo,
+        git_ref,
+        relative_path,
+        &mut crate::protocol::withheld::record_pending_withheld,
+    )
 }
 
 /// Read `canon_path` and return its bytes only if the file is admissible for
@@ -526,34 +388,17 @@ fn disk_read(
     // Secret dismissals need no override here: every publication route
     // classifies with them applied, so a fully dismissed file is recorded
     // admitted, not demoted, and never reaches this refusal.
-    if let Some(refusal) = refuse_by_policy(live, relative_path) {
-        return Err(if name_lines {
-            recorded_refusal_naming_lines(live, relative_path).unwrap_or(refusal)
-        } else {
-            refusal
-        });
-    }
-
-    // The one read, and the classification of exactly those bytes. Required
-    // even when the manifest is clean or says Indexed: a clean manifest cannot
-    // authorize bytes that changed after it was published. Regular files only:
-    // a FIFO, socket, or device must not block the gate.
-    let bytes = match read_regular_file(canon_path) {
-        Ok(bytes) => bytes,
-        Err(e) => return Err(format!("{relative_path} [error: could not read file: {e}]")),
-    };
-    if let Some(refusal) = classify_admitted_bytes(live, relative_path, &bytes) {
-        return Err(refusal);
-    }
-    Ok(bytes)
-}
-
-/// Classify bytes the gate is holding. `None` admits them.
-fn classify_admitted_bytes(live: &LiveIndex, relative_path: &str, bytes: &[u8]) -> Option<String> {
-    crate::index_lifecycle::guidance::read_gate::classify_admitted_bytes_with(
+    crate::index_lifecycle::guidance::read_gate::disk_read_with(
         live,
         relative_path,
-        bytes,
+        canon_path,
+        &mut || {
+            if name_lines {
+                recorded_refusal_naming_lines(live, relative_path)
+            } else {
+                None
+            }
+        },
         &mut crate::protocol::withheld::record_pending_withheld,
     )
 }
