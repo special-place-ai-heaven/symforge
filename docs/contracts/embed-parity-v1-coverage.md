@@ -6,10 +6,10 @@ As of 2026-10-10. Local unpublished work against SymForge 11.5.6. API additions 
 
 | Standalone capability | Native path / required parity | Current verification |
 |---|---|---|
-| health | Source-bound health, counts, snapshot verification and trust | Basic native host fixture passes; complete recovery metadata pending |
-| health_compact | Same health state, compact presentation | Complete compact projection pending |
+| health | Source-bound health, counts, snapshot verification and trust | `HostRequest::HealthReport` renders the shared `guidance::health` report the MCP handler calls, with quarantine paging; daemon, sidecar, hook, binary and worktree-misuse sections are reported not applicable. Proven by `tests/embed_health.rs` and the MCP golden `health_quarantine_paging_matches_embed_parity_golden` |
+| health_compact | Same health state, compact presentation | `HostRequest::HealthCompact` renders the shared compact projection. Proven by `tests/embed_health.rs` and the same MCP golden |
 | status | Loading/current/blocked progress without false current claim | Host fixture passes; full standalone comparison pending |
-| index_folder | Admitted source open/reset, refresh and lifecycle controls | Existing V11 binding baseline passes; full operation options pending |
+| index_folder | Admitted source open/reset, refresh and lifecycle controls | `EmbeddedOpenOptions` carries `allow_protected_root`, `reset_snapshot_state` and the replay control directory; `HostRequest::RefreshWith` carries the in-place reset and `idempotency_key` through the shared replay engine. `add` is explicit federation over separately opened sources. Proven by `tests/embed_index_folder.rs` |
 | checkpoint_now | Shared writer, resolved state placement, verification and source-move outcome | Native verified checkpoint fixture passes; race/recovery coverage pending |
 | analyze_file_impact | Real disk change admission/reindex and impact, with explicit observations | Captured source vs local Git fixture passes; complete disk workflow pending |
 | detect_impact | Complete repository change/dependency analysis | Pending shared native projection |
@@ -52,7 +52,7 @@ The default 39-tool inventory and additional enabled remediation/compact facade 
 
 ## Resources and prompts
 
-The library/service contract must expose equivalent admitted semantics for repository health, outline, map, uncommitted changes, tool catalog and glossary; file-context/content and symbol-detail/context resource templates; and all eight shipped admin, review, architecture, triage, onboard, refactor, debug and knowledge-hygiene prompts. The eighth prompt was confirmed by the actual installed MCP inventory; the older AGENTS list contains seven. Shared content and request validation must remain aligned with MCP. These paths are assigned and pending; static names alone are not resource/prompt parity.
+The library/service contract must expose equivalent admitted semantics for repository health, outline, map, uncommitted changes, tool catalog and glossary; file-context/content and symbol-detail/context resource templates; and all eight shipped admin, review, architecture, triage, onboard, refactor, debug and knowledge-hygiene prompts. The eighth prompt was confirmed by the actual installed MCP inventory; the older AGENTS list contains seven. Shared content and request validation must remain aligned with MCP. These paths are assigned and pending; static names alone are not resource/prompt parity. Repository health, tool catalog and glossary now render the shared MCP text, proven by `tests/embed_health.rs`.
 
 ## Additional native capabilities
 

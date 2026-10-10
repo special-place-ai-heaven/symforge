@@ -95,3 +95,17 @@ says "pending"; that is understated.
 - `tests/embed_parity.rs` cannot compile: `ExploreRequest` lacks estimate and max_tokens.
 - Dead tracked files: `src/embed/parity/{ask,changes,detect_impact}.rs`, `src/index_lifecycle/embed_ask.rs`.
 - `examples/embed_room_consumer` uses public API only by inspection (default-features=false, features=["embed"], own [workspace]). Not built in this audit.
+
+## Status update: class A plumbing batch (appended 2026-10-10)
+
+This file is append-only, so the rows above keep their audit-time status. The
+following rows moved from PARTIAL to FULL on branch `feat/embed-parity-v2`.
+
+| Row | Status | Fixture |
+|---|---|---|
+| 1 health | FULL (daemon, sidecar, hook, binary and worktree-misuse sections reported not applicable) | `tests/embed_health.rs`; MCP golden `health_quarantine_paging_matches_embed_parity_golden` |
+| 2 health_compact | FULL | `tests/embed_health.rs` |
+| 4 index_folder | FULL (`add` covered by federation) | `tests/embed_index_folder.rs` |
+| repo/health resource | FULL | `tests/embed_health.rs` |
+| tools/catalog resource | FULL | `tests/embed_health.rs` |
+| glossary resource | FULL | `tests/embed_health.rs` |
