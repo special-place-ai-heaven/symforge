@@ -1103,10 +1103,12 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // stale protocol/knowledge_curation.rs row is removed. The eight other
 // embed/parity children (parity, host, edit, knowledge, federation, session,
 // read, reference) were rerouted through src/embed.rs and hold zero edges.
+// Refreshed for the embed-cell clippy/cfg cleanup (collapsed ifs, an elided
+// lifetime, a type alias, &Path params, one allow); no new boundary edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "b131d6409e146c024e72c2abf1cc0a96c85521e86d7db26e662e76839f6e1f38",
+    "850547834e09893eddd92229ca3cf3a05c8ca56528a90dd992413412f0f5dfb2",
     75,
-    1_759_735,
+    1_759_421,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1246,10 +1248,11 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // stale protocol/knowledge_curation.rs row is removed. The eight other
 // embed/parity children (parity, host, edit, knowledge, federation, session,
 // read, reference) were rerouted through src/embed.rs and hold zero edges.
+// Refreshed for the embed-cell clippy/cfg cleanup and stale unix test removal; no new boundary edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8a3adec647dd184e55354862de8d7def1c97e59bebde81e50b0d5d51f98e3a50",
+    "bb1ce29ed5272fcb6ccb0e78728023841748e555e1211102640601dd35d27e59",
     295,
-    11_557_887,
+    11_556_055,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
