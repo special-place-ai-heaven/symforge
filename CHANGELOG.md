@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.6.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.6...v11.6.0) (2026-10-10)
+
+
+### Features
+
+* **embed:** native parity v1 lanes, shared replay gate and regression fixes ([#778](https://github.com/special-place-ai-heaven/symforge/issues/778)) ([368ec43](https://github.com/special-place-ai-heaven/symforge/commit/368ec439e6a50ae9148f341ed06273e0bbe69620))
+
 ## [11.5.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.5...v11.5.6) (2026-10-07)
 
 
