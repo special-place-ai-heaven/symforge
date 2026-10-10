@@ -305,7 +305,7 @@ fn render_routed(request: &QueryRequest, output: &QueryOutput) -> Result<String,
                     })
                     .collect(),
             };
-            search_render::search_text_result_view(
+            let mut rendered = search_render::search_text_result_view(
                 Ok(rows),
                 None,
                 None,
@@ -315,7 +315,12 @@ fn render_routed(request: &QueryRequest, output: &QueryOutput) -> Result<String,
                     include_tests: request.include_tests.unwrap_or(false),
                     multi_word_literal: !value.regex && query.trim().contains(char::is_whitespace),
                 },
-            )
+            );
+            super::guidance::search::append_untracked_file_diagnostic(
+                &mut rendered,
+                &value.untracked_paths,
+            );
+            rendered
         }
         (QueryRequest::FileSearch(request), QueryOutput::FileSearch(value)) => {
             use crate::live_index::{SearchFilesHit, SearchFilesTier as Tier, SearchFilesView};

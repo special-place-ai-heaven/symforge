@@ -13,6 +13,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use symforge::embed::parity::read::{FileContentRequest, ReadAuthority, SourcePageRequest};
+use symforge::embed::parity::search::TextSearchRequest;
 use symforge::embed::parity::{QueryLimits, QueryOutput, QueryRefusalKind, QueryRequest};
 use symforge::embed::{
     EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase,
@@ -21,6 +22,13 @@ use symforge::embed::{
 /// Shared with the MCP goldens.
 const INDEXED_SYNTAX_GOLDEN: &str = "Syntax validation: src/broken.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn broken( {` (line 1, column 1)\nByte span: 0..16\nSymbols extracted: 0";
 const UNINDEXED_SYNTAX_GOLDEN: &str = "Syntax validation: ignored/scratch.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn scratch( {` (line 1, column 1)\nByte span: 0..17\nSymbols extracted: 0";
+
+/// MCP's sweep diagnostic for one late untracked file.
+fn sweep_golden(path: &str) -> String {
+    format!(
+        "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"{path}\", new_file=true)."
+    )
+}
 
 fn open(runtime: &ProcessIndexRuntime, root: &Path) -> EmbeddedSourceHandle {
     let handle = runtime
@@ -176,5 +184,49 @@ fn syntax_reparses_unindexed_disk_bytes_and_refuses_with_mcp_metadata() {
         })
         .collect();
     assert_eq!(lines, vec![(2, 2, "secret.context-assignment")]);
+    handle.close().unwrap();
+}
+
+#[test]
+fn zero_hit_text_search_sweeps_matching_untracked_files_like_mcp() {
+    let root = tempfile::tempdir().unwrap();
+    git2::Repository::init(root.path()).unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/lib.rs"), "pub fn indexed() {}\n").unwrap();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+
+    // A file written after capture stays unknown to the publication until the
+    // background worker's next poll publishes it, so each attempt uses a new
+    // file and is judged only when the search really was zero-hit.
+    let mut swept = false;
+    for attempt in 0..20 {
+        let path = format!("src/late_{attempt}.rs");
+        let needle = format!("late_needle_{attempt}");
+        fs::write(
+            root.path().join(&path),
+            format!("fn late() {{ let _ = \"{needle}\"; }}\n"),
+        )
+        .unwrap();
+        let QueryOutput::TextSearch(result) = query_current(
+            &handle,
+            &QueryRequest::TextSearch(TextSearchRequest {
+                query: Some(needle),
+                ..Default::default()
+            }),
+        ) else {
+            panic!("text search");
+        };
+        if result.total_matches > 0 {
+            assert!(result.untracked_paths.is_empty());
+            assert_eq!(result.untracked_diagnostic, None);
+            continue;
+        }
+        assert_eq!(result.untracked_paths, vec![path.clone()]);
+        assert_eq!(result.untracked_diagnostic, Some(sweep_golden(&path)));
+        swept = true;
+        break;
+    }
+    assert!(swept, "no attempt observed a zero-hit search");
     handle.close().unwrap();
 }

@@ -466,9 +466,9 @@ pub(crate) fn compact_tool_output_is_success(tool: &str, text: &str) -> bool {
     classify_compact_tool_output(tool, text) == OutcomeClass::Found
 }
 
+use crate::domain::LanguageId;
 /// Deserialize a required `u32` from either a JSON number or a stringified number.
 use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkipReason};
-use crate::domain::{FileClassification, LanguageId};
 use crate::live_index::qualified_usages;
 use crate::live_index::{
     IndexedFile, SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
@@ -1223,14 +1223,6 @@ fn untracked_path_has_component(path: &str, component: &str) -> bool {
         .any(|part| part.eq_ignore_ascii_case(component))
 }
 
-fn language_for_path(path: &str) -> Option<LanguageId> {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .and_then(|extension| LanguageId::from_extension(&extension))
-}
-
 fn untracked_common_path_filters_allow(
     path: &str,
     include_vendor: bool,
@@ -1238,41 +1230,6 @@ fn untracked_common_path_filters_allow(
 ) -> bool {
     (include_vendor || !crate::live_index::query::is_vendor_path(path))
         && (include_personal_tooling || !crate::live_index::query::is_personal_tooling_path(path))
-}
-
-/// The untracked paths `live` does not know.
-///
-/// `live` is the caller's CAPTURED publication — the same bundle that produced
-/// the response beside this verdict — so "not in the index" cannot disagree
-/// with the rows the receipt names. Taking a `&LiveIndex` rather than the
-/// server is what enforces that: this function has no route to
-/// `SharedIndexHandle`, so a second, later read is a compile error rather than
-/// something a reviewer has to catch.
-fn untracked_paths_not_in_index(repo: &crate::git::GitRepo, live: &LiveIndex) -> Vec<String> {
-    let Ok(mut paths) = repo.untracked_paths() else {
-        return Vec::new();
-    };
-
-    paths.retain(|path| live.get_file(path).is_none());
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-fn untracked_file_diagnostic(paths: &[String]) -> Option<String> {
-    let first = paths.first()?;
-    Some(format!(
-        "untracked file may match: {} untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"{}\", new_file=true).",
-        paths.len(),
-        first
-    ))
-}
-
-fn append_untracked_file_diagnostic(output: &mut String, paths: &[String]) {
-    if let Some(diagnostic) = untracked_file_diagnostic(paths) {
-        output.push_str("\n\n");
-        output.push_str(&diagnostic);
-    }
 }
 
 fn untracked_path_matches_search_files_query(path: &str, query: &str) -> bool {
@@ -1361,111 +1318,11 @@ fn matching_untracked_paths_for_search_files(
         .collect()
 }
 
-fn untracked_text_path_allowed(path: &str, options: &search::TextSearchOptions) -> bool {
-    let classification = FileClassification::for_code_path(path);
-    options.path_scope.matches(path)
-        && options.search_scope.allows(&classification)
-        && options.noise_policy.allows(&classification)
-        && (options.noise_policy.include_vendor || !crate::live_index::query::is_vendor_path(path))
-        && (options.include_personal_tooling
-            || !crate::live_index::query::is_personal_tooling_path(path))
-        && options
-            .language_filter
-            .as_ref()
-            .is_none_or(|language| language_for_path(path).as_ref() == Some(language))
-        && untracked_text_globs_allow(path, options)
-}
-
-fn untracked_text_globs_allow(path: &str, options: &search::TextSearchOptions) -> bool {
-    let include_matches = match options.glob.as_deref() {
-        Some(pattern) => globset::GlobBuilder::new(pattern)
-            .literal_separator(false)
-            .build()
-            .map(|glob| glob.compile_matcher().is_match(path))
-            .unwrap_or(false),
-        None => true,
-    };
-    let exclude_matches = match options.exclude_glob.as_deref() {
-        Some(pattern) => globset::GlobBuilder::new(pattern)
-            .literal_separator(false)
-            .build()
-            .map(|glob| glob.compile_matcher().is_match(path))
-            .unwrap_or(false),
-        None => false,
-    };
-    include_matches && !exclude_matches
-}
-
-fn whole_word_contains(haystack: &str, needle: &str) -> bool {
-    haystack.match_indices(needle).any(|(idx, matched)| {
-        let before_is_word = haystack[..idx]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| ch == '_' || ch.is_alphanumeric());
-        let after_idx = idx + matched.len();
-        let after_is_word = haystack[after_idx..]
-            .chars()
-            .next()
-            .is_some_and(|ch| ch == '_' || ch.is_alphanumeric());
-        !before_is_word && !after_is_word
-    })
-}
-
-fn untracked_text_matches(
-    content: &str,
-    query: Option<&str>,
-    terms: Option<&[String]>,
-    is_regex: bool,
-    options: &search::TextSearchOptions,
-) -> bool {
-    let case_sensitive = options.case_sensitive.unwrap_or(is_regex);
-    if is_regex {
-        let Some(pattern) = query.map(str::trim).filter(|pattern| !pattern.is_empty()) else {
-            return false;
-        };
-        return regex::RegexBuilder::new(pattern)
-            .case_insensitive(!case_sensitive)
-            .build()
-            .map(|regex| regex.is_match(content))
-            .unwrap_or(false);
-    }
-
-    let normalized_terms: Vec<&str> = match terms {
-        Some(raw_terms) if !raw_terms.is_empty() => raw_terms
-            .iter()
-            .map(|term| term.trim())
-            .filter(|term| !term.is_empty())
-            .collect(),
-        _ => query
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(|text| vec![text])
-            .unwrap_or_default(),
-    };
-    if normalized_terms.is_empty() {
-        return false;
-    }
-
-    if case_sensitive {
-        if options.whole_word {
-            normalized_terms
-                .iter()
-                .any(|term| whole_word_contains(content, term))
-        } else {
-            normalized_terms.iter().any(|term| content.contains(term))
-        }
-    } else {
-        let lowered = content.to_lowercase();
-        normalized_terms.iter().any(|term| {
-            let lowered_term = term.to_lowercase();
-            if options.whole_word {
-                whole_word_contains(&lowered, &lowered_term)
-            } else {
-                lowered.contains(&lowered_term)
-            }
-        })
-    }
-}
+use crate::index_lifecycle::guidance::search::{
+    append_untracked_file_diagnostic,
+    matching_untracked_paths_for_search_text as shared_untracked_text_sweep,
+    untracked_paths_not_in_index,
+};
 
 fn matching_untracked_paths_for_search_text(
     server: &SymForgeServer,
@@ -1486,23 +1343,10 @@ fn matching_untracked_paths_for_search_text(
         return Vec::new();
     };
 
-    // The caller's own regex is evaluated against this content, so an anchored
-    // pattern recovers a refused file character by character from nothing but
-    // which paths come back. The gate runs BEFORE any matching: a refusal drops
-    // the path from the sweep entirely, disclosing neither content nor
-    // existence-by-match.
-    untracked_paths_not_in_index(&repo, live)
-        .into_iter()
-        .filter(|path| untracked_text_path_allowed(path, options))
-        .filter(|path| {
-            crate::protocol::read_gate::admit_worktree_text_without_lines(live, &repo, path)
-                .ok()
-                .flatten()
-                .is_some_and(|content| {
-                    untracked_text_matches(&content, query, terms, is_regex, options)
-                })
-        })
-        .collect()
+    // The gate runs BEFORE any matching; see the shared sweep.
+    shared_untracked_text_sweep(&repo, live, query, terms, is_regex, options, &mut |path| {
+        crate::protocol::read_gate::admit_worktree_text_without_lines(live, &repo, path)
+    })
 }
 
 struct AdmissionDegradationView {
@@ -14440,6 +14284,34 @@ mod tests {
             })
             .collect();
         assert_eq!(lines, vec![(2, 2, "secret.context-assignment")]);
+    }
+
+    /// MCP side of the embed untracked-sweep golden
+    /// (`tests/embed_disk_parity.rs`): a zero-hit search over a publication
+    /// that does not know a late untracked file names it.
+    #[tokio::test]
+    async fn search_text_untracked_sweep_matches_embed_parity_golden() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("src");
+        fs::write(repo.path().join("src/lib.rs"), "pub fn indexed() {}\n").expect("lib");
+        let server = embed_parity_server(repo.path());
+        fs::write(
+            repo.path().join("src/late_0.rs"),
+            "fn late() { let _ = \"late_needle_0\"; }\n",
+        )
+        .expect("late");
+        let rendered = server
+            .search_text(Parameters(
+                serde_json::from_value(serde_json::json!({ "query": "late_needle_0" }))
+                    .expect("input"),
+            ))
+            .await;
+        assert!(
+            rendered.ends_with(
+                "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"src/late_0.rs\", new_file=true)."
+            ),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

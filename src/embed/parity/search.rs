@@ -153,4 +153,12 @@ pub struct TextSearchResult {
     pub ranked: bool,
     pub auto_detected_regex: bool,
     pub auto_corrected_regex: bool,
+    /// MCP `search_text`'s zero-hit untracked sweep: untracked paths unknown
+    /// to the publication whose admitted bytes match the query. Empty unless
+    /// the search returned no rows and suppressed none as noise.
+    #[serde(default)]
+    pub untracked_paths: Vec<String>,
+    /// The exact diagnostic line MCP appends for [`Self::untracked_paths`].
+    #[serde(default)]
+    pub untracked_diagnostic: Option<String>,
 }
