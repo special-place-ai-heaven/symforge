@@ -2,7 +2,7 @@
 //! surface over the planner, economics, ledger and calibration runtime the
 //! MCP handlers run, routed to this source's native lanes.
 
-pub use crate::index_lifecycle::guidance::outcome::OutcomeClass;
+pub use crate::embed::lifecycle::guidance::outcome::OutcomeClass;
 pub use crate::stel::types::{
     IntentBucket, StelEditIntent, StelEditOp, StelEditRequest, StelRequest, StelStatusDetail,
     StelStatusRequest,
