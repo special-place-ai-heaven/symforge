@@ -480,6 +480,15 @@ const WIRED_PRODUCTION_FILES: &[&str] = &[
     "src/embed/parity/replay.rs",
     // Carries the shared reconciliation gate.
     "src/protocol/secret_remediate.rs",
+    // Embed parity v2: protocol re-exports of the shared guidance engine.
+    "src/protocol/edit_format.rs",
+    "src/protocol/edit_plan.rs",
+    "src/protocol/result_status.rs",
+    // Embed parity v2: STEL modules made feature-neutral, delegating to the shared runtime.
+    "src/stel/controller.rs",
+    "src/stel/executor.rs",
+    "src/stel/planner.rs",
+    "src/stel/runtime.rs",
 ];
 
 /// The frozen publication_roots census (C4): the state structs that retired
@@ -1014,7 +1023,9 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/embed_batch.rs",
     "index_lifecycle/embed_changes.rs",
     "index_lifecycle/embed_detect_impact.rs",
+    "index_lifecycle/embed_edit_body.rs",
     "index_lifecycle/embed_federation.rs",
+    "index_lifecycle/embed_file_impact.rs",
     "index_lifecycle/embed_file_search.rs",
     "index_lifecycle/embed_git.rs",
     "index_lifecycle/embed_git_config.rs",
@@ -1029,25 +1040,37 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/embed_reference.rs",
     "index_lifecycle/embed_remediation.rs",
     "index_lifecycle/embed_restore.rs",
+    "index_lifecycle/embed_route.rs",
     "index_lifecycle/embed_search.rs",
     "index_lifecycle/embed_session.rs",
+    "index_lifecycle/embed_stel.rs",
     "index_lifecycle/embed_symbol.rs",
     "index_lifecycle/embed_symbol_context.rs",
+    "index_lifecycle/embed_symforge.rs",
+    "index_lifecycle/embed_symforge_edit.rs",
+    "index_lifecycle/embed_temporal.rs",
     "index_lifecycle/embed_usage.rs",
     "index_lifecycle/embed_wire_edit.rs",
     "index_lifecycle/embedded.rs",
     "index_lifecycle/guidance/changes.rs",
     "index_lifecycle/guidance/compression.rs",
     "index_lifecycle/guidance/conventions.rs",
+    "index_lifecycle/guidance/edit_body.rs",
+    "index_lifecycle/guidance/edit_plan.rs",
+    "index_lifecycle/guidance/edit_route.rs",
     "index_lifecycle/guidance/exploration.rs",
     "index_lifecycle/guidance/explore.rs",
+    "index_lifecycle/guidance/file_impact.rs",
     "index_lifecycle/guidance/file_read.rs",
     "index_lifecycle/guidance/file_search.rs",
     "index_lifecycle/guidance/filters.rs",
+    "index_lifecycle/guidance/freshen.rs",
+    "index_lifecycle/guidance/health.rs",
     "index_lifecycle/guidance/impact.rs",
     "index_lifecycle/guidance/investigation.rs",
     "index_lifecycle/guidance/knowledge_model.rs",
     "index_lifecycle/guidance/mod.rs",
+    "index_lifecycle/guidance/outcome.rs",
     "index_lifecycle/guidance/read_admission_format.rs",
     "index_lifecycle/guidance/read_context.rs",
     "index_lifecycle/guidance/read_contract.rs",
@@ -1105,10 +1128,16 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // read, reference) were rerouted through src/embed.rs and hold zero edges.
 // Refreshed for the embed-cell clippy/cfg cleanup (collapsed ifs, an elided
 // lifetime, a type alias, &Path params, one allow); no new boundary edge.
+// Refreshed for embed parity v2 (PR to follow): excluded set 75 -> 89 files. NEW edges into
+// src/index_lifecycle exist and the owner accepted them; the roster gains
+// seven files. Protocol re-exports of the shared guidance engine:
+// protocol/{edit_format,edit_plan,result_status}.rs. STEL modules made
+// feature-neutral and delegating to the shared runtime:
+// stel/{controller,executor,planner,runtime}.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "850547834e09893eddd92229ca3cf3a05c8ca56528a90dd992413412f0f5dfb2",
-    75,
-    1_759_421,
+    "71dbff62b55c3470648c1fc5dbbbd24000c22bd5104b78f2135ee59825fde065",
+    89,
+    2_157_501,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1250,10 +1279,16 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // read, reference) were rerouted through src/embed.rs and hold zero edges.
 // Refreshed for the embed-cell clippy/cfg cleanup, stale unix test removal, and canonical-root
 // test comparisons for 8.3 short-name TEMP; no new boundary edge.
+// Refreshed for embed parity v2 (PR to follow): 295 -> 312 files. NEW edges into
+// src/index_lifecycle exist and the owner accepted them; the roster gains
+// seven files. Protocol re-exports of the shared guidance engine:
+// protocol/{edit_format,edit_plan,result_status}.rs. STEL modules made
+// feature-neutral and delegating to the shared runtime:
+// stel/{controller,executor,planner,runtime}.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "0248f6647b95daf73511227a14c68072e54de6b3055658049327a87ffa531551",
-    295,
-    11_556_486,
+    "3a0a8ce6b911b4f08dbf523ccba97b1aa914a7708e108311eadf4d9ce60adb32",
+    312,
+    11_840_186,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
