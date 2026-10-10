@@ -122,3 +122,18 @@ Red embed-cell fixtures, root causes (2026-10-10):
 
 - `tests/embed_host.rs` `wire_dispatch_is_source_bound_and_refuses_untrusted_lifecycle_requests` asserted `file-content` in the catalog's static resources. MCP lists it as a resource template, and the catalog already mirrors that, so the assertion was corrected to the template list. Green.
 - `tests/embed_git_isolated_config.rs` (two tests) is blocked, not fixed. `PreparedGitView::repository` (`src/index_lifecycle/embed_git.rs:28-36`) and the fixture open the repository with libgit2 open flag `1 << 5`, described as supplied by "the pinned local libgit2 patch". No such patch exists: `Cargo.toml` `[patch.crates-io]` carries no `libgit2-sys` entry and `vendor/` has no libgit2. Upstream libgit2 ignores the unknown flag, so global config, attributes and excludes are still read; `prepare_git_view` refuses `InvalidRepository` on a malformed global include, and the raw open still sees global attributes. Making it pass needs a vendored, patched `libgit2-sys`, which is a vendor and dependency change.
+
+## Status update: edit family and recorded deviations (appended 2026-10-10)
+
+| Row | Status | Fixture |
+|---|---|---|
+| 31 edit_plan | FULL: `QueryRequest::EditPlan { target }` renders the shared `guidance::edit_plan` plan (moved verbatim from `protocol::edit_plan` and `protocol::format::edit_impact_summary`) for symbol, `path::name`, `Type::method` and file targets | `tests/embed_edit_plan.rs`; MCP golden `edit_plan_matches_embed_parity_golden` |
+| 32-38 edit tools | `working_directory` wired: `route_edit` resolves only against a host-admitted `AdmittedEditTarget` list, checks the git common dir from each admitted root's own `.git`, and reports MCP's `working_directory`/`rerouted`/`wrote_to`/`indexed_path` through the shared suffix renderer | `tests/embed_edit_route.rs` |
+| 6 validate_file_syntax | Not-Current deviation closed: `validate_syntax_from_disk` returns a `DiskSyntaxObservation` with no publication identity | `tests/embed_disk_parity.rs` |
+| 22 what_changed | `max_tokens` deviation closed: uncommitted mode only, 0 is uncapped | `tests/embed_changes.rs` |
+
+Remaining differences, with evidence:
+
+- `edit_plan` co-change lines need Ready git temporal data. Embed never computes it: `spawn_git_temporal_computation` has callers only in server modules, and its `load_commits` (`src/live_index/git_temporal.rs:713`) shells out to `git log`. A restored publication that carries temporal data renders the line.
+- A batch whose per-action overrides route different files into different sources has no embed equivalent. MCP stages every file into one rollback transaction; an embedded batch commits under one source root and one replay store (`src/index_lifecycle/embed_batch.rs:665` and `:678`). Batches routed wholly into one admitted worktree work by rebasing each guard.
+- The `SYMFORGE_WORKTREE_AWARE` policy is not read, because it is process-global environment. The host's admitted list is the routing policy.
