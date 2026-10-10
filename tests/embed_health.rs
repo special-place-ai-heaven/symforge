@@ -234,7 +234,7 @@ fn health_report_pages_quarantine_and_reports_process_sections_as_not_applicable
 fn health_report_renders_frecency_section_when_enabled() {
     const NAME: &str = "health_report_renders_frecency_section_when_enabled";
     if std::env::var("SYMFORGE_FRECENCY").as_deref() != Ok("1") {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = symforge::process_util::hidden_command(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--test-threads=1"])
             .env("SYMFORGE_FRECENCY", "1")
             .status()
