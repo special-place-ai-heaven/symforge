@@ -33,15 +33,7 @@ pub(super) fn load_admitted_snapshot(
     authority: &ProjectSourceAuthority,
 ) -> Result<Option<RestoredEmbeddedSeed>, EmbedRestoreRefusal> {
     let dismissal_digest = || {
-        authority
-            .with_source_anchor_read(|lease| {
-                super::physical_root::read_regular_beneath(
-                    lease,
-                    Path::new(".symforge/secret-dismissals.json"),
-                    crate::knowledge::secret_dismissals::DISMISSAL_STORE_MAX_BYTES as usize,
-                )
-            })
-            .map(|bytes| bytes.map_or_else(String::new, |bytes| crate::hash::digest_hex(&bytes)))
+        persist::admitted_dismissal_store_digest(authority)
             .map_err(|_| EmbedRestoreRefusal::SourceMoved)
     };
     authority

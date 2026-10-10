@@ -2013,19 +2013,7 @@ pub(crate) fn load_snapshot_bound(
     state_placement: &StatePlacement,
     authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
 ) -> Result<Option<IndexSnapshot>, BoundRestoreRefusal> {
-    let dismissal_bytes = authority
-        .with_source_anchor_read(|lease| {
-            crate::index_lifecycle::physical_root::read_regular_beneath(
-                lease,
-                Path::new(".symforge/secret-dismissals.json"),
-                crate::knowledge::secret_dismissals::DISMISSAL_STORE_MAX_BYTES as usize,
-            )
-        })
-        .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
-    let dismissal_digest = dismissal_bytes
-        .as_deref()
-        .map(crate::hash::digest_hex)
-        .unwrap_or_default();
+    let dismissal_digest = admitted_dismissal_store_digest(authority)?;
     let snapshot = load_snapshot_with_dismissal_digest(project_root, state_placement, || {
         Some(dismissal_digest)
     });
@@ -2033,6 +2021,39 @@ pub(crate) fn load_snapshot_bound(
         .verify_physical_root_anchor()
         .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
     Ok(snapshot)
+}
+
+/// Digest of the dismissal store read through the admitted source anchor,
+/// with the same classes as [`crate::knowledge::secret_dismissals::dismissal_store_digest`]:
+/// empty when absent, the refused marker when the store cannot be read as a
+/// bounded regular file (a non-directory `.symforge`, a link, an oversize or
+/// unreadable file), else the content digest. Only a revoked lease or a failed
+/// anchor is `SourceMoved`: one unreadable file beneath the root is not
+/// evidence that the root itself was replaced.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn admitted_dismissal_store_digest(
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<String, BoundRestoreRefusal> {
+    use crate::index_lifecycle::physical_root::RootRefusal;
+    use crate::knowledge::secret_dismissals as dismissals;
+    authority
+        .with_source_anchor_read(|lease| {
+            match crate::index_lifecycle::physical_root::read_regular_beneath(
+                lease,
+                Path::new(dismissals::DISMISSAL_STORE_REL),
+                dismissals::DISMISSAL_STORE_MAX_BYTES as usize,
+            ) {
+                Ok(bytes) => Ok(bytes
+                    .as_deref()
+                    .map(crate::hash::digest_hex)
+                    .unwrap_or_default()),
+                Err(RootRefusal::LeaseRevoked) => Err(RootRefusal::LeaseRevoked),
+                // The same marker `dismissal_store_digest` records for a
+                // refused store, so a snapshot taken under it still matches.
+                Err(_) => Ok("refused".to_string()),
+            }
+        })
+        .map_err(|_| BoundRestoreRefusal::SourceMoved)
 }
 
 #[cfg(feature = "embed")]
@@ -5179,6 +5200,36 @@ mod tests {
         std::fs::rename(&replacement, &root).unwrap();
         let proof = run_snapshot_store_restore_proof_bound(&snapshot, &root, &retained_authority);
         assert_eq!(proof, Err(BoundRestoreRefusal::SourceMoved));
+    }
+
+    /// A dismissal store that cannot be read (here `.symforge` is a regular file,
+    /// the fixture daemon tests use to block project-local state) is a refused
+    /// store, classified fail-closed. It is not a moved source root; only a real
+    /// root replacement may refuse the restore as `SourceMoved`.
+    #[test]
+    fn admitted_dismissal_digest_refuses_store_not_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("source");
+        let replacement = tmp.path().join("replacement");
+        for directory in [&root, &replacement] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join(".symforge"), b"not a directory").unwrap();
+        }
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+        assert_eq!(
+            admitted_dismissal_store_digest(&authority),
+            Ok("refused".to_string()),
+            "an unreadable dismissal store must not read as a moved root"
+        );
+
+        std::fs::rename(&root, tmp.path().join("displaced")).unwrap();
+        std::fs::rename(&replacement, &root).unwrap();
+        assert_eq!(
+            admitted_dismissal_store_digest(&authority),
+            Err(BoundRestoreRefusal::SourceMoved),
+            "a replaced root must still refuse"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
