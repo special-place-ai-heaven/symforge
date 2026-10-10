@@ -60,6 +60,19 @@ pub const SYMFORGE_INDEX_SNAPSHOT_QUARANTINE_DIR_PATH: &str =
 /// contracts/team-artifact.md § Integrity failure.
 pub const SYMFORGE_ARTIFACT_QUARANTINE_DIR_PATH: &str = ".symforge/quarantine/artifacts";
 
+/// Display spelling of a path: separators normalized to `/` on Windows.
+pub(crate) fn normalized_path_text(path_text: &str, windows: bool) -> String {
+    if windows {
+        path_text.replace('\\', "/")
+    } else {
+        path_text.to_string()
+    }
+}
+
+pub(crate) fn normalized_path_string(path: &Path) -> String {
+    normalized_path_text(&dunce::simplified(path).to_string_lossy(), cfg!(windows))
+}
+
 /// OS isolation tag for per-process runtime files (sidecar/daemon port/pid/session).
 ///
 /// This is a pure compile-time constant baked into the binary from its build

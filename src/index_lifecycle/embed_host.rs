@@ -5,9 +5,9 @@ use std::sync::Arc;
 use crate::domain::{CapabilityStatus, SourceAccessMode, StatePlacement};
 use crate::embed::parity::host::{
     HostArtifactOutcome, HostCheckpointOutcome, HostCheckpointReceipt, HostEngineIdentity,
-    HostHealth, HostLimits, HostPhase, HostProgress, HostPublishedHealth, HostRefusal,
-    HostRefusalKind, HostSourceProof, HostStateLocation, HostStatus, HostVerifyPhase,
-    OperationControl, map_stop,
+    HostHealth, HostHealthNotApplicable, HostHealthProjection, HostHealthReport, HostHealthRequest,
+    HostLimits, HostPhase, HostProgress, HostPublishedHealth, HostRefusal, HostRefusalKind,
+    HostSourceProof, HostStateLocation, HostStatus, HostVerifyPhase, OperationControl, map_stop,
 };
 use crate::live_index::store::SnapshotVerifyState;
 
@@ -80,6 +80,153 @@ pub(crate) fn health(
         None
     };
     HostHealth { status, current }
+}
+
+/// Health sections the MCP server observes from its own process. An embedded
+/// host has none of these processes; each is reported with its reason.
+const EMBEDDED_PROCESS_SECTIONS: &[(&str, &str)] = &[
+    (
+        "daemon_degradation",
+        "no daemon: the embedded host serves its source in-process",
+    ),
+    (
+        "project_mismatch",
+        "no caller-declared MCP root: the host binds its source explicitly",
+    ),
+    ("sidecar", "embedded hosts run no hook sidecar process"),
+    (
+        "token_savings",
+        "hook token savings are recorded by the sidecar process",
+    ),
+    (
+        "tool_call_counts",
+        "per-tool call counts are recorded by the sidecar process",
+    ),
+    (
+        "hook_adoption",
+        "hook adoption describes MCP client hook installs, not a library host",
+    ),
+];
+const EMBEDDED_WORKTREE: (&str, &str) = (
+    "worktree_misuse",
+    "embedded edit requests carry no working_directory",
+);
+const EMBEDDED_BINARY_SECTIONS: &[(&str, &str)] = &[
+    (
+        "version_drift",
+        "version drift compares installed server binaries",
+    ),
+    (
+        "path_shadow",
+        "PATH shadow compares installed server binaries",
+    ),
+];
+const EMBEDDED_WATCHER: (&str, &str) = (
+    "filesystem_watcher",
+    "no notify watcher is attached; the embedded observer polls the source tree and republishes on change",
+);
+
+/// MCP `health` / `health_compact` parity: the typed health plus the report
+/// rendered by the same shared assembler the MCP handlers call.
+pub(crate) fn health_report(
+    source: &EmbeddedSourceHandle,
+    room_id: &str,
+    engine: &HostEngineIdentity,
+    projection: HostHealthProjection,
+    request: &HostHealthRequest,
+) -> HostHealthReport {
+    use super::guidance::health as shared;
+
+    let health = health(source, room_id, engine);
+    let mut not_applicable: Vec<HostHealthNotApplicable> = EMBEDDED_PROCESS_SECTIONS
+        .iter()
+        .chain(std::iter::once(&EMBEDDED_WORKTREE))
+        .chain(EMBEDDED_BINARY_SECTIONS)
+        .chain(std::iter::once(&EMBEDDED_WATCHER))
+        .map(|(section, reason)| HostHealthNotApplicable {
+            section: (*section).to_owned(),
+            reason: (*reason).to_owned(),
+        })
+        .collect();
+    let report = source
+        .capture_health_context()
+        .map(|(shared_index, root, placement)| {
+            // T046: one capture of the published set for the whole report.
+            let source_set = shared_index.published_source_set();
+            let generation = source_set.current_generation();
+            let runtime_status = shared::RuntimeStatus {
+                mode: shared::RuntimeMode::Embedded,
+                project_root: Some(crate::paths::normalized_path_string(&root)),
+                project_id: crate::discovery::project_id_for_canonical_root(&root).0,
+                session_id: format!("embedded-room-{room_id}"),
+                index_generation: generation.health.generation,
+                project_generation: generation.project_generation,
+                reset_project_generation: shared_index.current_reset_project_generation(),
+                load_source: generation.health.load_source,
+            };
+            let persistence = if placement.directory().is_some() {
+                CapabilityStatus::Available
+            } else {
+                CapabilityStatus::Unavailable {
+                    reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+                }
+            };
+            let watcher = crate::watcher_state::WatcherInfo::default();
+            let inputs =
+                shared::HealthReportInputs {
+                    source_set: &source_set,
+                    watcher: &watcher,
+                    rejected_stale_mutations: shared_index.current_rejected_stale_mutations(),
+                    runtime_status: &runtime_status,
+                    repo_root: Some(&root),
+                    placement: Some(&placement),
+                    persistence,
+                    session_is_daemon: false,
+                    worktree_routing: format!("not_applicable ({})", EMBEDDED_WORKTREE.1),
+                    curation_health:
+                        crate::knowledge::curation::KnowledgeCurationCoordinator::default()
+                            .health_line(&shared_index, Some(&root), Some(&placement), persistence),
+                };
+            let not_applicable_lines = |sections: &[(&str, &str)]| {
+                sections
+                    .iter()
+                    .map(|(section, reason)| {
+                        format!(
+                            "
+{section}: not_applicable ({reason})"
+                        )
+                    })
+                    .collect::<String>()
+            };
+            let process = shared::HealthProcessSections {
+                after_runtime: not_applicable_lines(EMBEDDED_PROCESS_SECTIONS),
+                worktree_misuse: Err(EMBEDDED_WORKTREE.1),
+                trailing: not_applicable_lines(EMBEDDED_BINARY_SECTIONS),
+            };
+            match projection {
+                HostHealthProjection::Full => shared::render_health_report(
+                    &inputs,
+                    shared::QuarantineWindow::from_args(
+                        request.quarantine_offset.map(|n| n as usize),
+                        request.quarantine_limit.map(|n| n as usize),
+                    ),
+                    &process,
+                ),
+                HostHealthProjection::Compact => shared::render_health_compact(&inputs, &process),
+            }
+        });
+    if report.is_none() {
+        not_applicable.push(HostHealthNotApplicable {
+            section: "report".to_owned(),
+            reason: "the source is closed; no bound data plane was captured".to_owned(),
+        });
+    }
+    HostHealthReport {
+        health,
+        projection,
+        report,
+        not_applicable,
+    }
 }
 
 fn state_location(placement: &StatePlacement) -> HostStateLocation {

@@ -1558,6 +1558,25 @@ impl EmbeddedSourceHandle {
         })
     }
 
+    /// Health capture: the bound data plane, root and placement in ANY live
+    /// phase. Health reports Loading/Blocked state from the published set like
+    /// the MCP handler; it never answers a query, so it needs no Current claim.
+    #[cfg(feature = "embed")]
+    pub(super) fn capture_health_context(
+        &self,
+    ) -> Option<(crate::live_index::SharedIndex, PathBuf, StatePlacement)> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let binding = self.binding.as_ref()?;
+        let index = binding.runtime.acquire().ok()?;
+        Some((
+            Arc::clone(index),
+            binding.root.clone(),
+            binding.state_placement.clone(),
+        ))
+    }
+
     /// Internal curation context. A read capture is insufficient to authorize
     /// apply: the coordinator must separately require host authority and its
     /// own durability, review and mutation fences.

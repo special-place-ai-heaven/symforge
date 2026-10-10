@@ -26,10 +26,7 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{
-    CouplingPreparePolicy, FrecencyCollectionPolicy, RankingDiagnosticsPolicy,
-    WorktreeRoutingPolicy,
-};
+use crate::capability::WorktreeRoutingPolicy;
 use crate::protocol::result_status::{OutcomeClass, ResultStatus};
 
 #[cfg(test)]
@@ -1153,158 +1150,12 @@ fn search_files_match_type_label(view: &SearchFilesView) -> &'static str {
     }
 }
 
-use crate::index_lifecycle::guidance::file_search::{
-    ranking_diagnostics_policy_from_env, search_files_ranking_explanation,
-};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CapabilityStatusReport {
-    frecency: String,
-    co_change: String,
-    worktree_routing: String,
-    ranking_diagnostics: String,
-}
-
-impl CapabilityStatusReport {
-    fn full_text(&self) -> String {
-        format!(
-            "Capabilities:\n  frecency: {}\n  co-change: {}\n  worktree routing: {}\n  ranking diagnostics: {}",
-            self.frecency, self.co_change, self.worktree_routing, self.ranking_diagnostics
-        )
-    }
-
-    fn compact_text(&self) -> String {
-        format!(
-            "Capabilities: frecency={}; co-change={}; worktree={}; ranking={}",
-            self.frecency, self.co_change, self.worktree_routing, self.ranking_diagnostics
-        )
-    }
-}
-
-fn frecency_health_status(
-    repo_root: Option<&Path>,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-) -> String {
-    if repo_root.is_none() {
-        return "unavailable/no-repository-root".to_string();
-    }
-    let has_persistent_history = project_state
-        .map(crate::live_index::frecency::frecency_db_path)
-        .is_some_and(|path| path.is_file());
-    match crate::live_index::frecency::collection_policy_from_env() {
-        FrecencyCollectionPolicy::Disabled => "disabled by policy".to_string(),
-        FrecencyCollectionPolicy::Session => {
-            if has_persistent_history {
-                "ready/session+persistent".to_string()
-            } else {
-                "ready/session/no-history fallback-used-on-empty".to_string()
-            }
-        }
-        FrecencyCollectionPolicy::Persistent => {
-            if project_state.is_none() {
-                return "unavailable/no-project-state-owner".to_string();
-            }
-            if has_persistent_history {
-                "ready/persistent".to_string()
-            } else {
-                "ready/persistent/no-history fallback-used-on-empty".to_string()
-            }
-        }
-    }
-}
-
-fn cochange_store_health_status(
-    store: &crate::live_index::coupling::CouplingStore,
-    repo_root: &Path,
-) -> String {
-    match store.cold_built_at() {
-        Ok(Some(_)) => {}
-        Ok(None) => return "preparing/cold-build-pending fallback-used-on-request".to_string(),
-        Err(error) => return format!("unavailable/store-build-state-error ({error})"),
-    }
-
-    let stored_head = match store.last_head() {
-        Ok(Some(head)) => head,
-        Ok(None) => return "preparing/no-head-recorded fallback-used-on-request".to_string(),
-        Err(error) => return format!("unavailable/store-head-state-error ({error})"),
-    };
-    let current_head = match crate::git::head_sha(repo_root) {
-        Ok(head) => head,
-        Err(error) => return format!("unavailable/head-read-failed ({error})"),
-    };
-    if stored_head != current_head {
-        "stale/head-mismatch fallback-used-on-request".to_string()
-    } else {
-        "ready/current".to_string()
-    }
-}
-
-fn cochange_health_status(
-    index: &LiveIndex,
-    repo_root: Option<&Path>,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-) -> String {
-    let policy = crate::live_index::coupling::coupling_prepare_policy_from_env();
-    if matches!(policy, CouplingPreparePolicy::Disabled) {
-        return "disabled by policy".to_string();
-    }
-
-    let Some(repo_root) = repo_root else {
-        return "unavailable/no-repository-root".to_string();
-    };
-    if git2::Repository::discover(repo_root).is_err() {
-        return "unavailable/not-a-git-repo".to_string();
-    }
-
-    if let Some(store) = index.coupling_store() {
-        return cochange_store_health_status(store, repo_root);
-    }
-
-    let Some(project_state) = project_state else {
-        return "unavailable/no-project-state-owner".to_string();
-    };
-    match crate::live_index::coupling::open_existing_coupling_store(project_state) {
-        Ok(Some(store)) => cochange_store_health_status(store.as_ref(), repo_root),
-        Ok(None) => match policy {
-            CouplingPreparePolicy::LazyOnRequest => {
-                "preparing/lazy-on-request fallback-used-on-request".to_string()
-            }
-            CouplingPreparePolicy::WarmOnStart => {
-                "preparing/warm-on-start fallback-used-on-request".to_string()
-            }
-            CouplingPreparePolicy::Disabled => "disabled by policy".to_string(),
-        },
-        Err(error) => format!("unavailable/store-open-failed ({error})"),
-    }
-}
+use crate::index_lifecycle::guidance::file_search::search_files_ranking_explanation;
 
 fn worktree_routing_health_status() -> String {
     match crate::worktree::routing_policy_from_env() {
         WorktreeRoutingPolicy::ExplicitCallTime => "explicit-call enabled".to_string(),
         WorktreeRoutingPolicy::Disabled => "disabled by policy".to_string(),
-    }
-}
-
-fn ranking_diagnostics_health_status() -> String {
-    match ranking_diagnostics_policy_from_env() {
-        RankingDiagnosticsPolicy::CallTimeExplain => {
-            "call-time explain available/default-off".to_string()
-        }
-        RankingDiagnosticsPolicy::DefaultOn => "call-time explain available/default-on".to_string(),
-        RankingDiagnosticsPolicy::Disabled => "disabled by policy".to_string(),
-    }
-}
-
-fn capability_status_report(
-    index: &LiveIndex,
-    repo_root: Option<&Path>,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-) -> CapabilityStatusReport {
-    CapabilityStatusReport {
-        frecency: frecency_health_status(repo_root, project_state),
-        co_change: cochange_health_status(index, repo_root, project_state),
-        worktree_routing: worktree_routing_health_status(),
-        ranking_diagnostics: ranking_diagnostics_health_status(),
     }
 }
 
@@ -2203,31 +2054,6 @@ fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
     // binary we cannot introspect statically.)
     report.our_version = Some(env!("CARGO_PKG_VERSION").to_string());
     Some(report)
-}
-
-/// Read-only `.gitignore` hygiene status for the health `gitignore_hygiene=`
-/// field (source-binding-and-state.md Health contract). `None` when unbound.
-/// Explicit-protected roots are not applicable (hygiene never touches a
-/// protected root); every other bound root is observed without mutation via
-/// `ObserveOnly` — the same code path bind/init use, never a second checker.
-fn gitignore_hygiene_status(
-    repo_root: Option<&Path>,
-    placement: Option<&crate::domain::StatePlacement>,
-) -> Option<&'static str> {
-    let root = repo_root?;
-    if matches!(
-        crate::protocol::format::placement_authorization(placement),
-        Some(crate::domain::SourceAccessMode::ExplicitProtected)
-    ) {
-        return Some("not_applicable_explicit_protected");
-    }
-    Some(
-        crate::gitignore_hygiene::reconcile_project_gitignore(
-            root,
-            crate::gitignore_hygiene::GitignoreHygieneAuthority::ObserveOnly,
-        )
-        .status_label(),
-    )
 }
 
 /// Extract the `version=<token>` value emitted on the runtime-status line of a
@@ -5176,13 +5002,12 @@ impl SymForgeServer {
         // user-visible health report.
         let source_set = self.index.data_plane().published_source_set();
         let generation = source_set.current_generation();
-        let published = Arc::clone(&generation.health);
         // Capture before `session_id` is consumed: a `Some` session id means the
         // report is served through a daemon session (membership authority
         // applies); local in-process reports carry `None`.
         let session_is_daemon = session_id.is_some();
         let runtime_status = self.runtime_status_for(
-            &published,
+            &generation.health,
             generation.project_generation,
             mode,
             project_id,
@@ -5190,19 +5015,31 @@ impl SymForgeServer {
             project_root,
         );
         let watcher_guard = self.watcher_info.lock();
-        let rejected_stale_mutations = self.index.data_plane().current_rejected_stale_mutations();
-        let mut result = format::health_report_from_published_state_windowed(
-            &published,
-            &watcher_guard,
-            rejected_stale_mutations,
-            quarantine_window,
-        );
-        result.push('\n');
-        result.push_str(&format::format_runtime_status(&runtime_status));
-        result.push_str(&self.health_trust_diagnostics());
+        let repo_root = self.capture_repo_root();
+        let placement = self.capture_state_placement();
+        let persistence = *self.persistence_health.read();
+        let inputs = format::HealthReportInputs {
+            source_set: &source_set,
+            watcher: &watcher_guard,
+            rejected_stale_mutations: self.index.data_plane().current_rejected_stale_mutations(),
+            runtime_status: &runtime_status,
+            repo_root: repo_root.as_deref(),
+            placement: placement.as_ref(),
+            persistence,
+            session_is_daemon,
+            worktree_routing: worktree_routing_health_status(),
+            curation_health: self.curation_coordinator.health_line(
+                self.index.data_plane(),
+                repo_root.as_deref(),
+                placement.as_ref(),
+                persistence,
+            ),
+        };
+
+        let mut after_runtime = self.health_trust_diagnostics();
         let sidecar_status = sidecar_status_for_server(self);
-        result.push('\n');
-        result.push_str(&format::format_sidecar_status(&sidecar_status));
+        after_runtime.push('\n');
+        after_runtime.push_str(&format::format_sidecar_status(&sidecar_status));
         if mode == format::RuntimeMode::LocalProcess
             && matches!(
                 sidecar_status.liveness,
@@ -5210,7 +5047,7 @@ impl SymForgeServer {
                     | crate::sidecar::port_file::SidecarLiveness::NoSidecar
             )
         {
-            result.push_str(
+            after_runtime.push_str(
                 " (informational: local-process mode keeps no sidecar; hooks fail open by design)",
             );
         }
@@ -5220,141 +5057,57 @@ impl SymForgeServer {
             let snap = stats.summary();
             let savings = format::format_token_savings(&snap);
             if !savings.is_empty() {
-                result.push('\n');
-                result.push_str(&savings);
+                after_runtime.push('\n');
+                after_runtime.push_str(&savings);
             }
 
             // Append per-tool call counts.
             let counts = stats.tool_call_counts();
             let counts_section = format::format_tool_call_counts(&counts);
             if !counts_section.is_empty() {
-                result.push('\n');
-                result.push_str(&counts_section);
+                after_runtime.push('\n');
+                after_runtime.push_str(&counts_section);
             }
 
             // Append per-tool token efficiency breakdown.
             let token_details = stats.tool_token_details();
             let breakdown = format::format_tool_token_breakdown(&token_details);
             if !breakdown.is_empty() {
-                result.push('\n');
-                result.push_str(&breakdown);
+                after_runtime.push('\n');
+                after_runtime.push_str(&breakdown);
             }
         }
 
-        let adoption =
-            crate::cli::hook::load_hook_adoption_snapshot(self.capture_repo_root().as_deref());
+        let adoption = crate::cli::hook::load_hook_adoption_snapshot(repo_root.as_deref());
         let adoption_section = format::format_hook_adoption(&adoption);
         if !adoption_section.is_empty() {
-            result.push('\n');
-            result.push_str(&adoption_section);
-        }
-
-        // Append git temporal summary.
-        result.push('\n');
-        result.push_str(&format::git_temporal_health_line(
-            &generation.code_signals.temporal,
-        ));
-
-        let capabilities = {
-            let repo_root = self.capture_repo_root();
-            let project_state = self.capture_project_state_dir();
-            capability_status_report(
-                &generation.live,
-                repo_root.as_deref(),
-                project_state.as_ref(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&capabilities.full_text());
-        let curation_health = {
-            let repo_root = self.capture_repo_root();
-            let state_placement = self.capture_state_placement();
-            self.curation_coordinator.health_line(
-                self.index.data_plane(),
-                repo_root.as_deref(),
-                state_placement.as_ref(),
-                *self.persistence_health.read(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&curation_health);
-
-        // Feature 020 repository-knowledge health (M-001): manifest, dispositions,
-        // source set, bridge, temporal, authority hygiene, plus source-binding/
-        // runtime state. All read from the entry capture; nothing recomputed.
-        let rk_placement = self.capture_state_placement();
-        let rk_root = self.capture_repo_root();
-        let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
-        let binding_view = format::SourceBindingHealthView {
-            bound: rk_root.is_some(),
-            placement: rk_placement.as_ref(),
-            persistence: *self.persistence_health.read(),
-            session_id: &runtime_status.session_id,
-            daemon_session: session_is_daemon,
-            query_ready: published.status_label() == "Ready",
-            gitignore_hygiene: rk_gitignore,
-        };
-        result.push('\n');
-        result.push_str(&format::format_repository_knowledge_health(
-            &source_set,
-            &binding_view,
-            crate::live_index::store::configured_inflight_byte_budget(),
-        ));
-
-        // Append worktree-awareness misuse counter (rolling last-hour window).
-        result.push('\n');
-        result.push_str(&format!(
-            "── Worktree-awareness misuse ──\nedit tool calls without working_directory (last hour): {}",
-            self.worktree_misuse.current_window_count(),
-        ));
-        result.push('\n');
-        result.push_str(&Self::secret_dismissals_line(rk_root.as_deref()));
-
-        // Append frecency diagnostics when SYMFORGE_FRECENCY=1. The feature-flag
-        // guard mirrors the one in `frecency::bump`; when the flag is unset,
-        // the health output remains compact unless the feature is explicitly enabled.
-        if std::env::var(crate::live_index::frecency::FRECENCY_FLAG_ENV).as_deref() == Ok("1")
-            && let Some(project_state) = self.capture_project_state_dir()
-            && let Ok(store) = crate::live_index::frecency::FrecencyStore::open(
-                &crate::live_index::frecency::frecency_db_path(&project_state),
-            )
-        {
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            if let Ok(top) = store.top_frecent(10, now_ts) {
-                result.push('\n');
-                result.push_str(&format::format_frecency_top(&top));
-            }
-            // "Last 10 frecency bumps" is additionally gated on
-            // the ranking diagnostics default-on policy; it is a debug-only
-            // surface for ranker tuning, not the default health view.
-            if ranking_diagnostics_policy_from_env() == RankingDiagnosticsPolicy::DefaultOn
-                && let Ok(last) = store.last_10_bumps()
-            {
-                result.push('\n');
-                result.push_str(&format::format_frecency_last_bumps(&last));
-            }
+            after_runtime.push('\n');
+            after_runtime.push_str(&adoption_section);
         }
 
         // Surface a version-drift warning when this daemon's binary is older
         // than another installed copy (e.g. an npm-updated package). Read-only;
         // never copies or replaces the binary (see version_registry).
+        let mut trailing = String::new();
         if let Some(drift) = crate::version_registry::drift_banner_default() {
-            result.push('\n');
-            result.push_str(&drift);
+            trailing.push('\n');
+            trailing.push_str(&drift);
         }
 
         // Surface a PATH-shadow warning when a bare `symforge` would run a
         // DIFFERENT install than the binary serving this runtime. Read-only;
         // emits the exact remediation commands, never executes them.
         if let Some(report) = current_exe_shadow_report() {
-            result.push('\n');
-            result.push_str(&crate::path_shadow::format_shadow_warning(&report));
+            trailing.push('\n');
+            trailing.push_str(&crate::path_shadow::format_shadow_warning(&report));
         }
 
-        result
+        let process = format::HealthProcessSections {
+            after_runtime,
+            worktree_misuse: Ok(self.worktree_misuse.current_window_count()),
+            trailing,
+        };
+        format::render_health_report(&inputs, quarantine_window, &process)
     }
 
     fn health_compact_for_runtime(
@@ -5367,10 +5120,9 @@ impl SymForgeServer {
         // T046: same single-capture shape as health_for_runtime.
         let source_set = self.index.data_plane().published_source_set();
         let generation = source_set.current_generation();
-        let published = Arc::clone(&generation.health);
         let session_is_daemon = session_id.is_some();
         let runtime_status = self.runtime_status_for(
-            &published,
+            &generation.health,
             generation.project_generation,
             mode,
             project_id,
@@ -5378,18 +5130,31 @@ impl SymForgeServer {
             project_root,
         );
         let watcher_guard = self.watcher_info.lock();
-        let rejected_stale_mutations = self.index.data_plane().current_rejected_stale_mutations();
-        let mut result = format::health_report_compact_from_published_state(
-            &published,
-            &watcher_guard,
-            rejected_stale_mutations,
-        );
-        result.push('\n');
-        result.push_str(&format::format_runtime_status_compact(&runtime_status));
-        result.push_str(&self.health_trust_diagnostics());
+        let repo_root = self.capture_repo_root();
+        let placement = self.capture_state_placement();
+        let persistence = *self.persistence_health.read();
+        let inputs = format::HealthReportInputs {
+            source_set: &source_set,
+            watcher: &watcher_guard,
+            rejected_stale_mutations: self.index.data_plane().current_rejected_stale_mutations(),
+            runtime_status: &runtime_status,
+            repo_root: repo_root.as_deref(),
+            placement: placement.as_ref(),
+            persistence,
+            session_is_daemon,
+            worktree_routing: worktree_routing_health_status(),
+            curation_health: self.curation_coordinator.health_line(
+                self.index.data_plane(),
+                repo_root.as_deref(),
+                placement.as_ref(),
+                persistence,
+            ),
+        };
+
+        let mut after_runtime = self.health_trust_diagnostics();
         let sidecar_status = sidecar_status_for_server(self);
-        result.push('\n');
-        result.push_str(&format::format_sidecar_status_compact(&sidecar_status));
+        after_runtime.push('\n');
+        after_runtime.push_str(&format::format_sidecar_status_compact(&sidecar_status));
         if mode == format::RuntimeMode::LocalProcess
             && matches!(
                 sidecar_status.liveness,
@@ -5397,7 +5162,7 @@ impl SymForgeServer {
                     | crate::sidecar::port_file::SidecarLiveness::NoSidecar
             )
         {
-            result.push_str(
+            after_runtime.push_str(
                 " (informational: local-process mode keeps no sidecar; hooks fail open by design)",
             );
         }
@@ -5409,7 +5174,7 @@ impl SymForgeServer {
             let total_fires =
                 snap.read_fires + snap.edit_fires + snap.write_fires + snap.grep_fires;
             if total_fires > 0 {
-                result.push_str(&format!(
+                after_runtime.push_str(&format!(
                     "\nToken savings: ~{} tokens saved across {} hook fires",
                     total_saved, total_fires
                 ));
@@ -5418,7 +5183,7 @@ impl SymForgeServer {
             let counts = stats.tool_call_counts();
             let total_tool_calls: usize = counts.iter().map(|(_, count)| *count).sum();
             if total_tool_calls > 0 {
-                result.push_str(&format!(
+                after_runtime.push_str(&format!(
                     "\nTool calls: {} recorded across {} tools",
                     total_tool_calls,
                     counts.len()
@@ -5426,76 +5191,25 @@ impl SymForgeServer {
             }
         }
 
-        let git_temporal = format::git_temporal_health_line(&generation.code_signals.temporal);
-        let git_temporal_summary = git_temporal
-            .lines()
-            .next()
-            .unwrap_or("Git temporal: unknown");
-        result.push_str(&format!(
-            "\n{} | Worktree misuse/hour: {}",
-            git_temporal_summary,
-            self.worktree_misuse.current_window_count()
-        ));
-
-        let capabilities = {
-            let repo_root = self.capture_repo_root();
-            let project_state = self.capture_project_state_dir();
-            capability_status_report(
-                &generation.live,
-                repo_root.as_deref(),
-                project_state.as_ref(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&capabilities.compact_text());
-        let curation_health = {
-            let repo_root = self.capture_repo_root();
-            let state_placement = self.capture_state_placement();
-            self.curation_coordinator.health_line(
-                self.index.data_plane(),
-                repo_root.as_deref(),
-                state_placement.as_ref(),
-                *self.persistence_health.read(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&curation_health);
-
-        // Feature 020 repository-knowledge health (M-001), compact form. Reads
-        // from the entry capture.
-        let rk_placement = self.capture_state_placement();
-        let rk_root = self.capture_repo_root();
-        let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
-        let binding_view = format::SourceBindingHealthView {
-            bound: rk_root.is_some(),
-            placement: rk_placement.as_ref(),
-            persistence: *self.persistence_health.read(),
-            session_id: &runtime_status.session_id,
-            daemon_session: session_is_daemon,
-            query_ready: published.status_label() == "Ready",
-            gitignore_hygiene: rk_gitignore,
-        };
-        result.push('\n');
-        result.push_str(&format::format_repository_knowledge_health_compact(
-            &source_set,
-            &binding_view,
-        ));
-        result.push('\n');
-        result.push_str(&Self::secret_dismissals_line(rk_root.as_deref()));
-
+        let mut trailing = String::new();
         if let Some(drift) = crate::version_registry::drift_banner_default() {
-            result.push('\n');
-            result.push_str(&drift);
+            trailing.push('\n');
+            trailing.push_str(&drift);
         }
 
         // Compact PATH-shadow banner (one line, points at full health for the
         // exact fix). See `health_for_runtime` for the full block.
         if let Some(report) = current_exe_shadow_report() {
-            result.push('\n');
-            result.push_str(&crate::path_shadow::format_shadow_warning_compact(&report));
+            trailing.push('\n');
+            trailing.push_str(&crate::path_shadow::format_shadow_warning_compact(&report));
         }
 
-        result
+        let process = format::HealthProcessSections {
+            after_runtime,
+            worktree_misuse: Ok(self.worktree_misuse.current_window_count()),
+            trailing,
+        };
+        format::render_health_compact(&inputs, &process)
     }
 
     pub(crate) fn health_for_daemon_session(
@@ -8809,11 +8523,7 @@ impl SymForgeServer {
     /// One health/status line carrying ONLY the secret-dismissal record count:
     /// never paths, rule ids, digests, or notes (034 no-echo contract).
     fn secret_dismissals_line(root: Option<&Path>) -> String {
-        match root.map(crate::knowledge::secret_dismissals::dismissal_count) {
-            None => "secret_dismissals: unbound".to_string(),
-            Some(Some(count)) => format!("secret_dismissals: {count}"),
-            Some(None) => "secret_dismissals: store unreadable (all findings withheld)".to_string(),
-        }
+        format::secret_dismissals_line(root)
     }
 
     /// Render the `status` body from THIS server's own index, ledger, and
@@ -14638,6 +14348,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// MCP side of the embed health parity golden (`tests/embed_health.rs`):
+    /// the same three-partial fixture and paging must render the same
+    /// quarantine lines through the MCP `health` / `health_compact` handlers.
+    #[tokio::test]
+    async fn health_quarantine_paging_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join(".git")).expect("git marker");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .expect("source");
+        for name in ["a", "b", "c"] {
+            fs::write(
+                repo.path().join(format!("src/broken_{name}.rs")),
+                "pub fn broken( {\n",
+            )
+            .expect("broken source");
+        }
+        let server = SymForgeServer::new(
+            crate::live_index::LiveIndex::load(repo.path()).expect("index"),
+            "embed-parity-golden".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(repo.path().to_path_buf()),
+            None,
+        );
+        let full = server
+            .health(Parameters(super::HealthInput {
+                quarantine_limit: Some(1),
+                quarantine_offset: Some(1),
+            }))
+            .await;
+        for golden in [
+            "Watcher: off",
+            "Parse/span quarantine registry: total=3 unexpected_partial=3 failed=0 showing=1 offset=1 omitted=1",
+            "\n  2. src/broken_b.rs [unexpected_partial] - repo-owned partial parse; best-effort symbols may be incomplete",
+            "\n  (use health with quarantine_limit/quarantine_offset to page the full list)",
+            "\nCapabilities:\n  frecency: ",
+            "\n── Worktree-awareness misuse ──\nedit tool calls without working_directory (last hour): 0",
+        ] {
+            assert!(
+                full.contains(golden),
+                "MCP health lacks `{golden}`:\n{full}"
+            );
+        }
+        let compact = server.health_compact().await;
+        assert!(
+            compact.contains(
+                "\nParse/span quarantine: total=3 unexpected_partial=3 failed=0 showing=3 offset=0 omitted=0"
+            ),
+            "{compact}"
+        );
+        assert!(compact.contains("| Worktree misuse/hour: 0"), "{compact}");
     }
 
     #[tokio::test]

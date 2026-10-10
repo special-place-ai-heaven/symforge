@@ -7223,17 +7223,7 @@ pub(crate) fn project_key(root: &Path) -> String {
     crate::discovery::project_id_for_canonical_root(root).0
 }
 
-pub(crate) fn normalized_path_text(path_text: &str, windows: bool) -> String {
-    if windows {
-        path_text.replace('\\', "/")
-    } else {
-        path_text.to_string()
-    }
-}
-
-pub(crate) fn normalized_path_string(path: &Path) -> String {
-    normalized_path_text(&dunce::simplified(path).to_string_lossy(), cfg!(windows))
-}
+pub(crate) use crate::paths::{normalized_path_string, normalized_path_text};
 
 fn process_control_state_dir() -> io::Result<&'static ControlStateDir> {
     paths::process_control_state_placement()

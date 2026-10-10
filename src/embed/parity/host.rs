@@ -252,6 +252,11 @@ impl OperationControl {
 pub enum HostRequest {
     Status,
     Health,
+    /// MCP `health` parity: the typed health plus the shared full report,
+    /// with quarantine-registry paging.
+    HealthReport(HostHealthRequest),
+    /// MCP `health_compact` parity: the shared compact projection.
+    HealthCompact,
     Catalog,
     Resource(HostResourceRequest),
     Prompt(HostPromptRequest),
@@ -446,6 +451,40 @@ pub struct HostHealth {
     pub current: Option<HostPublishedHealth>,
 }
 
+/// Quarantine-registry paging for the full health report, the MCP `health`
+/// `quarantine_limit` / `quarantine_offset` options. `None` keeps the MCP
+/// defaults: offset 0, limit 10; the limit is clamped to 1..=1000.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostHealthRequest {
+    pub quarantine_limit: Option<u32>,
+    pub quarantine_offset: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostHealthProjection {
+    Full,
+    Compact,
+}
+
+/// A health section the MCP server renders from a process an embedded host
+/// does not have. Reported, never silently omitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostHealthNotApplicable {
+    pub section: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostHealthReport {
+    pub health: HostHealth,
+    pub projection: HostHealthProjection,
+    /// The shared MCP `health` / `health_compact` rendering for this source,
+    /// in any phase. `None` only when no bound data plane could be captured.
+    pub report: Option<String>,
+    pub not_applicable: Vec<HostHealthNotApplicable>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostCheckpointOutcome {
     WrittenCurrent,
@@ -635,6 +674,7 @@ pub struct HostResourceReply {
 #[non_exhaustive]
 pub enum HostResourceContent {
     Health(HostHealth),
+    HealthReport(HostHealthReport),
     Query(HostQueryReply),
     Catalog(HostCatalog),
     Text(String),
@@ -659,6 +699,7 @@ pub struct HostPromptReply {
 pub enum HostResponse {
     Status(HostStatus),
     Health(HostHealth),
+    HealthReport(HostHealthReport),
     Catalog(HostCatalog),
     Resource(HostResourceReply),
     Prompt(HostPromptReply),
@@ -677,6 +718,7 @@ impl std::fmt::Debug for HostResponse {
         let kind = match self {
             Self::Status(_) => "Status",
             Self::Health(_) => "Health",
+            Self::HealthReport(_) => "HealthReport",
             Self::Catalog(_) => "Catalog",
             Self::Resource(_) => "Resource",
             Self::Prompt(_) => "Prompt",
@@ -1498,9 +1540,19 @@ impl HostRoom {
         control: &OperationControl,
     ) -> Result<HostResourceReply, HostRefusal> {
         let (uri, content) = match resource {
-            HostResourceRequest::RepoHealth => ("symforge://repo/health",
-                HostResourceContent::Health(crate::embed::lifecycle::embed_host::health(
-                    &self.source, &self.room_id, &self.engine))),
+            // MCP renders this resource as `health` with default paging.
+            HostResourceRequest::RepoHealth => (
+                "symforge://repo/health",
+                HostResourceContent::HealthReport(
+                    crate::embed::lifecycle::embed_host::health_report(
+                        &self.source,
+                        &self.room_id,
+                        &self.engine,
+                        HostHealthProjection::Full,
+                        &HostHealthRequest::default(),
+                    ),
+                ),
+            ),
             HostResourceRequest::RepoOutline => {
                 return self.query_resource(
                     "symforge://repo/outline",
@@ -1530,15 +1582,21 @@ impl HostRoom {
             HostResourceRequest::FileContext { path, max_tokens } => {
                 return self.query_resource(
                     "symforge://file/context",
-                    QueryRequest::FileContext(crate::embed::parity::read_context::FileContextRequest {
-                        path: path.clone(),
-                        max_tokens: *max_tokens,
-                        ..Default::default()
-                    }),
+                    QueryRequest::FileContext(
+                        crate::embed::parity::read_context::FileContextRequest {
+                            path: path.clone(),
+                            max_tokens: *max_tokens,
+                            ..Default::default()
+                        },
+                    ),
                     control,
                 );
             }
-            HostResourceRequest::FileContent { path, start_line, end_line } => {
+            HostResourceRequest::FileContent {
+                path,
+                start_line,
+                end_line,
+            } => {
                 return self.query_resource(
                     "symforge://file/content",
                     QueryRequest::FileContent(crate::embed::parity::read::FileContentRequest {
@@ -1551,7 +1609,11 @@ impl HostRoom {
                 );
             }
             HostResourceRequest::FileContentOptions(options) => {
-                return self.query_resource("symforge://file/content", QueryRequest::FileContent(options.clone()), control);
+                return self.query_resource(
+                    "symforge://file/content",
+                    QueryRequest::FileContent(options.clone()),
+                    control,
+                );
             }
             HostResourceRequest::SymbolDetail { selector } => {
                 return self.query_resource(
@@ -1567,23 +1629,33 @@ impl HostRoom {
                 );
             }
             HostResourceRequest::SymbolDetailOptions(options) => {
-                return self.query_resource("symforge://symbol/detail", QueryRequest::SymbolRead(options.clone()), control);
+                return self.query_resource(
+                    "symforge://symbol/detail",
+                    QueryRequest::SymbolRead(options.clone()),
+                    control,
+                );
             }
             HostResourceRequest::SymbolContext { selector } => {
                 return self.query_resource(
                     "symforge://symbol/context",
-                    QueryRequest::SymbolContext(crate::embed::parity::symbol_context::SymbolContextRequest {
-                        name: selector.name.clone(),
-                        file: Some(selector.path.clone()),
-                        symbol_kind: selector.kind.clone(),
-                        symbol_line: selector.line,
-                        ..Default::default()
-                    }),
+                    QueryRequest::SymbolContext(
+                        crate::embed::parity::symbol_context::SymbolContextRequest {
+                            name: selector.name.clone(),
+                            file: Some(selector.path.clone()),
+                            symbol_kind: selector.kind.clone(),
+                            symbol_line: selector.line,
+                            ..Default::default()
+                        },
+                    ),
                     control,
                 );
             }
             HostResourceRequest::SymbolContextOptions(options) => {
-                return self.query_resource("symforge://symbol/context", QueryRequest::SymbolContext(options.clone()), control);
+                return self.query_resource(
+                    "symforge://symbol/context",
+                    QueryRequest::SymbolContext(options.clone()),
+                    control,
+                );
             }
             HostResourceRequest::ToolsCatalog => ("symforge://tools/catalog",
                 HostResourceContent::Catalog(self.catalog())),
@@ -1703,6 +1775,24 @@ impl HostRoom {
                     &self.source,
                     &self.room_id,
                     &self.engine,
+                ))
+            }
+            HostRequest::HealthReport(options) => {
+                HostResponse::HealthReport(crate::embed::lifecycle::embed_host::health_report(
+                    &self.source,
+                    &self.room_id,
+                    &self.engine,
+                    HostHealthProjection::Full,
+                    options,
+                ))
+            }
+            HostRequest::HealthCompact => {
+                HostResponse::HealthReport(crate::embed::lifecycle::embed_host::health_report(
+                    &self.source,
+                    &self.room_id,
+                    &self.engine,
+                    HostHealthProjection::Compact,
+                    &HostHealthRequest::default(),
                 ))
             }
             HostRequest::Catalog => HostResponse::Catalog(self.catalog()),
