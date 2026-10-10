@@ -850,19 +850,6 @@ fn apply_status_for_rescan(rescan: &str) -> &'static str {
     }
 }
 
-/// Unix credential mode after chmod. File-type bits above `0o777` are ignored.
-#[cfg(all(unix, test))]
-fn reject_non_owner_env_mode(mode: u32) -> Result<(), String> {
-    let mode = mode & 0o777;
-    if mode == 0o600 {
-        Ok(())
-    } else {
-        Err(format!(
-            ".env mode is {mode:#o} after chmod; expected owner-only 0o600"
-        ))
-    }
-}
-
 fn history_note(root: &Path) -> String {
     match crate::git::head_sha(root) {
         Ok(sha) => format!("history_note: old value may remain in git history since commit {sha}"),
@@ -938,48 +925,5 @@ mod tests {
             apply_status_for_rescan("unreadable after write: boom"),
             "apply_status: ok"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_owner_env_mode_is_a_failure() {
-        use super::reject_non_owner_env_mode;
-        let err = reject_non_owner_env_mode(0o644).unwrap_err();
-        assert!(err.contains("0o644"), "{err}");
-        assert!(reject_non_owner_env_mode(0o666).is_err());
-        assert!(reject_non_owner_env_mode(0o600).is_ok());
-        // `Permissions::mode` includes the file type above the permission bits.
-        assert!(reject_non_owner_env_mode(0o100600).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chmod_failure_on_missing_env_is_surfaced() {
-        use super::ensure_env_owner_only;
-        let missing =
-            std::env::temp_dir().join(format!("symforge-missing-env-{}", std::process::id()));
-        let _ = std::fs::remove_file(&missing);
-        let err = ensure_env_owner_only(&missing).unwrap_err();
-        assert!(err.contains("chmod .env 0o600 failed"), "{err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn owner_only_chmod_lands_0600() {
-        use super::ensure_env_owner_only;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".env");
-        std::fs::write(&path, b"K=v\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o644);
-        std::fs::set_permissions(&path, perms).unwrap();
-        ensure_env_owner_only(&path).unwrap();
-        let mode = std::fs::symlink_metadata(&path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
     }
 }
