@@ -100,6 +100,7 @@ pub enum QueryOperationKind {
     Conventions,
     ContextInventory,
     InvestigationSuggest,
+    EditPlan,
     Retrieve,
     WhatChanged,
     DiffSymbols,
@@ -189,6 +190,11 @@ pub enum QueryRequest {
     InvestigationSuggest {
         focus: Option<String>,
     },
+    /// The MCP `edit_plan` guidance for a symbol, `path::name`, `Type::method`
+    /// or file target, rendered by the shared planner over the captured publication.
+    EditPlan {
+        target: String,
+    },
     /// Read exact bytes from this session's served-output cache. The returned
     /// record retains its original publication and truncation metadata.
     Retrieve {
@@ -250,6 +256,7 @@ impl QueryRequest {
             Self::Conventions => QueryOperationKind::Conventions,
             Self::ContextInventory => QueryOperationKind::ContextInventory,
             Self::InvestigationSuggest { .. } => QueryOperationKind::InvestigationSuggest,
+            Self::EditPlan { .. } => QueryOperationKind::EditPlan,
             Self::Retrieve { .. } => QueryOperationKind::Retrieve,
             Self::WhatChanged(_) => QueryOperationKind::WhatChanged,
             Self::DiffSymbols(_) => QueryOperationKind::DiffSymbols,
@@ -456,6 +463,7 @@ pub enum QueryOutput {
     RetrievedOutput(session::RetrievedOutput),
     Exploration(guidance::Exploration),
     Conventions(guidance::Conventions),
+    EditPlan(guidance::EditPlanGuidance),
     File {
         file: QueryFile,
         symbols: Vec<QuerySymbol>,

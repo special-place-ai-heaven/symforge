@@ -69,6 +69,14 @@ pub struct Exploration {
     pub hidden_noise_results: u64,
 }
 
+/// The MCP `edit_plan` text: matched symbols or file, reference count,
+/// co-change partners and the suggested tool sequence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EditPlanGuidance {
+    pub target: String,
+    pub rendered: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Conventions {
     pub language: String,

@@ -771,6 +771,7 @@ fn operation_name(operation: QueryOperationKind) -> &'static str {
         QueryOperationKind::Conventions => "conventions",
         QueryOperationKind::ContextInventory => "context_inventory",
         QueryOperationKind::InvestigationSuggest => "investigation_suggest",
+        QueryOperationKind::EditPlan => "edit_plan",
         QueryOperationKind::Retrieve => "symforge_retrieve",
         QueryOperationKind::WhatChanged => "what_changed",
         QueryOperationKind::DiffSymbols => "diff_symbols",

@@ -1091,53 +1091,7 @@ pub fn co_changes_result_view(
     lines.join("\n")
 }
 
-/// Compute the impact summary for a just-edited path: the distinct dependent
-/// **file** count and the top-K co-change partner paths.
-///
-/// - Dependents use `capture_find_dependents_view(path).files.len()` — the count
-///   of distinct importing/referencing files (matching the `find_dependents`
-///   tool), NOT the raw per-reference count which double-counts a file that holds
-///   multiple references.
-/// - Co-changes are present only when `temporal.state` is `Ready` and the edited
-///   path has a non-empty strong `co_changes` list; otherwise the returned vector
-///   is empty (degrading the footer to `[impact: N dependents]`). The path is
-///   forward-slash normalized before the temporal lookup to match the temporal
-///   index key space.
-///
-/// `temporal` is passed in (rather than read off `index`) because the git
-/// temporal snapshot lives on the shared index handle, not the `LiveIndex` read
-/// snapshot. The caller (`append_impact_footer`) holds the handle and supplies
-/// both sources.
-pub fn edit_impact_summary(
-    index: &LiveIndex,
-    temporal: &crate::live_index::git_temporal::GitTemporalIndex,
-    path: &str,
-) -> (usize, Vec<String>) {
-    const COCHANGE_LIMIT: usize = 3;
-
-    let deps = index.capture_find_dependents_view(path).files.len();
-
-    let normalized = path.replace('\\', "/");
-    let cochanges = if temporal.state == crate::live_index::git_temporal::GitTemporalState::Ready {
-        temporal
-            .files
-            .get(&normalized)
-            .filter(|history| !history.co_changes.is_empty())
-            .map(|history| {
-                history
-                    .co_changes
-                    .iter()
-                    .take(COCHANGE_LIMIT)
-                    .map(|entry| entry.path.clone())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    (deps, cochanges)
-}
+pub use crate::index_lifecycle::guidance::edit_plan::edit_impact_summary;
 
 /// Substrings that `classify_edit_output` (src/protocol/edit_tools.rs) treats as
 /// failure / dry-run sentinels via `.contains(...)`. The three `_tool` wrappers

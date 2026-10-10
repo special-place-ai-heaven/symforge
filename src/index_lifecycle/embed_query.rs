@@ -1031,7 +1031,10 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         QueryRequest::DiffSymbols(input) => super::embed_changes::validate_diff_symbols(input)?,
         QueryRequest::DetectImpact(input) => super::embed_detect_impact::validate(input)?,
         QueryRequest::Ask(input) => super::embed_ask::validate(input)?,
-        QueryRequest::Conventions | QueryRequest::ContextInventory => {}
+        // MCP accepts any target string; the shared planner reports a miss.
+        QueryRequest::Conventions
+        | QueryRequest::ContextInventory
+        | QueryRequest::EditPlan { .. } => {}
         QueryRequest::InvestigationSuggest { focus } => {
             if focus
                 .as_ref()
@@ -1435,6 +1438,12 @@ pub(super) fn project(
             super::embed_ask::project(snapshot, input, budget, observations, session, policy)
         }
         QueryRequest::Conventions => super::embed_guidance::conventions(live, budget),
+        QueryRequest::EditPlan { target } => super::embed_guidance::edit_plan(
+            live,
+            &snapshot.generation.code_signals.temporal,
+            target,
+            budget,
+        ),
         QueryRequest::File {
             path,
             start_line,

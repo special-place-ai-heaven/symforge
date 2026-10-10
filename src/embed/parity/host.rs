@@ -1498,6 +1498,7 @@ impl HostRoom {
                     "ContextInventory",
                     "InvestigationSuggest",
                     "Retrieve",
+                    "EditPlan",
                 ]
                 .into_iter()
                 .map(str::to_owned)

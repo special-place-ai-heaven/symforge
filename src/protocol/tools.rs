@@ -14199,6 +14199,34 @@ mod tests {
         )
     }
 
+    /// MCP side of the embed edit-plan golden (`tests/embed_edit_plan.rs`):
+    /// symbol, `path::name`, file and missing targets render the same plan.
+    #[tokio::test]
+    async fn edit_plan_matches_embed_parity_golden() {
+        const SYMBOL_GOLDEN: &str = "── Edit Plan ──\nFound 1 symbol(s) matching 'target':\n  Function target in src/lib.rs (lines 1-1)\n\nReferences: 1 call sites across the project\n\nSuggested tool sequence:\n  1. get_symbol_context(name=\"target\", path=\"src/lib.rs\", bundle=true) — understand full context\n  2. Choose edit approach:\n     - Small change: edit_within_symbol(path=\"src/lib.rs\", name=\"target\", old_text=..., new_text=...)\n     - Full rewrite: replace_symbol_body(path=\"src/lib.rs\", name=\"target\", new_body=...)\n     - Rename: batch_rename(path=\"src/lib.rs\", name=\"target\", new_name=..., dry_run=true)\n     - Delete: delete_symbol(path=\"src/lib.rs\", name=\"target\", dry_run=true)\n  3. analyze_file_impact(path=\"src/lib.rs\") — verify changes";
+        const QUALIFIED_GOLDEN: &str = "── Edit Plan ──\nFound 1 symbol(s) matching 'src/lib.rs::target':\n  Function target in src/lib.rs (lines 1-1)\n\nReferences: 1 call sites across the project\n\nSuggested tool sequence:\n  1. get_symbol_context(name=\"target\", path=\"src/lib.rs\", bundle=true) — understand full context\n  2. Choose edit approach:\n     - Small change: edit_within_symbol(path=\"src/lib.rs\", name=\"target\", old_text=..., new_text=...)\n     - Full rewrite: replace_symbol_body(path=\"src/lib.rs\", name=\"target\", new_body=...)\n     - Rename: batch_rename(path=\"src/lib.rs\", name=\"target\", new_name=..., dry_run=true)\n     - Delete: delete_symbol(path=\"src/lib.rs\", name=\"target\", dry_run=true)\n  3. analyze_file_impact(path=\"src/lib.rs\") — verify changes";
+        const FILE_GOLDEN: &str = "── Edit Plan ──\nFound file: notes.md\n\nSuggested approach:\n  1. get_file_context(path=\"notes.md\", sections=[\"outline\"]) — understand structure\n  2. get_symbol(path=\"notes.md\", name=\"<target>\") — read specific symbols\n  3. Use edit_within_symbol or replace_symbol_body for changes\n  4. analyze_file_impact(path=\"notes.md\") — verify";
+        const MISSING_GOLDEN: &str = "── Edit Plan ──\nTarget 'does_not_exist' not found.\nTry: search_symbols(query=\"...\") to find the correct name.";
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn target() {}\n\npub fn caller() {\n    target();\n}\n",
+        )
+        .expect("source");
+        fs::write(repo.path().join("notes.md"), "# Notes\n").expect("notes");
+        let server = embed_parity_server(repo.path());
+        let plan = |target: &str| {
+            server.edit_plan(Parameters(
+                serde_json::from_value(serde_json::json!({ "target": target })).expect("input"),
+            ))
+        };
+        assert_eq!(plan("target").await, SYMBOL_GOLDEN);
+        assert_eq!(plan("src/lib.rs::target").await, QUALIFIED_GOLDEN);
+        assert_eq!(plan("notes.md").await, FILE_GOLDEN);
+        assert_eq!(plan("does_not_exist").await, MISSING_GOLDEN);
+    }
+
     /// MCP side of the embed freshen golden (`tests/embed_disk_parity.rs`):
     /// a write completed after the publication is served fresh by the
     /// synchronous exact-path freshen.
