@@ -67,23 +67,21 @@ pub(super) fn admit(
         // only redacted findings from an original-anchor bounded re-read, using
         // the same rule-set comparison as the MCP read gate. Failure to enrich
         // keeps the policy refusal and never authorizes rendering source bytes.
-        if budget.withheld.is_none() {
-            if let Some(crate::domain::FileDisposition::MetadataOnly {
+        if budget.withheld.is_none()
+            && let Some(crate::domain::FileDisposition::MetadataOnly {
                 reason: crate::domain::MetadataOnlyReason::SensitiveContent { rule_ids, .. },
             }) = live.capture_file_disposition(path)
-            {
-                budget.withheld = Some(WithheldMeta::unscanned(path));
-                if let Ok(Some(bytes)) = snapshot.authority.read_regular_beneath_expected(
-                    snapshot.authority_publication,
-                    std::path::Path::new(path),
-                    crate::knowledge::SECRET_SCAN_MAX_BYTES,
-                ) {
-                    let (_, findings) =
-                        read_gate::recorded_finding_evidence_from_bytes(path, &bytes, rule_ids);
-                    if !findings.is_empty() {
-                        budget.withheld =
-                            Some(WithheldMeta::from_content_findings(path, &findings));
-                    }
+        {
+            budget.withheld = Some(WithheldMeta::unscanned(path));
+            if let Ok(Some(bytes)) = snapshot.authority.read_regular_beneath_expected(
+                snapshot.authority_publication,
+                std::path::Path::new(path),
+                crate::knowledge::SECRET_SCAN_MAX_BYTES,
+            ) {
+                let (_, findings) =
+                    read_gate::recorded_finding_evidence_from_bytes(path, &bytes, rule_ids);
+                if !findings.is_empty() {
+                    budget.withheld = Some(WithheldMeta::from_content_findings(path, &findings));
                 }
             }
         }
@@ -316,25 +314,24 @@ pub(super) fn content(
     let (rendered, hash, authority, raw_len, nul_warning) = if let Some(file) = indexed {
         verify_indexed_content(snapshot, &input.path, file)?;
         selected_range(file, &options.content_context)?;
-        if let Some(session) = session {
-            if let Some((handle, body)) =
+        if let Some(session) = session
+            && let Some((handle, body)) =
                 session.file_content_cache_hit(snapshot, request, budget.limits())
-            {
-                let content_hash = crate::hash::digest_hex(&file.content);
-                budget.charge_bytes(
-                    input.path.len() + content_hash.len() + "PublishedGeneration".len(),
-                )?;
-                let rendered = budget.text(&body)?;
-                budget.reused_handle = Some(handle);
-                return Ok(QueryOutput::FileContent(FileContent {
-                    path: input.path,
-                    content_hash,
-                    approximate_tokens: source::approx_tokens_from_bytes(rendered.len()),
-                    rendered,
-                    cache_hit: true,
-                    authority: ReadAuthority::PublishedGeneration,
-                }));
-            }
+        {
+            let content_hash = crate::hash::digest_hex(&file.content);
+            budget.charge_bytes(
+                input.path.len() + content_hash.len() + "PublishedGeneration".len(),
+            )?;
+            let rendered = budget.text(&body)?;
+            budget.reused_handle = Some(handle);
+            return Ok(QueryOutput::FileContent(FileContent {
+                path: input.path,
+                content_hash,
+                approximate_tokens: source::approx_tokens_from_bytes(rendered.len()),
+                rendered,
+                cache_hit: true,
+                authority: ReadAuthority::PublishedGeneration,
+            }));
         }
         let output = file_read::file_content_from_indexed_file_with_context(
             file,
@@ -407,17 +404,17 @@ pub(super) fn content(
             raw_len,
         )),
     );
-    if input.force_refresh == Some(true) {
-        if let Some(prior) = session.and_then(|session| {
+    if input.force_refresh == Some(true)
+        && let Some(prior) = session.and_then(|session| {
             session.prior_file_content_fetch(snapshot, request, budget.limits())
-        }) {
-            rendered = file_read::append_dedup_hint_footer(
-                rendered,
-                "file",
-                prior.fetched_at.elapsed().as_secs(),
-                prior.approx_tokens,
-            );
-        }
+        })
+    {
+        rendered = file_read::append_dedup_hint_footer(
+            rendered,
+            "file",
+            prior.fetched_at.elapsed().as_secs(),
+            prior.approx_tokens,
+        );
     }
     let full = FileContent {
         path: input.path,

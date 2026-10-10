@@ -397,17 +397,17 @@ pub(super) fn file_context(
         rendered.push_str("\n\n");
         rendered.push_str(note);
     }
-    if request.force_refresh {
-        if let Some(prior) = session.and_then(|session| {
+    if request.force_refresh
+        && let Some(prior) = session.and_then(|session| {
             session.prior_file_context_fetch(snapshot, request, budget.limits())
-        }) {
-            rendered = file_read::append_dedup_hint_footer(
-                rendered,
-                "file context",
-                prior.fetched_at.elapsed().as_secs(),
-                prior.approx_tokens,
-            );
-        }
+        })
+    {
+        rendered = file_read::append_dedup_hint_footer(
+            rendered,
+            "file context",
+            prior.fetched_at.elapsed().as_secs(),
+            prior.approx_tokens,
+        );
     }
     let full = FileContextResult {
         path: request.path.clone(),

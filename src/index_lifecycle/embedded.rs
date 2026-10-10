@@ -503,6 +503,7 @@ impl std::fmt::Debug for EmbeddedBinding {
 }
 
 impl EmbeddedBinding {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         identity: EmbeddedIdentity,
         key: ProjectKey,

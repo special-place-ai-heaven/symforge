@@ -1279,8 +1279,11 @@ mod tests {
     #[test]
     fn bound_receipt_replays_on_original_root_and_refuses_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("project");
-        let displaced = dir.path().join("displaced");
+        // Production targets are joined from the canonical bound root; a TEMP
+        // spelled with 8.3 short names would not prefix the authority's root.
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        let displaced = base.join("displaced");
         let state = ProjectStateDir::new(dir.path().join("state"));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(state.as_path()).unwrap();

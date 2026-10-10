@@ -50,6 +50,8 @@ pub struct ResolvedQuerySource {
     pub aliases: Vec<String>,
 }
 #[derive(Debug)]
+// Claim is the expected outcome and is moved once into its result; boxing it would allocate on the success path.
+#[allow(clippy::large_enum_variant)]
 pub enum FederatedSourceOutcome {
     Claim(QueryClaim),
     Refusal(QueryRefusal),

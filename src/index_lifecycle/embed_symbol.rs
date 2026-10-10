@@ -167,18 +167,17 @@ pub(super) fn read(
         return Err(QueryRefusalKind::AdmissionUnavailable);
     }
     let estimate = request.estimate == Some(true);
-    if !estimate {
-        if let Some((handle, rendered)) = session
+    if !estimate
+        && let Some((handle, rendered)) = session
             .and_then(|session| session.symbol_read_cache_hit(snapshot, request, budget.limits()))
-        {
-            budget.reused_handle = Some(handle);
-            return Ok(QueryOutput::SymbolRead(SymbolReadResult {
-                entries: Vec::new(),
-                rendered: budget.text(&rendered)?,
-                cache_hit: true,
-                estimated_tokens: None,
-            }));
-        }
+    {
+        budget.reused_handle = Some(handle);
+        return Ok(QueryOutput::SymbolRead(SymbolReadResult {
+            entries: Vec::new(),
+            rendered: budget.text(&rendered)?,
+            cache_hit: true,
+            estimated_tokens: None,
+        }));
     }
     let mut targets = request.targets.clone().unwrap_or_else(|| {
         vec![SymbolTarget {

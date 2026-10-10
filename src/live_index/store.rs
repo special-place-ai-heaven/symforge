@@ -7551,12 +7551,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("source.rs"), b"pub fn source() {}\n").unwrap();
         let shared = LiveIndex::load(root.path()).unwrap();
+        // The index binds the canonical root; a TEMP spelled with 8.3 short
+        // names (Windows CI runners) differs from it only in spelling.
+        let canonical_root = dunce::canonicalize(root.path()).unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let holder = Arc::clone(&shared);
         let hold = std::thread::spawn(move || {
             holder.with_bound_write_binding(|bound_root, _, _| {
-                assert_eq!(bound_root, root.path());
+                assert_eq!(bound_root, canonical_root);
                 assert!(holder.write_mutex.try_lock().is_none());
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();

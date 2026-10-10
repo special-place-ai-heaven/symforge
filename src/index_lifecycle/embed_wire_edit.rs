@@ -7,21 +7,17 @@ use crate::embed::parity::edit::{
     WireEditPlan, WireEditReply, WireEditRequest,
 };
 use crate::lifecycle_identity::PublicationIdentity;
-use std::path::PathBuf;
+use std::path::Path;
 
 use super::embedded::EmbeddedSourceHandle;
 
-fn bound_guard(
-    wire: &WireEditGuard,
-    root: &PathBuf,
-    publication: PublicationIdentity,
-) -> EditGuard {
+fn bound_guard(wire: &WireEditGuard, root: &Path, publication: PublicationIdentity) -> EditGuard {
     wire.clone().bind(root, publication)
 }
 
 fn bound_actions(
     actions: &[WireBatchEditAction],
-    root: &PathBuf,
+    root: &Path,
     publication: PublicationIdentity,
 ) -> BatchEditRequest {
     BatchEditRequest {
@@ -68,7 +64,7 @@ fn bound_actions(
 
 fn bound_rename(
     wire: &WireBatchRenamePlan,
-    root: &PathBuf,
+    root: &Path,
     publication: PublicationIdentity,
 ) -> BatchRenamePlan {
     BatchRenamePlan {
