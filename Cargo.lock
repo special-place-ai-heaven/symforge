@@ -2665,6 +2665,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "libgit2-sys",
  "notify",
  "notify-debouncer-full",
  "once_cell",

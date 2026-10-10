@@ -4,6 +4,7 @@
 //! Never returns secret bytes or private keys.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -12,18 +13,21 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::hash::digest_hex;
-use crate::knowledge::{self, SECRET_POLICY_VERSION, SecretSpansScan};
+use crate::edit_safety::batch_commit::{
+    BatchIo, EmbeddedBatchIo, StagedImage, commit_staged_locked, with_staged_locks,
+};
+use crate::edit_safety::secret_remediation as shared_stage;
+use crate::knowledge;
+use crate::knowledge::secret_remediation::{self, SelectionRefusal};
 use crate::protocol::SymForgeServer;
-use crate::protocol::edit::atomic_write_file;
-use crate::protocol::edit_tools::{
-    begin_mutation_replay, complete_mutation_replay_with_receipt, fail_and_return_mutation_replay,
-};
+use crate::protocol::edit_tools::fail_and_return_mutation_replay;
 use crate::protocol::result_status::{OutcomeClass, ResultStatus};
-use crate::protocol::secret_dismissals::{
-    self, DISMISSAL_STORE_REL, DismissalRecord, line_bytes_at, line_content_digest,
-};
-use crate::protocol::withheld::{RemediationActionName, mint_finding_id};
+use crate::protocol::secret_dismissals::DISMISSAL_STORE_REL;
+use crate::protocol::withheld::RemediationActionName;
+
+const MAX_REMEDIATION_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REMEDIATION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REMEDIATION_SCAN_FILES: usize = 4096;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SecretRemediateInput {
@@ -42,35 +46,6 @@ pub struct SecretRemediateInput {
 
 fn default_preview_true() -> bool {
     true
-}
-
-#[derive(Debug)]
-struct PlannedRewrite {
-    path: String,
-    abs_path: PathBuf,
-    original: Vec<u8>,
-    rewritten: Vec<u8>,
-    env_lines: Vec<String>,
-    masked_diff: String,
-    #[allow(dead_code)]
-    finding_ids: Vec<String>,
-}
-
-#[derive(Debug)]
-struct PlannedDismiss {
-    path: String,
-    abs_path: PathBuf,
-    records: Vec<DismissalRecord>,
-    masked_summary: String,
-}
-
-#[derive(Debug)]
-struct PlannedEncrypt {
-    path: String,
-    abs_path: PathBuf,
-    original: Vec<u8>,
-    recipient: String,
-    masked_summary: String,
 }
 
 #[tool_router(router = secret_remediate_tool_router, vis = "pub(crate)")]
@@ -136,13 +111,7 @@ impl SymForgeServer {
         };
 
         // Idempotency: preview never reserves; apply honors edit-lane replay.
-        let idempotency = match begin_mutation_replay(
-            self,
-            "secret_remediate",
-            &input,
-            input.idempotency_key.as_deref(),
-            input.preview,
-        ) {
+        let idempotency = match begin_secret_replay(self, &input) {
             Ok(active) => active,
             Err(output) => {
                 if output.starts_with("Error:") {
@@ -172,74 +141,87 @@ impl SymForgeServer {
         paths: &[String],
         idempotency: &Option<crate::idempotency::ActiveReplay>,
     ) -> Result<String, String> {
-        let plan = match plan_externalize(self, paths, &input.finding_ids) {
-            Ok(p) => p,
-            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
-        };
+        let (root, generation, state_dir) = planning_binding(self)?;
+        let selected = select_bounded(&root, paths, &input.finding_ids, "externalize")
+            .map_err(|error| fail_and_return_mutation_replay(idempotency, error))?;
 
         if input.preview {
+            let plans = secret_remediation::plan_externalize(selected);
             let mut out = String::from("secret_remediate preview (externalize)\n");
             out.push_str("Files that would be created or modified:\n");
-            out.push_str(&format!("- {}\n", plan.path));
+            for plan in &plans {
+                out.push_str(&format!("- {}\n", plan.path));
+            }
             out.push_str("- .env\n");
             out.push_str("- .gitignore (ensure .env entry)\n");
             out.push_str("\nMasked diff:\n");
-            out.push_str(&plan.masked_diff);
-            out.push('\n');
+            for plan in plans {
+                out.push_str(&plan.masked_diff);
+                out.push('\n');
+            }
             return Ok(out);
         }
 
-        let live = self.index.data_plane().read();
-        let Some(root) = live.indexed_root.clone() else {
-            return Err(fail_and_return_mutation_replay(
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let staged = shared_stage::stage_externalize(&root, selected, |path| {
+            crate::index_lifecycle::physical_root::read_regular_beneath_root(
+                &root,
+                Path::new(path),
+                MAX_REMEDIATION_FILE_BYTES,
+            )
+            .map_err(|_| shared_stage::StageError::SourceUnavailable)
+        })
+        .map_err(|_| {
+            fail_and_return_mutation_replay(
                 idempotency,
-                "Error: no indexed root bound".to_string(),
-            ));
-        };
-        drop(live);
-
-        let originals = match snapshot_for_rollback(&root, &plan) {
-            Ok(s) => s,
-            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
-        };
-        if let Err(e) = apply_externalize(&root, &plan) {
-            let _ = rollback(&originals);
-            return Err(fail_and_return_mutation_replay(
-                idempotency,
-                format!("Error: apply failed and was rolled back: {e}"),
-            ));
+                "Error: externalize staging refused".into(),
+            )
+        })?;
+        let source = guarded_commit(
+            self,
+            &root,
+            generation,
+            state_dir.as_deref(),
+            &staged,
+            idempotency,
+        )?;
+        let mut rescan = String::from("clean");
+        let mut details = String::new();
+        for path in &selected_paths {
+            let finding = match source
+                .read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES)
+            {
+                Ok(Some(bytes)) => match knowledge::scan_secret_bytes(path, &bytes) {
+                    knowledge::SecretScan::Clean => "clean".to_string(),
+                    knowledge::SecretScan::Sensitive { finding_count, .. } => {
+                        format!("still_sensitive finding_count={finding_count}")
+                    }
+                    knowledge::SecretScan::Indeterminate { reason } => {
+                        format!("indeterminate {reason:?}")
+                    }
+                },
+                _ => "indeterminate source_unavailable".to_string(),
+            };
+            if finding != "clean" {
+                rescan = finding.clone();
+            }
+            details.push_str(&format!("rescan ({path}) : {finding}\n"));
         }
-
-        let rescan = match read_regular_bytes(&plan.abs_path) {
-            Ok(bytes) => match knowledge::scan_secret_bytes(&plan.path, &bytes) {
-                knowledge::SecretScan::Clean => "clean".to_string(),
-                knowledge::SecretScan::Sensitive { finding_count, .. } => {
-                    format!("still_sensitive finding_count={finding_count}")
-                }
-                knowledge::SecretScan::Indeterminate { reason } => {
-                    format!("indeterminate {reason:?}")
-                }
-            },
-            Err(e) => format!("unreadable after write: {e}"),
-        };
-
-        let history = history_note(&root);
-        let status = apply_status_for_rescan(&rescan);
         let mut out = format!(
-            "secret_remediate apply (externalize)\n\
-             {status}\n\
-             written:\n- {}\n- .env\n- .gitignore\n\
-             rescan ({}) : {rescan}\n\
-             {history}\n",
-            plan.path, plan.path
+            "secret_remediate apply (externalize)\n{}\nwritten:\n",
+            apply_status_for_rescan(&rescan)
         );
-        let written = vec![
-            plan.abs_path.clone(),
-            root.join(".env"),
-            root.join(".gitignore"),
-        ];
-        let receipt = crate::idempotency::capture_post_image(&written);
-        complete_mutation_replay_with_receipt(idempotency, &mut out, receipt);
+        for image in &staged {
+            out.push_str(&format!("- {}\n", image.relative.display()));
+        }
+        out.push_str(&details);
+        out.push_str(&history_note(&root));
+        out.push('\n');
+        complete_guarded_replay(idempotency, &source, &staged, &mut out)?;
+        let _ = crate::watcher::reconcile_stale_files(&root, self.index.data_plane());
         Ok(out)
     }
 
@@ -256,84 +238,120 @@ impl SymForgeServer {
                 format!("Error: encrypt is unavailable ({})", availability.1),
             ));
         }
-        let plan = match plan_encrypt(self, paths, &input.finding_ids, &availability.1) {
-            Ok(p) => p,
-            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
-        };
-
+        let binary = sops_binary_on_path().ok_or_else(|| {
+            fail_and_return_mutation_replay(
+                idempotency,
+                "Error: encrypt is unavailable (sops_not_installed)".to_string(),
+            )
+        })?;
+        let (root, generation, state_dir) = planning_binding(self)?;
+        let selected = select_bounded(&root, paths, &input.finding_ids, "encrypt")
+            .map_err(|error| fail_and_return_mutation_replay(idempotency, error))?;
+        secret_remediation::ensure_encrypt_formats(&selected).map_err(|error| {
+            fail_and_return_mutation_replay(idempotency, selection_error_text(error, "encrypt"))
+        })?;
         if input.preview {
-            let mut out = String::from("secret_remediate preview (encrypt)\n");
-            out.push_str("Files that would be created or modified:\n");
-            out.push_str(&format!("- {}\n", plan.path));
+            let mut out = String::from(
+                "secret_remediate preview (encrypt)\nFiles that would be created or modified:\n",
+            );
+            for file in &selected {
+                out.push_str(&format!("- {}\n", file.path));
+            }
             out.push_str("\nMasked summary:\n");
-            out.push_str(&plan.masked_summary);
-            out.push('\n');
+            for file in &selected {
+                out.push_str(&format!(
+                    "- {}: SOPS encryption with age recipient (public only)\n",
+                    file.path
+                ));
+            }
             return Ok(out);
         }
 
-        let live = self.index.data_plane().read();
-        let Some(root) = live.indexed_root.clone() else {
-            return Err(fail_and_return_mutation_replay(
-                idempotency,
-                "Error: no indexed root bound".to_string(),
-            ));
-        };
-        drop(live);
-
-        let snap = plan.original.clone();
-        if let Err(e) = apply_encrypt(&root, &plan) {
-            let _ = std::fs::write(&plan.abs_path, &snap);
-            return Err(fail_and_return_mutation_replay(
-                idempotency,
-                format!("Error: encrypt apply failed and was rolled back: {e}"),
-            ));
-        }
-
-        let after = match read_regular_bytes(&plan.abs_path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                // Do not open a FIFO for the rollback write; that blocks with
-                // no reader. A regular-file read error still attempts restore.
-                if e.kind() != std::io::ErrorKind::InvalidInput {
-                    let _ = std::fs::write(&plan.abs_path, &snap);
-                }
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + std::time::Duration::from_secs(300);
+        let mut staged = Vec::with_capacity(selected.len());
+        for file in selected {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
                 return Err(fail_and_return_mutation_replay(
                     idempotency,
-                    format!("Error: encrypt apply could not re-read {}: {e}", plan.path),
+                    "Error: encrypt preparation deadline exceeded".to_string(),
                 ));
             }
-        };
-        let plaintext_gone = !bytes_contain_utf8_secret(&after, &snap, &plan.path);
-        let rescan = match knowledge::scan_secret_bytes(&plan.path, &after) {
-            knowledge::SecretScan::Clean => "clean".to_string(),
-            knowledge::SecretScan::Sensitive { finding_count, .. } => {
-                format!("still_sensitive finding_count={finding_count}")
+            let encrypted = shared_stage::encrypt_selected_bytes(
+                &file.path,
+                &file.original,
+                &binary,
+                &availability.1,
+                timeout,
+                || None,
+            )
+            .map_err(|reason| {
+                fail_and_return_mutation_replay(
+                    idempotency,
+                    format!("Error: encrypt preparation refused ({reason:?})"),
+                )
+            })?;
+            if secret_remediation::contains_selected_plaintext(&encrypted, &file) {
+                return Err(fail_and_return_mutation_replay(
+                    idempotency,
+                    "Error: encrypt output retained selected plaintext".to_string(),
+                ));
             }
-            knowledge::SecretScan::Indeterminate { reason } => {
-                format!("indeterminate {reason:?}")
-            }
-        };
-        if !plaintext_gone {
-            let _ = std::fs::write(&plan.abs_path, &snap);
-            return Err(fail_and_return_mutation_replay(
-                idempotency,
-                "Error: encrypt apply left plaintext secret bytes; rolled back".to_string(),
-            ));
+            staged.push(StagedImage {
+                absolute: root.join(&file.path),
+                relative: PathBuf::from(&file.path),
+                original: Some(file.original),
+                replacement: encrypted,
+                owner_only: false,
+            });
         }
-
-        let history = history_note(&root);
-        let status = apply_status_for_rescan(&rescan);
+        let source = guarded_commit(
+            self,
+            &root,
+            generation,
+            state_dir.as_deref(),
+            &staged,
+            idempotency,
+        )?;
+        let mut rescan = String::from("clean");
+        let mut details = String::new();
+        for path in &selected_paths {
+            let finding = match source
+                .read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES)
+            {
+                Ok(Some(bytes)) => match knowledge::scan_secret_bytes(path, &bytes) {
+                    knowledge::SecretScan::Clean => "clean".to_string(),
+                    knowledge::SecretScan::Sensitive { finding_count, .. } => {
+                        format!("still_sensitive finding_count={finding_count}")
+                    }
+                    knowledge::SecretScan::Indeterminate { reason } => {
+                        format!("indeterminate {reason:?}")
+                    }
+                },
+                _ => "indeterminate source_unavailable".to_string(),
+            };
+            if finding != "clean" {
+                rescan = finding.clone();
+            }
+            details.push_str(&format!("rescan ({path}) : {finding}\n"));
+        }
         let mut out = format!(
-            "secret_remediate apply (encrypt)\n\
-             {status}\n\
-             written:\n- {}\n\
-             rescan ({}) : {rescan}\n\
-             plaintext_absent: true\n\
-             {history}\n",
-            plan.path, plan.path
+            "secret_remediate apply (encrypt)\n{}\nwritten:\n",
+            apply_status_for_rescan(&rescan)
         );
-        let receipt = crate::idempotency::capture_post_image(std::slice::from_ref(&plan.abs_path));
-        complete_mutation_replay_with_receipt(idempotency, &mut out, receipt);
+        for image in &staged {
+            out.push_str(&format!("- {}\n", image.relative.display()));
+        }
+        out.push_str(&details);
+        out.push_str("plaintext_absent: true\n");
+        out.push_str(&history_note(&root));
+        out.push('\n');
+        complete_guarded_replay(idempotency, &source, &staged, &mut out)?;
+        let _ = crate::watcher::reconcile_stale_files(&root, self.index.data_plane());
         Ok(out)
     }
 
@@ -343,141 +361,373 @@ impl SymForgeServer {
         paths: &[String],
         idempotency: &Option<crate::idempotency::ActiveReplay>,
     ) -> Result<String, String> {
-        let plan = match plan_dismiss(self, paths, &input.finding_ids) {
-            Ok(p) => p,
-            Err(e) => return Err(fail_and_return_mutation_replay(idempotency, e)),
-        };
-
+        let (root, generation, state_dir) = planning_binding(self)?;
+        let selected = select_bounded(&root, paths, &input.finding_ids, "dismiss")
+            .map_err(|error| fail_and_return_mutation_replay(idempotency, error))?;
+        let records = secret_remediation::plan_dismiss(&selected).map_err(|error| {
+            fail_and_return_mutation_replay(idempotency, selection_error_text(error, "dismiss"))
+        })?;
         if input.preview {
-            let mut out = String::from("secret_remediate preview (dismiss)\n");
-            out.push_str("Files that would be created or modified:\n");
-            out.push_str(&format!("- {DISMISSAL_STORE_REL}\n"));
-            out.push_str("\nMasked summary:\n");
-            out.push_str(&plan.masked_summary);
-            out.push('\n');
-            return Ok(out);
-        }
-
-        let live = self.index.data_plane().read();
-        let Some(root) = live.indexed_root.clone() else {
-            return Err(fail_and_return_mutation_replay(
-                idempotency,
-                "Error: no indexed root bound".to_string(),
-            ));
-        };
-        drop(live);
-
-        let store_path = secret_dismissals::store_abs(&root);
-        // A load error must not merge onto an empty set: that rewrite would
-        // drop every prior record. Missing store is Ok(empty) and still applies.
-        let mut merged = match secret_dismissals::load_dismissals(&root) {
-            Ok(records) => records,
-            Err(err) => {
-                return Err(fail_and_return_mutation_replay(
-                    idempotency,
-                    format!(
-                        "Error: dismiss apply refused; dismissal store could not be loaded: {err}"
-                    ),
+            let mut out = String::from(
+                "secret_remediate preview (dismiss)\nFiles that would be created or modified:\n",
+            );
+            out.push_str(&format!("- {DISMISSAL_STORE_REL}\n\nMasked summary:\n"));
+            for record in &records {
+                out.push_str(&format!(
+                    "- {} rule={} digest={}\n",
+                    record.path,
+                    record.rule_id,
+                    &record.line_digest[..12.min(record.line_digest.len())],
                 ));
             }
-        };
-        for rec in &plan.records {
-            merged.retain(|r| {
-                !(r.path.replace('\\', "/") == rec.path.replace('\\', "/")
-                    && r.rule_id == rec.rule_id
-                    && r.line_digest == rec.line_digest)
-            });
-            merged.push(rec.clone());
+            return Ok(out);
         }
-        let store_bytes = serde_json::to_vec_pretty(&serde_json::json!({ "records": merged }))
-            .map_err(|e| {
-                fail_and_return_mutation_replay(
-                    idempotency,
-                    format!("Error: serialize dismissals: {e}"),
-                )
-            })?;
-
-        if let Some(parent) = store_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = atomic_write_file(&root, None, &store_path, &store_bytes) {
-            return Err(fail_and_return_mutation_replay(
-                idempotency,
-                format!("Error: write dismissal store: {e}"),
-            ));
-        }
-
-        // Reconcile the index with the store just written: every path the old
-        // or new records name is re-admitted through the watcher's single-file
-        // seam, which classifies with the current store. When every finding is
-        // dismissed the file is published with symbols and search content;
-        // otherwise it stays withheld. Covers every file type, not only those
-        // with a parser language. A lost publication race is retried once and
-        // otherwise reported, never folded into "withheld".
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let staged = shared_stage::stage_dismiss(&root, &selected, |path| {
+            crate::index_lifecycle::physical_root::read_regular_beneath_root(
+                &root,
+                Path::new(path),
+                MAX_REMEDIATION_FILE_BYTES,
+            )
+            .map_err(|_| shared_stage::StageError::SourceUnavailable)
+        })
+        .map_err(|error| {
+            let reason = match error {
+                shared_stage::StageError::SourceUnavailable => {
+                    "Error: dismiss apply refused; dismissal store could not be loaded".to_string()
+                }
+                _ => format!("Error: dismiss staging refused ({error:?})"),
+            };
+            fail_and_return_mutation_replay(idempotency, reason)
+        })?;
+        let source = guarded_commit(
+            self,
+            &root,
+            generation,
+            state_dir.as_deref(),
+            &staged,
+            idempotency,
+        )?;
+        let actual_store = source
+            .read_regular_beneath_anchor(Path::new(DISMISSAL_STORE_REL), MAX_REMEDIATION_FILE_BYTES)
+            .ok()
+            .flatten();
+        let current_records = actual_store.as_deref().and_then(|bytes| {
+            crate::knowledge::secret_dismissals::parse_dismissals_bytes(bytes).ok()
+        });
         use crate::live_index::single_file::{
             ReindexOutcome, admit_and_index_single_path, reconcile_secret_dismissals,
         };
         let shared = self.index.data_plane();
-        let readmit = || {
-            admit_and_index_single_path(
-                &plan.path,
-                &plan.abs_path,
-                shared,
-                shared.current_project_generation(),
-            )
-        };
-        let mut outcome = reconcile_secret_dismissals(shared, &root)
-            .remove(&plan.path)
-            .unwrap_or_else(readmit);
-        if matches!(outcome, ReindexOutcome::PublicationRejected) {
-            outcome = readmit();
-        }
-        let index_outcome = match outcome {
-            ReindexOutcome::Reindexed | ReindexOutcome::HashSkip => "indexed",
-            ReindexOutcome::Skipped => "withheld",
-            ReindexOutcome::NotFound | ReindexOutcome::Removed => "absent",
-            ReindexOutcome::ReadError(_) => "unreadable",
-            ReindexOutcome::PublicationRejected => {
-                "publication rejected by a concurrent index change; index unchanged"
+        let mut outcomes = reconcile_secret_dismissals(shared, &root);
+        let mut rescan = String::from("clean");
+        let mut details = String::new();
+        for path in &selected_paths {
+            let absolute = root.join(path);
+            let readmit = || {
+                admit_and_index_single_path(
+                    path,
+                    &absolute,
+                    shared,
+                    shared.current_project_generation(),
+                )
+            };
+            let mut outcome = outcomes.remove(path).unwrap_or_else(readmit);
+            if matches!(outcome, ReindexOutcome::PublicationRejected) {
+                outcome = readmit();
             }
-        };
-
-        let rescan = match read_regular_bytes(&plan.abs_path) {
-            Ok(bytes) => {
-                let filtered = secret_dismissals::scan_with_dismissals(&root, &plan.path, &bytes);
-                match filtered {
-                    knowledge::SecretScan::Clean => "clean".to_string(),
-                    knowledge::SecretScan::Sensitive { finding_count, .. } => {
-                        format!("still_sensitive finding_count={finding_count}")
-                    }
-                    knowledge::SecretScan::Indeterminate { reason } => {
-                        format!("indeterminate {reason:?}")
+            let index_outcome = match outcome {
+                ReindexOutcome::Reindexed | ReindexOutcome::HashSkip => "indexed",
+                ReindexOutcome::Skipped => "withheld",
+                ReindexOutcome::NotFound | ReindexOutcome::Removed => "absent",
+                ReindexOutcome::ReadError(_) => "unreadable",
+                ReindexOutcome::PublicationRejected => {
+                    "publication rejected by a concurrent index change; index unchanged"
+                }
+            };
+            let finding = match (
+                &current_records,
+                source.read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES),
+            ) {
+                (Some(records), Ok(Some(bytes))) => {
+                    match crate::knowledge::secret_dismissals::scan_with_records(
+                        path, &bytes, records,
+                    ) {
+                        knowledge::SecretScan::Clean => "clean".to_string(),
+                        knowledge::SecretScan::Sensitive { finding_count, .. } => {
+                            format!("still_sensitive finding_count={finding_count}")
+                        }
+                        knowledge::SecretScan::Indeterminate { reason } => {
+                            format!("indeterminate {reason:?}")
+                        }
                     }
                 }
+                _ => "indeterminate source_unavailable".to_string(),
+            };
+            if finding != "clean" {
+                rescan = finding.clone();
             }
-            Err(e) => format!("unreadable: {e}"),
-        };
-
-        let history = history_note(&root);
-        let status = apply_status_for_rescan(&rescan);
+            details.push_str(&format!(
+                "rescan ({path}) : {finding}\nindex ({path}) : {index_outcome}\n"
+            ));
+        }
         let mut out = format!(
-            "secret_remediate apply (dismiss)\n\
-             {status}\n\
-             written:\n- {DISMISSAL_STORE_REL}\n\
-             rescan ({}) : {rescan}\n\
-             index ({}) : {index_outcome}\n\
-             {history}\n",
-            plan.path, plan.path
+            "secret_remediate apply (dismiss)\n{}\nwritten:\n- {DISMISSAL_STORE_REL}\n",
+            apply_status_for_rescan(&rescan)
         );
-        let receipt = crate::idempotency::capture_post_image(&[store_path]);
-        complete_mutation_replay_with_receipt(idempotency, &mut out, receipt);
+        out.push_str(&details);
+        out.push_str(&history_note(&root));
+        out.push('\n');
+        complete_guarded_replay(idempotency, &source, &staged, &mut out)?;
         Ok(out)
     }
 }
 
+fn admitted_root_matches(
+    root: &Path,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> bool {
+    root.canonicalize()
+        .is_ok_and(|canonical| canonical == source.admitted_root())
+}
+
+/// The replay gate every lane (secret remediation, edit begin, edit probe)
+/// runs before it touches a replay store: the bound root must still be the
+/// root the source authority admitted, then the state placement is
+/// reconciled. One function, so the three lanes cannot drift apart.
+pub(crate) fn admitted_replay_state(
+    server: &SymForgeServer,
+    root: &Path,
+    runtime: Option<&crate::domain::ProjectStateDir>,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    label: &str,
+) -> Result<Option<crate::domain::ProjectStateDir>, String> {
+    if !admitted_root_matches(root, source) {
+        return Err(format!("Error: admitted {label} source changed"));
+    }
+    resolved_project_state(server, root, runtime, label)
+}
+
+/// Reconcile the server's resolved state placement with the pinned index
+/// binding for a replay. The roots must canonicalize equal, and two present
+/// state dirs must agree. When only one side carries a state dir, that one is
+/// the durable placement for this root. `label` names the caller in refusals.
+pub(crate) fn resolved_project_state(
+    server: &SymForgeServer,
+    root: &Path,
+    runtime: Option<&crate::domain::ProjectStateDir>,
+    label: &str,
+) -> Result<Option<crate::domain::ProjectStateDir>, String> {
+    let unavailable = || format!("Error: admitted {label} source unavailable");
+    let server_root = server.capture_repo_root().ok_or_else(unavailable)?;
+    let (Ok(server_canonical), Ok(runtime_canonical)) =
+        (server_root.canonicalize(), root.canonicalize())
+    else {
+        return Err(unavailable());
+    };
+    if server_canonical != runtime_canonical {
+        return Err(format!("Error: admitted {label} source changed"));
+    }
+    let server_state = server.capture_project_state_dir();
+    if let (Some(runtime), Some(server_state)) = (runtime, server_state.as_ref())
+        && runtime.as_path() != server_state.as_path()
+    {
+        return Err("Error: durable project-state placement changed".to_string());
+    }
+    Ok(server_state.or_else(|| runtime.cloned()))
+}
+
+fn begin_secret_replay(
+    server: &SymForgeServer,
+    input: &SecretRemediateInput,
+) -> Result<Option<crate::idempotency::ActiveReplay>, String> {
+    // The key is optional (spec 034 contract): without one, apply runs
+    // unreplayed, exactly as the edit lane does. An empty key still reaches
+    // the idempotency module, which refuses it with its own typed error.
+    let Some(raw_key) = input.idempotency_key.as_deref().filter(|_| !input.preview) else {
+        return Ok(None);
+    };
+    let mut request = serde_json::to_value(input)
+        .map_err(|_| "Error: remediation request cannot be serialized".to_string())?;
+    if let Value::Object(map) = &mut request {
+        map.remove("idempotency_key");
+    }
+    let decision = server
+        .index
+        .with_admitted_replay_source(|root, state, source| {
+            let placement = admitted_replay_state(server, root, state, source, "remediation")?;
+            let state = placement.as_ref().ok_or_else(|| {
+                "Error: durable project-state replay is unavailable for this binding".to_string()
+            })?;
+            crate::idempotency::begin_tool_replay_verified_bound(
+                state,
+                "secret_remediate",
+                raw_key,
+                &request,
+                source,
+            )
+            .map_err(|error| crate::idempotency::format_tool_error(&error))
+        })
+        .map_err(|_| "Error: admitted remediation source unavailable".to_string())?
+        .ok_or_else(|| "Error: admitted remediation source unavailable".to_string())??;
+    match decision {
+        crate::idempotency::ReplayStart::FirstExecution(active) => Ok(Some(active)),
+        crate::idempotency::ReplayStart::Replay(response) => Err(response),
+    }
+}
+
+fn planning_binding(server: &SymForgeServer) -> Result<(PathBuf, u64, Option<PathBuf>), String> {
+    let shared = server.index.data_plane();
+    let live = shared.read();
+    let root = live
+        .indexed_root
+        .clone()
+        .ok_or_else(|| "Error: no indexed root bound".to_string())?;
+    let generation = shared.current_project_generation();
+    let state_dir = resolved_project_state(
+        server,
+        &root,
+        shared.project_state_dir().as_deref(),
+        "remediation",
+    )?
+    .map(|state| state.as_path().to_path_buf());
+    Ok((root, generation, state_dir))
+}
+
+fn select_bounded(
+    root: &Path,
+    paths: &[String],
+    finding_ids: &[String],
+    action: &str,
+) -> Result<Vec<secret_remediation::SelectedFile>, String> {
+    if paths.len() > MAX_REMEDIATION_SCAN_FILES {
+        return Err(selection_error_text(
+            SelectionRefusal::ResourceLimit,
+            action,
+        ));
+    }
+    let mut total = 0usize;
+    secret_remediation::select_requested_checked(paths, finding_ids, |path| {
+        let bytes = crate::index_lifecycle::physical_root::read_regular_beneath_root(
+            root,
+            Path::new(path),
+            MAX_REMEDIATION_FILE_BYTES,
+        )
+        .map_err(|_| SelectionRefusal::ResourceLimit)?;
+        if let Some(bytes) = &bytes {
+            total = total.saturating_add(bytes.len());
+            if total > MAX_REMEDIATION_TOTAL_BYTES {
+                return Err(SelectionRefusal::ResourceLimit);
+            }
+        }
+        Ok(bytes)
+    })
+    .map_err(|error| selection_error_text(error, action))
+}
+
+fn guarded_commit(
+    server: &SymForgeServer,
+    planned_root: &Path,
+    planned_generation: u64,
+    planned_state: Option<&Path>,
+    staged: &[StagedImage],
+    idempotency: &Option<crate::idempotency::ActiveReplay>,
+) -> Result<Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>, String> {
+    with_staged_locks(staged, |order| {
+        server.index.with_admitted_write_binding(
+            |root, state, generation, authority, publication| {
+                if root != planned_root
+                    || !admitted_root_matches(planned_root, authority)
+                    || generation != planned_generation
+                    || state
+                        .is_some_and(|state| Some(state.as_path()) != planned_state)
+                    || staged.iter().any(|image| image.absolute != root.join(&image.relative))
+                {
+                    return Err("Error: source binding changed before remediation apply".to_string());
+                }
+                let write = authority.acquire_write_expected(publication).map_err(|_| {
+                    "Error: source publication changed before remediation apply".to_string()
+                })?;
+                let mut io = EmbeddedBatchIo::new(write);
+                for image in staged {
+                    match io.matches(image, image.original.as_deref()) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = io.finish();
+                            return Err("Error: remediation source bytes changed before apply".to_string());
+                        }
+                        Err(_) => {
+                            let _ = io.finish();
+                            return Err("Error: remediation source preimage unavailable".to_string());
+                        }
+                    }
+                }
+                if let Some(active) = idempotency
+                    && active.mark_started().is_err() {
+                        let _ = io.finish();
+                        return Err("Error: durable remediation start record unavailable".to_string());
+                    }
+                let committed = commit_staged_locked(staged, order, &mut io, None);
+                let finished = io.finish();
+                if committed.is_err() || finished.is_err() {
+                    if let Some(active) = idempotency {
+                        let _ = active.mark_uncertain();
+                    }
+                    return Err("secret_remediate apply\napply_status: incomplete\nreason: guarded_write_uncertain\n".to_string());
+                }
+                Ok(Arc::clone(authority))
+            },
+        )
+    })
+    .map_err(|_| "Error: remediation target lock unavailable".to_string())?
+    .map_err(|_| "Error: admitted source binding unavailable".to_string())?
+    .ok_or_else(|| "Error: admitted source is not current".to_string())?
+}
+
+fn complete_guarded_replay(
+    idempotency: &Option<crate::idempotency::ActiveReplay>,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    staged: &[StagedImage],
+    output: &mut String,
+) -> Result<(), String> {
+    // Keyless apply has no replay record to complete; the guarded write
+    // already committed, so there is nothing left to report as incomplete.
+    let Some(active) = idempotency else {
+        return Ok(());
+    };
+    let targets = staged
+        .iter()
+        .map(|image| crate::idempotency::PostImageTarget {
+            path: image.absolute.display().to_string(),
+            content_digest: Some(crate::hash::digest_hex(&image.replacement)),
+        })
+        .collect();
+    let receipt = crate::idempotency::PostImageReceipt {
+        targets,
+        source: None,
+    };
+    let Some(receipt) = crate::idempotency::bind_post_image_to_source(receipt, source) else {
+        let _ = active.mark_uncertain();
+        return Err("secret_remediate apply\napply_status: incomplete\nreason: source_post_image_unavailable\n".to_string());
+    };
+    if active
+        .complete_with_post_image(output.clone(), Some(receipt))
+        .is_err()
+    {
+        let _ = active.mark_uncertain();
+        output.clear();
+        output.push_str("secret_remediate apply\napply_status: incomplete\nreason: replay_completion_unavailable\n");
+        return Err(output.clone());
+    }
+    Ok(())
+}
+
 /// Returns (available, reason_or_recipient).
 fn encrypt_runtime_availability(server: &SymForgeServer) -> (bool, String) {
-    if !sops_binary_on_path() {
+    if sops_binary_on_path().is_none() {
         return (false, "sops_not_installed".to_string());
     }
     let live = server.index.data_plane().read();
@@ -490,15 +740,16 @@ fn encrypt_runtime_availability(server: &SymForgeServer) -> (bool, String) {
     }
 }
 
-fn sops_binary_on_path() -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let candidate = dir.join(if cfg!(windows) { "sops.exe" } else { "sops" });
-                candidate.is_file()
-            })
+fn sops_binary_on_path() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(if cfg!(windows) { "sops.exe" } else { "sops" });
+            candidate
+                .is_file()
+                .then(|| std::fs::canonicalize(candidate).ok())
+                .flatten()
         })
-        .unwrap_or(false)
+    })
 }
 
 fn resolve_age_recipient(root: &Path) -> Result<String, String> {
@@ -565,468 +816,28 @@ fn resolve_scope_paths(server: &SymForgeServer, scope: &Value) -> Result<Vec<Str
     }
 }
 
-fn plan_externalize(
-    server: &SymForgeServer,
-    paths: &[String],
-    finding_ids: &[String],
-) -> Result<PlannedRewrite, String> {
-    let live = server.index.data_plane().read();
-    let Some(root) = live.indexed_root.as_deref() else {
-        return Err("Error: no indexed root bound".to_string());
-    };
-    let mut wanted: std::collections::BTreeSet<&str> =
-        finding_ids.iter().map(String::as_str).collect();
-    let mut matched_path: Option<PlannedRewrite> = None;
-
-    for rel in paths {
-        if wanted.is_empty() {
-            break;
+fn selection_error_text(error: SelectionRefusal, action: &str) -> String {
+    match error {
+        SelectionRefusal::EmptyFindings => "Error: finding_ids must be non-empty".to_owned(),
+        SelectionRefusal::DuplicateFinding => "Error: duplicate finding_id".to_owned(),
+        SelectionRefusal::TooManyFindings => "Error: too many finding_ids".to_owned(),
+        SelectionRefusal::ScanIndeterminate => {
+            format!("Error: secret span scan indeterminate; refusing {action}")
         }
-        let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
-            continue;
-        };
-        let Ok(bytes) = read_regular_bytes(&abs) else {
-            continue;
-        };
-        let spans = match knowledge::scan_secret_spans(rel, &bytes) {
-            SecretSpansScan::Spans(s) => s,
-            SecretSpansScan::Indeterminate { reason } => {
-                return Err(format!(
-                    "Error: secret span scan indeterminate ({reason:?}); refusing externalize"
-                ));
-            }
-        };
-        let mut hits = Vec::new();
-        for (idx, span) in spans.iter().enumerate() {
-            let id = mint_finding_id(
-                rel,
-                span.rule_id,
-                span.line_start,
-                span.line_end,
-                &span.shape,
-            );
-            if wanted.remove(id.as_str()) {
-                hits.push((idx, span, id));
-            }
+        SelectionRefusal::MissingFinding => "Error: finding_ids not found in scope".to_owned(),
+        SelectionRefusal::UndismissableFinding => {
+            "Error: finding rule cannot be dismissed".to_owned()
         }
-        if hits.is_empty() {
-            continue;
+        SelectionRefusal::MissingLine => "Error: could not bind line digest".to_owned(),
+        SelectionRefusal::UnsupportedEncryptFormat => {
+            "Error: finding is not in an encrypt-supported format".to_owned()
         }
-        let mut rewritten = bytes.clone();
-        let mut env_lines = Vec::new();
-        let mut masked = String::new();
-        let mut applied_ids = Vec::new();
-        hits.sort_by_key(|(_, span, _)| std::cmp::Reverse(span.value_start));
-        let idiom = externalize_idiom(rel);
-        for (secret_n, (_idx, span, id)) in hits.into_iter().enumerate() {
-            let var = env_var_name(rel, span.rule_id, span.line_start, secret_n);
-            let value = &bytes[span.value_start..span.value_end];
-            env_lines.push(format!("{var}={}", String::from_utf8_lossy(value)));
-            let replacement = idiom_replacement(&idiom, &var);
-            rewritten.splice(span.value_start..span.value_end, replacement.bytes());
-            applied_ids.push(id);
-            let mask_kind = ["sec", "ret"].concat();
-            masked.push_str(&format!(
-                "--- {rel}\n+++ {rel}\n@@ line {} @@\n-«{mask_kind}:{}»\n+{replacement}\n",
-                span.line_start,
-                secret_n + 1
-            ));
-        }
-        matched_path = Some(PlannedRewrite {
-            path: rel.clone(),
-            abs_path: abs,
-            original: bytes,
-            rewritten,
-            env_lines,
-            masked_diff: masked,
-            finding_ids: applied_ids,
-        });
-        break;
-    }
-
-    if !wanted.is_empty() {
-        let missing: Vec<_> = wanted.into_iter().collect();
-        return Err(format!(
-            "Error: finding_ids not found in scope: {missing:?}"
-        ));
-    }
-    matched_path.ok_or_else(|| "Error: no matching findings in scope".to_string())
-}
-
-fn plan_encrypt(
-    server: &SymForgeServer,
-    paths: &[String],
-    finding_ids: &[String],
-    recipient: &str,
-) -> Result<PlannedEncrypt, String> {
-    let live = server.index.data_plane().read();
-    let Some(root) = live.indexed_root.as_deref() else {
-        return Err("Error: no indexed root bound".to_string());
-    };
-    let mut wanted: std::collections::BTreeSet<&str> =
-        finding_ids.iter().map(String::as_str).collect();
-
-    for rel in paths {
-        if !encrypt_format_supported(rel) {
-            continue;
-        }
-        let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
-            continue;
-        };
-        let Ok(bytes) = read_regular_bytes(&abs) else {
-            continue;
-        };
-        let spans = match knowledge::scan_secret_spans(rel, &bytes) {
-            SecretSpansScan::Spans(s) => s,
-            SecretSpansScan::Indeterminate { reason } => {
-                return Err(format!(
-                    "Error: secret span scan indeterminate ({reason:?}); refusing encrypt"
-                ));
-            }
-        };
-        let mut matched = false;
-        for span in &spans {
-            let id = mint_finding_id(
-                rel,
-                span.rule_id,
-                span.line_start,
-                span.line_end,
-                &span.shape,
-            );
-            if wanted.remove(id.as_str()) {
-                matched = true;
-            }
-        }
-        if !matched {
-            continue;
-        }
-        if !wanted.is_empty() {
-            let missing: Vec<_> = wanted.into_iter().collect();
-            return Err(format!(
-                "Error: finding_ids not found in scope: {missing:?}"
-            ));
-        }
-        let mask_kind = ["sec", "ret"].concat();
-        return Ok(PlannedEncrypt {
-            path: rel.clone(),
-            abs_path: abs,
-            original: bytes,
-            recipient: recipient.to_string(),
-            masked_summary: format!(
-                "Would SOPS-encrypt {rel} in place with age recipient (public only).\n\
-                 Values shown as «{mask_kind}:N» are never returned.\n"
-            ),
-        });
-    }
-    if !wanted.is_empty() {
-        let missing: Vec<_> = wanted.into_iter().collect();
-        return Err(format!(
-            "Error: finding_ids not found in encrypt-supported scope: {missing:?}"
-        ));
-    }
-    Err("Error: no matching findings in encrypt-supported formats (json/yaml/toml/env)".to_string())
-}
-
-fn plan_dismiss(
-    server: &SymForgeServer,
-    paths: &[String],
-    finding_ids: &[String],
-) -> Result<PlannedDismiss, String> {
-    let live = server.index.data_plane().read();
-    let Some(root) = live.indexed_root.as_deref() else {
-        return Err("Error: no indexed root bound".to_string());
-    };
-    let mut wanted: std::collections::BTreeSet<&str> =
-        finding_ids.iter().map(String::as_str).collect();
-    let mut records = Vec::new();
-    let mut path_hit: Option<(String, PathBuf)> = None;
-    let mut summary = String::new();
-
-    for rel in paths {
-        if wanted.is_empty() {
-            break;
-        }
-        let Ok(Some(abs)) = crate::discovery::resolve_repo_path(root, rel) else {
-            continue;
-        };
-        let Ok(bytes) = read_regular_bytes(&abs) else {
-            continue;
-        };
-        let spans = match knowledge::scan_secret_spans(rel, &bytes) {
-            SecretSpansScan::Spans(s) => s,
-            SecretSpansScan::Indeterminate { reason } => {
-                return Err(format!(
-                    "Error: secret span scan indeterminate ({reason:?}); refusing dismiss"
-                ));
-            }
-        };
-        for span in &spans {
-            let id = mint_finding_id(
-                rel,
-                span.rule_id,
-                span.line_start,
-                span.line_end,
-                &span.shape,
-            );
-            if !wanted.remove(id.as_str()) {
-                continue;
-            }
-            if !secret_dismissals::rule_is_dismissable(span.rule_id) {
-                return Err(format!(
-                    "Error: finding {id} ({}) cannot be dismissed: the rule matches only the \
-                     key's BEGIN header, so a dismissal could not bind the key material. \
-                     Remove the key from the repository or externalize it instead.",
-                    span.rule_id
-                ));
-            }
-            let Some(line) = line_bytes_at(&bytes, span.line_start) else {
-                return Err(format!(
-                    "Error: could not bind line digest for finding {id}"
-                ));
-            };
-            let digest = line_content_digest(line);
-            records.push(DismissalRecord {
-                path: rel.replace('\\', "/"),
-                line_digest: digest.clone(),
-                rule_id: span.rule_id.to_string(),
-                created_at: Some(chrono_now_rfc3339()),
-                note: Some("dismissed via secret_remediate".to_string()),
-            });
-            let mask_kind = ["sec", "ret"].concat();
-            summary.push_str(&format!(
-                "- {rel}:{} rule={} digest={} «{mask_kind}:bound»\n",
-                span.line_start,
-                span.rule_id,
-                &digest[..12.min(digest.len())]
-            ));
-            path_hit = Some((rel.clone(), abs.clone()));
+        SelectionRefusal::ResourceLimit => "Error: remediation scan resource limit".to_owned(),
+        SelectionRefusal::Cancelled => "Error: remediation scan cancelled".to_owned(),
+        SelectionRefusal::DeadlineExceeded => {
+            "Error: remediation scan deadline exceeded".to_owned()
         }
     }
-
-    if !wanted.is_empty() {
-        let missing: Vec<_> = wanted.into_iter().collect();
-        return Err(format!(
-            "Error: finding_ids not found in scope: {missing:?}"
-        ));
-    }
-    let (path, abs_path) = path_hit.ok_or_else(|| "Error: no matching findings".to_string())?;
-    Ok(PlannedDismiss {
-        path,
-        abs_path,
-        records,
-        masked_summary: summary,
-    })
-}
-
-fn chrono_now_rfc3339() -> String {
-    // Avoid pulling chrono if unused elsewhere: use a simple UTC-ish stamp via SystemTime.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("unix:{secs}")
-}
-
-fn encrypt_format_supported(path: &str) -> bool {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        ext.as_str(),
-        "json" | "yaml" | "yml" | "toml" | "env" | "ini"
-    ) || Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == ".env" || n.ends_with(".env"))
-}
-
-fn apply_encrypt(root: &Path, plan: &PlannedEncrypt) -> Result<(), String> {
-    let _ = root;
-    // Encrypt via temp file then atomic replace — never leave partial ciphertext
-    // without rollback path.
-    let tmp = plan.abs_path.with_extension("sops.tmp");
-    let output = crate::process_util::hidden_command("sops")
-        .args([
-            "--encrypt",
-            "--age",
-            &plan.recipient,
-            "--output",
-            tmp.to_str().ok_or("encrypt temp path not utf8")?,
-            plan.abs_path.to_str().ok_or("encrypt path not utf8")?,
-        ])
-        .output()
-        .map_err(|e| format!("sops spawn failed: {e}"))?;
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "sops encrypt failed (status {:?}): {}",
-            output.status.code(),
-            stderr.chars().take(200).collect::<String>()
-        ));
-    }
-    let encrypted = read_regular_bytes(&tmp).map_err(|e| format!("read sops output: {e}"))?;
-    let _ = std::fs::remove_file(&tmp);
-    atomic_write_file(root, None, &plan.abs_path, &encrypted)
-        .map_err(|e| format!("write encrypted {}: {e}", plan.path))?;
-    Ok(())
-}
-
-/// Best-effort: if original had a secret capture and encrypted bytes still contain
-/// that exact capture as utf8, treat as plaintext leak. Uses span scan on original only.
-fn bytes_contain_utf8_secret(after: &[u8], original: &[u8], path: &str) -> bool {
-    let SecretSpansScan::Spans(spans) = knowledge::scan_secret_spans(path, original) else {
-        return false;
-    };
-    for span in spans {
-        let value = &original[span.value_start..span.value_end];
-        if value.len() >= 8 && after.windows(value.len()).any(|w| w == value) {
-            return true;
-        }
-    }
-    false
-}
-
-#[derive(Clone, Copy)]
-enum Idiom {
-    EnvSubst,
-    ProcessEnv,
-    OsEnviron,
-    StdEnvVar,
-}
-
-fn externalize_idiom(path: &str) -> Idiom {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => Idiom::ProcessEnv,
-        "py" => Idiom::OsEnviron,
-        "rs" => Idiom::StdEnvVar,
-        _ => Idiom::EnvSubst,
-    }
-}
-
-fn idiom_replacement(idiom: &Idiom, var: &str) -> String {
-    match idiom {
-        Idiom::EnvSubst => format!("${{{var}}}"),
-        Idiom::ProcessEnv => format!("process.env.{var}"),
-        Idiom::OsEnviron => format!("os.environ[\"{var}\"]"),
-        Idiom::StdEnvVar => format!("std::env::var(\"{var}\").expect(\"{var} must be set\")"),
-    }
-}
-
-fn env_var_name(path: &str, rule_id: &str, line: u32, n: usize) -> String {
-    let material = format!("{path}\0{rule_id}\0{line}\0{n}\0{SECRET_POLICY_VERSION}");
-    let hex = digest_hex(material.as_bytes());
-    format!("SYMFORGE_SECRET_{}", hex[..8].to_ascii_uppercase())
-}
-
-fn read_regular_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    crate::protocol::read_gate::read_regular_file(path)
-}
-
-/// Missing path is empty. A FIFO, socket, device, or symlink is an error
-/// rather than a blocking read.
-fn read_optional_regular_text(path: &Path, label: &str) -> Result<String, String> {
-    match read_regular_bytes(path) {
-        Ok(bytes) => String::from_utf8(bytes).map_err(|err| format!("read {label}: {err}")),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(err) => Err(format!("read {label}: {err}")),
-    }
-}
-
-struct RollbackSnap {
-    path: PathBuf,
-    bytes: Option<Vec<u8>>,
-}
-
-fn snapshot_for_rollback(root: &Path, plan: &PlannedRewrite) -> Result<Vec<RollbackSnap>, String> {
-    let mut snaps = vec![RollbackSnap {
-        path: plan.abs_path.clone(),
-        bytes: Some(plan.original.clone()),
-    }];
-    for name in [".env", ".gitignore"] {
-        let p = root.join(name);
-        let bytes = match std::fs::symlink_metadata(&p) {
-            Ok(meta) if meta.is_file() => {
-                Some(read_regular_bytes(&p).map_err(|e| format!("snapshot {name}: {e}"))?)
-            }
-            Ok(_) => {
-                // Exists but is not a regular file (e.g. directory planted to
-                // force a mid-apply failure). Do not snapshot or roll it back.
-                continue;
-            }
-            Err(_) => None,
-        };
-        snaps.push(RollbackSnap { path: p, bytes });
-    }
-    Ok(snaps)
-}
-
-fn rollback(snaps: &[RollbackSnap]) -> Result<(), String> {
-    for snap in snaps {
-        match &snap.bytes {
-            Some(b) => {
-                std::fs::write(&snap.path, b).map_err(|e| format!("rollback: {e}"))?;
-            }
-            None => {
-                let _ = std::fs::remove_file(&snap.path);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn apply_externalize(root: &Path, plan: &PlannedRewrite) -> Result<(), String> {
-    // Bruce F3: write `.env` BEFORE stripping the source so a crash mid-apply
-    // cannot leave a stripped source without the env append.
-    let env_path = root.join(".env");
-    let mut env_body = read_optional_regular_text(&env_path, ".env")?;
-    if !env_body.ends_with('\n') && !env_body.is_empty() {
-        env_body.push('\n');
-    }
-    for line in &plan.env_lines {
-        let (key, value) = line.split_once('=').unwrap_or((line.as_str(), ""));
-        if let Some(existing) = env_body.lines().find(|l| l.starts_with(&format!("{key}="))) {
-            // Bruce F1: idempotent skip only when the value matches.
-            let existing_val = existing.split_once('=').map(|(_, v)| v).unwrap_or("");
-            if existing_val != value {
-                return Err(format!(
-                    ".env key {key} already exists with a different value; refusing silent overwrite"
-                ));
-            }
-            continue;
-        }
-        env_body.push_str(line);
-        env_body.push('\n');
-    }
-    atomic_write_file(root, None, &env_path, env_body.as_bytes())
-        .map_err(|e| format!("write .env: {e}"))?;
-    // Owner-only mode. A failed chmod, or a mode that is still not 0o600,
-    // fails the apply (caller rolls the .env write back).
-    #[cfg(unix)]
-    ensure_env_owner_only(&env_path)?;
-
-    atomic_write_file(root, None, &plan.abs_path, &plan.rewritten)
-        .map_err(|e| format!("write {}: {e}", plan.path))?;
-
-    let gi = root.join(".gitignore");
-    let mut gi_body = read_optional_regular_text(&gi, ".gitignore")?;
-    if !gi_body.lines().any(|l| l.trim() == ".env") {
-        if !gi_body.is_empty() && !gi_body.ends_with('\n') {
-            gi_body.push('\n');
-        }
-        gi_body.push_str(".env\n");
-        atomic_write_file(root, None, &gi, gi_body.as_bytes())
-            .map_err(|e| format!("write .gitignore: {e}"))?;
-    }
-    Ok(())
 }
 
 /// Same honesty rule for externalize, encrypt, and dismiss: a rescan that
@@ -1039,32 +850,6 @@ fn apply_status_for_rescan(rescan: &str) -> &'static str {
     }
 }
 
-/// Unix credential mode after chmod. File-type bits above `0o777` are ignored.
-#[cfg(unix)]
-fn reject_non_owner_env_mode(mode: u32) -> Result<(), String> {
-    let mode = mode & 0o777;
-    if mode == 0o600 {
-        Ok(())
-    } else {
-        Err(format!(
-            ".env mode is {mode:#o} after chmod; expected owner-only 0o600"
-        ))
-    }
-}
-
-#[cfg(unix)]
-fn ensure_env_owner_only(env_path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod .env 0o600 failed: {e}"))?;
-    let meta = std::fs::symlink_metadata(env_path)
-        .map_err(|e| format!("stat .env after chmod failed: {e}"))?;
-    if !meta.is_file() {
-        return Err("stat .env after chmod: not a regular file".to_string());
-    }
-    reject_non_owner_env_mode(meta.permissions().mode())
-}
-
 fn history_note(root: &Path) -> String {
     match crate::git::head_sha(root) {
         Ok(sha) => format!("history_note: old value may remain in git history since commit {sha}"),
@@ -1075,6 +860,55 @@ fn history_note(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::apply_status_for_rescan;
+
+    /// A binding whose root is not the root the source authority admitted is
+    /// refused by the shared gate before any replay store is opened, and all
+    /// three replay lanes route through that gate.
+    #[test]
+    fn replay_gate_refuses_a_root_the_source_authority_did_not_admit() {
+        let bound = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let state = crate::domain::ProjectStateDir::new(bound.path().join("never-created"));
+        let server = super::SymForgeServer::new(
+            crate::live_index::LiveIndex::load(bound.path()).unwrap(),
+            "replay-gate".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(bound.path().to_path_buf()),
+            None,
+        );
+
+        let foreign = crate::index_lifecycle::activation::project_source_authority(other.path());
+        for label in ["edit", "remediation"] {
+            assert_eq!(
+                super::admitted_replay_state(&server, bound.path(), Some(&state), &foreign, label),
+                Err(format!("Error: admitted {label} source changed"))
+            );
+        }
+        assert!(
+            !state.as_path().exists(),
+            "a refused gate must not touch the replay state"
+        );
+
+        // Positive control: the authority for the bound root itself passes.
+        let own = crate::index_lifecycle::activation::project_source_authority(bound.path());
+        assert!(super::admitted_replay_state(&server, bound.path(), None, &own, "edit").is_ok());
+
+        let edit_lanes = include_str!("edit_tools.rs");
+        let secret_lane = include_str!("secret_remediate.rs");
+        assert_eq!(
+            edit_lanes
+                .matches("secret_remediate::admitted_replay_state(")
+                .count(),
+            2,
+            "edit begin and probe must both run the shared replay gate"
+        );
+        assert!(
+            secret_lane
+                .contains("admitted_replay_state(server, root, state, source, \"remediation\")")
+        );
+    }
 
     #[test]
     fn still_sensitive_rescan_is_incomplete() {
@@ -1091,48 +925,5 @@ mod tests {
             apply_status_for_rescan("unreadable after write: boom"),
             "apply_status: ok"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_owner_env_mode_is_a_failure() {
-        use super::reject_non_owner_env_mode;
-        let err = reject_non_owner_env_mode(0o644).unwrap_err();
-        assert!(err.contains("0o644"), "{err}");
-        assert!(reject_non_owner_env_mode(0o666).is_err());
-        assert!(reject_non_owner_env_mode(0o600).is_ok());
-        // `Permissions::mode` includes the file type above the permission bits.
-        assert!(reject_non_owner_env_mode(0o100600).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chmod_failure_on_missing_env_is_surfaced() {
-        use super::ensure_env_owner_only;
-        let missing =
-            std::env::temp_dir().join(format!("symforge-missing-env-{}", std::process::id()));
-        let _ = std::fs::remove_file(&missing);
-        let err = ensure_env_owner_only(&missing).unwrap_err();
-        assert!(err.contains("chmod .env 0o600 failed"), "{err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn owner_only_chmod_lands_0600() {
-        use super::ensure_env_owner_only;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".env");
-        std::fs::write(&path, b"K=v\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o644);
-        std::fs::set_permissions(&path, perms).unwrap();
-        ensure_env_owner_only(&path).unwrap();
-        let mode = std::fs::symlink_metadata(&path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
     }
 }

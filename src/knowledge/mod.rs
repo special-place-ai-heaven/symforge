@@ -3,7 +3,15 @@
 //! Knowledge reuses the live index's byte store and Markdown section records;
 //! this module owns only policy and projection seams, never a second corpus.
 
+pub(crate) mod curation;
+pub(crate) mod curation_contract;
+pub(crate) mod review;
+pub(crate) mod review_contract;
+pub(crate) mod search;
+pub(crate) mod search_contract;
 pub mod secret_dismissals;
+pub(crate) mod secret_remediation;
+pub(crate) mod source_scope;
 
 /// UTF-8 byte-order mark accepted by the v1 searchable-text contract.
 pub const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";

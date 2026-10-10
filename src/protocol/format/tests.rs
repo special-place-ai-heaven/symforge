@@ -1,6 +1,7 @@
 use super::*;
 use crate::domain::{LanguageId, SymbolKind, SymbolRecord};
 use crate::live_index::store::{CircuitBreakerState, IndexedFile, LiveIndex, ParseStatus};
+use crate::live_index::{SearchFilesResolveView, SearchFilesTier, SearchFilesView};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

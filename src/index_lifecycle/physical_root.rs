@@ -38,6 +38,16 @@ static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// Distinguishes concurrent replacements of the same target within one process.
 static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+#[cfg(unix)]
+fn sync_directory_beneath_capability(dir: &Dir) -> std::io::Result<()> {
+    // cap-std may retain its directory capability as O_PATH; fsync on that
+    // descriptor fails with EBADF. Open a readable directory descriptor through
+    // the same capability, so this never resolves the mutable root spelling.
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    dir.open_with(".", &options)?.sync_all()
+}
+
 /// How many temporary names to try before refusing.
 const MAX_TEMP_ATTEMPTS: u32 = 16;
 
@@ -72,10 +82,60 @@ pub struct PhysicalRootAnchor {
 }
 
 impl PhysicalRootAnchor {
+    /// Stable bytes for a durable project binding. The two fields come from the
+    /// opened directory object, never from its mutable path spelling.
+    pub(crate) fn stable_key(self) -> [u8; 16] {
+        let mut key = [0_u8; 16];
+        key[..8].copy_from_slice(&self.dev.to_le_bytes());
+        key[8..].copy_from_slice(&self.ino.to_le_bytes());
+        key
+    }
+
     /// Observe the directory object currently installed at `path`.
     pub fn observe(path: &Path) -> Option<Self> {
         observe_physical_root_anchor(path)
     }
+
+    /// Identify the directory object already opened by the capability. A
+    /// second path lookup here would accept a replacement at the same spelling.
+    fn observe_opened(dir: &Dir) -> Option<Self> {
+        observe_opened_physical_root_anchor(dir)
+    }
+}
+
+#[cfg(unix)]
+fn observe_opened_physical_root_anchor(dir: &Dir) -> Option<PhysicalRootAnchor> {
+    use cap_std::fs::MetadataExt as _;
+
+    let metadata = dir.dir_metadata().ok()?;
+    Some(PhysicalRootAnchor {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn observe_opened_physical_root_anchor(dir: &Dir) -> Option<PhysicalRootAnchor> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the Dir owns this live handle, and `info` is the API's correctly
+    // sized output buffer. The Dir remains alive through the call.
+    unsafe { GetFileInformationByHandle(HANDLE(dir.as_raw_handle()), &mut info) }.ok()?;
+    Some(PhysicalRootAnchor {
+        dev: u64::from(info.dwVolumeSerialNumber),
+        ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn observe_opened_physical_root_anchor(_dir: &Dir) -> Option<PhysicalRootAnchor> {
+    None
 }
 
 #[cfg(unix)]
@@ -189,6 +249,11 @@ pub struct PhysicalRootLease {
 }
 
 impl PhysicalRootLease {
+    /// Physical identity of the directory handle this lease actually opened.
+    pub(crate) fn opened_stable_key(&self) -> Option<[u8; 16]> {
+        PhysicalRootAnchor::observe_opened(self.dir.as_ref()?).map(PhysicalRootAnchor::stable_key)
+    }
+
     /// Take a lease on `root` under a fresh identity.
     ///
     /// Opening the directory here is what makes the confinement real: from this
@@ -203,6 +268,20 @@ impl PhysicalRootLease {
             dir,
             revoked: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Read-only lease that refuses a root whose opened directory object is
+    /// different from the authority's admitted object.
+    pub(crate) fn take_matching_anchor(
+        root: &Path,
+        expected: Option<PhysicalRootAnchor>,
+    ) -> Result<Self, RootRefusal> {
+        let lease = Self::take(root);
+        let dir = lease.capability()?;
+        if expected.is_none() || PhysicalRootAnchor::observe_opened(dir) != expected {
+            return Err(RootRefusal::LeaseRevoked);
+        }
+        Ok(lease)
     }
 
     /// A DORMANT copy of this lease: same identity, same shared revocation, no
@@ -240,6 +319,91 @@ impl PhysicalRootLease {
             dir: Dir::open_ambient_dir(&self.root, ambient_authority()).ok(),
             revoked: Arc::clone(&self.revoked),
         }
+    }
+
+    /// Reopen a parked state directory only when it is still the admitted
+    /// physical directory. The returned capability stays open through one
+    /// complete state operation; path spelling is not used for its effects.
+    pub(crate) fn reopened_matching_stable_key(
+        &self,
+        expected: [u8; 16],
+    ) -> Result<Self, RootRefusal> {
+        let opened = self.reopened();
+        if opened.opened_stable_key() != Some(expected) {
+            return Err(RootRefusal::LeaseRevoked);
+        }
+        Ok(opened)
+    }
+
+    /// An owned second handle to this lease's own opened directory: same
+    /// identity, same revocation, and the same directory object, with no path
+    /// re-resolution in between.
+    #[cfg(feature = "embed")]
+    pub(crate) fn duplicated(&self) -> Result<Self, RootRefusal> {
+        let dir = self
+            .capability()?
+            .try_clone()
+            .map_err(|error| RootRefusal::Unreadable {
+                path: self.root.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            identity: self.identity,
+            root: self.root.clone(),
+            dir: Some(dir),
+            revoked: Arc::clone(&self.revoked),
+        })
+    }
+
+    /// Open a child directory through this lease, sharing its revocation.
+    pub(crate) fn child_directory(
+        &self,
+        relative: &Path,
+        create: bool,
+    ) -> Result<Self, RootRefusal> {
+        let target = self.resolve_beneath(relative)?;
+        self.refuse_link_relative(target.relative())?;
+        let parent = self.capability()?;
+        if create {
+            parent
+                .create_dir_all(target.relative())
+                .map_err(|error| RootRefusal::Unreadable {
+                    path: target.path(),
+                    message: error.to_string(),
+                })?;
+        }
+        self.refuse_link_relative(target.relative())?;
+        let dir = parent
+            .open_dir(target.relative())
+            .map_err(|error| RootRefusal::Unreadable {
+                path: target.path(),
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            identity: self.identity,
+            root: target.path(),
+            dir: Some(dir),
+            revoked: Arc::clone(&self.revoked),
+        })
+    }
+
+    pub(crate) fn directory_capability(&self) -> Result<&Dir, RootRefusal> {
+        self.capability()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn sync_directory(&self) -> Result<(), RootRefusal> {
+        sync_directory_beneath_capability(self.capability()?).map_err(|error| {
+            RootRefusal::Unreadable {
+                path: self.root.clone(),
+                message: error.to_string(),
+            }
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_directory(&self) -> Result<(), RootRefusal> {
+        self.capability().map(|_| ())
     }
 
     /// The directory capability, if the lease is live and the root opened.
@@ -448,6 +612,14 @@ pub fn replace_beneath(
     stage_replacement(lease, relative, contents)?.commit()
 }
 
+pub(crate) fn replace_owner_only_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    contents: &[u8],
+) -> Result<WriteReceipt, RootRefusal> {
+    stage_replacement_with_policy(lease, relative, contents, true)?.commit()
+}
+
 /// Verify a DELEGATED replacement beneath `lease`: the caller ran its own
 /// durability protocol against `relative` (a lane whose staged fsync/failpoint
 /// protocol is contract-pinned and cannot be replaced by [`replace_beneath`]);
@@ -482,6 +654,1063 @@ pub fn verify_replacement_beneath(
     }))
 }
 
+/// Verify a staged preimage through the pinned root, including a target that
+/// did not exist when the batch was planned. Missing parents count as absent;
+/// a link at any existing component is refused before the read.
+pub(crate) fn matches_optional_image_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    expected: Option<&[u8]>,
+) -> Result<bool, RootRefusal> {
+    let target = lease.resolve_beneath(relative)?;
+    lease.refuse_link_relative(target.relative())?;
+    let dir = lease.capability()?;
+    match dir.read(target.relative()) {
+        Ok(observed) => Ok(expected.is_some_and(|bytes| observed == bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(expected.is_none()),
+        Err(error) => Err(RootRefusal::Unreadable {
+            path: target.path(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+/// Read a bounded regular file through the same path confinement as writes.
+/// `None` means absent; links, special files, and oversized files refuse.
+pub(crate) fn open_regular_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+) -> Result<Option<(cap_std::fs::File, PathBuf)>, RootRefusal> {
+    let target = lease.resolve_beneath(relative)?;
+    lease.refuse_link_relative(target.relative())?;
+    let dir = lease.capability()?;
+    let metadata = match dir.symlink_metadata(target.relative()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RootRefusal::Unreadable {
+                path: target.path(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if !metadata.is_file() {
+        return Err(RootRefusal::Unreadable {
+            path: target.path(),
+            message: "not a regular file".to_string(),
+        });
+    }
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = match dir.open_with(target.relative(), &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RootRefusal::Unreadable {
+                path: target.path(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err(RootRefusal::Unreadable {
+            path: target.path(),
+            message: "not a regular file".to_string(),
+        });
+    }
+    Ok(Some((file, target.path())))
+}
+
+/// Nofollow metadata for a final entry, including a directory or special file.
+/// A missing entry is distinct from an unsafe traversal or an unreadable entry.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) struct AnchoredEntryMetadata {
+    pub len: u64,
+    pub modified_secs: u64,
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn entry_metadata_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+) -> Result<Option<AnchoredEntryMetadata>, RootRefusal> {
+    use std::time::UNIX_EPOCH;
+
+    let target = lease.resolve_beneath(relative)?;
+    lease.refuse_link_relative(target.relative())?;
+    let metadata = match lease.capability()?.symlink_metadata(target.relative()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RootRefusal::Unreadable {
+                path: target.path(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if metadata.is_symlink() {
+        return Err(RootRefusal::LinkComponent {
+            component: target.path(),
+        });
+    }
+    let modified = metadata
+        .modified()
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.path(),
+            message: error.to_string(),
+        })?;
+    Ok(Some(AnchoredEntryMetadata {
+        len: metadata.len(),
+        modified_secs: modified
+            .into_std()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    }))
+}
+
+/// Confirm each component uses the exact name returned by the admitted
+/// directory handle. On case-insensitive filesystems a non-exact alias may
+/// otherwise open bytes that the index admitted under a different name.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn exact_spelling_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+) -> Result<bool, RootRefusal> {
+    let target = lease.resolve_beneath(relative)?;
+    exact_spelling_from_dir(
+        lease.capability()?,
+        target.relative().components(),
+        &target.path(),
+    )
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn exact_spelling_from_dir(
+    directory: &Dir,
+    mut components: std::path::Components<'_>,
+    target: &Path,
+) -> Result<bool, RootRefusal> {
+    let Some(Component::Normal(name)) = components.next() else {
+        return Err(RootRefusal::EscapesRoot {
+            requested: target.to_path_buf(),
+        });
+    };
+    let mut exact = false;
+    for entry in directory
+        .read_dir(".")
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.to_path_buf(),
+            message: error.to_string(),
+        })?
+    {
+        if entry
+            .map_err(|error| RootRefusal::Unreadable {
+                path: target.to_path_buf(),
+                message: error.to_string(),
+            })?
+            .file_name()
+            .as_os_str()
+            == name
+        {
+            exact = true;
+            break;
+        }
+    }
+    if !exact {
+        return match directory.symlink_metadata(name) {
+            Ok(_) => Err(RootRefusal::Unreadable {
+                path: target.to_path_buf(),
+                message: "path spelling differs from the on-disk name".to_owned(),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(RootRefusal::Unreadable {
+                path: target.to_path_buf(),
+                message: error.to_string(),
+            }),
+        };
+    }
+    if components.clone().next().is_none() {
+        return Ok(true);
+    }
+    let metadata = directory
+        .symlink_metadata(name)
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    if metadata.is_symlink() {
+        return Err(RootRefusal::LinkComponent {
+            component: target.to_path_buf(),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(RootRefusal::Unreadable {
+            path: target.to_path_buf(),
+            message: "path component is not a directory".to_owned(),
+        });
+    }
+    let child = directory
+        .open_dir(name)
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    exact_spelling_from_dir(&child, components, target)
+}
+
+/// A stable observation from one no-follow regular-file handle. No file bytes
+/// are retained when `bytes` is `None`.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) struct AnchoredRegularObservation {
+    pub metadata: std::fs::Metadata,
+    pub len: u64,
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// Observe metadata, and optionally bounded bytes, from the same admitted
+/// file handle. A disappeared file is distinct from an unsafe/unreadable one.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn observe_regular_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    read_limit: Option<usize>,
+) -> Result<Option<AnchoredRegularObservation>, RootRefusal> {
+    use std::io::Read;
+
+    let Some((file, path)) = open_regular_beneath(lease, relative)? else {
+        return Ok(None);
+    };
+    let mut file = file.into_std();
+    let before = file.metadata().map_err(|error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    let modified = before.modified().map_err(|error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    let bytes = if let Some(max_bytes) = read_limit {
+        let limit = max_bytes
+            .checked_add(1)
+            .ok_or_else(|| RootRefusal::Unreadable {
+                path: path.clone(),
+                message: "bounded read limit overflow".to_owned(),
+            })?;
+        if before.len() > max_bytes as u64 {
+            return Err(RootRefusal::Unreadable {
+                path,
+                message: "regular file exceeds bounded read limit".to_owned(),
+            });
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(limit as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| RootRefusal::Unreadable {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        if bytes.len() > max_bytes {
+            return Err(RootRefusal::Unreadable {
+                path,
+                message: "regular file changed during bounded read".to_owned(),
+            });
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let after = file.metadata().map_err(|error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    if before.len() != after.len() || after.modified().ok() != Some(modified) {
+        return Err(RootRefusal::Unreadable {
+            path,
+            message: "regular file changed during observation".to_owned(),
+        });
+    }
+    Ok(Some(AnchoredRegularObservation {
+        metadata: before.clone(),
+        len: before.len(),
+        bytes,
+    }))
+}
+
+/// Read only a bounded prefix from one no-follow file handle. A file larger
+/// than the prefix remains eligible for metadata-first discovery probing.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn probe_regular_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    prefix_limit: usize,
+) -> Result<Option<(std::fs::Metadata, Vec<u8>)>, RootRefusal> {
+    use std::io::Read;
+
+    if prefix_limit > 1_048_576 {
+        return Err(RootRefusal::Unreadable {
+            path: lease.root().join(relative),
+            message: "source probe exceeds bounded prefix limit".to_owned(),
+        });
+    }
+    let Some((file, path)) = open_regular_beneath(lease, relative)? else {
+        return Ok(None);
+    };
+    let mut file = file.into_std();
+    let before = file.metadata().map_err(|error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    let before_modified = before.modified().map_err(|error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(prefix_limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| RootRefusal::Unreadable {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    let after = file.metadata().map_err(|error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    let after_modified = after.modified().map_err(|error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    if before.len() != after.len() || before_modified != after_modified {
+        return Err(RootRefusal::Unreadable {
+            path,
+            message: "regular file changed during prefix probe".to_owned(),
+        });
+    }
+    Ok(Some((before, bytes)))
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchoredEntryKind {
+    Regular,
+    Directory,
+    Link,
+    Other,
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) struct AnchoredDirectoryEntry {
+    pub relative: PathBuf,
+    pub kind: AnchoredEntryKind,
+}
+
+/// List one directory through the admitted root, bounded to one chunk. The
+/// caller applies ignore policy and recurses with another short authority read.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn list_directory_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    max_entries: usize,
+) -> Result<Option<Vec<AnchoredDirectoryEntry>>, RootRefusal> {
+    let directory = if relative == Path::new(".") {
+        lease.directory_capability()?
+    } else {
+        let root = lease.directory_capability()?;
+        match root.symlink_metadata(relative) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(RootRefusal::LinkComponent {
+                    component: lease.root().join(relative),
+                });
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(RootRefusal::Unreadable {
+                    path: lease.root().join(relative),
+                    message: "not a directory".to_owned(),
+                });
+            }
+            Err(error) => {
+                return Err(RootRefusal::Unreadable {
+                    path: lease.root().join(relative),
+                    message: error.to_string(),
+                });
+            }
+        }
+        // The owned child keeps the opened directory stable throughout this
+        // chunk even if the path spelling changes concurrently.
+        return list_opened_directory(
+            &lease.child_directory(relative, false)?,
+            relative,
+            max_entries,
+        )
+        .map(Some);
+    };
+    list_entries_from_dir(directory, lease.root(), relative, max_entries).map(Some)
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn list_opened_directory(
+    opened: &PhysicalRootLease,
+    relative: &Path,
+    max_entries: usize,
+) -> Result<Vec<AnchoredDirectoryEntry>, RootRefusal> {
+    list_entries_from_dir(
+        opened.directory_capability()?,
+        opened.root(),
+        relative,
+        max_entries,
+    )
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn list_entries_from_dir(
+    directory: &Dir,
+    root: &Path,
+    relative: &Path,
+    max_entries: usize,
+) -> Result<Vec<AnchoredDirectoryEntry>, RootRefusal> {
+    let mut entries = Vec::new();
+    for entry in directory
+        .read_dir(".")
+        .map_err(|error| RootRefusal::Unreadable {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?
+    {
+        let entry = entry.map_err(|error| RootRefusal::Unreadable {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let name = entry.file_name();
+        let metadata =
+            directory
+                .symlink_metadata(&name)
+                .map_err(|error| RootRefusal::Unreadable {
+                    path: root.join(&name),
+                    message: error.to_string(),
+                })?;
+        let kind = if metadata.is_symlink() {
+            AnchoredEntryKind::Link
+        } else if metadata.is_dir() {
+            AnchoredEntryKind::Directory
+        } else if metadata.is_file() {
+            AnchoredEntryKind::Regular
+        } else {
+            AnchoredEntryKind::Other
+        };
+        entries.push(AnchoredDirectoryEntry {
+            relative: if relative == Path::new(".") {
+                PathBuf::from(name)
+            } else {
+                relative.join(name)
+            },
+            kind,
+        });
+        if entries.len() > max_entries {
+            return Err(RootRefusal::Unreadable {
+                path: root.to_path_buf(),
+                message: "directory enumeration exceeds its bounded chunk".to_owned(),
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(entries)
+}
+
+pub(crate) fn read_regular_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, RootRefusal> {
+    use std::io::Read;
+
+    let Some((file, path)) = open_regular_beneath(lease, relative)? else {
+        return Ok(None);
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| RootRefusal::Unreadable {
+            path: path.clone(),
+            message: error.to_string(),
+        })?
+        .len();
+    if length > max_bytes as u64 {
+        return Err(RootRefusal::Unreadable {
+            path,
+            message: "regular file exceeds byte limit".to_string(),
+        });
+    }
+    let mut bytes = Vec::new();
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| RootRefusal::Unreadable {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(RootRefusal::Unreadable {
+            path,
+            message: "regular file exceeds byte limit".to_string(),
+        });
+    }
+    Ok(Some(bytes))
+}
+
+/// Hash an opened regular file without buffering its whole contents. Replay
+/// postimage checks may cover files larger than the bounded content-read cap.
+#[cfg(feature = "embed")]
+pub(crate) fn digest_regular_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+) -> Result<Option<String>, RootRefusal> {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+
+    let Some((mut file, path)) = open_regular_beneath(lease, relative)? else {
+        return Ok(None);
+    };
+    let expected_len = file
+        .metadata()
+        .map_err(|error| RootRefusal::Unreadable {
+            path: path.clone(),
+            message: error.to_string(),
+        })?
+        .len();
+    let mut hasher = Sha256::new();
+    let mut observed_len = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| RootRefusal::Unreadable {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        if count == 0 {
+            break;
+        }
+        observed_len =
+            observed_len
+                .checked_add(count as u64)
+                .ok_or_else(|| RootRefusal::Unreadable {
+                    path: path.clone(),
+                    message: "regular file length changed during hash".to_string(),
+                })?;
+        if observed_len > expected_len {
+            return Err(RootRefusal::Unreadable {
+                path,
+                message: "regular file length changed during hash".to_string(),
+            });
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let final_len = file
+        .metadata()
+        .map_err(|error| RootRefusal::Unreadable {
+            path: path.clone(),
+            message: error.to_string(),
+        })?
+        .len();
+    if observed_len != expected_len || final_len != expected_len {
+        return Err(RootRefusal::Unreadable {
+            path,
+            message: "regular file length changed during hash".to_string(),
+        });
+    }
+    let mut digest = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(digest, "{byte:02x}").expect("hex writes to String");
+    }
+    Ok(Some(digest))
+}
+
+/// Preview-only capability read. Apply callers use the permit's pinned lease.
+pub(crate) fn read_regular_beneath_root(
+    root: &Path,
+    relative: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, RootRefusal> {
+    let lease = PhysicalRootLease::take(root);
+    read_regular_beneath(&lease, relative, max_bytes)
+}
+
+/// Read-only regular-file size through the same root capability and no-link
+/// checks as a bounded source read. This opens the file but never reads bytes,
+/// so aggregate estimates can account for files beyond the content scan cap.
+#[cfg(all(test, feature = "embed"))]
+pub(crate) fn regular_file_size_beneath_root(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<u64>, RootRefusal> {
+    let lease = PhysicalRootLease::take(root);
+    regular_file_size_beneath(&lease, relative)
+}
+
+/// Read-only metadata from an already pinned root capability.
+#[cfg(feature = "embed")]
+pub(crate) fn regular_file_size_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+) -> Result<Option<u64>, RootRefusal> {
+    let Some((file, path)) = open_regular_beneath(lease, relative)? else {
+        return Ok(None);
+    };
+    let opened = file.metadata().map_err(|error| RootRefusal::Unreadable {
+        path,
+        message: error.to_string(),
+    })?;
+    Ok(Some(opened.len()))
+}
+
+/// Complete a post-rename recovery sync through the admitted root, including
+/// the containing directory on Unix. This never reopens the root by spelling.
+pub(crate) fn sync_root_file_beneath(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+) -> Result<(), RootRefusal> {
+    let target = lease.resolve_beneath(relative)?;
+    if target
+        .relative()
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        return Err(RootRefusal::EscapesRoot {
+            requested: relative.to_path_buf(),
+        });
+    }
+    let Some((file, path)) = open_regular_beneath(lease, relative)? else {
+        return Err(RootRefusal::Unreadable {
+            path: target.path(),
+            message: "committed source file is absent".to_owned(),
+        });
+    };
+    file.sync_all().map_err(|error| RootRefusal::Unreadable {
+        path,
+        message: error.to_string(),
+    })?;
+    #[cfg(unix)]
+    sync_directory_beneath_capability(lease.capability()?).map_err(|error| {
+        RootRefusal::Unreadable {
+            path: lease.root().to_path_buf(),
+            message: error.to_string(),
+        }
+    })?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(RootRefusal::Unreadable {
+        path: lease.root().to_path_buf(),
+        message: "parent durability unsupported".to_owned(),
+    });
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_owner_only(file: &cap_std::fs::File) -> std::io::Result<()> {
+    use cap_std::fs::PermissionsExt;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode == 0o600 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("owner-only mode was not preserved"))
+    }
+}
+
+#[cfg(unix)]
+fn protect_owner_only(file: &cap_std::fs::File) -> std::io::Result<()> {
+    // OpenOptions::mode sets this at create_new, before any source bytes exist.
+    verify_owner_only(file)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod owner_only_windows {
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
+        AddAccessAllowedAce, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+        GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetTokenInformation, InitializeAcl,
+        InitializeSecurityDescriptor, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SetKernelObjectSecurity,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    fn io_error(error: windows::core::Error) -> io::Error {
+        io::Error::other(error)
+    }
+
+    fn current_user_sid() -> io::Result<(Vec<u64>, PSID)> {
+        let mut token = HANDLE::default();
+        // SAFETY: out handle is valid; it is closed after the bounded token query.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            .map_err(io_error)?;
+        let result = (|| {
+            let mut len = 0_u32;
+            // SAFETY: a null buffer is the documented size probe.
+            let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
+            if len < size_of::<TOKEN_USER>() as u32 || len > 64 * 1024 {
+                return Err(io::Error::other("invalid current-user token size"));
+            }
+            let mut storage = vec![0_u64; (len as usize).div_ceil(8)];
+            // SAFETY: storage is aligned and has at least the probed byte length.
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    Some(storage.as_mut_ptr().cast()),
+                    len,
+                    &mut len,
+                )
+            }
+            .map_err(io_error)?;
+            // SAFETY: the successful TokenUser query initialized TOKEN_USER in storage.
+            let sid = unsafe { (*(storage.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+            if sid.0.is_null() {
+                return Err(io::Error::other("current-user SID is absent"));
+            }
+            Ok((storage, sid))
+        })();
+        // SAFETY: token is owned here and never used after this close.
+        let _ = unsafe { CloseHandle(token) };
+        result
+    }
+
+    fn handle(file: &cap_std::fs::File) -> HANDLE {
+        HANDLE(file.as_raw_handle())
+    }
+
+    pub(super) fn protect(file: &cap_std::fs::File) -> io::Result<()> {
+        let (_token_storage, sid) = current_user_sid()?;
+        // SAFETY: GetLengthSid receives a SID returned by a successful TokenUser query.
+        let sid_len = unsafe { GetLengthSid(sid) as usize };
+        if sid_len == 0 || sid_len > 64 * 1024 {
+            return Err(io::Error::other("invalid current-user SID length"));
+        }
+        let acl_len =
+            size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_len;
+        let mut acl_storage = vec![0_u64; acl_len.div_ceil(8)];
+        let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let descriptor_ptr =
+            PSECURITY_DESCRIPTOR((&mut descriptor as *mut SECURITY_DESCRIPTOR).cast());
+        // SAFETY: all buffers are aligned, sufficiently sized, and live through SetKernelObjectSecurity.
+        unsafe {
+            InitializeAcl(acl, acl_len as u32, ACL_REVISION).map_err(io_error)?;
+            AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS.0, sid).map_err(io_error)?;
+            InitializeSecurityDescriptor(descriptor_ptr, 1).map_err(io_error)?;
+            SetSecurityDescriptorDacl(descriptor_ptr, true, Some(acl), false).map_err(io_error)?;
+            SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+                .map_err(io_error)?;
+            SetKernelObjectSecurity(
+                handle(file),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor_ptr,
+            )
+            .map_err(io_error)?;
+        }
+        verify(file)
+    }
+
+    pub(super) fn verify(file: &cap_std::fs::File) -> io::Result<()> {
+        let (_token_storage, sid) = current_user_sid()?;
+        let mut len = 0_u32;
+        // SAFETY: the null descriptor is a documented size probe on a live handle.
+        let _ = unsafe {
+            GetKernelObjectSecurity(handle(file), DACL_SECURITY_INFORMATION.0, None, 0, &mut len)
+        };
+        if len < size_of::<SECURITY_DESCRIPTOR>() as u32 || len > 64 * 1024 {
+            return Err(io::Error::other("invalid file security descriptor size"));
+        }
+        let mut storage = vec![0_u64; (len as usize).div_ceil(8)];
+        let descriptor = PSECURITY_DESCRIPTOR(storage.as_mut_ptr().cast());
+        // SAFETY: the descriptor buffer is aligned and sized from the preceding kernel query.
+        unsafe {
+            GetKernelObjectSecurity(
+                handle(file),
+                DACL_SECURITY_INFORMATION.0,
+                Some(descriptor),
+                len,
+                &mut len,
+            )
+            .map_err(io_error)?;
+        }
+        let mut control = Default::default();
+        let mut revision = 0_u32;
+        let mut present = Default::default();
+        let mut defaulted = Default::default();
+        let mut acl = std::ptr::null_mut();
+        // SAFETY: queried self-relative descriptor remains alive for both inspectors.
+        unsafe {
+            GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)
+                .map_err(io_error)?;
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted)
+                .map_err(io_error)?;
+        }
+        if control & SE_DACL_PROTECTED.0 == 0 || !present.as_bool() || acl.is_null() {
+            return Err(io::Error::other("file DACL is not private"));
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: ACL pointer belongs to the queried descriptor and info has the documented size.
+        unsafe {
+            GetAclInformation(
+                acl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+            .map_err(io_error)?;
+        }
+        if info.AceCount != 1 {
+            return Err(io::Error::other("file DACL has unexpected entries"));
+        }
+        let mut ace_ptr = std::ptr::null_mut();
+        // SAFETY: one ACE was reported, and the ACL remains alive.
+        unsafe { GetAce(acl, 0, &mut ace_ptr) }.map_err(io_error)?;
+        // SAFETY: GetAce returns a valid ACCESS_ALLOWED_ACE when AceType is zero.
+        let ace = unsafe { &*(ace_ptr.cast::<ACCESS_ALLOWED_ACE>()) };
+        if ace.Header.AceType != 0 || ace.Mask != FILE_ALL_ACCESS.0 {
+            return Err(io::Error::other("file DACL has unexpected rights"));
+        }
+        let ace_sid = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+        // SAFETY: both SIDs remain valid for this comparison.
+        unsafe { EqualSid(ace_sid, sid) }.map_err(io_error)?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn protect_owner_only(file: &cap_std::fs::File) -> std::io::Result<()> {
+    owner_only_windows::protect(file)
+}
+
+#[cfg(windows)]
+fn verify_owner_only(file: &cap_std::fs::File) -> std::io::Result<()> {
+    owner_only_windows::verify(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect_owner_only(_file: &cap_std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "owner-only publication is unavailable",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_owner_only(_file: &cap_std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "owner-only publication is unavailable",
+    ))
+}
+
+/// The durability boundaries exposed by the curation policy writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableReplaceStage {
+    TempWritten,
+    TempSynced,
+    Replaced,
+    ParentSynced,
+}
+
+pub(crate) enum DurableReplaceError<E> {
+    Root(RootRefusal),
+    Stage(E),
+    ImageMismatch,
+}
+
+/// Durably replace one root-level source file through the permit's opened root.
+/// The callback preserves the curation writer's ordered failpoints. It may
+/// modify the still-private temporary after `TempWritten` for corruption tests.
+pub(crate) fn durable_replace_root_file_beneath<E>(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    contents: &[u8],
+    prefix: &str,
+    mut stage: impl FnMut(DurableReplaceStage, &mut cap_std::fs::File) -> Result<(), E>,
+) -> Result<(), DurableReplaceError<E>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let target = lease
+        .resolve_beneath(relative)
+        .map_err(DurableReplaceError::Root)?;
+    if target
+        .relative()
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        return Err(DurableReplaceError::Root(RootRefusal::EscapesRoot {
+            requested: relative.to_path_buf(),
+        }));
+    }
+    lease
+        .refuse_link_relative(target.relative())
+        .map_err(DurableReplaceError::Root)?;
+    let dir = lease.capability().map_err(DurableReplaceError::Root)?;
+    let unreadable = |path: PathBuf, error: std::io::Error| {
+        DurableReplaceError::Root(RootRefusal::Unreadable {
+            path,
+            message: error.to_string(),
+        })
+    };
+
+    struct TempCleanup<'a> {
+        dir: &'a Dir,
+        relative: PathBuf,
+        armed: bool,
+    }
+    impl Drop for TempCleanup<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = self.dir.remove_file(&self.relative);
+            }
+        }
+    }
+
+    let mut opened = None;
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let candidate = PathBuf::from(format!(
+            "{prefix}{}-{}-{attempt}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            use windows::Win32::Storage::FileSystem::{
+                DELETE, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            options.access_mode((FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE).0);
+            options.share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0);
+            options.custom_flags(FILE_FLAG_WRITE_THROUGH.0);
+        }
+        match dir.open_with(&candidate, &options) {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(unreadable(lease.root().join(candidate), error)),
+        }
+    }
+    let (temp_relative, mut file) = opened.ok_or_else(|| {
+        DurableReplaceError::Root(RootRefusal::Unreadable {
+            path: lease.root().to_path_buf(),
+            message: "no unused curation temporary name was available".to_owned(),
+        })
+    })?;
+    let mut cleanup = TempCleanup {
+        dir,
+        relative: temp_relative.clone(),
+        armed: true,
+    };
+    let temp_path = lease.root().join(&temp_relative);
+    file.write_all(contents)
+        .and_then(|()| file.flush())
+        .map_err(|error| unreadable(temp_path.clone(), error))?;
+    stage(DurableReplaceStage::TempWritten, &mut file).map_err(DurableReplaceError::Stage)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| unreadable(temp_path.clone(), error))?;
+    let mut observed = Vec::new();
+    (&mut file)
+        .take((contents.len() as u64).saturating_add(1))
+        .read_to_end(&mut observed)
+        .map_err(|error| unreadable(temp_path.clone(), error))?;
+    if observed != contents {
+        return Err(DurableReplaceError::ImageMismatch);
+    }
+    file.sync_all()
+        .map_err(|error| unreadable(lease.root().join(&temp_relative), error))?;
+    stage(DurableReplaceStage::TempSynced, &mut file).map_err(DurableReplaceError::Stage)?;
+    lease
+        .refuse_link_relative(target.relative())
+        .map_err(DurableReplaceError::Root)?;
+    if !lease.is_live() {
+        return Err(DurableReplaceError::Root(RootRefusal::LeaseRevoked));
+    }
+    #[cfg(windows)]
+    windows_write_through_replace_beneath(dir, &file, target.relative())
+        .map_err(|error| unreadable(target.path(), error))?;
+    #[cfg(not(windows))]
+    dir.rename(&temp_relative, dir, target.relative())
+        .map_err(|error| unreadable(target.path(), error))?;
+    cleanup.armed = false;
+    stage(DurableReplaceStage::Replaced, &mut file).map_err(DurableReplaceError::Stage)?;
+    file.sync_all()
+        .map_err(|error| unreadable(target.path(), error))?;
+    #[cfg(unix)]
+    sync_directory_beneath_capability(dir)
+        .map_err(|error| unreadable(lease.root().to_path_buf(), error))?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(DurableReplaceError::Root(RootRefusal::Unreadable {
+        path: lease.root().to_path_buf(),
+        message: "parent durability unsupported".to_owned(),
+    }));
+    stage(DurableReplaceStage::ParentSynced, &mut file).map_err(DurableReplaceError::Stage)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_write_through_replace_beneath(
+    dir: &Dir,
+    file: &cap_std::fs::File,
+    target: &Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+    };
+    use windows::Win32::Foundation::{HANDLE, RtlNtStatusToDosError};
+    use windows::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let name = target.as_os_str().encode_wide().collect::<Vec<_>>();
+    let length = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name.len() * 2;
+    let mut storage = vec![0_u64; length.div_ceil(8)];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: the aligned buffer has room for the header and every UTF-16 code
+    // unit; both handles remain open through the rename call. `target` is a
+    // single validated leaf relative to the retained root directory handle.
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).RootDirectory = HANDLE(dir.as_raw_handle());
+        (*info).FileNameLength = (name.len() * 2) as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = NtSetInformationFile(
+            HANDLE(file.as_raw_handle()),
+            &mut io_status,
+            info.cast(),
+            length as u32,
+            FileRenameInformation,
+        );
+        if status.0 < 0 {
+            Err(std::io::Error::from_raw_os_error(
+                RtlNtStatusToDosError(status) as i32,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Stage a replacement without committing it.
 ///
 /// Splitting the write in two is not a testing affordance bolted on: it makes
@@ -495,6 +1724,15 @@ pub fn stage_replacement(
     lease: &PhysicalRootLease,
     relative: &Path,
     contents: &[u8],
+) -> Result<StagedReplacement, RootRefusal> {
+    stage_replacement_with_policy(lease, relative, contents, false)
+}
+
+fn stage_replacement_with_policy(
+    lease: &PhysicalRootLease,
+    relative: &Path,
+    contents: &[u8],
+    owner_only: bool,
 ) -> Result<StagedReplacement, RootRefusal> {
     let target = lease.resolve_beneath(relative)?;
     lease.refuse_link_relative(target.relative())?;
@@ -540,6 +1778,20 @@ pub fn stage_replacement(
         };
         let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(unix)]
+        if owner_only {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(windows)]
+        if owner_only {
+            use cap_std::fs::OpenOptionsExt;
+            use windows::Win32::Storage::FileSystem::{
+                FILE_GENERIC_WRITE, READ_CONTROL, WRITE_DAC,
+            };
+            options.access_mode((FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC).0);
+            options.share_mode(0);
+        }
         match dir.open_with(&candidate, &options) {
             Ok(handle) => {
                 temp_relative = candidate;
@@ -562,6 +1814,15 @@ pub fn stage_replacement(
         });
     };
 
+    if owner_only && let Err(error) = protect_owner_only(&handle) {
+        drop(handle);
+        let _ = dir.remove_file(&temp_relative);
+        return Err(RootRefusal::Unreadable {
+            path: lease.root().join(&temp_relative),
+            message: error.to_string(),
+        });
+    }
+
     let written = handle.write_all(contents).and_then(|()| handle.sync_all());
     drop(handle);
     if let Err(error) = written {
@@ -583,6 +1844,7 @@ pub fn stage_replacement(
         revoked: Arc::clone(lease.revocation()),
         dir: staged_dir,
         steps,
+        owner_only,
     })
 }
 
@@ -601,6 +1863,7 @@ pub struct StagedReplacement {
     revoked: Arc<AtomicBool>,
     dir: Dir,
     steps: Vec<ReplacementStep>,
+    owner_only: bool,
 }
 
 impl StagedReplacement {
@@ -638,6 +1901,18 @@ impl StagedReplacement {
                 message: error.to_string(),
             });
         }
+        if self.owner_only {
+            let verified = self
+                .dir
+                .open(&self.target_relative)
+                .and_then(|file| verify_owner_only(&file));
+            if let Err(error) = verified {
+                return Err(RootRefusal::Unreadable {
+                    path: self.target.clone(),
+                    message: error.to_string(),
+                });
+            }
+        }
         let receipt = WriteReceipt {
             steps: {
                 let mut steps = std::mem::take(&mut self.steps);
@@ -660,6 +1935,151 @@ impl Drop for StagedReplacement {
         if !self.temp_relative.as_os_str().is_empty() {
             let _ = self.dir.remove_file(&self.temp_relative);
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_read_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_read_distinguishes_absent_regular_and_invalid_targets() {
+        let root = tempfile::tempdir().expect("temporary root");
+        std::fs::write(root.path().join("present"), b"source bytes").expect("source");
+        std::fs::create_dir(root.path().join("directory")).expect("directory");
+        assert_eq!(
+            read_regular_beneath_root(root.path(), Path::new("missing/nested"), 64)
+                .expect("absent target"),
+            None
+        );
+        assert_eq!(
+            read_regular_beneath_root(root.path(), Path::new("present"), 64).expect("regular file"),
+            Some(b"source bytes".to_vec())
+        );
+        assert!(read_regular_beneath_root(root.path(), Path::new("present"), 4).is_err());
+        assert!(read_regular_beneath_root(root.path(), Path::new("directory"), 64).is_err());
+        assert!(read_regular_beneath_root(root.path(), Path::new("../escape"), 64).is_err());
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn regular_size_observes_large_file_without_reading_its_content() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let path = root.path().join("large");
+        std::fs::File::create(&path)
+            .expect("create sparse file")
+            .set_len(4 * 1024 * 1024 + 1)
+            .expect("size sparse file");
+        assert_eq!(
+            regular_file_size_beneath_root(root.path(), Path::new("large"))
+                .expect("size regular file"),
+            Some(4 * 1024 * 1024 + 1)
+        );
+        assert_eq!(
+            regular_file_size_beneath_root(root.path(), Path::new("missing")).expect("absent file"),
+            None
+        );
+        assert!(regular_file_size_beneath_root(root.path(), Path::new("../escape")).is_err());
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn anchored_prefix_probe_accepts_a_large_file_without_reading_past_limit() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let path = root.path().join("large");
+        std::fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).expect("large source");
+        let lease = PhysicalRootLease::take(root.path());
+
+        let (metadata, prefix) = probe_regular_beneath(&lease, Path::new("large"), 1024)
+            .expect("bounded prefix probe")
+            .expect("regular file");
+        assert_eq!(metadata.len(), 2 * 1024 * 1024);
+        assert_eq!(prefix, vec![b'x'; 1024]);
+        assert!(probe_regular_beneath(&lease, Path::new("../escape"), 1024).is_err());
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn anchored_directory_listing_preserves_relative_names_and_bounds() {
+        let root = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(root.path().join("nested")).expect("nested directory");
+        std::fs::write(root.path().join("nested/file.rs"), b"fn example() {}")
+            .expect("nested source");
+        let lease = PhysicalRootLease::take(root.path());
+
+        let entries = list_directory_beneath(&lease, Path::new("."), 1)
+            .expect("root listing")
+            .expect("root directory");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative, Path::new("nested"));
+        assert!(entries[0].kind == AnchoredEntryKind::Directory);
+
+        let nested = list_directory_beneath(&lease, Path::new("nested"), 1)
+            .expect("nested listing")
+            .expect("nested directory");
+        assert_eq!(nested[0].relative, Path::new("nested/file.rs"));
+        assert!(nested[0].kind == AnchoredEntryKind::Regular);
+        assert!(list_directory_beneath(&lease, Path::new("nested"), 0).is_err());
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn streamed_digest_covers_large_regular_file_and_refuses_invalid_targets() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let bytes = vec![b'x'; 4 * 1024 * 1024 + 17];
+        std::fs::write(root.path().join("large"), &bytes).expect("large source");
+        std::fs::create_dir(root.path().join("directory")).expect("directory");
+        let lease = PhysicalRootLease::take(root.path());
+        assert_eq!(
+            digest_regular_beneath(&lease, Path::new("large")).expect("stream digest"),
+            Some(crate::hash::digest_hex(&bytes))
+        );
+        assert_eq!(
+            digest_regular_beneath(&lease, Path::new("missing")).expect("absent target"),
+            None
+        );
+        assert!(digest_regular_beneath(&lease, Path::new("directory")).is_err());
+        assert!(digest_regular_beneath(&lease, Path::new("../escape")).is_err());
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod owner_only_tests {
+    use super::*;
+
+    #[test]
+    fn staged_sensitive_image_is_private_before_publication_and_after_rename() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let lease = PhysicalRootLease::take(root.path());
+        let target = Path::new(".env");
+        let stage = stage_replacement_with_policy(&lease, target, b"fixture", true)
+            .expect("owner-only stage");
+        assert!(!root.path().join(target).exists());
+        let temp = stage.temp_path().to_path_buf();
+        let staged_file = std::fs::File::open(&temp).expect("staged private image");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                staged_file.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            let opened = lease
+                .capability()
+                .unwrap()
+                .open(stage.temp_relative.as_path())
+                .unwrap();
+            verify_owner_only(&opened).expect("staged protected DACL");
+        }
+        drop(staged_file);
+        stage.commit().expect("published owner-only image");
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(root.path().join(target)).unwrap(), b"fixture");
+        let published = lease.capability().unwrap().open(target).unwrap();
+        verify_owner_only(&published).expect("published private image");
     }
 }
 

@@ -353,6 +353,7 @@ type LoadedServeIndex = (
     Option<std::path::PathBuf>,
     Option<StatePlacement>,
     Option<std::collections::HashMap<String, u64>>,
+    Option<Arc<crate::live_index::index_lifecycle::activation::ProjectSourceAuthority>>,
 );
 
 fn load_serve_index(
@@ -372,16 +373,46 @@ fn load_serve_index(
                 RootCandidateSource::LaunchCwd,
                 RootRequestMode::Automatic,
             ) else {
-                return Ok((LiveIndex::empty(), None, None, None));
+                return Ok((LiveIndex::empty(), None, None, None, None));
             };
             let state_placement = crate::discovery::resolve_state_placement(&binding);
             let root = binding.canonical_root;
+            let admission = crate::live_index::index_lifecycle::activation::admit_project(
+                crate::live_index::index_lifecycle::process_runtime::SurfaceKind::Serve,
+                &root,
+                &binding.root_id.0,
+                binding.access_mode,
+                &state_placement,
+            )
+            .map_err(|refusal| ServeError::IndexLoad {
+                source: anyhow::anyhow!("project admission refused: {refusal:?}"),
+            })?;
+            let source_authority =
+                crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+            let admitted_physical_root = admission
+                .binding()
+                .map_err(|refusal| ServeError::IndexLoad {
+                    source: anyhow::anyhow!("project admission retired: {refusal:?}"),
+                })?
+                .physical_root();
+            if source_authority.admission_binding().physical_root() != admitted_physical_root {
+                return Err(ServeError::IndexLoad {
+                    source: anyhow::anyhow!(
+                        "admitted serve source changed before snapshot restore"
+                    ),
+                });
+            }
 
             // Fast path: rehydrate the persisted snapshot (staleness-gated
             // inside `load_snapshot`) instead of re-parsing the tree.
-            if let Some(snapshot) =
-                crate::live_index::persist::load_snapshot(&root, &state_placement)
-            {
+            if let Some(snapshot) = crate::live_index::persist::load_snapshot_bound(
+                &root,
+                &state_placement,
+                &source_authority,
+            )
+            .map_err(|refusal| ServeError::IndexLoad {
+                source: anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"),
+            })? {
                 let file_count = snapshot.files.len();
                 let snapshot_mtimes: std::collections::HashMap<String, u64> = snapshot
                     .files
@@ -389,9 +420,14 @@ fn load_serve_index(
                     .map(|(path, file)| (path.clone(), file.mtime_secs))
                     .collect();
                 let (live, code_signals) =
-                    crate::live_index::persist::snapshot_to_live_index_with_code_signals(
-                        snapshot, &root,
-                    );
+                    crate::live_index::persist::snapshot_to_live_index_with_code_signals_bound(
+                        snapshot,
+                        &root,
+                        &source_authority,
+                    )
+                    .map_err(|refusal| ServeError::IndexLoad {
+                        source: anyhow::anyhow!("admitted snapshot source refused: {refusal:?}"),
+                    })?;
                 tracing::info!(
                     files = file_count,
                     load_source = ?live.load_source(),
@@ -409,14 +445,21 @@ fn load_serve_index(
                     Some(root),
                     Some(state_placement),
                     Some(snapshot_mtimes),
+                    Some(source_authority),
                 ));
             }
 
             let index = LiveIndex::load_for_state_placement(&root, &state_placement)
                 .map_err(|source| ServeError::IndexLoad { source })?;
-            Ok((index, Some(root), Some(state_placement), None))
+            Ok((
+                index,
+                Some(root),
+                Some(state_placement),
+                None,
+                Some(source_authority),
+            ))
         }
-        None => Ok((LiveIndex::empty(), None, None, None)),
+        None => Ok((LiveIndex::empty(), None, None, None, None)),
     }
 }
 
@@ -563,48 +606,26 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // the load itself on this repo, and an unattributed slow phase is exactly
     // what let the load-duration under-report go unnoticed.
     let phase = std::time::Instant::now();
-    let (index, repo_root, state_placement, snapshot_mtimes) =
+    let (index, repo_root, state_placement, snapshot_mtimes, source_authority) =
         load_serve_index(args.workspace_root.as_deref())?;
     tracing::info!("serve: index ready in {:?}", phase.elapsed());
-    // V11 bootstrap (C4b): the serve project admits through the process
-    // registry. OPEN residual (T038 round-1 adjudication): this path still
-    // surfaces no RootBinding, so the admission hardcodes NormalProject.
-    // Correct today by invariant — `load_serve_index` binds via
-    // RootRequestMode::Automatic, which can never bind a protected root —
-    // but a future serve-side explicit-protected open would misdeclare here.
-    // Threading `binding.access_mode` through is the recorded follow-up
-    // (docs/reviews/FEATURE-020-SLICE4-ACTIVATION-EVIDENCE-v11.md); C5 did
-    // NOT discharge this.
-    if let (Some(root), Some(placement)) = (repo_root.as_ref(), state_placement.as_ref()) {
-        let project_id = crate::discovery::project_id_for_canonical_root(root);
-        if let Err(refusal) = crate::live_index::index_lifecycle::activation::admit_project(
-            crate::live_index::index_lifecycle::process_runtime::SurfaceKind::Serve,
-            root,
-            &project_id.0,
-            crate::domain::index::SourceAccessMode::NormalProject,
-            placement,
-        ) {
-            return Err(ServeError::IndexLoad {
-                source: anyhow::anyhow!(
-                    "project admission refused for '{}': {refusal:?}",
-                    project_id.0
-                ),
-            });
-        }
-    }
+    // `load_serve_index` admitted the resolved binding before any source proof.
     // Spec 026: a snapshot-restored index reconciles against current disk
     // state in the background (same verify pass the stdio path spawns); tools
     // serve immediately with the honest SnapshotRestore/Pending trust labels.
-    if let (Some(mtimes), Some(root)) = (snapshot_mtimes, repo_root.clone()) {
+    if let (Some(mtimes), Some(root), Some(authority)) =
+        (snapshot_mtimes, repo_root.clone(), source_authority)
+    {
         let bg_index = index.clone();
-        // V11 callbacks census (C3b): carry the observer incarnation current
-        // at spawn; a later watcher registration makes it stale and the lane
-        // refuses its observations.
-        let observer =
-            crate::live_index::index_lifecycle::activation::project_source_authority(&root)
-                .active_observer();
         tokio::spawn(async move {
-            crate::live_index::persist::background_verify(bg_index, root, mtimes, observer).await;
+            crate::live_index::persist::background_verify_cancellable_bound(
+                bg_index,
+                root,
+                mtimes,
+                authority,
+                || false,
+            )
+            .await;
         });
     }
     let control_state_dir: Option<ControlStateDir> =
@@ -792,7 +813,7 @@ mod tests {
         std::fs::write(dir.path().join("lib.rs"), "pub fn seeded() {}\n").expect("seed file");
 
         // Cold path first: no snapshot on disk yet.
-        let (cold, root, placement, mtimes) =
+        let (cold, root, placement, mtimes, _) =
             load_serve_index(Some(dir.path())).expect("cold load");
         assert!(mtimes.is_none(), "no snapshot => no verify map");
         let root = root.expect("root bound");
@@ -804,7 +825,7 @@ mod tests {
             .expect("write snapshot");
 
         // Warm path: the snapshot must be restored, not re-parsed.
-        let (warm, _, _, mtimes) = load_serve_index(Some(dir.path())).expect("warm load");
+        let (warm, _, _, mtimes, _) = load_serve_index(Some(dir.path())).expect("warm load");
         assert_eq!(
             warm.read().load_source(),
             crate::live_index::store::IndexLoadSource::SnapshotRestore,

@@ -582,6 +582,50 @@ async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
     assert_eq!(after_first, std::fs::read(&file_path).unwrap());
 }
 
+/// The replay probe answers a record it cannot serve (here: its post-image is
+/// no longer on disk) with an `Error: Idempotency replay unavailable` refusal.
+/// That text used to be stamped `found`, so the structured status reported a
+/// refused replay as a success.
+#[tokio::test]
+async fn symforge_edit_refused_replay_reports_an_error_outcome() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let (dir, file_path) = temp_rust_repo("fn foo() { old }\n");
+    let server = server_for_repo(dir.path(), "edit-replay-refusal");
+    let request = StelEditRequest {
+        path: "src/lib.rs".to_string(),
+        symbol: Some("foo".to_string()),
+        body: Some("fn foo() { new }".to_string()),
+        apply: Some(true),
+        idempotency_key: Some("stel-edit-refused-replay-key".to_string()),
+        ..Default::default()
+    };
+    let first = dispatch_symforge_edit_result(&server, &request).await;
+    assert_eq!(outcome_class(&first), "found", "{first}");
+
+    // An external writer moves the file past the recorded post-image.
+    std::fs::write(&file_path, "fn foo() { external }\n").unwrap();
+
+    let refused = dispatch_symforge_edit_result(&server, &request).await;
+    let text = tool_result_text(&refused);
+    assert!(
+        text.starts_with("Error: Idempotency replay unavailable"),
+        "the probe must refuse the unservable record:\n{text}"
+    );
+    assert_ne!(outcome_class(&refused), "found", "{refused}");
+    assert_eq!(
+        refused["isError"],
+        serde_json::Value::Bool(true),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file_path).unwrap(),
+        "fn foo() { external }\n",
+        "a refused replay must not write"
+    );
+}
+
 #[tokio::test]
 async fn symforge_edit_rejects_absolute_and_scheme_paths() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;

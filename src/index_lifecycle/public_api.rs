@@ -399,7 +399,7 @@ impl<T> EmbedClaim<T> {
 /// The contract-shaped source spec: how an embedder names a source to open.
 #[derive(Debug)]
 pub struct EmbeddedSourceSpec {
-    root: std::path::PathBuf,
+    pub(super) root: std::path::PathBuf,
 }
 
 impl EmbeddedSourceSpec {
@@ -557,7 +557,7 @@ pub(crate) fn refresh_ticket(
 #[derive(Debug, Clone)]
 pub struct ProcessRuntimeApi {
     _inner: std::sync::Arc<ProcessIndexRuntime>,
-    owner: std::sync::Arc<super::embedded::EmbeddedRuntimeOwner>,
+    pub(super) owner: std::sync::Arc<super::embedded::EmbeddedRuntimeOwner>,
     _not_unwind_safe: NotUnwindSafe,
 }
 

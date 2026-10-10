@@ -69,6 +69,9 @@ pub use internals::{
 #[cfg_attr(not(feature = "__test-internals"), allow(dead_code))]
 pub(crate) mod lifecycle_identity;
 
+#[cfg_attr(not(feature = "__test-internals"), allow(dead_code))]
+mod prompt_engine;
+
 // Feature 020 V11 (C5 — the keyword flip executed): the real server API,
 // public exactly as the frozen contract's four `symforge::server_api` atoms
 // pin it, behind the contract's `feature=server` availability gate. The

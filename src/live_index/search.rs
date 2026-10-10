@@ -915,7 +915,7 @@ pub(crate) fn browse_kind_rank(kind: &str) -> u8 {
 /// Returns true when `filter` matches the given `kind`, accepting both the
 /// Display string (e.g. `"let"` for `Variable`, `"fn"` for `Function`) and
 /// common semantic aliases (e.g. `"variable"`, `"function"`, `"method"`).
-fn kind_filter_matches(filter: &str, kind: &crate::domain::SymbolKind) -> bool {
+pub(crate) fn kind_filter_matches(filter: &str, kind: &crate::domain::SymbolKind) -> bool {
     if kind.to_string().eq_ignore_ascii_case(filter) {
         return true;
     }

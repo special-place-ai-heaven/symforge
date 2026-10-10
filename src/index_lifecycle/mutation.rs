@@ -173,6 +173,18 @@ impl SourceMutationPermit {
             .map_err(AuthorityRefusal::from)
     }
 
+    pub(crate) fn replace_owner_only_beneath(
+        &mut self,
+        relative: &std::path::Path,
+        contents: &[u8],
+    ) -> Result<WriteReceipt, AuthorityRefusal> {
+        if self.state != PermitState::InFlight {
+            return Err(AuthorityRefusal::PermitAlreadyTerminal);
+        }
+        super::physical_root::replace_owner_only_beneath(&self.lease, relative, contents)
+            .map_err(AuthorityRefusal::from)
+    }
+
     /// Attest a DELEGATED durable replacement beneath this permit's lease.
     ///
     /// The caller ran its own contract-pinned durability protocol against

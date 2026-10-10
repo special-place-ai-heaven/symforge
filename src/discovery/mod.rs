@@ -458,7 +458,10 @@ fn cargo_target_dir_root_child(root: &Path) -> Option<String> {
 /// skipped. Only the FIRST path component is inspected, so a legitimately-named
 /// nested source dir such as `src/target/mod.rs` is never over-skipped — only a
 /// `target*` (or `CARGO_TARGET_DIR`) directory that is a direct child of the root.
-fn is_under_repo_root_build_dir(relative_path: &str, target_dir_child: Option<&str>) -> bool {
+pub(crate) fn is_under_repo_root_build_dir(
+    relative_path: &str,
+    target_dir_child: Option<&str>,
+) -> bool {
     let Some(first) = relative_path.split('/').next() else {
         return false;
     };
@@ -1676,15 +1679,7 @@ fn add_gitignore_file(
     let Ok(relative) = dir.strip_prefix(root) else {
         return;
     };
-    let prefix = relative
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(escape_glob(&name.to_string_lossy())),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    if prefix.is_empty() {
+    if relative.as_os_str().is_empty() {
         if let Some(err) = builder.add(file) {
             tracing::debug!("failed to load {:?}: {}", file, err);
         }
@@ -1697,9 +1692,33 @@ fn add_gitignore_file(
             return;
         }
     };
-    let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+    add_gitignore_contents(builder, relative, file, &contents);
+}
+
+/// Add patterns already read through an admitted source capability. This is the
+/// same nested reanchoring used by the filesystem loader, with no file access.
+pub(crate) fn add_gitignore_contents(
+    builder: &mut ignore::gitignore::GitignoreBuilder,
+    relative_dir: &Path,
+    file: &Path,
+    contents: &str,
+) {
+    let prefix = relative_dir
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(escape_glob(&name.to_string_lossy())),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     for line in contents.lines() {
-        if let Some(pattern) = anchor_nested_gitignore_line(&prefix, line)
+        let pattern = if prefix.is_empty() {
+            Some(line.to_string())
+        } else {
+            anchor_nested_gitignore_line(&prefix, line)
+        };
+        if let Some(pattern) = pattern
             && let Err(err) = builder.add_line(Some(file.to_path_buf()), &pattern)
         {
             tracing::debug!("failed to load {:?}: {}", file, err);
@@ -2747,6 +2766,10 @@ fn is_wsl_windows_container_path(path: &Path) -> bool {
 /// 2. UTF-8 decode failure -> binary
 /// 3. >30% suspicious control bytes (excluding \t, \n, \r) -> binary
 pub fn is_binary_content(content: &[u8]) -> bool {
+    is_binary_content_sample(content, content.len() as u64)
+}
+
+fn is_binary_content_sample(content: &[u8], file_size: u64) -> bool {
     if content.is_empty() {
         return false;
     }
@@ -2765,7 +2788,7 @@ pub fn is_binary_content(content: &[u8]) -> bool {
     // (Dogfood 2026-07-11: the 8KB cut split a `─` in src/protocol/tools.rs
     // at byte 8190 and demoted 1.1 MB of pure-UTF-8 Rust to Tier 2 "binary".)
     if let Err(error) = std::str::from_utf8(window) {
-        let boundary_cut = error.error_len().is_none() && check_len < content.len();
+        let boundary_cut = error.error_len().is_none() && (check_len as u64) < file_size;
         if !boundary_cut {
             return true;
         }
@@ -2864,7 +2887,7 @@ pub fn classify_admission(
         return AdmissionDecision::skip(AdmissionTier::MetadataOnly, skip);
     }
     if let Some(content) = content_sample
-        && is_binary_content(content)
+        && is_binary_content_sample(content, file_size)
     {
         return AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::BinaryContent);
     }
@@ -4066,6 +4089,32 @@ mod tests {
     fn test_binary_sniff_allows_common_whitespace_controls() {
         let content = b"col1\tcol2\tcol3\r\nval1\tval2\tval3\r\n";
         assert!(!is_binary_content(content));
+    }
+
+    #[test]
+    fn scout_utf8_sample_boundary_uses_declared_file_size() {
+        let sniff = crate::domain::index::BINARY_SNIFF_BYTES;
+        let bytes = format!("// {}\npub fn item() {{}}\n", "é".repeat(sniff)).into_bytes();
+        let sample = &bytes[..sniff];
+        assert!(std::str::from_utf8(sample).is_err());
+        assert_eq!(
+            classify_admission(
+                std::path::Path::new("large.rs"),
+                bytes.len() as u64,
+                Some(sample)
+            )
+            .tier,
+            AdmissionTier::Normal,
+        );
+        assert_eq!(
+            classify_admission(
+                std::path::Path::new("incomplete.rs"),
+                sample.len() as u64,
+                Some(sample)
+            )
+            .tier,
+            AdmissionTier::MetadataOnly,
+        );
     }
 
     // ── classify_admission tests ──

@@ -615,6 +615,160 @@ impl ProjectSourceAuthority {
             .map(|publication| publication.publication())
     }
 
+    fn with_anchored_read<R>(
+        &self,
+        expected: Option<PublicationIdentity>,
+        read: impl FnOnce(&PhysicalRootLease) -> Result<R, super::physical_root::RootRefusal>,
+    ) -> Result<R, AuthorityRefusal> {
+        let inner = self.inner.lock().expect("project source authority lock");
+        if !inner.lease.is_live() {
+            return Err(AuthorityRefusal::PhysicalRootReplaced);
+        }
+        if matches!(
+            inner.runtime.phase(),
+            super::authority::PhaseName::Blocked | super::authority::PhaseName::Stopping
+        ) {
+            return Err(AuthorityRefusal::PhaseNotCurrent {
+                phase: inner.runtime.phase(),
+            });
+        }
+        if let Some(expected) = expected {
+            let presented = inner.runtime.live_publication().ok_or_else(|| {
+                AuthorityRefusal::PhaseNotCurrent {
+                    phase: inner.runtime.phase(),
+                }
+            })?;
+            if presented.publication() != expected {
+                return Err(AuthorityRefusal::PublicationIdentityMismatch {
+                    presented: expected,
+                    live: presented.publication(),
+                });
+            }
+        }
+        let lease = PhysicalRootLease::take_matching_anchor(&self.root, self.physical_anchor)
+            .map_err(AuthorityRefusal::from)?;
+        read(&lease).map_err(AuthorityRefusal::from)
+    }
+
+    /// One bounded read-only operation on the originally admitted source root.
+    /// The callback must return owned observations; parsing and publication run
+    /// after it releases the authority lock. Loading is allowed for warm restore.
+    #[cfg(any(feature = "server", feature = "embed"))]
+    pub(crate) fn with_source_anchor_read<R>(
+        &self,
+        read: impl FnOnce(&PhysicalRootLease) -> Result<R, super::physical_root::RootRefusal>,
+    ) -> Result<R, AuthorityRefusal> {
+        self.with_anchored_read(None, read)
+    }
+
+    /// Identity of the physical directory admitted with this source authority.
+    /// Persisted replay bindings compare it with a newly opened directory handle.
+    pub(crate) fn physical_root_stable_key(&self) -> Option<[u8; 16]> {
+        self.physical_anchor.map(PhysicalRootAnchor::stable_key)
+    }
+
+    /// Refuse an already-replaced root without reading source bytes.
+    #[cfg(any(feature = "server", feature = "embed"))]
+    pub(crate) fn verify_physical_root_anchor(&self) -> Result<(), AuthorityRefusal> {
+        self.with_source_anchor_read(|_| Ok(()))
+    }
+
+    /// Check exact on-disk spelling under the admitted root and publication.
+    /// `false` means absent; a case or short-name alias is a refusal.
+    #[cfg(feature = "embed")]
+    pub(crate) fn verify_exact_spelling_expected(
+        &self,
+        expected: PublicationIdentity,
+        relative: &Path,
+    ) -> Result<bool, AuthorityRefusal> {
+        self.with_anchored_read(Some(expected), |lease| {
+            super::physical_root::exact_spelling_beneath(lease, relative)
+        })
+    }
+
+    /// Attribute a bounded disk read to this authority's admitted physical root
+    /// and its exact live publication. This grants no mutation capability.
+    #[cfg(feature = "embed")]
+    pub(crate) fn read_regular_beneath_expected(
+        &self,
+        expected: PublicationIdentity,
+        relative: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, AuthorityRefusal> {
+        self.with_anchored_read(Some(expected), |lease| {
+            super::physical_root::read_regular_beneath(lease, relative, max_bytes)
+        })
+    }
+
+    /// Observe one read-only regular-file handle under the original root and
+    /// exact publication. The callback cannot reopen a different path and may
+    /// carry only owned results into later parsing/publication work.
+    #[cfg(feature = "embed")]
+    pub(crate) fn with_regular_file_beneath_expected<R>(
+        &self,
+        expected: PublicationIdentity,
+        relative: &Path,
+        observe: impl FnOnce(&mut std::fs::File) -> Result<R, super::physical_root::RootRefusal>,
+    ) -> Result<Option<R>, AuthorityRefusal> {
+        self.with_anchored_read(Some(expected), |lease| {
+            let Some((file, _)) = super::physical_root::open_regular_beneath(lease, relative)?
+            else {
+                return Ok(None);
+            };
+            let mut file = file.into_std();
+            observe(&mut file).map(Some)
+        })
+    }
+
+    /// Read a committed replay's postimage even while publication refreshes.
+    /// Replay supplies its own durable digest; this only proves root provenance.
+    pub(crate) fn read_regular_beneath_anchor(
+        &self,
+        relative: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, AuthorityRefusal> {
+        self.with_anchored_read(None, |lease| {
+            super::physical_root::read_regular_beneath(lease, relative, max_bytes)
+        })
+    }
+
+    /// Stream a replay postimage digest from the admitted root, including while
+    /// that publication is refreshing. The opened file never follows a link.
+    #[cfg(feature = "embed")]
+    pub(crate) fn digest_regular_beneath_anchor(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<String>, AuthorityRefusal> {
+        self.with_anchored_read(None, |lease| {
+            super::physical_root::digest_regular_beneath(lease, relative)
+        })
+    }
+
+    pub(crate) fn sync_root_file_beneath_anchor(
+        &self,
+        relative: &Path,
+    ) -> Result<(), AuthorityRefusal> {
+        self.with_anchored_read(None, |lease| {
+            super::physical_root::sync_root_file_beneath(lease, relative)
+        })
+    }
+
+    #[cfg(feature = "embed")]
+    pub(crate) fn regular_file_size_beneath_expected(
+        &self,
+        expected: PublicationIdentity,
+        relative: &Path,
+    ) -> Result<Option<u64>, AuthorityRefusal> {
+        self.with_anchored_read(Some(expected), |lease| {
+            super::physical_root::regular_file_size_beneath(lease, relative)
+        })
+    }
+
+    /// Canonical root spelling captured with this admitted authority.
+    pub(crate) fn admitted_root(&self) -> &Path {
+        &self.root
+    }
+
     /// The stable admission-root identity this authority presents.
     pub fn admission_root(&self) -> PhysicalRootIdentity {
         self.admission_root
@@ -655,6 +809,23 @@ impl ProjectSourceAuthority {
     /// live `Current` publication (which publishes non-`Current` before the
     /// permit exists), then mint the permit pinned to this root's lease.
     pub fn acquire_write(self: &Arc<Self>) -> Result<WriteAuthority, AuthorityRefusal> {
+        self.acquire_write_if_publication(None)
+    }
+
+    /// The embedded edit lane presents the publication it planned against.
+    /// Compare while holding the same authority lock that issues the permit,
+    /// so a same-byte intervening publication cannot pass a stale guard.
+    pub(crate) fn acquire_write_expected(
+        self: &Arc<Self>,
+        expected: PublicationIdentity,
+    ) -> Result<WriteAuthority, AuthorityRefusal> {
+        self.acquire_write_if_publication(Some(expected))
+    }
+
+    fn acquire_write_if_publication(
+        self: &Arc<Self>,
+        expected: Option<PublicationIdentity>,
+    ) -> Result<WriteAuthority, AuthorityRefusal> {
         let mut inner = self.inner.lock().expect("project source authority lock");
         let presented = match inner.runtime.live_publication() {
             Some(publication) => publication.publication(),
@@ -664,6 +835,14 @@ impl ProjectSourceAuthority {
                 });
             }
         };
+        if let Some(expected) = expected
+            && expected != presented
+        {
+            return Err(AuthorityRefusal::PublicationIdentityMismatch {
+                presented: expected,
+                live: presented,
+            });
+        }
         let grant = inner
             .runtime
             .request_mutation_grant(MutationGrantInput::LiveCurrent(presented))?;
@@ -823,6 +1002,38 @@ impl ObservationLane {
 }
 
 impl WriteAuthority {
+    /// Bounded read from the same physical root lease that will perform writes.
+    #[cfg(feature = "embed")]
+    pub(crate) fn read_regular_beneath(
+        &self,
+        relative: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, AuthorityRefusal> {
+        let permit = self
+            .permit
+            .as_ref()
+            .expect("permit lives until a finish path");
+        super::physical_root::read_regular_beneath(permit.lease(), relative, max_bytes)
+            .map_err(AuthorityRefusal::from)
+    }
+
+    /// Read-only exact image check through this permit's pinned physical-root
+    /// lease. Batch staging uses it before any side effect and for postimage
+    /// attestation; it never mints mutation authority by itself.
+    /// Check an existing or absent batch preimage through the pinned root.
+    pub(crate) fn matches_optional_beneath(
+        &self,
+        relative: &Path,
+        expected: Option<&[u8]>,
+    ) -> Result<bool, AuthorityRefusal> {
+        let permit = self
+            .permit
+            .as_ref()
+            .expect("permit lives until a finish path");
+        super::physical_root::matches_optional_image_beneath(permit.lease(), relative, expected)
+            .map_err(AuthorityRefusal::from)
+    }
+
     /// Write one path beneath the authorized root. The first write begins the
     /// permit's side effect; later writes continue it (a batch is one
     /// authority, many receipts).
@@ -844,6 +1055,22 @@ impl WriteAuthority {
         permit.replace_beneath(relative, contents)
     }
 
+    pub(crate) fn write_owner_only(
+        &mut self,
+        relative: &Path,
+        contents: &[u8],
+    ) -> Result<WriteReceipt, AuthorityRefusal> {
+        let permit = self
+            .permit
+            .as_mut()
+            .expect("permit lives until a finish path");
+        match permit.start_side_effect() {
+            Ok(()) | Err(AuthorityRefusal::SideEffectAlreadyInFlight) => {}
+            Err(refusal) => return Err(refusal),
+        }
+        permit.replace_owner_only_beneath(relative, contents)
+    }
+
     /// Begin a DELEGATED side effect: the caller is about to run its own
     /// contract-pinned durability protocol (curation policy lane) beneath
     /// this authority's root. The permit goes in flight FIRST, so a protocol
@@ -858,6 +1085,20 @@ impl WriteAuthority {
             Ok(()) | Err(AuthorityRefusal::SideEffectAlreadyInFlight) => Ok(()),
             Err(refusal) => Err(refusal),
         }
+    }
+
+    /// Begin a delegated source effect and expose only its retained root lease.
+    /// The caller cannot resolve the mutable root spelling while this effect is
+    /// in flight; its durable writer must operate through this capability.
+    pub(crate) fn begin_delegated_lease(
+        &mut self,
+    ) -> Result<&super::physical_root::PhysicalRootLease, AuthorityRefusal> {
+        self.begin_delegated()?;
+        Ok(self
+            .permit
+            .as_ref()
+            .expect("permit lives until a finish path")
+            .lease())
     }
 
     /// Attest the delegated protocol's outcome: the pinned lease re-reads
@@ -1059,6 +1300,83 @@ impl ProjectRuntimeHandle {
             return Err(super::registry::RegistryRefusal::Tombstoned { slot: slot.slot() });
         }
         Ok(&self.data_plane)
+    }
+
+    /// Run one already path-locked staged write against a single admitted
+    /// project binding. The shared-index writer mutex prevents `index_folder`
+    /// from rebinding the root or state placement until the caller has finished
+    /// its source permit inside `operation`. No authority is serialized or
+    /// inferred from request metadata.
+    #[cfg(feature = "server")]
+    pub(crate) fn with_admitted_write_binding<R>(
+        &self,
+        operation: impl FnOnce(
+            &Path,
+            Option<&crate::domain::ProjectStateDir>,
+            u64,
+            &Arc<ProjectSourceAuthority>,
+            PublicationIdentity,
+        ) -> R,
+    ) -> Result<Option<R>, RegistryRefusal> {
+        let index = self.acquire()?;
+        match index.with_bound_write_binding(|root, state_dir, generation| {
+            let run = || {
+                let authority = project_source_authority(root);
+                authority.current_publication().map(|publication| {
+                    operation(root, state_dir, generation, &authority, publication)
+                })
+            };
+            // The read gate linearizes against stop after the index binding
+            // is captured. A winning write finishes its source permit before
+            // stop can revoke the slot; a winning stop refuses this scope.
+            if let Some(slot) = &self.admission {
+                slot.with_live_write_scope(run)
+            } else {
+                Ok(run())
+            }
+        }) {
+            Some(result) => result,
+            None => Ok(None),
+        }
+    }
+
+    /// Observe the bound source for read-only Completed replay while a writer
+    /// may have published non-Current. The index binding stays pinned for the
+    /// closure, and an admitted slot rejects a registry authority for another
+    /// physical root at the same path. Callers must not acquire path locks or
+    /// start an effect in this scope.
+    #[cfg(feature = "server")]
+    pub(crate) fn with_admitted_replay_source<R>(
+        &self,
+        operation: impl FnOnce(
+            &Path,
+            Option<&crate::domain::ProjectStateDir>,
+            &Arc<ProjectSourceAuthority>,
+        ) -> R,
+    ) -> Result<Option<R>, RegistryRefusal> {
+        let index = self.acquire()?;
+        match index.with_bound_write_binding(|root, state_dir, _| {
+            let run = || {
+                let authority = project_source_authority(root);
+                if let Some(slot) = &self.admission {
+                    let joined = slot.binding()?.physical_root();
+                    let presented = authority.admission_binding().physical_root();
+                    if joined != presented {
+                        return Err(RegistryRefusal::RootMismatch { joined, presented });
+                    }
+                }
+                Ok(operation(root, state_dir, &authority))
+            };
+            if let Some(slot) = &self.admission {
+                slot.with_live_write_scope(run)
+                    .and_then(std::convert::identity)
+            } else {
+                run()
+            }
+        }) {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The owned V10 data plane, borrowed.
@@ -1473,6 +1791,77 @@ mod admit_retry_loop {
             4,
             "the bound is four attempts; a change here is a deliberate change to              TORN_DOWN_ADMIT_ATTEMPTS, not an incidental one"
         );
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod admitted_write_scope_tests {
+    use super::*;
+    use crate::live_index::LiveIndex;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn stop_waits_for_admitted_write_scope_and_later_writes_refuse() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.rs"), b"pub fn source() {}\n").unwrap();
+        let registry = ProjectRegistry::new();
+        let key = ProjectKey::new("admitted-write-scope");
+        let binding = project_source_authority(root.path()).admission_binding();
+        registry
+            .admit(
+                key.clone(),
+                binding,
+                RootProtection::Normal,
+                false,
+                AdmissionStatePlacement::ProjectLocal,
+            )
+            .unwrap();
+        let slot = registry.install(&key, None).unwrap();
+        let index = LiveIndex::load(root.path()).unwrap();
+        let handle = ProjectRuntimeHandle::bind_admitted(index, slot);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            handle
+                .with_admitted_write_binding(|_, _, _, authority, publication| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let write = authority.acquire_write_expected(publication).unwrap();
+                    write.finish_no_side_effect().unwrap();
+                })
+                .unwrap()
+                .unwrap();
+            handle
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let stopping = Arc::clone(&registry);
+        let stop_key = key.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let stop = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = stopping.stop(&stop_key);
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "stop retired a slot while its admitted write scope was open"
+        );
+        release_tx.send(()).unwrap();
+        let handle = writer.join().unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        stop.join().unwrap();
+        assert!(matches!(
+            handle.with_admitted_write_binding(|_, _, _, _, _| ()),
+            Err(RegistryRefusal::Tombstoned { .. })
+        ));
     }
 }
 

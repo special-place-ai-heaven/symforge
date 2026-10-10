@@ -36,7 +36,58 @@ pub mod authority;
 // only planned production caller.
 pub mod candidate;
 pub mod capacity;
+#[cfg(feature = "embed")]
+mod embed_ask;
+#[cfg(feature = "embed")]
+mod embed_batch;
+#[cfg(feature = "embed")]
+mod embed_changes;
+#[cfg(feature = "embed")]
+mod embed_detect_impact;
+#[cfg(feature = "embed")]
+pub(crate) mod embed_federation;
+#[cfg(feature = "embed")]
+mod embed_file_search;
+#[cfg(feature = "embed")]
+mod embed_git;
+#[cfg(feature = "embed")]
+mod embed_git_config;
+#[cfg(feature = "embed")]
+mod embed_guidance;
+#[cfg(feature = "embed")]
+pub(crate) mod embed_host;
+#[cfg(feature = "embed")]
+mod embed_knowledge;
+#[cfg(feature = "embed")]
+mod embed_knowledge_query;
+#[cfg(feature = "embed")]
+mod embed_mutation;
+#[cfg(feature = "embed")]
+pub(crate) mod embed_query;
+#[cfg(feature = "embed")]
+mod embed_read;
+#[cfg(feature = "embed")]
+mod embed_read_context;
+#[cfg(feature = "embed")]
+mod embed_reference;
+#[cfg(feature = "embed")]
+pub(crate) mod embed_remediation;
+#[cfg(feature = "embed")]
+pub(super) mod embed_restore;
+#[cfg(feature = "embed")]
+mod embed_search;
+#[cfg(feature = "embed")]
+pub(crate) mod embed_session;
+#[cfg(feature = "embed")]
+mod embed_symbol;
+#[cfg(feature = "embed")]
+mod embed_symbol_context;
+#[cfg(feature = "embed")]
+mod embed_usage;
+#[cfg(feature = "embed")]
+mod embed_wire_edit;
 pub mod embedded;
+pub(crate) mod guidance;
 pub mod mutation;
 pub mod physical_root;
 pub mod process_runtime;

@@ -446,7 +446,6 @@ const WIRED_PRODUCTION_FILES: &[&str] = &[
     "src/live_index/store.rs",
     "src/protocol/edit.rs",
     "src/protocol/edit_tools.rs",
-    "src/protocol/knowledge_curation.rs",
     "src/protocol/mod.rs",
     "src/protocol/tools.rs",
     "src/server/mod.rs",
@@ -455,6 +454,32 @@ const WIRED_PRODUCTION_FILES: &[&str] = &[
     "src/sidecar/mod.rs",
     "src/sidecar/server.rs",
     "src/watcher/mod.rs",
+    // Embed-parity boundary, accepted 2026-10-10 (docs/reviews/2026-10-10-darkness-pin-review.md).
+    // Guidance callers: handlers rewired onto the shared `guidance` engine.
+    "src/protocol/format.rs",
+    "src/protocol/read_gate.rs",
+    "src/protocol/search_tools.rs",
+    "src/protocol/read_tools.rs",
+    "src/protocol/ccr.rs",
+    "src/protocol/conventions.rs",
+    "src/protocol/explore.rs",
+    "src/protocol/investigation.rs",
+    "src/protocol/knowledge_model.rs",
+    "src/protocol/search_format.rs",
+    "src/protocol/session.rs",
+    "src/protocol/smart_query.rs",
+    "src/protocol/withheld.rs",
+    "src/knowledge/search.rs",
+    "src/knowledge/search_contract.rs",
+    // Write-authority callers moved out of protocol into shared modules.
+    "src/knowledge/curation.rs",
+    "src/idempotency.rs",
+    "src/edit_safety/atomic_write.rs",
+    "src/edit_safety/batch_commit.rs",
+    // Takes physical-root leases directly: write authority, not facade forwarding.
+    "src/embed/parity/replay.rs",
+    // Carries the shared reconciliation gate.
+    "src/protocol/secret_remediate.rs",
 ];
 
 /// The frozen publication_roots census (C4): the state structs that retired
@@ -985,7 +1010,62 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/authority.rs",
     "index_lifecycle/candidate.rs",
     "index_lifecycle/capacity.rs",
+    "index_lifecycle/embed_ask.rs",
+    "index_lifecycle/embed_batch.rs",
+    "index_lifecycle/embed_changes.rs",
+    "index_lifecycle/embed_detect_impact.rs",
+    "index_lifecycle/embed_federation.rs",
+    "index_lifecycle/embed_file_search.rs",
+    "index_lifecycle/embed_git.rs",
+    "index_lifecycle/embed_git_config.rs",
+    "index_lifecycle/embed_guidance.rs",
+    "index_lifecycle/embed_host.rs",
+    "index_lifecycle/embed_knowledge.rs",
+    "index_lifecycle/embed_knowledge_query.rs",
+    "index_lifecycle/embed_mutation.rs",
+    "index_lifecycle/embed_query.rs",
+    "index_lifecycle/embed_read.rs",
+    "index_lifecycle/embed_read_context.rs",
+    "index_lifecycle/embed_reference.rs",
+    "index_lifecycle/embed_remediation.rs",
+    "index_lifecycle/embed_restore.rs",
+    "index_lifecycle/embed_search.rs",
+    "index_lifecycle/embed_session.rs",
+    "index_lifecycle/embed_symbol.rs",
+    "index_lifecycle/embed_symbol_context.rs",
+    "index_lifecycle/embed_usage.rs",
+    "index_lifecycle/embed_wire_edit.rs",
     "index_lifecycle/embedded.rs",
+    "index_lifecycle/guidance/changes.rs",
+    "index_lifecycle/guidance/compression.rs",
+    "index_lifecycle/guidance/conventions.rs",
+    "index_lifecycle/guidance/exploration.rs",
+    "index_lifecycle/guidance/explore.rs",
+    "index_lifecycle/guidance/file_read.rs",
+    "index_lifecycle/guidance/file_search.rs",
+    "index_lifecycle/guidance/filters.rs",
+    "index_lifecycle/guidance/impact.rs",
+    "index_lifecycle/guidance/investigation.rs",
+    "index_lifecycle/guidance/knowledge_model.rs",
+    "index_lifecycle/guidance/mod.rs",
+    "index_lifecycle/guidance/read_admission_format.rs",
+    "index_lifecycle/guidance/read_context.rs",
+    "index_lifecycle/guidance/read_contract.rs",
+    "index_lifecycle/guidance/read_gate.rs",
+    "index_lifecycle/guidance/reference_contract.rs",
+    "index_lifecycle/guidance/reference_read.rs",
+    "index_lifecycle/guidance/routing.rs",
+    "index_lifecycle/guidance/search.rs",
+    "index_lifecycle/guidance/search_contract.rs",
+    "index_lifecycle/guidance/search_envelope.rs",
+    "index_lifecycle/guidance/search_render.rs",
+    "index_lifecycle/guidance/serde_input.rs",
+    "index_lifecycle/guidance/session.rs",
+    "index_lifecycle/guidance/smart_query.rs",
+    "index_lifecycle/guidance/source.rs",
+    "index_lifecycle/guidance/symbol_context.rs",
+    "index_lifecycle/guidance/symbol_read.rs",
+    "index_lifecycle/guidance/withheld.rs",
     "index_lifecycle/mod.rs",
     "index_lifecycle/mutation.rs",
     "index_lifecycle/observer.rs",
@@ -1010,10 +1090,25 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Refreshed for deferred knowledge-bridge publication: embedded.rs labels
 // DerivedCoverage::Loading. Same 20 paths. No new inbound call edge into
 // src/index_lifecycle; the arm is inside the excluded file.
+// Refreshed for the embed-parity boundary: excluded set grew from 20 to 75
+// paths (embed_* engines, guidance/, widened lanes). NEW edges into src/index_lifecycle exist and the owner accepted them
+// (docs/reviews/2026-10-10-darkness-pin-review.md): roster +21 -1.
+// Guidance callers (15, target `guidance`): protocol/{format,read_gate,
+// search_tools,read_tools,ccr,conventions,explore,investigation,
+// knowledge_model,search_format,session,smart_query,withheld}.rs and
+// knowledge/{search,search_contract}.rs. Write-authority callers (4):
+// knowledge/curation.rs, idempotency.rs, edit_safety/atomic_write.rs,
+// edit_safety/batch_commit.rs. Also embed/parity/replay.rs (physical-root
+// leases) and protocol/secret_remediate.rs (shared reconciliation gate). The
+// stale protocol/knowledge_curation.rs row is removed. The eight other
+// embed/parity children (parity, host, edit, knowledge, federation, session,
+// read, reference) were rerouted through src/embed.rs and hold zero edges.
+// Refreshed for the embed-cell clippy/cfg cleanup (collapsed ifs, an elided
+// lifetime, a type alias, &Path params, one allow); no new boundary edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "cecbd130ae4acdc419712c6e06a9bff6cf16784b53e5de14efadd1f1888270e4",
-    20,
-    465_164,
+    "850547834e09893eddd92229ca3cf3a05c8ca56528a90dd992413412f0f5dfb2",
+    75,
+    1_759_421,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1141,10 +1236,24 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for the Windows read-gate named-pipe refusal: GetFileType after
 // open, before any read. Same 203 files. Private helpers only. No new token
 // or call edge into src/index_lifecycle or server_api.rs.
+// Refreshed for the embed-parity boundary: 203 -> 295 files. NEW edges into src/index_lifecycle exist and the owner accepted them
+// (docs/reviews/2026-10-10-darkness-pin-review.md): roster +21 -1.
+// Guidance callers (15, target `guidance`): protocol/{format,read_gate,
+// search_tools,read_tools,ccr,conventions,explore,investigation,
+// knowledge_model,search_format,session,smart_query,withheld}.rs and
+// knowledge/{search,search_contract}.rs. Write-authority callers (4):
+// knowledge/curation.rs, idempotency.rs, edit_safety/atomic_write.rs,
+// edit_safety/batch_commit.rs. Also embed/parity/replay.rs (physical-root
+// leases) and protocol/secret_remediate.rs (shared reconciliation gate). The
+// stale protocol/knowledge_curation.rs row is removed. The eight other
+// embed/parity children (parity, host, edit, knowledge, federation, session,
+// read, reference) were rerouted through src/embed.rs and hold zero edges.
+// Refreshed for the embed-cell clippy/cfg cleanup, stale unix test removal, and canonical-root
+// test comparisons for 8.3 short-name TEMP; no new boundary edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "05b0e1dcb82288853ec2f268de44821d52332449290c8344f725314cbfed7713",
-    203,
-    10_558_921,
+    "0248f6647b95daf73511227a14c68072e54de6b3055658049327a87ffa531551",
+    295,
+    11_556_486,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

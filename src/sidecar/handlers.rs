@@ -13,7 +13,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{LanguageId, ReferenceKind};
+use crate::domain::LanguageId;
+use crate::index_lifecycle::guidance::read_context::ContextSourceAuthority;
+#[cfg(test)]
+use crate::index_lifecycle::guidance::read_context::{
+    append_parse_status_lines, is_intra_workspace_path, parse_state_label,
+};
 use crate::sidecar::{SidecarState, SymbolSnapshot, SymbolSnapshotCache, build_with_budget};
 use crate::watcher;
 
@@ -83,12 +88,6 @@ enum PromptHintMatchKind {
     QualifiedSymbolAlias,
 }
 
-#[derive(Clone, Copy)]
-enum ContextSourceAuthority {
-    DiskRefreshed,
-    CurrentIndex,
-}
-
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub file_count: usize,
@@ -136,92 +135,6 @@ fn no_high_confidence_prompt_context_message() -> String {
     // Dogfood #8 (2026-07-06): a no-evidence report must cost one line, not a
     // multi-line report — this lands in the agent's prompt on EVERY submit.
     "Prompt-context signal: none (no file/symbol/repo-map cue in prompt)".to_string()
-}
-
-fn context_source_authority_label(authority: ContextSourceAuthority) -> &'static str {
-    match authority {
-        ContextSourceAuthority::DiskRefreshed => "disk-refreshed",
-        ContextSourceAuthority::CurrentIndex => "current index",
-    }
-}
-
-fn parse_state_label(file: &crate::live_index::store::IndexedFile) -> &'static str {
-    match &file.parse_status {
-        crate::live_index::store::ParseStatus::Parsed => "parsed",
-        crate::live_index::store::ParseStatus::PartialParse { .. } => {
-            // SF-004: a partial parse caused only by Angular template control-flow
-            // (`@if`/`@for`/... in `.html`) that tree-sitter-html cannot model is
-            // a known framework limitation; symbols are extracted best-effort, so
-            // surface it as parsed rather than a bare "partial" in the
-            // file-context envelope (the report's actual repro surface).
-            if crate::live_index::query::is_expected_framework_partial_parse(file) {
-                return "parsed";
-            }
-            // SF-003: a partial parse caused only by the tree-sitter-typescript
-            // 0.23.2 import-type-array grammar limitation is valid TypeScript;
-            // surface it as parsed rather than partial in the file-context
-            // envelope (the report's repro surface).
-            if crate::parsing::is_expected_typescript_import_type_array_limitation(
-                &file.language,
-                &file.content,
-                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
-            ) {
-                "parsed"
-            } else {
-                "partial"
-            }
-        }
-        crate::live_index::store::ParseStatus::Failed { .. } => "degraded",
-    }
-}
-
-fn aggregate_parse_state_label<'a>(
-    statuses: impl IntoIterator<Item = &'a crate::live_index::store::ParseStatus>,
-    published: &crate::live_index::store::PublishedIndexState,
-) -> &'static str {
-    let mut saw_partial = false;
-    for status in statuses {
-        match status {
-            crate::live_index::store::ParseStatus::Parsed => {}
-            crate::live_index::store::ParseStatus::PartialParse { .. } => saw_partial = true,
-            crate::live_index::store::ParseStatus::Failed { .. } => return "degraded",
-        }
-    }
-    if saw_partial {
-        "partial"
-    } else if matches!(
-        published.status,
-        crate::live_index::store::PublishedIndexStatus::Degraded
-    ) {
-        "degraded"
-    } else {
-        "parsed"
-    }
-}
-
-fn format_context_envelope(
-    match_type: &str,
-    source_authority: ContextSourceAuthority,
-    parse_state: &str,
-    completeness: &str,
-    scope: impl Into<String>,
-    evidence: impl Into<String>,
-) -> String {
-    let authority = context_source_authority_label(source_authority);
-    let scope = scope.into();
-    let evidence = evidence.into();
-    // "Silence is the happy path" (see format_search_envelope): collapse the four
-    // baseline status lines on a fully-trusted result; keep the full six-line
-    // envelope when anything deviates so degraded/stale results stay loud.
-    if authority == "current index" && parse_state == "parsed" && completeness.starts_with("full") {
-        format!(
-            "Trust: {match_type} | {authority} | {parse_state} | {completeness}\nScope: {scope}\nEvidence: {evidence}"
-        )
-    } else {
-        format!(
-            "Match type: {match_type}\nSource authority: {authority}\nParse state: {parse_state}\nCompleteness: {completeness}\nScope: {scope}\nEvidence: {evidence}"
-        )
-    }
 }
 
 fn freshen_sidecar_path_if_stale_at_generation(
@@ -661,66 +574,6 @@ fn outline_hook_text(
     outline_text(state, params, HOOK_RENDER_OPTIONS, fence)
 }
 
-fn append_parse_status_lines(
-    lines: &mut Vec<String>,
-    file: &crate::live_index::store::IndexedFile,
-) {
-    match &file.parse_status {
-        crate::live_index::store::ParseStatus::Parsed => {}
-        crate::live_index::store::ParseStatus::PartialParse { warning } => {
-            // SF-004: suppress the partial-parse diagnostic when the only cause
-            // is Angular template control-flow (`@if`/`@for`/... in `.html`) that
-            // tree-sitter-html cannot model. Surface a non-alarming framework note
-            // instead so the file-context envelope does not flag a known
-            // framework-template limitation as a defect (the report's repro tool).
-            if crate::live_index::query::is_expected_framework_partial_parse(file) {
-                lines.push(
-                    "Parse status: ok (framework limitation: Angular template control-flow \
-                     is not supported by tree-sitter-html; symbols extracted best-effort)"
-                        .to_string(),
-                );
-                return;
-            }
-            // SF-003: suppress the partial-parse diagnostic when the only cause
-            // is the known tree-sitter-typescript 0.23.2 import-type-array
-            // grammar limitation (valid TypeScript). Surface a non-alarming note
-            // instead so the file-context envelope does not flag valid source.
-            if crate::parsing::is_expected_typescript_import_type_array_limitation(
-                &file.language,
-                &file.content,
-                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
-            ) {
-                lines.push(
-                    "Parse status: ok (parser limitation: tree-sitter-typescript 0.23.2 \
-                     mis-parses an import-type followed by `[]`; source is valid TypeScript)"
-                        .to_string(),
-                );
-                return;
-            }
-            lines.push("Parse status: partial".to_string());
-            if let Some(diagnostic) = &file.parse_diagnostic {
-                lines.push(format!("Diagnostic: {}", diagnostic.summary()));
-                if let Some((start, end)) = diagnostic.byte_span {
-                    lines.push(format!("Byte span: {start}..{end}"));
-                }
-            } else {
-                lines.push(format!("Diagnostic: {warning}"));
-            }
-        }
-        crate::live_index::store::ParseStatus::Failed { error } => {
-            lines.push("Parse status: failed".to_string());
-            if let Some(diagnostic) = &file.parse_diagnostic {
-                lines.push(format!("Diagnostic: {}", diagnostic.summary()));
-                if let Some((start, end)) = diagnostic.byte_span {
-                    lines.push(format!("Byte span: {start}..{end}"));
-                }
-            } else {
-                lines.push(format!("Diagnostic: {error}"));
-            }
-        }
-    }
-}
-
 fn outline_text(
     state: &SidecarState,
     params: &OutlineParams,
@@ -744,268 +597,24 @@ fn outline_text_for_generation(
     options: RenderOptions,
     source_authority: ContextSourceAuthority,
 ) -> Result<String, StatusCode> {
-    let guard = published.live.as_ref();
-
-    // Return 404 for non-indexed files.
-    let file = guard.get_file(&params.path).ok_or(StatusCode::NOT_FOUND)?;
-
-    let file_bytes = file.byte_len;
-    let language = format!("{:?}", file.language);
-    let parse_state = parse_state_label(file);
-
-    let include_section = |name: &str| -> bool {
-        match &params.sections {
-            None => true,
-            Some(list) => list.iter().any(|s| s.eq_ignore_ascii_case(name)),
-        }
+    let selection = crate::index_lifecycle::guidance::read_context::OutlineProjectionParams {
+        path: params.path.clone(),
+        max_tokens: params.max_tokens,
+        sections: params.sections.clone(),
     };
-    let include_consumers = include_section("consumers");
-    let include_references = include_section("references");
-
-    // Build symbol outline lines.
-    let mut body_lines: Vec<String> = Vec::new();
-    body_lines.push(format!(
-        "── {} ({} symbols, {}) ──",
-        params.path,
-        file.symbols.len(),
-        language
-    ));
-    append_parse_status_lines(&mut body_lines, file);
-
-    // Surface section validation warnings in the output.
-    if let Some(ref section_list) = params.sections {
-        let valid = ["outline", "imports", "consumers", "references", "git"];
-        let unknown: Vec<&str> = section_list
-            .iter()
-            .filter(|s| !valid.iter().any(|v| s.eq_ignore_ascii_case(v)))
-            .map(|s| s.as_str())
-            .collect();
-        if !unknown.is_empty() {
-            body_lines.push(format!(
-                "Warning: unknown section(s): {}. Valid: {}.",
-                unknown.join(", "),
-                valid.join(", ")
-            ));
-        }
-    }
-
-    let mut budget_omissions = false;
-    if include_section("outline") {
-        let symbol_cap = params
-            .max_tokens
-            .map(|tokens| ((tokens as usize).saturating_div(12)).clamp(25, 500));
-        let symbols_to_render = symbol_cap
-            .map(|cap| cap.min(file.symbols.len()))
-            .unwrap_or(file.symbols.len());
-        for sym in file.symbols.iter().take(symbols_to_render) {
-            let indent = "  ".repeat(sym.depth as usize);
-            let kind_str = sym.kind.to_string();
-            // Strip redundant kind prefix from name (e.g., impl blocks named "impl Foo").
-            let display_name = if sym.name.starts_with(&format!("{} ", kind_str)) {
-                &sym.name[kind_str.len() + 1..]
-            } else {
-                &sym.name[..]
-            };
-            body_lines.push(format!(
-                "{}  {:<10} {}  L{}-{}",
-                indent,
-                kind_str,
-                display_name,
-                sym.line_range.0 + 1,
-                sym.line_range.1 + 1,
-            ));
-        }
-        if symbols_to_render < file.symbols.len() {
-            budget_omissions = true;
-            body_lines.push(format!(
-                "  ...omitted {} symbols due to budget; pass a larger max_tokens or request get_file_content(start_line,end_line) for exact text",
-                file.symbols.len() - symbols_to_render
-            ));
-        }
-    }
-
-    // Build "Imports from" section.
-    // Group import references by source (qualified_name or name), count per source.
-    if include_section("imports") {
-        let mut import_sources: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for reference in &file.references {
-            if reference.kind == ReferenceKind::Import {
-                let source = reference
-                    .qualified_name
-                    .as_deref()
-                    .unwrap_or(&reference.name);
-                *import_sources.entry(source).or_insert(0) += 1;
-            }
-        }
-        if !import_sources.is_empty() {
-            let mut sorted: Vec<_> = import_sources.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-            body_lines.push(String::new());
-            body_lines.push(format!("Imports from ({} sources):", sorted.len()));
-            for (source, count) in sorted.iter().take(10) {
-                body_lines.push(format!("  {} ({} symbols)", source, count));
-            }
-            if sorted.len() > 10 {
-                body_lines.push(format!("  ...and {} more", sorted.len() - 10));
-            }
-        }
-    }
-
-    // Build "Used by" section.
-    // Group dependents by consuming file, count references per consumer.
-    let attributed_dependents = if include_consumers || include_references {
-        guard.find_dependents_for_file(&params.path)
-    } else {
-        Vec::new()
-    };
-    if include_consumers {
-        let mut consumers: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for (file_path, _) in &attributed_dependents {
-            *consumers.entry(*file_path).or_insert(0) += 1;
-        }
-        if !consumers.is_empty() {
-            let mut sorted: Vec<_> = consumers.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-            body_lines.push(String::new());
-            body_lines.push(format!("Used by ({} files):", sorted.len()));
-            for (consumer, count) in sorted.iter().take(10) {
-                body_lines.push(format!("  {} ({} refs)", consumer, count));
-            }
-            if sorted.len() > 10 {
-                body_lines.push(format!("  ...and {} more", sorted.len() - 10));
-            }
-        }
-    }
-
-    // Build "Key references" section.
-    // Rank symbols by caller count descending, take top 5, show up to 3 callers each.
-    if include_references {
-        let mut symbol_callers: Vec<(String, Vec<(String, u32)>)> = Vec::new();
-
-        for sym in &file.symbols {
-            let external_callers: Vec<(String, u32)> = attributed_dependents
-                .iter()
-                .filter(|(_, reference)| {
-                    reference.kind != ReferenceKind::Import && reference.name == sym.name
-                })
-                .map(|(fp, r)| (fp.to_string(), r.line_range.0 + 1))
-                .take(3)
-                .collect();
-
-            if !external_callers.is_empty() {
-                symbol_callers.push((sym.name.clone(), external_callers));
-            }
-        }
-
-        // Sort by caller count descending, take top 5.
-        symbol_callers.sort_by_key(|(_, callers)| std::cmp::Reverse(callers.len()));
-        symbol_callers.truncate(5);
-
-        if !symbol_callers.is_empty() {
-            body_lines.push(String::new());
-            body_lines.push("Key references:".to_string());
-            for (sym_name, callers) in &symbol_callers {
-                body_lines.push(format!("  {}()", sym_name));
-                for (caller_file, caller_line) in callers {
-                    body_lines.push(format!("    {}  line {}", caller_file, caller_line));
-                }
-            }
-        }
-    }
-
-    // Build "Git activity" section from temporal intelligence.
-    if include_section("git") {
-        use crate::live_index::git_temporal::{
-            GitTemporalState, churn_bar, churn_label, relative_time,
-        };
-        let temporal = &published.code_signals.temporal;
-        if temporal.state == GitTemporalState::Ready
-            && let Some(history) = temporal.files.get(&params.path)
-        {
-            body_lines.push(String::new());
-            body_lines.push(format!(
-                "Git activity:  {} {:.2} ({})    {} commits, last {}",
-                churn_bar(history.churn_score),
-                history.churn_score,
-                churn_label(history.churn_score),
-                history.commit_count,
-                relative_time(history.last_commit.days_ago),
-            ));
-            body_lines.push(format!(
-                "  Last:  {} \"{}\" ({}, {})",
-                history.last_commit.hash,
-                history.last_commit.message_head,
-                history.last_commit.author,
-                history.last_commit.timestamp,
-            ));
-            if !history.contributors.is_empty() {
-                let owners: Vec<String> = history
-                    .contributors
-                    .iter()
-                    .map(|c| format!("{} {:.0}%", c.author, c.percentage))
-                    .collect();
-                body_lines.push(format!("  Owners: {}", owners.join(", ")));
-            }
-            if !history.co_changes.is_empty() {
-                body_lines.push("  Co-changes:".to_string());
-                for entry in &history.co_changes {
-                    body_lines.push(format!(
-                        "    {}  ({:.2} coupling, {} shared commits)",
-                        entry.path, entry.coupling_score, entry.shared_commits,
-                    ));
-                }
-            }
-        }
-    }
-
-    // Apply budget enforcement.
-    // Hook path: default 200 tokens (800 bytes) for compact hook output.
-    // Tool path: no cap unless explicitly requested — section filtering
-    // must be visible, not masked by a tiny default budget.
-    let max_bytes = match params.max_tokens {
-        Some(n) => n * 4,
-        None if options.include_savings_footer => 200 * 4, // hook path: compact
-        None => 0,                                         // tool path: unlimited (0 = no cap)
-    };
-    let (body_text, remaining) = build_with_budget(&body_lines, max_bytes);
-    let completeness = if remaining > 0 || budget_omissions {
-        "budget-limited"
-    } else {
-        "full"
-    };
-    let scope = match &params.sections {
-        Some(sections) if !sections.is_empty() => {
-            format!("path `{}`; sections {}", params.path, sections.join(", "))
-        }
-        _ => format!("path `{}`; all sections", params.path),
-    };
-    let envelope = format_context_envelope(
-        "exact",
-        source_authority,
-        parse_state,
-        completeness,
-        scope,
-        format!("file anchor `{}`", params.path),
-    );
-    let mut text = format!("{envelope}\n\n{body_text}");
-
-    let output_bytes = text.len() as u64;
-    if options.include_savings_footer {
-        text.push_str(&crate::protocol::format::compact_savings_footer(
-            output_bytes as usize,
-            file_bytes as usize,
-        ));
-    }
-
+    let (text, file_bytes, output_bytes) =
+        crate::index_lifecycle::guidance::read_context::outline_text_for_generation(
+            published,
+            &selection,
+            options.include_savings_footer,
+            source_authority,
+        )
+        .ok_or(StatusCode::NOT_FOUND)?;
     if options.record_stats {
         state.token_stats.record_read(file_bytes, output_bytes);
     }
-
     Ok(text)
 }
-
 /// `GET /impact?path=<relative>[&new_file=true]` — symbol diff after edit, or index confirmation.
 ///
 /// **new_file=true (HOOK-06):** Reads file from disk, parses it, indexes it.
@@ -1861,231 +1470,23 @@ fn symbol_context_text_for_generation(
     options: RenderOptions,
     source_authority: ContextSourceAuthority,
 ) -> Result<String, StatusCode> {
-    let guard = published.live.as_ref();
-
-    let references = if let Some(path) = params.path.as_deref() {
-        match guard.find_exact_references_for_symbol(
-            path,
-            &params.name,
-            params.symbol_kind.as_deref(),
-            params.symbol_line,
-            None,
-        ) {
-            Ok(refs) => refs,
-            Err(error) => return Ok(error),
-        }
-    } else {
-        guard.find_references_for_name(&params.name, None, false)
+    use crate::index_lifecycle::guidance::symbol_context::{
+        SymbolContextSelector, symbol_context_references,
     };
-
-    // Group by file, applying optional file filter, capping at 10 total matches.
-    let mut map: std::collections::HashMap<String, Vec<(u32, String, Option<String>)>> =
-        std::collections::HashMap::new();
-
-    let mut total = 0usize;
-    let mut grand_total = 0usize;
-
-    for (file_path, reference) in &references {
-        grand_total += 1;
-        if let Some(ref filter_file) = params.file
-            && *file_path != filter_file.as_str()
-        {
-            continue;
-        }
-        if total >= 10 {
-            continue; // count beyond 10 but don't include
-        }
-
-        // Capture the enclosing symbol as a kind-aware display label
-        // (e.g. "impl BucketManager", "struct BucketManager", "fn delta")
-        // instead of bare name, so the reference list does not mislabel every
-        // enclosing symbol as a function.
-        let enclosing = reference.enclosing_symbol_index.and_then(|idx| {
-            guard
-                .get_file(file_path)
-                .and_then(|f| f.symbols.get(idx as usize))
-                .map(|s| {
-                    crate::protocol::format::symbol_kind_name_label(&s.kind.to_string(), &s.name)
-                })
-        });
-
-        map.entry(file_path.to_string()).or_default().push((
-            reference.line_range.0,
-            format!("{}", reference.kind),
-            enclosing,
-        ));
-        total += 1;
-    }
-
-    // Compute total bytes for savings (sum of content of all matched files).
-    let total_bytes: u64 = map
-        .keys()
-        .filter_map(|fp| guard.get_file(fp))
-        .map(|f| f.byte_len)
-        .sum();
-
-    let parse_state = if let Some(path) = params.path.as_deref() {
-        guard
-            .get_file(path)
-            .map(parse_state_label)
-            .unwrap_or_else(|| {
-                aggregate_parse_state_label(std::iter::empty(), published.health.as_ref())
-            })
-    } else if let Some(file) = params.file.as_deref() {
-        guard
-            .get_file(file)
-            .map(parse_state_label)
-            .unwrap_or_else(|| {
-                aggregate_parse_state_label(std::iter::empty(), published.health.as_ref())
-            })
-    } else {
-        aggregate_parse_state_label(
-            map.keys()
-                .filter_map(|file_path| guard.get_file(file_path))
-                .map(|file| &file.parse_status),
-            published.health.as_ref(),
-        )
+    let selector = SymbolContextSelector {
+        name: &params.name,
+        file: params.file.as_deref(),
+        path: params.path.as_deref(),
+        symbol_kind: params.symbol_kind.as_deref(),
+        symbol_line: params.symbol_line,
     };
-
-    // Sort files for deterministic output.
-    let mut files: Vec<String> = map.keys().cloned().collect();
-    files.sort();
-
-    let mut evidence_anchors: Vec<String> = Vec::new();
-    // Files that contributed at least one anchor. The 3-anchor cap can exhaust
-    // on the first file(s); the evidence line must then say how many reference
-    // files it left unnamed instead of silently undercounting usage sites.
-    let mut anchored_files = 0usize;
-    for file in &files {
-        // safe: `files` is built from `map.keys()` immediately above; lookup cannot miss.
-        let refs = map.get(file).unwrap();
-        let mut sorted_refs = refs.clone();
-        sorted_refs.sort_by_key(|(line, _, _)| *line);
-        let before = evidence_anchors.len();
-        for (line, _, _) in &sorted_refs {
-            if evidence_anchors.len() >= 3 {
-                break;
-            }
-            evidence_anchors.push(format!("{file}:{line}"));
-        }
-        if evidence_anchors.len() > before {
-            anchored_files += 1;
-        }
-        if evidence_anchors.len() >= 3 {
-            break;
-        }
-    }
-
-    let mut body_lines: Vec<String> = Vec::new();
-
-    for file in &files {
-        body_lines.push(format!("── {} ──", file));
-        // safe: `files` is built from `map.keys()` above; lookup cannot miss.
-        let refs = map.get(file).unwrap();
-        let mut sorted_refs = refs.clone();
-        sorted_refs.sort_by_key(|(line, _, _)| *line);
-        for (line, _kind, enclosing) in &sorted_refs {
-            if let Some(sym_label) = enclosing {
-                body_lines.push(format!("  line {}  in {}", line, sym_label));
-            } else {
-                body_lines.push(format!("  line {}  (module level)", line));
-            }
-        }
-    }
-
-    if body_lines.is_empty() {
-        // Dogfood #8 (2026-07-06): hooks feed this into prompt context on
-        // every Grep, so a zero-hit report must cost one line.
-        body_lines.push(
-            "No references found in the index (not a symbol, or only dynamic/external usage)."
-                .to_string(),
-        );
-    }
-
-    if total < grand_total {
-        if params.file.is_some() {
-            body_lines.push(format!(
-                "... (showing {} of {} matches — use `path` to narrow further)",
-                total, grand_total
-            ));
-        } else {
-            body_lines.push(format!(
-                "... (showing {} of {} matches — use `path` or `file` to narrow)",
-                total, grand_total
-            ));
-        }
-    }
-
-    // Apply the references-section budget. Tool calls get ~1000 tokens
-    // (4000 bytes); the prompt-context hook stays at ~100 tokens (400 bytes).
-    let (body_text, remaining) =
-        build_with_budget(&body_lines, options.symbol_context_references_budget_bytes);
-    let completeness = if total < grand_total {
-        "truncated"
-    } else if remaining > 0 {
-        "budget-limited"
-    } else {
-        "full"
-    };
-    let match_type = if params.path.is_some() && params.symbol_line.is_some() {
-        "exact"
-    } else if params.path.is_some() || params.file.is_some() {
-        "constrained"
-    } else {
-        "heuristic"
-    };
-    let evidence = if let Some(path) = params.path.as_deref() {
-        match params.symbol_line {
-            Some(line) => format!(
-                "exact selector `{path}:{line}` for symbol `{}`",
-                params.name
-            ),
-            None => format!("path-constrained symbol `{}` in `{path}`", params.name),
-        }
-    } else if let Some(file) = params.file.as_deref() {
-        format!("file filter `{file}` for symbol `{}`", params.name)
-    } else if evidence_anchors.is_empty() {
-        format!(
-            "symbol token `{}` with no indexed reference anchors",
-            params.name
-        )
-    } else {
-        let more_files = files.len().saturating_sub(anchored_files);
-        if more_files > 0 {
-            format!(
-                "symbol token `{}` anchored at {} (+{} more files)",
-                params.name,
-                evidence_anchors.join(", "),
-                more_files
-            )
-        } else {
-            format!(
-                "symbol token `{}` anchored at {}",
-                params.name,
-                evidence_anchors.join(", ")
-            )
-        }
-    };
-    let scope = if let Some(path) = params.path.as_deref() {
-        match params.symbol_line {
-            Some(line) => format!("path `{path}`; exact selector line {line}"),
-            None => format!("path `{path}`; symbol-scoped references"),
-        }
-    } else if let Some(file) = params.file.as_deref() {
-        format!("file filter `{file}`; symbol token `{}`", params.name)
-    } else {
-        format!("repo-wide symbol token `{}`", params.name)
-    };
-    let envelope = format_context_envelope(
-        match_type,
+    let (mut text, total_bytes, _) = symbol_context_references(
+        published,
+        &selector,
+        options.symbol_context_references_budget_bytes,
+        10,
         source_authority,
-        parse_state,
-        completeness,
-        scope,
-        evidence,
     );
-    let mut text = format!("{envelope}\n\n{body_text}");
-
     let output_bytes = text.len() as u64;
     if options.include_savings_footer {
         let baseline_chars =
@@ -2136,15 +1537,6 @@ pub async fn workflow_repo_start_handler(
 /// legit file literally named `src/a:b.rs` on POSIX would also be filtered,
 /// but we accept that edge case in exchange for blocking the octogent-style
 /// cross-workspace leak that motivated Unit 1.
-fn is_intra_workspace_path(path: &str) -> bool {
-    if path.contains(':') || path.starts_with('/') || path.starts_with('\\') {
-        return false;
-    }
-    !path
-        .replace('\\', "/")
-        .split('/')
-        .any(|segment| segment == "..")
-}
 fn repo_map_text(state: &SidecarState, fence: &SidecarQueryFence) -> Result<String, StatusCode> {
     let generation = capture_queryable_sidecar_generation(state, fence)?;
     repo_map_text_for_generation(&generation)
@@ -2156,199 +1548,8 @@ fn repo_map_text(state: &SidecarState, fence: &SidecarQueryFence) -> Result<Stri
 pub(crate) fn repo_map_text_for_generation(
     generation: &crate::live_index::PublishedGeneration,
 ) -> Result<String, StatusCode> {
-    let guard = generation.live.as_ref();
-
-    let total_files = guard.file_count();
-    let total_symbols = guard.symbol_count();
-
-    // Collect language breakdown.
-    let mut lang_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    // Collect per-directory stats (2-level max).
-    let mut dir_file_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut dir_symbol_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-
-    for (path, file) in guard.all_files() {
-        // Skip files with absolute paths (outside project root, e.g., Windows memory files).
-        if !is_intra_workspace_path(path) {
-            continue;
-        }
-
-        // Language breakdown.
-        let lang = format!("{:?}", file.language);
-        *lang_counts.entry(lang).or_insert(0) += 1;
-
-        // Directory (up to 2 levels).
-        let dir = get_dir_2level(path);
-        *dir_file_counts.entry(dir.clone()).or_insert(0) += 1;
-        *dir_symbol_counts.entry(dir).or_insert(0) += file.symbols.len();
-    }
-
-    // Build header.
-    let mut lang_parts: Vec<String> = lang_counts
-        .iter()
-        .map(|(k, v)| format!("{}: {}", k, v))
-        .collect();
-    lang_parts.sort();
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!(
-        "Index: {} files, {} symbols  [{}]",
-        total_files,
-        total_symbols,
-        lang_parts.join(", ")
-    ));
-    lines.push(String::new());
-
-    // Sort directories and emit tree.
-    let mut dirs: Vec<String> = dir_file_counts.keys().cloned().collect();
-    dirs.sort();
-
-    for dir in &dirs {
-        let file_count = dir_file_counts[dir];
-        let sym_count = dir_symbol_counts[dir];
-        lines.push(format!(
-            "  {:<35}  {:>3} files   {:>5} symbols",
-            dir, file_count, sym_count
-        ));
-    }
-
-    // Key entry points: top-level structs/traits/interfaces/enums in src/ (depth 0, limit 10).
-    {
-        let mut entry_points: Vec<(String, String, String)> = Vec::new(); // (kind, name, path)
-        for (path, file) in guard.all_files() {
-            // Exclude paths from other indexed workspaces — same guard as the
-            // directory-stats loop above; without it the key-types section
-            // leaks symbols from unrelated projects.
-            if !is_intra_workspace_path(path) {
-                continue;
-            }
-            // Only source code, skip docs/tests/vendor
-            let pl = path.to_ascii_lowercase();
-            if pl.ends_with(".md")
-                || pl.contains("/docs/")
-                || pl.contains("vendor/")
-                || pl.contains("node_modules/")
-            {
-                continue;
-            }
-            for sym in &file.symbols {
-                if sym.depth == 0 {
-                    match sym.kind {
-                        crate::domain::SymbolKind::Struct
-                        | crate::domain::SymbolKind::Trait
-                        | crate::domain::SymbolKind::Interface
-                        | crate::domain::SymbolKind::Enum
-                        | crate::domain::SymbolKind::Class => {
-                            entry_points.push((
-                                sym.kind.to_string(),
-                                sym.name.clone(),
-                                path.to_string(),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if !entry_points.is_empty() {
-            // Importance ranking (feature 007, US3): rank entry-point lines by
-            // their containing file's importance rather than alphabetically.
-            //
-            // rank_key(file) = (dependent_count DESC, churn_score DESC,
-            //                   relative_path ASC, symbol_name ASC)
-            //
-            // The `relative_path ASC` key is the contract's deterministic
-            // tie-break; `symbol_name ASC` is the additional innermost key that
-            // keeps order stable when one file contributes several top-level
-            // types (multiple entry-point lines share a path). Identical index
-            // state therefore always yields identical order (FR-017).
-
-            // Distinct importing-file count, memoized per distinct entry-point
-            // path. The candidate set is bounded (only files with top-level
-            // types), so this is O(candidates × refs), never O(all_files²).
-            // Keyed by owned path so the memo does not borrow `entry_points`
-            // (which must stay mutably sortable/truncatable below).
-            let mut dep_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for (_, _, path) in &entry_points {
-                if !dep_counts.contains_key(path) {
-                    let distinct: std::collections::HashSet<&str> = guard
-                        .find_dependents_for_file(path)
-                        .into_iter()
-                        .map(|(file_path, _)| file_path)
-                        .collect();
-                    dep_counts.insert(path.clone(), distinct.len());
-                }
-            }
-
-            // Churn from the lock-free temporal snapshot; 0.0 when temporal is
-            // not Ready or the file is absent (read-only — no frecency bump).
-            let temporal = generation.code_signals.temporal.as_ref();
-            let churn_of = |path: &str| -> f32 {
-                if generation.code_signals.state
-                    == crate::live_index::git_temporal::GitTemporalState::Ready
-                {
-                    temporal
-                        .files
-                        .get(path)
-                        .map(|history| history.churn_score)
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                }
-            };
-
-            entry_points.sort_by(|a, b| {
-                let (a_kind, a_name, a_path) = a;
-                let (b_kind, b_name, b_path) = b;
-                let a_dep = dep_counts.get(a_path.as_str()).copied().unwrap_or(0);
-                let b_dep = dep_counts.get(b_path.as_str()).copied().unwrap_or(0);
-                // dependent_count DESC
-                b_dep
-                    .cmp(&a_dep)
-                    // churn_score DESC (f32 in [0,1], never NaN; Equal fallback
-                    // is harmless because the path/name keys below are total).
-                    .then_with(|| {
-                        churn_of(b_path)
-                            .partial_cmp(&churn_of(a_path))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    // relative_path ASC (deterministic tie-break)
-                    .then_with(|| a_path.cmp(b_path))
-                    // symbol_name ASC (stable order for multi-type files)
-                    .then_with(|| a_name.cmp(b_name))
-                    // kind ASC (final guard; identical (path,name) is unusual
-                    // but keeps the order total either way).
-                    .then_with(|| a_kind.cmp(b_kind))
-            });
-            entry_points.truncate(15);
-            lines.push(String::new());
-            lines.push("Key types:".to_string());
-            for (kind, name, path) in &entry_points {
-                // Annotate high-fan-in files: `(→N)` iff distinct dependents N>=2.
-                let dep_count = dep_counts.get(path.as_str()).copied().unwrap_or(0);
-                if dep_count >= 2 {
-                    lines.push(format!("  {kind} {name}  ({path}) (→{dep_count})"));
-                } else {
-                    lines.push(format!("  {kind} {name}  ({path})"));
-                }
-            }
-            if entry_points.len() == 15 {
-                lines.push("  ...".to_string());
-            }
-        }
-    }
-
-    // Apply budget (1000 tokens = 4000 bytes).
-    // Medium repos (up to ~70 directories) fit without truncation.
-    let (text, _) = build_with_budget(&lines, 4000);
-
-    Ok(text)
+    Ok(crate::index_lifecycle::guidance::read_context::repo_map_text_for_generation(generation))
 }
-
 /// `GET /prompt-context?text=<prompt>` — derive compact context from a user prompt.
 ///
 /// Heuristics:
@@ -2536,24 +1737,6 @@ pub async fn stats_handler(
 // ---------------------------------------------------------------------------
 // Helper: extract up to 2-level directory from a relative path
 // ---------------------------------------------------------------------------
-
-fn get_dir_2level(path: &str) -> String {
-    let p = std::path::Path::new(path);
-    let components: Vec<_> = p.components().collect();
-
-    if components.len() <= 1 {
-        // Root-level file.
-        return "(root)".to_string();
-    }
-
-    // Take at most 2 directory components (exclude the file name).
-    let dir_components: Vec<_> = components[..components.len() - 1].iter().take(2).collect();
-    dir_components
-        .iter()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join("/")
-}
 
 fn find_prompt_file_hint(
     generation: &crate::live_index::PublishedGeneration,

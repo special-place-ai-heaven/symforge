@@ -409,7 +409,7 @@ where
         .filter(|(_, s)| {
             name_pred(s)
                 && symbol_kind
-                    .map(|k| s.kind.to_string().eq_ignore_ascii_case(k))
+                    .map(|k| super::search::kind_filter_matches(k, &s.kind))
                     .unwrap_or(true)
         })
         .collect();

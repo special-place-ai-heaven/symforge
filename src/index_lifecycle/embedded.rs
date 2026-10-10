@@ -425,12 +425,64 @@ struct EmbeddedBinding {
     root: PathBuf,
     state_placement: StatePlacement,
     runtime: super::activation::ProjectRuntimeHandle,
+    #[cfg(feature = "embed")]
+    authority: Arc<super::activation::ProjectSourceAuthority>,
+    #[cfg(feature = "embed")]
+    state_anchor: Option<AdmittedStateAnchor>,
+    #[cfg(feature = "embed")]
+    restored_mtimes: std::sync::Mutex<Option<HashMap<String, u64>>>,
+    #[cfg(feature = "embed")]
+    git_view: std::sync::Mutex<Option<Arc<super::embed_git::PreparedGitView>>>,
     state: std::sync::Mutex<EmbeddedRuntimeState>,
     control: std::sync::Mutex<WorkerControl>,
     wake: Condvar,
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
     progress: Arc<crate::live_index::store::ReloadProgressSink>,
+}
+
+/// Original selected state child. Parked between operations so an idle source
+/// does not hold Windows directory handles, while every reopen checks identity.
+#[cfg(feature = "embed")]
+#[derive(Clone)]
+pub(super) struct AdmittedStateAnchor {
+    lease: Arc<super::physical_root::PhysicalRootLease>,
+    stable_key: [u8; 16],
+}
+
+#[cfg(feature = "embed")]
+impl AdmittedStateAnchor {
+    fn capture(
+        placement: &StatePlacement,
+        authority: &super::activation::ProjectSourceAuthority,
+    ) -> Result<Option<Self>, EmbeddedOpenError> {
+        let opened = match placement {
+            StatePlacement::MemoryOnly { .. } => return Ok(None),
+            StatePlacement::ProjectLocal { .. } => authority
+                .with_source_anchor_read(|root| {
+                    root.child_directory(std::path::Path::new(".symforge"), false)
+                })
+                .map_err(|_| EmbeddedOpenError::AdmissionUnavailable)?,
+            StatePlacement::UserLocal { directory, .. } => {
+                super::physical_root::PhysicalRootLease::take(directory.as_path())
+            }
+        };
+        let stable_key = opened
+            .opened_stable_key()
+            .ok_or(EmbeddedOpenError::AdmissionUnavailable)?;
+        Ok(Some(Self {
+            lease: Arc::new(opened.parked()),
+            stable_key,
+        }))
+    }
+
+    pub(super) fn lease(&self) -> &super::physical_root::PhysicalRootLease {
+        &self.lease
+    }
+
+    pub(super) fn stable_key(&self) -> [u8; 16] {
+        self.stable_key
+    }
 }
 
 impl std::fmt::Debug for EmbeddedBinding {
@@ -445,12 +497,16 @@ impl std::fmt::Debug for EmbeddedBinding {
 }
 
 impl EmbeddedBinding {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         identity: EmbeddedIdentity,
         key: ProjectKey,
         root: PathBuf,
         state_placement: StatePlacement,
         runtime: super::activation::ProjectRuntimeHandle,
+        #[cfg(feature = "embed")] authority: Arc<super::activation::ProjectSourceAuthority>,
+        #[cfg(feature = "embed")] state_anchor: Option<AdmittedStateAnchor>,
+        #[cfg(feature = "embed")] restored_mtimes: Option<HashMap<String, u64>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
@@ -458,6 +514,14 @@ impl EmbeddedBinding {
             root,
             state_placement,
             runtime,
+            #[cfg(feature = "embed")]
+            authority,
+            #[cfg(feature = "embed")]
+            state_anchor,
+            #[cfg(feature = "embed")]
+            restored_mtimes: std::sync::Mutex::new(restored_mtimes),
+            #[cfg(feature = "embed")]
+            git_view: std::sync::Mutex::new(None),
             state: std::sync::Mutex::new(EmbeddedRuntimeState {
                 phase: super::public_api::SourceRuntimePhase::Loading,
                 current_publication_identity: None,
@@ -487,6 +551,26 @@ impl EmbeddedBinding {
             state.observer_epoch = 1;
         }
 
+        #[cfg(feature = "embed")]
+        let restored = self
+            .restored_mtimes
+            .lock()
+            .expect("embedded restored seed mutex")
+            .take();
+        #[cfg(feature = "embed")]
+        let mut observed_fingerprint = if let Some(mtimes) = restored {
+            crate::live_index::persist::background_verify_bound(
+                self.runtime.data_plane(),
+                &self.root,
+                &mtimes,
+                &self.authority,
+                || self.shutdown_started.load(Ordering::Acquire),
+            );
+            self.publish_observed_current()
+        } else {
+            self.reload_and_publish()
+        };
+        #[cfg(not(feature = "embed"))]
         let mut observed_fingerprint = self.reload_and_publish();
         loop {
             let mut control = self.control.lock().expect("embedded control mutex");
@@ -528,6 +612,11 @@ impl EmbeddedBinding {
             }
         }
         self.set_phase(super::public_api::SourceRuntimePhase::Stopped);
+        #[cfg(feature = "embed")]
+        self.git_view
+            .lock()
+            .expect("embedded Git view mutex")
+            .take();
     }
 
     fn wait_refresh_visibility_or_stop(&self) -> bool {
@@ -542,6 +631,11 @@ impl EmbeddedBinding {
     }
 
     fn reload_and_publish(&self) -> Option<String> {
+        #[cfg(feature = "embed")]
+        if self.authority.verify_physical_root_anchor().is_err() {
+            self.set_blocked();
+            return None;
+        }
         self.progress.reset();
         let _progress = crate::live_index::store::register_reload_progress(
             &self.root,
@@ -570,6 +664,15 @@ impl EmbeddedBinding {
             return None;
         }
 
+        self.publish_observed_current()
+    }
+
+    fn publish_observed_current(&self) -> Option<String> {
+        #[cfg(feature = "embed")]
+        if self.authority.verify_physical_root_anchor().is_err() {
+            self.set_blocked();
+            return None;
+        }
         if self.shutdown_started.load(Ordering::Acquire) {
             return None;
         }
@@ -604,6 +707,8 @@ impl EmbeddedBinding {
         if self.shutdown_started.load(Ordering::Acquire) {
             return None;
         }
+        #[cfg(feature = "embed")]
+        self.authority.verify_physical_root_anchor().ok()?;
         let exclusions = crate::discovery::SourceExclusions::for_state_placement(
             &self.root,
             &self.state_placement,
@@ -617,6 +722,8 @@ impl EmbeddedBinding {
         if self.shutdown_started.load(Ordering::Acquire) {
             return None;
         }
+        #[cfg(feature = "embed")]
+        self.authority.verify_physical_root_anchor().ok()?;
         Some(crate::hash::digest_hex(format!("{plan:?}").as_bytes()))
     }
 
@@ -887,6 +994,35 @@ impl EmbeddedSourceFactory {
             &state_placement,
         )
         .map_err(|_| EmbeddedOpenError::AdmissionUnavailable)?;
+        #[cfg(feature = "embed")]
+        let authority = {
+            let candidate = super::activation::project_source_authority(&binding.canonical_root);
+            let admitted_root = admission
+                .slot()
+                .binding()
+                .map_err(|_| EmbeddedOpenError::AdmissionUnavailable)?
+                .physical_root();
+            if candidate.admission_binding().physical_root() != admitted_root {
+                return Err(EmbeddedOpenError::AdmissionUnavailable);
+            }
+            candidate
+        };
+        #[cfg(feature = "embed")]
+        let state_anchor = AdmittedStateAnchor::capture(&state_placement, &authority)?;
+        #[cfg(feature = "embed")]
+        let restored = super::embed_restore::load_admitted_snapshot(
+            &binding.canonical_root,
+            &state_placement,
+            state_anchor.as_ref(),
+            &authority,
+        )
+        .map_err(|_| EmbeddedOpenError::AdmissionUnavailable)?;
+        #[cfg(feature = "embed")]
+        let (index, restored_mtimes) = match restored {
+            Some(seed) => (seed.index, Some(seed.mtimes)),
+            None => (crate::live_index::store::LiveIndex::empty(), None),
+        };
+        #[cfg(not(feature = "embed"))]
         let index = crate::live_index::store::LiveIndex::empty();
         let runtime =
             super::activation::ProjectRuntimeHandle::bind_admitted(index, admission.into_slot());
@@ -896,6 +1032,12 @@ impl EmbeddedSourceFactory {
             binding.canonical_root,
             state_placement,
             runtime,
+            #[cfg(feature = "embed")]
+            authority,
+            #[cfg(feature = "embed")]
+            state_anchor,
+            #[cfg(feature = "embed")]
+            restored_mtimes,
         );
         rollback.bind(Arc::clone(&source));
         if source.start().is_err() {
@@ -1020,6 +1162,70 @@ impl EmbeddedSourceFactory {
     }
 }
 
+#[cfg(feature = "embed")]
+impl super::public_api::ProcessRuntimeApi {
+    /// Open a source with state placement selected by the trusted host. These
+    /// options are Rust capabilities, never fields decoded from a room query.
+    pub fn open_embedded_source_with_options(
+        &self,
+        spec: super::public_api::EmbeddedSourceSpec,
+        options: crate::embed::parity::source_options::EmbeddedOpenOptions,
+    ) -> Result<EmbeddedSourceHandle, super::public_api::EmbedSourceRefusal> {
+        use super::public_api::{
+            OperationKind, RetryAdvice, SourceRefusalKind, bound_source_refusal,
+        };
+        use crate::embed::parity::source_options::{StateSelectionError, select_state_placement};
+        let normalized = format!("current_worktree={:?};state={:?}", spec.root, options.state);
+        let refuse = |kind, retry| {
+            bound_source_refusal(
+                kind,
+                OperationKind::OpenEmbeddedSource,
+                retry,
+                normalized.as_bytes(),
+            )
+        };
+        let binding = match crate::discovery::resolve_root_candidate(
+            &spec.root,
+            crate::domain::RootCandidateSource::McpClientRoot,
+            crate::domain::RootRequestMode::Automatic,
+        ) {
+            crate::domain::RootResolution::Bound(binding) => binding,
+            crate::domain::RootResolution::Unbound { .. } => {
+                return Err(refuse(
+                    SourceRefusalKind::InvalidSelection,
+                    RetryAdvice::Operator,
+                ));
+            }
+        };
+        let placement =
+            select_state_placement(&binding, &options).map_err(|error| match error {
+                StateSelectionError::InvalidSelection => {
+                    refuse(SourceRefusalKind::InvalidSelection, RetryAdvice::Operator)
+                }
+                StateSelectionError::Unavailable => refuse(
+                    SourceRefusalKind::AdmissionUnavailable,
+                    RetryAdvice::Operator,
+                ),
+            })?;
+        self.owner
+            .factory()
+            .open_bound(binding, placement, self.owner.identity())
+            .map_err(|error| match error {
+                EmbeddedOpenError::SourceAlreadyOpen => refuse(
+                    SourceRefusalKind::SelectionUnavailable,
+                    RetryAdvice::OnEvent,
+                ),
+                EmbeddedOpenError::AdmissionUnavailable => refuse(
+                    SourceRefusalKind::AdmissionUnavailable,
+                    RetryAdvice::Automatic,
+                ),
+                EmbeddedOpenError::WorkerUnavailable => {
+                    refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::Automatic)
+                }
+            })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EmbeddedRuntimeOwner {
     identity: EmbeddedIdentity,
@@ -1069,6 +1275,324 @@ pub struct EmbeddedSourceHandle {
 }
 
 impl EmbeddedSourceHandle {
+    /// Prepare a bounded disposable Git view using a trusted host workspace.
+    /// This lifecycle operation grants no room permission to prepare other state.
+    #[cfg(feature = "embed")]
+    pub fn prepare_git_view(
+        &self,
+        options: &crate::embed::parity::source_options::GitPreparationOptions,
+        control: &crate::embed::parity::host::OperationControl,
+    ) -> Result<
+        crate::embed::parity::source_options::GitPreparationClaim,
+        crate::embed::parity::source_options::GitPreparationRefusal,
+    > {
+        use crate::embed::parity::source_options::{
+            GitPreparationRefusal, GitPreparationRefusalKind,
+        };
+        let unavailable = || GitPreparationRefusal {
+            kind: GitPreparationRefusalKind::SourceUnavailable,
+        };
+        let snapshot = self
+            .capture_query_snapshot(b"symforge.embed.git-preparation.v1")
+            .map_err(|_| unavailable())?;
+        let binding = self.binding.as_ref().ok_or_else(unavailable)?;
+        let mut current = binding.git_view.lock().expect("embedded Git view mutex");
+        let (prepared, claim) =
+            super::embed_git::prepare(&snapshot, options, control, current.as_ref())?;
+        let final_snapshot = self
+            .capture_query_snapshot(b"symforge.embed.git-preparation.v1")
+            .map_err(|_| unavailable())?;
+        if final_snapshot.serving_publication_identity != snapshot.serving_publication_identity
+            || binding.shutdown_started.load(Ordering::Acquire)
+        {
+            return Err(unavailable());
+        }
+        control.check().map_err(|stop| GitPreparationRefusal {
+            kind: match stop {
+                crate::embed::parity::host::OperationStop::Cancelled => {
+                    GitPreparationRefusalKind::Cancelled
+                }
+                crate::embed::parity::host::OperationStop::DeadlineExceeded => {
+                    GitPreparationRefusalKind::DeadlineExceeded
+                }
+            },
+        })?;
+        *current = Some(prepared);
+        Ok(claim)
+    }
+
+    /// Execute a bounded query against one admitted, immutable publication.
+    #[cfg(feature = "embed")]
+    pub fn query(
+        &self,
+        request: &crate::embed::parity::QueryRequest,
+        limits: crate::embed::parity::QueryLimits,
+    ) -> Result<super::embed_query::QueryClaim, super::embed_query::QueryRefusal> {
+        super::embed_query::execute(self, request, limits)
+    }
+
+    /// Execute with the host's deadline and shared cancellation signal.
+    /// Stops are checked around engine calls and while projecting rows; a single
+    /// parser/search call runs to its next safe checkpoint. The convenience
+    /// `query` method imposes output bounds without choosing a host deadline.
+    #[cfg(feature = "embed")]
+    pub fn query_with_control(
+        &self,
+        request: &crate::embed::parity::QueryRequest,
+        limits: crate::embed::parity::QueryLimits,
+        control: &crate::embed::parity::host::OperationControl,
+    ) -> Result<super::embed_query::QueryClaim, super::embed_query::QueryRefusal> {
+        super::embed_query::execute_with_control(self, request, limits, control)
+    }
+
+    /// Create an independent context history and retrieval cache bound to this
+    /// admitted source incarnation.
+    #[cfg(feature = "embed")]
+    pub fn new_query_session(
+        &self,
+    ) -> Result<crate::embed::parity::session::QuerySession, super::public_api::EmbedSourceRefusal>
+    {
+        let snapshot = self.capture_query_snapshot(b"symforge.embed.session.v1")?;
+        Ok(super::embed_session::QuerySession::new(&snapshot))
+    }
+
+    /// Create a session with trusted bounds no larger than the engine defaults.
+    #[cfg(feature = "embed")]
+    pub fn new_query_session_with_limits(
+        &self,
+        limits: crate::embed::parity::session::SessionCacheLimits,
+    ) -> Result<
+        crate::embed::parity::session::QuerySession,
+        crate::embed::parity::session::SessionCreationRefusal,
+    > {
+        use crate::embed::parity::session::{SessionCacheLimits, SessionCreationRefusal};
+        let defaults = SessionCacheLimits::default();
+        if limits.max_bytes > defaults.max_bytes || limits.max_entries > defaults.max_entries {
+            return Err(SessionCreationRefusal::InvalidLimits);
+        }
+        let snapshot = self
+            .capture_query_snapshot(b"symforge.embed.session.v1")
+            .map_err(|_| SessionCreationRefusal::SourceUnavailable)?;
+        Ok(super::embed_session::QuerySession::with_limits(
+            &snapshot, limits,
+        ))
+    }
+
+    /// Execute with explicit source-bound context history and optional host
+    /// cancellation. A session from another source is refused.
+    #[cfg(feature = "embed")]
+    pub fn query_with_session(
+        &self,
+        request: &crate::embed::parity::QueryRequest,
+        limits: crate::embed::parity::QueryLimits,
+        session: &crate::embed::parity::session::QuerySession,
+        control: Option<&crate::embed::parity::host::OperationControl>,
+    ) -> Result<super::embed_query::QueryClaim, super::embed_query::QueryRefusal> {
+        super::embed_query::execute_with_session(self, request, limits, session, control)
+    }
+
+    /// Execute with explicit host rights for optional derived-state preparation.
+    /// Read-only queries use the default policy; a grant does not create state
+    /// placement authority or change the source bound to this handle.
+    #[cfg(feature = "embed")]
+    pub fn query_with_policy(
+        &self,
+        request: &crate::embed::parity::QueryRequest,
+        limits: crate::embed::parity::QueryLimits,
+        policy: crate::embed::parity::QueryPolicy,
+        session: Option<&crate::embed::parity::session::QuerySession>,
+        control: Option<&crate::embed::parity::host::OperationControl>,
+    ) -> Result<super::embed_query::QueryClaim, super::embed_query::QueryRefusal> {
+        super::embed_query::execute_with_policy(self, request, limits, policy, session, control)
+    }
+
+    /// Run a trusted synchronous envelope check before committing read bookkeeping.
+    /// The callback must not reenter this session and must not deliver the result
+    /// before this method succeeds; cancellation is checked again after admission.
+    #[cfg(feature = "embed")]
+    pub(crate) fn query_with_policy_admitted(
+        &self,
+        request: &crate::embed::parity::QueryRequest,
+        limits: crate::embed::parity::QueryLimits,
+        policy: crate::embed::parity::QueryPolicy,
+        session: Option<&crate::embed::parity::session::QuerySession>,
+        control: Option<&crate::embed::parity::host::OperationControl>,
+        admit: impl FnOnce(&super::embed_query::QueryClaim) -> bool,
+    ) -> Result<super::embed_query::QueryClaim, super::embed_query::QueryRefusal> {
+        super::embed_query::execute_with_policy_admitted(
+            self, request, limits, policy, session, control, admit,
+        )
+    }
+
+    /// Original admitted placement for verifying completed replay records while
+    /// a refresh is in progress. This carries no query or mutation authority.
+    #[cfg(feature = "embed")]
+    pub(super) fn bound_replay_placement(&self) -> Option<(PathBuf, Option<PathBuf>)> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let binding = self.binding.as_ref()?;
+        let state = binding.state.lock().expect("embedded state mutex");
+        if binding.shutdown_started.load(Ordering::Acquire)
+            || !matches!(
+                state.phase,
+                super::public_api::SourceRuntimePhase::Loading
+                    | super::public_api::SourceRuntimePhase::Current
+                    | super::public_api::SourceRuntimePhase::Refreshing
+            )
+            || self.closed.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some((
+            binding.root.clone(),
+            binding
+                .state_placement
+                .directory()
+                .map(|directory| directory.as_path().to_path_buf()),
+        ))
+    }
+
+    /// Original read capability for verifying completed postimages while the
+    /// source refreshes. It never re-resolves authority from a path spelling.
+    #[cfg(feature = "embed")]
+    pub(super) fn bound_replay_authority(
+        &self,
+    ) -> Option<Arc<super::activation::ProjectSourceAuthority>> {
+        self.bound_replay_placement()?;
+        Some(Arc::clone(&self.binding.as_ref()?.authority))
+    }
+
+    #[cfg(feature = "embed")]
+    pub(super) fn bound_state_anchor(&self) -> Option<AdmittedStateAnchor> {
+        self.bound_replay_placement()?;
+        self.binding.as_ref()?.state_anchor.clone()
+    }
+
+    /// Internal read capture shared by parity queries and edit previews. It is
+    /// never a write permit. Capture source state and its matching data plane
+    /// together, refusing a publication swap instead of mislabelling its bytes.
+    #[cfg(feature = "embed")]
+    pub(super) fn capture_query_snapshot(
+        &self,
+        normalized: &[u8],
+    ) -> Result<super::embed_query::EmbeddedQuerySnapshot, super::public_api::EmbedSourceRefusal>
+    {
+        use super::public_api::{
+            OperationKind, RetryAdvice, SourceRefusalKind, SourceRuntimePhase,
+        };
+        let refuse = |kind, retry| {
+            super::public_api::bound_source_refusal(
+                kind,
+                OperationKind::IndexCensus,
+                retry,
+                normalized,
+            )
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::Never,
+            ));
+        }
+        let binding = self
+            .binding
+            .as_ref()
+            .ok_or_else(|| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::Never))?;
+        let state = binding.state.lock().expect("embedded state mutex");
+        if state.phase != SourceRuntimePhase::Current {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::OnEvent,
+            ));
+        }
+        let index = binding
+            .runtime
+            .acquire()
+            .map_err(|_| refuse(SourceRefusalKind::AdmissionUnavailable, RetryAdvice::Never))?;
+        let authority = Arc::clone(&binding.authority);
+        authority
+            .verify_physical_root_anchor()
+            .map_err(|_| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::OnEvent))?;
+        let authority_publication = authority
+            .current_publication()
+            .ok_or_else(|| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::OnEvent))?;
+        let source_set = index.published_source_set();
+        let generation = source_set.current_generation();
+        let publication_identity = format!(
+            "embed-publication-{}-{}",
+            self.identity.raw(),
+            generation.publication_generation
+        );
+        if state.current_publication_identity.as_deref() != Some(&publication_identity)
+            || !matches!(generation.freshness.as_ref(), FreshnessStatus::Current)
+            || authority.current_publication() != Some(authority_publication)
+            || self.closed.load(Ordering::Acquire)
+        {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::OnEvent,
+            ));
+        }
+        let binding_identity = format!("source-{}", self.identity.raw());
+        let serving_publication_identity = super::embed_query::serving_publication_identity(
+            &binding_identity,
+            &publication_identity,
+            state.source_version,
+        );
+        Ok(super::embed_query::EmbeddedQuerySnapshot {
+            root: binding.root.clone(),
+            project_state: binding.state_placement.directory().cloned(),
+            state_dir: binding
+                .state_placement
+                .directory()
+                .map(|directory| directory.as_path().to_path_buf()),
+            source_set,
+            generation,
+            binding_identity,
+            publication_identity,
+            serving_publication_identity,
+            source_version: state.source_version,
+            authority_publication,
+            authority,
+            state_anchor: binding.state_anchor.clone(),
+        })
+    }
+
+    /// Internal curation context. A read capture is insufficient to authorize
+    /// apply: the coordinator must separately require host authority and its
+    /// own durability, review and mutation fences.
+    #[cfg(feature = "embed")]
+    pub(super) fn capture_curation_context(
+        &self,
+        normalized: &[u8],
+    ) -> Result<
+        (
+            super::embed_query::EmbeddedQuerySnapshot,
+            crate::live_index::SharedIndex,
+            StatePlacement,
+        ),
+        super::public_api::EmbedSourceRefusal,
+    > {
+        let snapshot = self.capture_query_snapshot(normalized)?;
+        let refuse = || {
+            super::public_api::bound_source_refusal(
+                super::public_api::SourceRefusalKind::SourceUnavailable,
+                super::public_api::OperationKind::IndexCensus,
+                super::public_api::RetryAdvice::OnEvent,
+                normalized,
+            )
+        };
+        let binding = self.binding.as_ref().ok_or_else(refuse)?;
+        let index = binding.runtime.acquire().map_err(|_| refuse())?;
+        if self.closed.load(Ordering::Acquire)
+            || !Arc::ptr_eq(&index.published_generation(), &snapshot.generation)
+        {
+            return Err(refuse());
+        }
+        Ok((snapshot, Arc::clone(index), binding.state_placement.clone()))
+    }
+
     /// This open's identity.
     pub fn identity(&self) -> EmbeddedIdentity {
         self.identity

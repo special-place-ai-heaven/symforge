@@ -1695,6 +1695,8 @@ fn verify_in_flight(state: &SnapshotVerifyState) -> bool {
 }
 
 /// Whether the file still has the size and mtime it was read at.
+#[cfg(any(not(feature = "embed"), test))]
+#[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
 fn snapshot_verified_stamp_matches(scouted: &crate::domain::ScoutedEntry) -> bool {
     let Some(path) = scouted.absolute_path.as_deref() else {
         return false;
@@ -2858,6 +2860,24 @@ impl SharedIndexHandle {
     #[must_use]
     pub fn project_state_dir(&self) -> Option<Arc<ProjectStateDir>> {
         self.project_state_dir.load_full()
+    }
+
+    /// Freeze a bound project's root and state placement across one external
+    /// staged write. The caller must already hold its sorted per-path locks;
+    /// reload publishes a new binding under this same writer mutex. The closure
+    /// must finish its source permit before it returns and must not call an
+    /// index mutation, which would reacquire this mutex.
+    #[cfg(feature = "server")]
+    pub(crate) fn with_bound_write_binding<R>(
+        &self,
+        operation: impl FnOnce(&Path, Option<&ProjectStateDir>, u64) -> R,
+    ) -> Option<R> {
+        let _guard = self.write_mutex.lock();
+        let live = self.live.load_full();
+        let root = live.indexed_root.as_deref()?;
+        let state_dir = self.project_state_dir.load_full();
+        let generation = self.project_generation.load(Ordering::Acquire);
+        Some(operation(root, state_dir.as_deref(), generation))
     }
 
     #[must_use]
@@ -4660,12 +4680,41 @@ impl SharedIndexHandle {
     ///   canonical single-file seam; completion then waits for the caller.
     ///
     /// `None` means the project was retargeted and nothing was published.
+    #[cfg(any(not(feature = "embed"), test))]
+    #[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
     pub(crate) fn publish_snapshot_verify_at_generation(
         &self,
         expected_gen: u64,
         removals: &[(String, PathBuf)],
         files: Vec<SnapshotVerifiedFile>,
         completion: Option<SnapshotVerifyCompletion>,
+    ) -> Option<SnapshotVerifyBatchReceipt> {
+        self.publish_snapshot_verify_with_observation(
+            expected_gen,
+            removals,
+            files,
+            completion,
+            |_, absolute_path| {
+                matches!(std::fs::symlink_metadata(absolute_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            },
+            |_, scouted| snapshot_verified_stamp_matches(scouted),
+            || true,
+        )
+    }
+
+    /// The same publication transaction with caller-bound filesystem checks.
+    /// Native callers observe each path through their retained source anchor;
+    /// the ordinary wrapper retains its existing metadata checks unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_snapshot_verify_with_observation(
+        &self,
+        expected_gen: u64,
+        removals: &[(String, PathBuf)],
+        files: Vec<SnapshotVerifiedFile>,
+        completion: Option<SnapshotVerifyCompletion>,
+        mut absent: impl FnMut(&str, &Path) -> bool,
+        mut stamp_matches: impl FnMut(&str, &crate::domain::ScoutedEntry) -> bool,
+        final_admission: impl FnOnce() -> bool,
     ) -> Option<SnapshotVerifyBatchReceipt> {
         let _wg = self.write_mutex.lock();
         if self.project_generation.load(Ordering::Acquire) != expected_gen {
@@ -4691,8 +4740,8 @@ impl SharedIndexHandle {
         let mut panicked = false;
 
         for (path, absolute_path) in removals {
-            match std::fs::symlink_metadata(absolute_path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match absent(path, absolute_path) {
+                true => {
                     removed_paths.push(path.clone());
                     let row_removed = live.remove_row(path);
                     let entry_held = catalog.contains_key(path);
@@ -4703,7 +4752,7 @@ impl SharedIndexHandle {
                         receipt.removed.push(path.clone());
                     }
                 }
-                _ => receipt.refused.push(path.clone()),
+                false => receipt.refused.push(path.clone()),
             }
         }
 
@@ -4716,7 +4765,7 @@ impl SharedIndexHandle {
                 receipt.superseded.push(verified.path);
                 continue;
             }
-            if !snapshot_verified_stamp_matches(&verified.scouted) {
+            if !stamp_matches(&verified.path, &verified.scouted) {
                 receipt.refused.push(verified.path);
                 continue;
             }
@@ -4815,6 +4864,10 @@ impl SharedIndexHandle {
         }
         if !content_changed && !receipt.completed {
             return Some(receipt);
+        }
+        if !final_admission() {
+            self.note_rejected_stale_mutation();
+            return None;
         }
         match self.scout_plan_with_batch_locked(scouted_entries, &removed_paths, &live) {
             Ok(Some(plan)) => self.scout_plan.store(Some(plan)),
@@ -7488,6 +7541,51 @@ mod tests {
     use tempfile::TempDir;
 
     static COUPLING_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn bound_write_binding_blocks_reset_publication_until_scope_ends() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("source.rs"), b"pub fn source() {}\n").unwrap();
+        let shared = LiveIndex::load(root.path()).unwrap();
+        // The index binds the canonical root; a TEMP spelled with 8.3 short
+        // names (Windows CI runners) differs from it only in spelling.
+        let canonical_root = dunce::canonicalize(root.path()).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = Arc::clone(&shared);
+        let hold = std::thread::spawn(move || {
+            holder.with_bound_write_binding(|bound_root, _, _| {
+                assert_eq!(bound_root, canonical_root);
+                assert!(holder.write_mutex.try_lock().is_none());
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let resetting = Arc::clone(&shared);
+        let reset = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            resetting.reset_to_empty();
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        hold.join().unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        reset.join().unwrap();
+        assert!(shared.read().indexed_root.is_none());
+    }
 
     struct CouplingEnvGuard {
         previous: Option<String>,

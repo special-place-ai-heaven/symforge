@@ -1997,6 +1997,81 @@ pub fn load_snapshot(
     project_root: &Path,
     state_placement: &StatePlacement,
 ) -> Option<IndexSnapshot> {
+    load_snapshot_with_dismissal_digest(project_root, state_placement, || {
+        Some(crate::knowledge::secret_dismissals::dismissal_store_digest(
+            project_root,
+        ))
+    })
+}
+
+/// Load using the source authority already admitted by the caller. The state
+/// directory remains the caller's protected persistence placement; source
+/// metadata such as dismissals comes only from the original source anchor.
+#[cfg(feature = "server")]
+pub(crate) fn load_snapshot_bound(
+    project_root: &Path,
+    state_placement: &StatePlacement,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<Option<IndexSnapshot>, BoundRestoreRefusal> {
+    let dismissal_digest = admitted_dismissal_store_digest(authority)?;
+    let snapshot = load_snapshot_with_dismissal_digest(project_root, state_placement, || {
+        Some(dismissal_digest)
+    });
+    authority
+        .verify_physical_root_anchor()
+        .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
+    Ok(snapshot)
+}
+
+/// Digest of the dismissal store read through the admitted source anchor,
+/// with the same classes as [`crate::knowledge::secret_dismissals::dismissal_store_digest`]:
+/// empty when absent, the refused marker when the store cannot be read as a
+/// bounded regular file (a non-directory `.symforge`, a link, an oversize or
+/// unreadable file), else the content digest. Only a revoked lease or a failed
+/// anchor is `SourceMoved`: one unreadable file beneath the root is not
+/// evidence that the root itself was replaced.
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn admitted_dismissal_store_digest(
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<String, BoundRestoreRefusal> {
+    use crate::index_lifecycle::physical_root::RootRefusal;
+    use crate::knowledge::secret_dismissals as dismissals;
+    authority
+        .with_source_anchor_read(|lease| {
+            match crate::index_lifecycle::physical_root::read_regular_beneath(
+                lease,
+                Path::new(dismissals::DISMISSAL_STORE_REL),
+                dismissals::DISMISSAL_STORE_MAX_BYTES as usize,
+            ) {
+                Ok(bytes) => Ok(bytes
+                    .as_deref()
+                    .map(crate::hash::digest_hex)
+                    .unwrap_or_default()),
+                Err(RootRefusal::LeaseRevoked) => Err(RootRefusal::LeaseRevoked),
+                // The same marker `dismissal_store_digest` records for a
+                // refused store, so a snapshot taken under it still matches.
+                Err(_) => Ok("refused".to_string()),
+            }
+        })
+        .map_err(|_| BoundRestoreRefusal::SourceMoved)
+}
+
+#[cfg(feature = "embed")]
+pub(crate) fn load_snapshot_with_admitted_dismissals(
+    project_root: &Path,
+    state_placement: &StatePlacement,
+    dismissal_digest: &str,
+) -> Option<IndexSnapshot> {
+    load_snapshot_with_dismissal_digest(project_root, state_placement, || {
+        Some(dismissal_digest.to_owned())
+    })
+}
+
+fn load_snapshot_with_dismissal_digest(
+    project_root: &Path,
+    state_placement: &StatePlacement,
+    dismissal_digest: impl FnOnce() -> Option<String>,
+) -> Option<IndexSnapshot> {
     let (state_dir, expected_project_id) =
         resolved_snapshot_state(project_root, state_placement).ok()?;
     let path = state_dir.as_path().join(INDEX_FILENAME);
@@ -2151,9 +2226,7 @@ pub fn load_snapshot(
     // Checked after identity, so a foreign snapshot is quarantined for being
     // foreign. A local snapshot's verdicts answer to the dismissal store they
     // were classified under; a different store here makes them stale.
-    if snapshot.dismissal_store_digest
-        != crate::knowledge::secret_dismissals::dismissal_store_digest(project_root)
-    {
+    if Some(snapshot.dismissal_store_digest.as_str()) != dismissal_digest().as_deref() {
         warn!("index snapshot secret dismissals changed — will re-scout");
         try_quarantine_bad_snapshot(
             state_dir,
@@ -2325,6 +2398,7 @@ fn snapshot_restore_decode_capacity(snapshot: &IndexSnapshot, wire_len: u64) -> 
         .max(wire_len)
 }
 
+#[cfg(test)]
 fn prove_snapshot_entry_on_disk(
     project_root: &Path,
     source_to_path: &BTreeMap<u64, String>,
@@ -2363,6 +2437,19 @@ fn run_snapshot_store_restore_proof(
     project_root: &Path,
     wire_bytes: Option<&[u8]>,
 ) -> SnapshotRestoreProof {
+    run_snapshot_store_restore_proof_with(snapshot, project_root, wire_bytes, |path, file| {
+        let abs_path = project_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        std::fs::read(abs_path)
+            .is_ok_and(|bytes| crate::hash::digest_hex(&bytes) == file.content_hash)
+    })
+}
+
+fn run_snapshot_store_restore_proof_with(
+    snapshot: &IndexSnapshot,
+    project_root: &Path,
+    wire_bytes: Option<&[u8]>,
+    prove_file: impl Fn(&str, &IndexedFileSnapshot) -> bool,
+) -> SnapshotRestoreProof {
     let owned_wire_bytes;
     let wire_bytes = match wire_bytes {
         Some(bytes) => Some(bytes),
@@ -2396,13 +2483,20 @@ fn run_snapshot_store_restore_proof(
     let (seed, source_to_path) = build_snapshot_seed_from_index(snapshot, declared_len);
     let limit = snapshot_restore_decode_capacity(snapshot, declared_len);
     let files = &snapshot.files;
-    let root = project_root.to_path_buf();
     let mut store = SnapshotStore::new();
     let outcome = store.restore(
         seed,
         limit,
         |entry| *entry,
-        |source, stamp| prove_snapshot_entry_on_disk(&root, &source_to_path, files, source, stamp),
+        |source, stamp| {
+            let Some(path) = source_to_path.get(&source) else {
+                return false;
+            };
+            let Some(file) = files.get(path.as_str()) else {
+                return false;
+            };
+            snapshot_entry_stamp(&file.content_hash) == stamp && prove_file(path, file)
+        },
     );
     let rebuild_required = store.rebuild_required() || outcome.is_err();
     for line in store.diagnostics() {
@@ -2434,6 +2528,53 @@ fn run_snapshot_store_restore_proof(
     }
 }
 
+#[cfg(any(feature = "server", feature = "embed"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoundRestoreRefusal {
+    SourceMoved,
+    SourceReadRefused,
+}
+
+/// Prove snapshot entries against the source directory originally admitted by
+/// the embedded runtime. A path with the same spelling and bytes is not proof
+/// when its physical directory has changed.
+#[cfg(any(feature = "server", feature = "embed"))]
+fn run_snapshot_store_restore_proof_bound(
+    snapshot: &IndexSnapshot,
+    project_root: &Path,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<SnapshotRestoreProof, BoundRestoreRefusal> {
+    authority
+        .verify_physical_root_anchor()
+        .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
+    let read_refused = std::cell::Cell::new(false);
+    let proof =
+        run_snapshot_store_restore_proof_with(snapshot, project_root, None, |path, file| {
+            let max_bytes = file.content.len();
+            match authority.with_source_anchor_read(|lease| {
+                crate::index_lifecycle::physical_root::read_regular_beneath(
+                    lease,
+                    Path::new(path),
+                    max_bytes,
+                )
+            }) {
+                Ok(Some(bytes)) => crate::hash::digest_hex(&bytes) == file.content_hash,
+                Ok(None) => false,
+                Err(_) => {
+                    read_refused.set(true);
+                    false
+                }
+            }
+        });
+    authority
+        .verify_physical_root_anchor()
+        .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
+    if read_refused.get() {
+        return Err(BoundRestoreRefusal::SourceReadRefused);
+    }
+    Ok(proof)
+}
+
 #[cfg(test)]
 pub(crate) fn snapshot_store_restore_proof_for_test(
     snapshot: &IndexSnapshot,
@@ -2459,6 +2600,28 @@ pub fn snapshot_to_live_index_with_code_signals(
     project_root: &Path,
 ) -> (LiveIndex, CodeSignalsSnapshot) {
     let proof = run_snapshot_store_restore_proof(&snapshot, project_root, None);
+    hydrate_snapshot_with_proof(snapshot, project_root, proof)
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn snapshot_to_live_index_with_code_signals_bound(
+    snapshot: IndexSnapshot,
+    project_root: &Path,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<(LiveIndex, CodeSignalsSnapshot), BoundRestoreRefusal> {
+    let proof = run_snapshot_store_restore_proof_bound(&snapshot, project_root, authority)?;
+    let restored = hydrate_snapshot_with_proof(snapshot, project_root, proof);
+    authority
+        .verify_physical_root_anchor()
+        .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
+    Ok(restored)
+}
+
+fn hydrate_snapshot_with_proof(
+    snapshot: IndexSnapshot,
+    project_root: &Path,
+    proof: SnapshotRestoreProof,
+) -> (LiveIndex, CodeSignalsSnapshot) {
     if proof.rebuild_required {
         debug_assert!(
             matches!(
@@ -2582,11 +2745,65 @@ pub fn snapshot_to_live_index_with_code_signals(
 /// Files with `ENOENT` go to `deleted`. Files on disk not in the index go to `new_files`.
 /// Returns `None` once `stop` reports true; it is polled every
 /// [`SNAPSHOT_VERIFY_STOP_EVERY`] files and after new-file discovery.
+#[cfg(any(test, not(feature = "embed")))]
+#[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
 fn stat_check_files_from_view(
     verify_view: &VerifyIndexView,
     snapshot_mtimes: &HashMap<String, u64>,
     root: &Path,
     stop: &dyn Fn() -> bool,
+) -> Option<StatCheckResult> {
+    stat_check_files_from_view_with(
+        verify_view,
+        snapshot_mtimes,
+        stop,
+        |relative| {
+            let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            Ok(std::fs::metadata(absolute).ok().map(|metadata| {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                (metadata.len(), mtime)
+            }))
+        },
+        || {
+            let discovered = crate::discovery::discover_files(root);
+            #[cfg(test)]
+            let discovered = match test_discovery_failure_root().lock().as_deref() {
+                Some(failing) if failing == root => Err(anyhow::anyhow!(
+                    "injected discovery failure under {}",
+                    root.display()
+                )),
+                _ => discovered,
+            };
+            discovered
+                .map(|files| files.into_iter().map(|file| file.relative_path).collect())
+                .map_err(|error| AnchoredDiscoveryError::Failed(error.to_string()))
+        },
+    )
+}
+
+enum AnchoredDiscoveryError {
+    #[cfg(any(feature = "server", feature = "embed"))]
+    Cancelled,
+    Failed(String),
+}
+
+impl From<String> for AnchoredDiscoveryError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn stat_check_files_from_view_with(
+    verify_view: &VerifyIndexView,
+    snapshot_mtimes: &HashMap<String, u64>,
+    stop: &dyn Fn() -> bool,
+    mut observe: impl FnMut(&str) -> Result<Option<(u64, u64)>, String>,
+    mut discover: impl FnMut() -> Result<Vec<String>, AnchoredDiscoveryError>,
 ) -> Option<StatCheckResult> {
     let known_paths: std::collections::HashSet<&str> = verify_view
         .files
@@ -2601,26 +2818,15 @@ fn stat_check_files_from_view(
         .collect();
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
+    let mut observation_error = None;
 
     // Check each indexed file against disk
     for (position, file) in verify_view.files.iter().enumerate() {
         if position % SNAPSHOT_VERIFY_STOP_EVERY == 0 && stop() {
             return None;
         }
-        let abs_path = root.join(
-            file.relative_path
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
-        match std::fs::metadata(&abs_path) {
-            Ok(meta) => {
-                let on_disk_size = meta.len();
-                let on_disk_mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
+        match observe(&file.relative_path) {
+            Ok(Some((on_disk_size, on_disk_mtime))) => {
                 let stored_mtime = snapshot_mtimes
                     .get(&file.relative_path)
                     .copied()
@@ -2630,35 +2836,31 @@ fn stat_check_files_from_view(
                     changed.push(file.relative_path.clone());
                 }
             }
-            Err(_) => {
+            Ok(None) => {
                 // File gone
                 deleted.push(file.relative_path.clone());
+            }
+            Err(error) => {
+                changed.push(file.relative_path.clone());
+                observation_error.get_or_insert(error);
             }
         }
     }
 
     // Find new files (on disk but not in index)
-    let discovered = crate::discovery::discover_files(root);
-    #[cfg(test)]
-    let discovered = match test_discovery_failure_root().lock().as_deref() {
-        Some(failing) if failing == root => Err(anyhow::anyhow!(
-            "injected discovery failure under {}",
-            root.display()
-        )),
-        _ => discovered,
-    };
-    let (new_files, discovery_error) = match discovered {
+    let (new_files, discovery_error) = match discover() {
         Ok(discovered) => (
             discovered
                 .into_iter()
-                .filter(|df| !known_paths.contains(df.relative_path.as_str()))
-                .map(|df| df.relative_path)
+                .filter(|path| !known_paths.contains(path.as_str()))
                 .collect(),
-            None,
+            observation_error,
         ),
-        Err(e) => {
+        #[cfg(any(feature = "server", feature = "embed"))]
+        Err(AnchoredDiscoveryError::Cancelled) => return None,
+        Err(AnchoredDiscoveryError::Failed(e)) => {
             warn!("stat_check_files: discover_files failed: {e}");
-            (Vec::new(), Some(e.to_string()))
+            (Vec::new(), Some(e))
         }
     };
 
@@ -2671,6 +2873,265 @@ fn stat_check_files_from_view(
         new_files,
         discovery_error,
     })
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn discover_files_from_source_anchor(
+    root: &Path,
+    index: &crate::live_index::store::SharedIndex,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<String>, AnchoredDiscoveryError> {
+    use crate::index_lifecycle::physical_root::{AnchoredEntryKind, list_directory_beneath};
+    use std::collections::VecDeque;
+
+    #[cfg(test)]
+    if test_discovery_failure_root().lock().as_deref() == Some(root) {
+        return Err(format!("injected discovery failure under {}", root.display()).into());
+    }
+
+    let limits = crate::discovery::DiscoveryLimits::from_env();
+    let max_entries = usize::try_from(limits.max_files)
+        .unwrap_or(usize::MAX)
+        .min(200_000);
+    let exclusions = index.source_exclusions();
+    let mut directories = VecDeque::from([PathBuf::from(".")]);
+    let mut files = Vec::new();
+    let mut ignore_files = Vec::new();
+    let mut visited = 0usize;
+    while let Some(directory) = directories.pop_front() {
+        if stop() {
+            return Err(AnchoredDiscoveryError::Cancelled);
+        }
+        let entries = authority
+            .with_source_anchor_read(|lease| list_directory_beneath(lease, &directory, max_entries))
+            .map_err(|_| "the admitted source directory could not be listed".to_string())?
+            .ok_or_else(|| "an admitted source directory vanished".to_string())?;
+        visited = visited.saturating_add(entries.len());
+        if visited > max_entries {
+            return Err("admitted source discovery exceeds its file bound"
+                .to_string()
+                .into());
+        }
+        for entry in entries {
+            if crate::discovery::path_is_hard_scope_excluded(&entry.relative)
+                || exclusions.excludes_relative(&entry.relative)
+            {
+                continue;
+            }
+            let relative = entry
+                .relative
+                .to_str()
+                .ok_or_else(|| "source path encoding is unsupported".to_string())?
+                .replace('\\', "/");
+            if crate::discovery::is_under_repo_root_build_dir(&relative, None) {
+                continue;
+            }
+            match entry.kind {
+                AnchoredEntryKind::Directory => directories.push_back(entry.relative),
+                AnchoredEntryKind::Regular => {
+                    if relative.ends_with(".gitignore") || relative.ends_with(".ignore") {
+                        ignore_files.push((relative.clone(), entry.relative.clone()));
+                    }
+                    if crate::domain::LanguageId::from_path(&relative).is_some() {
+                        files.push(relative);
+                    }
+                }
+                AnchoredEntryKind::Link | AnchoredEntryKind::Other => {}
+            }
+        }
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    for (relative, path) in ignore_files {
+        let bytes = authority
+            .with_source_anchor_read(|lease| {
+                crate::index_lifecycle::physical_root::read_regular_beneath(
+                    lease,
+                    &path,
+                    256 * 1024,
+                )
+            })
+            .map_err(|_| "an admitted ignore file could not be read".to_string())?
+            .ok_or_else(|| "an admitted ignore file vanished".to_string())?;
+        let contents = std::str::from_utf8(&bytes)
+            .map_err(|_| "an admitted ignore file is not UTF-8".to_string())?;
+        let relative_parent = path.parent().unwrap_or_else(|| Path::new("."));
+        crate::discovery::add_gitignore_contents(
+            &mut builder,
+            relative_parent,
+            &root.join(relative),
+            contents,
+        );
+    }
+    let matcher = builder
+        .build()
+        .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
+    files.retain(|path| !matcher.matched_path_or_any_parents(path, false).is_ignore());
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn read_dismissals_from_source_anchor(
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<
+    (
+        crate::knowledge::secret_dismissals::HeldDismissals,
+        Vec<crate::knowledge::secret_dismissals::DismissalRecord>,
+    ),
+    String,
+> {
+    use crate::knowledge::secret_dismissals as dismissals;
+    let bytes = authority
+        .with_source_anchor_read(|lease| {
+            crate::index_lifecycle::physical_root::read_regular_beneath(
+                lease,
+                Path::new(".symforge/secret-dismissals.json"),
+                dismissals::DISMISSAL_STORE_MAX_BYTES as usize,
+            )
+        })
+        .map_err(|_| "the admitted dismissal store could not be read".to_string())?;
+    let Some(bytes) = bytes else {
+        return Ok((dismissals::HeldDismissals::default(), Vec::new()));
+    };
+    let records = dismissals::parse_dismissals_bytes(&bytes)
+        .map_err(|_| "the admitted dismissal store could not be parsed".to_string())?;
+    let held = dismissals::HeldDismissals {
+        digest: crate::hash::digest_hex(&bytes),
+        paths: records
+            .iter()
+            .map(|record| record.path.replace('\\', "/"))
+            .collect(),
+    };
+    Ok((held, records))
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+pub(crate) fn prepare_snapshot_verify_from_source_anchor(
+    relative: &str,
+    root: &Path,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    base: Option<&std::sync::Arc<crate::live_index::store::IndexedFile>>,
+    records: &[crate::knowledge::secret_dismissals::DismissalRecord],
+) -> Option<crate::live_index::store::SnapshotVerifiedFile> {
+    use crate::domain::ScoutDecision;
+    let path = Path::new(relative);
+    if !authority
+        .with_source_anchor_read(|lease| {
+            crate::index_lifecycle::physical_root::exact_spelling_beneath(lease, path)
+        })
+        .ok()?
+    {
+        return None;
+    }
+    let (metadata, prefix) = authority
+        .with_source_anchor_read(|lease| {
+            crate::index_lifecycle::physical_root::probe_regular_beneath(lease, path, 1_048_576)
+        })
+        .ok()??;
+    let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let scouted = crate::discovery::scout_single_path_with_io(
+        relative,
+        &absolute,
+        |_| Ok(metadata.clone()),
+        |_, limit| Ok(prefix.iter().take(limit).copied().collect()),
+    )
+    .ok()?;
+    let bytes = if matches!(scouted.decision, ScoutDecision::Ingest { .. }) {
+        let observation = authority
+            .with_source_anchor_read(|lease| {
+                crate::index_lifecycle::physical_root::observe_regular_beneath(
+                    lease,
+                    path,
+                    Some(100 * 1024 * 1024),
+                )
+            })
+            .ok()??;
+        if observation.len != scouted.stamp.size
+            || observation.metadata.modified().ok() != scouted.stamp.modified_hint
+        {
+            return None;
+        }
+        observation.bytes
+    } else {
+        None
+    };
+    crate::live_index::single_file::prepare_snapshot_verify_from_observation(
+        relative,
+        scouted,
+        bytes,
+        base,
+        |targets, bytes| {
+            crate::knowledge::classify_stable_content_with(
+                relative,
+                targets,
+                bytes,
+                |path, bytes| {
+                    crate::knowledge::secret_dismissals::scan_with_records(path, bytes, records)
+                },
+            )
+        },
+    )
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn publish_snapshot_verify_from_source_anchor(
+    index: &crate::live_index::store::SharedIndex,
+    expected_gen: u64,
+    removals: &[(String, PathBuf)],
+    files: Vec<crate::live_index::store::SnapshotVerifiedFile>,
+    completion: Option<crate::live_index::store::SnapshotVerifyCompletion>,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Option<crate::live_index::store::SnapshotVerifyBatchReceipt> {
+    authority.verify_physical_root_anchor().ok()?;
+    let receipt = index.publish_snapshot_verify_with_observation(
+        expected_gen,
+        removals,
+        files,
+        completion,
+        |relative, _| {
+            if verify_path_excluded(index, relative) {
+                return true;
+            }
+            authority
+                .with_source_anchor_read(|lease| {
+                    let path = Path::new(relative);
+                    if crate::index_lifecycle::physical_root::exact_spelling_beneath(lease, path)? {
+                        crate::index_lifecycle::physical_root::open_regular_beneath(lease, path)
+                            .map(|opened| opened.is_none())
+                    } else {
+                        Ok(true)
+                    }
+                })
+                .unwrap_or(false)
+        },
+        |relative, scouted| {
+            authority
+                .with_source_anchor_read(|lease| {
+                    if !crate::index_lifecycle::physical_root::exact_spelling_beneath(
+                        lease,
+                        Path::new(relative),
+                    )? {
+                        return Ok(None);
+                    }
+                    crate::index_lifecycle::physical_root::probe_regular_beneath(
+                        lease,
+                        Path::new(relative),
+                        0,
+                    )
+                })
+                .ok()
+                .flatten()
+                .is_some_and(|(metadata, _)| {
+                    metadata.len() == scouted.stamp.size
+                        && metadata.modified().ok() == scouted.stamp.modified_hint
+                })
+        },
+        || authority.verify_physical_root_anchor().is_ok(),
+    )?;
+    authority.verify_physical_root_anchor().ok()?;
+    Some(receipt)
 }
 
 /// Test-only fault injection: discovery fails for this project root.
@@ -2688,12 +3149,27 @@ const SNAPSHOT_VERIFY_STOP_EVERY: usize = 1024;
 /// Returns the paths whose on-disk content hash differs from the index, and
 /// the sampled paths that could not be read at all (neither is verified).
 /// Default: 10% (pass 0.10).
+#[cfg(any(test, not(feature = "embed")))]
+#[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
 fn spot_verify_sample_from_view(
     verify_view: &VerifyIndexView,
     root: &Path,
     sample_pct: f64,
     progress: Option<&SnapshotVerifyProgress>,
     stop: &dyn Fn() -> bool,
+) -> Option<(Vec<String>, Vec<String>)> {
+    spot_verify_sample_from_view_with(verify_view, sample_pct, progress, stop, |relative| {
+        let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        std::fs::read(absolute).ok()
+    })
+}
+
+fn spot_verify_sample_from_view_with(
+    verify_view: &VerifyIndexView,
+    sample_pct: f64,
+    progress: Option<&SnapshotVerifyProgress>,
+    stop: &dyn Fn() -> bool,
+    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
 ) -> Option<(Vec<String>, Vec<String>)> {
     if verify_view.files.is_empty() {
         return Some((Vec::new(), Vec::new()));
@@ -2717,17 +3193,12 @@ fn spot_verify_sample_from_view(
         if position % SNAPSHOT_VERIFY_STOP_EVERY == 0 && stop() {
             return None;
         }
-        let abs_path = root.join(
-            file.relative_path
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
-        let read = std::fs::read(&abs_path);
         if let Some(progress) = progress {
             progress.add_processed(1);
         }
-        let bytes = match read {
-            Ok(b) => b,
-            Err(_) => {
+        let bytes = match read(&file.relative_path) {
+            Some(bytes) => bytes,
+            None => {
                 unreadable.push(file.relative_path.clone());
                 continue;
             }
@@ -3047,6 +3518,31 @@ pub(crate) async fn background_verify_cancellable<C>(
     background_verify_with_hook(index, root, snapshot_mtimes, observer, || {}, cancelled).await;
 }
 
+/// Verify a restored index against the source authority retained at admission.
+/// The caller must not reacquire authority by root spelling after loading.
+#[cfg(feature = "server")]
+pub(crate) async fn background_verify_cancellable_bound<C>(
+    index: crate::live_index::store::SharedIndex,
+    root: std::path::PathBuf,
+    snapshot_mtimes: HashMap<String, u64>,
+    authority: std::sync::Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>,
+    cancelled: C,
+) where
+    C: Fn() -> bool + Send + 'static,
+{
+    let observer = authority.active_observer();
+    background_verify_with_hook_authority(
+        index,
+        root,
+        snapshot_mtimes,
+        authority,
+        observer,
+        || {},
+        cancelled,
+    )
+    .await;
+}
+
 /// Synchronous test harness for restore paths that skip tokio's
 /// `Handle::try_current()` spawn (unit tests, `bootstrap_project_index` callers).
 #[cfg(test)]
@@ -3080,6 +3576,31 @@ async fn background_verify_with_hook<F, C>(
     F: FnOnce() + Send + 'static,
     C: Fn() -> bool + Send + 'static,
 {
+    let authority = crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+    background_verify_with_hook_authority(
+        index,
+        root,
+        snapshot_mtimes,
+        authority,
+        observer,
+        after_running,
+        cancelled,
+    )
+    .await;
+}
+
+async fn background_verify_with_hook_authority<F, C>(
+    index: crate::live_index::store::SharedIndex,
+    root: std::path::PathBuf,
+    snapshot_mtimes: HashMap<String, u64>,
+    authority: std::sync::Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>,
+    observer: crate::live_index::index_lifecycle::observer::ObserverId,
+    after_running: F,
+    cancelled: C,
+) where
+    F: FnOnce() + Send + 'static,
+    C: Fn() -> bool + Send + 'static,
+{
     let expected_gen = index.current_project_generation();
     let task_index = index.clone();
     let joined = tokio::task::spawn_blocking(move || {
@@ -3087,6 +3608,7 @@ async fn background_verify_with_hook<F, C>(
             &task_index,
             &root,
             &snapshot_mtimes,
+            &authority,
             observer,
             expected_gen,
             after_running,
@@ -3109,12 +3631,44 @@ async fn background_verify_with_hook<F, C>(
     }
 }
 
+#[cfg(feature = "embed")]
+pub(crate) fn background_verify_bound<C>(
+    index: &crate::live_index::store::SharedIndex,
+    root: &Path,
+    snapshot_mtimes: &HashMap<String, u64>,
+    authority: &std::sync::Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>,
+    cancelled: C,
+) where
+    C: Fn() -> bool,
+{
+    let observer = authority.active_observer();
+    let expected_gen = index.current_project_generation();
+    run_background_verify(
+        index,
+        root,
+        snapshot_mtimes,
+        authority,
+        observer,
+        expected_gen,
+        || {},
+        cancelled,
+    );
+}
+
 /// Re-verify one path through the canonical single-file seam, with its
 /// bounded retries. Every outcome that leaves the index agreeing with disk
 /// counts as reconciled, including a terminal admission (`Skipped`) and a
 /// confirmed absence; a read or publication the seam could not complete is
 /// the caller's to report, with the reason returned here.
-#[cfg(feature = "server")]
+#[cfg(any(feature = "server", feature = "embed"))]
+fn verify_path_excluded(index: &crate::live_index::store::SharedIndex, relative: &str) -> bool {
+    let path = Path::new(relative);
+    crate::discovery::path_is_hard_scope_excluded(path)
+        || index.is_source_excluded(path)
+        || index.read().is_path_gitignored(relative)
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
 fn reverify_through_canonical_seam(
     index: &crate::live_index::store::SharedIndex,
     root: &Path,
@@ -3122,44 +3676,83 @@ fn reverify_through_canonical_seam(
     expected_gen: u64,
     authority: &crate::live_index::index_lifecycle::activation::ProjectSourceAuthority,
     observer: crate::live_index::index_lifecycle::observer::ObserverId,
+    stop: &dyn Fn() -> bool,
 ) -> Result<(), String> {
-    let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    match crate::live_index::single_file::maybe_reindex(
-        rel_path,
-        &abs_path,
-        index,
-        None::<crate::domain::LanguageId>,
-        expected_gen,
-    ) {
-        crate::watcher::ReindexResult::Reindexed => {
-            if let Err(active) = authority.observe_admission(observer, rel_path) {
-                tracing::debug!(
-                    ?observer,
-                    ?active,
-                    %rel_path,
-                    "stale verify incarnation: admission observation refused"
-                );
+    #[cfg(test)]
+    if crate::live_index::single_file::test_scout_failure_path()
+        .lock()
+        .as_deref()
+        == Some(rel_path)
+    {
+        return Err("injected scout failure".to_string());
+    }
+    let relative = Path::new(rel_path);
+    let absolute = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    for _ in 0..3 {
+        if stop() {
+            return Err("the admitted re-read was cancelled".to_string());
+        }
+        if verify_path_excluded(index, rel_path) {
+            let removals = vec![(rel_path.to_string(), absolute.clone())];
+            let receipt = publish_snapshot_verify_from_source_anchor(
+                index,
+                expected_gen,
+                &removals,
+                Vec::new(),
+                None,
+                authority,
+            )
+            .ok_or_else(|| "the excluded-path eviction was refused".to_string())?;
+            if receipt.refused.is_empty() {
+                return Ok(());
             }
-            Ok(())
+            continue;
         }
-        crate::watcher::ReindexResult::HashSkip
-        | crate::watcher::ReindexResult::Removed
-        | crate::watcher::ReindexResult::Skipped => Ok(()),
-        // The file is gone and nothing held it; a row still held is not.
-        crate::watcher::ReindexResult::NotFound => {
-            if index.read().files.contains_key(rel_path) {
-                Err("the file is gone but its restored row could not be removed".to_string())
-            } else {
-                Ok(())
+        let (_, records) = read_dismissals_from_source_anchor(authority)?;
+        let base = index.read().files.get(rel_path).cloned();
+        let prepared = prepare_snapshot_verify_from_source_anchor(
+            rel_path,
+            root,
+            authority,
+            base.as_ref(),
+            &records,
+        );
+        let (removals, files) = if let Some(prepared) = prepared {
+            (Vec::new(), vec![prepared])
+        } else {
+            let absent = authority
+                .with_source_anchor_read(|lease| {
+                    crate::index_lifecycle::physical_root::open_regular_beneath(lease, relative)
+                        .map(|opened| opened.is_none())
+                })
+                .map_err(|_| "the admitted source file could not be read".to_string())?;
+            if !absent {
+                continue;
             }
+            (vec![(rel_path.to_string(), absolute.clone())], Vec::new())
+        };
+        if stop() {
+            return Err("the admitted re-read was cancelled".to_string());
         }
-        crate::watcher::ReindexResult::ReadError(error) => {
-            Err(format!("it could not be read: {error}"))
-        }
-        crate::watcher::ReindexResult::PublicationRejected => {
-            Err("its re-read could not be published after retries".to_string())
+        let receipt = publish_snapshot_verify_from_source_anchor(
+            index,
+            expected_gen,
+            &removals,
+            files,
+            None,
+            authority,
+        )
+        .ok_or_else(|| "the admitted source publication was refused".to_string())?;
+        if receipt.refused.is_empty() {
+            if !receipt.indexed.is_empty()
+                && let Err(active) = authority.observe_admission(observer, rel_path)
+            {
+                tracing::debug!(?observer, ?active, %rel_path, "stale verify admission observation refused");
+            }
+            return Ok(());
         }
     }
+    Err("its admitted re-read could not be published after retries".to_string())
 }
 
 /// Why a verify's mismatches exist, in words an agent can act on. Withheld
@@ -3196,10 +3789,12 @@ fn snapshot_verify_mismatch_reason(
     parts.join("; ")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_background_verify<F, C>(
     index: &crate::live_index::store::SharedIndex,
     root: &Path,
     snapshot_mtimes: &HashMap<String, u64>,
+    authority: &std::sync::Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>,
     observer: crate::live_index::index_lifecycle::observer::ObserverId,
     expected_gen: u64,
     after_running: F,
@@ -3215,7 +3810,6 @@ fn run_background_verify<F, C>(
     // and the lane refuses it — late V10 callbacks are unreachable in the
     // authority lane — while the V10 data-plane reconciliation continues
     // under its own per-path fences (recorded residual until C4 gates it).
-    let authority = crate::live_index::index_lifecycle::activation::project_source_authority(root);
     let observe_admissions = |paths: &[String]| {
         for path in paths {
             if let Err(active) = authority.observe_admission(observer, path) {
@@ -3270,15 +3864,41 @@ fn run_background_verify<F, C>(
         return;
     }
     after_running();
+    #[cfg(any(feature = "server", feature = "embed"))]
+    if authority.verify_physical_root_anchor().is_err() {
+        let unverified: Vec<String> = index.read().files.keys().cloned().collect();
+        let report = SnapshotVerifyReport::from_mismatched_paths(unverified)
+            .with_reason("the originally admitted source directory moved".to_string());
+        index.mark_snapshot_verify_failed_at_generation(expected_gen, report);
+        return;
+    }
 
     // 1. Stat-check all files (fast: just metadata reads).
     let base = index.read();
     let verify_view = capture_verify_view(&base);
-    let Some(stat_result) =
-        stat_check_files_from_view(&verify_view, snapshot_mtimes, root, &|| {
-            stopped("the stat pass")
-        })
-    else {
+    #[cfg(any(feature = "server", feature = "embed"))]
+    let stat_result = stat_check_files_from_view_with(
+        &verify_view,
+        snapshot_mtimes,
+        &|| stopped("the stat pass"),
+        |relative| {
+            authority
+                .with_source_anchor_read(|lease| {
+                    crate::index_lifecycle::physical_root::entry_metadata_beneath(
+                        lease,
+                        Path::new(relative),
+                    )
+                })
+                .map_err(|_| "the admitted source could not be observed".to_string())
+                .map(|observed| observed.map(|metadata| (metadata.len, metadata.modified_secs)))
+        },
+        || discover_files_from_source_anchor(root, index, authority, &|| stopped("discovery")),
+    );
+    #[cfg(not(any(feature = "server", feature = "embed")))]
+    let stat_result = stat_check_files_from_view(&verify_view, snapshot_mtimes, root, &|| {
+        stopped("the stat pass")
+    });
+    let Some(stat_result) = stat_result else {
         return;
     };
     let changed_count = stat_result.changed.len();
@@ -3307,9 +3927,43 @@ fn run_background_verify<F, C>(
             // Spot-check only samples resident rows; terminals stay catalog-only.
             terminal_catalog_paths: Vec::new(),
         };
-        spot_verify_sample_from_view(&cleared, root, 0.10, Some(&progress), &|| {
+        #[cfg(any(feature = "server", feature = "embed"))]
+        let spot = {
+            let lengths: HashMap<&str, usize> = cleared
+                .files
+                .iter()
+                .map(|file| {
+                    (
+                        file.relative_path.as_str(),
+                        usize::try_from(file.byte_len).unwrap_or(usize::MAX),
+                    )
+                })
+                .collect();
+            spot_verify_sample_from_view_with(
+                &cleared,
+                0.10,
+                Some(&progress),
+                &|| stopped("the spot check"),
+                |relative| {
+                    let limit = lengths.get(relative).copied()?;
+                    authority
+                        .with_source_anchor_read(|lease| {
+                            crate::index_lifecycle::physical_root::read_regular_beneath(
+                                lease,
+                                Path::new(relative),
+                                limit,
+                            )
+                        })
+                        .ok()
+                        .flatten()
+                },
+            )
+        };
+        #[cfg(not(any(feature = "server", feature = "embed")))]
+        let spot = spot_verify_sample_from_view(&cleared, root, 0.10, Some(&progress), &|| {
             stopped("the spot check")
-        })
+        });
+        spot
     };
     let Some((spot_mismatches, spot_unreadable)) = spot else {
         return;
@@ -3322,6 +3976,18 @@ fn run_background_verify<F, C>(
     // store here differs, every path either record set names is re-read, so
     // the single publication below carries verdicts taken under THIS store.
     // With no recorded state, every restored path is re-read.
+    #[cfg(any(feature = "server", feature = "embed"))]
+    let (dismissals_now, dismissal_records) = match read_dismissals_from_source_anchor(authority) {
+        Ok(observed) => observed,
+        Err(reason) => {
+            let unverified: Vec<String> = base.files.keys().cloned().collect();
+            let report =
+                SnapshotVerifyReport::from_mismatched_paths(unverified).with_reason(reason);
+            index.mark_snapshot_verify_failed_at_generation(expected_gen, report);
+            return;
+        }
+    };
+    #[cfg(not(any(feature = "server", feature = "embed")))]
     let dismissals_now = crate::knowledge::secret_dismissals::observe_dismissals(root);
     let dismissal_paths: Vec<String> = {
         let candidates: std::collections::BTreeSet<String> =
@@ -3341,14 +4007,29 @@ fn run_background_verify<F, C>(
             };
         candidates
             .into_iter()
-            .filter(|path| matches!(crate::discovery::resolve_repo_path(root, path), Ok(Some(_))))
+            .filter(|path| {
+                #[cfg(any(feature = "server", feature = "embed"))]
+                {
+                    let relative = Path::new(path);
+                    relative
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_)))
+                        && !crate::discovery::path_is_hard_scope_excluded(relative)
+                }
+                #[cfg(not(any(feature = "server", feature = "embed")))]
+                {
+                    matches!(crate::discovery::resolve_repo_path(root, path), Ok(Some(_)))
+                }
+            })
             .collect()
     };
 
     // Reported whatever the re-read does. Freshness degrades on them instead
     // of asserting a currency nothing established.
-    #[cfg_attr(feature = "server", allow(unused_mut))]
+    #[cfg_attr(any(feature = "server", feature = "embed"), allow(unused_mut))]
     let mut reported: Vec<String> = spot_mismatches.clone();
+    #[cfg(any(feature = "server", feature = "embed"))]
+    reported.retain(|path| !verify_path_excluded(index, path));
     // No path stands for the files nobody could discover. The error goes in
     // its own field, without the machine's absolute project root.
     let discovery_error = stat_result.discovery_error.as_deref().map(|error| {
@@ -3367,10 +4048,10 @@ fn run_background_verify<F, C>(
     // the verify resolves.
     let mut unreconciled: BTreeMap<String, String> = BTreeMap::new();
 
-    // Re-parsing routes through the watcher's admission seam; embed has no
-    // watcher, so changed/new files are detected but not re-parsed there and
-    // fold straight into the mismatch set (reconciliation is server-only).
-    #[cfg(feature = "server")]
+    // Re-parsing uses the same scout/classify/parse core in both surfaces.
+    // The embedded caller supplies original-capability observations; the
+    // ordinary server caller retains its watcher admission seam.
+    #[cfg(any(feature = "server", feature = "embed"))]
     let (to_reparse, not_reparsed, unreadable_not_reparsed) = {
         let mut to_reparse: Vec<String> = stat_result
             .changed
@@ -3385,7 +4066,7 @@ fn run_background_verify<F, C>(
         to_reparse.dedup();
         (to_reparse, 0usize, 0usize)
     };
-    #[cfg(not(feature = "server"))]
+    #[cfg(not(any(feature = "server", feature = "embed")))]
     let (to_reparse, not_reparsed, unreadable_not_reparsed) = {
         let not_reparsed = stat_result.changed.len() + stat_result.new_files.len();
         reported.extend(stat_result.changed.iter().cloned());
@@ -3437,91 +4118,89 @@ fn run_background_verify<F, C>(
     //    publication can carry the resolved state.
     #[cfg_attr(not(feature = "server"), allow(unused_mut))]
     let mut prepared: Vec<crate::live_index::store::SnapshotVerifiedFile> = Vec::new();
-    #[cfg(feature = "server")]
+    #[cfg(any(feature = "server", feature = "embed"))]
     {
-        use rayon::prelude::*;
         let mut prepared_bytes = 0usize;
-        // Paths for the canonical seam; `true` once progress already counted
-        // the path, so a refused path re-read here is not counted twice.
-        let mut canonical: Vec<(String, bool)> = Vec::new();
         for chunk in to_reparse.chunks(SNAPSHOT_VERIFY_PREPARE_CHUNK) {
-            if stopped("a re-read batch") {
+            if stopped("an admitted re-read batch") {
                 return;
             }
-            let results: Vec<(
-                &String,
-                Option<crate::live_index::store::SnapshotVerifiedFile>,
-            )> = chunk
-                .par_iter()
-                .map(|path| {
-                    let abs_path = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-                    let verified =
-                        crate::live_index::single_file::prepare_snapshot_verify_admission(
-                            path,
-                            &abs_path,
-                            index,
-                            base_rows.get(path),
-                        );
-                    (path, verified)
-                })
-                .collect();
-            for (path, verified) in results {
-                if let Some(verified) = verified {
-                    prepared_bytes += verified.resident_bytes();
-                    prepared.push(verified);
+            for path in chunk {
+                if verify_path_excluded(index, path) {
+                    removals.push((path.clone(), root.join(path)));
                     progress.add_processed(1);
                     continue;
                 }
-                let abs_path = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-                let gone = matches!(
-                    std::fs::symlink_metadata(&abs_path),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                let verified = prepare_snapshot_verify_from_source_anchor(
+                    path,
+                    root,
+                    authority,
+                    base_rows.get(path),
+                    &dismissal_records,
                 );
-                if gone {
-                    // Gone since the stat pass: a removal inside the single
-                    // publication, which re-checks the absence, rather than a
-                    // canonical re-read and a publication of its own. A new
-                    // file that vanished held nothing.
-                    if base_rows.contains_key(path) {
-                        removals.push((path.clone(), abs_path));
-                    }
-                    progress.add_processed(1);
+                if let Some(verified) = verified {
+                    prepared_bytes = prepared_bytes.saturating_add(verified.resident_bytes());
+                    prepared.push(verified);
                 } else {
-                    canonical.push((path.clone(), false));
+                    let absent = authority
+                        .with_source_anchor_read(|lease| {
+                            crate::index_lifecycle::physical_root::open_regular_beneath(
+                                lease,
+                                Path::new(path),
+                            )
+                            .map(|opened| opened.is_none())
+                        })
+                        .unwrap_or(false);
+                    if absent {
+                        if base_rows.contains_key(path) {
+                            removals.push((path.clone(), root.join(path)));
+                        }
+                    } else {
+                        if let Err(reason) = reverify_through_canonical_seam(
+                            index,
+                            root,
+                            path,
+                            expected_gen,
+                            authority,
+                            observer,
+                            &|| stopped("a canonical re-read"),
+                        ) {
+                            unreconciled.insert(path.clone(), reason);
+                        }
+                    }
                 }
+                progress.add_processed(1);
             }
             if prepared_bytes >= SNAPSHOT_VERIFY_PUBLISH_BYTES {
-                let Some(receipt) = index.publish_snapshot_verify_at_generation(
+                let Some(receipt) = publish_snapshot_verify_from_source_anchor(
+                    index,
                     expected_gen,
                     &[],
                     std::mem::take(&mut prepared),
                     None,
+                    authority,
                 ) else {
-                    abandoned("a memory-bounded publication");
+                    let unverified: Vec<String> = index.read().files.keys().cloned().collect();
+                    let report = SnapshotVerifyReport::from_mismatched_paths(unverified)
+                        .with_reason("admitted source publication was refused".to_string());
+                    index.mark_snapshot_verify_failed_at_generation(expected_gen, report);
                     return;
                 };
                 observe_admissions(&receipt.indexed);
-                canonical.extend(receipt.refused.into_iter().map(|path| (path, true)));
+                for path in receipt.refused {
+                    if let Err(reason) = reverify_through_canonical_seam(
+                        index,
+                        root,
+                        &path,
+                        expected_gen,
+                        authority,
+                        observer,
+                        &|| stopped("a refused-path retry"),
+                    ) {
+                        unreconciled.insert(path, reason);
+                    }
+                }
                 prepared_bytes = 0;
-            }
-        }
-        for (path, counted) in canonical {
-            if stopped("a canonical re-read") {
-                return;
-            }
-            if let Err(reason) = reverify_through_canonical_seam(
-                index,
-                root,
-                &path,
-                expected_gen,
-                &authority,
-                observer,
-            ) {
-                unreconciled.insert(path, reason);
-            }
-            // Settled either way, reconciled or as a mismatch.
-            if !counted {
-                progress.add_processed(1);
             }
         }
     }
@@ -3555,15 +4234,34 @@ fn run_background_verify<F, C>(
     if stopped("the publication") {
         return;
     }
+    #[cfg(any(feature = "server", feature = "embed"))]
+    if authority.verify_physical_root_anchor().is_err() {
+        let unverified: Vec<String> = index.read().files.keys().cloned().collect();
+        let report = SnapshotVerifyReport::from_mismatched_paths(unverified)
+            .with_reason("the originally admitted source directory moved".to_string());
+        index.mark_snapshot_verify_failed_at_generation(expected_gen, report);
+        return;
+    }
     progress.enter_publish();
     let prepared_files = prepared.len();
     let publish_started = Instant::now();
-    let Some(receipt) = index.publish_snapshot_verify_at_generation(
+    #[cfg(any(feature = "server", feature = "embed"))]
+    let publish = publish_snapshot_verify_from_source_anchor(
+        index,
         expected_gen,
         &removals,
         prepared,
         Some(completion(&unreconciled)),
-    ) else {
+        authority,
+    );
+    #[cfg(not(any(feature = "server", feature = "embed")))]
+    let publish = index.publish_snapshot_verify_at_generation(
+        expected_gen,
+        &removals,
+        prepared,
+        Some(completion(&unreconciled)),
+    );
+    let Some(receipt) = publish else {
         abandoned("publication");
         return;
     };
@@ -3583,7 +4281,7 @@ fn run_background_verify<F, C>(
     } else {
         // The disk moved after the verify read these paths (or a deleted path
         // came back). One canonical retry each, then resolve the state.
-        #[cfg(feature = "server")]
+        #[cfg(any(feature = "server", feature = "embed"))]
         for path in receipt.refused {
             if stopped("a refused-path retry") {
                 return;
@@ -3593,13 +4291,14 @@ fn run_background_verify<F, C>(
                 root,
                 &path,
                 expected_gen,
-                &authority,
+                authority,
                 observer,
+                &|| stopped("a refused-path retry"),
             ) {
                 unreconciled.insert(path, reason);
             }
         }
-        #[cfg(not(feature = "server"))]
+        #[cfg(not(any(feature = "server", feature = "embed")))]
         for path in receipt.refused {
             unreconciled.insert(
                 path,
@@ -3625,7 +4324,7 @@ fn run_background_verify<F, C>(
     }
     // The verdicts now answer to this store, unless a re-read dismissal path
     // stayed unreconciled or this build cannot re-read at all.
-    if cfg!(feature = "server")
+    if cfg!(any(feature = "server", feature = "embed"))
         && dismissal_paths
             .iter()
             .all(|path| !unreconciled.contains_key(path))
@@ -4440,6 +5139,99 @@ mod tests {
         assert_eq!(published.failed_count, before.failed_count);
     }
 
+    #[tokio::test]
+    async fn background_verify_refuses_replaced_original_source_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("source");
+        let replacement = tmp.path().join("replacement");
+        let displaced = tmp.path().join("displaced");
+        for directory in [&root, &replacement] {
+            std::fs::create_dir_all(directory.join("src")).unwrap();
+            std::fs::write(directory.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        }
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        serialize_index(&index, &root).unwrap();
+        let snapshot = load_snapshot(&root).unwrap();
+        let snapshot_mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect::<HashMap<_, _>>();
+        let shared =
+            crate::live_index::SharedIndexHandle::shared(snapshot_to_live_index(snapshot, &root));
+        let observer = verify_observer(&root);
+        background_verify_with_hook(
+            shared.clone(),
+            root.clone(),
+            snapshot_mtimes,
+            observer,
+            move || {
+                std::fs::rename(&root, &displaced).unwrap();
+                std::fs::rename(&replacement, &root).unwrap();
+            },
+            || false,
+        )
+        .await;
+        assert!(
+            !matches!(
+                shared.read().snapshot_verify_state(),
+                SnapshotVerifyState::Completed(_)
+            ),
+            "verification must not certify bytes from a replacement physical root"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_proof_refuses_replaced_original_source_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("source");
+        let replacement = tmp.path().join("replacement");
+        let displaced = tmp.path().join("displaced");
+        for directory in [&root, &replacement] {
+            std::fs::create_dir_all(directory.join("src")).unwrap();
+            std::fs::write(directory.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        }
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        serialize_index(&index, &root).unwrap();
+        let snapshot = load_snapshot(&root).unwrap();
+        let retained_authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::rename(&replacement, &root).unwrap();
+        let proof = run_snapshot_store_restore_proof_bound(&snapshot, &root, &retained_authority);
+        assert_eq!(proof, Err(BoundRestoreRefusal::SourceMoved));
+    }
+
+    /// A dismissal store that cannot be read (here `.symforge` is a regular file,
+    /// the fixture daemon tests use to block project-local state) is a refused
+    /// store, classified fail-closed. It is not a moved source root; only a real
+    /// root replacement may refuse the restore as `SourceMoved`.
+    #[test]
+    fn admitted_dismissal_digest_refuses_store_not_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("source");
+        let replacement = tmp.path().join("replacement");
+        for directory in [&root, &replacement] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join(".symforge"), b"not a directory").unwrap();
+        }
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+        assert_eq!(
+            admitted_dismissal_store_digest(&authority),
+            Ok("refused".to_string()),
+            "an unreadable dismissal store must not read as a moved root"
+        );
+
+        std::fs::rename(&root, tmp.path().join("displaced")).unwrap();
+        std::fs::rename(&replacement, &root).unwrap();
+        assert_eq!(
+            admitted_dismissal_store_digest(&authority),
+            Err(BoundRestoreRefusal::SourceMoved),
+            "a replaced root must still refuse"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_restore_rebuilds_current_authority_versions_before_ready() {
         let tmp = TempDir::new().unwrap();
@@ -5152,7 +5944,7 @@ mod tests {
         match &live.snapshot_verify_state {
             SnapshotVerifyState::Completed(report) => {
                 assert_eq!(report.mismatched_paths, vec!["src/dir.rs".to_string()]);
-                #[cfg(feature = "server")]
+                #[cfg(any(feature = "server", feature = "embed"))]
                 {
                     // Re-read, and the failed re-read withholds it.
                     assert!(
@@ -5161,7 +5953,7 @@ mod tests {
                         "{report:?}"
                     );
                 }
-                #[cfg(not(feature = "server"))]
+                #[cfg(not(any(feature = "server", feature = "embed")))]
                 assert!(
                     report.reason.as_deref().is_some_and(
                         |reason| reason.contains("could not be read for the spot check")
@@ -6528,14 +7320,15 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "server"))]
+    #[cfg(any(feature = "server", feature = "embed"))]
     #[tokio::test]
-    async fn test_background_verify_embed_folds_stat_changed_into_mismatches() {
-        // Embed contract (no watcher): a file the stat-check flags as changed must
-        // degrade freshness even when the 10% content-hash spot sample would clear
-        // it. Isolate the stat-only path — identical content on disk and in the
-        // snapshot (so spot_verify sees no mismatch), but the recorded snapshot
-        // mtime is older than the on-disk mtime (so stat_check flags it changed).
+    async fn test_background_verify_rereads_stat_changed_through_the_canonical_seam() {
+        // Embed and server share one contract: a file the stat-check flags as
+        // changed is re-read through the source-anchor seam, not folded into
+        // mismatches unread. Isolate the stat-only path — identical content on
+        // disk and in the snapshot (so spot_verify sees no mismatch), but the
+        // recorded snapshot mtime is older than the on-disk mtime (so stat_check
+        // flags it changed). The re-read then reconciles it.
         let tmp = TempDir::new().unwrap();
         let file_path = tmp.path().join("src").join("main.rs");
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
@@ -6563,7 +7356,7 @@ mod tests {
         // `build_snapshot` re-stats the disk mtime, so the recorded mtime currently
         // equals the on-disk mtime. Force it OLDER so `stat_check_files_from_view`
         // reports the file as changed while the byte-identical content keeps the
-        // spot sample clean — isolating the embed-only fold-in path.
+        // spot sample clean — isolating the stat-changed re-read path.
         snapshot_mtimes.insert("src/main.rs".to_string(), disk_mtime.saturating_sub(1_000));
 
         let loaded = snapshot_to_live_index(snapshot, tmp.path());
@@ -6581,24 +7374,31 @@ mod tests {
         match &published.snapshot_verify_state {
             SnapshotVerifyState::Completed(report) => {
                 assert!(
-                    report.mismatched_paths.contains(&"src/main.rs".to_string()),
-                    "stat-changed file must be folded into mismatches under embed, got {:?}",
-                    report.mismatched_paths
+                    report.mismatched_paths.is_empty() && report.unverified.is_empty(),
+                    "a stat-changed file the re-read reconciles is not a mismatch: {report:?}"
                 );
             }
             other => panic!("expected completed snapshot verify report, got {other:?}"),
         }
-
-        match &*shared.freshness_status() {
-            crate::domain::FreshnessStatus::Degraded { reason_codes, .. } => {
-                assert!(
-                    reason_codes
-                        .contains(&crate::domain::FreshnessReason::SnapshotVerificationFailed),
-                    "expected SnapshotVerificationFailed, got {reason_codes:?}"
-                );
-            }
-            other => panic!("expected Degraded freshness under embed, got {other:?}"),
-        }
+        assert_eq!(
+            shared
+                .read()
+                .files
+                .get("src/main.rs")
+                .map(|file| file.content.as_slice()),
+            Some(b"fn main() {}\n".as_slice()),
+            "the re-read keeps the reconciled row"
+        );
+        assert!(
+            !matches!(
+                &*shared.freshness_status(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes
+                        .contains(&crate::domain::FreshnessReason::SnapshotVerificationFailed)
+            ),
+            "a reconciled verify must not degrade freshness, got {:?}",
+            shared.freshness_status()
+        );
     }
 
     #[test]

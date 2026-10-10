@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::index::{LanguageId, SymbolKind, SymbolRecord};
 use crate::live_index::SharedIndex;
-use crate::live_index::qualified_usages;
 use crate::live_index::query::{
     SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
 };
@@ -24,443 +23,31 @@ pub(crate) fn safe_repo_path(repo_root: &Path, relative_path: &str) -> Result<Pa
         .ok_or_else(|| format!("cannot resolve path '{relative_path}': not found on disk"))
 }
 
-/// Leading text of the refusal for a spelling that reaches a file whose
-/// on-disk name is different. Callers match on it to surface the hint.
-pub(crate) const PATH_SPELLING_DIFFERS: &str = "path spelling differs from the on-disk name";
+/// The refusal-rendering resolver and its spelling-hint prefix live with the
+/// shared read gate so the embedded lanes confine paths identically.
+pub(crate) use crate::index_lifecycle::guidance::read_gate::{
+    PATH_SPELLING_DIFFERS, resolve_repo_path,
+};
 
-/// [`crate::discovery::resolve_repo_path`] with its refusal rendered as the
-/// caller-facing message. `Ok(None)` means nothing exists at that spelling.
-pub(crate) fn resolve_repo_path(
-    repo_root: &Path,
-    relative_path: &str,
-) -> Result<Option<PathBuf>, String> {
-    use crate::discovery::PathRefusal;
-    crate::discovery::resolve_repo_path(repo_root, relative_path).map_err(|refusal| match refusal {
-        PathRefusal::OutsideRoot => format!("path '{relative_path}' is outside the repository"),
-        PathRefusal::Unresolvable(message) => message,
-        PathRefusal::WindowsAlias => format!(
-            "path '{relative_path}' is an alias spelling on Windows (a ':' stream \
-             suffix or a trailing dot or space); use the file's own name"
-        ),
-        // The refusal the on-disk name gets from the read gate.
-        PathRefusal::CredentialAlias(rule_id) => {
-            crate::protocol::format::content_withheld_by_path_rule(relative_path, rule_id)
-        }
-        PathRefusal::SpellingDiffers(None) => PATH_SPELLING_DIFFERS.to_string(),
-        PathRefusal::SpellingDiffers(Some(canonical)) => {
-            format!("{PATH_SPELLING_DIFFERS}; retry with `{canonical}`")
-        }
-    })
-}
-
-/// [`resolve_repo_path`] for lanes that only need its verdict.
-pub(crate) fn refuse_path_alias(repo_root: &Path, relative_path: &str) -> Result<(), String> {
-    resolve_repo_path(repo_root, relative_path).map(|_| ())
-}
-
-// ---------------------------------------------------------------------------
-// Core splice
-// ---------------------------------------------------------------------------
-
-/// Splice `replacement` bytes into `content` at the given byte range [start, end).
-pub(crate) fn apply_splice(content: &[u8], range: (u32, u32), replacement: &[u8]) -> Vec<u8> {
-    let (start, end) = (range.0 as usize, range.1 as usize);
-    let mut result = Vec::with_capacity(content.len() - (end - start) + replacement.len());
-    result.extend_from_slice(&content[..start]);
-    result.extend_from_slice(replacement);
-    result.extend_from_slice(&content[end..]);
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Line ending detection and normalization
-// ---------------------------------------------------------------------------
-
-/// Detected line ending style of a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LineEnding {
-    Lf,
-    CrLf,
-}
-
-impl LineEnding {
-    /// Returns the byte sequence for this line ending.
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        match self {
-            LineEnding::Lf => b"\n",
-            LineEnding::CrLf => b"\r\n",
-        }
-    }
-}
-
-/// Detect the dominant line ending style in file content.
-/// Counts \r\n pairs vs lone \n. If \r\n > lone \n → CrLf, else Lf.
-/// Empty or no-newline content defaults to Lf.
-pub(crate) fn detect_line_ending(content: &[u8]) -> LineEnding {
-    let mut crlf_count: usize = 0;
-    let mut lf_count: usize = 0;
-    let mut i = 0;
-    while i < content.len() {
-        if i + 1 < content.len() && content[i] == b'\r' && content[i + 1] == b'\n' {
-            crlf_count += 1;
-            i += 2;
-        } else if content[i] == b'\n' {
-            lf_count += 1;
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-    if crlf_count > lf_count {
-        LineEnding::CrLf
-    } else {
-        LineEnding::Lf
-    }
-}
-
-/// Normalize line endings in generated/replacement text to match the target style.
-/// 1. Convert \r\n → \n  2. Convert lone \r → \n  3. If target is CrLf, convert \n → \r\n
-pub(crate) fn normalize_line_endings(text: &[u8], target: LineEnding) -> Vec<u8> {
-    // Step 1+2: canonicalize to \n
-    let mut canonical = Vec::with_capacity(text.len());
-    let mut i = 0;
-    while i < text.len() {
-        if i + 1 < text.len() && text[i] == b'\r' && text[i + 1] == b'\n' {
-            canonical.push(b'\n');
-            i += 2;
-        } else if text[i] == b'\r' {
-            canonical.push(b'\n');
-            i += 1;
-        } else {
-            canonical.push(text[i]);
-            i += 1;
-        }
-    }
-    match target {
-        LineEnding::Lf => canonical,
-        LineEnding::CrLf => {
-            let mut result = Vec::with_capacity(canonical.len() * 2);
-            for &byte in &canonical {
-                if byte == b'\n' {
-                    result.extend_from_slice(b"\r\n");
-                } else {
-                    result.push(byte);
-                }
-            }
-            result
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Atomic file write
-// ---------------------------------------------------------------------------
-
-/// Write content to a file atomically: write to a unique temp file in the same directory,
-/// then rename over the target. Using a `NamedTempFile` in the same directory ensures the
-/// rename is within a single filesystem (no cross-device move) and avoids collisions between
-/// concurrent callers that would occur with a fixed `.symforge_tmp` extension.
-#[derive(Debug, Clone)]
-pub(crate) struct AtomicWriteReport {
-    pub tee_snapshot: crate::edit_safety::tee::TeeSnapshot,
-}
-
-/// Wrap an authority refusal for this module's `io::Result` writers.
-fn authority_refused(
-    refusal: crate::live_index::index_lifecycle::authority::AuthorityRefusal,
-) -> std::io::Error {
-    std::io::Error::other(format!("source mutation authority refused: {refusal:?}"))
-}
-
-pub(crate) fn atomic_write_file(
-    repo_root: &Path,
-    project_state_dir: Option<&crate::domain::ProjectStateDir>,
-    path: &Path,
-    content: &[u8],
-) -> std::io::Result<AtomicWriteReport> {
-    // The tee snapshot is a ProjectStateDir state write and stays permit-free
-    // per the frozen writers-category assertion; only the repository-source
-    // byte write below carries mutation authority.
-    let tee_snapshot = match project_state_dir {
-        Some(state_dir) => crate::edit_safety::tee::Tee::for_repo(repo_root, state_dir)
-            .snapshot(path)
-            .unwrap_or_else(|err| crate::edit_safety::tee::TeeSnapshot::Warning {
-                original_path: path.to_path_buf(),
-                message: format!("unexpected tee snapshot error: {err}"),
-            }),
-        None => crate::edit_safety::tee::TeeSnapshot::Warning {
-            original_path: path.to_path_buf(),
-            message: "project state unavailable; tee snapshot disabled".to_string(),
-        },
-    };
-    match path.strip_prefix(repo_root) {
-        Ok(relative) => {
-            // The lease's staged replacement deliberately creates missing
-            // parents beneath the confined root (physical_root.rs); this
-            // seam preserves the V10 refusal instead — pinned by
-            // test_atomic_write_error_path_no_orphan — so an edit-tool
-            // write into a nonexistent directory stays an error, checked
-            // before any grant is spent.
-            match path.parent() {
-                None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "path has no parent directory",
-                    ));
-                }
-                Some(parent) if !parent.exists() => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "target parent directory does not exist",
-                    ));
-                }
-                Some(_) => {}
-            }
-            // T064: the repository-source byte write obtains a current
-            // SourceMutationPermit BEFORE I/O, writes beneath the permit's
-            // own confined lease, and returns to Current only through a
-            // fresh publication. A sibling writer holds the source
-            // non-Current for the length of one write cycle, so a brief
-            // bounded wait stands in for the daemon-level serialization the
-            // C4 root commit makes structural.
-            let authority =
-                crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
-            let mut write = {
-                let mut attempts = 0u32;
-                loop {
-                    match authority.acquire_write() {
-                        Ok(write) => break write,
-                        Err(
-                            refusal @ crate::live_index::index_lifecycle::authority::AuthorityRefusal::PhaseNotCurrent { .. },
-                        ) => {
-                            attempts += 1;
-                            if attempts >= 80 {
-                                // ~2s of sibling-writer patience, then the
-                                // refusal surfaces honestly.
-                                return Err(authority_refused(refusal));
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(25));
-                        }
-                        Err(refusal) => return Err(authority_refused(refusal)),
-                    }
-                }
-            };
-            let receipt = write.write(relative, content).map_err(authority_refused)?;
-            write.finish_committed(receipt).map_err(authority_refused)?;
-        }
-        Err(_) => {
-            // Resolve-hook reroute outside the project root (worktree lane).
-            // Recorded C2 residual: this lane keeps the legacy tempfile
-            // write until the per-root authorities of C3/C4 attach to
-            // resolved targets (execution map, seal section).
-            use std::io::Write;
-            let parent = path.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "path has no parent directory",
-                )
-            })?;
-            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-            tmp.write_all(content)?;
-            tmp.flush()?;
-            tmp.as_file().sync_all()?;
-            // persist() uses rename(2) on Unix and
-            // MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows, atomically
-            // replacing any existing target file.
-            tmp.persist(path).map_err(|e| e.error)?;
-        }
-    }
-    Ok(AtomicWriteReport { tee_snapshot })
-}
-
-/// Outcome of a write-time `if_match` guard check (TR-06 / FR-009).
-///
-/// `Rejected` means the on-disk bytes diverged from the base the splice was
-/// computed against AFTER the caller's read, so the guarded apply is refused
-/// and NOTHING is written — the divergent on-disk content is left intact.
-pub(crate) enum GuardedWriteOutcome {
-    /// The write committed; carries the atomic-write report for the response.
-    Written(AtomicWriteReport),
-    /// The guard rejected the write; the on-disk content is unchanged.
-    Rejected,
-}
-
-/// Test-only interleave hook for the TR-06 regression test.
-///
-/// Installed by the concurrent-change test to simulate a writer that lands
-/// inside the guarded window: it fires INSIDE [`guarded_atomic_write_file`],
-/// strictly BEFORE the write-time on-disk re-read, so the subsequent re-read
-/// observes the injected divergence deterministically (no sleep, no extra
-/// thread). It is compiled out of release builds.
+// Shared structural byte planning for MCP and embedded edits.
 #[cfg(test)]
-mod write_interleave {
-    use std::cell::RefCell;
+use crate::edit_safety::structural::{
+    LineEnding, body_starts_with_doc_comment, collapse_blank_lines,
+    docless_replacement_splice_start,
+};
+pub(crate) use crate::edit_safety::structural::{
+    apply_indentation, apply_splice, build_delete, build_edit_within, build_insert_after,
+    build_insert_before, detect_indentation, detect_line_ending, extend_past_orphaned_docs,
+    normalize_line_endings,
+};
 
-    type Hook = Box<dyn Fn()>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// RAII guard that uninstalls the hook on drop so tests cannot leak it
-    /// across the thread-local into a sibling test on the same thread.
-    pub(crate) struct InterleaveGuard;
-
-    impl Drop for InterleaveGuard {
-        fn drop(&mut self) {
-            HOOK.with(|h| *h.borrow_mut() = None);
-        }
-    }
-
-    /// Install a callback fired at the next guarded-write interleave point.
-    ///
-    /// The hook is consumed on first fire (see [`fire`]), so it runs at most
-    /// once per `install` — a second guarded write on the same thread does not
-    /// re-trigger it. This keeps the T022 interleave deterministic: exactly one
-    /// simulated concurrent write lands in the guarded window.
-    pub(crate) fn install(hook: impl Fn() + 'static) -> InterleaveGuard {
-        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-        InterleaveGuard
-    }
-
-    /// Fire the installed hook if one is present, consuming it so it fires at
-    /// most once. Called from the guarded write path before the on-disk
-    /// re-read. `take()` removes the hook before invoking it so a re-entrant or
-    /// subsequent guarded write does not fire it again.
-    pub(crate) fn fire() {
-        let hook = HOOK.with(|h| h.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-}
-
+// Shared with the embedded edit lane; one admission, lock and write path.
 #[cfg(test)]
-pub(crate) use write_interleave::install as install_write_interleave_hook;
-
-/// Process-global registry of per-path write locks (TR-06 / FR-009, design D1).
-///
-/// Each distinct target file maps to one `Arc<Mutex<()>>`; [`lock_for_path`]
-/// hands out the same mutex for every write to that path so the
-/// re-read → rename critical section in [`guarded_atomic_write_file`] is
-/// serialized PER FILE — unrelated files never contend. `std::sync::Mutex` is
-/// deliberate: the guarded write runs in sync / `spawn_blocking` context and
-/// holds NO `.await` across the lock, so a tokio mutex would be both wrong
-/// (cannot be held across the blocking rename without an async runtime) and
-/// unnecessary.
-///
-/// Memory: the map is never evicted. It is keyed by canonical path, so its
-/// size is bounded by the number of distinct files ever written in the
-/// process — i.e. the repo's file count. That is acceptable; deliberately not
-/// GC'd to keep the lock identity stable for the process lifetime.
-static PATH_WRITE_LOCKS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
-> = std::sync::OnceLock::new();
-
-/// Return the process-global write lock for `key`, creating it on first use.
-///
-/// `key` MUST be a canonicalized path (see [`guarded_atomic_write_file`]) so
-/// symlink / relative / `.`-segment variants of the same file all map to a
-/// single lock and cannot race each other.
-fn lock_for_path(key: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
-    let map =
-        PATH_WRITE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut guard = map.lock().expect("path write-lock map poisoned");
-    std::sync::Arc::clone(
-        guard
-            .entry(key.to_path_buf())
-            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(()))),
-    )
-}
-
-/// Atomic write with a write-time `if_match` optimistic-concurrency guard
-/// (TR-06 / FR-009, design D1).
-///
-/// `base` is the exact byte image the splice in `new_content` was computed
-/// against (the index snapshot, or the rebased worktree target). The entire
-/// re-read → rename critical section runs under a process-global per-path
-/// mutex ([`lock_for_path`], keyed by the canonical path), so two in-process
-/// writers targeting the SAME file are serialized: the second blocks until the
-/// first's rename commits, then — if it supplied `if_match` — its re-read sees
-/// the first's committed bytes (`on_disk != base`) and the apply is REJECTED
-/// with no write, preserving the concurrent change (US3 AC-1).
-///
-/// The per-path lock is taken for EVERY write through this function, including
-/// the `if_match: None` case. That is intentional: if an unguarded write could
-/// slip between a guarded writer's re-read and its rename, the guarded writer
-/// would still clobber it. The re-read/compare itself stays gated on
-/// `if_match.is_some()` (an unguarded write keeps today's last-writer-wins
-/// semantics), but the LOCK is unconditional so the critical section is never
-/// interleaved by another in-process write to the same path.
-///
-/// HONESTY / SCOPE: the per-path mutex serializes ALL in-process writes to a
-/// given path, so two concurrent same-file applies through SymForge cannot
-/// clobber each other. It is NOT an OS-level file lock: a truly external,
-/// non-SymForge process writing the file between the re-read and the rename is
-/// outside this lock and is not serialized by it. For SymForge's own
-/// multi-agent workflow — every writer funnels through the same in-process
-/// server — the clobber is closed on every surface (in-process facade, daemon,
-/// serve). The residual is the external-editor case only.
-pub(crate) fn guarded_atomic_write_file(
-    repo_root: &Path,
-    project_state_dir: Option<&crate::domain::ProjectStateDir>,
-    path: &Path,
-    base: &[u8],
-    new_content: &[u8],
-    if_match: Option<&str>,
-) -> std::io::Result<GuardedWriteOutcome> {
-    // Pin the path once: canonicalize so symlink / relative variants resolve to
-    // the same lock key AND so the re-read and the write operate on the same
-    // resolved path (mitigates symlink TOCTOU on the re-read). Fall back to the
-    // caller's path if canonicalize fails (e.g. parent dir not yet canonical on
-    // some platforms); the lock map then keys on the non-canonical path, which
-    // is still consistent within the process for that exact path value.
-    // Symlink assumption: the canonical key collapses symlink aliases to one
-    // lock, so concurrent SymForge writers cannot race through different aliases
-    // of the same file.
-    let pinned = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-
-    // Acquire the per-path lock and HOLD it across BOTH the on-disk re-read and
-    // the atomic rename. `_write_lock` lives to the end of the function, so the
-    // whole critical section is serialized against any other in-process write to
-    // this path. No `.await` exists in this function — the std mutex is correct.
-    let lock = lock_for_path(&pinned);
-    let _write_lock = lock.lock().expect("per-path write lock poisoned");
-
-    // Deterministic test interleave point: a concurrent writer "lands" here,
-    // strictly before the on-disk re-read below (no-op in release). It fires
-    // INSIDE the lock by design — the T022 hook simulates a writer that already
-    // committed before this writer entered the critical section.
-    #[cfg(test)]
-    write_interleave::fire();
-
-    if if_match.is_some() {
-        // Re-read the bytes actually on disk right now and compare to the
-        // base image the splice was computed against. Divergence => a writer
-        // changed the file after the caller's read; reject without writing.
-        // Re-read via the pinned (canonical) path so we compare the same file
-        // we are about to write.
-        match std::fs::read(&pinned) {
-            Ok(on_disk) => {
-                if on_disk.as_slice() != base {
-                    return Ok(GuardedWriteOutcome::Rejected);
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    atomic_write_file(repo_root, project_state_dir, path, new_content)
-        .map(GuardedWriteOutcome::Written)
-}
-
-pub(crate) fn format_tee_snapshot_suffix(report: &AtomicWriteReport) -> String {
-    report
-        .tee_snapshot
-        .response_hint()
-        .map(|hint| format!("\n{hint}"))
-        .unwrap_or_default()
-}
+pub(crate) use crate::edit_safety::atomic_write::install_write_interleave_hook;
+pub(crate) use crate::edit_safety::atomic_write::{
+    AtomicWriteReport, GuardedWriteOutcome, atomic_write_file, format_tee_snapshot_suffix,
+    guarded_atomic_write_file,
+};
 
 fn append_response_suffix_to_first_summary(summaries: &mut Vec<String>, suffix: &str) {
     let suffix = suffix.trim_start_matches('\n');
@@ -477,6 +64,53 @@ fn append_response_suffix_to_first_summary(summaries: &mut Vec<String>, suffix: 
         first.push_str(&indented);
     } else {
         summaries.push(indented);
+    }
+}
+
+fn commit_protocol_batch_images(
+    repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
+    images: &[crate::edit_safety::batch_commit::StagedImage],
+    operation: &str,
+) -> Result<(), String> {
+    use crate::edit_safety::batch_commit::{BatchAbort, ProtocolBatchIo, commit_staged};
+
+    let mut io = ProtocolBatchIo {
+        repo_root,
+        project_state_dir,
+    };
+    match commit_staged(images, &mut io, None) {
+        Ok(_) => Ok(()),
+        Err(BatchAbort::Conflict { index }) => Err(format!(
+            "Write conflict for {}: on-disk bytes changed after staging. No {operation} was applied.",
+            images[index].relative.display(),
+        )),
+        Err(BatchAbort::PreflightUnavailable { index }) => Err(format!(
+            "Write failed for {}: source pre-image could not be verified. No {operation} was applied.",
+            images[index].relative.display(),
+        )),
+        Err(BatchAbort::WriteFailed {
+            index,
+            reason,
+            restored,
+            uncertain,
+        }) => {
+            if uncertain.is_empty() {
+                Err(format!(
+                    "Write failed for {}: {reason}\n\nROLLED BACK — {restored} file(s) restored to original content. No {operation} was applied.",
+                    images[index].relative.display(),
+                ))
+            } else {
+                Err(format!(
+                    "Write failed for {}: {reason}\n\nROLLBACK INCOMPLETE — {} file(s) could not be verified. Manually verify affected files.",
+                    images[index].relative.display(),
+                    uncertain.len(),
+                ))
+            }
+        }
+        Err(BatchAbort::Cancelled { .. }) => {
+            unreachable!("MCP batch operations do not pass a cancellation signal")
+        }
     }
 }
 
@@ -665,14 +299,20 @@ fn line_ending_insensitive_eq(a: &[u8], b: &[u8]) -> bool {
 /// worktree target the way the single-symbol tools do. Until that refactor
 /// lands, a rerouted batch write onto a target that differs from the indexed
 /// content would silently destroy earlier routed edits — so refuse it loudly
-/// instead. A rerouted batch onto a byte-identical target stays allowed.
+/// instead. A rerouted batch onto a byte-identical (or line-ending-only
+/// different) target stays allowed.
+///
+/// Returns the preimage the batch must stage against: the target bytes this
+/// guard actually read and admitted. A CRLF worktree checkout of an LF
+/// indexed file is admitted, so staging the indexed bytes instead would make
+/// the commit's exact-bytes check refuse the write it was just allowed.
 pub(crate) fn guard_batch_reroute_divergence(
     resolved: &crate::worktree::ResolvedTarget,
     indexed_content: &[u8],
     relative_path: &str,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     if !resolved.rerouted {
-        return Ok(());
+        return Ok(indexed_content.to_vec());
     }
     let target_bytes = std::fs::read(&resolved.target_path).map_err(|e| {
         format!(
@@ -682,7 +322,7 @@ pub(crate) fn guard_batch_reroute_divergence(
     })?;
     if target_bytes == indexed_content || line_ending_insensitive_eq(&target_bytes, indexed_content)
     {
-        return Ok(());
+        return Ok(target_bytes);
     }
     Err(format!(
         "Error: rerouted batch edit refused for '{relative_path}': the worktree target {} has \
@@ -882,633 +522,11 @@ pub(crate) fn resolve_or_error(
 }
 
 // ---------------------------------------------------------------------------
-// Indentation utilities
-// ---------------------------------------------------------------------------
-
-/// Detect the leading whitespace on the line containing `byte_offset`.
-pub(crate) fn detect_indentation(content: &[u8], byte_offset: u32) -> Vec<u8> {
-    let offset = byte_offset as usize;
-    let line_start = content[..offset]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map(|p| p + 1)
-        .unwrap_or(0);
-    let indent_end = content[line_start..]
-        .iter()
-        .position(|b| !b.is_ascii_whitespace() || *b == b'\n')
-        .unwrap_or(0);
-    content[line_start..line_start + indent_end].to_vec()
-}
-
-/// The longest leading-whitespace prefix common to every line of `lines` that
-/// has non-whitespace content (blank / whitespace-only lines are ignored). This
-/// is the body's uniform base indent — empty when any content line is already
-/// flush-left (the normal case). Mirrors the prefix `textwrap.dedent` strips.
-fn common_leading_whitespace<'a>(lines: &[&'a str]) -> &'a str {
-    let mut common: Option<&'a str> = None;
-    for raw in lines {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if line.trim().is_empty() {
-            continue;
-        }
-        let ws = &line[..line.len() - line.trim_start().len()];
-        common = Some(match common {
-            None => ws,
-            Some(prev) => {
-                let max = prev.len().min(ws.len());
-                let (pb, wb) = (prev.as_bytes(), ws.as_bytes());
-                let mut end = 0;
-                while end < max && pb[end] == wb[end] {
-                    end += 1;
-                }
-                &prev[..end]
-            }
-        });
-        if common == Some("") {
-            break;
-        }
-    }
-    common.unwrap_or("")
-}
-
-/// Re-column `text` to `indent`: strip the body's uniform base indent, then
-/// prefix each non-empty line with `indent`, using the given line ending.
-///
-/// Stripping the common base indent first means a body the caller pasted at
-/// some other column (e.g. an 8-space chat-context indent) is re-columned to
-/// exactly the symbol's `indent` rather than COMPOUNDING to base+indent. When
-/// the body is already flush-left (its first content line has no leading
-/// whitespace — the normal case) the base is empty and this is a pure prefix,
-/// so existing callers are unaffected.
-pub(crate) fn apply_indentation(text: &str, indent: &[u8], line_ending: LineEnding) -> Vec<u8> {
-    let mut result = Vec::new();
-    // Use split('\n') instead of lines() so that trailing newlines produce a trailing
-    // empty element, preserving them. str::lines() silently strips all trailing newlines.
-    let parts: Vec<&str> = text.split('\n').collect();
-    let base = common_leading_whitespace(&parts);
-    for (i, line) in parts.iter().enumerate() {
-        // Strip '\r' left behind by split('\n') on CRLF input; re-emit via line_ending.
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if i > 0 {
-            result.extend_from_slice(line_ending.as_bytes());
-        }
-        if !line.is_empty() {
-            // Dedent the uniform base, then apply the symbol's column.
-            let dedented = line.strip_prefix(base).unwrap_or(line);
-            result.extend_from_slice(indent);
-            result.extend_from_slice(dedented.as_bytes());
-        }
-    }
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Insert helpers
-// ---------------------------------------------------------------------------
-
-/// Build the bytes to insert before a symbol: indented content + separator + existing content.
-/// Splices at the start of the line (before existing indentation) so indentation isn't doubled.
-/// Uses `\n\n` when the target symbol has no doc comments and no blank line already precedes
-/// the splice point (visual separation between definitions), and `\n` otherwise (avoids triple
-/// newlines when a blank line already exists, and keeps doc comments tight against their symbol).
-pub(crate) fn build_insert_before(
-    file_content: &[u8],
-    sym: &SymbolRecord,
-    new_code: &str,
-    line_ending: LineEnding,
-) -> Vec<u8> {
-    let sym_start = sym.effective_start() as usize;
-    let line_start = file_content[..sym_start]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map(|p| p + 1)
-        .unwrap_or(0) as u32;
-    let indent = detect_indentation(file_content, sym.byte_range.0);
-    let normalized = normalize_line_endings(new_code.as_bytes(), line_ending);
-    let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_code);
-    let indented = apply_indentation(normalized_str, &indent, line_ending);
-    let mut insertion = indented;
-    let le = line_ending.as_bytes();
-    let separator: Vec<u8> = if sym.doc_byte_range.is_some() {
-        le.to_vec()
-    } else {
-        // Use single newline only when a blank line already precedes the symbol
-        // (avoids creating triple-newline sequences). At start-of-file (empty prefix),
-        // there's no existing blank line, so use double newline for visual separation.
-        let prefix = &file_content[..line_start as usize];
-        let already_has_blank = match line_ending {
-            LineEnding::CrLf => {
-                prefix.len() >= 4
-                    && prefix[prefix.len() - 2] == b'\r'
-                    && prefix[prefix.len() - 1] == b'\n'
-                    && prefix[prefix.len() - 4] == b'\r'
-                    && prefix[prefix.len() - 3] == b'\n'
-            }
-            LineEnding::Lf => {
-                prefix.len() >= 2
-                    && prefix[prefix.len() - 1] == b'\n'
-                    && prefix[prefix.len() - 2] == b'\n'
-            }
-        };
-        if already_has_blank {
-            le.to_vec()
-        } else {
-            let mut sep = Vec::with_capacity(le.len() * 2);
-            sep.extend_from_slice(le);
-            sep.extend_from_slice(le);
-            sep
-        }
-    };
-    insertion.extend_from_slice(&separator);
-    apply_splice(file_content, (line_start, line_start), &insertion)
-}
-
-/// Build the bytes to insert after a symbol: existing content + blank line + indented content.
-///
-/// Handles the C/C++ quirk where struct/enum/class definitions end their tree-sitter
-/// node at `}` while the actual declaration includes a trailing `;`.  When the byte
-/// immediately following the symbol end (skipping spaces/tabs) is `;`, the insertion
-/// point moves past it so the result stays syntactically valid.
-pub(crate) fn build_insert_after(
-    file_content: &[u8],
-    sym: &SymbolRecord,
-    new_code: &str,
-    line_ending: LineEnding,
-) -> Vec<u8> {
-    let indent = detect_indentation(file_content, sym.byte_range.0);
-    let normalized = normalize_line_endings(new_code.as_bytes(), line_ending);
-    let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_code);
-    let indented = apply_indentation(normalized_str, &indent, line_ending);
-    let le = line_ending.as_bytes();
-    let mut insertion = Vec::new();
-    insertion.extend_from_slice(le);
-    insertion.extend_from_slice(le);
-    insertion.extend_from_slice(&indented);
-    // Skip past a trailing `;` that belongs to the parent declaration (C/C++
-    // struct/enum/class: tree-sitter node ends at `}`, declaration at `};`).
-    let insert_pos = skip_trailing_semicolon(file_content, sym.byte_range.1 as usize) as u32;
-    apply_splice(file_content, (insert_pos, insert_pos), &insertion)
-}
-
-/// If the byte(s) immediately after `pos` (skipping spaces and tabs, but not
-/// newlines) form a `;`, return the position just past it.  Otherwise return `pos`.
-fn skip_trailing_semicolon(content: &[u8], pos: usize) -> usize {
-    let mut i = pos;
-    while i < content.len() && (content[i] == b' ' || content[i] == b'\t') {
-        i += 1;
-    }
-    if i < content.len() && content[i] == b';' {
-        i + 1
-    } else {
-        pos
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Delete helper
-// ---------------------------------------------------------------------------
-
-/// Build file content with the symbol removed, including leading whitespace and trailing newlines.
-/// Collapses runs of 3+ consecutive blank lines down to 1 after deletion.
-/// Scan upward from `line_start` to include orphaned doc comments when
-/// `doc_byte_range` is `None`. Returns the (possibly earlier) byte offset
-/// that includes the orphaned comments. Used by `build_delete` and
-/// `replace_symbol_body` to handle blank-line-separated doc comments.
-pub(crate) fn extend_past_orphaned_docs(
-    file_content: &[u8],
-    line_start: usize,
-    sym: &SymbolRecord,
-) -> usize {
-    if sym.doc_byte_range.is_some() {
-        return line_start;
-    }
-    let above = &file_content[..line_start];
-    let lines: Vec<&[u8]> = above.split(|&b| b == b'\n').collect();
-    let mut i = lines.len();
-    // Skip trailing empty element from split
-    if i > 0 && lines[i - 1].is_empty() {
-        i -= 1;
-    }
-    // Skip exactly one blank line
-    if i > 0 && lines[i - 1].iter().all(|b| b.is_ascii_whitespace()) {
-        i -= 1;
-        // Collect consecutive comment lines above the blank line
-        let mut found_comments = false;
-        while i > 0 {
-            let line_text = std::str::from_utf8(lines[i - 1]).unwrap_or("");
-            let trimmed = line_text.trim_start();
-            if trimmed.starts_with("///")
-                || trimmed.starts_with("//!")
-                || trimmed.starts_with("/**")
-                || trimmed.starts_with("* ")
-                || trimmed == "*/"
-                || trimmed.starts_with("# ")
-                || trimmed == "#"
-            {
-                found_comments = true;
-                i -= 1;
-            } else {
-                break;
-            }
-        }
-        if found_comments {
-            // split('\n') leaves \r in slices for CRLF; +1 accounts for the \n separator
-            return lines[..i].iter().map(|l| l.len() + 1).sum();
-        }
-    }
-    line_start
-}
-
-/// Walk upward from `line_start` (the first byte of the symbol's opening
-/// line) and include contiguous Rust outer-attribute lines (`#[...]`) that sit
-/// directly above the item with no blank line between. Attributes belong to
-/// the item; leaving them behind on a delete orphans them onto the following
-/// item — for example a stray `#[test]` that then fails to compile. Inner
-/// attributes (`#![...]`) are not consumed (they belong to the enclosing
-/// scope), and only the leading line of a multi-line attribute is recognized,
-/// which is never worse than the previous behaviour of consuming none.
-fn extend_past_leading_attributes(file_content: &[u8], line_start: usize) -> usize {
-    let mut start = line_start;
-    while start > 0 {
-        // `start` sits just past a '\n'; find the bounds of the line above it.
-        let prev_line_end = start - 1;
-        let prev_line_start = file_content[..prev_line_end]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        let line = &file_content[prev_line_start..prev_line_end];
-        let trimmed = std::str::from_utf8(line).unwrap_or("").trim();
-        if trimmed.starts_with("#[") {
-            start = prev_line_start;
-        } else {
-            break;
-        }
-    }
-    start
-}
-
-/// Whether `body` begins (first non-blank line) with a doc-comment marker.
-///
-/// Used by `replace_symbol_body` to decide whether the caller intends to
-/// supply fresh docs for the symbol. When true, the splice range extends
-/// past the existing docs so the old ones are replaced. When false, the
-/// splice starts at the signature line so attached docs are preserved.
-///
-/// Conservative on purpose: only matches markers that are unambiguously
-/// doc comments across the grammars SymForge indexes. Line comments like
-/// `//` and `#` are NOT counted because they may be ordinary code
-/// comments or, for `#`, Rust attributes (e.g., `#[inline]`).
-pub(crate) fn body_starts_with_doc_comment(body: &str) -> bool {
-    let Some(first) = body.lines().find(|l| !l.trim().is_empty()) else {
-        return false;
-    };
-    let trimmed = first.trim_start();
-    trimmed.starts_with("///")
-        || trimmed.starts_with("//!")
-        || trimmed.starts_with("/**")
-        || trimmed.starts_with("/*!")
-        || trimmed.starts_with("#[doc")
-}
-
-/// Return the splice start for a docless replacement.
-///
-/// Normally this is the start of the symbol's source line. When a doc marker
-/// shares the line with the symbol, preserve the marker and its separator, then
-/// replace the old modifiers/signature with the caller's `new_body`.
-pub(crate) fn docless_replacement_splice_start(
-    file_content: &[u8],
-    raw_line_start: usize,
-    symbol_start: usize,
-) -> usize {
-    if raw_line_start >= symbol_start || symbol_start > file_content.len() {
-        return raw_line_start;
-    }
-
-    let prefix = &file_content[raw_line_start..symbol_start];
-    same_line_doc_prefix_end(prefix)
-        .map(|end| raw_line_start + end)
-        .unwrap_or(raw_line_start)
-}
-
-fn same_line_doc_prefix_end(prefix: &[u8]) -> Option<usize> {
-    let Ok(text) = std::str::from_utf8(prefix) else {
-        return None;
-    };
-    let leading = text.len() - text.trim_start().len();
-    let trimmed = &text[leading..];
-
-    if trimmed.starts_with("/**") || trimmed.starts_with("/*!") {
-        let marker_end = trimmed.find("*/")? + 2;
-        let after_padding = trimmed[marker_end..]
-            .find(|c: char| !c.is_whitespace())
-            .map(|pos| marker_end + pos)
-            .unwrap_or(trimmed.len());
-        return Some(leading + after_padding);
-    }
-
-    if trimmed.starts_with("#[doc") {
-        let marker_end = trimmed.find(']')? + 1;
-        let after_padding = trimmed[marker_end..]
-            .find(|c: char| !c.is_whitespace())
-            .map(|pos| marker_end + pos)
-            .unwrap_or(trimmed.len());
-        return Some(leading + after_padding);
-    }
-
-    None
-}
-
-pub(crate) fn build_delete(
-    file_content: &[u8],
-    sym: &SymbolRecord,
-    line_ending: LineEnding,
-) -> Vec<u8> {
-    // Extend to start of line (include leading whitespace, attached attributes,
-    // and orphaned doc comments).
-    let start = {
-        let s = sym.effective_start() as usize;
-        let line_start = file_content[..s]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        // Consume contiguous outer-attribute lines (`#[...]`) directly above the
-        // item so they are removed with it instead of being orphaned onto the
-        // next item (e.g. a stray `#[test]`, which then fails to compile).
-        let after_attrs = extend_past_leading_attributes(file_content, line_start);
-        extend_past_orphaned_docs(file_content, after_attrs, sym) as u32
-    };
-    // Extend past trailing newlines (consume up to one blank line).
-    // CRLF-aware: on CRLF files, a line ending is \r\n not just \n.
-    let end = {
-        let e = sym.byte_range.1 as usize;
-        let mut pos = e;
-        // Skip to end of current line (past any trailing non-newline chars).
-        while pos < file_content.len() && file_content[pos] != b'\n' {
-            pos += 1;
-        }
-        // Consume the \n (or \r\n).
-        if pos < file_content.len() && file_content[pos] == b'\n' {
-            pos += 1;
-        }
-        // Consume one more blank line if present.
-        match line_ending {
-            LineEnding::CrLf => {
-                if pos + 1 < file_content.len()
-                    && file_content[pos] == b'\r'
-                    && file_content[pos + 1] == b'\n'
-                {
-                    pos += 2;
-                }
-            }
-            LineEnding::Lf => {
-                if pos < file_content.len() && file_content[pos] == b'\n' {
-                    pos += 1;
-                }
-            }
-        }
-        pos as u32
-    };
-    let spliced = apply_splice(file_content, (start, end), b"");
-    collapse_blank_lines(&spliced, line_ending)
-}
-
-/// Collapse runs of 3+ consecutive newlines down to 2 (one blank line).
-/// On CRLF files, counts `\r\n` pairs; on LF files, counts `\n` bytes.
-fn collapse_blank_lines(content: &[u8], line_ending: LineEnding) -> Vec<u8> {
-    let mut result = Vec::with_capacity(content.len());
-    match line_ending {
-        LineEnding::Lf => {
-            let mut consecutive_newlines = 0u32;
-            for &b in content {
-                if b == b'\n' {
-                    consecutive_newlines += 1;
-                    if consecutive_newlines <= 2 {
-                        result.push(b);
-                    }
-                } else {
-                    consecutive_newlines = 0;
-                    result.push(b);
-                }
-            }
-        }
-        LineEnding::CrLf => {
-            // Count \r\n pairs as line endings; threshold at 2 pairs (one blank line).
-            let mut consecutive_line_endings = 0u32;
-            let mut i = 0;
-            while i < content.len() {
-                if i + 1 < content.len() && content[i] == b'\r' && content[i + 1] == b'\n' {
-                    consecutive_line_endings += 1;
-                    if consecutive_line_endings <= 2 {
-                        result.push(b'\r');
-                        result.push(b'\n');
-                    }
-                    i += 2;
-                } else {
-                    consecutive_line_endings = 0;
-                    result.push(content[i]);
-                    i += 1;
-                }
-            }
-        }
-    }
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Edit-within helper
-// ---------------------------------------------------------------------------
-
-/// Find-and-replace text within a symbol's byte range. Returns (new_content, replacement_count).
-pub(crate) fn build_edit_within(
-    file_content: &[u8],
-    sym: &SymbolRecord,
-    old_text: &str,
-    new_text: &str,
-    replace_all: bool,
-) -> Result<(Vec<u8>, usize), String> {
-    let sym_start = sym.effective_start() as usize;
-    let sym_end = sym.byte_range.1 as usize;
-    let body = &file_content[sym_start..sym_end];
-    let body_str =
-        std::str::from_utf8(body).map_err(|_| "Symbol body is not valid UTF-8.".to_string())?;
-
-    // Callers (LLMs) almost always supply `\n`-separated text regardless of the
-    // file's on-disk convention. Normalize both the search needle and the
-    // replacement to the file's dominant line ending so matches succeed in
-    // CRLF files and the splice never introduces mixed line endings.
-    let line_ending = detect_line_ending(file_content);
-    let needle = String::from_utf8(normalize_line_endings(old_text.as_bytes(), line_ending))
-        .map_err(|_| "Normalized search text is not valid UTF-8.".to_string())?;
-    let replacement = String::from_utf8(normalize_line_endings(new_text.as_bytes(), line_ending))
-        .map_err(|_| "Normalized replacement text is not valid UTF-8.".to_string())?;
-
-    let (new_body, count) = if replace_all {
-        let count = body_str.matches(needle.as_str()).count();
-        if count == 0 {
-            return Err(format!(
-                "`{old_text}` not found within symbol `{}`",
-                sym.name
-            ));
-        }
-        (
-            body_str.replace(needle.as_str(), replacement.as_str()),
-            count,
-        )
-    } else {
-        match body_str.find(needle.as_str()) {
-            Some(_) => (
-                body_str.replacen(needle.as_str(), replacement.as_str(), 1),
-                1,
-            ),
-            None => {
-                return Err(format!(
-                    "`{old_text}` not found within symbol `{}`",
-                    sym.name
-                ));
-            }
-        }
-    };
-
-    let effective_range = (sym.effective_start(), sym.byte_range.1);
-    let new_content = apply_splice(file_content, effective_range, new_body.as_bytes());
-    Ok((new_content, count))
-}
-
-// ---------------------------------------------------------------------------
 // Whitespace-flexible matching fallback
 // ---------------------------------------------------------------------------
 
-/// Return the leading whitespace of the first non-blank line.
-fn indent_of_first_nonempty<'a>(lines: &[&'a str]) -> &'a str {
-    for line in lines {
-        let trimmed = line.trim_start();
-        if !trimmed.is_empty() {
-            return &line[..line.len() - trimmed.len()];
-        }
-    }
-    ""
-}
-
-/// Re-indent `line` from `old_base` indentation to `file_base`.
-fn reindent_line(line: &str, old_base: &str, file_base: &str) -> String {
-    if line.trim().is_empty() {
-        return String::new();
-    }
-    match line.strip_prefix(old_base) {
-        Some(rest) => format!("{file_base}{rest}"),
-        None => {
-            // Line has different indent depth than the base.
-            let line_indent = line.len() - line.trim_start().len();
-            let old_indent = old_base.len();
-            if line_indent < old_indent {
-                // Less indented (e.g. closing brace) — preserve relative de-indent.
-                let deficit = old_indent - line_indent;
-                if file_base.len() > deficit {
-                    format!(
-                        "{}{}",
-                        &file_base[..file_base.len() - deficit],
-                        line.trim_start()
-                    )
-                } else {
-                    line.trim_start().to_string()
-                }
-            } else {
-                // More indented but prefix mismatch (tabs vs spaces mix).
-                let extra = &line[old_indent..line_indent];
-                format!("{file_base}{extra}{}", line.trim_start())
-            }
-        }
-    }
-}
-
-/// Attempt a whitespace-flexible find-and-replace within `body`.
-///
-/// When an exact match of `old_text` fails, this tries matching lines
-/// with leading whitespace stripped.  If found, `new_text` is re-indented
-/// to match the file's actual indentation before replacement.
-///
-/// Returns `Some((new_body, count))` on success, `None` if no flexible
-/// match is found either.
-pub(crate) fn try_whitespace_flexible_replace(
-    body: &str,
-    old_text: &str,
-    new_text: &str,
-    replace_all: bool,
-) -> Option<(String, usize)> {
-    let body_lines: Vec<&str> = body.lines().collect();
-    let old_lines: Vec<&str> = old_text.lines().collect();
-
-    if old_lines.is_empty() || old_lines.iter().all(|l| l.trim().is_empty()) {
-        return None;
-    }
-
-    let old_trimmed: Vec<&str> = old_lines.iter().map(|l| l.trim_start()).collect();
-    let window = old_trimmed.len();
-
-    // Find matching positions (line-aligned, trimmed comparison).
-    let mut matches: Vec<usize> = Vec::new();
-    for start in 0..=body_lines.len().saturating_sub(window) {
-        let hit = old_trimmed
-            .iter()
-            .enumerate()
-            .all(|(i, ot)| body_lines[start + i].trim_start() == *ot);
-        if hit {
-            matches.push(start);
-            if !replace_all {
-                break;
-            }
-        }
-    }
-
-    if matches.is_empty() {
-        return None;
-    }
-
-    // Pre-compute byte offset of each line start.
-    let mut line_starts: Vec<usize> = vec![0];
-    for (i, b) in body.bytes().enumerate() {
-        if b == b'\n' {
-            line_starts.push(i + 1);
-        }
-    }
-
-    let count = matches.len();
-    let mut result = body.to_string();
-
-    // Process in reverse so earlier byte offsets remain valid.
-    for &m in matches.iter().rev() {
-        let byte_start = line_starts[m];
-        let byte_end = if m + window < line_starts.len() {
-            line_starts[m + window]
-        } else {
-            body.len()
-        };
-
-        let matched_lines = &body_lines[m..m + window];
-        let old_base = indent_of_first_nonempty(&old_lines);
-        let file_base = indent_of_first_nonempty(matched_lines);
-
-        let reindented: Vec<String> = new_text
-            .lines()
-            .map(|l| reindent_line(l, old_base, file_base))
-            .collect();
-        let mut replacement = reindented.join("\n");
-
-        // Preserve trailing newline when the matched region included one.
-        if byte_end > byte_start
-            && result.as_bytes().get(byte_end - 1) == Some(&b'\n')
-            && !replacement.ends_with('\n')
-        {
-            replacement.push('\n');
-        }
-
-        result.replace_range(byte_start..byte_end, &replacement);
-    }
-
-    Some((result, count))
-}
+#[cfg(test)]
+pub(crate) use crate::edit_safety::structural::try_whitespace_flexible_replace;
 
 // ---------------------------------------------------------------------------
 // Input structs for tool handlers
@@ -2010,6 +1028,104 @@ pub(crate) fn execute_batch_edit(
                 }
             }
         }
+        let file = {
+            let guard = index.read();
+            guard
+                .capture_shared_file(path)
+                .ok_or_else(|| format!("File disappeared: {path}"))?
+        };
+        if indices.iter().any(|&index| {
+            resolved[index].sym.effective_start() as usize > file.content.len()
+                || resolved[index].sym.byte_range.1 as usize > file.content.len()
+        }) {
+            continue; // The existing Phase 3 stale-span refusal reports the exact target.
+        }
+        let line_ending = detect_line_ending(&file.content);
+        let footprints = indices
+            .iter()
+            .map(|&index| {
+                let symbol = &resolved[index].sym;
+                match &edits[resolved[index].operation].operation {
+                    EditOperation::InsertBefore { .. } => {
+                        crate::edit_safety::structural::SpliceFootprint::Insert(
+                            crate::edit_safety::structural::insert_before_position(
+                                &file.content,
+                                symbol,
+                            ),
+                        )
+                    }
+                    EditOperation::InsertAfter { .. } => {
+                        crate::edit_safety::structural::SpliceFootprint::Insert(
+                            crate::edit_safety::structural::insert_after_position(
+                                &file.content,
+                                symbol,
+                            ),
+                        )
+                    }
+                    EditOperation::Delete => {
+                        let (start, end) = crate::edit_safety::structural::delete_source_range(
+                            &file.content,
+                            symbol,
+                            line_ending,
+                        );
+                        crate::edit_safety::structural::SpliceFootprint::Bytes(start, end)
+                    }
+                    EditOperation::Replace { new_body } => {
+                        let (start, end) =
+                            crate::edit_safety::structural::replacement_splice_range(
+                                &file.content,
+                                symbol,
+                                new_body,
+                            )
+                            .unwrap_or((symbol.effective_start(), symbol.byte_range.1));
+                        crate::edit_safety::structural::SpliceFootprint::Bytes(start, end)
+                    }
+                    EditOperation::EditWithin { .. } => {
+                        crate::edit_safety::structural::SpliceFootprint::Bytes(
+                            symbol.effective_start(),
+                            symbol.byte_range.1,
+                        )
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        for left in 0..footprints.len() {
+            for right in (left + 1)..footprints.len() {
+                if crate::edit_safety::structural::splice_footprints_overlap(
+                    footprints[left],
+                    footprints[right],
+                ) {
+                    return Err(format!(
+                        "Overlapping splice footprints in {path}. Split into separate calls.{}",
+                        rollback_footer(&targeted_paths),
+                    ));
+                }
+            }
+        }
+        for (position, &index) in indices.iter().enumerate() {
+            if !matches!(
+                &edits[resolved[index].operation].operation,
+                EditOperation::Delete
+            ) {
+                continue;
+            }
+            let cleanup = crate::edit_safety::structural::delete_cleanup_ranges(
+                &file.content,
+                &resolved[index].sym,
+                line_ending,
+            );
+            if footprints.iter().enumerate().any(|(other, footprint)| {
+                other != position
+                    && crate::edit_safety::structural::cleanup_invalidates_splice(
+                        &cleanup, *footprint,
+                    )
+            }) {
+                return Err(format!(
+                    "Overlapping delete cleanup in {path}. Split into separate calls.{}",
+                    rollback_footer(&targeted_paths),
+                ));
+            }
+        }
     }
 
     // Phase 2: Sort each file's edits reverse by byte offset.
@@ -2172,12 +1288,12 @@ pub(crate) fn execute_batch_edit(
         // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
         // a diverged rerouted target — this batch's splices were resolved
         // against the index snapshot, not the worktree file.
-        guard_batch_reroute_divergence(&resolved_target, &file.content, path)?;
+        let original = guard_batch_reroute_divergence(&resolved_target, &file.content, path)?;
         let abs_path = resolved_target.target_path.clone();
         staged.push(StagedFile {
             path: path.clone(),
             abs_path,
-            original: file.content.clone(),
+            original,
             new_content: content,
             language,
             summaries: file_summaries,
@@ -2196,79 +1312,64 @@ pub(crate) fn execute_batch_edit(
         return Ok((summaries, Vec::new()));
     }
 
-    // Phase 4: Apply all writes, rolling back any already-written files on failure.
-    let mut written: Vec<usize> = Vec::new();
+    // Phase 4: the shared staged kernel checks every on-disk base under ordered
+    // path locks, then writes and verifies all postimages. Its rollback never
+    // overwrites an unexpected third image.
+    let images = staged
+        .iter()
+        .map(|file| crate::edit_safety::batch_commit::StagedImage {
+            relative: PathBuf::from(&file.path),
+            absolute: file.abs_path.clone(),
+            original: Some(file.original.clone()),
+            replacement: file.new_content.clone(),
+            owner_only: false,
+        })
+        .collect::<Vec<_>>();
+    let mut io = crate::edit_safety::batch_commit::ProtocolBatchIo {
+        repo_root,
+        project_state_dir,
+    };
     let mut write_reports: Vec<Option<AtomicWriteReport>> = vec![None; staged.len()];
-    let mut write_error: Option<String> = None;
-    for (i, staged_file) in staged.iter().enumerate() {
-        match atomic_write_file(
-            repo_root,
-            project_state_dir,
-            &staged_file.abs_path,
-            &staged_file.new_content,
-        ) {
-            Ok(report) => {
-                write_reports[i] = Some(report);
-            }
-            Err(e) => {
-                write_error = Some(format!("Write failed for {}: {e}", staged_file.path));
-                break;
+    match crate::edit_safety::batch_commit::commit_staged(&images, &mut io, None) {
+        Ok(reports) => {
+            for (index, report) in reports {
+                write_reports[index] = Some(report);
             }
         }
-        written.push(i);
-    }
-
-    if let Some(err_msg) = write_error {
-        let mut rollback_failures: Vec<String> = Vec::new();
-        for &written_index in &written {
-            let staged_file = &staged[written_index];
-            if let Err(rb_err) = atomic_write_file(
-                repo_root,
-                project_state_dir,
-                &staged_file.abs_path,
-                &staged_file.original,
-            ) {
-                rollback_failures.push(format!("  {}: {rb_err}", staged_file.path));
-                continue;
-            }
-            match std::fs::read(&staged_file.abs_path) {
-                Ok(on_disk) => {
-                    reindex_after_write(
-                        index,
-                        &staged_file.abs_path,
-                        &staged_file.path,
-                        &on_disk,
-                        staged_file.language,
-                    );
-                }
-                Err(rb_err) => {
-                    rollback_failures.push(format!(
-                        "  {} (reindex after rollback): {rb_err}",
-                        staged_file.path
-                    ));
-                }
-            }
-        }
-
-        if rollback_failures.is_empty() {
+        Err(crate::edit_safety::batch_commit::BatchAbort::Conflict { index }) => {
             return Err(format!(
-                "{err_msg}\n\nROLLED BACK — {} file(s) restored to original content. No batch edit was applied.",
-                written.len(),
-            ));
-        } else {
-            return Err(format!(
-                "{err_msg}\n\nROLLBACK INCOMPLETE — {} file(s) could not be restored:\n{}\nWARNING: codebase may be in a partially-edited state. Manually verify the following files:\n{}",
-                rollback_failures.len(),
-                rollback_failures.join("\n"),
-                written
-                    .iter()
-                    .map(|&written_index| format!("  {}", staged[written_index].path))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                "Write conflict for {}; on-disk bytes changed after staging. No batch edit was applied.",
+                staged[index].path,
             ));
         }
+        Err(crate::edit_safety::batch_commit::BatchAbort::PreflightUnavailable { index }) => {
+            return Err(format!(
+                "Write failed preflight for {}; source pre-image could not be verified. No batch edit was applied.",
+                staged[index].path,
+            ));
+        }
+        Err(crate::edit_safety::batch_commit::BatchAbort::WriteFailed {
+            index,
+            reason,
+            restored,
+            uncertain,
+        }) => {
+            if uncertain.is_empty() {
+                return Err(format!(
+                    "Write failed for {}: {reason}\n\nROLLED BACK — {restored} file(s) restored to original content. No batch edit was applied.",
+                    staged[index].path,
+                ));
+            }
+            return Err(format!(
+                "Write failed for {}: {reason}\n\nROLLBACK INCOMPLETE — {} file(s) could not be verified. Manually verify affected files.",
+                staged[index].path,
+                uncertain.len(),
+            ));
+        }
+        Err(crate::edit_safety::batch_commit::BatchAbort::Cancelled { .. }) => {
+            unreachable!("MCP batch edit does not pass a cancellation signal")
+        }
     }
-
     // Phase 5: All writes succeeded — reindex every file and return summaries.
     let mut summaries = Vec::new();
     for (i, staged_file) in staged.iter().enumerate() {
@@ -2345,44 +1446,8 @@ pub struct BatchRenameInput {
     pub working_directory: Option<String>,
 }
 
-/// Validate rename ranges for a single file. Sorts descending, deduplicates exact matches,
-/// validates bounds/text/overlaps. Mutates `ranges` in place.
-fn validate_rename_ranges(
-    ranges: &mut Vec<(u32, u32)>,
-    original: &[u8],
-    old_name: &str,
-    file_path: &str,
-) -> Result<(), String> {
-    let old_bytes = old_name.as_bytes();
-
-    // Sort descending by (start, end) — current code only sorts by start
-    ranges.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-    ranges.dedup();
-
-    // Validate bounds and text match; remove ranges that don't match (xref may
-    // produce wider ranges for qualified paths like crate::Widget).
-    ranges.retain(|&(start, end)| {
-        if start >= end || end as usize > original.len() {
-            return false;
-        }
-        let actual = &original[start as usize..end as usize];
-        actual == old_bytes
-    });
-
-    // Check overlaps: ranges sorted descending, so prev.start >= curr.start
-    for window in ranges.windows(2) {
-        let prev = window[0]; // higher offset
-        let curr = window[1]; // lower offset
-        if curr.1 > prev.0 {
-            return Err(format!(
-                "{file_path}: overlapping ranges ({}, {}) and ({}, {})",
-                curr.0, curr.1, prev.0, prev.1
-            ));
-        }
-    }
-
-    Ok(())
-}
+#[cfg(test)]
+use crate::edit_safety::rename::validate_rename_ranges;
 
 /// Rename a symbol and all its references across the project.
 pub(crate) fn execute_batch_rename(
@@ -2391,348 +1456,39 @@ pub(crate) fn execute_batch_rename(
     project_state_dir: Option<&crate::domain::ProjectStateDir>,
     input: &BatchRenameInput,
 ) -> Result<(String, Vec<std::path::PathBuf>), String> {
-    // Phase 1: Resolve the definition and find the name within its body.
-    // `target_owner` is the resolved target's enclosing-`impl` owner type (019
-    // recall-recovery): for `Target::new`, `Some("Target")`. `None` when the
-    // def is not inside an `impl` (free fn, non-Rust container) — those keep the
-    // ambiguity demote/drop behavior unchanged.
-    let (def_name_range, language, target_owner) = {
-        let guard = index.read();
-        let file = guard
+    // Resolve through MCP's selector, then use the same reference/ambiguity
+    // planner as embedded rename against this coherent index read.
+    let rename_plan = {
+        let live = index.read();
+        let file = live
             .get_file(&input.path)
             .ok_or_else(|| format!("File not indexed: {}", input.path))?;
-        let (_, sym) =
+        let (_, symbol) =
             resolve_or_error(file, &input.name, input.kind.as_deref(), input.symbol_line)?;
-        let body = &file.content[sym.byte_range.0 as usize..sym.byte_range.1 as usize];
-        let name_offset = body
-            .windows(input.name.len())
-            .position(|w| w == input.name.as_bytes())
-            .ok_or_else(|| {
-                format!(
-                    "Could not locate name `{}` within symbol body at {}:{}-{}",
-                    input.name, input.path, sym.byte_range.0, sym.byte_range.1
-                )
-            })?;
-        let abs_start = sym.byte_range.0 + name_offset as u32;
-        let abs_end = abs_start + input.name.len() as u32;
-        let owner = crate::live_index::enclosing_impl_owner(&file.symbols, sym.line_range.0);
-        ((abs_start, abs_end), file.language, owner)
+        crate::edit_safety::rename::build_rename_plan(
+            &live,
+            file,
+            &symbol,
+            &crate::edit_safety::rename::RenamePlanInput {
+                path: input.path.clone(),
+                name: input.name.clone(),
+                code_only: input.code_only.unwrap_or(false),
+            },
+        )?
     };
-
-    // Phase 2: Find all references across the project. Carry each ref's
-    // `qualified_name` (019 recall-recovery): the immediate qualifier lets the
-    // ambiguity gate recover `Target::new()` call sites whose qualifier matches
-    // the resolved target's owner.
-    let ref_sites: Vec<(String, (u32, u32), Option<String>)> = {
-        let guard = index.read();
-        let refs = guard.find_references_for_name(&input.name, None, false);
-        refs.into_iter()
-            .map(|(path, rr)| (path.to_string(), rr.byte_range, rr.qualified_name.clone()))
-            .collect()
-    };
-
-    // Filter ref_sites by code_only
-    let mut ref_sites: Vec<(String, (u32, u32), Option<String>)> =
-        if input.code_only.unwrap_or(false) {
-            ref_sites
-                .into_iter()
-                .filter(|(path, _, _)| {
-                    let ext = path.rsplit('.').next().unwrap_or("");
-                    match crate::domain::index::LanguageId::from_extension(ext) {
-                        None => false,
-                        Some(lang) => !crate::parsing::config_extractors::is_config_language(&lang),
-                    }
-                })
-                .collect()
-        } else {
-            ref_sites
-        };
-
-    // Phase 2b: Supplemental qualified-path scan with confidence classification.
-    // The xref index tracks call targets (e.g. "new" in Widget::new()), not
-    // path prefixes. find_qualified_usages catches Type::method() patterns,
-    // import paths, and any other qualified usage the xref system doesn't index.
-    // Matches are split into confident (code context) and uncertain (comments/strings).
-    //
-    // We collect file content snapshots under the lock, then run the scan outside it.
-    let file_contents: Vec<(String, Vec<u8>)> = {
-        let guard = index.read();
-        guard
-            .files
-            .iter()
-            .filter(|(path, _)| {
-                if !input.code_only.unwrap_or(false) {
-                    return true;
-                }
-                let ext = path.rsplit('.').next().unwrap_or("");
-                match crate::domain::index::LanguageId::from_extension(ext) {
-                    None => false,
-                    Some(lang) => !crate::parsing::config_extractors::is_config_language(&lang),
-                }
-            })
-            .map(|(path, file)| (path.clone(), file.content.clone()))
-            .collect()
-    };
-
-    // Collect confident and uncertain supplemental matches separately.
-    // Each entry: (file_path, byte_range (start, end))
-    let mut qualified_confident: Vec<(String, (u32, u32))> = Vec::new();
-    // Uncertain entries also carry the display context string for the warning block.
-    let mut qualified_uncertain: Vec<(String, u32, String)> = Vec::new(); // (path, line, context)
-
-    let qualified_inputs =
-        file_contents
-            .iter()
-            .map(|(path, content)| qualified_usages::QualifiedFileContent {
-                file_path: path.as_str(),
-                content: content.as_slice(),
-            });
-    for usage in qualified_usages::collect_qualified_usages(&input.name, qualified_inputs) {
-        if usage.confident {
-            qualified_confident.push((usage.file_path, usage.byte_range));
-        } else {
-            qualified_uncertain.push((usage.file_path, usage.line, usage.context));
-        }
-    }
-
-    // Phase 2c: Ambiguity gate (P0 safety) with owner-name recall recovery.
-    // Count how many DEFINITIONS the index holds for `input.name`. The bare-name
-    // reverse-index refs (`ref_sites`) and the unscoped qualified matches
-    // (`qualified_confident`) both key on the leaf name only, so for a name with
-    // 2+ definitions they cannot be attributed to the resolved target definition
-    // by the leaf alone (e.g. renaming `Target::new` must not rewrite
-    // `SomeOther::new`).
-    //
-    // 019 recall-recovery: a qualified ref whose IMMEDIATE QUALIFIER equals the
-    // resolved target's `impl` OWNER (`Target::new()` when renaming Target's
-    // `new`) IS attributable and stays writable — BUT ONLY when that owner name
-    // is UNIQUE among the ambiguous defs' owners. If two unrelated `impl Target`
-    // exist, the qualifier can't disambiguate, so we fall back to demoting. Bare
-    // (unqualified) refs and refs whose qualifier != owner still demote.
-    let def_count = {
-        let guard = index.read();
-        guard
-            .files
-            .values()
-            .flat_map(|file| file.symbols.iter())
-            .filter(|sym| sym.name == input.name)
-            .count()
-    };
-    if def_count >= 2 {
-        // Owner-uniqueness guard: count how many defs of `input.name` share the
-        // resolved target's owner name. Recovery is sound only when EXACTLY ONE
-        // does (mirrors resolve_ambiguous_callee's "matched >1 -> drop"). A `None`
-        // target owner (free fn / non-Rust container) never recovers.
-        let owner_is_unique = if let Some(owner) = target_owner.as_deref() {
-            let guard = index.read();
-            let same_owner_defs = guard
-                .files
-                .values()
-                .flat_map(|file| {
-                    file.symbols.iter().filter_map(move |sym| {
-                        if sym.name != input.name {
-                            return None;
-                        }
-                        crate::live_index::enclosing_impl_owner(&file.symbols, sym.line_range.0)
-                    })
-                })
-                .filter(|o| o == owner)
-                .count();
-            same_owner_defs == 1
-        } else {
-            false
-        };
-
-        // Immediate qualifier of a `qualified_name` string: the segment right
-        // before the leaf (`Target::new` -> `Target`; `a::b::Foo::new` -> `Foo`).
-        let immediate_qualifier = |qn: &str| -> Option<String> {
-            let segs: Vec<&str> = qn
-                .split(['.', ':'])
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            match segs.len() {
-                0 | 1 => None,
-                n => Some(segs[n - 2].to_string()),
-            }
-        };
-        // Immediate qualifier for a byte-scanned match: the identifier ending at
-        // the `::` immediately before the leaf at `leaf_start`.
-        let qualifier_before = |content: &[u8], leaf_start: u32| -> Option<String> {
-            let leaf_start = leaf_start as usize;
-            if leaf_start < 2
-                || leaf_start > content.len()
-                || content[leaf_start - 2] != b':'
-                || content[leaf_start - 1] != b':'
-            {
-                return None;
-            }
-            let end = leaf_start - 2;
-            let mut start = end;
-            while start > 0 {
-                let b = content[start - 1];
-                if b == b'_' || b.is_ascii_alphanumeric() {
-                    start -= 1;
-                } else {
-                    break;
-                }
-            }
-            if start == end {
-                return None;
-            }
-            // Guard the byte slice against multi-byte UTF-8 splits before decode.
-            while start < end && (content[start] & 0b1100_0000) == 0b1000_0000 {
-                start += 1;
-            }
-            std::str::from_utf8(&content[start..end])
-                .ok()
-                .map(|s| s.to_string())
-        };
-
-        // Keep-writable predicate: recovery only when the owner is unique AND the
-        // ref's immediate qualifier equals that owner.
-        let recovers = |qualifier: Option<&str>| -> bool {
-            owner_is_unique
-                && match (qualifier, target_owner.as_deref()) {
-                    (Some(q), Some(owner)) => q == owner,
-                    _ => false,
-                }
-        };
-
-        // Convert each demoted (path, byte_range) site into an uncertain
-        // (path, line, context) tuple so it flows through the existing
-        // uncertain-warning block instead of the confident write set.
-        let demote = |path: &str, start: u32, sink: &mut Vec<(String, u32, String)>| {
-            let content = file_contents
-                .iter()
-                .find(|(p, _)| p == path)
-                .map(|(_, c)| c.as_slice())
-                .unwrap_or(&[]);
-            let text = String::from_utf8_lossy(content);
-            let start = (start as usize).min(text.len());
-            let line = text[..start].bytes().filter(|&b| b == b'\n').count() + 1;
-            let context = text.lines().nth(line - 1).unwrap_or("").trim().to_string();
-            sink.push((path.to_string(), line as u32, context));
-        };
-
-        // Partition ref_sites: keep owner-recovered, demote the rest.
-        let mut kept_refs: Vec<(String, (u32, u32), Option<String>)> = Vec::new();
-        for (path, range, qn) in ref_sites.drain(..) {
-            let qualifier = qn.as_deref().and_then(immediate_qualifier);
-            if recovers(qualifier.as_deref()) {
-                kept_refs.push((path, range, qn));
-            } else {
-                demote(&path, range.0, &mut qualified_uncertain);
-            }
-        }
-        ref_sites = kept_refs;
-
-        // Partition qualified_confident the same way, parsing the qualifier out
-        // of the scanned file content (byte-scan matches carry no qualified_name).
-        let mut kept_qual: Vec<(String, (u32, u32))> = Vec::new();
-        for (path, range) in qualified_confident.drain(..) {
-            let content = file_contents
-                .iter()
-                .find(|(p, _)| *p == path)
-                .map(|(_, c)| c.as_slice())
-                .unwrap_or(&[]);
-            let qualifier = qualifier_before(content, range.0);
-            if recovers(qualifier.as_deref()) {
-                kept_qual.push((path, range));
-            } else {
-                demote(&path, range.0, &mut qualified_uncertain);
-            }
-        }
-        qualified_confident = kept_qual;
-    }
-
-    // Phase 3: Group rename sites by file.
-    // Confident sources: definition site, indexed refs, qualified confident matches.
-    // Uncertain matches are NOT applied — only surfaced in output.
-    let mut by_file: std::collections::HashMap<String, Vec<(u32, u32)>> =
-        std::collections::HashMap::new();
-    by_file
-        .entry(input.path.clone())
-        .or_default()
-        .push(def_name_range);
-    for (path, range, _qn) in &ref_sites {
-        by_file.entry(path.clone()).or_default().push(*range);
-    }
-    for (path, range) in &qualified_confident {
-        by_file.entry(path.clone()).or_default().push(*range);
-    }
-    // Validate, sort descending, dedup, and check for overlaps.
-    for (path, ranges) in by_file.iter_mut() {
-        let file = {
-            let guard = index.read();
-            guard
-                .capture_shared_file(path)
-                .ok_or_else(|| format!("File disappeared: {path}"))?
-        };
-        validate_rename_ranges(ranges, &file.content, &input.name, path)?;
-    }
-
-    // Build uncertain warning lines sorted by file then line, deduped.
-    let mut sorted_uncertain = qualified_uncertain.clone();
-    sorted_uncertain.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    sorted_uncertain.dedup();
-    let uncertain_lines: Vec<String> = sorted_uncertain
-        .iter()
-        .map(|(path, line, ctx)| format!("  {}:{}  {}", path, line, ctx))
-        .collect();
-
-    // Dry run: return preview without writing, with separate confident/uncertain sections.
     if input.dry_run.unwrap_or(false) {
-        // Cap per-site preview lines per file to keep output bounded on hub
-        // files renamed across many sites.
-        const MAX_PREVIEW_SITES_PER_FILE: usize = 10;
-        let total_confident: usize = by_file.values().map(|r| r.len()).sum();
-        let mut lines = vec![format!("Dry run: `{}` → `{}`", input.name, input.new_name,)];
-        lines.push(format!(
-            "\n── Confident matches (will be applied) — {} site(s) across {} file(s) ──",
-            total_confident,
-            by_file.len(),
-        ));
-        let mut sorted_files: Vec<_> = by_file.iter().collect();
-        sorted_files.sort_by_key(|(p, _)| (*p).clone());
-        for (path, ranges) in sorted_files {
-            lines.push(format!("  {} ({} site(s))", path, ranges.len()));
-            // Per-site detail: render `L<line>: <trimmed source line>` for each
-            // confident site, ascending by byte offset (ranges are stored
-            // descending). Best-effort: skip detail if the file content is
-            // unavailable in the index.
-            let file = {
-                let guard = index.read();
-                guard.capture_shared_file(path)
-            };
-            if let Some(file) = file {
-                let content = String::from_utf8_lossy(&file.content);
-                let mut ascending: Vec<(u32, u32)> = ranges.clone();
-                ascending.sort_by_key(|(start, _)| *start);
-                for (start, _end) in ascending.iter().take(MAX_PREVIEW_SITES_PER_FILE) {
-                    let line_no = content[..(*start as usize).min(content.len())]
-                        .bytes()
-                        .filter(|&b| b == b'\n')
-                        .count()
-                        + 1;
-                    let src_line = content.lines().nth(line_no - 1).unwrap_or("").trim();
-                    lines.push(format!("    L{line_no}: {src_line}"));
-                }
-                let overflow = ranges.len().saturating_sub(MAX_PREVIEW_SITES_PER_FILE);
-                if overflow > 0 {
-                    lines.push(format!("    … and {overflow} more"));
-                }
-            }
-        }
-        if !uncertain_lines.is_empty() {
-            lines.push(format!(
-                "\n── Uncertain matches (NOT applied — review manually) — {} site(s) ──",
-                uncertain_lines.len(),
-            ));
-            lines.extend(uncertain_lines);
-        }
-        return Ok((lines.join("\n"), Vec::new()));
+        let live = index.read();
+        let rendered = crate::edit_safety::rename::render_rename_preview(
+            &live,
+            &rename_plan,
+            &input.name,
+            &input.new_name,
+        );
+        return Ok((rendered, Vec::new()));
     }
+    let by_file = rename_plan.by_file;
+    let uncertain_lines = rename_plan.uncertain_lines;
+    let language = rename_plan.language;
 
     // Phase 4: Atomic rename — stage all new content in memory first, then write all.
     // On any write failure, roll back already-written files to their original content.
@@ -2797,7 +1553,7 @@ pub(crate) fn execute_batch_rename(
         // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
         // a diverged rerouted target — rename ranges were validated against
         // the index snapshot, not the worktree file.
-        guard_batch_reroute_divergence(&resolved_target, &original, path)?;
+        let original = guard_batch_reroute_divergence(&resolved_target, &original, path)?;
         staged.push(StagedFile {
             path: path.clone(),
             abs_path: resolved_target.target_path.clone(),
@@ -2810,61 +1566,26 @@ pub(crate) fn execute_batch_rename(
         });
     }
 
-    // Apply: write each staged file; on failure roll back already-written files.
-    let mut written: Vec<usize> = Vec::new(); // indices into staged
-    let mut write_error: Option<String> = None;
-    for (i, sf) in staged.iter().enumerate() {
-        if let Err(e) =
-            atomic_write_file(repo_root, project_state_dir, &sf.abs_path, &sf.new_content)
-        {
-            write_error = Some(format!("Write failed for {}: {e}", sf.path));
-            break;
-        }
-        written.push(i);
-    }
-
-    if let Some(err_msg) = write_error {
-        // Rollback: restore every file that was already written.
-        let mut rollback_failures: Vec<String> = Vec::new();
-        for &wi in &written {
-            let sf = &staged[wi];
-            if let Err(rb_err) =
-                atomic_write_file(repo_root, project_state_dir, &sf.abs_path, &sf.original)
-            {
-                rollback_failures.push(format!("  {}: {rb_err}", sf.path));
-                continue;
-            }
-            // Re-read from disk and reindex to ensure index matches disk.
-            match std::fs::read(&sf.abs_path) {
-                Ok(on_disk) => {
-                    reindex_after_write(index, &sf.abs_path, &sf.path, &on_disk, sf.language);
-                }
-                Err(rb_err) => {
-                    rollback_failures
-                        .push(format!("  {} (reindex after rollback): {rb_err}", sf.path));
-                }
+    // Commit the staged postimages through the shared preflight/rollback kernel.
+    let images = staged
+        .iter()
+        .map(|file| crate::edit_safety::batch_commit::StagedImage {
+            relative: PathBuf::from(&file.path),
+            absolute: file.abs_path.clone(),
+            original: Some(file.original.clone()),
+            replacement: file.new_content.clone(),
+            owner_only: false,
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) =
+        commit_protocol_batch_images(repo_root, project_state_dir, &images, "rename")
+    {
+        for file in &staged {
+            if let Ok(on_disk) = std::fs::read(&file.abs_path) {
+                reindex_after_write(index, &file.abs_path, &file.path, &on_disk, file.language);
             }
         }
-        if rollback_failures.is_empty() {
-            return Err(format!(
-                "{err_msg}\n\nROLLED BACK — {} file(s) restored to original content. \
-                 No rename was applied.",
-                written.len(),
-            ));
-        } else {
-            return Err(format!(
-                "{err_msg}\n\nROLLBACK INCOMPLETE — {} file(s) could not be restored:\n{}\n\
-                 WARNING: codebase may be in a partially-renamed state. \
-                 Manually verify the following files:\n{}",
-                rollback_failures.len(),
-                rollback_failures.join("\n"),
-                written
-                    .iter()
-                    .map(|&wi| format!("  {}", staged[wi].path))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ));
-        }
+        return Err(error);
     }
 
     // All writes succeeded — reindex every file.
@@ -3193,11 +1914,11 @@ pub(crate) fn execute_batch_insert(
         // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
         // a diverged rerouted target — these insert anchors were resolved
         // against the index snapshot, not the worktree file.
-        guard_batch_reroute_divergence(&resolved_target, &file.content, &path)?;
+        let original = guard_batch_reroute_divergence(&resolved_target, &file.content, &path)?;
         staged.push(StagedFile {
             path: path.clone(),
             abs_path: resolved_target.target_path.clone(),
-            original: file.content.clone(),
+            original,
             new_content: content,
             language: resolved[indices[0]].language,
             summaries: file_summaries,
@@ -3216,70 +1937,25 @@ pub(crate) fn execute_batch_insert(
         return Ok((summaries, Vec::new()));
     }
 
-    let mut written: Vec<usize> = Vec::new();
-    let mut write_error: Option<String> = None;
-    for (i, staged_file) in staged.iter().enumerate() {
-        if let Err(e) = atomic_write_file(
-            repo_root,
-            project_state_dir,
-            &staged_file.abs_path,
-            &staged_file.new_content,
-        ) {
-            write_error = Some(format!("Write failed for {}: {e}", staged_file.path));
-            break;
-        }
-        written.push(i);
-    }
-
-    if let Some(err_msg) = write_error {
-        let mut rollback_failures: Vec<String> = Vec::new();
-        for &written_index in &written {
-            let staged_file = &staged[written_index];
-            if let Err(rb_err) = atomic_write_file(
-                repo_root,
-                project_state_dir,
-                &staged_file.abs_path,
-                &staged_file.original,
-            ) {
-                rollback_failures.push(format!("  {}: {rb_err}", staged_file.path));
-                continue;
-            }
-            match std::fs::read(&staged_file.abs_path) {
-                Ok(on_disk) => {
-                    reindex_after_write(
-                        index,
-                        &staged_file.abs_path,
-                        &staged_file.path,
-                        &on_disk,
-                        staged_file.language,
-                    );
-                }
-                Err(rb_err) => {
-                    rollback_failures.push(format!(
-                        "  {} (reindex after rollback): {rb_err}",
-                        staged_file.path
-                    ));
-                }
+    let images = staged
+        .iter()
+        .map(|file| crate::edit_safety::batch_commit::StagedImage {
+            relative: PathBuf::from(&file.path),
+            absolute: file.abs_path.clone(),
+            original: Some(file.original.clone()),
+            replacement: file.new_content.clone(),
+            owner_only: false,
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) =
+        commit_protocol_batch_images(repo_root, project_state_dir, &images, "batch insert")
+    {
+        for file in &staged {
+            if let Ok(on_disk) = std::fs::read(&file.abs_path) {
+                reindex_after_write(index, &file.abs_path, &file.path, &on_disk, file.language);
             }
         }
-
-        if rollback_failures.is_empty() {
-            return Err(format!(
-                "{err_msg}\n\nROLLED BACK — {} file(s) restored to original content. No batch insert was applied.",
-                written.len(),
-            ));
-        }
-
-        return Err(format!(
-            "{err_msg}\n\nROLLBACK INCOMPLETE — {} file(s) could not be restored:\n{}\nWARNING: codebase may be in a partially-inserted state. Manually verify the following files:\n{}",
-            rollback_failures.len(),
-            rollback_failures.join("\n"),
-            written
-                .iter()
-                .map(|&written_index| format!("  {}", staged[written_index].path))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
+        return Err(error);
     }
 
     let mut summaries = Vec::new();
@@ -4510,6 +3186,91 @@ mod tests {
         let result = execute_batch_edit(&handle, dir.path(), None, &edits, false, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Overlapping"));
+    }
+
+    #[test]
+    fn test_execute_batch_edit_rejects_same_line_delete_insert_splice_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let original = b"pub fn first() {} pub fn second() {}\n";
+        std::fs::write(src.join("a.rs"), original).unwrap();
+        let handle = crate::live_index::LiveIndex::empty();
+        let parsed = crate::parsing::process_file("src/a.rs", original, LanguageId::Rust);
+        handle.update_file(
+            "src/a.rs".to_string(),
+            IndexedFile::from_parse_result(parsed, original.to_vec()),
+        );
+        let edits = vec![
+            SingleEdit {
+                path: "src/a.rs".to_string(),
+                name: "first".to_string(),
+                kind: None,
+                symbol_line: None,
+                operation: EditOperation::Delete,
+                working_directory: None,
+            },
+            SingleEdit {
+                path: "src/a.rs".to_string(),
+                name: "second".to_string(),
+                kind: None,
+                symbol_line: None,
+                operation: EditOperation::InsertBefore {
+                    content: "pub fn helper() {}".to_string(),
+                },
+                working_directory: None,
+            },
+        ];
+        let error = execute_batch_edit(&handle, dir.path(), None, &edits, false, None)
+            .expect_err("physical splice ranges overlap");
+        assert!(error.contains("Overlapping"), "{error}");
+        assert_eq!(std::fs::read(src.join("a.rs")).unwrap(), original);
+    }
+
+    #[test]
+    fn test_execute_batch_edit_rejects_delete_cleanup_that_shifts_another_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let original = format!(
+            "pub fn first() {{}}\n{}pub fn second() {{}}\npub fn third() {{}}\npub fn fourth() {{ let marker = 1234567890; }}\n",
+            "\n".repeat(31)
+        );
+        std::fs::write(src.join("a.rs"), original.as_bytes()).unwrap();
+        let handle = crate::live_index::LiveIndex::empty();
+        let parsed =
+            crate::parsing::process_file("src/a.rs", original.as_bytes(), LanguageId::Rust);
+        handle.update_file(
+            "src/a.rs".to_string(),
+            IndexedFile::from_parse_result(parsed, original.as_bytes().to_vec()),
+        );
+        let edits = vec![
+            SingleEdit {
+                path: "src/a.rs".to_string(),
+                name: "second".to_string(),
+                kind: None,
+                symbol_line: None,
+                operation: EditOperation::InsertBefore {
+                    content: "pub fn helper() {}".to_string(),
+                },
+                working_directory: None,
+            },
+            SingleEdit {
+                path: "src/a.rs".to_string(),
+                name: "third".to_string(),
+                kind: None,
+                symbol_line: None,
+                operation: EditOperation::Delete,
+                working_directory: None,
+            },
+        ];
+        let error = execute_batch_edit(&handle, dir.path(), None, &edits, false, None)
+            .expect_err("delete cleanup changes the other captured anchor");
+        assert!(error.contains("delete cleanup"), "{error}");
+        assert_eq!(
+            std::fs::read(src.join("a.rs")).unwrap(),
+            original.as_bytes()
+        );
     }
 
     #[test]

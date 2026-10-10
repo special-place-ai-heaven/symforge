@@ -1,0 +1,308 @@
+diff --git a/src/live_index/frecency.rs b/src/live_index/frecency.rs
+index eadd2c2d..896c1895 100644
+--- a/src/live_index/frecency.rs
++++ b/src/live_index/frecency.rs
+@@ -27,6 +27,10 @@ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex, OnceLock};
+ 
+ use crate::domain::ProjectStateDir;
++#[cfg(feature = "embed")]
++use crate::live_index::index_lifecycle::activation::ProjectSourceAuthority;
++#[cfg(feature = "embed")]
++use crate::live_index::index_lifecycle::physical_root::PhysicalRootLease;
+ 
+ /// Half-life for frecency decay, in seconds. 7 days.
+ pub const HALF_LIFE_SECS: i64 = 7 * 24 * 60 * 60;
+@@ -144,6 +148,49 @@ impl FrecencyStore {
+         Ok(())
+     }
+ 
++    #[cfg(feature = "embed")]
++    fn bind_admitted_identity(
++        &self,
++        source_key: [u8; 16],
++        state_key: [u8; 16],
++        initialize: bool,
++    ) -> Result<(), String> {
++        const BINDING_META: &str = "embed_admitted_physical_binding_v1";
++        let expected = format!("{}:{}", hex_key(source_key), hex_key(state_key));
++        let mut conn = self.conn.lock().expect("frecency mutex poisoned");
++        let tx = conn.transaction().map_err(|_| "bound frecency state is unavailable".to_string())?;
++        let stored: Option<String> = tx
++            .query_row(
++                "SELECT value FROM meta WHERE key = ?1",
++                params![BINDING_META],
++                |row| row.get(0),
++            )
++            .optional()
++            .map_err(|_| "bound frecency identity is unreadable".to_string())?;
++        match stored {
++            Some(stored) if stored == expected => {}
++            Some(_) => return Err("bound frecency physical identity changed".to_string()),
++            None if initialize => {
++                let rows: i64 = tx
++                    .query_row("SELECT COUNT(*) FROM frecency", [], |row| row.get(0))
++                    .map_err(|_| "bound frecency history is unreadable".to_string())?;
++                if rows != 0 {
++                    return Err("unbound frecency history requires explicit reconciliation".to_string());
++                }
++                tx.execute(
++                    "INSERT INTO meta(key, value) VALUES (?1, ?2)",
++                    params![BINDING_META, expected],
++                )
++                .map_err(|_| "bound frecency identity could not be stored".to_string())?;
++                tx.execute("DELETE FROM meta WHERE key = ?1", params![META_LAST_HEAD])
++                    .map_err(|_| "bound frecency metadata could not be reset".to_string())?;
++            }
++            None => return Err("unbound frecency history cannot be attributed to this source".to_string()),
++        }
++        tx.commit()
++            .map_err(|_| "bound frecency identity could not be committed".to_string())
++    }
++
+     /// Bump the given paths at `now_ts`. Each path increments `hit_count` by 1
+     /// and sets `last_access_ts = now_ts`. The caller is responsible for
+     /// deduplicating within a single invocation (per the Implementation Notes
+@@ -486,6 +533,208 @@ pub fn ranking_scores_for_paths(
+     }))
+ }
+ 
++#[cfg(feature = "embed")]
++pub(crate) struct BoundFrecencyContext<'a> {
++    pub repo_root: &'a Path,
++    pub project_state: Option<&'a ProjectStateDir>,
++    pub source_authority: &'a ProjectSourceAuthority,
++    pub state_anchor: Option<(&'a PhysicalRootLease, [u8; 16])>,
++}
++
++#[cfg(feature = "embed")]
++#[derive(Clone, Hash, PartialEq, Eq)]
++struct BoundPersistentKey {
++    db_path: PathBuf,
++    repo_root: PathBuf,
++    source_key: [u8; 16],
++    state_key: [u8; 16],
++}
++
++#[cfg(feature = "embed")]
++#[derive(Clone, Hash, PartialEq, Eq)]
++struct BoundSessionKey {
++    repo_root: PathBuf,
++    source_key: [u8; 16],
++}
++
++#[cfg(feature = "embed")]
++impl BoundFrecencyContext<'_> {
++    fn source_key(&self) -> Result<[u8; 16], String> {
++        if self.source_authority.admitted_root() != self.repo_root {
++            return Err("bound frecency source root changed".to_string());
++        }
++        self.source_authority
++            .verify_physical_root_anchor()
++            .map_err(|_| "bound frecency source root is unavailable".to_string())?;
++        self.source_authority
++            .physical_root_stable_key()
++            .ok_or_else(|| "bound frecency source identity is unavailable".to_string())
++    }
++
++    fn persistent_key(&self) -> Result<BoundPersistentKey, String> {
++        let source_key = self.source_key()?;
++        let project_state = self
++            .project_state
++            .ok_or_else(|| "bound frecency persistent state is unavailable".to_string())?;
++        let (parked, state_key) = self
++            .state_anchor
++            .ok_or_else(|| "bound frecency state identity is unavailable".to_string())?;
++        let opened = parked
++            .reopened_matching_stable_key(state_key)
++            .map_err(|_| "bound frecency state directory changed".to_string())?;
++        if opened.root() != project_state.as_path() {
++            return Err("bound frecency state selection changed".to_string());
++        }
++        Ok(BoundPersistentKey {
++            db_path: frecency_db_path(project_state),
++            repo_root: self.repo_root.to_path_buf(),
++            source_key,
++            state_key,
++        })
++    }
++}
++
++#[cfg(feature = "embed")]
++fn hex_key(key: [u8; 16]) -> String {
++    key.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++#[cfg(feature = "embed")]
++fn bound_persistent_cache() -> &'static Mutex<HashMap<BoundPersistentKey, Arc<FrecencyStore>>> {
++    static CACHE: OnceLock<Mutex<HashMap<BoundPersistentKey, Arc<FrecencyStore>>>> = OnceLock::new();
++    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++#[cfg(feature = "embed")]
++fn bound_session_cache() -> &'static Mutex<HashMap<BoundSessionKey, Arc<FrecencyStore>>> {
++    static CACHE: OnceLock<Mutex<HashMap<BoundSessionKey, Arc<FrecencyStore>>>> = OnceLock::new();
++    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++#[cfg(feature = "embed")]
++fn bound_session_store(context: &BoundFrecencyContext<'_>) -> Result<Arc<FrecencyStore>, String> {
++    let key = BoundSessionKey {
++        repo_root: context.repo_root.to_path_buf(),
++        source_key: context.source_key()?,
++    };
++    let mut cache = bound_session_cache()
++        .lock()
++        .map_err(|_| "bound frecency session cache is unavailable".to_string())?;
++    if let Some(store) = cache.get(&key) {
++        return Ok(Arc::clone(store));
++    }
++    let store = Arc::new(FrecencyStore::open_in_memory().map_err(|_| "bound frecency session store is unavailable".to_string())?);
++    cache.insert(key, Arc::clone(&store));
++    Ok(store)
++}
++
++/// Commit against a cache entry bound to both admitted physical identities.
++/// `initialize` runs before the store becomes visible to concurrent callers;
++/// it must use a previously retained Git read view, never reacquire source
++/// authority while this cache lock is held. SQLite database, WAL, and SHM path
++/// operations rely on the selected state directory's protected host boundary;
++/// this identity check alone does not confine SQLite's pathname opens.
++#[cfg(feature = "embed")]
++pub(crate) fn bound_bump(
++    context: &BoundFrecencyContext<'_>,
++    paths: &[PathBuf],
++    initialize: impl FnOnce(&FrecencyStore) -> Result<(), String>,
++) -> Result<(), String> {
++    if paths.is_empty() {
++        return Ok(());
++    }
++    let policy = collection_policy_from_env();
++    let store = match policy {
++        crate::capability::FrecencyCollectionPolicy::Disabled => return Ok(()),
++        crate::capability::FrecencyCollectionPolicy::Session => bound_session_store(context)?,
++        crate::capability::FrecencyCollectionPolicy::Persistent => {
++            let key = context.persistent_key()?;
++            let mut cache = bound_persistent_cache()
++                .lock()
++                .map_err(|_| "bound frecency persistent cache is unavailable".to_string())?;
++            if let Some(existing) = cache.get(&key) {
++                Arc::clone(existing)
++            } else {
++                let opened = Arc::new(FrecencyStore::open(&key.db_path)
++                    .map_err(|_| "bound frecency persistent store is unavailable".to_string())?);
++                opened.bind_admitted_identity(key.source_key, key.state_key, true)?;
++                initialize(&opened)?;
++                // An admission change during SQLite open or HEAD initialization
++                // must never publish this connection into the bound cache.
++                if context.persistent_key()? != key {
++                    return Err("bound frecency admission changed before store publication".to_string());
++                }
++                cache.insert(key, Arc::clone(&opened));
++                opened
++            }
++        }
++    };
++    context.source_key()?;
++    if policy == crate::capability::FrecencyCollectionPolicy::Persistent {
++        context.persistent_key()?;
++    }
++    let now_ts = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|duration| duration.as_secs() as i64)
++        .unwrap_or(0);
++    store.bump(paths, now_ts).map_err(|_| "bound frecency bump failed".to_string())
++}
++
++/// Read existing native history without creating a persistent footprint.
++#[cfg(feature = "embed")]
++pub(crate) fn bound_ranking_scores_for_paths(
++    context: &BoundFrecencyContext<'_>,
++    paths: &[&Path],
++    now_ts: i64,
++) -> Result<Option<FrecencyRankingSnapshot>, String> {
++    let mut scores = HashMap::new();
++    let mut sources = Vec::new();
++    if context.project_state.is_some() && context.state_anchor.is_some() {
++        let key = context.persistent_key()?;
++        let cached = bound_persistent_cache()
++            .lock()
++            .map_err(|_| "bound frecency persistent cache is unavailable".to_string())?
++            .get(&key)
++            .cloned();
++        let store = if let Some(store) = cached {
++            Some(store)
++        } else {
++            FrecencyStore::open_existing_readonly(&key.db_path)
++                .map_err(|_| "bound frecency persistent history is unreadable".to_string())?
++                .map(Arc::new)
++        };
++        if let Some(store) = store {
++            store.bind_admitted_identity(key.source_key, key.state_key, false)?;
++            scores.extend(store.bulk_scores(paths, now_ts).map_err(|_| "bound frecency scores are unreadable".to_string())?);
++            sources.push("persistent");
++        }
++        if context.persistent_key()? != key {
++            return Err("bound frecency admission changed during ranking".to_string());
++        }
++    }
++    let session_key = BoundSessionKey {
++        repo_root: context.repo_root.to_path_buf(),
++        source_key: context.source_key()?,
++    };
++    if let Some(store) = bound_session_cache()
++        .lock()
++        .map_err(|_| "bound frecency session cache is unavailable".to_string())?
++        .get(&session_key)
++        .cloned()
++    {
++        scores.extend(store.bulk_scores(paths, now_ts).map_err(|_| "bound frecency session scores are unreadable".to_string())?);
++        sources.push("session");
++    }
++    context.source_key()?;
++    if sources.is_empty() {
++        return Ok(None);
++    }
++    Ok(Some(FrecencyRankingSnapshot {
++        scores,
++        source: format!("{} frecency history", sources.join(" + ")),
++    }))
++}
++
+ fn persistent_cache() -> &'static Mutex<HashMap<PathBuf, Arc<FrecencyStore>>> {
+     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<FrecencyStore>>>> = OnceLock::new();
+     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+@@ -624,6 +873,33 @@ mod tests {
+         FrecencyStore::open_in_memory().expect("open in-memory frecency store")
+     }
+ 
++    #[cfg(feature = "embed")]
++    #[test]
++    fn bound_history_refuses_a_copied_state_identity() {
++        let temp = tempfile::tempdir().unwrap();
++        let db = temp.path().join("frecency.db");
++        let source_a = [1_u8; 16];
++        let source_b = [2_u8; 16];
++        let state_a = [3_u8; 16];
++        let state_b = [4_u8; 16];
++        let store = FrecencyStore::open(&db).unwrap();
++        store.bind_admitted_identity(source_a, state_a, true).unwrap();
++        store.bump(&[PathBuf::from("src/lib.rs")], 100).unwrap();
++        drop(store);
++        let reopened = FrecencyStore::open_existing_readonly(&db).unwrap().unwrap();
++        assert!(reopened.bind_admitted_identity(source_a, state_a, false).is_ok());
++        assert!(reopened.bind_admitted_identity(source_b, state_a, false).is_err());
++        assert!(reopened.bind_admitted_identity(source_a, state_b, false).is_err());
++    }
++
++    #[cfg(feature = "embed")]
++    #[test]
++    fn legacy_unbound_history_is_not_attributed_to_an_admitted_source() {
++        let store = make_store();
++        store.bump(&[PathBuf::from("src/lib.rs")], 100).unwrap();
++        assert!(store.bind_admitted_identity([1; 16], [2; 16], true).is_err());
++    }
++
+     fn norm(p: &Path) -> PathBuf {
+         PathBuf::from(normalize_path(p))
+     }
