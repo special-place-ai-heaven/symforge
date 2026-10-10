@@ -5,42 +5,7 @@ use std::future::Future;
 pub const RESULT_STATUS_META_KEY: &str = "symforge/result_status";
 pub const RESULT_STATUS_CONTRACT_VERSION: u8 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutcomeClass {
-    Found,
-    NotFound,
-    Ambiguous,
-    InvalidRequest,
-    EmptyResult,
-    InternalFailure,
-}
-
-impl OutcomeClass {
-    pub const ALL: [Self; 6] = [
-        Self::Found,
-        Self::NotFound,
-        Self::Ambiguous,
-        Self::InvalidRequest,
-        Self::EmptyResult,
-        Self::InternalFailure,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Found => "found",
-            Self::NotFound => "not_found",
-            Self::Ambiguous => "ambiguous",
-            Self::InvalidRequest => "invalid_request",
-            Self::EmptyResult => "empty_result",
-            Self::InternalFailure => "internal_failure",
-        }
-    }
-
-    pub const fn is_error(self) -> bool {
-        matches!(self, Self::InvalidRequest | Self::InternalFailure)
-    }
-}
+pub use crate::index_lifecycle::guidance::outcome::OutcomeClass;
 
 /// `_meta` key carrying the selected-project trust evidence (Task 7).
 pub const PROJECT_EVIDENCE_META_KEY: &str = "symforge/project_evidence";

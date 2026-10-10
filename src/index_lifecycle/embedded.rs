@@ -442,6 +442,8 @@ struct EmbeddedBinding {
     #[cfg(feature = "embed")]
     impact_symbols: super::embed_file_impact::ImpactSymbolStore,
     #[cfg(feature = "embed")]
+    stel_store: super::embed_stel::StelStoreSlot,
+    #[cfg(feature = "embed")]
     open_reset: Option<crate::embed::parity::source_options::SnapshotResetReceipt>,
     state: std::sync::Mutex<EmbeddedRuntimeState>,
     control: std::sync::Mutex<WorkerControl>,
@@ -539,6 +541,8 @@ impl EmbeddedBinding {
             temporal_cache: Arc::default(),
             #[cfg(feature = "embed")]
             impact_symbols: Default::default(),
+            #[cfg(feature = "embed")]
+            stel_store: Default::default(),
             #[cfg(feature = "embed")]
             open_reset: open_reset.clone(),
             state: std::sync::Mutex::new(EmbeddedRuntimeState {
@@ -1823,6 +1827,21 @@ impl EmbeddedSourceHandle {
         let index = binding.runtime.acquire().ok()?;
         let generation = index.published_source_set().current_generation();
         Some((Arc::clone(&binding.authority), generation, phase))
+    }
+
+    /// This source's durable STEL ledger under `policy`, opened on first use
+    /// in the binding's own state placement.
+    #[cfg(feature = "embed")]
+    pub(super) fn stel_store(
+        &self,
+        policy: crate::embed::parity::QueryPolicy,
+    ) -> Option<Arc<crate::stel::ledger_store::StelLedgerStore>> {
+        let binding = self.binding.as_ref()?;
+        binding
+            .stel_store
+            .get(&binding.state_placement, policy, || {
+                format!("embedded-{}", binding.identity.0)
+            })
     }
 
     /// Health capture: the bound data plane, root and placement in ANY live

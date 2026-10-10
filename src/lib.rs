@@ -43,21 +43,21 @@ pub use internals::index_lifecycle;
     not(feature = "__test-internals")
 ))]
 #[cfg_attr(not(feature = "server"), allow(unused_imports))]
-pub(crate) use internals::stel_core;
+pub(crate) use internals::{stel, stel_core};
 #[cfg(all(
     any(feature = "server", feature = "embed"),
     feature = "__test-internals"
 ))]
-pub use internals::stel_core;
+pub use internals::{stel, stel_core};
 
 #[cfg(all(feature = "server", not(feature = "__test-internals")))]
 pub(crate) use internals::{
-    analytics, cli, daemon, observability, path_shadow, protocol, server, sidecar, stel,
+    analytics, cli, daemon, observability, path_shadow, protocol, server, sidecar,
     version_registry, watcher, worktree,
 };
 #[cfg(all(feature = "server", feature = "__test-internals"))]
 pub use internals::{
-    analytics, cli, daemon, observability, path_shadow, protocol, server, sidecar, stel,
+    analytics, cli, daemon, observability, path_shadow, protocol, server, sidecar,
     version_registry, watcher, worktree,
 };
 

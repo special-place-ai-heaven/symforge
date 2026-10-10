@@ -67,404 +67,26 @@ fn statused_tool_result(
     Ok(ResultStatus::new(outcome_class).into_call_tool_result(text))
 }
 
-/// Canonicalize the deepest existing ancestor of `path`, then append a truly
-/// missing suffix without resolving it lexically.
-///
-/// This preserves filesystem semantics for `link/..` and catches a missing
-/// leaf beneath an escaping symlink/junction. Any error other than an ordinary
-/// missing component fails closed. A dangling link also fails closed because
-/// `symlink_metadata` can observe the link even though `canonicalize` cannot
-/// resolve its target.
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
-    let mut ancestor = path.to_path_buf();
-    let mut missing_tail = Vec::<std::ffi::OsString>::new();
+// The facade's path containment checks live in the shared STEL runtime so
+// the embedded facade refuses the same `path:` values MCP does.
+use crate::stel::runtime::{facade_path_is_repo_relative, path_is_within_bound_project};
 
-    loop {
-        match ancestor.canonicalize() {
-            Ok(mut canonical) => {
-                for component in missing_tail.iter().rev() {
-                    canonical.push(component);
-                }
-                return Some(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match std::fs::symlink_metadata(&ancestor) {
-                    Ok(_) => return None,
-                    Err(metadata_error)
-                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return None,
-                }
-                missing_tail.push(ancestor.file_name()?.to_os_string());
-                if !ancestor.pop() {
-                    return None;
-                }
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
-/// Whether `path` (a `symforge` `path:` filter) resolves WITHIN the bound
-/// project `root` (012 D6 / contracts §3c). `path:` is a within-project filter,
-/// never a project selector, so a path that escapes the bound root is a caller
-/// error.
-///
-/// Resolution: a relative `path` is joined onto `root`; an absolute `path` is
-/// used as-is. The bound root must canonicalize. The target is resolved through
-/// its deepest existing ancestor so symlinks/junctions and `..` retain filesystem
-/// semantics even when the final leaf does not exist. Containment is the
-/// canonical root being a component prefix of the resolved target (equal counts
-/// as within); observation failures reject the filter.
-fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
-    let Ok(canonical_root) = root.canonicalize() else {
-        return false;
-    };
-
-    let raw = Path::new(path);
-    let resolved = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        canonical_root.join(raw)
-    };
-    let Some(resolved) = canonicalize_with_missing_tail(&resolved) else {
-        return false;
-    };
-
-    // Compare with the Windows verbatim (`\\?\`) prefix stripped from BOTH sides
-    // so a canonicalized root (which gains `\\?\`) and a lexically-normalized
-    // not-yet-existing target (which does not) still compare correctly.
-    let resolved_cmp = strip_verbatim_prefix(&resolved);
-    let root_cmp = strip_verbatim_prefix(&canonical_root);
-    resolved_cmp.starts_with(&root_cmp)
-}
-
-/// The compact facade forwards `path` as an index key/filter, never as an OS
-/// path. Reject every rooted/prefixed spelling, including Windows drive-relative
-/// (`C:foo`) and root-relative (`\foo`) forms that `Path::is_absolute` does not
-/// classify uniformly across platforms.
-fn facade_path_is_repo_relative(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    if path.starts_with('/')
-        || path.starts_with('\\')
-        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-    {
-        return false;
-    }
-    !Path::new(path).components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::Prefix(_) | std::path::Component::RootDir
-        )
-    })
-}
-
-/// Strip the Windows verbatim/UNC `\\?\` prefix from a path for comparison,
-/// returning a plain comparable `PathBuf`. On a path without the prefix (or on
-/// non-Windows) this is an allocation-light passthrough.
-///
-/// We rebuild the path from its components: a `Prefix` component that is verbatim
-/// (`\\?\C:`, `\\?\UNC\...`) is replaced by its plain disk/UNC form so it lines
-/// up with a non-canonicalized (lexically normalized) sibling path.
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    use std::path::{Component, Prefix};
-    let mut out = PathBuf::new();
-    let mut rebuilt_prefix_already_rooted = false;
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => match prefix.kind() {
-                Prefix::VerbatimDisk(disk) => {
-                    out.push(format!("{}:\\", disk as char));
-                    rebuilt_prefix_already_rooted = true;
-                }
-                Prefix::VerbatimUNC(server, share) => {
-                    let mut unc = std::ffi::OsString::from(r"\\");
-                    unc.push(server);
-                    unc.push(r"\");
-                    unc.push(share);
-                    out.push(unc);
-                    rebuilt_prefix_already_rooted = true;
-                }
-                _ => {
-                    out.push(component.as_os_str());
-                    rebuilt_prefix_already_rooted = false;
-                }
-            },
-            Component::RootDir => {
-                // Rebuilt verbatim disk/UNC prefixes already include their root
-                // separator. Ordinary disk prefixes (`C:`) do not: preserve the
-                // following RootDir so an absolute path never becomes drive-
-                // relative during comparison.
-                if !rebuilt_prefix_already_rooted {
-                    out.push(component.as_os_str());
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-pub(super) fn is_index_unavailable_output(text: &str) -> bool {
-    text.starts_with("Index not loaded.")
-        || text.starts_with("Index is loading")
-        || text.starts_with("Index degraded:")
-        || text.starts_with("Index refresh interrupted:")
-}
-
-/// The ONE error-shape predicate for the whole protocol surface, read/write
-/// alike. `edit_tools.rs` used to keep a private copy of this function, which
-/// diverged the moment the project-refusal shapes were added here — so the seven
-/// structural edit tools reported a REFUSED edit as `success`/`found`. Shared
-/// (`pub(super)`) so a new shape can only ever be taught once.
-pub(super) fn is_error_output(text: &str) -> bool {
-    text.starts_with("Error:")
-        || text.starts_with("Error in ")
-        || is_admission_refusal(text)
-        || is_foreign_project_refusal(text)
-        || is_local_cross_project_refusal(text)
-}
-
-/// An admission-gate refusal is an honest REFUSAL, not a successful read. Taught
-/// HERE rather than per-arm: `validate_file_syntax` has no classifier arm of its
-/// own, so its refusal fell through `classify_compact_tool_output`'s catch-all
-/// and reported a withheld file as a successful validation. Anchored at position
-/// 0 (not `contains`) so a body that merely QUOTES the phrase stays `Found`.
-/// Both refusal variants share this opening clause, so one anchor classifies
-/// both.
-fn is_admission_refusal(text: &str) -> bool {
-    text.starts_with("Content withheld by admission policy:")
-}
-
-/// The single-project refusal [`SymForgeServer::foreign_project_refusal`] emits
-/// carries no `Error:` prefix, so without this a refusal that came back through
-/// DISPATCH rather than an early return classified as a SUCCESSFUL answer
-/// (`found`) — notably in `classify_symforge_edit_outcome` and in every
-/// `classify_edit_output` caller. Deliberately narrow: BOTH anchors must match,
-/// so no unrelated body is reclassified.
-fn is_foreign_project_refusal(text: &str) -> bool {
-    // Current shape carries the typed `Error: project_routing:` prefix; the
-    // legacy anchor below still classifies pre-10.1 bodies that came back
-    // through DISPATCH rather than an early return.
-    (text.starts_with("Error: project_routing: project '") || text.starts_with("project '"))
-        && text.contains("is not available on this connection")
-}
-
-/// Sibling shape emitted by [`SymForgeServer::local_cross_project_refusal`] for
-/// a genuinely cross-project (`projects`, `*`, or foreign `project`) read on a
-/// transport with no daemon working set. Same defect as above and same fix: an
-/// honest refusal must not be reported as a successful answer. Narrow by
-/// anchoring the FULL opening clause at position 0: a rendered search hit or doc
-/// line that quotes the message is prefixed (`7: // ...`) and stays `Found`.
-fn is_local_cross_project_refusal(text: &str) -> bool {
-    // Current shape carries the typed `Error: project_routing:` prefix; the
-    // legacy anchor still classifies pre-10.1 bodies.
-    text.starts_with("Error: project_routing: cross-project queries")
-        || text.starts_with("Cross-project queries (project/projects) require the daemon")
-}
-
-fn classify_get_symbol_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous:") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("File not found:") || text.starts_with("No symbol ") {
-        OutcomeClass::NotFound
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous symbol selector") || text.starts_with("Ambiguous:") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("Symbol \"") || text.starts_with("Symbol '") {
-        OutcomeClass::NotFound
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-/// Strip an optional leading `── mode: <name> (explicit) ──\n` annotation so
-/// output classification can match the renderer's message at the start of the
-/// remaining body. Returns `text` unchanged when no annotation is present.
-fn strip_mode_annotation(text: &str) -> &str {
-    text.strip_prefix("── mode: ")
-        .and_then(|rest| rest.split_once(" ──\n"))
-        .map(|(_, body)| body)
-        .unwrap_or(text)
-}
-fn classify_get_file_content_output(text: &str) -> OutcomeClass {
-    // Strip an optional `── mode: <name> (explicit) ──` prefix so the renderer's
-    // status message is matched at the start of `body` even when an explicit-mode
-    // annotation precedes it. Anchoring on `body` (not a bare `contains`) keeps a
-    // successful read whose CONTENT merely mentions these phrases classified Found.
-    let body = strip_mode_annotation(text);
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text)
-        || text.starts_with("Invalid get_file_content request:")
-        || text.starts_with("mode=")
-        || text.contains("[error:")
-        || body.starts_with("Path is outside the repository root:")
-        || (body.starts_with("Chunk ") && body.contains(" out of range for "))
-    {
-        // A request for a non-existent chunk index is an invalid request, not a
-        // successful read: the path exists but the requested page does not.
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous symbol selector") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("File not found:")
-        || text.starts_with("No symbol ")
-        || text.starts_with("Symbol not found in ")
-        || body.starts_with("No matches for '")
-        || body.starts_with("Match occurrence ")
-    {
-        // around_match / match-occurrence misses: the needle was not found in the
-        // file. These must report NotFound, not a successful read.
-        OutcomeClass::NotFound
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_symbols_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) || text.starts_with("search_symbols requires") {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("No symbols matching") {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_text_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text)
-        || text.starts_with("Regex search requires")
-        || text.starts_with("Search requires")
-        || text.starts_with("Invalid regex")
-        || text.starts_with("Invalid glob")
-        || text.starts_with("whole_word is not supported")
-    {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("No matches") || text.starts_with("No AST matches") {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_knowledge_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Error:") {
-        OutcomeClass::InvalidRequest
-    } else if text.contains("\nNo match:") {
-        OutcomeClass::EmptyResult
-    } else if text.starts_with("Readiness:") {
-        OutcomeClass::InternalFailure
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_files_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text)
-        || text.starts_with("Path search requires")
-        || text.starts_with("Path hint must not be empty")
-        || text.starts_with("search_files")
-    {
-        OutcomeClass::InvalidRequest
-    } else if text.contains("Ambiguous path hint") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("No indexed source files matching")
-        || text.starts_with("No indexed source path matched")
-        || text.starts_with("No git history found")
-        || text.starts_with("'") && text.contains("not found in git history")
-    {
-        OutcomeClass::NotFound
-    } else if text.starts_with("No high-confidence co-change data") {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_find_references_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous symbol selector") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("File not found:")
-        || text.starts_with("Symbol not found")
-        || text.contains("this symbol is not defined in the indexed project")
-    {
-        OutcomeClass::NotFound
-    } else if text.starts_with("No references found")
-        || text.starts_with("No implementations found")
-    {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_get_file_context_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) || text.starts_with("Invalid get_file_context") {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("File not found:")
-        || text.starts_with("File not found on disk:")
-        || text.starts_with("No symbol ")
-    {
-        OutcomeClass::NotFound
-    } else if text.starts_with("Ambiguous") {
-        OutcomeClass::Ambiguous
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-/// Classify compact-surface legacy tool output for STEL chain admission and replay validation.
-pub(crate) fn classify_compact_tool_output(tool: &str, text: &str) -> OutcomeClass {
-    match tool {
-        "get_symbol" => classify_get_symbol_output(text),
-        "get_symbol_context" => classify_get_symbol_context_output(text),
-        "get_file_content" => classify_get_file_content_output(text),
-        "get_file_context" => classify_get_file_context_output(text),
-        "search_symbols" => classify_search_symbols_output(text),
-        "search_text" => classify_search_text_output(text),
-        "search_knowledge" => classify_search_knowledge_output(text),
-        "search_files" => classify_search_files_output(text),
-        "find_references" => classify_find_references_output(text),
-        _ => {
-            if is_index_unavailable_output(text) {
-                OutcomeClass::InternalFailure
-            } else if is_error_output(text) || text.starts_with("Invalid") {
-                OutcomeClass::InvalidRequest
-            } else {
-                OutcomeClass::Found
-            }
-        }
-    }
-}
-
-/// Whether a legacy tool body represents successful serve output for STEL chain continuation.
-pub(crate) fn compact_tool_output_is_success(tool: &str, text: &str) -> bool {
-    classify_compact_tool_output(tool, text) == OutcomeClass::Found
-}
+// Moved verbatim to the feature-neutral `guidance::outcome` so the STEL
+// facade and the embedded facade classify a rendered answer exactly as MCP does.
+use crate::index_lifecycle::guidance::outcome::{
+    classify_find_references_output, classify_get_file_content_output,
+    classify_get_symbol_context_output, classify_get_symbol_output, classify_search_files_output,
+    classify_search_knowledge_output, classify_search_symbols_output, classify_search_text_output,
+    is_admission_refusal,
+};
+pub(super) use crate::index_lifecycle::guidance::outcome::{
+    is_error_output, is_index_unavailable_output,
+};
+// The classifier tests below name these through `super::`.
+#[cfg(test)]
+use crate::index_lifecycle::guidance::outcome::{
+    classify_compact_tool_output, classify_get_file_context_output, compact_tool_output_is_success,
+};
 
 use crate::domain::LanguageId;
 /// Deserialize a required `u32` from either a JSON number or a stringified number.
@@ -4448,58 +4070,13 @@ impl SymForgeServer {
         result
     }
 
-    /// Resolve the co-change anchor for a fused-find `search_files` step.
-    ///
-    /// US4 find fusion: the STEL planner is index-free, so it emits the
-    /// `search_files` path step with `rank_by="path+cochange"` but NO
-    /// `anchor_path`. Anchor resolution belongs where the index lives — here.
-    ///
-    /// The path matcher reads a multi-word query as `component…/basename`, so a
-    /// fuzzy bag of words whose trailing token is not a file basename (e.g.
-    /// `"stel planner find"`) yields no path candidates. To stay robust to token
-    /// order we try the full query first, then each individual token, and take
-    /// the first top Tier-1 path hit. `search_files`'s own
-    /// `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR=basename` gate still decides whether
-    /// the boost applies, so a weak anchor degrades to pure path ranking with no
-    /// special-casing. Returns `None` when nothing path-like matches.
-    ///
-    /// Reads only the index path view (never `get_*`), so this stays on the
-    /// frecency-neutral discovery surface.
-    pub(crate) fn resolve_find_fusion_cochange_anchor(&self, query: &str) -> Option<String> {
-        let guard = self.index.data_plane().read();
-        let top_hit = |q: &str| -> Option<String> {
-            match guard.capture_search_files_view(q, 5, None, None) {
-                SearchFilesView::Found { hits, .. } => hits
-                    .into_iter()
-                    .find(|hit| hit.tier != SearchFilesTier::MetadataOnly)
-                    .map(|hit| hit.path),
-                _ => None,
-            }
-        };
-        if let Some(hit) = top_hit(query) {
-            return Some(hit);
-        }
-        query
-            .split_whitespace()
-            .filter(|tok| tok.chars().any(char::is_alphanumeric))
-            .find_map(top_hit)
-    }
-
     /// Task 4 Step 5: whether a planned facade step's tool accepts the single
     /// `project` selector the facade routes — the daemon's single-project
     /// routed set plus the set-valued discovery verbs (which take `project`
     /// too). A plan containing any other tool refuses project routing
     /// all-or-nothing rather than part-routing the chain.
     fn facade_step_accepts_project(tool: &str) -> bool {
-        crate::daemon::single_project_routed_tool(tool)
-            || matches!(
-                tool,
-                "search_symbols"
-                    | "search_text"
-                    | "search_knowledge"
-                    | "find_references"
-                    | "search_files"
-            )
+        crate::stel::runtime::facade_step_accepts_project(tool)
     }
 
     /// Inject the resolved co-change anchor into a fused-find `search_files` step.
@@ -4523,54 +4100,12 @@ impl SymForgeServer {
         args: &serde_json::Value,
         may_use_local_project_state: bool,
     ) -> serde_json::Value {
-        let is_fusion_path_step = tool == "search_files"
-            && args.get("rank_by").and_then(serde_json::Value::as_str) == Some("path+cochange")
-            && args.get("anchor_path").is_none();
-        if !is_fusion_path_step {
-            return args.clone();
-        }
-        let query = args
-            .get("query")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let mut args = args.clone();
-        let Some(map) = args.as_object_mut() else {
-            return args;
-        };
-        if !may_use_local_project_state {
-            // A healthy daemon can route the primitive to a foreign project,
-            // but this adapter's index still belongs to its home project. Drop
-            // the speculative co-change mode rather than deriving target args
-            // from a home-only anchor.
-            map.remove("rank_by");
-            return args;
-        }
-        match self.resolve_find_fusion_cochange_anchor(query) {
-            Some(anchor) => {
-                // Retarget the path side to the anchor's basename STEM. The stem
-                // names the anchor's own basename, so the anchor clears the
-                // `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR=basename` gate (via the
-                // SF-006 stem-equals-basename anchor promotion), while files
-                // that share the stem prefix (a common co-change-partner naming
-                // pattern) remain candidates the boost can promote. Falls back
-                // to the full anchor path when it has no usable stem.
-                let path_query = std::path::Path::new(&anchor)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .filter(|stem| stem.len() >= 3)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| anchor.clone());
-                map.insert("query".to_string(), serde_json::Value::String(path_query));
-                map.insert("anchor_path".to_string(), serde_json::Value::String(anchor));
-            }
-            None => {
-                // No path-like anchor → pure path ranking on the original query.
-                // Drop the co-change request so search_files does not emit a
-                // fallback-evidence note for a speculative request.
-                map.remove("rank_by");
-            }
-        }
-        args
+        crate::stel::runtime::inject_find_fusion_cochange_anchor(
+            &self.index.data_plane().read(),
+            tool,
+            args,
+            may_use_local_project_state,
+        )
     }
 
     /// US5 economics grounding (010 FR-014, D2): stamp real target byte sizes onto
@@ -4598,63 +4133,7 @@ impl SymForgeServer {
     /// Resolution is deterministic for a fixed index state (same query + same repo
     /// ⇒ same sizes ⇒ same decision; Constitution IV).
     fn ground_plan_economics(&self, plan: &mut crate::stel::StelPlan) {
-        let guard = self.index.data_plane().read();
-        if !guard.is_ready() {
-            return;
-        }
-        for step in &mut plan.steps {
-            if !step.index_refs.is_empty() {
-                continue;
-            }
-            // Only single-file read tools have a "read this one file" manual
-            // baseline. Symbol-name resolution applies to `get_symbol` only;
-            // `find_references` shares the `name` arg but is a multi-file trace.
-            let resolve_symbol = step.tool == "get_symbol";
-            if !matches!(
-                step.tool.as_str(),
-                "get_file_context" | "get_file_content" | "get_symbol"
-            ) {
-                continue;
-            }
-            let resolved_path = step
-                .args
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    if !resolve_symbol {
-                        return None;
-                    }
-                    // Resolve a path-less `get_symbol` step to the file the symbol
-                    // is defined in, but only when exactly one file defines it —
-                    // an ambiguous symbol has no single manual baseline, so we
-                    // leave it on the plan-only floor.
-                    let name = step
-                        .args
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())?;
-                    let candidates = symbol_candidate_paths(&guard, name);
-                    if candidates.len() == 1 {
-                        candidates.into_iter().next()
-                    } else {
-                        None
-                    }
-                });
-            let Some(path) = resolved_path else {
-                continue;
-            };
-            if let Some(file) = guard.capture_shared_file(&path) {
-                step.index_refs
-                    .push(crate::stel::controller::index_ref_for_target(
-                        path,
-                        file.content.len() as u64,
-                    ));
-            }
-        }
+        crate::stel::runtime::ground_plan_economics(&self.index.data_plane().read(), plan)
     }
 
     fn project_id_for_root(root: &Path) -> String {
@@ -7845,38 +7324,11 @@ impl SymForgeServer {
     /// placeholder block. `args` is the executed `find_dependents` step args,
     /// whose `path` field is the impact target.
     fn append_impact_intent_cochanges(&self, body: &mut String, args: &serde_json::Value) {
-        const IMPACT_INTENT_COCHANGE_LIMIT: usize = 5;
-
-        let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
-            return;
-        };
-
-        let temporal = self.index.data_plane().git_temporal();
-        match temporal.state {
-            crate::live_index::git_temporal::GitTemporalState::Ready => {
-                let normalized = path.replace('\\', "/");
-                match temporal.files.get(&normalized) {
-                    Some(history) => {
-                        body.push_str("\n\n");
-                        body.push_str(&format::co_changes_result_view(
-                            &normalized,
-                            history,
-                            IMPACT_INTENT_COCHANGE_LIMIT,
-                        ));
-                    }
-                    None => {
-                        body.push_str("\n\nNo git co-change data found for this file.");
-                    }
-                }
-            }
-            crate::live_index::git_temporal::GitTemporalState::Pending
-            | crate::live_index::git_temporal::GitTemporalState::Computing => {
-                body.push_str("\n\nGit temporal data is still loading. Co-changes unavailable.");
-            }
-            crate::live_index::git_temporal::GitTemporalState::Unavailable(ref reason) => {
-                body.push_str(&format!("\n\nGit temporal data unavailable: {reason}"));
-            }
-        }
+        crate::stel::runtime::append_impact_intent_cochanges(
+            &self.index.data_plane().git_temporal(),
+            body,
+            args,
+        )
     }
 
     #[tool(
@@ -8140,18 +7592,7 @@ impl SymForgeServer {
     /// mutation that applied nothing, so every arm is `isError:true` at the
     /// host seam via `into_mutation_call_tool_result`.
     fn mutation_refusal_outcome(text: &str) -> OutcomeClass {
-        let lower = text.to_ascii_lowercase();
-        if lower.contains("symbol not found")
-            || lower.contains("file not found")
-            || lower.contains("file not indexed:")
-            || lower.contains(" not found within symbol ")
-        {
-            OutcomeClass::NotFound
-        } else if text.contains("Ambiguous:") {
-            OutcomeClass::Ambiguous
-        } else {
-            OutcomeClass::InvalidRequest
-        }
+        crate::stel::runtime::mutation_refusal_outcome(text)
     }
 
     fn classify_symforge_edit_outcome(
@@ -8302,24 +7743,6 @@ impl SymForgeServer {
         &self,
         request: &crate::stel::StelStatusRequest,
     ) -> String {
-        // T037 / FR-011 operator reset: clear accumulated calibration BEFORE
-        // rendering, so the surface returns to `Deferred`. MCP-native — a param on
-        // the existing `status` tool, never injected context; never rebuilds the
-        // index (only the calibration tables are cleared).
-        let reset_note = if request.reset_calibration == Some(true) {
-            match self.reset_calibration() {
-                Some(cleared) => Some(format!(
-                    "calibration_reset: cleared {cleared} sample(s) + active tuning (state -> deferred)"
-                )),
-                None => Some(
-                    "calibration_reset: no durable store; in-memory calibration is already deferred"
-                        .to_string(),
-                ),
-            }
-        } else {
-            None
-        };
-
         // Report the surface actually served on THIS connection. In the daemon-
         // proxy topology that is the ADAPTER's profile, threaded in via
         // `request.connection_surface`; this daemon process's own env may differ
@@ -8356,59 +7779,40 @@ impl SymForgeServer {
         let project_root = self
             .capture_repo_root()
             .map(|root| crate::daemon::normalized_path_string(&root));
-        // 013: `mut` — line below reassigns `ctx` with the durable calibration
-        // verdict override (T033/FR-009).
-        let mut ctx = crate::stel::StelStatusContext::from_server(
-            surface_label,
-            &self.project_name,
-            project_root,
-            guard.is_ready(),
-            guard.file_count(),
-            guard.symbol_count(),
-            &ledger,
-            self.session_context.snapshot().total_tokens,
+        let mut trailing_lines: Vec<String> = format::snapshot_verify_status_line(
+            guard.load_source(),
+            &guard.snapshot_verify_state(),
         )
-        // US3/T029: surface the durable ledger subsystem state so
-        // restart-survival is observable from `status` (Unavailable on
-        // stdio/embed; Disabled{reason} for a wired-but-failing store — N-3).
-        .with_durable_ledger(self.durable_ledger_summary_for_status());
-
-        // T033 / FR-009: override the in-memory verdict with the DURABLE one so
-        // `status detail:full` reflects the persisted cross-session calibration
-        // state + active tuning. `None` means no durable store is wired; a wired
-        // store whose sample read fails returns `Deferred` so status never keeps
-        // an in-memory `Tuned` verdict without a readable durable artifact. After
-        // a reset above, the durable read sees zero samples -> `Deferred`.
-        if let Some(verdict) = self.durable_calibration_verdict() {
-            ctx = ctx.with_calibration_verdict(verdict);
-        }
-
-        // Attach the daemon-env divergence (proxy topology only); `None` on
-        // same-env and direct serving so the disclosure line appears strictly on
-        // divergence.
-        ctx.daemon_env_surface = daemon_env_surface;
-
-        // Disclose an ORPHANED daemon: one that still answers but is no longer
-        // the daemon clients discover. `None` for the recorded daemon and for
-        // every non-daemon topology, so the line appears strictly on divergence
-        // — same discipline as the env-surface disclosure above.
-        ctx.orphaned_daemon_pid = crate::daemon::unrecorded_daemon_pid();
-
-        let mut body = crate::stel::format_stel_status(request, &ctx);
-        if let Some(line) =
-            format::snapshot_verify_status_line(guard.load_source(), &guard.snapshot_verify_state())
-        {
-            body.push('\n');
-            body.push_str(&line);
-        }
-        body.push('\n');
-        body.push_str(&Self::secret_dismissals_line(
+        .into_iter()
+        .collect();
+        trailing_lines.push(Self::secret_dismissals_line(
             self.capture_repo_root().as_deref(),
         ));
-        match reset_note {
-            Some(note) => format!("{body}\n{note}"),
-            None => body,
-        }
+        // The shared STEL runtime runs the operator reset, the durable verdict
+        // override (T033 / FR-009) and the durable-ledger line (US3/T029) in
+        // the same order for every host.
+        crate::stel::runtime::render_status_body(
+            request,
+            crate::stel::runtime::StatusObservation {
+                surface: surface_label,
+                // Attach the daemon-env divergence (proxy topology only); `None`
+                // on same-env and direct serving.
+                daemon_env_surface,
+                // Disclose an ORPHANED daemon: one that still answers but is no
+                // longer the daemon clients discover. `None` for the recorded
+                // daemon and for every non-daemon topology.
+                orphaned_daemon_pid: crate::daemon::unrecorded_daemon_pid(),
+                project_name: &self.project_name,
+                project_root,
+                index_ready: guard.is_ready(),
+                index_files: guard.file_count(),
+                index_symbols: guard.symbol_count(),
+                ledger: &ledger,
+                session_tokens: self.session_context.snapshot().total_tokens,
+                store: self.stel_ledger_store.as_deref(),
+                trailing_lines,
+            },
+        )
     }
 
     /// Render the proxy-owned `status` line-set from THIS server's OWN ledger +
@@ -8480,15 +7884,7 @@ impl SymForgeServer {
     /// while claiming embed behavior (T038 round-2 cfg-lens finding; both
     /// removed).
     pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
-        match self.reset_calibration() {
-            Some(cleared) => format!(
-                "calibration_reset: cleared {cleared} sample(s) + active tuning (state -> deferred)"
-            ),
-            None => {
-                "calibration_reset: no durable store; in-memory calibration is already deferred"
-                    .to_string()
-            }
-        }
+        crate::stel::runtime::calibration_reset_note(self.reset_calibration())
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -8587,42 +7983,25 @@ impl SymForgeServer {
         tools_called: Option<Vec<String>>,
         tuned: Option<&crate::stel::ledger_store::TunedEstimateConstants>,
     ) -> String {
-        use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision_tuned};
-        use crate::stel::ledger::{
-            LedgerCaptureInput, capture_ledger, format_ledger_envelope_line,
-        };
-
-        let response_tokens = handler::estimate_tokens(body);
-        // T032: record the prediction the predictor ACTUALLY made for this call —
-        // tuned when a validated tuning is in force, static otherwise — so the
-        // ledger's predicted-vs-actual residual reflects the live estimator and
-        // the next tuning pass measures progress against it (hysteresis).
-        let metrics = metrics_for_decision_tuned(
-            plan_summary,
-            decision,
-            plan,
-            response_tokens,
-            session_tokens_served,
-            tuned,
-        );
-        let (event, meta) = capture_ledger(&LedgerCaptureInput {
-            plan,
-            decision,
-            economics: &metrics.economics,
-            selected_tool,
-            tools_called: tools_called.as_deref(),
-            legacy_executed,
-            output_body: body,
-            surface,
-        });
-        self.stel_ledger.lock().push(event.clone());
-        // US3/T028: durable write-through after the in-memory push. Single
-        // ledger path (no double-count); degrades to a logged no-op on a store
-        // error and never fails the request (FR-011). Compile-time no-op on
-        // stdio/embed builds where no durable store is wired.
-        self.persist_ledger_event_durably(&event);
-        let ledger_line = format_ledger_envelope_line(&event, &meta);
-        finalize_symforge_output(metrics, ledger_line, body)
+        crate::stel::runtime::finalize_with_ledger(
+            &self.stel_ledger.lock(),
+            crate::stel::runtime::FacadeLedgerInput {
+                surface,
+                plan,
+                decision,
+                plan_summary,
+                session_tokens_served,
+                body,
+                legacy_executed,
+                selected_tool,
+                tools_called,
+                tuned,
+            },
+            // US3/T028: durable write-through after the in-memory push.
+            // Compile-time no-op on stdio/embed builds where no durable store
+            // is wired.
+            |event| self.persist_ledger_event_durably(event),
+        )
     }
 
     #[tool(
@@ -14175,6 +13554,97 @@ mod tests {
             Some(root.to_path_buf()),
             None,
         )
+    }
+
+    /// MCP `status` parity: the same golden `tests/embed_stel_status.rs` asserts
+    /// against an embedded source with a durable store. `{root}`, `{project}` and
+    /// `{version}` stand for the bound root, the project name and the version.
+    const STATUS_FULL_GOLDEN: &str = "── stel status ──\n\
+        surface: full\n\
+        symforge_version: {version}\n\
+        phase0_go: 07b42a8\n\
+        phase0_evidence: 08f7d14\n\
+        l1_planner: wired\n\
+        l2_economics: wired\n\
+        l3_bypass: wired\n\
+        l4_ledger: in_memory\n\
+        handler_symforge: wired\n\
+        handler_status: wired\n\
+        handler_symforge_edit: preview-and-apply\n\
+        ledger_events: 0\n\
+        project_root: {root}\n\
+        index_ready: true\n\
+        index_files: 1\n\
+        deferred: b_results\n\
+        superseded: multi_step_planner (client agentic loop + find-fusion)\n\
+        ──\n\
+        project: {project}\n\
+        index_symbols: 1\n\
+        session_tokens: 0\n\
+        last_ledger_decision: none\n\
+        last_ledger_route: none\n\
+        durable_ledger: events=0 net_vs_manual=0 sessions=0\n\
+        ── calibration (observational) ──\n\
+        events: 0\n\
+        serve: 0\n\
+        degrade: 0\n\
+        bypass: 0\n\
+        cache_hit: 0\n\
+        pff_bypass: 0\n\
+        legacy_executed: 0\n\
+        schema_tokens: 0\n\
+        invoke_tokens: 0\n\
+        predicted_net_total: 0\n\
+        predicted_response_tokens: 0\n\
+        actual_response_tokens: 0\n\
+        calibration: deferred\n\
+        tuning: deferred\n\
+        ──\n\
+        secret_dismissals: 0";
+
+    #[test]
+    fn status_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .expect("source");
+        let root = dunce::canonicalize(repo.path()).expect("canonical root");
+        let store = crate::stel::ledger_store::StelLedgerStore::open_in_memory("status-golden")
+            .expect("in-memory durable store");
+        let server = embed_parity_server(&root).with_stel_ledger_store(std::sync::Arc::new(store));
+        let golden = STATUS_FULL_GOLDEN
+            .replace("{version}", env!("CARGO_PKG_VERSION"))
+            .replace("{root}", &crate::daemon::normalized_path_string(&root))
+            .replace("{project}", "embed-parity-golden");
+        let full = crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+            connection_surface: Some("full".to_string()),
+            ..Default::default()
+        };
+        // The daemon-instance line depends on this test process's runtime
+        // records; the embedded host reports that line not applicable.
+        let render = |request: &crate::stel::StelStatusRequest| {
+            server
+                .render_stel_status_body(request)
+                .lines()
+                .filter(|line| !line.starts_with("daemon_instance: "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(render(&full), golden);
+        let reset = crate::stel::StelStatusRequest {
+            reset_calibration: Some(true),
+            ..full
+        };
+        assert_eq!(
+            render(&reset),
+            format!(
+                "{golden}\ncalibration_reset: cleared 0 sample(s) + active tuning (state -> deferred)"
+            )
+        );
     }
 
     /// MCP side of the embed edit-plan golden (`tests/embed_edit_plan.rs`):

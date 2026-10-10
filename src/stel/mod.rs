@@ -24,8 +24,11 @@ pub mod golden_replay;
 pub mod handler;
 pub mod ledger;
 pub mod planner;
+pub mod runtime;
 pub mod status;
 pub mod surface;
+// rmcp tool schemas for the compact `tools/list`: server transport only.
+#[cfg(feature = "server")]
 pub mod surface_list;
 
 // D3-ROOT extract-up: the protocol-free trio (`types` + the durable
@@ -65,9 +68,11 @@ pub use controller::{
     detect_pff_bypass, estimate_economics, estimate_economics_tuned, evaluate_edit_plan,
     evaluate_plan, evaluate_plan_with_session,
 };
+#[cfg(feature = "server")]
+pub use edit_apply::run_pre_apply_gates;
 pub use edit_apply::{
     PreApplyOutcome, ResolvedEditSymbol, apply_requested, format_already_applied_body,
-    format_apply_metadata, run_pre_apply_gates,
+    format_apply_metadata, run_pre_apply_gates_on_ready,
 };
 pub use edit_planner::{
     EditValidationError, build_edit_plan, edit_plan_summary_line, validate_edit_request,
@@ -115,6 +120,7 @@ pub use status::{
     render_proxy_owned_lines,
 };
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
+#[cfg(feature = "server")]
 pub use surface_list::{
     compact_surface_list_schema_bytes, compact_surface_tools, symforge_edit_schema_bytes,
 };

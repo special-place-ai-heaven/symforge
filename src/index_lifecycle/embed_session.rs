@@ -28,6 +28,9 @@ pub struct QuerySession {
     reset_epoch: AtomicU64,
     operation_gate: Mutex<()>,
     inner: Mutex<SessionState>,
+    /// MCP's per-server STEL L4 session ledger: one economics event per
+    /// facade answer, read back by `status`.
+    stel_ledger: crate::stel::ledger::SessionLedger,
 }
 
 struct SessionState {
@@ -83,6 +86,7 @@ impl QuerySession {
                     limits.max_entries as usize,
                 ),
             }),
+            stel_ledger: crate::stel::ledger::SessionLedger::new(),
         }
     }
 
@@ -130,6 +134,15 @@ impl QuerySession {
             revision_before,
             revision_after: revision_before + 1,
         }
+    }
+
+    pub(super) fn stel_ledger(&self) -> &crate::stel::ledger::SessionLedger {
+        &self.stel_ledger
+    }
+
+    /// The MCP session context's served-token total.
+    pub(super) fn served_tokens(&self) -> u64 {
+        self.inner.lock().context.snapshot().total_tokens
     }
 
     pub(super) fn begin_operation(&self) -> SessionOperation<'_> {

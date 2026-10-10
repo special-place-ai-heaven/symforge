@@ -83,6 +83,8 @@ mod embed_search;
 #[cfg(feature = "embed")]
 pub(crate) mod embed_session;
 #[cfg(feature = "embed")]
+mod embed_stel;
+#[cfg(feature = "embed")]
 mod embed_symbol;
 #[cfg(feature = "embed")]
 mod embed_symbol_context;

@@ -6126,48 +6126,7 @@ fn is_cross_project_read_verb(tool_name: &str) -> bool {
     )
 }
 
-/// Task 4 (outstanding-work hardening): the read/guidance verbs that accept ONE
-/// optional `project` selector, resolved by `DaemonState::runtime_for_target`
-/// in `call_tool_handler` before decode. Exactly the plan's parity table minus
-/// the set-valued discovery verbs above (which own `project`/`projects` in
-/// `execute_tool_call`) and minus `context_inventory` (session-scoped, no
-/// selector). `search_files` is deliberately in BOTH sets: a lone `project`
-/// routes here to the FULL single-project handler (resolve/coupling modes),
-/// while `projects` fans out via the cross-project read route. Structural edits route the same way (Task 5): the selector is
-/// batch-level only — each call stays one single-project transaction, and the
-/// existing worktree/`working_directory` validation then runs against the
-/// SELECTED project's repository, so an unrelated root rejects before preview
-/// or apply.
-pub(crate) fn single_project_routed_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "get_symbol"
-            | "get_symbol_context"
-            | "get_file_context"
-            | "get_file_content"
-            | "get_repo_map"
-            | "search_files"
-            | "find_dependents"
-            | "diff_symbols"
-            | "what_changed"
-            | "analyze_file_impact"
-            | "validate_file_syntax"
-            | "explore"
-            | "ask"
-            | "conventions"
-            | "edit_plan"
-            | "investigation_suggest"
-            | "replace_symbol_body"
-            | "edit_within_symbol"
-            | "insert_symbol"
-            | "delete_symbol"
-            | "batch_edit"
-            | "batch_insert"
-            | "batch_rename"
-            | "symforge_edit"
-            | "curate_knowledge"
-    )
-}
+pub(crate) use crate::stel::runtime::single_project_routed_tool;
 
 /// Resolve whether a tool call is a genuine CROSS-PROJECT read, returning the
 /// targeted projects iff so (B2/D12). Returns `None` for every path that stays

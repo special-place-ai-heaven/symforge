@@ -13,6 +13,7 @@ pub(crate) mod filters;
 pub(crate) mod freshen;
 pub(crate) mod health;
 pub(crate) mod impact;
+pub mod outcome;
 pub(crate) mod read_admission_format;
 pub(crate) mod read_context;
 pub(crate) mod read_contract;

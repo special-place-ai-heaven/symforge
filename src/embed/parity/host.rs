@@ -251,6 +251,10 @@ impl OperationControl {
 #[non_exhaustive]
 pub enum HostRequest {
     Status,
+    /// MCP `status` parity: the typed status plus the shared STEL readout over
+    /// this room's query session. `reset_calibration` deletes persisted
+    /// calibration state, so it additionally requires the checkpoint right.
+    StatusReport(crate::embed::parity::stel::StelStatusRequest),
     Health,
     /// MCP `health` parity: the typed health plus the shared full report,
     /// with quarantine-registry paging.
@@ -403,6 +407,14 @@ pub struct HostProgress {
     pub files_discovered: u64,
     pub files_parsed: u64,
     pub symbols_found: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStatusReport {
+    pub status: HostStatus,
+    /// The shared MCP `status` readout. `None` only when no bound data plane
+    /// could be captured.
+    pub report: Option<crate::embed::parity::stel::StelStatusReport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -730,6 +742,7 @@ pub struct HostPromptReply {
 #[non_exhaustive]
 pub enum HostResponse {
     Status(HostStatus),
+    StatusReport(HostStatusReport),
     Health(HostHealth),
     HealthReport(HostHealthReport),
     Catalog(HostCatalog),
@@ -749,6 +762,7 @@ impl std::fmt::Debug for HostResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self {
             Self::Status(_) => "Status",
+            Self::StatusReport(_) => "StatusReport",
             Self::Health(_) => "Health",
             Self::HealthReport(_) => "HealthReport",
             Self::Catalog(_) => "Catalog",
@@ -1901,6 +1915,28 @@ impl HostRoom {
                     &self.room_id,
                     &self.engine,
                 ))
+            }
+            HostRequest::StatusReport(status) => {
+                if status.reset_calibration == Some(true) && !self.rights.checkpoint {
+                    return Err(HostRefusal::new(HostRefusalKind::Denied));
+                }
+                // `status` answers in every phase, as MCP's does; a room whose
+                // source has not yet reached Current has no session ledger.
+                let session = self.query_session().ok();
+                HostResponse::StatusReport(HostStatusReport {
+                    status: crate::embed::lifecycle::embed_host::status(
+                        &self.source,
+                        &self.room_id,
+                        &self.engine,
+                    ),
+                    report: self.source.stel_status(
+                        status,
+                        session.as_deref(),
+                        QueryPolicy {
+                            allow_derived_state_preparation: self.rights.derived_state_prepare,
+                        },
+                    ),
+                })
             }
             HostRequest::Health => {
                 HostResponse::Health(crate::embed::lifecycle::embed_host::health(

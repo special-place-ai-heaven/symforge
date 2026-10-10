@@ -104,7 +104,10 @@ pub mod server;
 #[cfg(feature = "server")]
 #[path = "sidecar/mod.rs"]
 pub mod sidecar;
-#[cfg(feature = "server")]
+// The STEL planner, economics, ledger and status renderers are protocol-free:
+// the embedded facade routes them to the same lanes MCP does. Only the rmcp
+// tool-list schema (`stel::surface_list`) stays server-only.
+#[cfg(any(feature = "server", feature = "embed"))]
 #[path = "stel/mod.rs"]
 pub mod stel;
 #[cfg(feature = "server")]

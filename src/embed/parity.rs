@@ -23,6 +23,7 @@ pub mod replay;
 pub mod search;
 pub mod session;
 pub mod source_options;
+pub mod stel;
 pub mod symbol;
 pub mod symbol_context;
 

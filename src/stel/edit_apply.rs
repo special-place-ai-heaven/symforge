@@ -3,9 +3,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "server")]
 use crate::live_index::IndexState;
+#[cfg(feature = "server")]
+use crate::live_index::SharedIndex;
 use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
-use crate::live_index::{IndexedFile, SharedIndex};
+use crate::live_index::{IndexedFile, LiveIndex};
 
 use super::edit_planner::EditValidationError;
 use super::types::StelEditRequest;
@@ -68,6 +71,7 @@ pub fn apply_requested(request: &StelEditRequest) -> bool {
 }
 
 /// Run apply-only gates after L1 validation and path freshening.
+#[cfg(feature = "server")]
 pub fn run_pre_apply_gates(
     index: &SharedIndex,
     request: &StelEditRequest,
@@ -99,7 +103,17 @@ pub fn run_pre_apply_gates(
             )));
         }
     }
+    run_pre_apply_gates_on_ready(&guard, request, abs_path)
+}
 
+/// The apply gates past the index-state check, over a ready publication: the
+/// MCP handler reaches them through [`run_pre_apply_gates`], and an embedded
+/// host, whose every claim binds a Current publication, calls them directly.
+pub fn run_pre_apply_gates_on_ready(
+    guard: &LiveIndex,
+    request: &StelEditRequest,
+    abs_path: &Path,
+) -> Result<PreApplyOutcome, EditValidationError> {
     let path = request.path.as_str();
     let name = request.symbol.as_deref().unwrap_or("").trim();
     let file = guard
@@ -238,7 +252,8 @@ fn resolve_symbol_in_file(
     }
 }
 
-#[cfg(test)]
+// The pre-apply gate tests drive `run_pre_apply_gates` over a SharedIndex.
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use crate::live_index::LiveIndex;
