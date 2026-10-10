@@ -13,6 +13,10 @@ pub struct ExploreRequest {
     pub include_personal_tooling: bool,
     pub language: Option<String>,
     pub path_prefix: Option<String>,
+    /// Return the MCP handler's depth-keyed token estimate instead of results.
+    pub estimate: Option<bool>,
+    /// Response token budget; the full result stays retrievable by handle.
+    pub max_tokens: Option<u64>,
 }
 
 impl ExploreRequest {
@@ -26,6 +30,8 @@ impl ExploreRequest {
             include_personal_tooling: false,
             language: None,
             path_prefix: None,
+            estimate: None,
+            max_tokens: None,
         }
     }
 }

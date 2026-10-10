@@ -4,6 +4,7 @@ use super::embed_query::{Budget, text_line};
 use crate::embed::parity::guidance::{
     Conventions, Exploration, ExploreRequest, ExploreSymbol, RelatedFile,
 };
+use crate::embed::parity::search::SearchEstimate;
 use crate::embed::parity::{QueryOutput, QueryRefusalKind};
 use crate::live_index::LiveIndex;
 
@@ -50,6 +51,17 @@ pub(super) fn explore(
     budget: &mut Budget,
 ) -> Result<QueryOutput, QueryRefusalKind> {
     use super::guidance::exploration;
+    // Same depth-keyed figure the MCP handler returns before touching the index.
+    if options.estimate == Some(true) {
+        budget.required(0)?;
+        return Ok(QueryOutput::SearchEstimate(SearchEstimate {
+            approximate_tokens: match options.depth {
+                1 => 500,
+                2 => 1500,
+                _ => 3000,
+            },
+        }));
+    }
     let request = exploration::ExploreRequest {
         query: options.query.clone(),
         limit: options.limit as usize,
@@ -64,13 +76,30 @@ pub(super) fn explore(
     let result = exploration::explore(live, &request, &mut || budget.check().is_ok());
     budget.check()?;
     let result = result.map_err(|_| QueryRefusalKind::InvalidRequest)?;
+    // A token cap bounds what is returned, never what is retrievable: the
+    // full projection is cached first, exactly like the MCP CCR budget.
+    if options.max_tokens.is_some() {
+        let mut full = budget.projection_budget();
+        budget.cache_output = Some(project_exploration(live, &result, &mut full)?);
+        budget.cache_truncated = full.truncated;
+        budget.check()?;
+        budget.cap_tokens(options.max_tokens);
+    }
+    project_exploration(live, &result, budget)
+}
+
+fn project_exploration(
+    live: &LiveIndex,
+    result: &super::guidance::exploration::ExploreResult,
+    budget: &mut Budget,
+) -> Result<QueryOutput, QueryRefusalKind> {
     budget.required(result.display_label.len())?;
     budget.truncated |= result.overflow_count > 0;
     let mut symbols = Vec::new();
-    for ((name, kind, path), score) in result.symbol_hits.into_iter().zip(result.symbol_scores) {
+    for ((name, kind, path), score) in result.symbol_hits.iter().zip(&result.symbol_scores) {
         let enriched = result.enriched_symbols.iter().find(
             |(candidate, candidate_kind, candidate_path, _, _)| {
-                candidate == &name && candidate_kind == &kind && candidate_path == &path
+                candidate == name && candidate_kind == kind && candidate_path == path
             },
         );
         let signature = enriched.and_then(|(_, _, _, signature, _)| signature.clone());
@@ -89,7 +118,7 @@ pub(super) fn explore(
             result
                 .symbol_impls
                 .iter()
-                .filter(|(candidate, _)| candidate == &name)
+                .filter(|(candidate, _)| candidate == name)
                 .flat_map(|(_, values)| values.iter().cloned()),
             budget,
         );
@@ -97,14 +126,14 @@ pub(super) fn explore(
             result
                 .symbol_deps
                 .iter()
-                .filter(|(candidate, _)| candidate == &name)
+                .filter(|(candidate, _)| candidate == name)
                 .flat_map(|(_, values)| values.iter().cloned()),
             budget,
         );
         symbols.push(ExploreSymbol {
-            name,
-            kind,
-            path,
+            name: name.clone(),
+            kind: kind.clone(),
+            path: path.clone(),
             score_millionths: (score * 1_000_000.0).round() as u32,
             signature,
             dependent_files,
@@ -113,34 +142,34 @@ pub(super) fn explore(
         });
     }
     let mut text_matches = Vec::new();
-    for (path, preview, line) in result.text_hits {
-        let Some(row) = text_line(live, &path, line as u32, preview, budget)? else {
+    for (path, preview, line) in &result.text_hits {
+        let Some(row) = text_line(live, path, *line as u32, preview.clone(), budget)? else {
             break;
         };
         text_matches.push(row);
     }
     let mut related_files = Vec::new();
-    for (path, matches) in result.related_files {
+    for (path, matches) in &result.related_files {
         if !budget.row(path.len()) {
             break;
         }
         related_files.push(RelatedFile {
-            path,
-            matches: matches as u64,
+            path: path.clone(),
+            matches: *matches as u64,
         });
     }
     let (derived_seed_terms, derived_symbols, derived_seed_files) =
-        if let Some(cluster) = result.derived_cluster {
+        if let Some(cluster) = &result.derived_cluster {
             (
-                strings(cluster.seed_terms, budget),
-                strings(cluster.promoted_symbols, budget),
-                strings(cluster.seed_files, budget),
+                strings(cluster.seed_terms.iter().cloned(), budget),
+                strings(cluster.promoted_symbols.iter().cloned(), budget),
+                strings(cluster.seed_files.iter().cloned(), budget),
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
     Ok(QueryOutput::Exploration(Exploration {
-        label: result.display_label,
+        label: result.display_label.clone(),
         depth: result.depth,
         symbols,
         text_matches,
@@ -148,7 +177,7 @@ pub(super) fn explore(
         derived_seed_terms,
         derived_symbols,
         derived_seed_files,
-        enriched_imports: strings(result.enriched_imports, budget),
+        enriched_imports: strings(result.enriched_imports.iter().cloned(), budget),
         hidden_noise_results: result.noise_hidden as u64,
     }))
 }

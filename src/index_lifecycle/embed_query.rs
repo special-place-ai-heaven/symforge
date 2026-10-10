@@ -978,6 +978,7 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         QueryRequest::SymbolSearch(input) => super::embed_search::validate_symbol(input)?,
         QueryRequest::Explore(options) => {
             if options.query.trim().is_empty()
+                || options.max_tokens == Some(0)
                 || !(1..=3).contains(&options.depth)
                 || options.limit == 0
                 || options.limit > 10_000
