@@ -684,12 +684,18 @@ fn begin_mutation_replay<T: Serialize>(
 
     server
         .index
-        .with_admitted_replay_source(|_, project_state, source| {
-            let project_state = project_state.ok_or_else(|| {
+        .with_admitted_replay_source(|root, project_state, source| {
+            let project_state = super::secret_remediate::resolved_project_state(
+                server,
+                root,
+                project_state,
+                "edit",
+            )?
+            .ok_or_else(|| {
                 "Error: durable project-state replay is unavailable for this binding.".to_string()
             })?;
             match crate::idempotency::begin_tool_replay_verified_bound(
-                project_state,
+                &project_state,
                 tool_name,
                 raw_key,
                 &request,
@@ -749,12 +755,18 @@ fn probe_mutation_replay<T: Serialize>(
 
     server
         .index
-        .with_admitted_replay_source(|_, project_state, source| {
-            let project_state = project_state.ok_or_else(|| {
+        .with_admitted_replay_source(|root, project_state, source| {
+            let project_state = super::secret_remediate::resolved_project_state(
+                server,
+                root,
+                project_state,
+                "edit",
+            )?
+            .ok_or_else(|| {
                 "Error: durable project-state replay is unavailable for this binding.".to_string()
             })?;
             crate::idempotency::probe_tool_replay_verified_bound(
-                project_state,
+                &project_state,
                 tool_name,
                 raw_key,
                 &request,

@@ -21249,6 +21249,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), written_once);
     }
 
+    /// The pinned index binding and the server must name the same durable state
+    /// directory. When both exist and differ, replay refuses with an explicit
+    /// mismatch before any write instead of silently preferring either one.
+    #[tokio::test]
+    async fn test_edit_idempotency_refuses_server_and_binding_state_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let file_path = dir.path().join("src/lib.rs");
+        std::fs::write(&file_path, "fn present() {\n    old();\n}\n").unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let other_state = tempfile::tempdir().unwrap();
+        let index = LiveIndex::load_for_state_placement(
+            &root,
+            &crate::domain::StatePlacement::ProjectLocal {
+                directory: crate::domain::ProjectStateDir::new(other_state.path().join("state")),
+            },
+        )
+        .unwrap();
+        let server = SymForgeServer::new_with_state_placement(
+            index,
+            "state_mismatch".to_string(),
+            Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(root.clone()),
+            Some(crate::domain::StatePlacement::ProjectLocal {
+                directory: crate::domain::ProjectStateDir::new(root.join(".symforge")),
+            }),
+            None,
+        );
+
+        let output = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                serde_json::json!({
+                    "path": "src/lib.rs",
+                    "name": "present",
+                    "new_body": "fn present() {\n    new();\n}",
+                    "idempotency_key": "state-mismatch",
+                }),
+            )))
+            .await;
+
+        assert!(
+            output.contains("durable project-state placement changed"),
+            "{output}"
+        );
+        assert!(
+            std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("old();")
+        );
+    }
+
     #[tokio::test]
     async fn test_edit_idempotency_rejects_same_key_different_request_before_file_changes() {
         let source = b"fn present() {\n    old();\n}\n";
@@ -26568,7 +26621,10 @@ mod tests {
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0);
         }
-        let index = make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]);
+        let mut index = make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]);
+        // Every production loader binds the index to its root; replay pins
+        // that binding, so an edit fixture must carry it too.
+        index.indexed_root = Some(crate::live_index::store::normalize_root(dir.path()));
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
         (dir, server, file_path)
     }

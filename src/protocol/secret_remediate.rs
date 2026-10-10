@@ -488,21 +488,25 @@ fn admitted_root_matches(
         .is_ok_and(|canonical| canonical == source.admitted_root())
 }
 
-fn resolved_project_state(
+/// Reconcile the server's resolved state placement with the pinned index
+/// binding for a replay. The roots must canonicalize equal, and two present
+/// state dirs must agree. When only one side carries a state dir, that one is
+/// the durable placement for this root. `label` names the caller in refusals.
+pub(crate) fn resolved_project_state(
     server: &SymForgeServer,
     root: &Path,
     runtime: Option<&crate::domain::ProjectStateDir>,
+    label: &str,
 ) -> Result<Option<crate::domain::ProjectStateDir>, String> {
-    let server_root = server
-        .capture_repo_root()
-        .ok_or_else(|| "Error: admitted remediation source unavailable".to_string())?;
+    let unavailable = || format!("Error: admitted {label} source unavailable");
+    let server_root = server.capture_repo_root().ok_or_else(unavailable)?;
     let (Ok(server_canonical), Ok(runtime_canonical)) =
         (server_root.canonicalize(), root.canonicalize())
     else {
-        return Err("Error: admitted remediation source unavailable".to_string());
+        return Err(unavailable());
     };
     if server_canonical != runtime_canonical {
-        return Err("Error: admitted remediation source changed".to_string());
+        return Err(format!("Error: admitted {label} source changed"));
     }
     let server_state = server.capture_project_state_dir();
     if let (Some(runtime), Some(server_state)) = (runtime, server_state.as_ref())
@@ -536,7 +540,7 @@ fn begin_secret_replay(
             if !admitted_root_matches(root, source) {
                 return Err("Error: admitted remediation source changed".to_string());
             }
-            let placement = resolved_project_state(server, root, state)?;
+            let placement = resolved_project_state(server, root, state, "remediation")?;
             let state = placement.as_ref().ok_or_else(|| {
                 "Error: durable project-state replay is unavailable for this binding".to_string()
             })?;
@@ -571,8 +575,13 @@ fn planning_binding(server: &SymForgeServer) -> Result<(PathBuf, u64, Option<Pat
         .clone()
         .ok_or_else(|| "Error: no indexed root bound".to_string())?;
     let generation = shared.current_project_generation();
-    let state_dir = resolved_project_state(server, &root, shared.project_state_dir().as_deref())?
-        .map(|state| state.as_path().to_path_buf());
+    let state_dir = resolved_project_state(
+        server,
+        &root,
+        shared.project_state_dir().as_deref(),
+        "remediation",
+    )?
+    .map(|state| state.as_path().to_path_buf());
     Ok((root, generation, state_dir))
 }
 
