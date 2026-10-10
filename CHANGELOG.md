@@ -32,6 +32,13 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+## [11.7.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.6.0...v11.7.0) (2026-10-10)
+
+
+### Features
+
+* **embed:** full MCP parity for every tool, resource and prompt ([#780](https://github.com/special-place-ai-heaven/symforge/issues/780)) ([98b644b](https://github.com/special-place-ai-heaven/symforge/commit/98b644bd5b9f25f2a0b0537953aa20c587d5068d))
+
 ## [11.6.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.5.6...v11.6.0) (2026-10-10)
 
 
