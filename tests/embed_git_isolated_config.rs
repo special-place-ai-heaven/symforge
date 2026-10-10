@@ -52,6 +52,10 @@ fn child_isolated_git_config() {
         check_attribute_and_exclude_isolation(&root);
         return;
     }
+    if std::env::var_os("SYMFORGE_ISOLATED_GIT_LOCAL").is_some() {
+        check_local_config_preserved(&root);
+        return;
+    }
     let regular = git2::Repository::open_ext(
         root.join(".git"),
         git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::NO_DOTGIT,
@@ -63,9 +67,16 @@ fn child_isolated_git_config() {
     );
     let scratch = tempfile::tempdir().unwrap();
     let (_runtime, source) = prepared_source(&root, scratch.path());
-    let isolated = source
+    source
         .prepared_git_repository_for_test()
         .expect("isolated open must not parse unadmitted global configuration");
+}
+
+/// The isolated view keeps the repository's own config and committed blobs.
+fn check_local_config_preserved(root: &Path) {
+    let scratch = tempfile::tempdir().unwrap();
+    let (_runtime, source) = prepared_source(root, scratch.path());
+    let isolated = source.prepared_git_repository_for_test().unwrap();
     assert_eq!(
         isolated
             .config()
@@ -82,7 +93,8 @@ fn child_isolated_git_config() {
         .unwrap();
     assert_eq!(
         isolated.find_blob(entry.id()).unwrap().content(),
-        b"pub fn original() {}\n"
+        b"pub fn original() {}
+"
     );
 }
 
@@ -185,6 +197,44 @@ fn isolated_git_open_keeps_local_attributes_and_excludes_without_ambient_fallbac
     );
 }
 
+#[test]
+fn isolated_git_open_preserves_local_config() {
+    let root = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    let repository = committed_repository(root.path());
+    repository
+        .config()
+        .unwrap()
+        .set_bool("core.filemode", false)
+        .unwrap();
+    std::fs::write(
+        global.path().join(".gitconfig"),
+        "[core]
+filemode = true
+[user]
+name = ambient
+",
+    )
+    .unwrap();
+    let child = symforge::process_util::hidden_command(std::env::current_exe().unwrap())
+        .args(["--exact", "child_isolated_git_config", "--nocapture"])
+        .env("SYMFORGE_ISOLATED_GIT_CHILD", root.path())
+        .env("SYMFORGE_ISOLATED_GIT_LOCAL", "1")
+        .env("HOME", global.path())
+        .env("USERPROFILE", global.path())
+        .env("XDG_CONFIG_HOME", global.path())
+        .env("GIT_CONFIG_GLOBAL", global.path().join(".gitconfig"))
+        .env_remove("GIT_CONFIG_COUNT")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&child.stdout).contains("running 1 test"));
+    assert!(
+        child.status.success(),
+        "local-config child failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
 // Proven libgit2 1.9.4 limit, not a symforge gap: every public repository open
 // (git_repository_open_ext/open_bare/open_from_worktree) runs
 // obtain_config_and_set_oid_type -> git_repository_config__weakptr ->
@@ -195,15 +245,10 @@ fn isolated_git_open_keeps_local_attributes_and_excludes_without_ambient_fallbac
 // git_libgit2_opts search-path mutation (process-global, forbidden here).
 #[test]
 #[ignore = "libgit2 loads global config inside every public open; see comment"]
-fn isolated_git_open_does_not_read_global_includes_and_preserves_local_config() {
+fn isolated_git_open_does_not_read_global_includes() {
     let root = tempfile::tempdir().unwrap();
     let global = tempfile::tempdir().unwrap();
-    let repository = committed_repository(root.path());
-    repository
-        .config()
-        .unwrap()
-        .set_bool("core.filemode", false)
-        .unwrap();
+    committed_repository(root.path());
     std::fs::write(
         global.path().join(".gitconfig"),
         "[include]\npath = broken-config\n",
