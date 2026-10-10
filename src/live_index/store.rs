@@ -2130,6 +2130,40 @@ fn pre_update_snapshot(existing: &IndexedFile) -> PreUpdateSnapshot {
     }
 }
 
+/// What a full reload does with the per-file `analyze_file_impact` baselines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreUpdateRetention {
+    /// A retarget or reset: the baselines belong to the previous project.
+    Clear,
+    /// A refresh of the same bound tree: keep the watcher's per-file rule.
+    RecordChangedFiles,
+}
+
+/// The slot updates [`SharedIndexHandle::update_file`] and the watcher's
+/// removals would have made for every file a full reload replaced: the prior
+/// image of a file whose bytes changed, and a cleared slot for a removed or
+/// newly admitted file. Untouched files are absent, so their slots survive.
+fn changed_file_baselines(
+    previous: &LiveIndex,
+    next: &LiveIndex,
+) -> Vec<(String, Option<PreUpdateSnapshot>)> {
+    let mut baselines: Vec<_> = next
+        .all_files()
+        .filter_map(|(path, file)| match previous.get_file(path) {
+            Some(prior) if prior.content_hash == file.content_hash => None,
+            Some(prior) => Some((path.clone(), Some(pre_update_snapshot(prior)))),
+            None => Some((path.clone(), None)),
+        })
+        .collect();
+    baselines.extend(
+        previous
+            .all_files()
+            .filter(|(path, _)| next.get_file(path).is_none())
+            .map(|(path, _)| (path.clone(), None)),
+    );
+    baselines
+}
+
 #[derive(Clone, Debug)]
 pub struct PreUpdateSymbol {
     pub name: String,
@@ -3679,6 +3713,7 @@ impl SharedIndexHandle {
             project_state_dir,
             source_exclusions,
             None,
+            PreUpdateRetention::Clear,
         )
     }
 
@@ -3697,6 +3732,30 @@ impl SharedIndexHandle {
             project_state_dir,
             source_exclusions,
             Some(cancel),
+            PreUpdateRetention::Clear,
+        )
+    }
+
+    /// The embedded worker's refresh of its OWN bound tree. It reloads the whole
+    /// tree where MCP's watcher re-indexes one file through [`Self::update_file`],
+    /// so it records the same per-file baseline the watcher would: every file
+    /// whose indexed bytes changed keeps its prior image for
+    /// `analyze_file_impact`, a removed or newly admitted file drops its slot,
+    /// and an untouched file keeps whatever baseline it already held. A
+    /// physically replaced root clears them all, as a retarget does.
+    pub(crate) fn refresh_bound_tree_cancellable(
+        &self,
+        root: &Path,
+        project_state_dir: Option<ProjectStateDir>,
+        source_exclusions: discovery::SourceExclusions,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        self.reload_for_binding_with_exclusions_cancellation(
+            root,
+            project_state_dir,
+            source_exclusions,
+            Some(cancel),
+            PreUpdateRetention::RecordChangedFiles,
         )
     }
 
@@ -3706,6 +3765,7 @@ impl SharedIndexHandle {
         project_state_dir: Option<ProjectStateDir>,
         source_exclusions: discovery::SourceExclusions,
         cancel: Option<&AtomicBool>,
+        retention: PreUpdateRetention,
     ) -> anyhow::Result<()> {
         check_reload_cancelled(cancel)?;
         // Watermark the published live root before the out-of-lock candidate
@@ -3809,8 +3869,22 @@ impl SharedIndexHandle {
         // Path-keyed pre-update snapshots belong to the previous project
         // generation. Clear them under the same writer lock as the retarget so
         // a late impact request cannot consume a replacement project's state.
-        self.pre_update_snapshots.lock().clear();
+        let baselines = match retention {
+            PreUpdateRetention::RecordChangedFiles if !physical_replacement => {
+                Some(changed_file_baselines(&current_live, &live))
+            }
+            _ => {
+                self.pre_update_snapshots.lock().clear();
+                None
+            }
+        };
         self.swap_and_publish(live);
+        if let Some(baselines) = baselines {
+            let replacement = self.publication_fence();
+            for (path, snapshot) in baselines {
+                self.record_pre_update_snapshot_for_publication(&path, snapshot, replacement);
+            }
+        }
         // Recorded only now that these verdicts are installed: every early
         // return above (cancel, merge refusal) keeps the old index and its
         // held dismissal state.

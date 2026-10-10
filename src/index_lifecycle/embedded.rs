@@ -686,15 +686,12 @@ impl EmbeddedBinding {
             &self.root,
             &self.state_placement,
         );
-        let result = self
-            .runtime
-            .data_plane()
-            .reload_for_binding_with_exclusions_cancellable(
-                &self.root,
-                self.state_placement.directory().cloned(),
-                exclusions,
-                &self.shutdown_started,
-            );
+        let result = self.runtime.data_plane().refresh_bound_tree_cancellable(
+            &self.root,
+            self.state_placement.directory().cloned(),
+            exclusions,
+            &self.shutdown_started,
+        );
         if let Err(error) = result {
             if self.shutdown_started.load(Ordering::Acquire)
                 || crate::live_index::store::reload_was_cancelled(&error)

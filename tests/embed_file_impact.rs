@@ -230,3 +230,66 @@ fn analyze_file_impact_reports_unavailable_co_changes_without_derived_state_perm
         report.rendered
     );
 }
+
+/// MCP's watcher re-indexes an edited file through `update_file`, which keeps
+/// the prior image as the impact baseline. The embedded worker refreshes the
+/// whole tree instead; that refresh must keep the same baseline, so an impact
+/// request that arrives after the worker already reloaded the edit still
+/// reports it rather than "indexed and unchanged".
+#[test]
+fn analyze_file_impact_keeps_the_pre_edit_baseline_across_a_worker_reload() {
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path());
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let before = handle.runtime_view().source_version;
+
+    fs::write(root.path().join("src/lib.rs"), LIB_AFTER).unwrap();
+    handle.request_refresh().unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = handle.runtime_view();
+        if view.phase == SourceRuntimePhase::Current && view.source_version > before {
+            break;
+        }
+        assert!(Instant::now() < until, "the worker never reloaded the edit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let reloaded = handle
+        .query(
+            &QueryRequest::SearchSymbols {
+                query: Some("zeta".into()),
+                path_prefix: None,
+                kind: None,
+                include_tests: false,
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Symbols(symbols) = reloaded.value() else {
+        panic!("symbol search");
+    };
+    assert_eq!(symbols.len(), 1, "the reload published the edit");
+
+    let edited = impact(
+        &handle,
+        FileImpactRequest {
+            path: "src/lib.rs".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(edited, EDIT_GOLDEN);
+
+    // Consumed like MCP's: the next request diffs against the edit itself.
+    let again = impact(
+        &handle,
+        FileImpactRequest {
+            path: "src/lib.rs".into(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        again.starts_with("── Impact: src/lib.rs ──\nStatus: indexed and unchanged\n"),
+        "{again}"
+    );
+}
