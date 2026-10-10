@@ -1,6 +1,6 @@
 //! Serializable edit facts for room hosts. Write grants are never wire data.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,13 +46,9 @@ impl From<&EditGuard> for WireEditGuard {
 }
 
 impl WireEditGuard {
-    pub(crate) fn bind(
-        self,
-        root: &PathBuf,
-        authority_publication: PublicationIdentity,
-    ) -> EditGuard {
+    pub(crate) fn bind(self, root: &Path, authority_publication: PublicationIdentity) -> EditGuard {
         EditGuard {
-            root: root.clone(),
+            root: root.to_path_buf(),
             path: self.path,
             name: self.name,
             kind: self.kind,

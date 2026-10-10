@@ -633,6 +633,8 @@ pub struct HostResourceReply {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
+// A short-lived wire reply value moved once into its response; boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum HostResourceContent {
     Health(HostHealth),
     Query(HostQueryReply),
@@ -737,10 +739,10 @@ pub struct HostRefusal {
     pub remediation_kind: Option<SecretRemediationRefusalKind>,
     pub edit_kind: Option<String>,
     pub knowledge_kind: Option<String>,
-    pub recovery: Option<HostRecoveryEvidence>,
+    pub recovery: Option<Box<HostRecoveryEvidence>>,
     /// Redacted finding metadata from the shared source admission gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub withheld: Option<WithheldMeta>,
+    pub withheld: Option<Box<WithheldMeta>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -797,7 +799,7 @@ impl HostRefusal {
             edit_kind: None,
             knowledge_kind: None,
             recovery: None,
-            withheld: refusal.withheld().cloned(),
+            withheld: refusal.withheld().cloned().map(Box::new),
         }
     }
 
@@ -885,6 +887,9 @@ impl HostRefusal {
     }
 }
 
+type SharedHostSources = Arc<Mutex<HashMap<PathBuf, SharedHostSource>>>;
+type ActiveRoomIds = Arc<Mutex<HashMap<String, Arc<()>>>>;
+
 /// Service-owned runtime for admitting several independent rooms.
 /// This value stays in trusted host code and never crosses the wire.
 pub struct HostRuntimeOwner {
@@ -892,8 +897,8 @@ pub struct HostRuntimeOwner {
     open_options: EmbeddedOpenOptions,
     instance_identity: String,
     stopped: Mutex<bool>,
-    sources: Arc<Mutex<HashMap<PathBuf, SharedHostSource>>>,
-    active_room_ids: Arc<Mutex<HashMap<String, Arc<()>>>>,
+    sources: SharedHostSources,
+    active_room_ids: ActiveRoomIds,
 }
 
 struct SharedHostSource {
@@ -918,13 +923,12 @@ impl HostRuntimeOwner {
     }
 
     fn release_room_id(&self, room_id: &str, token: &Arc<()>) {
-        if let Ok(mut active) = self.active_room_ids.lock() {
-            if active
+        if let Ok(mut active) = self.active_room_ids.lock()
+            && active
                 .get(room_id)
                 .is_some_and(|current| Arc::ptr_eq(current, token))
-            {
-                active.remove(room_id);
-            }
+        {
+            active.remove(room_id);
         }
     }
 
@@ -1016,8 +1020,8 @@ pub struct HostRoom {
     owns_runtime: bool,
     source: Arc<EmbeddedSourceHandle>,
     closed: AtomicBool,
-    owner_sources: Option<Arc<Mutex<HashMap<PathBuf, SharedHostSource>>>>,
-    owner_room_ids: Option<Arc<Mutex<HashMap<String, Arc<()>>>>>,
+    owner_sources: Option<SharedHostSources>,
+    owner_room_ids: Option<ActiveRoomIds>,
     room_token: Option<Arc<()>>,
     session: Mutex<Option<Arc<QuerySession>>>,
     secret_external_tool: Option<SecretExternalTool>,
@@ -1025,15 +1029,13 @@ pub struct HostRoom {
 
 impl HostRoom {
     fn release_room_id(&self) {
-        if let (Some(active), Some(token)) = (&self.owner_room_ids, &self.room_token) {
-            if let Ok(mut active) = active.lock() {
-                if active
-                    .get(&self.room_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, token))
-                {
-                    active.remove(&self.room_id);
-                }
-            }
+        if let (Some(active), Some(token)) = (&self.owner_room_ids, &self.room_token)
+            && let Ok(mut active) = active.lock()
+            && active
+                .get(&self.room_id)
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            active.remove(&self.room_id);
         }
     }
 
@@ -1271,7 +1273,7 @@ impl HostRoom {
         request: &HostRequest,
         operation_key: &str,
         certainty: HostEffectCertainty,
-    ) -> HostRecoveryEvidence {
+    ) -> Box<HostRecoveryEvidence> {
         let request_bytes = serde_json::to_vec(request).expect("typed request serializes");
         let route = match certainty {
             HostEffectCertainty::Committed => {
@@ -1279,7 +1281,7 @@ impl HostRoom {
             }
             HostEffectCertainty::Uncertain => "inspect_and_reconcile_durable_replay_before_retry",
         };
-        HostRecoveryEvidence {
+        Box::new(HostRecoveryEvidence {
             certainty,
             operation_kind: match request {
                 HostRequest::Edit { .. } => "edit",
@@ -1296,7 +1298,7 @@ impl HostRoom {
             ),
             source_scope_digest: crate::hash::digest_hex(self.source_scope.as_bytes()),
             route: route.to_owned(),
-        }
+        })
     }
 
     pub fn room_id(&self) -> &str {

@@ -451,18 +451,17 @@ pub(super) fn references(
             );
         }
     }
-    if view.total_refs == 0 {
-        if let Ok(text) = crate::live_index::search::search_text_with_options(
+    if view.total_refs == 0
+        && let Ok(text) = crate::live_index::search::search_text_with_options(
             live,
             Some(&request.name),
             None,
             false,
             &crate::live_index::search::TextSearchOptions::for_current_code_search(),
-        ) {
-            if !text.files.is_empty() {
-                body.push_str(&format!("\n\nNote: no indexed references found, but search_text found {} file(s) containing \"{}\". The index may miss qualified-path calls (e.g., module::{}()). Use search_text(query=\"{}\") for full coverage.",text.files.len(),request.name,request.name,request.name));
-            }
-        }
+        )
+        && !text.files.is_empty()
+    {
+        body.push_str(&format!("\n\nNote: no indexed references found, but search_text found {} file(s) containing \"{}\". The index may miss qualified-path calls (e.g., module::{}()). Use search_text(query=\"{}\") for full coverage.",text.files.len(),request.name,request.name,request.name));
     }
     if let Some(disclosure) = &disclosure {
         body.push_str("\n\n");

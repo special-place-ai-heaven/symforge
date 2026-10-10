@@ -574,21 +574,22 @@ fn execute_inner(
     if let Some(path) = committed_path {
         snapshot.record_commitment(&[PathBuf::from(path)]);
     }
-    if let Some(QueryOutput::SymbolRead(content)) = committed_value {
-        if !content.cache_hit && content.estimated_tokens.is_none() {
-            let paths = content
-                .entries
-                .iter()
-                .filter(|entry| entry.source.is_some())
-                .map(|entry| PathBuf::from(&entry.path))
-                .collect::<Vec<_>>();
-            snapshot.record_commitment(&paths);
-        }
+    if let Some(QueryOutput::SymbolRead(content)) = committed_value
+        && !content.cache_hit
+        && content.estimated_tokens.is_none()
+    {
+        let paths = content
+            .entries
+            .iter()
+            .filter(|entry| entry.source.is_some())
+            .map(|entry| PathBuf::from(&entry.path))
+            .collect::<Vec<_>>();
+        snapshot.record_commitment(&paths);
     }
-    if let Some(QueryOutput::InspectMatch(content)) = committed_value {
-        if content.estimated_tokens.is_none() {
-            snapshot.record_commitment(&[PathBuf::from(&content.path)]);
-        }
+    if let Some(QueryOutput::InspectMatch(content)) = committed_value
+        && content.estimated_tokens.is_none()
+    {
+        snapshot.record_commitment(&[PathBuf::from(&content.path)]);
     }
     if let Some(session) = session {
         session.commit_observation(result.value());

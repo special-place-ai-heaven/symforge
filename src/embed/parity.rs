@@ -407,6 +407,8 @@ pub struct QueryObservation {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
+// One reply per query, moved once to the caller; boxing every result variant would only add allocations.
+#[allow(clippy::large_enum_variant)]
 pub enum QueryOutput {
     TextSearch(search::TextSearchResult),
     SymbolSearch(search::SymbolSearchResult),

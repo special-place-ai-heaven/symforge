@@ -20,7 +20,7 @@ impl Counter {
         self.0 = self.0.saturating_add(bytes as u64);
     }
 }
-impl<'a> Serializer for &'a mut Counter {
+impl Serializer for &mut Counter {
     type Ok = ();
     type Error = serde_json::Error;
     type SerializeSeq = Self;

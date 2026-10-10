@@ -517,6 +517,7 @@ impl KnowledgeCurationCoordinator {
     /// Embed uses the same coordinator, replay, and policy writer as MCP, but
     /// pins its host-authorized mutation to the captured source publication.
     #[cfg(feature = "embed")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_guarded(
         &self,
         index: &SharedIndex,
@@ -569,6 +570,7 @@ impl KnowledgeCurationCoordinator {
     /// Read-only Completed replay for an old serialized Embed guard. It never
     /// reserves a new key or weakens the publication check for a fresh write.
     #[cfg(feature = "embed")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn replay_completed_guarded(
         &self,
         index: &SharedIndex,

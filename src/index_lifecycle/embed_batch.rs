@@ -335,11 +335,13 @@ fn manifest(
     serde_json::to_vec(&entries).map_err(|_| EditErrorKind::ReplayUnavailable)
 }
 
+type PathManifest = (Vec<u8>, Vec<(String, String)>);
+
 fn current_manifest_for_paths(
     root: &std::path::Path,
     paths: &[String],
     authority: &super::activation::ProjectSourceAuthority,
-) -> Result<(Vec<u8>, Vec<(String, String)>), EditErrorKind> {
+) -> Result<PathManifest, EditErrorKind> {
     if paths.is_empty() {
         return Err(EditErrorKind::ReplayConflict);
     }
