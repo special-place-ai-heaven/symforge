@@ -9,12 +9,12 @@
 /// duplicated across files. The exact wording/behavior is unchanged.
 pub(crate) const WRITE_MODE_FAILED_SENTINEL: &str = "Write mode: failed";
 
-pub(crate) use crate::index_lifecycle::guidance::edit_body::{
+pub(crate) use super::edit::edit_body::{
     EditSafetyMode, EditSourceAuthority, EditWriteSemantics, MatchType, format_batch_summary,
     format_delete, format_edit_within, format_insert, format_replace, format_stale_warnings,
 };
 #[cfg(test)]
-use crate::index_lifecycle::guidance::edit_body::{format_batch_envelope, format_edit_envelope};
+use super::edit::edit_body::{format_batch_envelope, format_edit_envelope};
 
 pub(crate) fn format_capability_warning(
     tool_name: &str,

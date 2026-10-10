@@ -319,6 +319,9 @@ pub(crate) fn guard_batch_reroute_divergence(
 // Symbol resolution wrapper
 // ---------------------------------------------------------------------------
 
+/// The shared MCP edit answer composition (`guidance::edit_body`); the
+/// protocol's other edit modules reach it through this wired door.
+pub(crate) use crate::index_lifecycle::guidance::edit_body;
 pub(crate) use crate::index_lifecycle::guidance::edit_body::resolve_or_error;
 
 // ---------------------------------------------------------------------------
