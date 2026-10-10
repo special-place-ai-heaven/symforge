@@ -299,14 +299,20 @@ fn line_ending_insensitive_eq(a: &[u8], b: &[u8]) -> bool {
 /// worktree target the way the single-symbol tools do. Until that refactor
 /// lands, a rerouted batch write onto a target that differs from the indexed
 /// content would silently destroy earlier routed edits — so refuse it loudly
-/// instead. A rerouted batch onto a byte-identical target stays allowed.
+/// instead. A rerouted batch onto a byte-identical (or line-ending-only
+/// different) target stays allowed.
+///
+/// Returns the preimage the batch must stage against: the target bytes this
+/// guard actually read and admitted. A CRLF worktree checkout of an LF
+/// indexed file is admitted, so staging the indexed bytes instead would make
+/// the commit's exact-bytes check refuse the write it was just allowed.
 pub(crate) fn guard_batch_reroute_divergence(
     resolved: &crate::worktree::ResolvedTarget,
     indexed_content: &[u8],
     relative_path: &str,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     if !resolved.rerouted {
-        return Ok(());
+        return Ok(indexed_content.to_vec());
     }
     let target_bytes = std::fs::read(&resolved.target_path).map_err(|e| {
         format!(
@@ -316,7 +322,7 @@ pub(crate) fn guard_batch_reroute_divergence(
     })?;
     if target_bytes == indexed_content || line_ending_insensitive_eq(&target_bytes, indexed_content)
     {
-        return Ok(());
+        return Ok(target_bytes);
     }
     Err(format!(
         "Error: rerouted batch edit refused for '{relative_path}': the worktree target {} has \
@@ -1282,12 +1288,12 @@ pub(crate) fn execute_batch_edit(
         // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
         // a diverged rerouted target — this batch's splices were resolved
         // against the index snapshot, not the worktree file.
-        guard_batch_reroute_divergence(&resolved_target, &file.content, path)?;
+        let original = guard_batch_reroute_divergence(&resolved_target, &file.content, path)?;
         let abs_path = resolved_target.target_path.clone();
         staged.push(StagedFile {
             path: path.clone(),
             abs_path,
-            original: file.content.clone(),
+            original,
             new_content: content,
             language,
             summaries: file_summaries,
@@ -1547,7 +1553,7 @@ pub(crate) fn execute_batch_rename(
         // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
         // a diverged rerouted target — rename ranges were validated against
         // the index snapshot, not the worktree file.
-        guard_batch_reroute_divergence(&resolved_target, &original, path)?;
+        let original = guard_batch_reroute_divergence(&resolved_target, &original, path)?;
         staged.push(StagedFile {
             path: path.clone(),
             abs_path: resolved_target.target_path.clone(),
@@ -1908,11 +1914,11 @@ pub(crate) fn execute_batch_insert(
         // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
         // a diverged rerouted target — these insert anchors were resolved
         // against the index snapshot, not the worktree file.
-        guard_batch_reroute_divergence(&resolved_target, &file.content, &path)?;
+        let original = guard_batch_reroute_divergence(&resolved_target, &file.content, &path)?;
         staged.push(StagedFile {
             path: path.clone(),
             abs_path: resolved_target.target_path.clone(),
-            original: file.content.clone(),
+            original,
             new_content: content,
             language: resolved[indices[0]].language,
             summaries: file_summaries,
