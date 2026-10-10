@@ -972,7 +972,7 @@ fn begin_tool_replay_verified_with(
                 Ok(ReplayStart::Replay(replay_response(&record)))
             } else {
                 Ok(ReplayStart::Replay(
-                    "Idempotency replay unavailable: stored operation requires reconciliation."
+                    "Error: Idempotency replay unavailable: stored operation requires reconciliation."
                         .to_owned(),
                 ))
             }
@@ -1022,7 +1022,8 @@ fn probe_tool_replay_verified_with(
             Ok(Some(replay_response(&record)))
         }
         Some(_) => Ok(Some(
-            "Idempotency replay unavailable: stored operation requires reconciliation.".to_owned(),
+            "Error: Idempotency replay unavailable: stored operation requires reconciliation."
+                .to_owned(),
         )),
         None => Ok(None),
     }
@@ -1062,20 +1063,20 @@ pub fn replay_response(record: &ReplayRecord) -> String {
             if validate_replay_response(response_text).is_ok() {
                 response_text.clone()
             } else {
-                "Idempotency replay unavailable: persisted response requires reconciliation."
+                "Error: Idempotency replay unavailable: persisted response requires reconciliation."
                     .to_owned()
             }
         }
         (ReplayStatus::Reserved, _) => format!(
-            "Idempotency replay unavailable: request for key hash {} is still reserved.",
+            "Error: Idempotency replay unavailable: request for key hash {} is still reserved.",
             record.key_hash
         ),
         (ReplayStatus::Started | ReplayStatus::Uncertain, _) => format!(
-            "Idempotency replay unavailable: request for key hash {} requires reconciliation.",
+            "Error: Idempotency replay unavailable: request for key hash {} requires reconciliation.",
             record.key_hash
         ),
         (status, None) => format!(
-            "Idempotency replay unavailable: record for key hash {} has status {:?} but no stored response.",
+            "Error: Idempotency replay unavailable: record for key hash {} has status {:?} but no stored response.",
             record.key_hash, status
         ),
     }

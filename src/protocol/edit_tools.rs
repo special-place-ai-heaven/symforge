@@ -707,9 +707,7 @@ fn begin_mutation_replay<T: Serialize>(
                         source: Arc::clone(source),
                     }))
                 }
-                Ok(crate::idempotency::ReplayStart::Replay(response)) => {
-                    Err(super::secret_remediate::typed_replay_response(response))
-                }
+                Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
                 Err(error) => Err(crate::idempotency::format_tool_error(&error)),
             }
         })
@@ -774,7 +772,6 @@ fn probe_mutation_replay<T: Serialize>(
                 &request,
                 source,
             )
-            .map(|found| found.map(super::secret_remediate::typed_replay_response))
             .map_err(|error| crate::idempotency::format_tool_error(&error))
         })
         .map_err(|_| {
