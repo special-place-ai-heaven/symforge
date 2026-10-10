@@ -1135,9 +1135,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // feature-neutral and delegating to the shared runtime:
 // stel/{controller,executor,planner,runtime}.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "71dbff62b55c3470648c1fc5dbbbd24000c22bd5104b78f2135ee59825fde065",
+    "90bf35d065162bd1c188903e45d43f26fb87167c67fbe18d239bd2b413a94f7e",
     89,
-    2_157_501,
+    2_159_881,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1284,11 +1284,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // seven files. Protocol re-exports of the shared guidance engine:
 // protocol/{edit_format,edit_plan,result_status}.rs. STEL modules made
 // feature-neutral and delegating to the shared runtime:
-// stel/{controller,executor,planner,runtime}.rs.
+// stel/{controller,executor,planner,runtime}.rs. Trust-mode host option; no new
+// boundary edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3a0a8ce6b911b4f08dbf523ccba97b1aa914a7708e108311eadf4d9ce60adb32",
+    "4156b7755492c8572ea2596b66698bb7d5632980939e6e393f5f0eca1cd9b961",
     312,
-    11_840_186,
+    11_843_380,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
