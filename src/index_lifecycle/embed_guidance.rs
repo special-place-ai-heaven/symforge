@@ -185,7 +185,7 @@ fn project_exploration(
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
-    Ok(QueryOutput::Exploration(Exploration {
+    let mut exploration = Exploration {
         label: result.display_label.clone(),
         depth: result.depth,
         symbols,
@@ -196,5 +196,8 @@ fn project_exploration(
         derived_seed_files,
         enriched_imports: strings(result.enriched_imports.iter().cloned(), budget),
         hidden_noise_results: result.noise_hidden as u64,
-    }))
+        rendered: String::new(),
+    };
+    exploration.rendered = super::embed_ask::exploration_text(&exploration);
+    Ok(QueryOutput::Exploration(exploration))
 }

@@ -540,55 +540,7 @@ fn render_output(
                 },
             )
         }
-        QueryOutput::DetectImpact(value) => detect_impact_text(value),
+        QueryOutput::DetectImpact(value) => value.rendered.clone(),
         _ => super::embed_ask::render_routed(request, output)?,
     })
-}
-
-/// MCP `detect_impact`'s text: the shared summary over the same payload the
-/// MCP handler builds.
-fn detect_impact_text(value: &crate::embed::parity::detect_impact::DetectImpactResult) -> String {
-    let page = |page: &crate::embed::parity::detect_impact::ImpactPage| {
-        serde_json::json!({
-            "total": page.total,
-            "returned": page.returned,
-            "truncated": page.truncated,
-        })
-    };
-    let payload = serde_json::json!({
-        "changed_files": value.changed_files,
-        "changed_symbols": value
-            .changed_symbols
-            .iter()
-            .map(|s| serde_json::json!({"name": s.name, "path": s.path, "kind": s.kind}))
-            .collect::<Vec<_>>(),
-        "blast_radius": value
-            .blast_radius
-            .iter()
-            .map(|b| serde_json::json!({"symbol": b.symbol, "hop": b.hop, "risk": b.risk}))
-            .collect::<Vec<_>>(),
-        "risk_summary": {
-            "critical": value.risk_summary.critical,
-            "high": value.risk_summary.high,
-            "medium": value.risk_summary.medium,
-            "low": value.risk_summary.low,
-        },
-        "pagination": {
-            "changed_files": page(&value.pagination.changed_files),
-            "changed_symbols": page(&value.pagination.changed_symbols),
-            "blast_radius": page(&value.pagination.blast_radius),
-        },
-        "source_filter": {
-            "applied": value.source_filter.applied,
-            "excluded_paths": value.source_filter.excluded_paths,
-            "hint": value.source_filter.hint,
-        },
-    });
-    crate::index_lifecycle::guidance::changes::detect_impact_result(
-        &payload,
-        value.requested_depth,
-        value.effective_depth,
-        value.base_branch.as_deref(),
-        value.staleness_note.as_deref(),
-    )
 }

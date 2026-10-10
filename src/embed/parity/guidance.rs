@@ -67,6 +67,9 @@ pub struct Exploration {
     pub derived_seed_files: Vec<String>,
     pub enriched_imports: Vec<String>,
     pub hidden_noise_results: u64,
+    /// MCP `explore`'s text for this exploration.
+    #[serde(default)]
+    pub rendered: String,
 }
 
 /// The MCP `edit_plan` text: matched symbols or file, reference count,

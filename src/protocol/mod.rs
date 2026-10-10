@@ -1941,6 +1941,8 @@ impl SymForgeServer {
             "edit_plan" => call!(edit_plan, tools::EditPlanInput),
             "index_folder" => call!(index_folder, tools::IndexFolderInput),
             "detect_impact" => call!(detect_impact, tools::DetectImpactInput),
+            "what_changed" => call!(what_changed, tools::WhatChangedInput),
+            "diff_symbols" => call!(diff_symbols, tools::DiffSymbolsInput),
             "explore" => call!(explore, tools::ExploreInput),
             "ask" => call!(ask, tools::SmartQueryInput),
             "get_repo_map" => call!(get_repo_map, tools::GetRepoMapInput),

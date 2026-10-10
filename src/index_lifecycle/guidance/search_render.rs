@@ -290,6 +290,24 @@ pub fn explore_result_view(input: ExploreResultViewInput<'_>) -> String {
     lines.join("\n")
 }
 
+/// MCP `explore`'s answer: the result view, the hidden-noise note and the
+/// ranking footer.
+pub fn explore_answer(input: ExploreResultViewInput<'_>, noise_hidden: usize) -> String {
+    let mut output = explore_result_view(input);
+    if noise_hidden > 0 {
+        output.push_str(&format!(
+            "\n\nNote: {noise_hidden} result(s) from vendor/generated files hidden. Use include_noise=true to include."
+        ));
+    }
+    if !output.is_empty() {
+        // SF-STRESS-013: the explore scorer computes match count, kind
+        // weight, term-coverage and path proximity — it does NOT compute
+        // caller density. Drop the inaccurate claim so the footer is honest.
+        output.push_str("\n\nranked by: concept match + symbol-token alignment + path proximity");
+    }
+    output
+}
+
 use super::source::is_noise_line;
 use crate::live_index::{SearchFilesResolveView, SearchFilesTier, SearchFilesView, search};
 

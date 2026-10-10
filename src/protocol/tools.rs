@@ -6024,44 +6024,33 @@ impl SymForgeServer {
             ..
         } = result;
 
-        let mut output = format::explore_result_view(format::ExploreResultViewInput {
-            label: &display_label,
-            symbol_hits: &symbol_hits,
-            text_hits: &text_hits,
-            related_files: &related_files,
-            enriched_symbols: &enriched_symbols,
-            symbol_impls: &symbol_impls,
-            symbol_deps: &symbol_deps,
-            derived_seed_terms: derived_cluster
-                .as_ref()
-                .map(|cluster| cluster.seed_terms.as_slice())
-                .unwrap_or(&[]),
-            derived_symbols: derived_cluster
-                .as_ref()
-                .map(|cluster| cluster.promoted_symbols.as_slice())
-                .unwrap_or(&[]),
-            enriched_imports: &enriched_imports,
-            symbol_scores: &symbol_scores,
-            derived_seed_files: derived_cluster
-                .as_ref()
-                .map(|cluster| cluster.seed_files.as_slice())
-                .unwrap_or(&[]),
-            depth,
-        });
-
-        if noise_hidden > 0 {
-            output.push_str(&format!(
-                "\n\nNote: {noise_hidden} result(s) from vendor/generated files hidden. Use include_noise=true to include."
-            ));
-        }
-
-        if !output.is_empty() {
-            // SF-STRESS-013: the explore scorer computes match count, kind
-            // weight, term-coverage and path proximity — it does NOT compute
-            // caller density. Drop the inaccurate claim so the footer is honest.
-            output
-                .push_str("\n\nranked by: concept match + symbol-token alignment + path proximity");
-        }
+        let output = crate::index_lifecycle::guidance::search_render::explore_answer(
+            format::ExploreResultViewInput {
+                label: &display_label,
+                symbol_hits: &symbol_hits,
+                text_hits: &text_hits,
+                related_files: &related_files,
+                enriched_symbols: &enriched_symbols,
+                symbol_impls: &symbol_impls,
+                symbol_deps: &symbol_deps,
+                derived_seed_terms: derived_cluster
+                    .as_ref()
+                    .map(|cluster| cluster.seed_terms.as_slice())
+                    .unwrap_or(&[]),
+                derived_symbols: derived_cluster
+                    .as_ref()
+                    .map(|cluster| cluster.promoted_symbols.as_slice())
+                    .unwrap_or(&[]),
+                enriched_imports: &enriched_imports,
+                symbol_scores: &symbol_scores,
+                derived_seed_files: derived_cluster
+                    .as_ref()
+                    .map(|cluster| cluster.seed_files.as_slice())
+                    .unwrap_or(&[]),
+                depth,
+            },
+            noise_hidden,
+        );
 
         self.record_tool_savings_named(
             "explore",
@@ -13475,6 +13464,138 @@ mod tests {
                 "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"src/late_0.rs\", new_file=true)."
             ),
             "{rendered}"
+        );
+    }
+
+    /// The query-parity fixture repository: each commit's files committed with a
+    /// fixed signature and time, so commit ids are the same on every run and
+    /// host, then the working-tree files written uncommitted. Returns the commit
+    /// ids in order.
+    fn query_parity_repo(spec: &serde_json::Value, root: &Path) -> Vec<String> {
+        let repository = git2::Repository::init(root).expect("init");
+        let signature = git2::Signature::new(
+            "Fixture",
+            "fixture@example.invalid",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .expect("signature");
+        let mut commits: Vec<String> = Vec::new();
+        for commit in spec["commits"].as_array().expect("commits") {
+            let mut index = repository.index().expect("index");
+            for (path, content) in commit["files"].as_object().expect("files") {
+                let file = root.join(path);
+                fs::create_dir_all(file.parent().expect("parent")).expect("dir");
+                fs::write(&file, content.as_str().expect("content")).expect("write");
+                index.add_path(Path::new(path)).expect("add");
+            }
+            index.write().expect("index write");
+            let tree = repository
+                .find_tree(index.write_tree().expect("tree"))
+                .expect("find tree");
+            let parent = commits.last().map(|id| {
+                repository
+                    .find_commit(git2::Oid::from_str(id).unwrap())
+                    .unwrap()
+            });
+            let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+            let id = repository
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "fixture",
+                    &tree,
+                    &parents,
+                )
+                .expect("commit");
+            commits.push(id.to_string());
+        }
+        for (path, content) in spec["working"].as_object().expect("working") {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().expect("parent")).expect("dir");
+            fs::write(&file, content.as_str().expect("content")).expect("write");
+        }
+        commits
+    }
+
+    /// Substitute `{base}` and `{target}` with the fixture's commit ids.
+    fn query_parity_input(input: &serde_json::Value, commits: &[String]) -> serde_json::Value {
+        let text = serde_json::to_string(input)
+            .unwrap()
+            .replace("{base}", &commits[0])
+            .replace("{target}", &commits[1]);
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Fold the fixture's commit ids and root back to placeholders.
+    fn query_parity_text(text: &str, commits: &[String], root: &Path) -> String {
+        let mut folded = text.to_string();
+        for (id, placeholder) in commits.iter().zip(["{base}", "{target}"]) {
+            folded = folded.replace(id.as_str(), placeholder);
+            for short in [12, 8, 7] {
+                folded = folded.replace(&id[..short], placeholder);
+            }
+        }
+        let mut roots = vec![root.display().to_string()];
+        if let Ok(canonical) = dunce::canonicalize(root) {
+            roots.push(canonical.display().to_string());
+        }
+        let slashed: Vec<String> = roots.iter().map(|root| root.replace('\\', "/")).collect();
+        roots.extend(slashed);
+        roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+        for root in roots {
+            folded = folded.replace(&root, "{root}");
+        }
+        folded
+    }
+
+    /// MCP side of the query golden shared with `tests/embed_query_goldens.rs`
+    /// (`tests/fixtures/query_parity/changes.json`): `what_changed`,
+    /// `diff_symbols`, `detect_impact`, `explore`, `ask` and the
+    /// `symforge://repo/changes/uncommitted` resource on one fixture. Observed
+    /// answers are written to `target/query-parity.observed.json`.
+    #[tokio::test]
+    async fn change_queries_match_embed_parity_golden() {
+        let fixture_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/query_parity/changes.json");
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&fixture_path).unwrap()).unwrap();
+        let expected = fixture.clone();
+        let repos = fixture["repos"].clone();
+        for case in fixture["cases"].as_array_mut().unwrap() {
+            let repo = TempDir::new().expect("temp repo");
+            let commits = query_parity_repo(&repos[case["repo"].as_str().unwrap()], repo.path());
+            let server = embed_parity_server(repo.path());
+            let text = match case["resource"].as_str() {
+                Some(uri) => {
+                    let result = server.read_resource_uri(uri).await.expect("resource");
+                    match &result.contents[0] {
+                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                            text.clone()
+                        }
+                        other => panic!("expected text resource, got {other:?}"),
+                    }
+                }
+                None => {
+                    server
+                        .dispatch_tool_for_tests(
+                            case["tool"].as_str().unwrap(),
+                            query_parity_input(&case["input"], &commits),
+                        )
+                        .await
+                }
+            };
+            case["expected"] =
+                serde_json::Value::String(query_parity_text(&text, &commits, repo.path()));
+        }
+        let observed =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/query-parity.observed.json");
+        let _ = fs::write(&observed, serde_json::to_string_pretty(&fixture).unwrap());
+        assert_eq!(
+            fixture,
+            expected,
+            "MCP change and query answers drifted from the shared golden; see {}",
+            observed.display()
         );
     }
 

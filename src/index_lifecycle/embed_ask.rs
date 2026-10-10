@@ -364,68 +364,74 @@ pub(super) fn render_routed(
             };
             search_render::search_files_result_view(&rows)
         }
-        (_, QueryOutput::Exploration(value)) => {
-            let hits: Vec<_> = value
-                .symbols
-                .iter()
-                .map(|row| (row.name.clone(), row.kind.clone(), row.path.clone()))
-                .collect();
-            let scores: Vec<_> = value
-                .symbols
-                .iter()
-                .map(|row| row.score_millionths as f32 / 1_000_000.0)
-                .collect();
-            let enriched: Vec<_> = value
-                .symbols
-                .iter()
-                .map(|row| {
-                    (
-                        row.name.clone(),
-                        row.kind.clone(),
-                        row.path.clone(),
-                        row.signature.clone(),
-                        row.dependent_files.clone(),
-                    )
-                })
-                .collect();
-            let implementations: Vec<_> = value
-                .symbols
-                .iter()
-                .filter(|row| !row.implementations.is_empty())
-                .map(|row| (row.name.clone(), row.implementations.clone()))
-                .collect();
-            let dependencies: Vec<_> = value
-                .symbols
-                .iter()
-                .filter(|row| !row.type_dependencies.is_empty())
-                .map(|row| (row.name.clone(), row.type_dependencies.clone()))
-                .collect();
-            let text: Vec<_> = value
-                .text_matches
-                .iter()
-                .map(|row| (row.path.clone(), row.preview.clone(), row.line as usize))
-                .collect();
-            let related: Vec<_> = value
-                .related_files
-                .iter()
-                .map(|row| (row.path.clone(), row.matches as usize))
-                .collect();
-            search_render::explore_result_view(search_render::ExploreResultViewInput {
-                label: &value.label,
-                symbol_hits: &hits,
-                text_hits: &text,
-                related_files: &related,
-                enriched_symbols: &enriched,
-                symbol_impls: &implementations,
-                symbol_deps: &dependencies,
-                derived_seed_terms: &value.derived_seed_terms,
-                derived_symbols: &value.derived_symbols,
-                derived_seed_files: &value.derived_seed_files,
-                enriched_imports: &value.enriched_imports,
-                symbol_scores: &scores,
-                depth: value.depth,
-            })
-        }
+        (_, QueryOutput::Exploration(value)) => value.rendered.clone(),
         _ => return Err(QueryRefusalKind::InvalidRequest),
     })
+}
+
+/// MCP `explore`'s text for one exploration, through the shared view.
+pub(super) fn exploration_text(value: &crate::embed::parity::guidance::Exploration) -> String {
+    let hits: Vec<_> = value
+        .symbols
+        .iter()
+        .map(|row| (row.name.clone(), row.kind.clone(), row.path.clone()))
+        .collect();
+    let scores: Vec<_> = value
+        .symbols
+        .iter()
+        .map(|row| row.score_millionths as f32 / 1_000_000.0)
+        .collect();
+    let enriched: Vec<_> = value
+        .symbols
+        .iter()
+        .map(|row| {
+            (
+                row.name.clone(),
+                row.kind.clone(),
+                row.path.clone(),
+                row.signature.clone(),
+                row.dependent_files.clone(),
+            )
+        })
+        .collect();
+    let implementations: Vec<_> = value
+        .symbols
+        .iter()
+        .filter(|row| !row.implementations.is_empty())
+        .map(|row| (row.name.clone(), row.implementations.clone()))
+        .collect();
+    let dependencies: Vec<_> = value
+        .symbols
+        .iter()
+        .filter(|row| !row.type_dependencies.is_empty())
+        .map(|row| (row.name.clone(), row.type_dependencies.clone()))
+        .collect();
+    let text: Vec<_> = value
+        .text_matches
+        .iter()
+        .map(|row| (row.path.clone(), row.preview.clone(), row.line as usize))
+        .collect();
+    let related: Vec<_> = value
+        .related_files
+        .iter()
+        .map(|row| (row.path.clone(), row.matches as usize))
+        .collect();
+    search_render::explore_answer(
+        search_render::ExploreResultViewInput {
+            label: &value.label,
+            symbol_hits: &hits,
+            text_hits: &text,
+            related_files: &related,
+            enriched_symbols: &enriched,
+            symbol_impls: &implementations,
+            symbol_deps: &dependencies,
+            derived_seed_terms: &value.derived_seed_terms,
+            derived_symbols: &value.derived_symbols,
+            derived_seed_files: &value.derived_seed_files,
+            enriched_imports: &value.enriched_imports,
+            symbol_scores: &scores,
+            depth: value.depth,
+        },
+        value.hidden_noise_results as usize,
+    )
 }
