@@ -2,6 +2,7 @@
 
 pub(crate) mod changes;
 pub mod conventions;
+pub(crate) mod edit_body;
 pub(crate) mod edit_plan;
 pub(crate) mod edit_route;
 pub(crate) mod exploration;

@@ -1,6 +1,7 @@
 {
   "cases": [
     {
+      "body": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would replace `target` in src/lib.rs (old: 32 bytes -> new: 32 bytes)",
       "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": false,
       "name": "preview replace",
@@ -16,6 +17,7 @@
       "tamper": null
     },
     {
+      "body": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would insert after `target` in src/lib.rs (17 bytes of content)",
       "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": false,
       "name": "preview insert",
@@ -32,6 +34,7 @@
       "tamper": null
     },
     {
+      "body": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:5`\n[DRY RUN] Would edit within `caller` in src/lib.rs (1 replacement(s))",
       "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": false,
       "name": "preview edit_within",
@@ -49,6 +52,7 @@
       "tamper": null
     },
     {
+      "body": "Symbol not found: missing",
       "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": true,
       "name": "missing symbol",
@@ -64,6 +68,7 @@
       "tamper": null
     },
     {
+      "body": "Write mode: committed\nChanged file: src/lib.rs\nSymbol: target\nByte range: 0-32\nLine range: 1-3\n\nEdit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:1`\nsrc/lib.rs — replaced fn `target` (32 → 32 bytes)\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 0 dependents]",
       "file": "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": false,
       "name": "apply replace",
@@ -81,6 +86,7 @@
       "tamper": null
     },
     {
+      "body": null,
       "file": "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": false,
       "name": "idempotent replay",
@@ -98,6 +104,7 @@
       "tamper": null
     },
     {
+      "body": null,
       "file": "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": true,
       "name": "same key, different request",
@@ -115,6 +122,7 @@
       "tamper": null
     },
     {
+      "body": null,
       "file": "pub fn target() -> u32 {\n    9\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
       "is_error": true,
       "name": "refused replay",

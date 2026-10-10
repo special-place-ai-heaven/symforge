@@ -10,6 +10,8 @@ use crate::embed::parity::edit::{
     EditTarget, ResolvedEditTarget,
 };
 
+use super::embed_edit_body::RouteContext;
+
 use super::activation::ProjectSourceAuthority;
 use super::embed_query::EmbeddedQuerySnapshot;
 use super::embedded::EmbeddedSourceHandle;
@@ -99,6 +101,20 @@ impl EmbeddedSourceHandle {
         }
         let bound_root = dunce::simplified(&snapshot.root).to_path_buf();
         let indexed_path = bound_root.join(path);
+        let context = |rerouted: bool, rebased: bool, target_root: &Path| RouteContext {
+            rerouted,
+            rebased,
+            bound_root: bound_root.clone(),
+            target_root: target_root.to_path_buf(),
+            working_directory: working_directory.to_path_buf(),
+            bound_live: std::sync::Arc::clone(&snapshot.generation.live),
+            // MCP leaves its index untouched for a write it routed elsewhere,
+            // so the footer reads the bound copy as it stands.
+            bound_impact: rerouted.then(|| {
+                super::embed_edit_body::impact_footer(&snapshot, &snapshot.generation.live, path)
+            }),
+            bound_trust: super::embed_edit_body::trust_suffix(&snapshot),
+        };
         if same_path(working_directory, &bound_root) {
             return Ok(EditRoute {
                 target: None,
@@ -110,6 +126,7 @@ impl EmbeddedSourceHandle {
                 },
                 path: path.to_owned(),
                 bound_root: snapshot.root.clone(),
+                context: context(false, false, &bound_root),
             });
         }
         let target = admitted
@@ -129,21 +146,33 @@ impl EmbeddedSourceHandle {
         if !same_repository(&snapshot, &target_snapshot) {
             return Err(EditError::Edit(EditErrorKind::WorkingDirectoryNotAWorktree));
         }
-        match crate::discovery::resolve_repo_path(&target_snapshot.root, path) {
-            Ok(Some(_)) if target_snapshot.generation.live.get_file(path).is_some() => {}
-            Ok(_) => return Err(EditError::Edit(EditErrorKind::TargetFileMissing)),
+        let target_file = match crate::discovery::resolve_repo_path(&target_snapshot.root, path) {
+            Ok(Some(_)) => target_snapshot
+                .generation
+                .live
+                .get_file(path)
+                .ok_or(EditError::Edit(EditErrorKind::TargetFileMissing))?,
+            Ok(None) => return Err(EditError::Edit(EditErrorKind::TargetFileMissing)),
             Err(_) => return Err(EditError::Edit(EditErrorKind::InvalidPath)),
-        }
+        };
+        // MCP's rebase: the target's bytes differ from the indexed copy's.
+        let rebased = snapshot
+            .generation
+            .live
+            .get_file(path)
+            .is_none_or(|bound_file| bound_file.content != target_file.content);
+        let target_root = dunce::simplified(&target_snapshot.root).to_path_buf();
         Ok(EditRoute {
             target: Some(target),
             resolved: ResolvedEditTarget {
                 working_directory: working_directory.to_path_buf(),
                 rerouted: true,
-                target_path: dunce::simplified(&target_snapshot.root).join(path),
+                target_path: target_root.join(path),
                 indexed_path,
             },
             path: path.to_owned(),
-            bound_root: snapshot.root,
+            bound_root: snapshot.root.clone(),
+            context: context(true, rebased, &target_root),
         })
     }
 
@@ -161,7 +190,10 @@ impl EmbeddedSourceHandle {
         match route.target {
             None => Ok(guard.clone()),
             Some(target) => rebase_selector(guard, |selector| target.handle.edit_plan(selector))
-                .map(|plan| plan.guard),
+                .map(|plan| EditGuard {
+                    selector: guard.selector.clone(),
+                    ..plan.guard
+                }),
         }
     }
 

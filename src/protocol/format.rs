@@ -957,60 +957,7 @@ pub use crate::index_lifecycle::guidance::file_impact::co_changes_result_view;
 
 pub use crate::index_lifecycle::guidance::edit_plan::edit_impact_summary;
 
-/// Substrings that `classify_edit_output` (src/protocol/edit_tools.rs) treats as
-/// failure / dry-run sentinels via `.contains(...)`. The three `_tool` wrappers
-/// re-classify the FULL edit body — footer included — so a co-change partner
-/// path that embeds one of these (e.g. `src/unavailable.rs`) would flip a
-/// successful edit to a failure. Any partner whose path contains one of these is
-/// elided from the footer. Keep in sync with `classify_edit_output`'s `.contains`
-/// checks (only substring checks matter here; `starts_with` sentinels cannot be
-/// triggered by a suffix footer).
-const FOOTER_SENTINEL_SUBSTRINGS: &[&str] = &[
-    "unavailable",
-    "still loading",
-    "no repository root configured",
-    "Write failed",
-    "ROLLBACK INCOMPLETE",
-    "File disappeared:",
-    "byte range",
-    "Session stale",
-    "Ambiguous:",
-    "Symbol not found:",
-    "File not indexed:",
-    "path escapes repo root",
-    "Path containment error",
-    "Path resolution error",
-    "[DRY RUN]",
-    "Write semantics: dry run (no writes)",
-];
-
-/// Render the success-only post-edit impact footer.
-///
-/// `[impact: N dependents]` when `cochanges` is empty, otherwise
-/// `[impact: N dependents · cochanges: a, b, c]` (partners joined with `, `).
-/// The static text avoids every `classify_edit_output` sentinel substring, and
-/// any co-change partner path that would itself embed a sentinel is filtered out
-/// (see `FOOTER_SENTINEL_SUBSTRINGS`) so appending the footer to a successful
-/// edit body can never flip the outcome class.
-pub fn impact_footer(deps: usize, cochanges: &[String]) -> String {
-    let safe: Vec<&str> = cochanges
-        .iter()
-        .map(String::as_str)
-        .filter(|partner| {
-            !FOOTER_SENTINEL_SUBSTRINGS
-                .iter()
-                .any(|sentinel| partner.contains(sentinel))
-        })
-        .collect();
-    if safe.is_empty() {
-        format!("[impact: {deps} dependents]")
-    } else {
-        format!(
-            "[impact: {deps} dependents \u{00b7} cochanges: {}]",
-            safe.join(", ")
-        )
-    }
-}
+pub use crate::index_lifecycle::guidance::edit_body::impact_footer;
 
 /// Format symbol-level diff between two git refs.
 ///

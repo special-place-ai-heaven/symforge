@@ -5,9 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::index::{LanguageId, SymbolRecord};
 use crate::live_index::SharedIndex;
-use crate::live_index::query::{
-    SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
-};
 use crate::live_index::store::IndexedFile;
 
 // ---------------------------------------------------------------------------
@@ -48,24 +45,7 @@ pub(crate) use crate::edit_safety::atomic_write::{
     AtomicWriteReport, GuardedWriteOutcome, atomic_write_file, format_tee_snapshot_suffix,
     guarded_atomic_write_file,
 };
-
-fn append_response_suffix_to_first_summary(summaries: &mut Vec<String>, suffix: &str) {
-    let suffix = suffix.trim_start_matches('\n');
-    if suffix.is_empty() {
-        return;
-    }
-    let indented = suffix
-        .lines()
-        .map(|line| format!("  {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if let Some(first) = summaries.first_mut() {
-        first.push('\n');
-        first.push_str(&indented);
-    } else {
-        summaries.push(indented);
-    }
-}
+use crate::index_lifecycle::guidance::edit_body::append_response_suffix_to_first_summary;
 
 fn commit_protocol_batch_images(
     repo_root: &Path,
@@ -339,187 +319,7 @@ pub(crate) fn guard_batch_reroute_divergence(
 // Symbol resolution wrapper
 // ---------------------------------------------------------------------------
 
-const MAX_SYMBOL_SUGGESTIONS: usize = 3;
-const MAX_SYMBOL_SUGGESTION_DISTANCE: usize = 3;
-const MIN_SYMBOL_SUGGESTION_CONFIDENCE: f64 = 0.6;
-
-fn did_you_mean_suffix(file: &IndexedFile, requested: &str) -> String {
-    let suggestions = same_file_symbol_suggestions(file, requested);
-    if suggestions.is_empty() {
-        String::new()
-    } else {
-        format!(" did_you_mean: [{}]", suggestions.join(", "))
-    }
-}
-
-fn same_file_symbol_suggestions(file: &IndexedFile, requested: &str) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut scored = Vec::new();
-
-    for sym in &file.symbols {
-        let candidate = sym.name.trim();
-        if candidate.is_empty() || candidate == requested || !seen.insert(candidate.to_string()) {
-            continue;
-        }
-
-        if let Some((score, distance)) = symbol_suggestion_score(requested, candidate) {
-            scored.push((score, distance, sym.line_range.0, candidate.to_string()));
-        }
-    }
-
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| a.3.cmp(&b.3))
-    });
-
-    scored
-        .into_iter()
-        .take(MAX_SYMBOL_SUGGESTIONS)
-        .map(|(_, _, _, name)| name)
-        .collect()
-}
-
-fn symbol_suggestion_score(requested: &str, candidate: &str) -> Option<(u16, usize)> {
-    let requested_norm = normalize_symbol_name(requested);
-    let candidate_norm = normalize_symbol_name(candidate);
-    if requested_norm.is_empty() || candidate_norm.is_empty() {
-        return None;
-    }
-
-    let mut best = bounded_levenshtein(
-        &requested_norm,
-        &candidate_norm,
-        MAX_SYMBOL_SUGGESTION_DISTANCE,
-    )
-    .and_then(|distance| {
-        let max_len = requested_norm
-            .chars()
-            .count()
-            .max(candidate_norm.chars().count());
-        let confidence = 1.0 - (distance as f64 / max_len as f64);
-        if confidence >= MIN_SYMBOL_SUGGESTION_CONFIDENCE {
-            Some(((confidence * 1000.0) as u16, distance))
-        } else {
-            None
-        }
-    });
-
-    if has_separator_prefix(requested, candidate) {
-        let prefix_score = 900;
-        let prefix_distance = bounded_levenshtein(
-            &requested_norm,
-            &candidate_norm,
-            MAX_SYMBOL_SUGGESTION_DISTANCE,
-        )
-        .unwrap_or(MAX_SYMBOL_SUGGESTION_DISTANCE + 1);
-        match best {
-            Some((score, _)) if score >= prefix_score => {}
-            _ => best = Some((prefix_score, prefix_distance)),
-        }
-    }
-
-    best
-}
-
-fn normalize_symbol_name(name: &str) -> String {
-    let mut normalized = String::new();
-    for ch in name.chars() {
-        for folded in ch.to_lowercase() {
-            if folded.is_alphanumeric() {
-                normalized.push(folded);
-            }
-        }
-    }
-    normalized
-}
-
-fn has_separator_prefix(requested: &str, candidate: &str) -> bool {
-    if normalize_symbol_name(requested).chars().count() < 3 {
-        return false;
-    }
-
-    let requested = requested.to_lowercase();
-    let candidate = candidate.to_lowercase();
-    let mut candidate_chars = candidate.chars();
-    for requested_char in requested.chars() {
-        if candidate_chars.next() != Some(requested_char) {
-            return false;
-        }
-    }
-
-    matches!(candidate_chars.next(), Some(ch) if !ch.is_alphanumeric())
-}
-
-fn bounded_levenshtein(left: &str, right: &str, max_distance: usize) -> Option<usize> {
-    let left_chars = left.chars().collect::<Vec<_>>();
-    let right_chars = right.chars().collect::<Vec<_>>();
-    if left_chars.len().abs_diff(right_chars.len()) > max_distance {
-        return None;
-    }
-
-    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
-    let mut current = vec![0; right_chars.len() + 1];
-
-    for (left_index, left_char) in left_chars.iter().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_char) in right_chars.iter().enumerate() {
-            let deletion = previous[right_index + 1] + 1;
-            let insertion = current[right_index] + 1;
-            let substitution = previous[right_index] + usize::from(left_char != right_char);
-            current[right_index + 1] = deletion.min(insertion).min(substitution);
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-
-    let distance = previous[right_chars.len()];
-    (distance <= max_distance).then_some(distance)
-}
-
-/// Resolve a symbol by name/kind/line, returning (index, cloned record) or user-friendly error.
-pub(crate) fn resolve_or_error(
-    file: &IndexedFile,
-    name: &str,
-    kind: Option<&str>,
-    line: Option<u32>,
-) -> Result<(usize, SymbolRecord), String> {
-    match resolve_symbol_selector(file, name, kind, line) {
-        SymbolSelectorMatch::Selected(idx, sym) => Ok((idx, sym.clone())),
-        SymbolSelectorMatch::NotFound => {
-            let label = render_symbol_selector(name, kind, line);
-            // Surface parse status so users know WHY symbols are missing.
-            let status_hint = match &file.parse_status {
-                crate::live_index::store::ParseStatus::Failed { error } => {
-                    format!(
-                        " (file failed to parse: {error} — symbol tools unavailable for this file)"
-                    )
-                }
-                crate::live_index::store::ParseStatus::PartialParse { warning } => {
-                    format!(
-                        " (file partially parsed with errors: {warning} — some symbols may be missing)"
-                    )
-                }
-                _ => String::new(),
-            };
-            let suggestion_hint = did_you_mean_suffix(file, name);
-            Err(format!(
-                "Symbol not found: {label}{status_hint}{suggestion_hint}"
-            ))
-        }
-        SymbolSelectorMatch::Ambiguous(candidate_lines) => {
-            let candidates = candidate_lines
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(format!(
-                "Ambiguous: multiple definitions of `{name}`. \
-                 Pass `symbol_line` to disambiguate. Candidate lines: {candidates}"
-            ))
-        }
-    }
-}
+pub(crate) use crate::index_lifecycle::guidance::edit_body::resolve_or_error;
 
 // ---------------------------------------------------------------------------
 // Whitespace-flexible matching fallback
@@ -1152,7 +952,11 @@ pub(crate) fn execute_batch_edit(
 
     let mut staged: Vec<StagedFile> = Vec::with_capacity(by_file.len());
 
-    for (path, indices) in &by_file {
+    // Stage (and so report) files in path order, as `execute_batch_insert`
+    // does: `by_file` is a hash map, whose order differs between calls.
+    let mut file_order: Vec<(&String, &Vec<usize>)> = by_file.iter().collect();
+    file_order.sort_by(|left, right| left.0.cmp(right.0));
+    for (path, indices) in file_order {
         let file = {
             let guard = index.read();
             guard
@@ -1486,7 +1290,10 @@ pub(crate) fn execute_batch_rename(
         );
         return Ok((rendered, Vec::new()));
     }
-    let by_file = rename_plan.by_file;
+    // Stage (and so report) files in path order: the plan's map is a hash
+    // map, whose order differs between calls.
+    let mut by_file: Vec<(String, Vec<(u32, u32)>)> = rename_plan.by_file.into_iter().collect();
+    by_file.sort_by(|left, right| left.0.cmp(&right.0));
     let uncertain_lines = rename_plan.uncertain_lines;
     let language = rename_plan.language;
 
@@ -1992,17 +1799,7 @@ pub(crate) fn execute_batch_insert(
 // Stale reference detection
 // ---------------------------------------------------------------------------
 
-/// Extract the first line of a symbol as a rough "signature" for change detection.
-pub(crate) fn extract_signature(content: &[u8], byte_range: (u32, u32)) -> String {
-    let start = byte_range.0 as usize;
-    let end = byte_range.1 as usize;
-    let slice = &content[start..end];
-    let first_line_end = slice
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(slice.len());
-    String::from_utf8_lossy(&slice[..first_line_end]).to_string()
-}
+pub(crate) use crate::index_lifecycle::guidance::edit_body::extract_signature;
 
 #[cfg(test)]
 use crate::index_lifecycle::guidance::file_impact::extract_impl_type_name;
@@ -2023,52 +1820,15 @@ pub(crate) fn detect_stale_references(
     parent_type: Option<&str>,
     source_language: Option<&crate::domain::LanguageId>,
 ) -> Vec<(String, u32, Option<String>)> {
-    if old_signature == new_signature {
-        return Vec::new();
-    }
-    let guard = index.read();
-    let refs = guard.find_references_for_name(name, None, false);
-
-    // When we know the parent type, collect the set of files that reference it.
-    // Only those files could plausibly call `ParentType::method_name()`.
-    let type_files: Option<std::collections::HashSet<&str>> = parent_type.map(|tn| {
-        guard
-            .find_references_for_name(tn, None, false)
-            .into_iter()
-            .map(|(fp, _)| fp)
-            .collect()
-    });
-
-    refs.into_iter()
-        .filter(|(ref_path, _)| *ref_path != path)
-        .filter(|(ref_path, _)| {
-            // Skip references in files of a different language to reduce false positives
-            // (e.g., Rust `add` flagging Python's `add`).
-            if let Some(lang) = source_language
-                && let Some(ref_file) = guard.get_file(ref_path)
-                && ref_file.language != *lang
-            {
-                return false;
-            }
-            true
-        })
-        .filter(|(ref_path, _)| {
-            // If we have a parent type filter, only keep refs in files that also mention it.
-            match &type_files {
-                Some(tf) => tf.contains(ref_path),
-                None => true,
-            }
-        })
-        .map(|(ref_path, rr)| {
-            let enclosing = rr.enclosing_symbol_index.and_then(|idx| {
-                guard
-                    .get_file(ref_path)
-                    .and_then(|f| f.symbols.get(idx as usize))
-                    .map(|s| s.name.clone())
-            });
-            (ref_path.to_string(), rr.line_range.0 + 1, enclosing)
-        })
-        .collect()
+    crate::index_lifecycle::guidance::edit_body::stale_references(
+        &index.read(),
+        path,
+        name,
+        old_signature,
+        new_signature,
+        parent_type,
+        source_language,
+    )
 }
 
 // ---------------------------------------------------------------------------

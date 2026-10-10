@@ -10,9 +10,9 @@ use crate::edit_safety::structural::{
     PreparedReplace, WithinSelectionError, apply_splice, prepare_replace, select_edit_within_body,
 };
 use crate::embed::parity::edit::{
-    DeleteRequest, EditApplyAuthority, EditError, EditErrorKind, EditGuard, EditPlan, EditTarget,
-    EditWithinPreview, EditWithinRequest, InsertPosition, InsertRequest, ReplaceApplied,
-    ReplacePreview, ReplaceRequest, StructuralApplied, StructuralPreview,
+    DeleteRequest, EditApplyAuthority, EditBody, EditError, EditErrorKind, EditGuard, EditPlan,
+    EditTarget, EditWithinPreview, EditWithinRequest, InsertPosition, InsertRequest,
+    ReplaceApplied, ReplacePreview, ReplaceRequest, StructuralApplied, StructuralPreview,
 };
 use crate::embed::parity::replay::{
     OutcomeKind, ReplayKey, ReplayOutcome, ReplayState, ReplayStore, RequestFingerprint,
@@ -23,8 +23,94 @@ use crate::knowledge::{StableContentAdmission, classify_stable_content_for_root}
 use crate::live_index::disambiguation::{SymbolSelectorMatch, resolve_symbol_selector};
 use crate::live_index::store::IndexedFile;
 
+use super::embed_edit_body::{self as answer, EditBodyParts, SingleParts, StaleQuery};
 use super::embed_query::EmbeddedQuerySnapshot;
 use super::embedded::EmbeddedSourceHandle;
+use super::guidance::edit_body::{self as shared, EditSafetyMode, EditWriteSemantics};
+
+/// MCP's evidence anchor for an edit: `path:line`, one-based.
+fn anchor(guard: &EditGuard) -> String {
+    format!("{}:{}", guard.path, guard.symbol_line)
+}
+
+fn position_label(position: InsertPosition) -> &'static str {
+    match position {
+        InsertPosition::Before => "before",
+        InsertPosition::After => "after",
+    }
+}
+
+/// MCP's dry-run answer: envelope, summary and trust suffix.
+fn preview_body(
+    snapshot: &EmbeddedQuerySnapshot,
+    guard: &EditGuard,
+    safety: EditSafetyMode,
+    summary: String,
+) -> EditBody {
+    EditBody::new(EditBodyParts::Single(Box::new(SingleParts {
+        safety,
+        semantics: EditWriteSemantics::DryRunNoWrites,
+        anchor: anchor(guard),
+        path: guard.path.clone(),
+        summary,
+        stale: None,
+        stale_warnings: String::new(),
+        tee: None,
+        tee_before_reroute: false,
+        trust: answer::trust_suffix(snapshot),
+        impact: None,
+    })))
+}
+
+/// What a committed single edit reports beyond its summary.
+struct Committed<'a> {
+    safety: EditSafetyMode,
+    summary: String,
+    stale: Option<StaleQuery>,
+    tee: crate::edit_safety::tee::TeeSnapshot,
+    tee_before_reroute: bool,
+    new_content: &'a [u8],
+}
+
+/// MCP's answer for a committed single edit. The stale warnings and the
+/// impact footer read the index with the post-image substituted, as MCP
+/// reads its index after `reindex_after_write`.
+fn applied_body(
+    snapshot: &EmbeddedQuerySnapshot,
+    guard: &EditGuard,
+    committed: Committed<'_>,
+) -> EditBody {
+    let after = answer::post_edit_index(snapshot, &[(&guard.path, committed.new_content)]);
+    let stale_warnings = committed
+        .stale
+        .as_ref()
+        .map(|query| query.warnings(&after))
+        .unwrap_or_default();
+    EditBody::new(EditBodyParts::Single(Box::new(SingleParts {
+        safety: committed.safety,
+        semantics: EditWriteSemantics::AtomicWriteAndReindex,
+        anchor: anchor(guard),
+        path: guard.path.clone(),
+        summary: committed.summary,
+        stale: committed.stale,
+        stale_warnings,
+        tee: Some(committed.tee),
+        tee_before_reroute: committed.tee_before_reroute,
+        trust: answer::trust_suffix(snapshot),
+        impact: Some(answer::impact_footer(snapshot, &after, &guard.path)),
+    })))
+}
+
+/// The answer a lane gives once its write committed: built from the
+/// snapshot it planned against, the prepared bytes and the tee hint.
+type DescribeApplied<'a> = Box<
+    dyn FnOnce(
+            &EmbeddedQuerySnapshot,
+            &PreparedReplace,
+            crate::edit_safety::tee::TeeSnapshot,
+        ) -> EditBody
+        + 'a,
+>;
 
 pub(super) fn admitted(snapshot: &EmbeddedQuerySnapshot, file: &IndexedFile) -> bool {
     let targets = crate::domain::IndexTargets::for_path(&file.relative_path, Some(&file.language));
@@ -333,6 +419,7 @@ impl EmbeddedSourceHandle {
             authority_publication: snapshot.authority_publication,
             content_hash: digest_hex(&file.content),
             symbol_hash: digest_hex(body),
+            selector: target.name.clone(),
         };
         let reference_count = snapshot
             .generation
@@ -355,6 +442,18 @@ impl EmbeddedSourceHandle {
         let snapshot = self.capture_query_snapshot(b"preview-replace-symbol-body")?;
         let (prepared, _) = prepare(&snapshot, request).map_err(EditError::Edit)?;
         let diff = preview_diff(&snapshot, &request.guard.path, &prepared.new_content)?;
+        let (_, symbol, _) = validate_guard(&snapshot, &request.guard).map_err(EditError::Edit)?;
+        let body = preview_body(
+            &snapshot,
+            &request.guard,
+            EditSafetyMode::StructuralEditSafe,
+            shared::dry_run_replace_summary(
+                &request.guard.selector,
+                &request.guard.path,
+                (symbol.byte_range.1 - symbol.byte_range.0) as usize,
+                request.new_body.len(),
+            ),
+        );
         Ok(ReplacePreview {
             path: request.guard.path.clone(),
             source_version: snapshot.source_version,
@@ -366,6 +465,7 @@ impl EmbeddedSourceHandle {
             rendered: diff.rendered,
             truncated: diff.truncated,
             redacted: diff.redacted,
+            body,
         })
     }
 
@@ -378,6 +478,17 @@ impl EmbeddedSourceHandle {
         )
         .map_err(EditError::Edit)?;
         let diff = preview_diff(&snapshot, &request.guard.path, &prepared.new_content)?;
+        let body = preview_body(
+            &snapshot,
+            &request.guard,
+            EditSafetyMode::StructuralEditSafe,
+            shared::dry_run_insert_summary(
+                position_label(request.position),
+                &request.guard.selector,
+                &request.guard.path,
+                request.content.len(),
+            ),
+        );
         Ok(StructuralPreview {
             path: request.guard.path.clone(),
             source_version: snapshot.source_version,
@@ -389,6 +500,7 @@ impl EmbeddedSourceHandle {
             rendered: diff.rendered,
             truncated: diff.truncated,
             redacted: diff.redacted,
+            body,
         })
     }
 
@@ -406,8 +518,11 @@ impl EmbeddedSourceHandle {
             &request.guard,
             authority,
             operation_key,
-            operation,
-            Some(("inserted_hash", digest_hex(request.content.as_bytes()))),
+            (
+                operation,
+                "insert_symbol",
+                Some(("inserted_hash", digest_hex(request.content.as_bytes()))),
+            ),
             |snapshot| {
                 prepare_structural(
                     snapshot,
@@ -415,6 +530,25 @@ impl EmbeddedSourceHandle {
                     StructuralOperation::Insert(request.position, &request.content),
                 )
             },
+            Box::new(|snapshot, prepared, tee| {
+                applied_body(
+                    snapshot,
+                    &request.guard,
+                    Committed {
+                        safety: EditSafetyMode::StructuralEditSafe,
+                        summary: shared::format_insert(
+                            &request.guard.path,
+                            &request.guard.selector,
+                            position_label(request.position),
+                            request.content.len(),
+                        ),
+                        stale: None,
+                        tee,
+                        tee_before_reroute: false,
+                        new_content: &prepared.new_content,
+                    },
+                )
+            }),
         )
     }
 
@@ -424,6 +558,17 @@ impl EmbeddedSourceHandle {
             prepare_structural(&snapshot, &request.guard, StructuralOperation::Delete)
                 .map_err(EditError::Edit)?;
         let diff = preview_diff(&snapshot, &request.guard.path, &prepared.new_content)?;
+        let (_, symbol, _) = validate_guard(&snapshot, &request.guard).map_err(EditError::Edit)?;
+        let body = preview_body(
+            &snapshot,
+            &request.guard,
+            EditSafetyMode::StructuralEditSafe,
+            shared::dry_run_delete_summary(
+                &request.guard.selector,
+                &request.guard.path,
+                (symbol.byte_range.1 - symbol.byte_range.0) as usize,
+            ),
+        );
         Ok(StructuralPreview {
             path: request.guard.path.clone(),
             source_version: snapshot.source_version,
@@ -435,6 +580,7 @@ impl EmbeddedSourceHandle {
             rendered: diff.rendered,
             truncated: diff.truncated,
             redacted: diff.redacted,
+            body,
         })
     }
 
@@ -448,9 +594,30 @@ impl EmbeddedSourceHandle {
             &request.guard,
             authority,
             operation_key,
-            "embed_delete_symbol_v1",
-            None,
+            ("embed_delete_symbol_v1", "delete_symbol", None),
             |snapshot| prepare_structural(snapshot, &request.guard, StructuralOperation::Delete),
+            Box::new(|snapshot, prepared, tee| {
+                let deleted = validate_guard(snapshot, &request.guard)
+                    .map(|(_, symbol, _)| (symbol.byte_range.1 - symbol.byte_range.0) as usize)
+                    .unwrap_or_default();
+                applied_body(
+                    snapshot,
+                    &request.guard,
+                    Committed {
+                        safety: EditSafetyMode::StructuralEditSafe,
+                        summary: shared::format_delete(
+                            &request.guard.path,
+                            &request.guard.selector,
+                            &request.guard.kind,
+                            deleted,
+                        ),
+                        stale: None,
+                        tee,
+                        tee_before_reroute: false,
+                        new_content: &prepared.new_content,
+                    },
+                )
+            }),
         )
     }
 
@@ -462,6 +629,20 @@ impl EmbeddedSourceHandle {
         let (prepared, _, replacement_count, untargeted_extra) =
             prepare_within(&snapshot, request).map_err(EditError::Edit)?;
         let diff = preview_diff(&snapshot, &request.guard.path, &prepared.new_content)?;
+        let body = preview_body(
+            &snapshot,
+            &request.guard,
+            EditSafetyMode::TextEditSafe,
+            shared::edit_within_summary(
+                true,
+                &request.guard.path,
+                &request.guard.selector,
+                replacement_count,
+                0,
+                0,
+                untargeted_extra,
+            ),
+        );
         Ok(EditWithinPreview {
             change: StructuralPreview {
                 path: request.guard.path.clone(),
@@ -474,6 +655,7 @@ impl EmbeddedSourceHandle {
                 rendered: diff.rendered,
                 truncated: diff.truncated,
                 redacted: diff.redacted,
+                body,
             },
             replacement_count,
             untargeted_extra,
@@ -501,11 +683,39 @@ impl EmbeddedSourceHandle {
             &request.guard,
             authority,
             operation_key,
-            "embed_edit_within_symbol_v1",
-            Some(("within_request_hash", payload_hash)),
+            (
+                "embed_edit_within_symbol_v1",
+                "edit_within_symbol",
+                Some(("within_request_hash", payload_hash)),
+            ),
             |snapshot| {
                 prepare_within(snapshot, request).map(|(prepared, path, _, _)| (prepared, path))
             },
+            Box::new(|snapshot, prepared, tee| {
+                let (count, extra) = prepare_within(snapshot, request)
+                    .map(|(_, _, count, extra)| (count, extra))
+                    .unwrap_or_default();
+                applied_body(
+                    snapshot,
+                    &request.guard,
+                    Committed {
+                        safety: EditSafetyMode::TextEditSafe,
+                        summary: shared::edit_within_summary(
+                            false,
+                            &request.guard.path,
+                            &request.guard.selector,
+                            count,
+                            prepared.old_bytes,
+                            prepared.inserted_bytes,
+                            extra,
+                        ),
+                        stale: None,
+                        tee,
+                        tee_before_reroute: false,
+                        new_content: &prepared.new_content,
+                    },
+                )
+            }),
         )
     }
 
@@ -521,15 +731,60 @@ impl EmbeddedSourceHandle {
             &request.guard,
             authority,
             operation_key,
-            "embed_replace_symbol_body_v1",
-            Some(("replacement_hash", digest_hex(request.new_body.as_bytes()))),
+            (
+                "embed_replace_symbol_body_v1",
+                "replace_symbol_body",
+                Some(("replacement_hash", digest_hex(request.new_body.as_bytes()))),
+            ),
             |snapshot| prepare(snapshot, request),
+            Box::new(|snapshot, prepared, tee| {
+                let stale =
+                    validate_guard(snapshot, &request.guard)
+                        .ok()
+                        .map(|(file, symbol, _)| StaleQuery {
+                            path: request.guard.path.clone(),
+                            name: request.guard.selector.clone(),
+                            old_signature: shared::extract_signature(
+                                &file.content,
+                                symbol.byte_range,
+                            ),
+                            new_signature: request
+                                .new_body
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .to_string(),
+                            parent_type: super::guidance::file_impact::find_parent_impl_type(
+                                file, symbol,
+                            ),
+                            language: file.language,
+                        });
+                applied_body(
+                    snapshot,
+                    &request.guard,
+                    Committed {
+                        safety: EditSafetyMode::StructuralEditSafe,
+                        summary: shared::format_replace(
+                            &request.guard.path,
+                            &request.guard.selector,
+                            &request.guard.kind,
+                            prepared.old_bytes,
+                            prepared.inserted_bytes,
+                        ),
+                        stale,
+                        tee,
+                        tee_before_reroute: true,
+                        new_content: &prepared.new_content,
+                    },
+                )
+            }),
         )?;
         Ok(ReplaceApplied {
             path: applied.path,
             post_image_hash: applied.post_image_hash,
             replayed: applied.replayed,
             refresh_ticket_identity: applied.refresh_ticket_identity,
+            body: applied.body,
         })
     }
 
@@ -538,11 +793,17 @@ impl EmbeddedSourceHandle {
         guard: &EditGuard,
         authority: &EditApplyAuthority,
         operation_key: &str,
-        operation: &'static str,
-        payload_hash: Option<(&'static str, String)>,
+        // The replay operation name, the MCP tool this lane answers as, and
+        // the hashed payload the replay request binds.
+        (operation, tool, payload_hash): (
+            &'static str,
+            &'static str,
+            Option<(&'static str, String)>,
+        ),
         prepare: impl FnOnce(
             &EmbeddedQuerySnapshot,
         ) -> Result<(PreparedReplace, PathBuf), EditErrorKind>,
+        describe: DescribeApplied<'_>,
     ) -> Result<StructuralApplied, EditError> {
         if authority.root != guard.root {
             return Err(EditError::Edit(EditErrorKind::WriteAuthorityRefused));
@@ -618,6 +879,11 @@ impl EmbeddedSourceHandle {
                     post_image_hash: digest_hex(&current),
                     replayed: true,
                     refresh_ticket_identity: None,
+                    body: EditBody::new(EditBodyParts::Replayed {
+                        tool,
+                        path: guard.path.clone(),
+                        post_image_hash: digest_hex(&current),
+                    }),
                 });
             }
         };
@@ -680,7 +946,7 @@ impl EmbeddedSourceHandle {
                 }
                 Err(EditError::Edit(EditErrorKind::WriteConflict))
             }
-            Ok(GuardedWriteOutcome::Written(_report)) => {
+            Ok(GuardedWriteOutcome::Written(report)) => {
                 let refresh = self.request_refresh();
                 if authority.cancel.load(Ordering::Acquire) || refresh.is_err() {
                     let _ = replay.mark_uncertain(&lease);
@@ -703,11 +969,13 @@ impl EmbeddedSourceHandle {
                     return Err(EditError::Edit(EditErrorKind::WriteUncertain));
                 }
                 snapshot.record_commitment(&[PathBuf::from(&guard.path)]);
+                let body = describe(&snapshot, &prepared, report.tee_snapshot);
                 Ok(StructuralApplied {
                     path: guard.path.clone(),
                     post_image_hash: digest_hex(&prepared.new_content),
                     replayed: false,
                     refresh_ticket_identity: Some(refresh.ticket_identity().to_owned()),
+                    body,
                 })
             }
             Err(_) => {

@@ -445,6 +445,10 @@ struct EmbeddedBinding {
     stel_store: super::embed_stel::StelStoreSlot,
     #[cfg(feature = "embed")]
     open_reset: Option<crate::embed::parity::source_options::SnapshotResetReceipt>,
+    /// The host's control-state directory (`<replay_control_directory>/embed-host`),
+    /// MCP's process control state for this source; `None` when the host gave none.
+    #[cfg(feature = "embed")]
+    control_directory: Option<PathBuf>,
     state: std::sync::Mutex<EmbeddedRuntimeState>,
     control: std::sync::Mutex<WorkerControl>,
     wake: Condvar,
@@ -522,6 +526,7 @@ impl EmbeddedBinding {
         #[cfg(feature = "embed")] open_reset: Option<
             crate::embed::parity::source_options::SnapshotResetReceipt,
         >,
+        #[cfg(feature = "embed")] control_directory: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
@@ -545,6 +550,8 @@ impl EmbeddedBinding {
             stel_store: Default::default(),
             #[cfg(feature = "embed")]
             open_reset: open_reset.clone(),
+            #[cfg(feature = "embed")]
+            control_directory,
             state: std::sync::Mutex::new(EmbeddedRuntimeState {
                 phase: super::public_api::SourceRuntimePhase::Loading,
                 current_publication_identity: None,
@@ -1095,7 +1102,7 @@ impl EmbeddedSourceFactory {
         state_placement: StatePlacement,
         owner: EmbeddedIdentity,
     ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
-        self.open_bound_with_reset(binding, state_placement, owner, false)
+        self.open_bound_with_reset(binding, state_placement, owner, false, None)
     }
 
     /// `open_bound` plus the MCP `index_folder` snapshot reset. A failed reset
@@ -1106,6 +1113,7 @@ impl EmbeddedSourceFactory {
         state_placement: StatePlacement,
         owner: EmbeddedIdentity,
         reset_snapshot_state: bool,
+        control_directory: Option<PathBuf>,
     ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
         let key = ProjectKey::new(&binding.root_id.0);
         let identity = EmbeddedIdentity::fresh();
@@ -1167,7 +1175,7 @@ impl EmbeddedSourceFactory {
             None
         };
         #[cfg(not(feature = "embed"))]
-        let _ = reset_snapshot_state;
+        let _ = (reset_snapshot_state, control_directory);
         #[cfg(feature = "embed")]
         let restored = super::embed_restore::load_admitted_snapshot(
             &binding.canonical_root,
@@ -1199,6 +1207,8 @@ impl EmbeddedSourceFactory {
             restored_mtimes,
             #[cfg(feature = "embed")]
             open_reset,
+            #[cfg(feature = "embed")]
+            control_directory,
         );
         rollback.bind(Arc::clone(&source));
         if source.start().is_err() {
@@ -1407,6 +1417,9 @@ impl super::public_api::ProcessRuntimeApi {
                 placement,
                 self.owner.identity(),
                 options.reset_snapshot_state,
+                options
+                    .replay_control_directory
+                    .map(|directory| directory.join("embed-host")),
             )
             .map_err(|error| match error {
                 EmbeddedOpenError::SourceAlreadyOpen => refuse(
@@ -1805,6 +1818,7 @@ impl EmbeddedSourceHandle {
             authority,
             state_anchor: binding.state_anchor.clone(),
             temporal_cache: Arc::clone(&binding.temporal_cache),
+            control_directory: binding.control_directory.clone(),
         })
     }
 

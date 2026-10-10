@@ -907,6 +907,32 @@ async fn symforge_edit_failed_guarded_apply_is_not_classified_as_found() {
     assert_eq!(before, std::fs::read(&file_path).unwrap());
 }
 
+/// The primitive tool's answer inside a `symforge_edit` reply: the text after
+/// the routing summary up to the trust envelope's closing rule, with the
+/// timestamped tee snapshot path compared as `<tee>`.
+fn edit_body_section(text: &str, routing: Option<&str>) -> Option<String> {
+    let routing = routing?;
+    let start = text.find(routing)? + routing.len();
+    let rest = text[start..].trim_start_matches('\n');
+    let rest = &rest[..rest.find("\n──").unwrap_or(rest.len())];
+    Some(
+        rest.lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                let indent = &line[..line.len() - trimmed.len()];
+                match trimmed
+                    .strip_prefix("Tee snapshot: `")
+                    .and_then(|tail| tail.split_once('`'))
+                {
+                    Some((_, tail)) => format!("{indent}Tee snapshot: `<tee>`{tail}"),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 /// The `symforge_edit` answer shape the embed parity golden compares: the
 /// routing summary (`Mode:` through `Economics:`), the whole text of an answer
 /// with no trust envelope, the outcome, the error flag and the file after.
@@ -928,10 +954,12 @@ fn edit_parity_observation(
             .unwrap_or(tail.len());
         tail[..end].to_string()
     });
+    let body = edit_body_section(text, routing.as_deref());
     serde_json::json!({
         "outcome": outcome,
         "is_error": is_error,
         "routing": routing,
+        "body": body,
         // A key conflict names each store's own request hashes; only the
         // class of refusal is shared.
         "plain_text": (!text.starts_with("──")).then(|| {
@@ -971,13 +999,21 @@ async fn symforge_edit_matches_embed_parity_golden() {
             result["isError"].as_bool().unwrap_or(false),
             &std::fs::read_to_string(&file_path).unwrap(),
         );
-        for key in ["outcome", "is_error", "routing", "plain_text", "file"] {
+        for key in [
+            "outcome",
+            "is_error",
+            "routing",
+            "body",
+            "plain_text",
+            "file",
+        ] {
             case[key] = observed[key].clone();
         }
         if case["replay"].as_bool() == Some(true) {
             // An embedded replay store keeps only digests, so the replayed
             // text is not compared; outcome and bytes are.
             case["routing"] = serde_json::Value::Null;
+            case["body"] = serde_json::Value::Null;
             case["plain_text"] = serde_json::Value::Null;
         }
     }

@@ -93,6 +93,32 @@ fn facade_answers_match_the_mcp_golden() {
     }
 }
 
+/// The primitive tool's answer inside a `symforge_edit` reply: the text after
+/// the routing summary up to the trust envelope's closing rule, with the
+/// timestamped tee snapshot path compared as `<tee>`.
+fn edit_body_section(text: &str, routing: Option<&str>) -> Option<String> {
+    let routing = routing?;
+    let start = text.find(routing)? + routing.len();
+    let rest = text[start..].trim_start_matches('\n');
+    let rest = &rest[..rest.find("\n──").unwrap_or(rest.len())];
+    Some(
+        rest.lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                let indent = &line[..line.len() - trimmed.len()];
+                match trimmed
+                    .strip_prefix("Tee snapshot: `")
+                    .and_then(|tail| tail.split_once('`'))
+                {
+                    Some((_, tail)) => format!("{indent}Tee snapshot: `<tee>`{tail}"),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 /// The `symforge_edit` observation MCP's `symforge_edit_matches_embed_parity_golden`
 /// records: the routing summary, the text of an answer with no trust
 /// envelope, the outcome, the error flag and the file after.
@@ -113,10 +139,12 @@ fn edit_observation(
             .unwrap_or(tail.len());
         tail[..end].to_string()
     });
+    let body = edit_body_section(text, routing.as_deref());
     serde_json::json!({
         "outcome": answer.outcome,
         "is_error": answer.is_error,
         "routing": routing,
+        "body": body,
         // A key conflict names each store's own request hashes; only the
         // class of refusal is shared.
         "plain_text": (!text.starts_with("──")).then(|| {
@@ -198,9 +226,17 @@ fn symforge_edit_answers_match_the_mcp_golden() {
         if case["replay"].as_bool() == Some(true) {
             assert!(answer.replayed, "{}", answer.rendered);
             observed["routing"] = serde_json::Value::Null;
+            observed["body"] = serde_json::Value::Null;
             observed["plain_text"] = serde_json::Value::Null;
         }
-        for key in ["outcome", "is_error", "routing", "plain_text", "file"] {
+        for key in [
+            "outcome",
+            "is_error",
+            "routing",
+            "body",
+            "plain_text",
+            "file",
+        ] {
             assert_eq!(
                 observed[key], case[key],
                 "{} / {key}:\n{}",

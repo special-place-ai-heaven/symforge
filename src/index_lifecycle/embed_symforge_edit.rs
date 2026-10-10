@@ -356,7 +356,10 @@ impl EmbeddedSourceHandle {
                         let _ = reserved.store.mark_uncertain(&reserved.lease);
                     }
                 }
-                let refused = edit_refusal(&step.tool, &error);
+                let mut refused = edit_refusal(&step.tool, &error);
+                if let Some(text) = self.mcp_refusal_text(request, &step.args, &error) {
+                    refused.rendered = text;
+                }
                 let body = match metadata("failed") {
                     Some(metadata) => {
                         format!("{routing_meta}\n\n{metadata}\n\n{}", refused.rendered)
@@ -553,51 +556,50 @@ impl EmbeddedSourceHandle {
             symbol_line: None,
         })?;
         let target = self.edit_target(request, admitted, authority)?;
-        let guard = match request.working_directory.as_deref() {
+        let route = match request.working_directory.as_deref() {
             Some(working_directory) => {
-                let route =
-                    self.route_edit(&request.path, Path::new(working_directory), admitted)?;
-                self.rebase_guard(&route, &planned.guard)?
+                Some(self.route_edit(&request.path, Path::new(working_directory), admitted)?)
             }
+            None => None,
+        };
+        let guard = match route.as_ref() {
+            Some(route) => self.rebase_guard(route, &planned.guard)?,
             None => planned.guard,
         };
-        let suffix = target
-            .resolved
-            .as_ref()
-            .map(ResolvedEditTarget::reroute_suffix)
-            .unwrap_or_default();
-        let old_bytes = (planned.byte_range.1 - planned.byte_range.0) as usize;
-        let summary = |prefix: &str, inserted: usize| {
-            format!(
-                "{prefix} {tool} `{name}` in {} (old: {old_bytes} bytes -> new: {inserted} bytes)",
-                request.path
-            )
+        // MCP's tool text for the step, through the route when one was given.
+        let render = |body: &crate::embed::parity::edit::EditBody| match route.as_ref() {
+            Some(route) => route.render_body(body),
+            None => body.render(),
         };
         let handle = target.handle;
         let Some(key) = inner_key else {
-            let (inserted, rendered) = match tool {
+            let body = match tool {
                 "replace_symbol_body" => {
-                    let preview = handle.preview_replace(&ReplaceRequest {
-                        guard,
-                        new_body: arg(args, "new_body"),
-                    })?;
-                    (preview.inserted_bytes, preview.rendered)
+                    handle
+                        .preview_replace(&ReplaceRequest {
+                            guard,
+                            new_body: arg(args, "new_body"),
+                        })?
+                        .body
                 }
                 "insert_symbol" => {
-                    let preview = handle.preview_insert(&InsertRequest {
-                        guard,
-                        position: position(args),
-                        content: arg(args, "content"),
-                    })?;
-                    (preview.inserted_bytes, preview.rendered)
+                    handle
+                        .preview_insert(&InsertRequest {
+                            guard,
+                            position: position(args),
+                            content: arg(args, "content"),
+                        })?
+                        .body
                 }
                 _ => {
-                    let preview = handle.preview_edit_within(&within(guard, args))?;
-                    (preview.change.inserted_bytes, preview.change.rendered)
+                    handle
+                        .preview_edit_within(&within(guard, args))?
+                        .change
+                        .body
                 }
             };
             return Ok(StepOutcome {
-                body: format!("{}\n{rendered}{suffix}", summary("[DRY RUN]", inserted)),
+                body: render(&body),
                 committed: false,
                 applied: None,
                 post_image: None,
@@ -606,7 +608,7 @@ impl EmbeddedSourceHandle {
         let authority = target
             .authority
             .ok_or(EditError::Edit(EditErrorKind::WriteAuthorityRefused))?;
-        let (path, post_image_hash, refresh) = match tool {
+        let (path, post_image_hash, refresh, body) = match tool {
             "replace_symbol_body" => {
                 let applied = handle.apply_replace(
                     &ReplaceRequest {
@@ -620,6 +622,7 @@ impl EmbeddedSourceHandle {
                     applied.path,
                     applied.post_image_hash,
                     applied.refresh_ticket_identity,
+                    applied.body,
                 )
             }
             "insert_symbol" => {
@@ -636,6 +639,7 @@ impl EmbeddedSourceHandle {
                     applied.path,
                     applied.post_image_hash,
                     applied.refresh_ticket_identity,
+                    applied.body,
                 )
             }
             _ => {
@@ -644,6 +648,7 @@ impl EmbeddedSourceHandle {
                     applied.path,
                     applied.post_image_hash,
                     applied.refresh_ticket_identity,
+                    applied.body,
                 )
             }
         };
@@ -659,9 +664,7 @@ impl EmbeddedSourceHandle {
             |resolved| resolved.target_path.display().to_string(),
         );
         Ok(StepOutcome {
-            body: format!(
-                "Applied {tool} `{name}` in {path}: post-image {post_image_hash}{suffix}"
-            ),
+            body: render(&body),
             committed: true,
             applied: Some(SymforgeEditApplied {
                 path,
@@ -671,6 +674,51 @@ impl EmbeddedSourceHandle {
             }),
             post_image,
         })
+    }
+
+    /// MCP's own text for a step the native lane refused, where the MCP tool
+    /// renders one from the indexed file: the symbol resolver's not-found or
+    /// ambiguity message, and `edit_within_symbol`'s selection refusals.
+    fn mcp_refusal_text(
+        &self,
+        request: &StelEditRequest,
+        args: &serde_json::Value,
+        error: &EditError,
+    ) -> Option<String> {
+        use super::guidance::edit_body::{edit_within_refusal, resolve_or_error};
+        use crate::edit_safety::structural::WithinSelectionError;
+        let EditError::Edit(kind) = error else {
+            return None;
+        };
+        let snapshot = self.capture_query_snapshot(b"symforge-edit-refusal").ok()?;
+        let file = snapshot.generation.live.get_file(&request.path)?;
+        let name = arg(args, "name");
+        let selection = match kind {
+            EditErrorKind::SymbolNotFound | EditErrorKind::AmbiguousSymbol { .. } => {
+                return resolve_or_error(file, &name, None, None).err();
+            }
+            EditErrorKind::TextNotFound => WithinSelectionError::NotFound,
+            EditErrorKind::OccurrenceOutOfRange { requested, total } => {
+                WithinSelectionError::OccurrenceOutOfRange {
+                    requested: *requested,
+                    total: *total,
+                }
+            }
+            EditErrorKind::ConflictingTargeting => WithinSelectionError::ConflictingTargeting,
+            _ => return None,
+        };
+        let (_, symbol) = resolve_or_error(file, &name, None, None).ok()?;
+        let body = file
+            .content
+            .get(symbol.effective_start() as usize..symbol.byte_range.1 as usize)
+            .and_then(|body| std::str::from_utf8(body).ok())
+            .unwrap_or("");
+        Some(edit_within_refusal(
+            selection,
+            body,
+            &arg(args, "old_text"),
+            &name,
+        ))
     }
 
     /// Record the answer's economics in the session ledger and, under

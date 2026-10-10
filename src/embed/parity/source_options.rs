@@ -32,9 +32,13 @@ pub struct EmbeddedOpenOptions {
     /// persisted snapshot scope before opening so the source loads fresh.
     /// The outcome is reported by `EmbeddedSourceHandle::open_reset_receipt`.
     pub reset_snapshot_state: bool,
-    /// Existing, absolute, host-protected directory for `index_folder`
-    /// idempotency records (MCP keeps them in process control state). `None`
-    /// refuses idempotency keys as persistence-unavailable, as MCP does.
+    /// Existing, absolute, host-protected directory for the state MCP keeps
+    /// in process control state, beneath its `embed-host` child: `index_folder`
+    /// idempotency records, and the edit-safety project-config trust store
+    /// (`embed-host/edit-safety/trust.json`) whose verdict the edit answers
+    /// report. `None` refuses idempotency keys as persistence-unavailable, as
+    /// MCP does, and reports the trust store unavailable, as MCP does when it
+    /// has no user-local control directory.
     pub replay_control_directory: Option<PathBuf>,
 }
 

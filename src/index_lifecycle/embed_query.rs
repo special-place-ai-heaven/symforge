@@ -35,6 +35,9 @@ pub(super) struct EmbeddedQuerySnapshot {
     pub state_anchor: Option<super::embedded::AdmittedStateAnchor>,
     /// The binding's git temporal cache (see `embed_temporal`).
     pub temporal_cache: Arc<super::embed_temporal::TemporalCache>,
+    /// The host's control-state directory, holding the edit-safety trust
+    /// store MCP keeps in process control state.
+    pub control_directory: Option<PathBuf>,
 }
 
 /// A process incarnation namespace, separate from the frozen core's counters.

@@ -22,8 +22,8 @@ use crate::edit_safety::structural::{
 use crate::embed::parity::edit::{
     BatchEditAction, BatchEditApplied, BatchEditPreview, BatchEditRequest, BatchFilePreview,
     BatchInsertRequest, BatchRenamePlan, BatchRenamePreview, BatchRenameRequest,
-    EditApplyAuthority, EditError, EditErrorKind, EditTarget, InsertRequest, RoutedBatchApplied,
-    RoutedBatchPart,
+    EditApplyAuthority, EditBody, EditError, EditErrorKind, EditTarget, InsertPosition,
+    InsertRequest, RoutedBatchApplied, RoutedBatchPart,
 };
 use crate::embed::parity::replay::{
     OutcomeKind, ReplayKey, ReplayOutcome, ReplayState, ReplayStore, RequestFingerprint,
@@ -32,9 +32,237 @@ use crate::embed::parity::replay::{
 use crate::hash::digest_hex;
 use crate::knowledge::{StableContentAdmission, classify_stable_content_for_root};
 
+use super::embed_edit_body::{
+    self as answer, BatchBody, BatchFileParts, BatchParts, EditBodyParts,
+};
 use super::embed_mutation::{admitted, validate_guard};
 use super::embed_query::EmbeddedQuerySnapshot;
 use super::embedded::EmbeddedSourceHandle;
+use super::guidance::edit_body::{self as shared, EditWriteSemantics, MatchType};
+
+/// The MCP batch tool an embedded batch answers as.
+#[derive(Clone, Copy)]
+enum BatchTool {
+    Edit,
+    Insert(InsertPosition),
+}
+
+impl BatchTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Edit => "batch_edit",
+            Self::Insert(_) => "batch_insert",
+        }
+    }
+}
+
+fn position_label(position: InsertPosition) -> &'static str {
+    match position {
+        InsertPosition::Before => "before",
+        InsertPosition::After => "after",
+    }
+}
+
+/// A batch answer before its write: what MCP prints whatever the outcome.
+struct PendingAnswer {
+    match_type: MatchType,
+    evidence: String,
+    body: BatchBody,
+    /// The path whose impact footer MCP appends (its first target).
+    primary: String,
+}
+
+/// MCP's per-file summaries for `request` over `snapshot`
+/// (`execute_batch_edit` / `execute_batch_insert`): within a file, edits in
+/// descending source order; inserts by descending anchor, later targets
+/// first. Files are in path order; MCP's own `batch_edit` file order follows
+/// a hash map and is not deterministic.
+fn batch_file_parts(
+    snapshot: &EmbeddedQuerySnapshot,
+    request: &BatchEditRequest,
+    tool: BatchTool,
+    dry_run: bool,
+) -> Result<Vec<BatchFileParts>, EditErrorKind> {
+    let mut by_file = BTreeMap::<String, Vec<(u32, usize, String)>>::new();
+    for (operation, action) in request.actions.iter().enumerate() {
+        let guard = action.guard();
+        let (file, symbol, _) = validate_guard(snapshot, guard)?;
+        let path = guard.path.as_str();
+        let old_bytes = (symbol.byte_range.1 - symbol.byte_range.0) as usize;
+        let summary = match action {
+            BatchEditAction::Replace(request) => shared::format_replace(
+                path,
+                &symbol.name,
+                &symbol.kind.to_string(),
+                old_bytes,
+                request.new_body.len(),
+            ),
+            BatchEditAction::Insert(request) => shared::format_insert(
+                path,
+                &symbol.name,
+                position_label(request.position),
+                request.content.len(),
+            ),
+            BatchEditAction::Delete(_) => {
+                shared::format_delete(path, &symbol.name, &symbol.kind.to_string(), old_bytes)
+            }
+            BatchEditAction::EditWithin(request) => {
+                let selection = select_edit_within_body(
+                    &file.content,
+                    symbol,
+                    &request.old_text,
+                    &request.new_text,
+                    request.replace_all,
+                    request.occurrence,
+                    request.near_line,
+                )
+                .map_err(|_| EditErrorKind::TextNotFound)?;
+                let spliced = (symbol.byte_range.1 - symbol.effective_start()) as usize;
+                let new_bytes = (old_bytes + selection.new_body.len()).saturating_sub(spliced);
+                shared::format_edit_within(
+                    path,
+                    &symbol.name,
+                    selection.count,
+                    old_bytes,
+                    new_bytes,
+                )
+            }
+        };
+        let summary = if dry_run {
+            format!("[DRY RUN] Would {summary}")
+        } else {
+            summary
+        };
+        let key = match tool {
+            BatchTool::Insert(InsertPosition::After) => symbol.byte_range.1,
+            _ => symbol.effective_start(),
+        };
+        by_file
+            .entry(guard.path.clone())
+            .or_default()
+            .push((key, operation, summary));
+    }
+    Ok(by_file
+        .into_iter()
+        .map(|(path, mut rows)| {
+            match tool {
+                BatchTool::Edit => rows.sort_by_key(|row| std::cmp::Reverse(row.0)),
+                BatchTool::Insert(_) => {
+                    rows.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)))
+                }
+            }
+            BatchFileParts {
+                path,
+                summaries: rows.into_iter().map(|(_, _, summary)| summary).collect(),
+                tee: None,
+                reroute: String::new(),
+            }
+        })
+        .collect())
+}
+
+fn pending_batch(
+    snapshot: &EmbeddedQuerySnapshot,
+    request: &BatchEditRequest,
+    tool: BatchTool,
+    dry_run: bool,
+) -> Result<PendingAnswer, EditErrorKind> {
+    let files = batch_file_parts(snapshot, request, tool, dry_run)?;
+    let file_count = files.len();
+    let count = request.actions.len();
+    Ok(PendingAnswer {
+        match_type: MatchType::Exact,
+        evidence: match tool {
+            BatchTool::Edit => format!("{count} edit target(s) across {file_count} file(s)"),
+            BatchTool::Insert(_) => format!("{count} target(s) across {file_count} file(s)"),
+        },
+        body: BatchBody::Summaries { files, file_count },
+        primary: request
+            .actions
+            .first()
+            .map(|action| action.guard().path.clone())
+            .unwrap_or_default(),
+    })
+}
+
+fn rename_evidence(path: &str) -> String {
+    format!("definition `{path}` + project-wide constrained references")
+}
+
+/// MCP's dry-run batch answer: the impact footer reads the current index.
+fn preview_answer(snapshot: &EmbeddedQuerySnapshot, pending: PendingAnswer) -> EditBody {
+    let impact = answer::impact_footer(snapshot, &snapshot.generation.live, &pending.primary);
+    EditBody::new(EditBodyParts::Batch(BatchParts {
+        match_type: pending.match_type,
+        semantics: EditWriteSemantics::DryRunNoWrites,
+        evidence: pending.evidence,
+        body: pending.body,
+        trust: answer::trust_suffix(snapshot),
+        impact: Some(impact),
+    }))
+}
+
+/// MCP's committed batch answer: each file's tee hint, and the impact
+/// footer over the index with every post-image substituted, as MCP's
+/// reindex leaves it.
+fn applied_answer(
+    snapshot: &EmbeddedQuerySnapshot,
+    mut pending: PendingAnswer,
+    staged: &[StagedImage],
+    tees: &[(usize, Option<crate::edit_safety::tee::TeeSnapshot>)],
+    reroute: &dyn Fn(&str) -> String,
+) -> EditBody {
+    if let BatchBody::Summaries { files, .. } = &mut pending.body {
+        for file in files.iter_mut() {
+            file.reroute = reroute(&file.path);
+        }
+        for (index, tee) in tees {
+            let hint = tee.as_ref().and_then(|tee| tee.response_hint());
+            let path = staged[*index].relative.to_string_lossy();
+            if let Some(file) = files.iter_mut().find(|file| file.path == path) {
+                file.tee = hint;
+            }
+        }
+    }
+    let written: Vec<(String, &[u8])> = staged
+        .iter()
+        .map(|image| {
+            (
+                image.relative.to_string_lossy().into_owned(),
+                image.replacement.as_slice(),
+            )
+        })
+        .collect();
+    let written: Vec<(&str, &[u8])> = written
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), *bytes))
+        .collect();
+    let after = answer::post_edit_index(snapshot, &written);
+    let impact = answer::impact_footer(snapshot, &after, &pending.primary);
+    EditBody::new(EditBodyParts::Batch(BatchParts {
+        match_type: pending.match_type,
+        semantics: EditWriteSemantics::TransactionalWriteRollbackAndReindex,
+        evidence: pending.evidence,
+        body: pending.body,
+        trust: answer::trust_suffix(snapshot),
+        impact: Some(impact),
+    }))
+}
+
+/// The answer for a completed same-key batch replayed without writing.
+fn replayed_answer(tool: &'static str, files: &[(String, String)]) -> EditBody {
+    let paths = files
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let manifest = serde_json::to_vec(files).unwrap_or_default();
+    EditBody::new(EditBodyParts::Replayed {
+        tool,
+        path: paths,
+        post_image_hash: digest_hex(&manifest),
+    })
+}
 
 struct ResolvedAction<'a> {
     symbol: SymbolRecord,
@@ -529,6 +757,18 @@ impl EmbeddedSourceHandle {
             &request.plan.guard.name,
             &request.new_name,
         );
+        let body = preview_answer(
+            &snapshot,
+            PendingAnswer {
+                match_type: MatchType::Constrained,
+                evidence: rename_evidence(&request.plan.guard.path),
+                body: BatchBody::Rename {
+                    text: rendered.clone(),
+                    paths: Vec::new(),
+                },
+                primary: request.plan.guard.path.clone(),
+            },
+        );
         const MAX_PREVIEW_BYTES: usize = 1_048_576;
         let truncated = rendered.len() > MAX_PREVIEW_BYTES;
         if truncated {
@@ -565,6 +805,7 @@ impl EmbeddedSourceHandle {
             rendered: diff.rendered,
             truncated: diff.truncated,
             redacted: diff.redacted,
+            body,
         };
         Ok(BatchRenamePreview {
             changes,
@@ -590,7 +831,40 @@ impl EmbeddedSourceHandle {
             operation_key,
             fingerprint,
             request.plan.affected_paths.clone(),
-            |snapshot| stage_rename(snapshot, request).map(|(staged, _)| staged),
+            StagedAnswer {
+                tool: "batch_rename",
+                tee: false,
+                stage: Box::new(|snapshot| {
+                    let (staged, plan) = stage_rename(snapshot, request)?;
+                    let sites = plan.by_file.values().map(Vec::len).sum::<usize>();
+                    let mut text = format!(
+                        "Renamed `{}` → `{}` — {sites} site(s) across {} file(s)",
+                        request.plan.guard.name,
+                        request.new_name,
+                        staged.len(),
+                    );
+                    if !plan.uncertain_lines.is_empty() {
+                        text.push_str(&format!(
+                            "\n\n── Uncertain matches (NOT applied — review manually) — {} site(s) ──\n",
+                            plan.uncertain_lines.len(),
+                        ));
+                        text.push_str(&plan.uncertain_lines.join("\n"));
+                    }
+                    let paths = staged
+                        .iter()
+                        .map(|image| image.relative.to_string_lossy().into_owned())
+                        .collect();
+                    Ok((
+                        staged,
+                        PendingAnswer {
+                            match_type: MatchType::Constrained,
+                            evidence: rename_evidence(&request.plan.guard.path),
+                            body: BatchBody::Rename { text, paths },
+                            primary: request.plan.guard.path.clone(),
+                        },
+                    ))
+                }),
+            },
         )
     }
 
@@ -598,7 +872,10 @@ impl EmbeddedSourceHandle {
         &self,
         request: &BatchInsertRequest,
     ) -> Result<BatchEditPreview, EditError> {
-        self.preview_batch_edit(&batch_insert_as_edits(request).map_err(EditError::Edit)?)
+        self.preview_batch(
+            &batch_insert_as_edits(request).map_err(EditError::Edit)?,
+            BatchTool::Insert(request.position),
+        )
     }
 
     pub fn apply_batch_insert(
@@ -607,10 +884,11 @@ impl EmbeddedSourceHandle {
         authority: &EditApplyAuthority,
         operation_key: &str,
     ) -> Result<BatchEditApplied, EditError> {
-        self.apply_batch_edit(
+        self.apply_batch(
             &batch_insert_as_edits(request).map_err(EditError::Edit)?,
             authority,
             operation_key,
+            BatchTool::Insert(request.position),
         )
     }
 
@@ -618,8 +896,20 @@ impl EmbeddedSourceHandle {
         &self,
         request: &BatchEditRequest,
     ) -> Result<BatchEditPreview, EditError> {
+        self.preview_batch(request, BatchTool::Edit)
+    }
+
+    fn preview_batch(
+        &self,
+        request: &BatchEditRequest,
+        tool: BatchTool,
+    ) -> Result<BatchEditPreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-batch-edit")?;
         let staged = stage_batch(&snapshot, request).map_err(EditError::Edit)?;
+        let body = preview_answer(
+            &snapshot,
+            pending_batch(&snapshot, request, tool, true).map_err(EditError::Edit)?,
+        );
         let diff = render_safe_batch(staged.iter().map(|image| {
             (
                 image.relative.to_str().expect("indexed UTF-8 path"),
@@ -643,6 +933,7 @@ impl EmbeddedSourceHandle {
             rendered: diff.rendered,
             truncated: diff.truncated,
             redacted: diff.redacted,
+            body,
         })
     }
 
@@ -651,6 +942,16 @@ impl EmbeddedSourceHandle {
         request: &BatchEditRequest,
         authority: &EditApplyAuthority,
         operation_key: &str,
+    ) -> Result<BatchEditApplied, EditError> {
+        self.apply_batch(request, authority, operation_key, BatchTool::Edit)
+    }
+
+    fn apply_batch(
+        &self,
+        request: &BatchEditRequest,
+        authority: &EditApplyAuthority,
+        operation_key: &str,
+        tool: BatchTool,
     ) -> Result<BatchEditApplied, EditError> {
         let snapshot = self.capture_query_snapshot(b"apply-batch-edit")?;
         let replay_paths = edit_paths(&snapshot.root, request).map_err(EditError::Edit)?;
@@ -661,7 +962,18 @@ impl EmbeddedSourceHandle {
             operation_key,
             fingerprint,
             replay_paths,
-            |snapshot| stage_batch(snapshot, request),
+            StagedAnswer {
+                tool: tool.name(),
+                // MCP's `batch_edit` writes through `atomic_write_file` and
+                // reports each tee; `batch_insert` and `batch_rename` discard it.
+                tee: matches!(tool, BatchTool::Edit),
+                stage: Box::new(move |snapshot| {
+                    Ok((
+                        stage_batch(snapshot, request)?,
+                        pending_batch(snapshot, request, tool, false)?,
+                    ))
+                }),
+            },
         )
     }
 
@@ -672,8 +984,9 @@ impl EmbeddedSourceHandle {
         operation_key: &str,
         fingerprint: RequestFingerprint,
         replay_paths: Vec<String>,
-        stage: impl FnOnce(&EmbeddedQuerySnapshot) -> Result<Vec<StagedImage>, EditErrorKind>,
+        answer: StagedAnswer<'_>,
     ) -> Result<BatchEditApplied, EditError> {
+        let StagedAnswer { tool, tee, stage } = answer;
         if authority.root != snapshot.root || authority.cancel.load(Ordering::Acquire) {
             return Err(EditError::Edit(EditErrorKind::WriteAuthorityRefused));
         }
@@ -709,14 +1022,16 @@ impl EmbeddedSourceHandle {
                 if !record.matches_post_image(&current) {
                     return Err(EditError::Edit(EditErrorKind::ReplayConflict));
                 }
+                let body = replayed_answer(tool, &files);
                 return Ok(BatchEditApplied {
                     files,
                     replayed: true,
                     refresh_ticket_identity: None,
+                    body,
                 });
             }
         };
-        let staged = match stage(&snapshot) {
+        let (staged, pending) = match stage(&snapshot) {
             Ok(staged) => staged,
             Err(error) => {
                 let _ = replay.release_not_started(&lease);
@@ -742,9 +1057,15 @@ impl EmbeddedSourceHandle {
                     }
                 };
             let mut io = EmbeddedBatchIo::new(write);
+            if tee && let Some(project_state) = snapshot.project_state.as_ref() {
+                io = io.with_tee(crate::edit_safety::tee::Tee::for_repo(
+                    &snapshot.root,
+                    project_state,
+                ));
+            }
             let committed = commit_staged_locked(&staged, order, &mut io, Some(&authority.cancel));
             match committed {
-                Ok(_) => {
+                Ok(tees) => {
                     if io.finish().is_err() {
                         let _ = replay.mark_uncertain(&lease);
                         return Err(EditError::Edit(EditErrorKind::WriteUncertain));
@@ -777,6 +1098,8 @@ impl EmbeddedSourceHandle {
                             .map(|image| image.relative.clone())
                             .collect::<Vec<_>>(),
                     );
+                    let body =
+                        applied_answer(&snapshot, pending, &staged, &tees, &|_| String::new());
                     Ok(BatchEditApplied {
                         files: staged
                             .iter()
@@ -794,6 +1117,7 @@ impl EmbeddedSourceHandle {
                                 .ticket_identity()
                                 .to_owned(),
                         ),
+                        body,
                     })
                 }
                 Err(abort) => {
@@ -839,6 +1163,21 @@ impl EmbeddedSourceHandle {
     }
 }
 
+/// What a staged batch writes and how it answers: the MCP tool it answers as
+/// (for a replay), whether the write tees each target, and the staging that
+/// also yields the answer's summaries.
+struct StagedAnswer<'a> {
+    tool: &'static str,
+    tee: bool,
+    #[allow(clippy::type_complexity)]
+    stage: Box<
+        dyn FnOnce(
+                &EmbeddedQuerySnapshot,
+            ) -> Result<(Vec<StagedImage>, PendingAnswer), EditErrorKind>
+            + 'a,
+    >,
+}
+
 /// The shared kernel's I/O over several admitted sources: every staged image
 /// is checked and written through the write authority of its own source.
 struct RoutedBatchIo {
@@ -869,7 +1208,7 @@ impl RoutedBatchIo {
 }
 
 impl BatchIo for RoutedBatchIo {
-    type Report = ();
+    type Report = Option<crate::edit_safety::tee::TeeSnapshot>;
 
     fn matches(&mut self, image: &StagedImage, expected: Option<&[u8]>) -> Result<bool, String> {
         self.io(image)?.matches(image, expected)
@@ -904,6 +1243,16 @@ impl EmbeddedSourceHandle {
         authority: &EditApplyAuthority,
         parts: &[RoutedBatchPart<'_>],
         operation_key: &str,
+    ) -> Result<RoutedBatchApplied, EditError> {
+        self.apply_routed_batch(authority, parts, operation_key, BatchTool::Edit)
+    }
+
+    fn apply_routed_batch(
+        &self,
+        authority: &EditApplyAuthority,
+        parts: &[RoutedBatchPart<'_>],
+        operation_key: &str,
+        tool: BatchTool,
     ) -> Result<RoutedBatchApplied, EditError> {
         let bound = self.capture_query_snapshot(b"apply-routed-batch-edit")?;
         if authority.root != bound.root || authority.cancel.load(Ordering::Acquire) {
@@ -984,6 +1333,13 @@ impl EmbeddedSourceHandle {
                 {
                     return Err(EditError::Edit(EditErrorKind::ReplayConflict));
                 }
+                let body = replayed_answer(
+                    tool.name(),
+                    &entries
+                        .iter()
+                        .flat_map(|(_, files)| files.iter().cloned())
+                        .collect::<Vec<_>>(),
+                );
                 return Ok(RoutedBatchApplied {
                     parts: entries
                         .into_iter()
@@ -991,9 +1347,11 @@ impl EmbeddedSourceHandle {
                             files,
                             replayed: true,
                             refresh_ticket_identity: None,
+                            body: body.clone(),
                         })
                         .collect(),
                     replayed: true,
+                    body,
                 });
             }
         };
@@ -1015,6 +1373,52 @@ impl EmbeddedSourceHandle {
             }
             ranges.push(start..staged.len());
         }
+        // One MCP answer for the whole batch: every part's summaries, each
+        // routed file with its part's reroute report.
+        let mut files = Vec::new();
+        let mut reroutes = HashMap::new();
+        for (part, snapshot) in parts.iter().zip(&snapshots) {
+            let part_files = match batch_file_parts(snapshot, &part.request, tool, false) {
+                Ok(part_files) => part_files,
+                Err(error) => {
+                    let _ = replay.release_not_started(&lease);
+                    return Err(EditError::Edit(error));
+                }
+            };
+            for file in part_files {
+                if let Some(working_directory) = part.working_directory.as_deref() {
+                    reroutes.insert(
+                        file.path.clone(),
+                        answer::shared_reroute(
+                            working_directory,
+                            snapshot.root != bound.root,
+                            &dunce::simplified(&snapshot.root).join(&file.path),
+                            &dunce::simplified(&bound.root).join(&file.path),
+                        ),
+                    );
+                }
+                files.push(file);
+            }
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let file_count = files.len();
+        let pending = PendingAnswer {
+            match_type: MatchType::Exact,
+            evidence: match tool {
+                BatchTool::Edit => {
+                    format!("{action_count} edit target(s) across {file_count} file(s)")
+                }
+                BatchTool::Insert(_) => {
+                    format!("{action_count} target(s) across {file_count} file(s)")
+                }
+            },
+            body: BatchBody::Summaries { files, file_count },
+            primary: parts
+                .iter()
+                .find_map(|part| part.request.actions.first())
+                .map(|action| action.guard().path.clone())
+                .unwrap_or_default(),
+        };
         if authority.cancel.load(Ordering::Acquire) {
             let _ = replay.release_not_started(&lease);
             return Err(EditError::Edit(EditErrorKind::Cancelled));
@@ -1051,7 +1455,20 @@ impl EmbeddedSourceHandle {
                     .authority
                     .acquire_write_expected(snapshot.authority_publication)
                 {
-                    Ok(write) => writes[index] = Some(EmbeddedBatchIo::new(write)),
+                    Ok(write) => {
+                        let mut io = EmbeddedBatchIo::new(write);
+                        // MCP tees every routed target into the indexed
+                        // project's state, displayed against its root.
+                        if matches!(tool, BatchTool::Edit)
+                            && let Some(project_state) = bound.project_state.as_ref()
+                        {
+                            io = io.with_tee(crate::edit_safety::tee::Tee::for_repo(
+                                &bound.root,
+                                project_state,
+                            ));
+                        }
+                        writes[index] = Some(io);
+                    }
                     Err(_) => {
                         for io in writes.into_iter().flatten() {
                             let _ = io.finish();
@@ -1065,10 +1482,13 @@ impl EmbeddedSourceHandle {
                 owner,
             };
             match commit_staged_locked(&staged, order, &mut io, Some(&authority.cancel)) {
-                Ok(_) => {
+                Ok(tees) => {
                     if io.finish().is_err() {
                         return Err(uncertain());
                     }
+                    let body = applied_answer(&bound, pending, &staged, &tees, &|path| {
+                        reroutes.get(path).cloned().unwrap_or_default()
+                    });
                     let mut tickets = Vec::with_capacity(parts.len());
                     for part in parts {
                         match part.handle.request_refresh() {
@@ -1111,9 +1531,11 @@ impl EmbeddedSourceHandle {
                                     .collect(),
                                 replayed: false,
                                 refresh_ticket_identity: Some(ticket),
+                                body: body.clone(),
                             })
                             .collect(),
                         replayed: false,
+                        body,
                     })
                 }
                 Err(abort) => {
@@ -1155,6 +1577,9 @@ impl EmbeddedSourceHandle {
         parts: &[RoutedBatchPart<'_, BatchInsertRequest>],
         operation_key: &str,
     ) -> Result<RoutedBatchApplied, EditError> {
+        let position = parts
+            .first()
+            .map_or(InsertPosition::After, |part| part.request.position);
         let parts = parts
             .iter()
             .map(|part| {
@@ -1162,11 +1587,17 @@ impl EmbeddedSourceHandle {
                     handle: part.handle,
                     authority: part.authority,
                     request: batch_insert_as_edits(&part.request)?,
+                    working_directory: part.working_directory.clone(),
                 })
             })
             .collect::<Result<Vec<_>, EditErrorKind>>()
             .map_err(EditError::Edit)?;
-        self.apply_routed_batch_edit(authority, &parts, operation_key)
+        self.apply_routed_batch(
+            authority,
+            &parts,
+            operation_key,
+            BatchTool::Insert(position),
+        )
     }
 }
 fn batch_insert_as_edits(request: &BatchInsertRequest) -> Result<BatchEditRequest, EditErrorKind> {

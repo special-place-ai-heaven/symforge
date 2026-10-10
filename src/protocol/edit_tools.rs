@@ -14,7 +14,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use serde::Serialize;
 
-use crate::edit_safety::trust::{ProjectConfigTrust, TrustEvaluation, TrustStatus};
+use crate::edit_safety::trust::ProjectConfigTrust;
+use crate::index_lifecycle::guidance::edit_body;
 use crate::live_index::store::IndexState;
 use crate::protocol::result_status::{
     OutcomeClass, RESULT_STATUS_CONTRACT_VERSION, RESULT_STATUS_META_KEY,
@@ -51,23 +52,6 @@ macro_rules! loading_guard {
             }
         }
     };
-}
-
-const PROJECT_CONFIG_TRUST_MODE_ENV: &str = "SYMFORGE_PROJECT_CONFIG_TRUST_MODE";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectConfigTrustMode {
-    LogOnly,
-    Enforce,
-}
-
-impl ProjectConfigTrustMode {
-    fn current() -> Self {
-        match std::env::var(PROJECT_CONFIG_TRUST_MODE_ENV) {
-            Ok(value) if value.eq_ignore_ascii_case("enforce") => Self::Enforce,
-            _ => Self::LogOnly,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -228,71 +212,13 @@ Required safety: structural",
     }
 }
 
-fn project_config_trust_inputs_exist(repo_root: &Path) -> bool {
-    let symforge_dir = repo_root.join(".symforge");
-    symforge_dir.join("config.toml").exists() || symforge_dir.join("config").exists()
-}
-
 fn project_config_trust_response_suffix(repo_root: &Path) -> Result<Option<String>, String> {
-    if !project_config_trust_inputs_exist(repo_root) {
-        return Ok(None);
-    }
-    let Some(trust) = ProjectConfigTrust::default_store() else {
-        return Ok(Some(
-            "ProjectConfigTrustWarning: status=Unavailable warning=\"could not determine user-local data directory\"; mode=LOG_ONLY; operation_allowed=true"
-                .to_string(),
-        ));
-    };
-    let evaluation = trust.evaluate(repo_root);
-    match evaluation.status {
-        TrustStatus::Trusted | TrustStatus::EnvOverride => Ok(None),
-        TrustStatus::Untrusted | TrustStatus::ContentChanged { .. } => {
-            let evidence = project_config_trust_evidence(&evaluation);
-            match ProjectConfigTrustMode::current() {
-                ProjectConfigTrustMode::LogOnly => Ok(Some(format!(
-                    "ProjectConfigTrustWarning: {evidence}; mode=LOG_ONLY; operation_allowed=true"
-                ))),
-                ProjectConfigTrustMode::Enforce => Err(format!(
-                    "ProjectConfigTrustEnforced: {evidence}; mode=ENFORCE; operation_allowed=false; run `symforge trust project-config accept --project {}` with reviewed actual_hash before retrying",
-                    repo_root.display()
-                )),
-            }
-        }
-    }
-}
-
-fn project_config_trust_evidence(evaluation: &TrustEvaluation) -> String {
-    let mut parts = match &evaluation.status {
-        TrustStatus::Trusted => vec!["status=Trusted".to_string()],
-        TrustStatus::Untrusted => vec!["status=Untrusted".to_string()],
-        TrustStatus::ContentChanged { expected, actual } => vec![
-            "status=ContentChanged".to_string(),
-            format!("expected_hash={expected}"),
-            format!("actual_hash={actual}"),
-        ],
-        TrustStatus::EnvOverride => vec!["status=EnvOverride".to_string()],
-    };
-    if !matches!(evaluation.status, TrustStatus::ContentChanged { .. }) {
-        parts.push(format!("actual_hash={}", evaluation.actual_hash));
-    }
-    if let Some(project_key) = &evaluation.project_key {
-        parts.push(format!("project_key={project_key}"));
-    }
-    if let Some(warning) = evaluation.warnings.first() {
-        parts.push(format!("warning=\"{}\"", one_line(warning)));
-    }
-    parts.join(" ")
-}
-
-fn append_project_config_trust_suffix(output: &mut String, suffix: Option<&str>) {
-    if let Some(suffix) = suffix {
-        output.push('\n');
-        output.push_str(suffix);
-    }
-}
-
-fn one_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+    edit_body::project_config_trust_response_suffix(
+        repo_root,
+        ProjectConfigTrust::default_store,
+        |trust| trust.evaluate(repo_root),
+        edit_body::ProjectConfigTrustMode::current,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -993,28 +919,26 @@ impl SymForgeServer {
         None // No capability restriction
     }
 
-    /// Append the success-only post-edit impact footer for `path` to `output`.
+    /// The success-only post-edit impact footer for `path`, which the shared
+    /// answer renderer appends after a single leading newline.
     ///
-    /// Mirrors `append_project_config_trust_suffix`: a single leading newline then
-    /// the footer text. Computes the distinct dependent file count and (when git
+    /// Computes the distinct dependent file count and (when git
     /// temporal data is `Ready`) the top co-change partners via
     /// `format::edit_impact_summary`. The dependents come from the read snapshot
     /// (`self.index.data_plane().read()` → `&LiveIndex`) and the co-changes from the lock-free
     /// temporal snapshot on the shared handle (`self.index.data_plane().git_temporal()`). If the
-    /// index is not `Ready` (loading/empty), nothing is appended — the footer is
+    /// index is not `Ready` (loading/empty), there is no footer — it is
     /// best-effort and never blocks a successful edit response.
-    fn append_impact_footer(&self, output: &mut String, path: &str) {
+    fn impact_footer_text(&self, path: &str) -> Option<String> {
         // T046: one capture — the dependency counts and the co-change rows in
         // one footer describe the same publication.
         let generation = self.index.data_plane().published_generation();
         let guard = &generation.live;
         if !matches!(guard.index_state(), IndexState::Ready) {
-            return;
+            return None;
         }
         let temporal = &generation.code_signals.temporal;
-        let (deps, cochanges) = format::edit_impact_summary(guard, temporal, path);
-        output.push('\n');
-        output.push_str(&format::impact_footer(deps, &cochanges));
+        Some(edit_body::impact_footer_for(guard, temporal, path))
     }
 
     /// Replace a symbol's entire definition with new source code. The index resolves the symbol's
@@ -1157,25 +1081,25 @@ impl SymForgeServer {
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
             let old_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-            let summary = format!(
-                "[DRY RUN] Would replace `{}` in {} (old: {} bytes -> new: {} bytes)",
-                params.0.name,
-                params.0.path,
+            let summary = edit_body::dry_run_replace_summary(
+                &params.0.name,
+                &params.0.path,
                 old_bytes,
-                params.0.new_body.len()
+                params.0.new_body.len(),
             );
-            let mut result = format!(
-                "{}\n{}",
-                edit_format::format_edit_envelope(
-                    edit_format::EditSafetyMode::StructuralEditSafe,
-                    source_authority,
-                    edit_format::EditWriteSemantics::DryRunNoWrites,
-                    &evidence_anchor,
-                ),
-                summary
-            );
-            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
-            return result;
+            return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+                safety: edit_format::EditSafetyMode::StructuralEditSafe,
+                authority: source_authority,
+                semantics: edit_format::EditWriteSemantics::DryRunNoWrites,
+                anchor: &evidence_anchor,
+                summary: &summary,
+                stale_warnings: "",
+                tee: "",
+                reroute: "",
+                tee_before_reroute: true,
+                trust: project_config_trust_suffix.as_deref(),
+                impact: None,
+            });
         }
         let prepared = match crate::edit_safety::structural::prepare_replace(
             &file.content,
@@ -1268,34 +1192,30 @@ impl SymForgeServer {
             parent_type.as_deref(),
             Some(&file.language),
         );
-        let mut result = format!(
-            "{}\n{}",
-            edit_format::format_edit_envelope(
-                edit_format::EditSafetyMode::StructuralEditSafe,
-                source_authority,
-                edit_format::EditWriteSemantics::AtomicWriteAndReindex,
-                &evidence_anchor,
-            ),
-            edit_format::format_replace(
+        let impact = self.impact_footer_text(&params.0.path);
+        let mut result = edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+            safety: edit_format::EditSafetyMode::StructuralEditSafe,
+            authority: source_authority,
+            semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
+            anchor: &evidence_anchor,
+            summary: &edit_format::format_replace(
                 &params.0.path,
                 &params.0.name,
                 &sym.kind.to_string(),
                 old_bytes,
                 inserted_bytes,
-            )
-        );
-        result.push_str(&edit_format::format_stale_warnings(
-            &params.0.path,
-            &params.0.name,
-            &warnings,
-        ));
-        result.push_str(&edit::format_tee_snapshot_suffix(&write_report));
-        result.push_str(&edit_format::format_reroute_suffix(
-            working_directory,
-            &resolved_target,
-        ));
-        append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
-        self.append_impact_footer(&mut result, &params.0.path);
+            ),
+            stale_warnings: &edit_format::format_stale_warnings(
+                &params.0.path,
+                &params.0.name,
+                &warnings,
+            ),
+            tee: &edit::format_tee_snapshot_suffix(&write_report),
+            reroute: &edit_format::format_reroute_suffix(working_directory, &resolved_target),
+            tee_before_reroute: true,
+            trust: project_config_trust_suffix.as_deref(),
+            impact: impact.as_deref(),
+        });
         complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut result,
@@ -1449,25 +1369,25 @@ impl SymForgeServer {
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
-            let summary = format!(
-                "[DRY RUN] Would insert {} `{}` in {} ({} bytes of content)",
+            let summary = edit_body::dry_run_insert_summary(
                 position,
-                params.0.name,
-                params.0.path,
-                params.0.content.len()
+                &params.0.name,
+                &params.0.path,
+                params.0.content.len(),
             );
-            let mut result = format!(
-                "{}\n{}",
-                edit_format::format_edit_envelope(
-                    edit_format::EditSafetyMode::StructuralEditSafe,
-                    source_authority,
-                    edit_format::EditWriteSemantics::DryRunNoWrites,
-                    &evidence_anchor,
-                ),
-                summary
-            );
-            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
-            return result;
+            return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+                safety: edit_format::EditSafetyMode::StructuralEditSafe,
+                authority: source_authority,
+                semantics: edit_format::EditWriteSemantics::DryRunNoWrites,
+                anchor: &evidence_anchor,
+                summary: &summary,
+                stale_warnings: "",
+                tee: "",
+                reroute: "",
+                tee_before_reroute: false,
+                trust: project_config_trust_suffix.as_deref(),
+                impact: None,
+            });
         }
         let line_ending = edit::detect_line_ending(&file.content);
         let new_content = if position == "before" {
@@ -1504,28 +1424,25 @@ impl SymForgeServer {
             );
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
-        let mut out = format!(
-            "{}\n{}",
-            edit_format::format_edit_envelope(
-                edit_format::EditSafetyMode::StructuralEditSafe,
-                source_authority,
-                edit_format::EditWriteSemantics::AtomicWriteAndReindex,
-                &evidence_anchor,
-            ),
-            edit_format::format_insert(
+        let impact = self.impact_footer_text(&params.0.path);
+        let mut out = edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+            safety: edit_format::EditSafetyMode::StructuralEditSafe,
+            authority: source_authority,
+            semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
+            anchor: &evidence_anchor,
+            summary: &edit_format::format_insert(
                 &params.0.path,
                 &params.0.name,
                 position,
                 params.0.content.len(),
-            )
-        );
-        out.push_str(&edit_format::format_reroute_suffix(
-            working_directory,
-            &resolved_target,
-        ));
-        out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
-        append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
-        self.append_impact_footer(&mut out, &params.0.path);
+            ),
+            stale_warnings: "",
+            tee: &edit::format_tee_snapshot_suffix(&write_report),
+            reroute: &edit_format::format_reroute_suffix(working_directory, &resolved_target),
+            tee_before_reroute: false,
+            trust: project_config_trust_suffix.as_deref(),
+            impact: impact.as_deref(),
+        });
         complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
@@ -1675,22 +1592,21 @@ impl SymForgeServer {
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
             let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-            let summary = format!(
-                "[DRY RUN] Would delete `{}` in {} ({} bytes)",
-                params.0.name, params.0.path, deleted_bytes
-            );
-            let mut result = format!(
-                "{}\n{}",
-                edit_format::format_edit_envelope(
-                    edit_format::EditSafetyMode::StructuralEditSafe,
-                    source_authority,
-                    edit_format::EditWriteSemantics::DryRunNoWrites,
-                    &evidence_anchor,
-                ),
-                summary
-            );
-            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
-            return result;
+            let summary =
+                edit_body::dry_run_delete_summary(&params.0.name, &params.0.path, deleted_bytes);
+            return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+                safety: edit_format::EditSafetyMode::StructuralEditSafe,
+                authority: source_authority,
+                semantics: edit_format::EditWriteSemantics::DryRunNoWrites,
+                anchor: &evidence_anchor,
+                summary: &summary,
+                stale_warnings: "",
+                tee: "",
+                reroute: "",
+                tee_before_reroute: false,
+                trust: project_config_trust_suffix.as_deref(),
+                impact: None,
+            });
         }
         let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
         let line_ending = edit::detect_line_ending(&file.content);
@@ -1724,28 +1640,25 @@ impl SymForgeServer {
             );
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
-        let mut out = format!(
-            "{}\n{}",
-            edit_format::format_edit_envelope(
-                edit_format::EditSafetyMode::StructuralEditSafe,
-                source_authority,
-                edit_format::EditWriteSemantics::AtomicWriteAndReindex,
-                &evidence_anchor,
-            ),
-            edit_format::format_delete(
+        let impact = self.impact_footer_text(&params.0.path);
+        let mut out = edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+            safety: edit_format::EditSafetyMode::StructuralEditSafe,
+            authority: source_authority,
+            semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
+            anchor: &evidence_anchor,
+            summary: &edit_format::format_delete(
                 &params.0.path,
                 &params.0.name,
                 &sym.kind.to_string(),
                 deleted_bytes,
-            )
-        );
-        out.push_str(&edit_format::format_reroute_suffix(
-            working_directory,
-            &resolved_target,
-        ));
-        out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
-        append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
-        self.append_impact_footer(&mut out, &params.0.path);
+            ),
+            stale_warnings: "",
+            tee: &edit::format_tee_snapshot_suffix(&write_report),
+            reroute: &edit_format::format_reroute_suffix(working_directory, &resolved_target),
+            tee_before_reroute: false,
+            trust: project_config_trust_suffix.as_deref(),
+            impact: impact.as_deref(),
+        });
         complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
@@ -1913,46 +1826,12 @@ impl SymForgeServer {
         ) {
             Ok(selection) => selection,
             Err(error) => {
-                use crate::edit_safety::structural::WithinSelectionError;
-                let output = match error {
-                    WithinSelectionError::InvalidSpan | WithinSelectionError::InvalidUtf8 =>
-                        "Error: symbol body is not valid UTF-8.".to_string(),
-                    WithinSelectionError::ConflictingTargeting =>
-                        "Error: `replace_all`, `occurrence`, and `near_line` are mutually exclusive — pass at most one targeting mode.".to_string(),
-                    WithinSelectionError::OccurrenceOutOfRange { requested, total } =>
-                        format!("Error: occurrence {requested} is out of range — `old_text` has {total} exact occurrence(s) within `{}`.", params.0.name),
-                    WithinSelectionError::NotFound => {
-                        let preview_len = if body_str.len() <= 800 {
-                            body_str.len()
-                        } else {
-                            body_str.char_indices()
-                                .map(|(offset, _)| offset)
-                                .take_while(|offset| *offset <= 800)
-                                .last()
-                                .unwrap_or(0)
-                        };
-                        let preview = &body_str[..preview_len];
-                        let truncated = if preview_len < body_str.len() {
-                            format!("\n... ({} more bytes)", body_str.len() - preview_len)
-                        } else {
-                            String::new()
-                        };
-                        let candidate = format!(
-                            "Error: `{}` not found within symbol `{}`. The symbol body is ({} bytes):\n```\n{}{}\n```",
-                            params.0.old_text, params.0.name, body_str.len(), preview, truncated,
-                        );
-                        if crate::knowledge::guard_query(&candidate).is_ok() {
-                            candidate
-                        } else {
-                            "Error: edit text not found; source preview withheld by safety policy.".to_string()
-                        }
-                    }
-                };
-                let output = if crate::knowledge::guard_query(&output).is_ok() {
-                    output
-                } else {
-                    "Error: edit target rejected by safety policy.".to_string()
-                };
+                let output = edit_body::edit_within_refusal(
+                    error,
+                    body_str,
+                    &params.0.old_text,
+                    &params.0.name,
+                );
                 return fail_and_return_bound_mutation_replay(&idempotency, output);
             }
         };
@@ -1960,27 +1839,28 @@ impl SymForgeServer {
         let count = selection.count;
         let untargeted_extra = selection.untargeted_extra;
         if params.0.dry_run == Some(true) {
-            let mut result = format!(
-                "{}\n[DRY RUN] Would edit within `{}` in {} ({} replacement(s))",
-                edit_format::format_edit_envelope(
-                    edit_format::EditSafetyMode::TextEditSafe,
-                    source_authority,
-                    edit_format::EditWriteSemantics::DryRunNoWrites,
-                    &evidence_anchor,
-                ),
-                params.0.name,
-                params.0.path,
-                count
+            let summary = edit_body::edit_within_summary(
+                true,
+                &params.0.path,
+                &params.0.name,
+                count,
+                0,
+                0,
+                untargeted_extra,
             );
-            if untargeted_extra > 0 {
-                result.push_str(&format!(
-                    "\nNote: `old_text` occurs {} times within `{}`; this targets the FIRST. Pass `occurrence: N` or `near_line: L` to pick another.",
-                    untargeted_extra + 1,
-                    params.0.name
-                ));
-            }
-            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
-            return result;
+            return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+                safety: edit_format::EditSafetyMode::TextEditSafe,
+                authority: source_authority,
+                semantics: edit_format::EditWriteSemantics::DryRunNoWrites,
+                anchor: &evidence_anchor,
+                summary: &summary,
+                stale_warnings: "",
+                tee: "",
+                reroute: "",
+                tee_before_reroute: false,
+                trust: project_config_trust_suffix.as_deref(),
+                impact: None,
+            });
         }
         let old_sym_bytes = sym_end - sym_start;
         let effective_range = (sym.effective_start(), sym.byte_range.1);
@@ -2014,38 +1894,28 @@ impl SymForgeServer {
             );
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
-        let mut out = format!(
-            "{}\n{}",
-            edit_format::format_edit_envelope(
-                edit_format::EditSafetyMode::TextEditSafe,
-                source_authority,
-                edit_format::EditWriteSemantics::AtomicWriteAndReindex,
-                &evidence_anchor,
-            ),
-            edit_format::format_edit_within(
+        let impact = self.impact_footer_text(&params.0.path);
+        let mut out = edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+            safety: edit_format::EditSafetyMode::TextEditSafe,
+            authority: source_authority,
+            semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
+            anchor: &evidence_anchor,
+            summary: &edit_body::edit_within_summary(
+                false,
                 &params.0.path,
                 &params.0.name,
                 count,
                 old_sym_bytes,
                 new_body.len(),
-            )
-        );
-        if untargeted_extra > 0 {
-            // Dogfood #4: replacing the first of several matches silently is a
-            // mini trust lie — disclose the ambiguity and the targeting knobs.
-            out.push_str(&format!(
-                "\nNote: `old_text` occurred {} times within `{}`; edited the FIRST. Pass `occurrence: N` or `near_line: L` to target another.",
-                untargeted_extra + 1,
-                params.0.name
-            ));
-        }
-        out.push_str(&edit_format::format_reroute_suffix(
-            working_directory,
-            &resolved_target,
-        ));
-        out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
-        append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
-        self.append_impact_footer(&mut out, &params.0.path);
+                untargeted_extra,
+            ),
+            stale_warnings: "",
+            tee: &edit::format_tee_snapshot_suffix(&write_report),
+            reroute: &edit_format::format_reroute_suffix(working_directory, &resolved_target),
+            tee_before_reroute: false,
+            trust: project_config_trust_suffix.as_deref(),
+            impact: impact.as_deref(),
+        });
         complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
@@ -2175,24 +2045,20 @@ impl SymForgeServer {
                     params.0.edits.len(),
                     file_count
                 );
-                let mut result = format!(
-                    "{}\n{}",
-                    edit_format::format_batch_envelope(
-                        edit_format::EditSafetyMode::StructuralEditSafe,
-                        edit_format::MatchType::Exact,
-                        source_authority,
-                        write_semantics,
-                        &evidence,
-                    ),
-                    edit_format::format_batch_summary(&summaries, file_count),
-                );
-                append_project_config_trust_suffix(
-                    &mut result,
-                    project_config_trust_suffix.as_deref(),
-                );
-                if let Some(primary) = params.0.edits.first() {
-                    self.append_impact_footer(&mut result, &primary.path);
-                }
+                let impact = params
+                    .0
+                    .edits
+                    .first()
+                    .and_then(|primary| self.impact_footer_text(&primary.path));
+                let mut result = edit_body::render_batch_edit_answer(&edit_body::BatchEditAnswer {
+                    match_type: edit_format::MatchType::Exact,
+                    authority: source_authority,
+                    semantics: write_semantics,
+                    evidence: &evidence,
+                    body: &edit_format::format_batch_summary(&summaries, file_count),
+                    trust: project_config_trust_suffix.as_deref(),
+                    impact: impact.as_deref(),
+                });
                 complete_mutation_replay(
                     &idempotency,
                     &mut result,
@@ -2302,22 +2168,16 @@ impl SymForgeServer {
                     "definition `{}` + project-wide constrained references",
                     params.0.path
                 );
-                let mut result = format!(
-                    "{}\n{}",
-                    edit_format::format_batch_envelope(
-                        edit_format::EditSafetyMode::StructuralEditSafe,
-                        edit_format::MatchType::Constrained,
-                        source_authority,
-                        write_semantics,
-                        &evidence,
-                    ),
-                    summary,
-                );
-                append_project_config_trust_suffix(
-                    &mut result,
-                    project_config_trust_suffix.as_deref(),
-                );
-                self.append_impact_footer(&mut result, &params.0.path);
+                let impact = self.impact_footer_text(&params.0.path);
+                let mut result = edit_body::render_batch_edit_answer(&edit_body::BatchEditAnswer {
+                    match_type: edit_format::MatchType::Constrained,
+                    authority: source_authority,
+                    semantics: write_semantics,
+                    evidence: &evidence,
+                    body: &summary,
+                    trust: project_config_trust_suffix.as_deref(),
+                    impact: impact.as_deref(),
+                });
                 complete_mutation_replay(
                     &idempotency,
                     &mut result,
@@ -2435,24 +2295,20 @@ impl SymForgeServer {
                     params.0.targets.len(),
                     file_count
                 );
-                let mut result = format!(
-                    "{}\n{}",
-                    edit_format::format_batch_envelope(
-                        edit_format::EditSafetyMode::StructuralEditSafe,
-                        edit_format::MatchType::Exact,
-                        source_authority,
-                        write_semantics,
-                        &evidence,
-                    ),
-                    edit_format::format_batch_summary(&summaries, file_count),
-                );
-                append_project_config_trust_suffix(
-                    &mut result,
-                    project_config_trust_suffix.as_deref(),
-                );
-                if let Some(primary) = params.0.targets.first() {
-                    self.append_impact_footer(&mut result, &primary.path);
-                }
+                let impact = params
+                    .0
+                    .targets
+                    .first()
+                    .and_then(|primary| self.impact_footer_text(&primary.path));
+                let mut result = edit_body::render_batch_edit_answer(&edit_body::BatchEditAnswer {
+                    match_type: edit_format::MatchType::Exact,
+                    authority: source_authority,
+                    semantics: write_semantics,
+                    evidence: &evidence,
+                    body: &edit_format::format_batch_summary(&summaries, file_count),
+                    trust: project_config_trust_suffix.as_deref(),
+                    impact: impact.as_deref(),
+                });
                 complete_mutation_replay(
                     &idempotency,
                     &mut result,
