@@ -1248,11 +1248,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // stale protocol/knowledge_curation.rs row is removed. The eight other
 // embed/parity children (parity, host, edit, knowledge, federation, session,
 // read, reference) were rerouted through src/embed.rs and hold zero edges.
-// Refreshed for the embed-cell clippy/cfg cleanup and stale unix test removal; no new boundary edge.
+// Refreshed for the embed-cell clippy/cfg cleanup, stale unix test removal, and canonical-root
+// test comparisons for 8.3 short-name TEMP; no new boundary edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "bb1ce29ed5272fcb6ccb0e78728023841748e555e1211102640601dd35d27e59",
+    "0248f6647b95daf73511227a14c68072e54de6b3055658049327a87ffa531551",
     295,
-    11_556_055,
+    11_556_486,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
