@@ -19,9 +19,42 @@ pub enum EmbeddedStateSelection {
     MemoryOnly,
 }
 
+/// MCP `index_folder` parity for an embedded open. `add` has no option:
+/// additive multi-source opens are explicit federation
+/// (`federation::query_sources`) over separately opened sources.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmbeddedOpenOptions {
     pub state: EmbeddedStateSelection,
+    /// MCP `allow_protected_root`: direct authority to index the exact
+    /// protected root in read/index-only mode. Never inherited.
+    pub allow_protected_root: bool,
+    /// MCP `index_folder` reset (`SYMFORGE_INDEX_FOLDER_RESET=1`): delete the
+    /// persisted snapshot scope before opening so the source loads fresh.
+    /// The outcome is reported by `EmbeddedSourceHandle::open_reset_receipt`.
+    pub reset_snapshot_state: bool,
+    /// Existing, absolute, host-protected directory for `index_folder`
+    /// idempotency records (MCP keeps them in process control state). `None`
+    /// refuses idempotency keys as persistence-unavailable, as MCP does.
+    pub replay_control_directory: Option<PathBuf>,
+}
+
+/// Outcome of an `index_folder`-style snapshot reset: the shared
+/// `persist::reset_snapshot_state` scope and its observed file counts.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotResetReceipt {
+    pub scope: String,
+    pub removed: u64,
+    pub missing: u64,
+}
+
+impl SnapshotResetReceipt {
+    pub(crate) fn from_report(report: &crate::live_index::persist::SnapshotResetReport) -> Self {
+        Self {
+            scope: crate::live_index::persist::SNAPSHOT_RESET_SCOPE_LABEL.to_owned(),
+            removed: report.removed_count() as u64,
+            missing: report.missing_count() as u64,
+        }
+    }
 }
 
 /// Host-only bounds and placement for disposable Git read artifacts.

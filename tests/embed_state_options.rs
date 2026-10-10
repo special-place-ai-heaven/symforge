@@ -36,6 +36,7 @@ fn memory_only_creates_no_state_and_source_can_reopen_with_automatic_placement()
             EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()),
             EmbeddedOpenOptions {
                 state: EmbeddedStateSelection::MemoryOnly,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -50,6 +51,7 @@ fn memory_only_creates_no_state_and_source_can_reopen_with_automatic_placement()
             EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()),
             EmbeddedOpenOptions {
                 state: EmbeddedStateSelection::Automatic,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -76,6 +78,7 @@ fn selected_user_local_base_is_partitioned_by_source_root() {
             state: EmbeddedStateSelection::UserLocal {
                 base_directory: base.path().to_path_buf(),
             },
+            ..Default::default()
         },
     );
     let mut rights = HostRights::read_only();
@@ -150,6 +153,7 @@ fn memory_only_checkpoint_refuses_durable_persistence() {
         ProcessIndexRuntime::acquire().unwrap(),
         EmbeddedOpenOptions {
             state: EmbeddedStateSelection::MemoryOnly,
+            ..Default::default()
         },
     );
     let mut rights = HostRights::read_only();

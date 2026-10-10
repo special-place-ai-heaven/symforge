@@ -285,10 +285,30 @@ pub enum HostRequest {
         operation_key: String,
     },
     Refresh,
+    /// MCP `index_folder` parity for the bound source: in-place reset and
+    /// idempotent replay. Requires the refresh right; `reset` additionally
+    /// requires the checkpoint right because it deletes persisted snapshot state.
+    RefreshWith(HostRefreshRequest),
     Checkpoint {
         verify_after_write: bool,
         export_artifact: bool,
     },
+}
+
+/// MCP `index_folder` options that apply to an already bound source.
+/// `path` is the room grant and `allow_protected_root` is the trusted open
+/// option; `add` is explicit federation over separately opened sources.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRefreshRequest {
+    /// MCP reset (`SYMFORGE_INDEX_FOLDER_RESET=1`): delete the snapshot scope
+    /// before the full reload. A replayed request never repeats it.
+    #[serde(default)]
+    pub reset: bool,
+    /// MCP `idempotency_key`: an identical request with the same key returns
+    /// the original receipt; a different request with the key is refused.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +633,16 @@ pub struct HostAuthorityIdentity {
 pub struct HostRefreshReceipt {
     pub ticket_identity: String,
     pub requested_source_version: u64,
+    /// The snapshot reset this request performed, when `reset` was requested.
+    #[serde(default)]
+    pub reset: Option<crate::embed::parity::source_options::SnapshotResetReceipt>,
+    /// This receipt was returned from the idempotency record, not re-executed.
+    #[serde(default)]
+    pub replayed: bool,
+    /// With an idempotency key: whether this receipt was durably recorded
+    /// (`Some(false)` mirrors MCP's "failed to store replay result" warning).
+    #[serde(default)]
+    pub replay_recorded: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1063,6 +1093,7 @@ pub struct HostRoom {
     room_token: Option<Arc<()>>,
     session: Mutex<Option<Arc<QuerySession>>>,
     secret_external_tool: Option<SecretExternalTool>,
+    open_options: EmbeddedOpenOptions,
 }
 
 impl HostRoom {
@@ -1255,7 +1286,95 @@ impl HostRoom {
             room_token,
             session: Mutex::new(None),
             secret_external_tool: grant.secret_external_tool,
+            open_options: owner
+                .map(|owner| owner.open_options.clone())
+                .unwrap_or_default(),
         })
+    }
+
+    /// MCP `index_folder` on the bound source, through the shared
+    /// `idempotency::begin_index_folder_replay` and snapshot reset engines.
+    fn refresh_with(
+        &self,
+        request: &HostRefreshRequest,
+    ) -> Result<HostRefreshReceipt, HostRefusal> {
+        use crate::idempotency::{IdempotencyError, ReplayStart};
+        let (active, stored) = match request.idempotency_key.as_deref() {
+            None => (None, None),
+            Some(raw_key) => {
+                let directory = self
+                    .open_options
+                    .replay_control_directory
+                    .as_ref()
+                    .ok_or_else(|| HostRefusal::new(HostRefusalKind::PersistenceUnavailable))?;
+                let control = crate::domain::ControlStateDir::new(directory.join("embed-host"));
+                match crate::idempotency::begin_index_folder_replay(
+                    &control,
+                    &self.source_root,
+                    raw_key,
+                    request.reset,
+                    self.open_options.allow_protected_root,
+                    // One bound source per room: the refresh IS the activation.
+                    true,
+                ) {
+                    Ok(ReplayStart::FirstExecution(active)) => (Some(active), None),
+                    Ok(ReplayStart::Replay(response)) => (None, Some(response)),
+                    Err(IdempotencyError::Conflict { .. } | IdempotencyError::EmptyKey) => {
+                        return Err(HostRefusal::new(HostRefusalKind::InvalidRequest));
+                    }
+                    Err(_) => {
+                        return Err(HostRefusal::new(HostRefusalKind::PersistenceUnavailable));
+                    }
+                }
+            }
+        };
+        if let Some(stored) = stored {
+            // MCP replays still reload the source but never repeat the reset.
+            self.source
+                .request_refresh()
+                .map_err(|_| HostRefusal::new(HostRefusalKind::SourceUnavailable))?;
+            let mut receipt: HostRefreshReceipt = serde_json::from_str(&stored)
+                .map_err(|_| HostRefusal::new(HostRefusalKind::PersistenceUnavailable))?;
+            receipt.replayed = true;
+            receipt.replay_recorded = Some(true);
+            return Ok(receipt);
+        }
+        let outcome = if request.reset {
+            self.source
+                .request_refresh_with_reset()
+                .map(|(ticket, reset)| (ticket, Some(reset)))
+        } else {
+            self.source.request_refresh().map(|ticket| (ticket, None))
+        };
+        let (ticket, reset) = match outcome {
+            Ok(outcome) => outcome,
+            Err(refusal) => {
+                let kind = match refusal.kind() {
+                    crate::embed::SourceRefusalKind::AdmissionUnavailable => {
+                        HostRefusalKind::PersistenceUnavailable
+                    }
+                    _ => HostRefusalKind::SourceUnavailable,
+                };
+                if let Some(active) = &active {
+                    let _ = active.fail(format!("Refresh refused: {kind:?}"));
+                }
+                return Err(HostRefusal::new(kind));
+            }
+        };
+        let mut receipt = HostRefreshReceipt {
+            ticket_identity: ticket.ticket_identity().to_owned(),
+            requested_source_version: ticket.requested_source_version(),
+            reset,
+            replayed: false,
+            replay_recorded: None,
+        };
+        if let Some(active) = &active {
+            let recorded = serde_json::to_string(&receipt)
+                .ok()
+                .is_some_and(|text| active.complete(text).is_ok());
+            receipt.replay_recorded = Some(recorded);
+        }
+        Ok(receipt)
     }
 
     fn query_session(&self) -> Result<Arc<QuerySession>, HostRefusal> {
@@ -2030,7 +2149,16 @@ impl HostRoom {
                 HostResponse::Refresh(HostRefreshReceipt {
                     ticket_identity: ticket.ticket_identity().to_owned(),
                     requested_source_version: ticket.requested_source_version(),
+                    reset: None,
+                    replayed: false,
+                    replay_recorded: None,
                 })
+            }
+            HostRequest::RefreshWith(refresh) => {
+                if !self.rights.refresh || (refresh.reset && !self.rights.checkpoint) {
+                    return Err(HostRefusal::new(HostRefusalKind::Denied));
+                }
+                HostResponse::Refresh(self.refresh_with(refresh)?)
             }
             HostRequest::Checkpoint {
                 verify_after_write,

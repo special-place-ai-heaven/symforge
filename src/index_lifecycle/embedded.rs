@@ -417,6 +417,10 @@ struct EmbeddedRuntimeState {
 struct WorkerControl {
     stop: bool,
     refresh_requested: bool,
+    /// An `index_folder` reset deleted the snapshot scope; the next reload
+    /// that publishes Current records the reset generation (MCP marks it
+    /// only after its reload succeeds).
+    reset_pending: bool,
 }
 
 struct EmbeddedBinding {
@@ -433,6 +437,8 @@ struct EmbeddedBinding {
     restored_mtimes: std::sync::Mutex<Option<HashMap<String, u64>>>,
     #[cfg(feature = "embed")]
     git_view: std::sync::Mutex<Option<Arc<super::embed_git::PreparedGitView>>>,
+    #[cfg(feature = "embed")]
+    open_reset: Option<crate::embed::parity::source_options::SnapshotResetReceipt>,
     state: std::sync::Mutex<EmbeddedRuntimeState>,
     control: std::sync::Mutex<WorkerControl>,
     wake: Condvar,
@@ -506,6 +512,9 @@ impl EmbeddedBinding {
         #[cfg(feature = "embed")] authority: Arc<super::activation::ProjectSourceAuthority>,
         #[cfg(feature = "embed")] state_anchor: Option<AdmittedStateAnchor>,
         #[cfg(feature = "embed")] restored_mtimes: Option<HashMap<String, u64>>,
+        #[cfg(feature = "embed")] open_reset: Option<
+            crate::embed::parity::source_options::SnapshotResetReceipt,
+        >,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
@@ -521,13 +530,19 @@ impl EmbeddedBinding {
             restored_mtimes: std::sync::Mutex::new(restored_mtimes),
             #[cfg(feature = "embed")]
             git_view: std::sync::Mutex::new(None),
+            #[cfg(feature = "embed")]
+            open_reset: open_reset.clone(),
             state: std::sync::Mutex::new(EmbeddedRuntimeState {
                 phase: super::public_api::SourceRuntimePhase::Loading,
                 current_publication_identity: None,
                 observer_epoch: 0,
                 source_version: 0,
             }),
-            control: std::sync::Mutex::new(WorkerControl::default()),
+            control: std::sync::Mutex::new(WorkerControl {
+                #[cfg(feature = "embed")]
+                reset_pending: open_reset.is_some(),
+                ..WorkerControl::default()
+            }),
             wake: Condvar::new(),
             worker: std::sync::Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
@@ -571,6 +586,7 @@ impl EmbeddedBinding {
         };
         #[cfg(not(feature = "embed"))]
         let mut observed_fingerprint = self.reload_and_publish();
+        self.complete_pending_reset();
         loop {
             let mut control = self.control.lock().expect("embedded control mutex");
             let (next, _) = self
@@ -606,6 +622,7 @@ impl EmbeddedBinding {
                 if self.shutdown_started.load(Ordering::Acquire) {
                     break;
                 }
+                self.complete_pending_reset();
             } else {
                 observed_fingerprint = next_fingerprint;
             }
@@ -616,6 +633,22 @@ impl EmbeddedBinding {
             .lock()
             .expect("embedded Git view mutex")
             .take();
+    }
+
+    /// Record the `index_folder` reset generation once a reload after the
+    /// reset has published Current; otherwise keep it pending for the next.
+    fn complete_pending_reset(&self) {
+        let mut control = self.control.lock().expect("embedded control mutex");
+        if !control.reset_pending {
+            return;
+        }
+        let current = self.state.lock().expect("embedded state mutex").phase
+            == super::public_api::SourceRuntimePhase::Current;
+        if current {
+            control.reset_pending = false;
+            drop(control);
+            self.runtime.data_plane().mark_index_folder_reset();
+        }
     }
 
     fn wait_refresh_visibility_or_stop(&self) -> bool {
@@ -795,7 +828,7 @@ impl EmbeddedBinding {
         })
     }
 
-    fn request_refresh(&self) -> Option<u64> {
+    fn request_refresh(&self, reset: bool) -> Option<u64> {
         let state = self.state.lock().expect("embedded state mutex");
         if matches!(
             state.phase,
@@ -808,6 +841,7 @@ impl EmbeddedBinding {
         drop(state);
         let mut control = self.control.lock().expect("embedded control mutex");
         control.refresh_requested = true;
+        control.reset_pending |= reset;
         self.wake.notify_all();
         Some(version)
     }
@@ -962,6 +996,18 @@ impl EmbeddedSourceFactory {
         state_placement: StatePlacement,
         owner: EmbeddedIdentity,
     ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
+        self.open_bound_with_reset(binding, state_placement, owner, false)
+    }
+
+    /// `open_bound` plus the MCP `index_folder` snapshot reset. A failed reset
+    /// refuses the open as admission-unavailable before anything is restored.
+    pub(crate) fn open_bound_with_reset(
+        self: &Arc<Self>,
+        binding: RootBinding,
+        state_placement: StatePlacement,
+        owner: EmbeddedIdentity,
+        reset_snapshot_state: bool,
+    ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
         let key = ProjectKey::new(&binding.root_id.0);
         let identity = EmbeddedIdentity::fresh();
         {
@@ -1008,6 +1054,21 @@ impl EmbeddedSourceFactory {
         };
         #[cfg(feature = "embed")]
         let state_anchor = AdmittedStateAnchor::capture(&state_placement, &authority)?;
+        // MCP `index_folder` reset: delete the snapshot scope after admission
+        // and before restore, so the open cannot warm-load what was reset.
+        #[cfg(feature = "embed")]
+        let open_reset = if reset_snapshot_state {
+            let report = crate::live_index::persist::reset_snapshot_state(
+                &binding.canonical_root,
+                &state_placement,
+            )
+            .map_err(|_| EmbeddedOpenError::AdmissionUnavailable)?;
+            Some(crate::embed::parity::source_options::SnapshotResetReceipt::from_report(&report))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "embed"))]
+        let _ = reset_snapshot_state;
         #[cfg(feature = "embed")]
         let restored = super::embed_restore::load_admitted_snapshot(
             &binding.canonical_root,
@@ -1037,6 +1098,8 @@ impl EmbeddedSourceFactory {
             state_anchor,
             #[cfg(feature = "embed")]
             restored_mtimes,
+            #[cfg(feature = "embed")]
+            open_reset,
         );
         rollback.bind(Arc::clone(&source));
         if source.start().is_err() {
@@ -1174,7 +1237,14 @@ impl super::public_api::ProcessRuntimeApi {
             OperationKind, RetryAdvice, SourceRefusalKind, bound_source_refusal,
         };
         use crate::embed::parity::source_options::{StateSelectionError, select_state_placement};
-        let normalized = format!("current_worktree={:?};state={:?}", spec.root, options.state);
+        let normalized = format!(
+            "current_worktree={:?};state={:?};allow_protected_root={};reset_snapshot_state={};replay_control_directory={:?}",
+            spec.root,
+            options.state,
+            options.allow_protected_root,
+            options.reset_snapshot_state,
+            options.replay_control_directory
+        );
         let refuse = |kind, retry| {
             bound_source_refusal(
                 kind,
@@ -1183,10 +1253,25 @@ impl super::public_api::ProcessRuntimeApi {
                 normalized.as_bytes(),
             )
         };
+        // MCP `index_folder` resolves an explicit root; without the override it
+        // admits exactly what automatic resolution admits.
+        let (candidate_source, request_mode) = if options.allow_protected_root {
+            (
+                crate::domain::RootCandidateSource::ExplicitIndexFolder,
+                crate::domain::RootRequestMode::ExplicitIndexFolder {
+                    allow_protected_root: true,
+                },
+            )
+        } else {
+            (
+                crate::domain::RootCandidateSource::McpClientRoot,
+                crate::domain::RootRequestMode::Automatic,
+            )
+        };
         let binding = match crate::discovery::resolve_root_candidate(
             &spec.root,
-            crate::domain::RootCandidateSource::McpClientRoot,
-            crate::domain::RootRequestMode::Automatic,
+            candidate_source,
+            request_mode,
         ) {
             crate::domain::RootResolution::Bound(binding) => binding,
             crate::domain::RootResolution::Unbound { .. } => {
@@ -1196,6 +1281,16 @@ impl super::public_api::ProcessRuntimeApi {
                 ));
             }
         };
+        if options
+            .replay_control_directory
+            .as_deref()
+            .is_some_and(|directory| !directory.is_absolute() || !directory.is_dir())
+        {
+            return Err(refuse(
+                SourceRefusalKind::InvalidSelection,
+                RetryAdvice::Operator,
+            ));
+        }
         let placement =
             select_state_placement(&binding, &options).map_err(|error| match error {
                 StateSelectionError::InvalidSelection => {
@@ -1208,7 +1303,12 @@ impl super::public_api::ProcessRuntimeApi {
             })?;
         self.owner
             .factory()
-            .open_bound(binding, placement, self.owner.identity())
+            .open_bound_with_reset(
+                binding,
+                placement,
+                self.owner.identity(),
+                options.reset_snapshot_state,
+            )
             .map_err(|error| match error {
                 EmbeddedOpenError::SourceAlreadyOpen => refuse(
                     SourceRefusalKind::SelectionUnavailable,
@@ -2111,7 +2211,7 @@ impl EmbeddedSourceHandle {
                 crate::lifecycle_identity::OperationKind::RefreshSource,
             ));
         };
-        let Some(source_version) = binding.request_refresh() else {
+        let Some(source_version) = binding.request_refresh(false) else {
             return Err(super::public_api::bound_source_refusal(
                 crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
                 crate::lifecycle_identity::OperationKind::RefreshSource,
@@ -2123,6 +2223,70 @@ impl EmbeddedSourceHandle {
             normalized,
             source_version,
         ))
+    }
+
+    /// MCP `index_folder` in-place reset: delete the persisted snapshot scope
+    /// through the shared `persist::reset_snapshot_state`, then request a full
+    /// reload. The reset generation is recorded once that reload publishes.
+    #[cfg(feature = "embed")]
+    pub fn request_refresh_with_reset(
+        &self,
+    ) -> Result<
+        (
+            super::public_api::EmbedRefreshTicket,
+            crate::embed::parity::source_options::SnapshotResetReceipt,
+        ),
+        super::public_api::EmbedSourceRefusal,
+    > {
+        let normalized = b"refresh-current-worktree;reset_snapshot_state=true";
+        let refuse = |kind, retry| {
+            super::public_api::bound_source_refusal(
+                kind,
+                crate::lifecycle_identity::OperationKind::RefreshSource,
+                retry,
+                normalized,
+            )
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(refuse(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::RetryAdvice::Never,
+            ));
+        }
+        let Some(binding) = self.binding.as_ref() else {
+            return Err(super::public_api::dark_unbound_refusal(
+                crate::lifecycle_identity::OperationKind::RefreshSource,
+            ));
+        };
+        let report = crate::live_index::persist::reset_snapshot_state(
+            &binding.root,
+            &binding.state_placement,
+        )
+        .map_err(|_| {
+            refuse(
+                crate::lifecycle_identity::SourceRefusalKind::AdmissionUnavailable,
+                crate::lifecycle_identity::RetryAdvice::Operator,
+            )
+        })?;
+        let Some(source_version) = binding.request_refresh(true) else {
+            return Err(refuse(
+                crate::lifecycle_identity::SourceRefusalKind::SourceUnavailable,
+                crate::lifecycle_identity::RetryAdvice::Never,
+            ));
+        };
+        Ok((
+            super::public_api::refresh_ticket(normalized, source_version),
+            crate::embed::parity::source_options::SnapshotResetReceipt::from_report(&report),
+        ))
+    }
+
+    /// The snapshot reset performed by `EmbeddedOpenOptions::reset_snapshot_state`,
+    /// or `None` when the open did not reset.
+    #[cfg(feature = "embed")]
+    pub fn open_reset_receipt(
+        &self,
+    ) -> Option<crate::embed::parity::source_options::SnapshotResetReceipt> {
+        self.binding.as_ref()?.open_reset.clone()
     }
 
     /// Fixture probe for the relocated guard: arms the finalizer for THIS

@@ -31,6 +31,7 @@ fn child_isolated_git_config() {
             symforge::embed::EmbeddedSourceSpec::current_worktree(root.clone()),
             symforge::embed::parity::source_options::EmbeddedOpenOptions {
                 state: symforge::embed::parity::source_options::EmbeddedStateSelection::MemoryOnly,
+                ..Default::default()
             },
         )
         .unwrap();
