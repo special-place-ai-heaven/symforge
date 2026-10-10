@@ -373,160 +373,7 @@ impl QuerySession {
             handle: expected_handle,
         } = prepared;
         let mut state = self.inner.lock();
-        match output {
-            QueryOutput::File { file, .. } => state.context.record_file(&file.path, tokens),
-            QueryOutput::Symbol(symbol) => {
-                state
-                    .context
-                    .record_symbol(&symbol.path, &symbol.name, tokens)
-            }
-            QueryOutput::Context(context) => {
-                state
-                    .context
-                    .record_symbol(&context.symbol.path, &context.symbol.name, tokens)
-            }
-            QueryOutput::SymbolContext(content) if content.estimate.is_none() => {
-                if let Some(symbol) = &content.symbol {
-                    state
-                        .context
-                        .record_symbol(&symbol.path, &symbol.name, tokens);
-                }
-                for candidate in &content.candidates {
-                    state
-                        .context
-                        .record_listed_symbol(&candidate.path, &candidate.name);
-                }
-            }
-            QueryOutput::SymbolRead(content) if content.estimated_tokens.is_none() => {
-                for entry in &content.entries {
-                    if entry.source.is_some() {
-                        if let Some(symbol) = &entry.symbol {
-                            state
-                                .context
-                                .record_symbol(&symbol.path, &symbol.name, tokens);
-                        } else {
-                            state.context.record_file(&entry.path, tokens);
-                        }
-                    }
-                    for candidate in &entry.candidates {
-                        state
-                            .context
-                            .record_listed_symbol(&candidate.path, &candidate.name);
-                    }
-                }
-            }
-            QueryOutput::InspectMatch(content) if content.estimated_tokens.is_none() => {
-                state.context.record_file(&content.path, tokens);
-            }
-            QueryOutput::Symbols(symbols) => {
-                for symbol in symbols {
-                    state
-                        .context
-                        .record_listed_symbol(&symbol.path, &symbol.name);
-                }
-            }
-            QueryOutput::ReferenceSearch(references) => {
-                for candidate in &references.target_candidates {
-                    state
-                        .context
-                        .record_listed_symbol(&candidate.path, &candidate.name);
-                }
-                for file in &references.files {
-                    state.context.record_listed_file(&file.path, 0);
-                }
-            }
-            QueryOutput::DependentSearch(dependents) => {
-                for file in &dependents.files {
-                    state.context.record_listed_file(&file.path, 0);
-                }
-            }
-            QueryOutput::SymbolSearch(result) => {
-                for hit in &result.symbols {
-                    state
-                        .context
-                        .record_listed_symbol(&hit.symbol.path, &hit.symbol.name);
-                }
-                for hit in &result.text_fallback {
-                    state.context.record_listed_file(&hit.path, 0);
-                }
-            }
-            QueryOutput::TextSearch(result) => {
-                use crate::embed::parity::search::TextRows;
-                match &result.rows {
-                    TextRows::Files(files) => {
-                        for file in files {
-                            state.context.record_listed_file(&file.path, 0);
-                            for hit in &file.matches {
-                                if let Some(symbol) = &hit.enclosing_symbol {
-                                    state
-                                        .context
-                                        .record_listed_symbol(&symbol.path, &symbol.name);
-                                }
-                            }
-                        }
-                    }
-                    TextRows::Symbols { groups, top_level } => {
-                        for group in groups {
-                            state
-                                .context
-                                .record_listed_symbol(&group.symbol.path, &group.symbol.name);
-                        }
-                        for hit in top_level {
-                            state.context.record_listed_file(&hit.path, 0);
-                        }
-                    }
-                    TextRows::Names(_) => {}
-                }
-            }
-            QueryOutput::Files(files) => {
-                for file in files {
-                    state.context.record_listed_file(&file.path, 0);
-                }
-            }
-            QueryOutput::FileSearch(result) => {
-                for hit in &result.hits {
-                    state.context.record_listed_file(&hit.path, 0);
-                }
-                match &result.resolution {
-                    Some(crate::embed::parity::search::FileResolution::Resolved {
-                        path, ..
-                    }) => {
-                        state.context.record_listed_file(path, 0);
-                    }
-                    Some(crate::embed::parity::search::FileResolution::Ambiguous {
-                        candidates,
-                        ..
-                    }) => {
-                        for path in candidates {
-                            state.context.record_listed_file(path, 0);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            QueryOutput::Text(matches) => {
-                for hit in matches {
-                    if let Some(symbol) = &hit.enclosing_symbol {
-                        state
-                            .context
-                            .record_listed_symbol(&symbol.path, &symbol.name);
-                    } else {
-                        state.context.record_listed_file(&hit.path, 0);
-                    }
-                }
-            }
-            QueryOutput::Exploration(exploration) => {
-                for symbol in &exploration.symbols {
-                    state
-                        .context
-                        .record_listed_symbol(&symbol.path, &symbol.name);
-                }
-                for file in &exploration.related_files {
-                    state.context.record_listed_file(&file.path, 0);
-                }
-            }
-            _ => {}
-        }
+        record_context(&mut state.context, output, tokens);
         let tool = operation_name(request.operation());
         if !matches!(
             output,
@@ -766,6 +613,142 @@ impl SessionOperation<'_> {
     }
 }
 
+fn record_context(context: &mut SessionContext, output: &QueryOutput, tokens: u32) {
+    match output {
+        QueryOutput::File { file, .. } => context.record_file(&file.path, tokens),
+        QueryOutput::Symbol(symbol) => context.record_symbol(&symbol.path, &symbol.name, tokens),
+        QueryOutput::Context(query_context) => context.record_symbol(
+            &query_context.symbol.path,
+            &query_context.symbol.name,
+            tokens,
+        ),
+        QueryOutput::SymbolContext(content) if content.estimate.is_none() => {
+            if let Some(symbol) = &content.symbol {
+                context.record_symbol(&symbol.path, &symbol.name, tokens);
+            }
+            for candidate in &content.candidates {
+                context.record_listed_symbol(&candidate.path, &candidate.name);
+            }
+        }
+        QueryOutput::SymbolRead(content) if content.estimated_tokens.is_none() => {
+            for entry in &content.entries {
+                if entry.source.is_some() {
+                    if let Some(symbol) = &entry.symbol {
+                        context.record_symbol(&symbol.path, &symbol.name, tokens);
+                    } else {
+                        context.record_file(&entry.path, tokens);
+                    }
+                }
+                for candidate in &entry.candidates {
+                    context.record_listed_symbol(&candidate.path, &candidate.name);
+                }
+            }
+        }
+        QueryOutput::InspectMatch(content) if content.estimated_tokens.is_none() => {
+            context.record_file(&content.path, tokens);
+        }
+        QueryOutput::Symbols(symbols) => {
+            for symbol in symbols {
+                context.record_listed_symbol(&symbol.path, &symbol.name);
+            }
+        }
+        QueryOutput::ReferenceSearch(references) => {
+            for candidate in &references.target_candidates {
+                context.record_listed_symbol(&candidate.path, &candidate.name);
+            }
+            for file in &references.files {
+                context.record_listed_file(&file.path, 0);
+            }
+        }
+        QueryOutput::DependentSearch(dependents) => {
+            for file in &dependents.files {
+                context.record_listed_file(&file.path, 0);
+            }
+        }
+        QueryOutput::SymbolSearch(result) => {
+            for hit in &result.symbols {
+                context.record_listed_symbol(&hit.symbol.path, &hit.symbol.name);
+            }
+            for hit in &result.text_fallback {
+                context.record_listed_file(&hit.path, 0);
+            }
+        }
+        QueryOutput::TextSearch(result) => {
+            use crate::embed::parity::search::TextRows;
+            match &result.rows {
+                TextRows::Files(files) => {
+                    for file in files {
+                        context.record_listed_file(&file.path, 0);
+                        for hit in &file.matches {
+                            if let Some(symbol) = &hit.enclosing_symbol {
+                                context.record_listed_symbol(&symbol.path, &symbol.name);
+                            }
+                        }
+                    }
+                }
+                TextRows::Symbols { groups, top_level } => {
+                    for group in groups {
+                        context.record_listed_symbol(&group.symbol.path, &group.symbol.name);
+                    }
+                    for hit in top_level {
+                        context.record_listed_file(&hit.path, 0);
+                    }
+                }
+                TextRows::Names(_) => {}
+            }
+        }
+        QueryOutput::Files(files) => {
+            for file in files {
+                context.record_listed_file(&file.path, 0);
+            }
+        }
+        QueryOutput::FileSearch(result) => {
+            for hit in &result.hits {
+                context.record_listed_file(&hit.path, 0);
+            }
+            match &result.resolution {
+                Some(crate::embed::parity::search::FileResolution::Resolved { path, .. }) => {
+                    context.record_listed_file(path, 0);
+                }
+                Some(crate::embed::parity::search::FileResolution::Ambiguous {
+                    candidates,
+                    ..
+                }) => {
+                    for path in candidates {
+                        context.record_listed_file(path, 0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        QueryOutput::Text(matches) => {
+            for hit in matches {
+                if let Some(symbol) = &hit.enclosing_symbol {
+                    context.record_listed_symbol(&symbol.path, &symbol.name);
+                } else {
+                    context.record_listed_file(&hit.path, 0);
+                }
+            }
+        }
+        QueryOutput::Exploration(exploration) => {
+            for symbol in &exploration.symbols {
+                context.record_listed_symbol(&symbol.path, &symbol.name);
+            }
+            for file in &exploration.related_files {
+                context.record_listed_file(&file.path, 0);
+            }
+        }
+        // An Ask records exactly what its routed query returned, under the
+        // same rules that query would have recorded on its own.
+        QueryOutput::Ask(ask) => {
+            if let Some(output) = ask.output.as_deref() {
+                record_context(context, output, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn operation_name(operation: QueryOperationKind) -> &'static str {
     match operation {
         QueryOperationKind::File => "get_file_content",
@@ -792,5 +775,6 @@ fn operation_name(operation: QueryOperationKind) -> &'static str {
         QueryOperationKind::WhatChanged => "what_changed",
         QueryOperationKind::DiffSymbols => "diff_symbols",
         QueryOperationKind::DetectImpact => "detect_impact",
+        QueryOperationKind::Ask => "ask",
     }
 }

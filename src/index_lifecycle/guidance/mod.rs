@@ -16,7 +16,6 @@ pub(crate) mod reference_contract;
 pub(crate) mod reference_read;
 pub(crate) mod routing;
 pub(crate) mod search_envelope;
-#[cfg(feature = "server")]
 pub(crate) mod search_render;
 pub mod smart_query;
 pub(crate) mod source;

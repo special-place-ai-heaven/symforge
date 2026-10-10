@@ -36,4 +36,3 @@ pub struct AskResult {
     pub output: Option<Box<QueryOutput>>,
     pub rendered: String,
 }
-

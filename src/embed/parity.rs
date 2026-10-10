@@ -6,6 +6,7 @@
 //! when resuming; a refresh refuses that continuation instead of mixing rows.
 //! The original V11 facade remains source-compatible.
 
+pub mod ask;
 pub mod changes;
 pub mod detect_impact;
 pub mod edit;
@@ -103,6 +104,7 @@ pub enum QueryOperationKind {
     WhatChanged,
     DiffSymbols,
     DetectImpact,
+    Ask,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -199,6 +201,8 @@ pub enum QueryRequest {
     DiffSymbols(changes::DiffSymbolsRequest),
     /// Git blast radius over the call graph (MCP `detect_impact`).
     DetectImpact(detect_impact::DetectImpactRequest),
+    /// Natural-language routing plus native execution (MCP `ask`).
+    Ask(ask::AskRequest),
 }
 
 impl QueryRequest {
@@ -236,6 +240,7 @@ impl QueryRequest {
             Self::WhatChanged(_) => QueryOperationKind::WhatChanged,
             Self::DiffSymbols(_) => QueryOperationKind::DiffSymbols,
             Self::DetectImpact(_) => QueryOperationKind::DetectImpact,
+            Self::Ask(_) => QueryOperationKind::Ask,
         }
     }
 }
@@ -445,4 +450,5 @@ pub enum QueryOutput {
     WhatChanged(changes::WhatChangedResult),
     DiffSymbols(changes::DiffSymbolsResult),
     DetectImpact(detect_impact::DetectImpactResult),
+    Ask(ask::AskResult),
 }

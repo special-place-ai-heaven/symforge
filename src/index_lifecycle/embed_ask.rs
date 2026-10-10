@@ -16,7 +16,10 @@ pub(super) fn validate(request: &AskRequest) -> Result<(), QueryRefusalKind> {
         .map_err(|_| QueryRefusalKind::AdmissionUnavailable)
 }
 
-fn routed_request(intent: &smart_query::QueryIntent) -> (AskRoute, Option<QueryRequest>) {
+fn routed_request(
+    intent: &smart_query::QueryIntent,
+    max_tokens: Option<u64>,
+) -> (AskRoute, Option<QueryRequest>) {
     use crate::embed::parity::{
         changes, guidance, knowledge, read_context, reference, search, symbol_context,
     };
@@ -100,12 +103,15 @@ fn routed_request(intent: &smart_query::QueryIntent) -> (AskRoute, Option<QueryR
                 knowledge::search::SearchKnowledgeRequest {
                     query: query.clone(),
                     source_scope: Some(knowledge::KnowledgeSourceScope::Current),
-                    authority_scope: Some(crate::knowledge::search_contract::KnowledgeAuthorityScope::Default),
+                    authority_scope: Some(
+                        crate::knowledge::search_contract::KnowledgeAuthorityScope::Default,
+                    ),
                     path_prefix: None,
                     project: None,
                     projects: None,
                     limit: None,
-                    max_tokens: None,
+                    // MCP forwards the outer budget to this route.
+                    max_tokens,
                 },
             )),
         ),
@@ -113,6 +119,7 @@ fn routed_request(intent: &smart_query::QueryIntent) -> (AskRoute, Option<QueryR
             AskRoute::RepositoryOrientation,
             Some(QueryRequest::RepoMap(read_context::RepoMapRequest {
                 detail: Some("compact".into()),
+                max_tokens,
                 ..Default::default()
             })),
         ),
@@ -139,19 +146,12 @@ pub(super) fn project(
     session: Option<&super::embed_session::QuerySession>,
     policy: QueryPolicy,
 ) -> Result<QueryOutput, QueryRefusalKind> {
-    if request.project.as_deref().is_some_and(|selected| {
-        !snapshot
-            .root
-            .to_str()
-            .is_some_and(|root| selected == root || selected == root.replace('\\', "/"))
-    }) {
-        return Err(QueryRefusalKind::AdmissionUnavailable);
-    }
+    super::embed_changes::check_project(snapshot, request.project.as_deref())?;
     let original = request.query.trim();
     let normalized = smart_query::strip_leading_articles(original);
     let (intent, matched) = routing::resolve(&snapshot.generation.live, normalized);
     let assessment = smart_query::assess_route(&intent, matched);
-    let (route, routed_request) = routed_request(&intent);
+    let (route, routed_request) = routed_request(&intent, request.max_tokens);
     let mut result = AskResult {
         route,
         confidence: smart_query::route_confidence_label(assessment.confidence).into(),

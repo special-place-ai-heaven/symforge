@@ -55,7 +55,6 @@ pub struct RouteAssessment {
 
 /// The common routed-answer envelope. Adapters supply their executed result;
 /// routing rationale and invocation wording remain identical across surfaces.
-#[cfg(feature = "server")]
 pub(crate) fn render_answer(
     intent: &QueryIntent,
     assessment: RouteAssessment,

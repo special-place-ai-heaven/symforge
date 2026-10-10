@@ -544,28 +544,37 @@ fn execute_inner(
 
     // No fallible projection remains. The source and exact transport envelope have been
     // admitted while the source-bound session operation gate is still held.
-    let committed_path = match result.value() {
-        QueryOutput::File { file, .. } => Some(file.path.as_str()),
-        QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
-        QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
-        QueryOutput::SymbolContext(context)
-            if context.estimate.is_none() && context.refusal.is_none() =>
-        {
-            context.path.as_deref()
-        }
-        QueryOutput::FileContent(content) if !content.cache_hit => Some(content.path.as_str()),
-        QueryOutput::FileContext(content)
-            if !content.cache_hit && content.estimated_tokens.is_none() =>
-        {
-            Some(content.path.as_str())
-        }
-        QueryOutput::SourcePage(page) => Some(page.path.as_str()),
-        _ => None,
+    // An Ask commits what its routed query returned, exactly as that query
+    // would have committed it when called directly.
+    let committed_value = match result.value() {
+        QueryOutput::Ask(ask) => ask.output.as_deref(),
+        value => Some(value),
+    };
+    let committed_path = match committed_value {
+        None => None,
+        Some(value) => match value {
+            QueryOutput::File { file, .. } => Some(file.path.as_str()),
+            QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
+            QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
+            QueryOutput::SymbolContext(context)
+                if context.estimate.is_none() && context.refusal.is_none() =>
+            {
+                context.path.as_deref()
+            }
+            QueryOutput::FileContent(content) if !content.cache_hit => Some(content.path.as_str()),
+            QueryOutput::FileContext(content)
+                if !content.cache_hit && content.estimated_tokens.is_none() =>
+            {
+                Some(content.path.as_str())
+            }
+            QueryOutput::SourcePage(page) => Some(page.path.as_str()),
+            _ => None,
+        },
     };
     if let Some(path) = committed_path {
         snapshot.record_commitment(&[PathBuf::from(path)]);
     }
-    if let QueryOutput::SymbolRead(content) = result.value() {
+    if let Some(QueryOutput::SymbolRead(content)) = committed_value {
         if !content.cache_hit && content.estimated_tokens.is_none() {
             let paths = content
                 .entries
@@ -576,7 +585,7 @@ fn execute_inner(
             snapshot.record_commitment(&paths);
         }
     }
-    if let QueryOutput::InspectMatch(content) = result.value() {
+    if let Some(QueryOutput::InspectMatch(content)) = committed_value {
         if content.estimated_tokens.is_none() {
             snapshot.record_commitment(&[PathBuf::from(&content.path)]);
         }
@@ -997,6 +1006,7 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         QueryRequest::WhatChanged(input) => super::embed_changes::validate_what_changed(input)?,
         QueryRequest::DiffSymbols(input) => super::embed_changes::validate_diff_symbols(input)?,
         QueryRequest::DetectImpact(input) => super::embed_detect_impact::validate(input)?,
+        QueryRequest::Ask(input) => super::embed_ask::validate(input)?,
         QueryRequest::Conventions | QueryRequest::ContextInventory => {}
         QueryRequest::InvestigationSuggest { focus } => {
             if focus
@@ -1334,7 +1344,7 @@ fn scope(prefix: Option<&str>) -> PathScope {
     })
 }
 
-fn project(
+pub(super) fn project(
     snapshot: &EmbeddedQuerySnapshot,
     request: &QueryRequest,
     budget: &mut Budget,
@@ -1396,6 +1406,9 @@ fn project(
         }
         QueryRequest::DetectImpact(input) => {
             super::embed_detect_impact::project(snapshot, input, budget)
+        }
+        QueryRequest::Ask(input) => {
+            super::embed_ask::project(snapshot, input, budget, observations, session, policy)
         }
         QueryRequest::Conventions => super::embed_guidance::conventions(live, budget),
         QueryRequest::File {

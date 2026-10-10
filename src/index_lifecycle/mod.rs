@@ -37,6 +37,8 @@ pub mod authority;
 pub mod candidate;
 pub mod capacity;
 #[cfg(feature = "embed")]
+mod embed_ask;
+#[cfg(feature = "embed")]
 mod embed_batch;
 #[cfg(feature = "embed")]
 mod embed_changes;
