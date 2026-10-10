@@ -534,24 +534,37 @@ async fn encrypt_apply_with_sops_leaves_no_plaintext_value() {
 /// Oracle 9: sops spawn inventory must not introduce raw process Command constructors outside hidden_command.
 #[test]
 fn no_raw_command_spawn_for_sops() {
-    let src = include_str!("../src/protocol/secret_remediate.rs");
+    // The sops spawn lives in the shared stage both the MCP tool and the embed
+    // lane call; the protocol and knowledge layers must not spawn at all.
+    let spawn_site = include_str!("../src/edit_safety/secret_remediation.rs");
     assert!(
-        src.contains("hidden_command(\"sops\")") || src.contains("hidden_command("),
-        "encrypt must spawn via hidden_command"
+        spawn_site.contains("crate::process_util::hidden_command(binary)"),
+        "encrypt must spawn sops via hidden_command"
     );
     // Assemble the forbidden pattern at runtime so this test file itself is not
     // flagged by `test_no_raw_command_spawns_outside_hidden_command`.
     let forbidden = format!("{}::{}(", "Command", "new");
-    for (n, line) in src.lines().enumerate() {
-        let t = line.trim_start();
-        if t.starts_with("//") {
-            continue;
+    for (file, src) in [
+        ("src/edit_safety/secret_remediation.rs", spawn_site),
+        (
+            "src/protocol/secret_remediate.rs",
+            include_str!("../src/protocol/secret_remediate.rs"),
+        ),
+        (
+            "src/knowledge/secret_remediation.rs",
+            include_str!("../src/knowledge/secret_remediation.rs"),
+        ),
+    ] {
+        for (n, line) in src.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains(&forbidden),
+                "raw {forbidden} at {file}:{}",
+                n + 1
+            );
         }
-        assert!(
-            !line.contains(&forbidden),
-            "raw {forbidden} at line {}",
-            n + 1
-        );
     }
 }
 
@@ -1061,26 +1074,55 @@ async fn resolve_repo_path_refusals_hold_for_remediation_scope() {
 /// Oracle 16: refuse_by_policy remains syscall-free (no new disk I/O in that fn).
 #[test]
 fn refuse_by_policy_remains_syscall_free() {
-    let src = include_str!("../src/protocol/read_gate.rs");
-    // Locate refuse_by_policy body and assert no std::fs / File::open inside it.
-    let start = src
-        .find("pub(crate) fn refuse_by_policy")
-        .expect("refuse_by_policy");
-    let rest = &src[start..];
-    let end = rest
-        .find("\npub(crate) fn normalize_requested_path")
-        .unwrap_or(rest.len());
-    let body = &rest[..end];
-    for needle in [
-        "std::fs::",
-        "File::open",
-        "symlink_metadata",
-        "read_to_string",
-    ] {
-        assert!(
-            !body.contains(needle),
-            "refuse_by_policy must stay syscall-free; found {needle}"
-        );
+    // The protocol entry point delegates to the transport-independent policy
+    // in guidance; every fn on that path is scanned, each up to its own
+    // closing brace, so the scan never runs into a neighbour or a test.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}")
+            .unwrap_or_else(|| panic!("{signature} has no closing brace"));
+        &rest[..end]
+    }
+    let protocol = include_str!("../src/protocol/read_gate.rs");
+    let guidance = include_str!("../src/index_lifecycle/guidance/read_gate.rs");
+    let delegator = fn_body(protocol, "pub(crate) fn refuse_by_policy(");
+    assert!(
+        delegator.contains("guidance::read_gate::refuse_by_policy_with("),
+        "refuse_by_policy must delegate to the scanned guidance policy"
+    );
+    let bodies = [
+        ("protocol refuse_by_policy", delegator),
+        (
+            "guidance refuse_by_policy_with",
+            fn_body(guidance, "pub(crate) fn refuse_by_policy_with("),
+        ),
+        (
+            "guidance unverified_notice",
+            fn_body(guidance, "pub(crate) fn unverified_notice("),
+        ),
+        (
+            "guidance normalize_requested_path",
+            fn_body(guidance, "pub(crate) fn normalize_requested_path("),
+        ),
+    ];
+    for (name, body) in bodies {
+        for needle in [
+            "std::fs::",
+            "File::open",
+            "symlink_metadata",
+            "read_to_string",
+            "canonicalize",
+            "read_regular",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "{name} must stay syscall-free; found {needle}"
+            );
+        }
     }
 }
 
