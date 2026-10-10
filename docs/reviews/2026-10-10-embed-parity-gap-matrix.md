@@ -137,3 +137,44 @@ Remaining differences, with evidence:
 - `edit_plan` co-change lines need Ready git temporal data. Embed never computes it: `spawn_git_temporal_computation` has callers only in server modules, and its `load_commits` (`src/live_index/git_temporal.rs:713`) shells out to `git log`. A restored publication that carries temporal data renders the line.
 - A batch whose per-action overrides route different files into different sources has no embed equivalent. MCP stages every file into one rollback transaction; an embedded batch commits under one source root and one replay store (`src/index_lifecycle/embed_batch.rs:665` and `:678`). Batches routed wholly into one admitted worktree work by rebasing each guard.
 - The `SYMFORGE_WORKTREE_AWARE` policy is not read, because it is process-global environment. The host's admitted list is the routing policy.
+
+## Status update: git temporal, file impact and routed batches (appended 2026-10-10)
+
+| Row | Status | Fixture |
+|---|---|---|
+| 14 search_files | `changed_with` co-change now has data: the embed temporal lane walks the source's history with MCP's producer and aggregator when the host permits derived-state preparation, and reports Unavailable with the reason otherwise | `tests/embed_temporal.rs` |
+| 21 analyze_file_impact | FULL: `QueryRequest::FileImpact` with every MCP option, re-admitting from disk through the shared `guidance::file_impact` engine the MCP handler and sidecar hook now call | `tests/embed_file_impact.rs`; MCP golden `analyze_file_impact_matches_embed_parity_golden` |
+| 31 edit_plan | Co-change lines render from the embed temporal lane | `tests/embed_temporal.rs` |
+| 32-38 batch_edit, batch_insert | A batch whose per-action overrides route files into two admitted worktrees commits as one staged transaction, as MCP's `execute_batch_edit` does | `tests/embed_edit_route.rs` |
+
+Corrections to earlier entries, with evidence:
+
+- The earlier note that `load_commits` shells out to `git log` was wrong. It calls
+  `GitRepo::log_with_stats` (`src/git.rs`), which is in-process libgit2: the newest
+  500 commits within 90 days from HEAD, TIME-sorted, each diffed against its first
+  parent with no rename detection. Embed lacked temporal data only because the
+  sole caller of `GitTemporalIndex::compute` was the server scheduler
+  `spawn_git_temporal_computation`. The producer (`load_commits_from`) and the
+  aggregator (`GitTemporalIndex::aggregate`) are now shared, and the producer
+  parity unit test runs both repository opens over a rename and merge fixture.
+- MCP's guarantee for a batch spanning two worktrees: one `commit_staged` run over
+  absolute paths in both roots (canonical path locks, every pre-image verified,
+  rollback across both). Its replay receipt is NOT verifiable across roots:
+  `bind_post_image_to_source` checks targets only beneath the indexed root's
+  anchor (`verify_post_image_bound` in `src/idempotency.rs`), so a batch with a
+  target in a worktree outside that root stores no receipt and a retry reports
+  that reconciliation is required. Embed matches the transaction and adds
+  verified replay: its one record covers every part and a retry verifies each
+  part through that part's own source authority.
+
+Remaining differences, with evidence:
+
+- Embed refreshes a changed tree by full reload (`reload_and_publish` in
+  `src/index_lifecycle/embedded.rs`), which advances the project generation and
+  clears pre-update snapshots (`src/live_index/store.rs`). MCP's watcher
+  re-indexes one file and keeps its pre-edit snapshot. So when the embedded
+  worker has already reloaded an edited file, `analyze_file_impact` diffs against
+  the reloaded copy and reports it unchanged, where MCP still reports the edit.
+- Temporal data is walked from the source root's own repository
+  (`GitRepo::open_worktree_root`), like embed's other git lanes, not from the
+  host-prepared isolated view, which no query lane reads.
