@@ -106,12 +106,37 @@ impl ProjectConfigTrust {
         }
     }
 
+    /// The store at `edit-safety/trust.json` beneath a control-state directory,
+    /// where [`Self::default_store`] keeps it under the process control state.
+    #[cfg(feature = "embed")]
+    pub(crate) fn for_control_state(control_state_dir: &ControlStateDir) -> Self {
+        Self::with_store_path(trust_store_path(control_state_dir))
+    }
+
     pub fn store_path(&self) -> &Path {
         &self.store_path
     }
 
     pub fn evaluate(&self, project_root: impl AsRef<Path>) -> TrustEvaluation {
-        let project_root = project_root.as_ref();
+        self.evaluate_with_override(project_root.as_ref(), trust_env_override_requested())
+    }
+
+    /// [`Self::evaluate`] for an embedded host, which reads no process
+    /// environment: the CI override (`SYMFORGE_TRUST_PROJECT_CONFIG`) is never
+    /// requested, so only the store's own record can trust the config.
+    #[cfg(feature = "embed")]
+    pub(crate) fn evaluate_without_env_override(
+        &self,
+        project_root: impl AsRef<Path>,
+    ) -> TrustEvaluation {
+        self.evaluate_with_override(project_root.as_ref(), false)
+    }
+
+    fn evaluate_with_override(
+        &self,
+        project_root: &Path,
+        override_requested: bool,
+    ) -> TrustEvaluation {
         let mut warnings = Vec::new();
         let digest = match hash_project_config(project_root) {
             Ok(digest) => digest,
@@ -138,7 +163,7 @@ impl ProjectConfigTrust {
             }
         };
 
-        if trust_env_override_requested() {
+        if override_requested {
             if recognized_ci_environment() {
                 return TrustEvaluation {
                     status: TrustStatus::EnvOverride,

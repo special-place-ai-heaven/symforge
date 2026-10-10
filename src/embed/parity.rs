@@ -11,6 +11,7 @@ pub mod changes;
 pub mod detect_impact;
 pub mod edit;
 pub mod federation;
+pub mod file_impact;
 pub mod guidance;
 pub mod host;
 pub mod knowledge;
@@ -22,6 +23,7 @@ pub mod replay;
 pub mod search;
 pub mod session;
 pub mod source_options;
+pub mod stel;
 pub mod symbol;
 pub mod symbol_context;
 
@@ -100,11 +102,13 @@ pub enum QueryOperationKind {
     Conventions,
     ContextInventory,
     InvestigationSuggest,
+    EditPlan,
     Retrieve,
     WhatChanged,
     DiffSymbols,
     DetectImpact,
     Ask,
+    Symforge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -183,11 +187,19 @@ pub enum QueryRequest {
         path: String,
         base_ref: String,
     },
+    /// MCP `analyze_file_impact`: re-admit one file from disk, then report its
+    /// symbol diff (or index it as new), with optional co-changes or estimate.
+    FileImpact(file_impact::FileImpactRequest),
     Explore(guidance::ExploreRequest),
     Conventions,
     ContextInventory,
     InvestigationSuggest {
         focus: Option<String>,
+    },
+    /// The MCP `edit_plan` guidance for a symbol, `path::name`, `Type::method`
+    /// or file target, rendered by the shared planner over the captured publication.
+    EditPlan {
+        target: String,
     },
     /// Read exact bytes from this session's served-output cache. The returned
     /// record retains its original publication and truncation metadata.
@@ -203,9 +215,26 @@ pub enum QueryRequest {
     DetectImpact(detect_impact::DetectImpactRequest),
     /// Natural-language routing plus native execution (MCP `ask`).
     Ask(ask::AskRequest),
+    /// MCP `symforge`: the compact facade's planner and economics, routed to
+    /// this source's native lanes.
+    Symforge(stel::StelRequest),
 }
 
 impl QueryRequest {
+    /// The one exact path MCP freshens synchronously before serving this
+    /// request (`freshen_exact_path_for_targeted_retrieval`): the read,
+    /// file-context, symbol-context and syntax lanes.
+    pub(crate) fn freshen_path(&self) -> Option<&str> {
+        match self {
+            Self::FileContent(input) => Some(&input.path),
+            Self::SourcePage(input) => Some(&input.path),
+            Self::FileContext(input) => Some(&input.path),
+            Self::SymbolContext(input) => input.path.as_deref().or(input.file.as_deref()),
+            Self::Syntax { path } => Some(path),
+            _ => None,
+        }
+    }
+
     pub fn operation(&self) -> QueryOperationKind {
         match self {
             Self::TextSearch(_) => QueryOperationKind::SearchText,
@@ -231,16 +260,18 @@ impl QueryRequest {
             Self::Graph { .. } => QueryOperationKind::Graph,
             Self::Syntax { .. } => QueryOperationKind::Syntax,
             Self::Diff { .. } => QueryOperationKind::Diff,
-            Self::Impact { .. } => QueryOperationKind::Impact,
+            Self::Impact { .. } | Self::FileImpact(_) => QueryOperationKind::Impact,
             Self::Explore(_) => QueryOperationKind::Explore,
             Self::Conventions => QueryOperationKind::Conventions,
             Self::ContextInventory => QueryOperationKind::ContextInventory,
             Self::InvestigationSuggest { .. } => QueryOperationKind::InvestigationSuggest,
+            Self::EditPlan { .. } => QueryOperationKind::EditPlan,
             Self::Retrieve { .. } => QueryOperationKind::Retrieve,
             Self::WhatChanged(_) => QueryOperationKind::WhatChanged,
             Self::DiffSymbols(_) => QueryOperationKind::DiffSymbols,
             Self::DetectImpact(_) => QueryOperationKind::DetectImpact,
             Self::Ask(_) => QueryOperationKind::Ask,
+            Self::Symforge(_) => QueryOperationKind::Symforge,
         }
     }
 }
@@ -370,6 +401,33 @@ pub struct QuerySyntax {
     pub diagnostic: Option<String>,
     pub line: Option<u32>,
     pub column: Option<u32>,
+    /// Whose bytes were parsed: the publication's, or the disk's when the
+    /// file is unindexed or its freshen did not publish (MCP
+    /// `validate_file_syntax`'s authoritative disk-parse lane).
+    #[serde(default = "published_generation")]
+    pub authority: read::ReadAuthority,
+    /// The exact report MCP `validate_file_syntax` renders for these bytes.
+    #[serde(default)]
+    pub rendered: String,
+}
+
+fn published_generation() -> read::ReadAuthority {
+    read::ReadAuthority::PublishedGeneration
+}
+
+/// MCP `validate_file_syntax`'s authoritative disk parse, served in any live
+/// phase including Loading and refresh. It reports the bytes on disk now,
+/// read beneath the admitted root and admitted by the latest published
+/// generation's policy, exactly as MCP does while its index is not Ready. It
+/// is deliberately not a [`QueryClaim`]: it carries no publication identity,
+/// generation or session evidence, so it cannot be mistaken for index currency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiskSyntaxObservation {
+    /// Always [`read::ReadAuthority::DiskObservation`].
+    pub syntax: QuerySyntax,
+    /// The source phase observed when the read was admitted.
+    pub source_phase: crate::embed::SourceRuntimePhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -430,6 +488,7 @@ pub enum QueryOutput {
     RetrievedOutput(session::RetrievedOutput),
     Exploration(guidance::Exploration),
     Conventions(guidance::Conventions),
+    EditPlan(guidance::EditPlanGuidance),
     File {
         file: QueryFile,
         symbols: Vec<QuerySymbol>,
@@ -449,8 +508,10 @@ pub enum QueryOutput {
         diff: QuerySymbolDiff,
         dependents: Vec<QueryReference>,
     },
+    FileImpact(file_impact::FileImpactReport),
     WhatChanged(changes::WhatChangedResult),
     DiffSymbols(changes::DiffSymbolsResult),
     DetectImpact(detect_impact::DetectImpactResult),
     Ask(ask::AskResult),
+    Symforge(stel::SymforgeAnswer),
 }

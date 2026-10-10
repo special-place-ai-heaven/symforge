@@ -8,7 +8,7 @@ use crate::embed::parity::{QueryOutput, QueryRefusalKind};
 use crate::live_index::search as engine;
 use std::collections::{BTreeSet, HashMap};
 
-fn text_input(input: &TextSearchRequest) -> search_contract::SearchTextInput {
+pub(super) fn text_input(input: &TextSearchRequest) -> search_contract::SearchTextInput {
     search_contract::SearchTextInput {
         query: input.query.clone(),
         terms: input.terms.clone(),
@@ -45,7 +45,7 @@ fn text_input(input: &TextSearchRequest) -> search_contract::SearchTextInput {
         projects: None,
     }
 }
-fn symbol_input(input: &SymbolSearchRequest) -> search_contract::SearchSymbolsInput {
+pub(super) fn symbol_input(input: &SymbolSearchRequest) -> search_contract::SearchSymbolsInput {
     search_contract::SearchSymbolsInput {
         query: input.query.clone(),
         kind: input.kind.clone(),
@@ -232,19 +232,63 @@ pub(super) fn text(
             approximate_tokens: u64::from(input.limit.unwrap_or(50)) * 20 + 50,
         }));
     }
+    let shared_input = text_input(input);
     let executed =
-        super::guidance::search::execute_text_search(&snapshot.generation, &text_input(input))
+        super::guidance::search::execute_text_search(&snapshot.generation, &shared_input)
             .map_err(|_| QueryRefusalKind::InvalidRequest)?;
     budget.check()?;
+    let untracked_paths = untracked_sweep(snapshot, &shared_input, &executed);
+    budget.check()?;
     cache_before_token_cap(budget, input.max_tokens, |budget| {
-        project_text(snapshot, input, &executed, budget)
+        project_text(snapshot, input, &executed, &untracked_paths, budget)
     })
+}
+
+/// MCP `render_search_text_output`'s zero-hit sweep over the same captured
+/// publication, read through the shared gate exactly as
+/// `admit_worktree_text_without_lines` reads for MCP.
+fn untracked_sweep(
+    snapshot: &EmbeddedQuerySnapshot,
+    input: &search_contract::SearchTextInput,
+    executed: &super::guidance::search::TextSearchExecution,
+) -> Vec<String> {
+    let zero_hit = matches!(
+        &executed.result,
+        Ok(found) if found.files.is_empty() && found.suppressed_by_noise == 0
+    );
+    if !zero_hit || executed.structural {
+        return Vec::new();
+    }
+    let Some(repo) = super::embed_changes::open_repository(&snapshot.root) else {
+        return Vec::new();
+    };
+    let live = &snapshot.generation.live;
+    super::guidance::search::matching_untracked_paths_for_search_text(
+        &repo,
+        live,
+        executed.effective_query.as_deref(),
+        input.terms.as_deref(),
+        executed.is_regex,
+        &executed.options,
+        &mut |path| {
+            super::guidance::read_gate::worktree_text_with(&repo, path, &mut |full_path| {
+                super::guidance::read_gate::disk_read_with(
+                    live,
+                    path,
+                    full_path,
+                    &mut || None,
+                    &mut |_| {},
+                )
+            })
+        },
+    )
 }
 
 fn project_text(
     snapshot: &EmbeddedQuerySnapshot,
     input: &TextSearchRequest,
     executed: &super::guidance::search::TextSearchExecution,
+    untracked_paths: &[String],
     budget: &mut Budget,
 ) -> Result<QueryOutput, QueryRefusalKind> {
     let found = executed.result.as_ref().map_err(|error| match error {
@@ -416,6 +460,11 @@ fn project_text(
         }
         TextRows::Files(files)
     };
+    let untracked_diagnostic = super::guidance::search::untracked_file_diagnostic(untracked_paths);
+    if let Some(diagnostic) = &untracked_diagnostic {
+        budget
+            .required(untracked_paths.iter().map(String::len).sum::<usize>() + diagnostic.len())?;
+    }
     Ok(QueryOutput::TextSearch(TextSearchResult {
         rows,
         total_matches: found.total_matches as u64,
@@ -430,5 +479,7 @@ fn project_text(
         ranked: executed.options.ranked,
         auto_detected_regex: executed.auto_detected_regex,
         auto_corrected_regex: executed.auto_corrected_regex,
+        untracked_paths: untracked_paths.to_vec(),
+        untracked_diagnostic,
     }))
 }

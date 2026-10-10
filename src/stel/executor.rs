@@ -2,8 +2,9 @@
 
 use serde_json;
 
-use crate::protocol::result_status::OutcomeClass;
-use crate::protocol::tools::{classify_compact_tool_output, compact_tool_output_is_success};
+use crate::index_lifecycle::guidance::outcome::{
+    OutcomeClass, classify_compact_tool_output, compact_tool_output_is_success,
+};
 
 use super::controller::DEGRADE_DEFAULT_MAX_TOKENS;
 
@@ -116,7 +117,7 @@ pub fn format_cache_hit_body(decision: &StelDecision) -> String {
 }
 
 fn format_cache_hit_body_from(cache: &StelCacheBody, decision_reason: &str) -> String {
-    let meta = crate::protocol::session::SessionCacheHitMeta {
+    let meta = crate::index_lifecycle::guidance::session::SessionCacheHitMeta {
         kind: if cache.kind == "symbol" {
             "symbol"
         } else {
@@ -128,7 +129,7 @@ fn format_cache_hit_body_from(cache: &StelCacheBody, decision_reason: &str) -> S
         session_age_secs: cache.session_age_secs,
         retrieve_handle: String::new(),
     };
-    crate::protocol::format::format_session_cache_hit_body(&meta, decision_reason)
+    crate::index_lifecycle::guidance::source::format_session_cache_hit_body(&meta, decision_reason)
 }
 
 /// Apply L2 degrade caps to a plan before L3 dispatch.
@@ -479,7 +480,7 @@ mod tests {
 
     #[test]
     fn get_symbol_prefetch_does_not_stel_cache_hit() {
-        use crate::protocol::session::SessionContext;
+        use crate::index_lifecycle::guidance::session::SessionContext;
         use crate::stel::controller::evaluate_plan_with_session;
         use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
 
@@ -487,7 +488,15 @@ mod tests {
         session.record_symbol_fetch(
             "src/lib.rs",
             "cfg_if",
-            crate::protocol::session::hash_symbol_params(None, None, None, 0, "unavailable", 0, 0),
+            crate::index_lifecycle::guidance::session::hash_symbol_params(
+                None,
+                None,
+                None,
+                0,
+                "unavailable",
+                0,
+                0,
+            ),
             96,
             "deadbeefcafe",
         );

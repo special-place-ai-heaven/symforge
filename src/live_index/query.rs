@@ -12,10 +12,7 @@ pub(crate) use super::disambiguation::{
 };
 use crate::domain::index::FileClassification;
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolRecord};
-// Only consumed by the server-gated `plan_edit` (protocol::edit_plan); gate the
-// re-export so the engine-only `embed` build stays free of an unused-import
-// error under `warnings = "deny"` (the consumer is absent when `server` is off).
-#[cfg(feature = "server")]
+// Consumed by the shared `plan_edit` (guidance::edit_plan) in every build.
 pub(crate) use super::disambiguation::symbol_belongs_to_type;
 use super::disambiguation::{
     is_receiver_method_call, matches_exact_symbol_qualified_name, matches_exact_symbol_reference,

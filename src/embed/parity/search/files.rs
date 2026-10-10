@@ -134,4 +134,9 @@ pub struct FileSearchResult {
     pub cochange: Option<CoChangeSummary>,
     pub ranking: Vec<RankingEvidence>,
     pub ranking_explanation: Option<String>,
+    /// MCP `search_files`' zero-hit untracked sweep: untracked worktree
+    /// paths unknown to the publication whose names match the query. Empty
+    /// unless a ranked search found nothing.
+    #[serde(default)]
+    pub untracked_paths: Vec<String>,
 }

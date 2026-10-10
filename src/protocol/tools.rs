@@ -26,10 +26,7 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{
-    CouplingPreparePolicy, FrecencyCollectionPolicy, RankingDiagnosticsPolicy,
-    WorktreeRoutingPolicy,
-};
+use crate::capability::WorktreeRoutingPolicy;
 use crate::protocol::result_status::{OutcomeClass, ResultStatus};
 
 #[cfg(test)]
@@ -70,411 +67,33 @@ fn statused_tool_result(
     Ok(ResultStatus::new(outcome_class).into_call_tool_result(text))
 }
 
-/// Canonicalize the deepest existing ancestor of `path`, then append a truly
-/// missing suffix without resolving it lexically.
-///
-/// This preserves filesystem semantics for `link/..` and catches a missing
-/// leaf beneath an escaping symlink/junction. Any error other than an ordinary
-/// missing component fails closed. A dangling link also fails closed because
-/// `symlink_metadata` can observe the link even though `canonicalize` cannot
-/// resolve its target.
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
-    let mut ancestor = path.to_path_buf();
-    let mut missing_tail = Vec::<std::ffi::OsString>::new();
+// The facade's path containment checks live in the shared STEL runtime so
+// the embedded facade refuses the same `path:` values MCP does.
+use crate::stel::runtime::{facade_path_is_repo_relative, path_is_within_bound_project};
 
-    loop {
-        match ancestor.canonicalize() {
-            Ok(mut canonical) => {
-                for component in missing_tail.iter().rev() {
-                    canonical.push(component);
-                }
-                return Some(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match std::fs::symlink_metadata(&ancestor) {
-                    Ok(_) => return None,
-                    Err(metadata_error)
-                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return None,
-                }
-                missing_tail.push(ancestor.file_name()?.to_os_string());
-                if !ancestor.pop() {
-                    return None;
-                }
-            }
-            Err(_) => return None,
-        }
-    }
-}
+// Moved verbatim to the feature-neutral `guidance::outcome` so the STEL
+// facade and the embedded facade classify a rendered answer exactly as MCP does.
+use crate::index_lifecycle::guidance::outcome::{
+    classify_find_references_output, classify_get_file_content_output,
+    classify_get_symbol_context_output, classify_get_symbol_output, classify_search_files_output,
+    classify_search_knowledge_output, classify_search_symbols_output, classify_search_text_output,
+    is_admission_refusal,
+};
+pub(super) use crate::index_lifecycle::guidance::outcome::{
+    is_error_output, is_index_unavailable_output,
+};
+// The classifier tests below name these through `super::`.
+#[cfg(test)]
+use crate::index_lifecycle::guidance::outcome::{
+    classify_compact_tool_output, classify_get_file_context_output, compact_tool_output_is_success,
+};
 
-/// Whether `path` (a `symforge` `path:` filter) resolves WITHIN the bound
-/// project `root` (012 D6 / contracts §3c). `path:` is a within-project filter,
-/// never a project selector, so a path that escapes the bound root is a caller
-/// error.
-///
-/// Resolution: a relative `path` is joined onto `root`; an absolute `path` is
-/// used as-is. The bound root must canonicalize. The target is resolved through
-/// its deepest existing ancestor so symlinks/junctions and `..` retain filesystem
-/// semantics even when the final leaf does not exist. Containment is the
-/// canonical root being a component prefix of the resolved target (equal counts
-/// as within); observation failures reject the filter.
-fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
-    let Ok(canonical_root) = root.canonicalize() else {
-        return false;
-    };
-
-    let raw = Path::new(path);
-    let resolved = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        canonical_root.join(raw)
-    };
-    let Some(resolved) = canonicalize_with_missing_tail(&resolved) else {
-        return false;
-    };
-
-    // Compare with the Windows verbatim (`\\?\`) prefix stripped from BOTH sides
-    // so a canonicalized root (which gains `\\?\`) and a lexically-normalized
-    // not-yet-existing target (which does not) still compare correctly.
-    let resolved_cmp = strip_verbatim_prefix(&resolved);
-    let root_cmp = strip_verbatim_prefix(&canonical_root);
-    resolved_cmp.starts_with(&root_cmp)
-}
-
-/// The compact facade forwards `path` as an index key/filter, never as an OS
-/// path. Reject every rooted/prefixed spelling, including Windows drive-relative
-/// (`C:foo`) and root-relative (`\foo`) forms that `Path::is_absolute` does not
-/// classify uniformly across platforms.
-fn facade_path_is_repo_relative(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    if path.starts_with('/')
-        || path.starts_with('\\')
-        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-    {
-        return false;
-    }
-    !Path::new(path).components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::Prefix(_) | std::path::Component::RootDir
-        )
-    })
-}
-
-/// Strip the Windows verbatim/UNC `\\?\` prefix from a path for comparison,
-/// returning a plain comparable `PathBuf`. On a path without the prefix (or on
-/// non-Windows) this is an allocation-light passthrough.
-///
-/// We rebuild the path from its components: a `Prefix` component that is verbatim
-/// (`\\?\C:`, `\\?\UNC\...`) is replaced by its plain disk/UNC form so it lines
-/// up with a non-canonicalized (lexically normalized) sibling path.
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    use std::path::{Component, Prefix};
-    let mut out = PathBuf::new();
-    let mut rebuilt_prefix_already_rooted = false;
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => match prefix.kind() {
-                Prefix::VerbatimDisk(disk) => {
-                    out.push(format!("{}:\\", disk as char));
-                    rebuilt_prefix_already_rooted = true;
-                }
-                Prefix::VerbatimUNC(server, share) => {
-                    let mut unc = std::ffi::OsString::from(r"\\");
-                    unc.push(server);
-                    unc.push(r"\");
-                    unc.push(share);
-                    out.push(unc);
-                    rebuilt_prefix_already_rooted = true;
-                }
-                _ => {
-                    out.push(component.as_os_str());
-                    rebuilt_prefix_already_rooted = false;
-                }
-            },
-            Component::RootDir => {
-                // Rebuilt verbatim disk/UNC prefixes already include their root
-                // separator. Ordinary disk prefixes (`C:`) do not: preserve the
-                // following RootDir so an absolute path never becomes drive-
-                // relative during comparison.
-                if !rebuilt_prefix_already_rooted {
-                    out.push(component.as_os_str());
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-pub(super) fn is_index_unavailable_output(text: &str) -> bool {
-    text.starts_with("Index not loaded.")
-        || text.starts_with("Index is loading")
-        || text.starts_with("Index degraded:")
-        || text.starts_with("Index refresh interrupted:")
-}
-
-/// The ONE error-shape predicate for the whole protocol surface, read/write
-/// alike. `edit_tools.rs` used to keep a private copy of this function, which
-/// diverged the moment the project-refusal shapes were added here — so the seven
-/// structural edit tools reported a REFUSED edit as `success`/`found`. Shared
-/// (`pub(super)`) so a new shape can only ever be taught once.
-pub(super) fn is_error_output(text: &str) -> bool {
-    text.starts_with("Error:")
-        || text.starts_with("Error in ")
-        || is_admission_refusal(text)
-        || is_foreign_project_refusal(text)
-        || is_local_cross_project_refusal(text)
-}
-
-/// An admission-gate refusal is an honest REFUSAL, not a successful read. Taught
-/// HERE rather than per-arm: `validate_file_syntax` has no classifier arm of its
-/// own, so its refusal fell through `classify_compact_tool_output`'s catch-all
-/// and reported a withheld file as a successful validation. Anchored at position
-/// 0 (not `contains`) so a body that merely QUOTES the phrase stays `Found`.
-/// Both refusal variants share this opening clause, so one anchor classifies
-/// both.
-fn is_admission_refusal(text: &str) -> bool {
-    text.starts_with("Content withheld by admission policy:")
-}
-
-/// The single-project refusal [`SymForgeServer::foreign_project_refusal`] emits
-/// carries no `Error:` prefix, so without this a refusal that came back through
-/// DISPATCH rather than an early return classified as a SUCCESSFUL answer
-/// (`found`) — notably in `classify_symforge_edit_outcome` and in every
-/// `classify_edit_output` caller. Deliberately narrow: BOTH anchors must match,
-/// so no unrelated body is reclassified.
-fn is_foreign_project_refusal(text: &str) -> bool {
-    // Current shape carries the typed `Error: project_routing:` prefix; the
-    // legacy anchor below still classifies pre-10.1 bodies that came back
-    // through DISPATCH rather than an early return.
-    (text.starts_with("Error: project_routing: project '") || text.starts_with("project '"))
-        && text.contains("is not available on this connection")
-}
-
-/// Sibling shape emitted by [`SymForgeServer::local_cross_project_refusal`] for
-/// a genuinely cross-project (`projects`, `*`, or foreign `project`) read on a
-/// transport with no daemon working set. Same defect as above and same fix: an
-/// honest refusal must not be reported as a successful answer. Narrow by
-/// anchoring the FULL opening clause at position 0: a rendered search hit or doc
-/// line that quotes the message is prefixed (`7: // ...`) and stays `Found`.
-fn is_local_cross_project_refusal(text: &str) -> bool {
-    // Current shape carries the typed `Error: project_routing:` prefix; the
-    // legacy anchor still classifies pre-10.1 bodies.
-    text.starts_with("Error: project_routing: cross-project queries")
-        || text.starts_with("Cross-project queries (project/projects) require the daemon")
-}
-
-fn classify_get_symbol_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous:") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("File not found:") || text.starts_with("No symbol ") {
-        OutcomeClass::NotFound
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous symbol selector") || text.starts_with("Ambiguous:") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("Symbol \"") || text.starts_with("Symbol '") {
-        OutcomeClass::NotFound
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-/// Strip an optional leading `── mode: <name> (explicit) ──\n` annotation so
-/// output classification can match the renderer's message at the start of the
-/// remaining body. Returns `text` unchanged when no annotation is present.
-fn strip_mode_annotation(text: &str) -> &str {
-    text.strip_prefix("── mode: ")
-        .and_then(|rest| rest.split_once(" ──\n"))
-        .map(|(_, body)| body)
-        .unwrap_or(text)
-}
-fn classify_get_file_content_output(text: &str) -> OutcomeClass {
-    // Strip an optional `── mode: <name> (explicit) ──` prefix so the renderer's
-    // status message is matched at the start of `body` even when an explicit-mode
-    // annotation precedes it. Anchoring on `body` (not a bare `contains`) keeps a
-    // successful read whose CONTENT merely mentions these phrases classified Found.
-    let body = strip_mode_annotation(text);
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text)
-        || text.starts_with("Invalid get_file_content request:")
-        || text.starts_with("mode=")
-        || text.contains("[error:")
-        || body.starts_with("Path is outside the repository root:")
-        || (body.starts_with("Chunk ") && body.contains(" out of range for "))
-    {
-        // A request for a non-existent chunk index is an invalid request, not a
-        // successful read: the path exists but the requested page does not.
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous symbol selector") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("File not found:")
-        || text.starts_with("No symbol ")
-        || text.starts_with("Symbol not found in ")
-        || body.starts_with("No matches for '")
-        || body.starts_with("Match occurrence ")
-    {
-        // around_match / match-occurrence misses: the needle was not found in the
-        // file. These must report NotFound, not a successful read.
-        OutcomeClass::NotFound
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_symbols_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) || text.starts_with("search_symbols requires") {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("No symbols matching") {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_text_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text)
-        || text.starts_with("Regex search requires")
-        || text.starts_with("Search requires")
-        || text.starts_with("Invalid regex")
-        || text.starts_with("Invalid glob")
-        || text.starts_with("whole_word is not supported")
-    {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("No matches") || text.starts_with("No AST matches") {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_knowledge_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Error:") {
-        OutcomeClass::InvalidRequest
-    } else if text.contains("\nNo match:") {
-        OutcomeClass::EmptyResult
-    } else if text.starts_with("Readiness:") {
-        OutcomeClass::InternalFailure
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_search_files_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text)
-        || text.starts_with("Path search requires")
-        || text.starts_with("Path hint must not be empty")
-        || text.starts_with("search_files")
-    {
-        OutcomeClass::InvalidRequest
-    } else if text.contains("Ambiguous path hint") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("No indexed source files matching")
-        || text.starts_with("No indexed source path matched")
-        || text.starts_with("No git history found")
-        || text.starts_with("'") && text.contains("not found in git history")
-    {
-        OutcomeClass::NotFound
-    } else if text.starts_with("No high-confidence co-change data") {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_find_references_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("Ambiguous symbol selector") {
-        OutcomeClass::Ambiguous
-    } else if text.starts_with("File not found:")
-        || text.starts_with("Symbol not found")
-        || text.contains("this symbol is not defined in the indexed project")
-    {
-        OutcomeClass::NotFound
-    } else if text.starts_with("No references found")
-        || text.starts_with("No implementations found")
-    {
-        OutcomeClass::EmptyResult
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-fn classify_get_file_context_output(text: &str) -> OutcomeClass {
-    if is_index_unavailable_output(text) {
-        OutcomeClass::InternalFailure
-    } else if is_error_output(text) || text.starts_with("Invalid get_file_context") {
-        OutcomeClass::InvalidRequest
-    } else if text.starts_with("File not found:")
-        || text.starts_with("File not found on disk:")
-        || text.starts_with("No symbol ")
-    {
-        OutcomeClass::NotFound
-    } else if text.starts_with("Ambiguous") {
-        OutcomeClass::Ambiguous
-    } else {
-        OutcomeClass::Found
-    }
-}
-
-/// Classify compact-surface legacy tool output for STEL chain admission and replay validation.
-pub(crate) fn classify_compact_tool_output(tool: &str, text: &str) -> OutcomeClass {
-    match tool {
-        "get_symbol" => classify_get_symbol_output(text),
-        "get_symbol_context" => classify_get_symbol_context_output(text),
-        "get_file_content" => classify_get_file_content_output(text),
-        "get_file_context" => classify_get_file_context_output(text),
-        "search_symbols" => classify_search_symbols_output(text),
-        "search_text" => classify_search_text_output(text),
-        "search_knowledge" => classify_search_knowledge_output(text),
-        "search_files" => classify_search_files_output(text),
-        "find_references" => classify_find_references_output(text),
-        _ => {
-            if is_index_unavailable_output(text) {
-                OutcomeClass::InternalFailure
-            } else if is_error_output(text) || text.starts_with("Invalid") {
-                OutcomeClass::InvalidRequest
-            } else {
-                OutcomeClass::Found
-            }
-        }
-    }
-}
-
-/// Whether a legacy tool body represents successful serve output for STEL chain continuation.
-pub(crate) fn compact_tool_output_is_success(tool: &str, text: &str) -> bool {
-    classify_compact_tool_output(tool, text) == OutcomeClass::Found
-}
-
+use crate::domain::LanguageId;
 /// Deserialize a required `u32` from either a JSON number or a stringified number.
 use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkipReason};
-use crate::domain::{FileClassification, LanguageId};
 use crate::live_index::qualified_usages;
 use crate::live_index::{
-    IndexedFile, SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
+    IndexedFile, SearchFilesResolveView, SearchFilesView, search,
     store::{IndexState, LiveIndex},
 };
 use crate::protocol::edit;
@@ -487,7 +106,6 @@ use crate::sidecar::handlers::{
     symbol_context_tool_text_for_generation,
 };
 use crate::sidecar::{SidecarState, TokenStats};
-use crate::watcher;
 
 use super::SymForgeServer;
 
@@ -892,43 +510,10 @@ fn suggest_similar_files(index: &crate::live_index::LiveIndex, path: &str) -> Ve
     suggestions
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TargetedFreshenRefusal {
-    ProjectGenerationChanged,
-    PublicationRejected,
-}
-
-impl TargetedFreshenRefusal {
-    fn message(self, relative_path: &str) -> String {
-        match self {
-            Self::ProjectGenerationChanged => format!(
-                "Index refresh interrupted: project changed while refreshing '{relative_path}'; retry the read."
-            ),
-            Self::PublicationRejected => format!(
-                "Index refresh interrupted: refresh for '{relative_path}' did not publish; retry the read."
-            ),
-        }
-    }
-
-    fn permits_authoritative_disk_fallback(self) -> bool {
-        matches!(self, Self::PublicationRejected)
-    }
-}
-
-fn classify_targeted_freshen_result(
-    result: watcher::FreshenResult,
-) -> Result<bool, TargetedFreshenRefusal> {
-    match result {
-        watcher::FreshenResult::Fresh => Ok(false),
-        watcher::FreshenResult::StaleReindexed | watcher::FreshenResult::StaleRemoved => Ok(true),
-        watcher::FreshenResult::GenerationMismatch => {
-            Err(TargetedFreshenRefusal::ProjectGenerationChanged)
-        }
-        watcher::FreshenResult::PublicationRejected => {
-            Err(TargetedFreshenRefusal::PublicationRejected)
-        }
-    }
-}
+#[cfg(test)]
+use crate::index_lifecycle::guidance::freshen::classify_targeted_freshen_result;
+pub(crate) use crate::index_lifecycle::guidance::freshen::safe_repo_path_for_freshen;
+use crate::index_lifecycle::guidance::freshen::{TargetedFreshenRefusal, freshen_exact_path};
 
 fn freshen_exact_path_for_targeted_retrieval(
     server: &SymForgeServer,
@@ -941,107 +526,24 @@ fn freshen_exact_path_for_targeted_retrieval(
     let Some(repo_root) = server.capture_repo_root() else {
         return Ok(false);
     };
-    let Ok(abs_path) = safe_repo_path_for_freshen(&repo_root, relative_path) else {
-        return Ok(false);
-    };
     // V11 observation lane (C4c): a request-path freshen observes under the
     // incarnation current at call time (the C3b synchronous-facade ruling).
     let lane_authority =
         crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
-    let lane_observer = lane_authority.active_observer();
-    classify_targeted_freshen_result(watcher::freshen_file_if_stale(
-        relative_path,
-        &abs_path,
+    freshen_exact_path(
         server.index.data_plane(),
         expected_gen,
+        &repo_root,
         &lane_authority,
-        lane_observer,
-    ))
-}
-
-pub(crate) fn safe_repo_path_for_freshen(
-    repo_root: &std::path::Path,
-    relative_path: &str,
-) -> Result<PathBuf, String> {
-    let relative = std::path::Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(format!("path '{relative_path}' is outside the repository"));
-    }
-    match edit::resolve_repo_path(repo_root, relative_path)? {
-        Some(path) => Ok(path),
-        // Only a spelling with nothing on disk falls back, so the freshen lane
-        // can confirm a deletion. Every refusal and every other I/O error
-        // propagates instead of becoming a path the lane would follow.
-        None => {
-            let canon_root = repo_root
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve repo root: {e}"))?;
-            Ok(canon_root.join(relative))
-        }
-    }
-}
-
-fn search_scope_summary(
-    path_scope: &search::PathScope,
-    language_filter: Option<&LanguageId>,
-    noise_policy: &search::NoisePolicy,
-    include_personal_tooling: bool,
-    glob: Option<&str>,
-    exclude_glob: Option<&str>,
-    ranked: bool,
-) -> String {
-    let mut parts = Vec::new();
-    match path_scope {
-        search::PathScope::Any => parts.push("repo-wide".to_string()),
-        search::PathScope::Exact(path) => parts.push(format!("path `{path}`")),
-        search::PathScope::Prefix(prefix) => parts.push(format!("path prefix `{prefix}`")),
-    }
-    if let Some(language) = language_filter {
-        parts.push(format!("language `{language}`"));
-    }
-    // SF-STRESS-011 honesty fix: these are HEURISTIC path-based filters, not a
-    // guaranteed outcome. Detection keys on path segments (vendor/, deps/,
-    // dist/, test_data/, ...) and basename patterns, so a vendored/generated
-    // file with an unconventional path can still appear in results. The header
-    // says "filter active (heuristic)" rather than asserting the file class was
-    // actually removed, which the previous "vendor filtered" wording overstated.
-    parts.push(if noise_policy.include_tests {
-        "tests included".to_string()
-    } else {
-        "tests filter active (heuristic)".to_string()
-    });
-    parts.push(if noise_policy.include_generated {
-        "generated included".to_string()
-    } else {
-        "generated filter active (heuristic)".to_string()
-    });
-    parts.push(if noise_policy.include_vendor {
-        "vendor included".to_string()
-    } else {
-        "vendor filter active (heuristic)".to_string()
-    });
-    parts.push(if include_personal_tooling {
-        "personal tooling included".to_string()
-    } else {
-        "personal tooling filtered".to_string()
-    });
-    if let Some(glob) = glob {
-        parts.push(format!("glob `{glob}`"));
-    }
-    if let Some(exclude_glob) = exclude_glob {
-        parts.push(format!("exclude `{exclude_glob}`"));
-    }
-    if ranked {
-        parts.push("ranked ordering enabled".to_string());
-    }
-    parts.join("; ")
+        relative_path,
+    )
 }
 
 use crate::index_lifecycle::guidance::reference_read::search_parse_state_for_paths;
+use crate::index_lifecycle::guidance::search_envelope::{
+    append_search_files_filter_summary, search_completeness_label, search_files_hidden_noise_note,
+    search_files_scope_summary,
+};
 
 fn parse_state_for_file(file: &IndexedFile) -> &'static str {
     match &file.parse_status {
@@ -1066,245 +568,10 @@ fn parse_state_for_file(file: &IndexedFile) -> &'static str {
 
 use crate::index_lifecycle::guidance::symbol_context::context_bundle_completeness_label;
 
-fn search_completeness_label(overflow_count: usize, suppressed_by_noise: usize) -> String {
-    // Honesty (trust): the index is built by a discovery walk with the `ignore`
-    // crate default `.hidden(true)`, so hidden / dotdir paths (`.github/`,
-    // `.gitlab-ci.yml`, …) are NOT indexed and never appear in results. A bare
-    // "full" claim would mislead an agent into trusting the file count as
-    // exhaustive (the dogfood report: `search_text` silently omitted
-    // `.github/workflows/release-please.yml` that ripgrep found). Qualify the
-    // claim so the agent knows to use a raw grep for hidden paths.
-    let mut parts = vec![if overflow_count > 0 {
-        format!("truncated by result cap ({overflow_count} more omitted)")
-    } else {
-        "full for indexed scope (hidden/dotdir paths not indexed — grep those)".to_string()
-    }];
-    if suppressed_by_noise > 0 {
-        if suppressed_by_noise > search::SUPPRESSED_TEXT_MATCH_DISPLAY_CAP {
-            parts.push(format!(
-                "{}+ noise-filtered match(es) suppressed",
-                search::SUPPRESSED_TEXT_MATCH_DISPLAY_CAP
-            ));
-        } else {
-            parts.push(format!(
-                "{suppressed_by_noise} noise-filtered match(es) suppressed"
-            ));
-        }
-    }
-    parts.join("; ")
-}
-
-fn search_text_match_type_label(
-    structural: bool,
-    is_regex: bool,
-    terms: Option<&[String]>,
-    auto_detected_regex: bool,
-    auto_corrected_regex: bool,
-    ranked: bool,
-) -> String {
-    if structural {
-        "structural (ast-grep)".to_string()
-    } else if auto_corrected_regex {
-        "heuristic (auto-corrected regex)".to_string()
-    } else if is_regex && auto_detected_regex {
-        "heuristic (auto-detected regex)".to_string()
-    } else if is_regex {
-        "heuristic (regex)".to_string()
-    } else if ranked {
-        match terms {
-            Some(terms) if !terms.is_empty() => "heuristic (ranked OR-literal terms)".to_string(),
-            _ => "heuristic (ranked literal)".to_string(),
-        }
-    } else if matches!(terms, Some(terms) if !terms.is_empty()) {
-        "constrained (OR-literal terms)".to_string()
-    } else {
-        "constrained (literal)".to_string()
-    }
-}
-
-fn search_symbols_match_type_label(
-    result: &search::SymbolSearchResult,
-    is_browse: bool,
-) -> &'static str {
-    if is_browse {
-        "constrained (scoped browse)"
-    } else {
-        match result.hits.first().map(|hit| hit.tier) {
-            Some(search::SymbolMatchTier::Exact) => "exact",
-            Some(search::SymbolMatchTier::Prefix) => "constrained (prefix tier)",
-            Some(search::SymbolMatchTier::Substring) => "heuristic (substring tier)",
-            None => "constrained",
-        }
-    }
-}
-
-fn search_files_match_type_label(view: &SearchFilesView) -> &'static str {
-    match view {
-        SearchFilesView::Found { hits, .. } => match hits.first().map(|hit| hit.tier) {
-            Some(SearchFilesTier::CoChange) => "heuristic (git-temporal coupling)",
-            Some(SearchFilesTier::StrongPath) | Some(SearchFilesTier::Basename) => {
-                "constrained (tiered path relevance)"
-            }
-            Some(SearchFilesTier::LoosePath) => "heuristic (loose path relevance)",
-            Some(SearchFilesTier::MetadataOnly) => "heuristic (Tier-2 metadata-only path)",
-            None => "constrained",
-        },
-        _ => "constrained",
-    }
-}
-
-use crate::index_lifecycle::guidance::file_search::{
-    ranking_diagnostics_policy_from_env, search_files_ranking_explanation,
-};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CapabilityStatusReport {
-    frecency: String,
-    co_change: String,
-    worktree_routing: String,
-    ranking_diagnostics: String,
-}
-
-impl CapabilityStatusReport {
-    fn full_text(&self) -> String {
-        format!(
-            "Capabilities:\n  frecency: {}\n  co-change: {}\n  worktree routing: {}\n  ranking diagnostics: {}",
-            self.frecency, self.co_change, self.worktree_routing, self.ranking_diagnostics
-        )
-    }
-
-    fn compact_text(&self) -> String {
-        format!(
-            "Capabilities: frecency={}; co-change={}; worktree={}; ranking={}",
-            self.frecency, self.co_change, self.worktree_routing, self.ranking_diagnostics
-        )
-    }
-}
-
-fn frecency_health_status(
-    repo_root: Option<&Path>,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-) -> String {
-    if repo_root.is_none() {
-        return "unavailable/no-repository-root".to_string();
-    }
-    let has_persistent_history = project_state
-        .map(crate::live_index::frecency::frecency_db_path)
-        .is_some_and(|path| path.is_file());
-    match crate::live_index::frecency::collection_policy_from_env() {
-        FrecencyCollectionPolicy::Disabled => "disabled by policy".to_string(),
-        FrecencyCollectionPolicy::Session => {
-            if has_persistent_history {
-                "ready/session+persistent".to_string()
-            } else {
-                "ready/session/no-history fallback-used-on-empty".to_string()
-            }
-        }
-        FrecencyCollectionPolicy::Persistent => {
-            if project_state.is_none() {
-                return "unavailable/no-project-state-owner".to_string();
-            }
-            if has_persistent_history {
-                "ready/persistent".to_string()
-            } else {
-                "ready/persistent/no-history fallback-used-on-empty".to_string()
-            }
-        }
-    }
-}
-
-fn cochange_store_health_status(
-    store: &crate::live_index::coupling::CouplingStore,
-    repo_root: &Path,
-) -> String {
-    match store.cold_built_at() {
-        Ok(Some(_)) => {}
-        Ok(None) => return "preparing/cold-build-pending fallback-used-on-request".to_string(),
-        Err(error) => return format!("unavailable/store-build-state-error ({error})"),
-    }
-
-    let stored_head = match store.last_head() {
-        Ok(Some(head)) => head,
-        Ok(None) => return "preparing/no-head-recorded fallback-used-on-request".to_string(),
-        Err(error) => return format!("unavailable/store-head-state-error ({error})"),
-    };
-    let current_head = match crate::git::head_sha(repo_root) {
-        Ok(head) => head,
-        Err(error) => return format!("unavailable/head-read-failed ({error})"),
-    };
-    if stored_head != current_head {
-        "stale/head-mismatch fallback-used-on-request".to_string()
-    } else {
-        "ready/current".to_string()
-    }
-}
-
-fn cochange_health_status(
-    index: &LiveIndex,
-    repo_root: Option<&Path>,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-) -> String {
-    let policy = crate::live_index::coupling::coupling_prepare_policy_from_env();
-    if matches!(policy, CouplingPreparePolicy::Disabled) {
-        return "disabled by policy".to_string();
-    }
-
-    let Some(repo_root) = repo_root else {
-        return "unavailable/no-repository-root".to_string();
-    };
-    if git2::Repository::discover(repo_root).is_err() {
-        return "unavailable/not-a-git-repo".to_string();
-    }
-
-    if let Some(store) = index.coupling_store() {
-        return cochange_store_health_status(store, repo_root);
-    }
-
-    let Some(project_state) = project_state else {
-        return "unavailable/no-project-state-owner".to_string();
-    };
-    match crate::live_index::coupling::open_existing_coupling_store(project_state) {
-        Ok(Some(store)) => cochange_store_health_status(store.as_ref(), repo_root),
-        Ok(None) => match policy {
-            CouplingPreparePolicy::LazyOnRequest => {
-                "preparing/lazy-on-request fallback-used-on-request".to_string()
-            }
-            CouplingPreparePolicy::WarmOnStart => {
-                "preparing/warm-on-start fallback-used-on-request".to_string()
-            }
-            CouplingPreparePolicy::Disabled => "disabled by policy".to_string(),
-        },
-        Err(error) => format!("unavailable/store-open-failed ({error})"),
-    }
-}
-
 fn worktree_routing_health_status() -> String {
     match crate::worktree::routing_policy_from_env() {
         WorktreeRoutingPolicy::ExplicitCallTime => "explicit-call enabled".to_string(),
         WorktreeRoutingPolicy::Disabled => "disabled by policy".to_string(),
-    }
-}
-
-fn ranking_diagnostics_health_status() -> String {
-    match ranking_diagnostics_policy_from_env() {
-        RankingDiagnosticsPolicy::CallTimeExplain => {
-            "call-time explain available/default-off".to_string()
-        }
-        RankingDiagnosticsPolicy::DefaultOn => "call-time explain available/default-on".to_string(),
-        RankingDiagnosticsPolicy::Disabled => "disabled by policy".to_string(),
-    }
-}
-
-fn capability_status_report(
-    index: &LiveIndex,
-    repo_root: Option<&Path>,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-) -> CapabilityStatusReport {
-    CapabilityStatusReport {
-        frecency: frecency_health_status(repo_root, project_state),
-        co_change: cochange_health_status(index, repo_root, project_state),
-        worktree_routing: worktree_routing_health_status(),
-        ranking_diagnostics: ranking_diagnostics_health_status(),
     }
 }
 
@@ -1316,76 +583,6 @@ fn append_changed_with_deprecation_warning(mut result: String) -> String {
     result
 }
 
-fn search_files_hidden_noise_note(
-    hidden_count: usize,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) -> Option<String> {
-    if hidden_count == 0 || (include_vendor && include_personal_tooling) {
-        return None;
-    }
-
-    let mut flags = Vec::new();
-    if !include_vendor {
-        flags.push("include_vendor=true");
-    }
-    if !include_personal_tooling {
-        flags.push("include_personal_tooling=true");
-    }
-
-    let noun = if hidden_count == 1 {
-        "path candidate"
-    } else {
-        "path candidates"
-    };
-    Some(format!(
-        "{hidden_count} vendor/personal-tooling {noun} hidden by default; pass {} to include suppressed noise.",
-        flags.join(" or ")
-    ))
-}
-
-fn search_files_filter_summary(include_vendor: bool, include_personal_tooling: bool) -> String {
-    // SF-STRESS-011 honesty fix: vendor detection is a heuristic path filter, so
-    // the header says "filter active (heuristic)" rather than asserting the file
-    // class was actually removed. Personal-tooling paths are an exact prefix
-    // match, so that claim stays definite.
-    let vendor = if include_vendor {
-        "vendor included"
-    } else {
-        "vendor filter active (heuristic)"
-    };
-    let personal = if include_personal_tooling {
-        "personal tooling included"
-    } else {
-        "personal tooling filtered"
-    };
-    format!("filters: {vendor}; {personal}")
-}
-
-fn search_files_scope_summary(
-    base_scope: impl Into<String>,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) -> String {
-    format!(
-        "{}; {}",
-        base_scope.into(),
-        search_files_filter_summary(include_vendor, include_personal_tooling)
-    )
-}
-
-fn append_search_files_filter_summary(
-    result: &mut String,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) {
-    result.push_str("\n\n");
-    result.push_str(&search_files_filter_summary(
-        include_vendor,
-        include_personal_tooling,
-    ));
-}
-
 fn search_files_resolve_match_type_label(view: &SearchFilesResolveView) -> &'static str {
     match view {
         SearchFilesResolveView::Resolved { .. } => "exact (resolve)",
@@ -1395,162 +592,6 @@ fn search_files_resolve_match_type_label(view: &SearchFilesResolveView) -> &'sta
         SearchFilesResolveView::Ambiguous { .. } => "constrained (resolve candidates)",
         _ => "constrained",
     }
-}
-
-use crate::index_lifecycle::guidance::reference_read::anchored_search_evidence;
-
-fn search_text_evidence(result: &search::TextSearchResult) -> String {
-    let anchors = result
-        .files
-        .iter()
-        .flat_map(|file| {
-            file.matches
-                .iter()
-                .take(2)
-                .map(move |line_match| format!("{}:{}", file.path, line_match.line_number))
-        })
-        .take(3)
-        .collect();
-    anchored_search_evidence(anchors, "line anchors")
-}
-
-fn search_symbols_evidence(result: &search::SymbolSearchResult) -> String {
-    let anchors = result
-        .hits
-        .iter()
-        .take(3)
-        .map(|hit| format!("{}:{}", hit.path, hit.line))
-        .collect();
-    anchored_search_evidence(anchors, "symbol anchors")
-}
-
-fn normalize_untracked_search_path(raw: &str) -> String {
-    let mut normalized = raw.trim().replace('\\', "/");
-    while normalized.starts_with("./") {
-        normalized = normalized[2..].to_string();
-    }
-    normalized.trim_matches('/').to_string()
-}
-
-fn untracked_path_has_component(path: &str, component: &str) -> bool {
-    path.split('/')
-        .any(|part| part.eq_ignore_ascii_case(component))
-}
-
-fn language_for_path(path: &str) -> Option<LanguageId> {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .and_then(|extension| LanguageId::from_extension(&extension))
-}
-
-fn untracked_common_path_filters_allow(
-    path: &str,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) -> bool {
-    (include_vendor || !crate::live_index::query::is_vendor_path(path))
-        && (include_personal_tooling || !crate::live_index::query::is_personal_tooling_path(path))
-}
-
-/// The untracked paths `live` does not know.
-///
-/// `live` is the caller's CAPTURED publication — the same bundle that produced
-/// the response beside this verdict — so "not in the index" cannot disagree
-/// with the rows the receipt names. Taking a `&LiveIndex` rather than the
-/// server is what enforces that: this function has no route to
-/// `SharedIndexHandle`, so a second, later read is a compile error rather than
-/// something a reviewer has to catch.
-fn untracked_paths_not_in_index(repo: &crate::git::GitRepo, live: &LiveIndex) -> Vec<String> {
-    let Ok(mut paths) = repo.untracked_paths() else {
-        return Vec::new();
-    };
-
-    paths.retain(|path| live.get_file(path).is_none());
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-fn untracked_file_diagnostic(paths: &[String]) -> Option<String> {
-    let first = paths.first()?;
-    Some(format!(
-        "untracked file may match: {} untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"{}\", new_file=true).",
-        paths.len(),
-        first
-    ))
-}
-
-fn append_untracked_file_diagnostic(output: &mut String, paths: &[String]) {
-    if let Some(diagnostic) = untracked_file_diagnostic(paths) {
-        output.push_str("\n\n");
-        output.push_str(&diagnostic);
-    }
-}
-
-fn untracked_path_matches_search_files_query(path: &str, query: &str) -> bool {
-    let normalized_query = normalize_untracked_search_path(query);
-    if normalized_query.is_empty() {
-        return false;
-    }
-
-    let is_glob = normalized_query.contains('*')
-        || normalized_query.contains('?')
-        || normalized_query.contains('[');
-    if is_glob
-        && let Ok(glob) = globset::GlobBuilder::new(&normalized_query)
-            .literal_separator(false)
-            .build()
-    {
-        return glob.compile_matcher().is_match(path);
-    }
-
-    let path_lower = path.to_ascii_lowercase();
-    let normalized_query_lower = normalized_query.to_ascii_lowercase();
-    let has_path_context = normalized_query.contains('/');
-    if path_lower == normalized_query_lower
-        || (has_path_context && path_lower.ends_with(&normalized_query_lower))
-    {
-        return true;
-    }
-
-    let tokens: Vec<String> = normalized_query
-        .split(|ch: char| ch == '/' || ch.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let Some(basename_token) = tokens.last() else {
-        return false;
-    };
-    let component_tokens = if tokens.len() > 1 {
-        &tokens[..tokens.len() - 1]
-    } else {
-        &[][..]
-    };
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if file_name.eq_ignore_ascii_case(basename_token)
-        && component_tokens
-            .iter()
-            .all(|component| untracked_path_has_component(path, component))
-    {
-        return true;
-    }
-
-    if basename_token.len() >= 3 {
-        let file_stem = Path::new(path)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("");
-        if file_stem.to_ascii_lowercase().starts_with(basename_token) {
-            return true;
-        }
-    }
-
-    tokens.iter().all(|token| path_lower.contains(token))
 }
 
 fn matching_untracked_paths_for_search_files(
@@ -1566,120 +607,19 @@ fn matching_untracked_paths_for_search_files(
     let Ok(repo) = crate::git::GitRepo::open(&repo_root) else {
         return Vec::new();
     };
-    untracked_paths_not_in_index(&repo, live)
-        .into_iter()
-        .filter(|path| {
-            untracked_common_path_filters_allow(path, include_vendor, include_personal_tooling)
-                && untracked_path_matches_search_files_query(path, query)
-        })
-        .collect()
+    crate::index_lifecycle::guidance::search::matching_untracked_paths_for_search_files(
+        &repo,
+        live,
+        query,
+        include_vendor,
+        include_personal_tooling,
+    )
 }
 
-fn untracked_text_path_allowed(path: &str, options: &search::TextSearchOptions) -> bool {
-    let classification = FileClassification::for_code_path(path);
-    options.path_scope.matches(path)
-        && options.search_scope.allows(&classification)
-        && options.noise_policy.allows(&classification)
-        && (options.noise_policy.include_vendor || !crate::live_index::query::is_vendor_path(path))
-        && (options.include_personal_tooling
-            || !crate::live_index::query::is_personal_tooling_path(path))
-        && options
-            .language_filter
-            .as_ref()
-            .is_none_or(|language| language_for_path(path).as_ref() == Some(language))
-        && untracked_text_globs_allow(path, options)
-}
-
-fn untracked_text_globs_allow(path: &str, options: &search::TextSearchOptions) -> bool {
-    let include_matches = match options.glob.as_deref() {
-        Some(pattern) => globset::GlobBuilder::new(pattern)
-            .literal_separator(false)
-            .build()
-            .map(|glob| glob.compile_matcher().is_match(path))
-            .unwrap_or(false),
-        None => true,
-    };
-    let exclude_matches = match options.exclude_glob.as_deref() {
-        Some(pattern) => globset::GlobBuilder::new(pattern)
-            .literal_separator(false)
-            .build()
-            .map(|glob| glob.compile_matcher().is_match(path))
-            .unwrap_or(false),
-        None => false,
-    };
-    include_matches && !exclude_matches
-}
-
-fn whole_word_contains(haystack: &str, needle: &str) -> bool {
-    haystack.match_indices(needle).any(|(idx, matched)| {
-        let before_is_word = haystack[..idx]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| ch == '_' || ch.is_alphanumeric());
-        let after_idx = idx + matched.len();
-        let after_is_word = haystack[after_idx..]
-            .chars()
-            .next()
-            .is_some_and(|ch| ch == '_' || ch.is_alphanumeric());
-        !before_is_word && !after_is_word
-    })
-}
-
-fn untracked_text_matches(
-    content: &str,
-    query: Option<&str>,
-    terms: Option<&[String]>,
-    is_regex: bool,
-    options: &search::TextSearchOptions,
-) -> bool {
-    let case_sensitive = options.case_sensitive.unwrap_or(is_regex);
-    if is_regex {
-        let Some(pattern) = query.map(str::trim).filter(|pattern| !pattern.is_empty()) else {
-            return false;
-        };
-        return regex::RegexBuilder::new(pattern)
-            .case_insensitive(!case_sensitive)
-            .build()
-            .map(|regex| regex.is_match(content))
-            .unwrap_or(false);
-    }
-
-    let normalized_terms: Vec<&str> = match terms {
-        Some(raw_terms) if !raw_terms.is_empty() => raw_terms
-            .iter()
-            .map(|term| term.trim())
-            .filter(|term| !term.is_empty())
-            .collect(),
-        _ => query
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(|text| vec![text])
-            .unwrap_or_default(),
-    };
-    if normalized_terms.is_empty() {
-        return false;
-    }
-
-    if case_sensitive {
-        if options.whole_word {
-            normalized_terms
-                .iter()
-                .any(|term| whole_word_contains(content, term))
-        } else {
-            normalized_terms.iter().any(|term| content.contains(term))
-        }
-    } else {
-        let lowered = content.to_lowercase();
-        normalized_terms.iter().any(|term| {
-            let lowered_term = term.to_lowercase();
-            if options.whole_word {
-                whole_word_contains(&lowered, &lowered_term)
-            } else {
-                lowered.contains(&lowered_term)
-            }
-        })
-    }
-}
+use crate::index_lifecycle::guidance::search::{
+    append_untracked_file_diagnostic,
+    matching_untracked_paths_for_search_text as shared_untracked_text_sweep,
+};
 
 fn matching_untracked_paths_for_search_text(
     server: &SymForgeServer,
@@ -1700,23 +640,10 @@ fn matching_untracked_paths_for_search_text(
         return Vec::new();
     };
 
-    // The caller's own regex is evaluated against this content, so an anchored
-    // pattern recovers a refused file character by character from nothing but
-    // which paths come back. The gate runs BEFORE any matching: a refusal drops
-    // the path from the sweep entirely, disclosing neither content nor
-    // existence-by-match.
-    untracked_paths_not_in_index(&repo, live)
-        .into_iter()
-        .filter(|path| untracked_text_path_allowed(path, options))
-        .filter(|path| {
-            crate::protocol::read_gate::admit_worktree_text_without_lines(live, &repo, path)
-                .ok()
-                .flatten()
-                .is_some_and(|content| {
-                    untracked_text_matches(&content, query, terms, is_regex, options)
-                })
-        })
-        .collect()
+    // The gate runs BEFORE any matching; see the shared sweep.
+    shared_untracked_text_sweep(&repo, live, query, terms, is_regex, options, &mut |path| {
+        crate::protocol::read_gate::admit_worktree_text_without_lines(live, &repo, path)
+    })
 }
 
 struct AdmissionDegradationView {
@@ -2086,38 +1013,8 @@ fn render_search_text_output(
     auto_detected_regex: bool,
     auto_corrected_regex: bool,
 ) -> String {
-    let envelope = match &result {
-        Ok(result) if !result.files.is_empty() => {
-            let guard = Arc::clone(&generation.live);
-            Some(search_format::format_search_envelope(
-                &search_text_match_type_label(
-                    structural,
-                    is_regex,
-                    terms,
-                    auto_detected_regex,
-                    auto_corrected_regex,
-                    options.ranked,
-                ),
-                search_format::SourceAuthority::from_freshness(&generation.freshness),
-                search_parse_state_for_paths(
-                    &guard,
-                    result.files.iter().map(|file| file.path.as_str()),
-                ),
-                &search_completeness_label(result.overflow_count, result.suppressed_by_noise),
-                &search_scope_summary(
-                    &options.path_scope,
-                    options.language_filter.as_ref(),
-                    &options.noise_policy,
-                    options.include_personal_tooling,
-                    options.glob.as_deref(),
-                    options.exclude_glob.as_deref(),
-                    options.ranked,
-                ),
-                &search_text_evidence(result),
-            ))
-        }
-        _ => None,
-    };
+    // The zero-hit untracked sweep reads this server's git root; the rest of
+    // the rendering is the shared engine the embedded facade also runs.
     let matching_untracked_paths = match &result {
         Ok(result) if result.files.is_empty() && result.suppressed_by_noise == 0 => {
             matching_untracked_paths_for_search_text(
@@ -2132,35 +1029,19 @@ fn render_search_text_output(
         }
         _ => Vec::new(),
     };
-    let confidence = if auto_corrected_regex {
-        0.75f32
-    } else if is_regex && auto_detected_regex {
-        0.80
-    } else if is_regex {
-        0.85
-    } else if options.ranked {
-        0.80
-    } else {
-        0.95
-    };
-    let output = format::search_text_result_view(
+    crate::index_lifecycle::guidance::search::render_search_text_output(
+        generation,
         result,
+        query,
+        structural,
         group_by,
         terms,
-        Some(confidence),
-        format::SearchSuggestionContext {
-            regex: is_regex,
-            include_tests: options.noise_policy.include_tests,
-            multi_word_literal: !is_regex
-                && query.is_some_and(|q| q.trim().contains(char::is_whitespace)),
-        },
-    );
-    let mut rendered = match envelope {
-        Some(envelope) => format!("{envelope}\n\n{output}"),
-        None => output,
-    };
-    append_untracked_file_diagnostic(&mut rendered, &matching_untracked_paths);
-    rendered
+        options,
+        is_regex,
+        auto_detected_regex,
+        auto_corrected_regex,
+        &matching_untracked_paths,
+    )
 }
 
 fn sidecar_state_for_server(server: &SymForgeServer) -> SidecarState {
@@ -2203,31 +1084,6 @@ fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
     // binary we cannot introspect statically.)
     report.our_version = Some(env!("CARGO_PKG_VERSION").to_string());
     Some(report)
-}
-
-/// Read-only `.gitignore` hygiene status for the health `gitignore_hygiene=`
-/// field (source-binding-and-state.md Health contract). `None` when unbound.
-/// Explicit-protected roots are not applicable (hygiene never touches a
-/// protected root); every other bound root is observed without mutation via
-/// `ObserveOnly` — the same code path bind/init use, never a second checker.
-fn gitignore_hygiene_status(
-    repo_root: Option<&Path>,
-    placement: Option<&crate::domain::StatePlacement>,
-) -> Option<&'static str> {
-    let root = repo_root?;
-    if matches!(
-        crate::protocol::format::placement_authorization(placement),
-        Some(crate::domain::SourceAccessMode::ExplicitProtected)
-    ) {
-        return Some("not_applicable_explicit_protected");
-    }
-    Some(
-        crate::gitignore_hygiene::reconcile_project_gitignore(
-            root,
-            crate::gitignore_hygiene::GitignoreHygieneAuthority::ObserveOnly,
-        )
-        .status_label(),
-    )
 }
 
 /// Extract the `version=<token>` value emitted on the runtime-status line of a
@@ -3890,12 +2746,9 @@ impl SymForgeServer {
             return refusal;
         }
         if params.0.estimate == Some(true) {
-            let with_co = params.0.include_co_changes.unwrap_or(false);
-            let co_limit = params.0.co_changes_limit.unwrap_or(10) as usize;
-            let est = 200 + if with_co { co_limit * 13 } else { 0 };
-            return format!(
-                "Estimate for analyze_file_impact: ~{} tokens (include_co_changes={})",
-                est, with_co
+            return crate::index_lifecycle::guidance::file_impact::estimate_text(
+                params.0.include_co_changes.unwrap_or(false),
+                params.0.co_changes_limit.unwrap_or(10) as usize,
             );
         }
         // Gate on one queryable baseline before the sidecar await. The impact
@@ -3932,31 +2785,12 @@ impl SymForgeServer {
 
         // Append co-changes if requested
         if params.0.include_co_changes.unwrap_or(false) {
-            let temporal = Arc::clone(&generation.code_signals.temporal);
-            match temporal.state {
-                crate::live_index::git_temporal::GitTemporalState::Ready => {
-                    let limit = params.0.co_changes_limit.unwrap_or(10) as usize;
-                    let path = params.0.path.as_str();
-                    match temporal.files.get(path) {
-                        Some(history) => {
-                            result.push_str("\n\n");
-                            result.push_str(&format::co_changes_result_view(path, history, limit));
-                        }
-                        None => {
-                            result.push_str("\n\nNo git co-change data found for this file.");
-                        }
-                    }
-                }
-                crate::live_index::git_temporal::GitTemporalState::Pending
-                | crate::live_index::git_temporal::GitTemporalState::Computing => {
-                    result.push_str(
-                        "\n\nGit temporal data is still loading. Co-changes unavailable.",
-                    );
-                }
-                crate::live_index::git_temporal::GitTemporalState::Unavailable(ref reason) => {
-                    result.push_str(&format!("\n\nGit temporal data unavailable: {reason}"));
-                }
-            }
+            crate::index_lifecycle::guidance::file_impact::append_co_changes(
+                &mut result,
+                &generation.code_signals.temporal,
+                params.0.path.as_str(),
+                params.0.co_changes_limit.unwrap_or(10) as usize,
+            );
         }
 
         self.session_context.record_summary_output(
@@ -4025,55 +2859,12 @@ impl SymForgeServer {
                 Err(message) => return message,
             }
         };
+        let output = crate::index_lifecycle::guidance::search::render_symbol_search(
+            &generation,
+            &execution,
+            query_str,
+        );
         let result = execution.result;
-        let options = execution.options;
-        let hidden_noise_count = execution.suppressed_by_noise;
-        // Browse ordering is owned by the engine (search::search_symbols_with_options),
-        // which ranks browse results by importance (reference count -> kind -> path ->
-        // line). Do NOT re-sort here: a tool-level re-sort would override that order and
-        // reintroduce the symbol_kind_priority display-kind mismatch ("fn" -> 0.1). (018 US2)
-        let envelope = if result.hits.is_empty() {
-            None
-        } else {
-            let guard = Arc::clone(&generation.live);
-            Some(search_format::format_search_envelope(
-                search_symbols_match_type_label(&result, is_browse),
-                search_format::SourceAuthority::from_freshness(&generation.freshness),
-                search_parse_state_for_paths(
-                    &guard,
-                    result.hits.iter().map(|hit| hit.path.as_str()),
-                ),
-                &search_completeness_label(result.overflow_count, hidden_noise_count),
-                &search_scope_summary(
-                    &options.path_scope,
-                    options.language_filter.as_ref(),
-                    &options.noise_policy,
-                    options.include_personal_tooling,
-                    None,
-                    None,
-                    false,
-                ),
-                &search_symbols_evidence(&result),
-            ))
-        };
-        let output = format::search_symbols_result_view(&result, query_str);
-        let output = match envelope {
-            Some(envelope) => format!("{envelope}\n\n{output}"),
-            None => output,
-        };
-        let output = if execution.text_fallback.is_empty() {
-            output
-        } else {
-            let paths: Vec<_> = execution
-                .text_fallback
-                .iter()
-                .map(|(path, line)| format!("{path}:{line}"))
-                .collect();
-            format!(
-                "{output}\n\nText path fallback (sparse symbol hits):\n{}",
-                paths.join("\n")
-            )
-        };
         self.record_tool_savings_named(
             "search_symbols",
             format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
@@ -4741,8 +3532,6 @@ impl SymForgeServer {
             return "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files).".to_string();
         }
 
-        let rank_by_path_cochange = params.0.rank_by.as_deref() == Some("path+cochange");
-        let rank_by_frecency = params.0.rank_by.as_deref() == Some("frecency");
         let ranked = {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
@@ -4754,103 +3543,22 @@ impl SymForgeServer {
                 true,
             )
         };
-        let view = ranked.view;
-        let hidden_noise_count = ranked.hidden_noise_count;
-        let cochange_evidence = ranked.cochange_evidence;
-        let frecency_evidence = ranked.frecency_evidence;
-        let ranking_diagnostics = ranked.ranking_diagnostics;
-        let debug_ranking = ranking_diagnostics.explain;
-        let envelope = match &view {
-            SearchFilesView::Found {
-                hits,
-                overflow_count,
-                ..
-            } => {
-                let guard = Arc::clone(&generation.live);
-                let scope = match params.0.current_file.as_deref() {
-                    Some(current_file) => {
-                        format!("ranked indexed file paths; current file boost `{current_file}`")
-                    }
-                    None => "ranked indexed file paths".to_string(),
-                };
-                Some(search_format::format_search_envelope(
-                    search_files_match_type_label(&view),
-                    // The two composite labels already differ from the bare
-                    // "current index" sentinel, so they never collapse the
-                    // envelope; only the plain arm needed measuring. They do
-                    // still say "current" unconditionally — worth revisiting
-                    // once every lane derives its own prefix.
-                    if rank_by_path_cochange {
-                        search_format::SourceAuthority::never_collapse(
-                            "current index + optional coupling store",
-                        )
-                    } else if rank_by_frecency {
-                        search_format::SourceAuthority::never_collapse(
-                            "current index + optional frecency history",
-                        )
-                    } else {
-                        search_format::SourceAuthority::from_freshness(&generation.freshness)
-                    },
-                    search_parse_state_for_paths(&guard, hits.iter().map(|hit| hit.path.as_str())),
-                    &search_completeness_label(*overflow_count, hidden_noise_count),
-                    &search_files_scope_summary(scope, include_vendor, include_personal_tooling),
-                    &search_paths_evidence(hits.iter().map(|hit| hit.path.as_str())),
-                ))
-            }
-            _ => None,
-        };
-        let output = format::search_files_result_view(&view);
-        let had_envelope = envelope.is_some();
-        let mut result = match envelope {
-            Some(envelope) => format!("{envelope}\n\n{output}"),
-            None => output,
-        };
-        if !had_envelope {
-            append_search_files_filter_summary(
-                &mut result,
-                include_vendor,
-                include_personal_tooling,
-            );
-        }
-        if let Some(evidence) = cochange_evidence.as_ref() {
-            result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(evidence));
-        }
-        if let Some(evidence) = frecency_evidence.as_ref() {
-            result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(evidence));
-        }
-        if let Some(evidence) = ranking_diagnostics.evidence.as_ref() {
-            result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(evidence));
-        }
-        if debug_ranking {
-            result.push_str("\n\n");
-            result.push_str(&search_files_ranking_explanation(
-                &view,
-                params.0.rank_by.as_deref(),
-                cochange_evidence.as_ref(),
-                frecency_evidence.as_ref(),
-            ));
-        }
-        if let Some(note) = search_files_hidden_noise_note(
-            hidden_noise_count,
+        let result = crate::index_lifecycle::guidance::file_search::render_ranked_files(
+            &generation,
+            ranked,
+            &params.0,
             include_vendor,
             include_personal_tooling,
-        ) {
-            result.push_str("\n\n");
-            result.push_str(&note);
-        }
-        if matches!(view, SearchFilesView::NotFound { .. }) {
-            let matching_untracked_paths = matching_untracked_paths_for_search_files(
-                self,
-                &generation.live,
-                &params.0.query,
-                include_vendor,
-                include_personal_tooling,
-            );
-            append_untracked_file_diagnostic(&mut result, &matching_untracked_paths);
-        }
+            || {
+                matching_untracked_paths_for_search_files(
+                    self,
+                    &generation.live,
+                    &params.0.query,
+                    include_vendor,
+                    include_personal_tooling,
+                )
+            },
+        );
         self.session_context.record_summary_output(
             "search_files",
             (result.len() / 4).min(u32::MAX as usize) as u32,
@@ -4865,58 +3573,13 @@ impl SymForgeServer {
         result
     }
 
-    /// Resolve the co-change anchor for a fused-find `search_files` step.
-    ///
-    /// US4 find fusion: the STEL planner is index-free, so it emits the
-    /// `search_files` path step with `rank_by="path+cochange"` but NO
-    /// `anchor_path`. Anchor resolution belongs where the index lives — here.
-    ///
-    /// The path matcher reads a multi-word query as `component…/basename`, so a
-    /// fuzzy bag of words whose trailing token is not a file basename (e.g.
-    /// `"stel planner find"`) yields no path candidates. To stay robust to token
-    /// order we try the full query first, then each individual token, and take
-    /// the first top Tier-1 path hit. `search_files`'s own
-    /// `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR=basename` gate still decides whether
-    /// the boost applies, so a weak anchor degrades to pure path ranking with no
-    /// special-casing. Returns `None` when nothing path-like matches.
-    ///
-    /// Reads only the index path view (never `get_*`), so this stays on the
-    /// frecency-neutral discovery surface.
-    pub(crate) fn resolve_find_fusion_cochange_anchor(&self, query: &str) -> Option<String> {
-        let guard = self.index.data_plane().read();
-        let top_hit = |q: &str| -> Option<String> {
-            match guard.capture_search_files_view(q, 5, None, None) {
-                SearchFilesView::Found { hits, .. } => hits
-                    .into_iter()
-                    .find(|hit| hit.tier != SearchFilesTier::MetadataOnly)
-                    .map(|hit| hit.path),
-                _ => None,
-            }
-        };
-        if let Some(hit) = top_hit(query) {
-            return Some(hit);
-        }
-        query
-            .split_whitespace()
-            .filter(|tok| tok.chars().any(char::is_alphanumeric))
-            .find_map(top_hit)
-    }
-
     /// Task 4 Step 5: whether a planned facade step's tool accepts the single
     /// `project` selector the facade routes — the daemon's single-project
     /// routed set plus the set-valued discovery verbs (which take `project`
     /// too). A plan containing any other tool refuses project routing
     /// all-or-nothing rather than part-routing the chain.
     fn facade_step_accepts_project(tool: &str) -> bool {
-        crate::daemon::single_project_routed_tool(tool)
-            || matches!(
-                tool,
-                "search_symbols"
-                    | "search_text"
-                    | "search_knowledge"
-                    | "find_references"
-                    | "search_files"
-            )
+        crate::stel::runtime::facade_step_accepts_project(tool)
     }
 
     /// Inject the resolved co-change anchor into a fused-find `search_files` step.
@@ -4940,54 +3603,12 @@ impl SymForgeServer {
         args: &serde_json::Value,
         may_use_local_project_state: bool,
     ) -> serde_json::Value {
-        let is_fusion_path_step = tool == "search_files"
-            && args.get("rank_by").and_then(serde_json::Value::as_str) == Some("path+cochange")
-            && args.get("anchor_path").is_none();
-        if !is_fusion_path_step {
-            return args.clone();
-        }
-        let query = args
-            .get("query")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let mut args = args.clone();
-        let Some(map) = args.as_object_mut() else {
-            return args;
-        };
-        if !may_use_local_project_state {
-            // A healthy daemon can route the primitive to a foreign project,
-            // but this adapter's index still belongs to its home project. Drop
-            // the speculative co-change mode rather than deriving target args
-            // from a home-only anchor.
-            map.remove("rank_by");
-            return args;
-        }
-        match self.resolve_find_fusion_cochange_anchor(query) {
-            Some(anchor) => {
-                // Retarget the path side to the anchor's basename STEM. The stem
-                // names the anchor's own basename, so the anchor clears the
-                // `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR=basename` gate (via the
-                // SF-006 stem-equals-basename anchor promotion), while files
-                // that share the stem prefix (a common co-change-partner naming
-                // pattern) remain candidates the boost can promote. Falls back
-                // to the full anchor path when it has no usable stem.
-                let path_query = std::path::Path::new(&anchor)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .filter(|stem| stem.len() >= 3)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| anchor.clone());
-                map.insert("query".to_string(), serde_json::Value::String(path_query));
-                map.insert("anchor_path".to_string(), serde_json::Value::String(anchor));
-            }
-            None => {
-                // No path-like anchor → pure path ranking on the original query.
-                // Drop the co-change request so search_files does not emit a
-                // fallback-evidence note for a speculative request.
-                map.remove("rank_by");
-            }
-        }
-        args
+        crate::stel::runtime::inject_find_fusion_cochange_anchor(
+            &self.index.data_plane().read(),
+            tool,
+            args,
+            may_use_local_project_state,
+        )
     }
 
     /// US5 economics grounding (010 FR-014, D2): stamp real target byte sizes onto
@@ -5015,63 +3636,7 @@ impl SymForgeServer {
     /// Resolution is deterministic for a fixed index state (same query + same repo
     /// ⇒ same sizes ⇒ same decision; Constitution IV).
     fn ground_plan_economics(&self, plan: &mut crate::stel::StelPlan) {
-        let guard = self.index.data_plane().read();
-        if !guard.is_ready() {
-            return;
-        }
-        for step in &mut plan.steps {
-            if !step.index_refs.is_empty() {
-                continue;
-            }
-            // Only single-file read tools have a "read this one file" manual
-            // baseline. Symbol-name resolution applies to `get_symbol` only;
-            // `find_references` shares the `name` arg but is a multi-file trace.
-            let resolve_symbol = step.tool == "get_symbol";
-            if !matches!(
-                step.tool.as_str(),
-                "get_file_context" | "get_file_content" | "get_symbol"
-            ) {
-                continue;
-            }
-            let resolved_path = step
-                .args
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    if !resolve_symbol {
-                        return None;
-                    }
-                    // Resolve a path-less `get_symbol` step to the file the symbol
-                    // is defined in, but only when exactly one file defines it —
-                    // an ambiguous symbol has no single manual baseline, so we
-                    // leave it on the plan-only floor.
-                    let name = step
-                        .args
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())?;
-                    let candidates = symbol_candidate_paths(&guard, name);
-                    if candidates.len() == 1 {
-                        candidates.into_iter().next()
-                    } else {
-                        None
-                    }
-                });
-            let Some(path) = resolved_path else {
-                continue;
-            };
-            if let Some(file) = guard.capture_shared_file(&path) {
-                step.index_refs
-                    .push(crate::stel::controller::index_ref_for_target(
-                        path,
-                        file.content.len() as u64,
-                    ));
-            }
-        }
+        crate::stel::runtime::ground_plan_economics(&self.index.data_plane().read(), plan)
     }
 
     fn project_id_for_root(root: &Path) -> String {
@@ -5176,13 +3741,12 @@ impl SymForgeServer {
         // user-visible health report.
         let source_set = self.index.data_plane().published_source_set();
         let generation = source_set.current_generation();
-        let published = Arc::clone(&generation.health);
         // Capture before `session_id` is consumed: a `Some` session id means the
         // report is served through a daemon session (membership authority
         // applies); local in-process reports carry `None`.
         let session_is_daemon = session_id.is_some();
         let runtime_status = self.runtime_status_for(
-            &published,
+            &generation.health,
             generation.project_generation,
             mode,
             project_id,
@@ -5190,19 +3754,31 @@ impl SymForgeServer {
             project_root,
         );
         let watcher_guard = self.watcher_info.lock();
-        let rejected_stale_mutations = self.index.data_plane().current_rejected_stale_mutations();
-        let mut result = format::health_report_from_published_state_windowed(
-            &published,
-            &watcher_guard,
-            rejected_stale_mutations,
-            quarantine_window,
-        );
-        result.push('\n');
-        result.push_str(&format::format_runtime_status(&runtime_status));
-        result.push_str(&self.health_trust_diagnostics());
+        let repo_root = self.capture_repo_root();
+        let placement = self.capture_state_placement();
+        let persistence = *self.persistence_health.read();
+        let inputs = format::HealthReportInputs {
+            source_set: &source_set,
+            watcher: &watcher_guard,
+            rejected_stale_mutations: self.index.data_plane().current_rejected_stale_mutations(),
+            runtime_status: &runtime_status,
+            repo_root: repo_root.as_deref(),
+            placement: placement.as_ref(),
+            persistence,
+            session_is_daemon,
+            worktree_routing: worktree_routing_health_status(),
+            curation_health: self.curation_coordinator.health_line(
+                self.index.data_plane(),
+                repo_root.as_deref(),
+                placement.as_ref(),
+                persistence,
+            ),
+        };
+
+        let mut after_runtime = self.health_trust_diagnostics();
         let sidecar_status = sidecar_status_for_server(self);
-        result.push('\n');
-        result.push_str(&format::format_sidecar_status(&sidecar_status));
+        after_runtime.push('\n');
+        after_runtime.push_str(&format::format_sidecar_status(&sidecar_status));
         if mode == format::RuntimeMode::LocalProcess
             && matches!(
                 sidecar_status.liveness,
@@ -5210,7 +3786,7 @@ impl SymForgeServer {
                     | crate::sidecar::port_file::SidecarLiveness::NoSidecar
             )
         {
-            result.push_str(
+            after_runtime.push_str(
                 " (informational: local-process mode keeps no sidecar; hooks fail open by design)",
             );
         }
@@ -5220,141 +3796,57 @@ impl SymForgeServer {
             let snap = stats.summary();
             let savings = format::format_token_savings(&snap);
             if !savings.is_empty() {
-                result.push('\n');
-                result.push_str(&savings);
+                after_runtime.push('\n');
+                after_runtime.push_str(&savings);
             }
 
             // Append per-tool call counts.
             let counts = stats.tool_call_counts();
             let counts_section = format::format_tool_call_counts(&counts);
             if !counts_section.is_empty() {
-                result.push('\n');
-                result.push_str(&counts_section);
+                after_runtime.push('\n');
+                after_runtime.push_str(&counts_section);
             }
 
             // Append per-tool token efficiency breakdown.
             let token_details = stats.tool_token_details();
             let breakdown = format::format_tool_token_breakdown(&token_details);
             if !breakdown.is_empty() {
-                result.push('\n');
-                result.push_str(&breakdown);
+                after_runtime.push('\n');
+                after_runtime.push_str(&breakdown);
             }
         }
 
-        let adoption =
-            crate::cli::hook::load_hook_adoption_snapshot(self.capture_repo_root().as_deref());
+        let adoption = crate::cli::hook::load_hook_adoption_snapshot(repo_root.as_deref());
         let adoption_section = format::format_hook_adoption(&adoption);
         if !adoption_section.is_empty() {
-            result.push('\n');
-            result.push_str(&adoption_section);
-        }
-
-        // Append git temporal summary.
-        result.push('\n');
-        result.push_str(&format::git_temporal_health_line(
-            &generation.code_signals.temporal,
-        ));
-
-        let capabilities = {
-            let repo_root = self.capture_repo_root();
-            let project_state = self.capture_project_state_dir();
-            capability_status_report(
-                &generation.live,
-                repo_root.as_deref(),
-                project_state.as_ref(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&capabilities.full_text());
-        let curation_health = {
-            let repo_root = self.capture_repo_root();
-            let state_placement = self.capture_state_placement();
-            self.curation_coordinator.health_line(
-                self.index.data_plane(),
-                repo_root.as_deref(),
-                state_placement.as_ref(),
-                *self.persistence_health.read(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&curation_health);
-
-        // Feature 020 repository-knowledge health (M-001): manifest, dispositions,
-        // source set, bridge, temporal, authority hygiene, plus source-binding/
-        // runtime state. All read from the entry capture; nothing recomputed.
-        let rk_placement = self.capture_state_placement();
-        let rk_root = self.capture_repo_root();
-        let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
-        let binding_view = format::SourceBindingHealthView {
-            bound: rk_root.is_some(),
-            placement: rk_placement.as_ref(),
-            persistence: *self.persistence_health.read(),
-            session_id: &runtime_status.session_id,
-            daemon_session: session_is_daemon,
-            query_ready: published.status_label() == "Ready",
-            gitignore_hygiene: rk_gitignore,
-        };
-        result.push('\n');
-        result.push_str(&format::format_repository_knowledge_health(
-            &source_set,
-            &binding_view,
-            crate::live_index::store::configured_inflight_byte_budget(),
-        ));
-
-        // Append worktree-awareness misuse counter (rolling last-hour window).
-        result.push('\n');
-        result.push_str(&format!(
-            "── Worktree-awareness misuse ──\nedit tool calls without working_directory (last hour): {}",
-            self.worktree_misuse.current_window_count(),
-        ));
-        result.push('\n');
-        result.push_str(&Self::secret_dismissals_line(rk_root.as_deref()));
-
-        // Append frecency diagnostics when SYMFORGE_FRECENCY=1. The feature-flag
-        // guard mirrors the one in `frecency::bump`; when the flag is unset,
-        // the health output remains compact unless the feature is explicitly enabled.
-        if std::env::var(crate::live_index::frecency::FRECENCY_FLAG_ENV).as_deref() == Ok("1")
-            && let Some(project_state) = self.capture_project_state_dir()
-            && let Ok(store) = crate::live_index::frecency::FrecencyStore::open(
-                &crate::live_index::frecency::frecency_db_path(&project_state),
-            )
-        {
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            if let Ok(top) = store.top_frecent(10, now_ts) {
-                result.push('\n');
-                result.push_str(&format::format_frecency_top(&top));
-            }
-            // "Last 10 frecency bumps" is additionally gated on
-            // the ranking diagnostics default-on policy; it is a debug-only
-            // surface for ranker tuning, not the default health view.
-            if ranking_diagnostics_policy_from_env() == RankingDiagnosticsPolicy::DefaultOn
-                && let Ok(last) = store.last_10_bumps()
-            {
-                result.push('\n');
-                result.push_str(&format::format_frecency_last_bumps(&last));
-            }
+            after_runtime.push('\n');
+            after_runtime.push_str(&adoption_section);
         }
 
         // Surface a version-drift warning when this daemon's binary is older
         // than another installed copy (e.g. an npm-updated package). Read-only;
         // never copies or replaces the binary (see version_registry).
+        let mut trailing = String::new();
         if let Some(drift) = crate::version_registry::drift_banner_default() {
-            result.push('\n');
-            result.push_str(&drift);
+            trailing.push('\n');
+            trailing.push_str(&drift);
         }
 
         // Surface a PATH-shadow warning when a bare `symforge` would run a
         // DIFFERENT install than the binary serving this runtime. Read-only;
         // emits the exact remediation commands, never executes them.
         if let Some(report) = current_exe_shadow_report() {
-            result.push('\n');
-            result.push_str(&crate::path_shadow::format_shadow_warning(&report));
+            trailing.push('\n');
+            trailing.push_str(&crate::path_shadow::format_shadow_warning(&report));
         }
 
-        result
+        let process = format::HealthProcessSections {
+            after_runtime,
+            worktree_misuse: Ok(self.worktree_misuse.current_window_count()),
+            trailing,
+        };
+        format::render_health_report(&inputs, quarantine_window, &process)
     }
 
     fn health_compact_for_runtime(
@@ -5367,10 +3859,9 @@ impl SymForgeServer {
         // T046: same single-capture shape as health_for_runtime.
         let source_set = self.index.data_plane().published_source_set();
         let generation = source_set.current_generation();
-        let published = Arc::clone(&generation.health);
         let session_is_daemon = session_id.is_some();
         let runtime_status = self.runtime_status_for(
-            &published,
+            &generation.health,
             generation.project_generation,
             mode,
             project_id,
@@ -5378,18 +3869,31 @@ impl SymForgeServer {
             project_root,
         );
         let watcher_guard = self.watcher_info.lock();
-        let rejected_stale_mutations = self.index.data_plane().current_rejected_stale_mutations();
-        let mut result = format::health_report_compact_from_published_state(
-            &published,
-            &watcher_guard,
-            rejected_stale_mutations,
-        );
-        result.push('\n');
-        result.push_str(&format::format_runtime_status_compact(&runtime_status));
-        result.push_str(&self.health_trust_diagnostics());
+        let repo_root = self.capture_repo_root();
+        let placement = self.capture_state_placement();
+        let persistence = *self.persistence_health.read();
+        let inputs = format::HealthReportInputs {
+            source_set: &source_set,
+            watcher: &watcher_guard,
+            rejected_stale_mutations: self.index.data_plane().current_rejected_stale_mutations(),
+            runtime_status: &runtime_status,
+            repo_root: repo_root.as_deref(),
+            placement: placement.as_ref(),
+            persistence,
+            session_is_daemon,
+            worktree_routing: worktree_routing_health_status(),
+            curation_health: self.curation_coordinator.health_line(
+                self.index.data_plane(),
+                repo_root.as_deref(),
+                placement.as_ref(),
+                persistence,
+            ),
+        };
+
+        let mut after_runtime = self.health_trust_diagnostics();
         let sidecar_status = sidecar_status_for_server(self);
-        result.push('\n');
-        result.push_str(&format::format_sidecar_status_compact(&sidecar_status));
+        after_runtime.push('\n');
+        after_runtime.push_str(&format::format_sidecar_status_compact(&sidecar_status));
         if mode == format::RuntimeMode::LocalProcess
             && matches!(
                 sidecar_status.liveness,
@@ -5397,7 +3901,7 @@ impl SymForgeServer {
                     | crate::sidecar::port_file::SidecarLiveness::NoSidecar
             )
         {
-            result.push_str(
+            after_runtime.push_str(
                 " (informational: local-process mode keeps no sidecar; hooks fail open by design)",
             );
         }
@@ -5409,7 +3913,7 @@ impl SymForgeServer {
             let total_fires =
                 snap.read_fires + snap.edit_fires + snap.write_fires + snap.grep_fires;
             if total_fires > 0 {
-                result.push_str(&format!(
+                after_runtime.push_str(&format!(
                     "\nToken savings: ~{} tokens saved across {} hook fires",
                     total_saved, total_fires
                 ));
@@ -5418,7 +3922,7 @@ impl SymForgeServer {
             let counts = stats.tool_call_counts();
             let total_tool_calls: usize = counts.iter().map(|(_, count)| *count).sum();
             if total_tool_calls > 0 {
-                result.push_str(&format!(
+                after_runtime.push_str(&format!(
                     "\nTool calls: {} recorded across {} tools",
                     total_tool_calls,
                     counts.len()
@@ -5426,76 +3930,25 @@ impl SymForgeServer {
             }
         }
 
-        let git_temporal = format::git_temporal_health_line(&generation.code_signals.temporal);
-        let git_temporal_summary = git_temporal
-            .lines()
-            .next()
-            .unwrap_or("Git temporal: unknown");
-        result.push_str(&format!(
-            "\n{} | Worktree misuse/hour: {}",
-            git_temporal_summary,
-            self.worktree_misuse.current_window_count()
-        ));
-
-        let capabilities = {
-            let repo_root = self.capture_repo_root();
-            let project_state = self.capture_project_state_dir();
-            capability_status_report(
-                &generation.live,
-                repo_root.as_deref(),
-                project_state.as_ref(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&capabilities.compact_text());
-        let curation_health = {
-            let repo_root = self.capture_repo_root();
-            let state_placement = self.capture_state_placement();
-            self.curation_coordinator.health_line(
-                self.index.data_plane(),
-                repo_root.as_deref(),
-                state_placement.as_ref(),
-                *self.persistence_health.read(),
-            )
-        };
-        result.push('\n');
-        result.push_str(&curation_health);
-
-        // Feature 020 repository-knowledge health (M-001), compact form. Reads
-        // from the entry capture.
-        let rk_placement = self.capture_state_placement();
-        let rk_root = self.capture_repo_root();
-        let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
-        let binding_view = format::SourceBindingHealthView {
-            bound: rk_root.is_some(),
-            placement: rk_placement.as_ref(),
-            persistence: *self.persistence_health.read(),
-            session_id: &runtime_status.session_id,
-            daemon_session: session_is_daemon,
-            query_ready: published.status_label() == "Ready",
-            gitignore_hygiene: rk_gitignore,
-        };
-        result.push('\n');
-        result.push_str(&format::format_repository_knowledge_health_compact(
-            &source_set,
-            &binding_view,
-        ));
-        result.push('\n');
-        result.push_str(&Self::secret_dismissals_line(rk_root.as_deref()));
-
+        let mut trailing = String::new();
         if let Some(drift) = crate::version_registry::drift_banner_default() {
-            result.push('\n');
-            result.push_str(&drift);
+            trailing.push('\n');
+            trailing.push_str(&drift);
         }
 
         // Compact PATH-shadow banner (one line, points at full health for the
         // exact fix). See `health_for_runtime` for the full block.
         if let Some(report) = current_exe_shadow_report() {
-            result.push('\n');
-            result.push_str(&crate::path_shadow::format_shadow_warning_compact(&report));
+            trailing.push('\n');
+            trailing.push_str(&crate::path_shadow::format_shadow_warning_compact(&report));
         }
 
-        result
+        let process = format::HealthProcessSections {
+            after_runtime,
+            worktree_misuse: Ok(self.worktree_misuse.current_window_count()),
+            trailing,
+        };
+        format::render_health_compact(&inputs, &process)
     }
 
     pub(crate) fn health_for_daemon_session(
@@ -7571,44 +6024,33 @@ impl SymForgeServer {
             ..
         } = result;
 
-        let mut output = format::explore_result_view(format::ExploreResultViewInput {
-            label: &display_label,
-            symbol_hits: &symbol_hits,
-            text_hits: &text_hits,
-            related_files: &related_files,
-            enriched_symbols: &enriched_symbols,
-            symbol_impls: &symbol_impls,
-            symbol_deps: &symbol_deps,
-            derived_seed_terms: derived_cluster
-                .as_ref()
-                .map(|cluster| cluster.seed_terms.as_slice())
-                .unwrap_or(&[]),
-            derived_symbols: derived_cluster
-                .as_ref()
-                .map(|cluster| cluster.promoted_symbols.as_slice())
-                .unwrap_or(&[]),
-            enriched_imports: &enriched_imports,
-            symbol_scores: &symbol_scores,
-            derived_seed_files: derived_cluster
-                .as_ref()
-                .map(|cluster| cluster.seed_files.as_slice())
-                .unwrap_or(&[]),
-            depth,
-        });
-
-        if noise_hidden > 0 {
-            output.push_str(&format!(
-                "\n\nNote: {noise_hidden} result(s) from vendor/generated files hidden. Use include_noise=true to include."
-            ));
-        }
-
-        if !output.is_empty() {
-            // SF-STRESS-013: the explore scorer computes match count, kind
-            // weight, term-coverage and path proximity — it does NOT compute
-            // caller density. Drop the inaccurate claim so the footer is honest.
-            output
-                .push_str("\n\nranked by: concept match + symbol-token alignment + path proximity");
-        }
+        let output = crate::index_lifecycle::guidance::search_render::explore_answer(
+            format::ExploreResultViewInput {
+                label: &display_label,
+                symbol_hits: &symbol_hits,
+                text_hits: &text_hits,
+                related_files: &related_files,
+                enriched_symbols: &enriched_symbols,
+                symbol_impls: &symbol_impls,
+                symbol_deps: &symbol_deps,
+                derived_seed_terms: derived_cluster
+                    .as_ref()
+                    .map(|cluster| cluster.seed_terms.as_slice())
+                    .unwrap_or(&[]),
+                derived_symbols: derived_cluster
+                    .as_ref()
+                    .map(|cluster| cluster.promoted_symbols.as_slice())
+                    .unwrap_or(&[]),
+                enriched_imports: &enriched_imports,
+                symbol_scores: &symbol_scores,
+                derived_seed_files: derived_cluster
+                    .as_ref()
+                    .map(|cluster| cluster.seed_files.as_slice())
+                    .unwrap_or(&[]),
+                depth,
+            },
+            noise_hidden,
+        );
 
         self.record_tool_savings_named(
             "explore",
@@ -8374,38 +6816,11 @@ impl SymForgeServer {
     /// placeholder block. `args` is the executed `find_dependents` step args,
     /// whose `path` field is the impact target.
     fn append_impact_intent_cochanges(&self, body: &mut String, args: &serde_json::Value) {
-        const IMPACT_INTENT_COCHANGE_LIMIT: usize = 5;
-
-        let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
-            return;
-        };
-
-        let temporal = self.index.data_plane().git_temporal();
-        match temporal.state {
-            crate::live_index::git_temporal::GitTemporalState::Ready => {
-                let normalized = path.replace('\\', "/");
-                match temporal.files.get(&normalized) {
-                    Some(history) => {
-                        body.push_str("\n\n");
-                        body.push_str(&format::co_changes_result_view(
-                            &normalized,
-                            history,
-                            IMPACT_INTENT_COCHANGE_LIMIT,
-                        ));
-                    }
-                    None => {
-                        body.push_str("\n\nNo git co-change data found for this file.");
-                    }
-                }
-            }
-            crate::live_index::git_temporal::GitTemporalState::Pending
-            | crate::live_index::git_temporal::GitTemporalState::Computing => {
-                body.push_str("\n\nGit temporal data is still loading. Co-changes unavailable.");
-            }
-            crate::live_index::git_temporal::GitTemporalState::Unavailable(ref reason) => {
-                body.push_str(&format!("\n\nGit temporal data unavailable: {reason}"));
-            }
-        }
+        crate::stel::runtime::append_impact_intent_cochanges(
+            &self.index.data_plane().git_temporal(),
+            body,
+            args,
+        )
     }
 
     #[tool(
@@ -8669,18 +7084,7 @@ impl SymForgeServer {
     /// mutation that applied nothing, so every arm is `isError:true` at the
     /// host seam via `into_mutation_call_tool_result`.
     fn mutation_refusal_outcome(text: &str) -> OutcomeClass {
-        let lower = text.to_ascii_lowercase();
-        if lower.contains("symbol not found")
-            || lower.contains("file not found")
-            || lower.contains("file not indexed:")
-            || lower.contains(" not found within symbol ")
-        {
-            OutcomeClass::NotFound
-        } else if text.contains("Ambiguous:") {
-            OutcomeClass::Ambiguous
-        } else {
-            OutcomeClass::InvalidRequest
-        }
+        crate::stel::runtime::mutation_refusal_outcome(text)
     }
 
     fn classify_symforge_edit_outcome(
@@ -8809,11 +7213,7 @@ impl SymForgeServer {
     /// One health/status line carrying ONLY the secret-dismissal record count:
     /// never paths, rule ids, digests, or notes (034 no-echo contract).
     fn secret_dismissals_line(root: Option<&Path>) -> String {
-        match root.map(crate::knowledge::secret_dismissals::dismissal_count) {
-            None => "secret_dismissals: unbound".to_string(),
-            Some(Some(count)) => format!("secret_dismissals: {count}"),
-            Some(None) => "secret_dismissals: store unreadable (all findings withheld)".to_string(),
-        }
+        format::secret_dismissals_line(root)
     }
 
     /// Render the `status` body from THIS server's own index, ledger, and
@@ -8835,24 +7235,6 @@ impl SymForgeServer {
         &self,
         request: &crate::stel::StelStatusRequest,
     ) -> String {
-        // T037 / FR-011 operator reset: clear accumulated calibration BEFORE
-        // rendering, so the surface returns to `Deferred`. MCP-native — a param on
-        // the existing `status` tool, never injected context; never rebuilds the
-        // index (only the calibration tables are cleared).
-        let reset_note = if request.reset_calibration == Some(true) {
-            match self.reset_calibration() {
-                Some(cleared) => Some(format!(
-                    "calibration_reset: cleared {cleared} sample(s) + active tuning (state -> deferred)"
-                )),
-                None => Some(
-                    "calibration_reset: no durable store; in-memory calibration is already deferred"
-                        .to_string(),
-                ),
-            }
-        } else {
-            None
-        };
-
         // Report the surface actually served on THIS connection. In the daemon-
         // proxy topology that is the ADAPTER's profile, threaded in via
         // `request.connection_surface`; this daemon process's own env may differ
@@ -8889,59 +7271,40 @@ impl SymForgeServer {
         let project_root = self
             .capture_repo_root()
             .map(|root| crate::daemon::normalized_path_string(&root));
-        // 013: `mut` — line below reassigns `ctx` with the durable calibration
-        // verdict override (T033/FR-009).
-        let mut ctx = crate::stel::StelStatusContext::from_server(
-            surface_label,
-            &self.project_name,
-            project_root,
-            guard.is_ready(),
-            guard.file_count(),
-            guard.symbol_count(),
-            &ledger,
-            self.session_context.snapshot().total_tokens,
+        let mut trailing_lines: Vec<String> = format::snapshot_verify_status_line(
+            guard.load_source(),
+            &guard.snapshot_verify_state(),
         )
-        // US3/T029: surface the durable ledger subsystem state so
-        // restart-survival is observable from `status` (Unavailable on
-        // stdio/embed; Disabled{reason} for a wired-but-failing store — N-3).
-        .with_durable_ledger(self.durable_ledger_summary_for_status());
-
-        // T033 / FR-009: override the in-memory verdict with the DURABLE one so
-        // `status detail:full` reflects the persisted cross-session calibration
-        // state + active tuning. `None` means no durable store is wired; a wired
-        // store whose sample read fails returns `Deferred` so status never keeps
-        // an in-memory `Tuned` verdict without a readable durable artifact. After
-        // a reset above, the durable read sees zero samples -> `Deferred`.
-        if let Some(verdict) = self.durable_calibration_verdict() {
-            ctx = ctx.with_calibration_verdict(verdict);
-        }
-
-        // Attach the daemon-env divergence (proxy topology only); `None` on
-        // same-env and direct serving so the disclosure line appears strictly on
-        // divergence.
-        ctx.daemon_env_surface = daemon_env_surface;
-
-        // Disclose an ORPHANED daemon: one that still answers but is no longer
-        // the daemon clients discover. `None` for the recorded daemon and for
-        // every non-daemon topology, so the line appears strictly on divergence
-        // — same discipline as the env-surface disclosure above.
-        ctx.orphaned_daemon_pid = crate::daemon::unrecorded_daemon_pid();
-
-        let mut body = crate::stel::format_stel_status(request, &ctx);
-        if let Some(line) =
-            format::snapshot_verify_status_line(guard.load_source(), &guard.snapshot_verify_state())
-        {
-            body.push('\n');
-            body.push_str(&line);
-        }
-        body.push('\n');
-        body.push_str(&Self::secret_dismissals_line(
+        .into_iter()
+        .collect();
+        trailing_lines.push(Self::secret_dismissals_line(
             self.capture_repo_root().as_deref(),
         ));
-        match reset_note {
-            Some(note) => format!("{body}\n{note}"),
-            None => body,
-        }
+        // The shared STEL runtime runs the operator reset, the durable verdict
+        // override (T033 / FR-009) and the durable-ledger line (US3/T029) in
+        // the same order for every host.
+        crate::stel::runtime::render_status_body(
+            request,
+            crate::stel::runtime::StatusObservation {
+                surface: surface_label,
+                // Attach the daemon-env divergence (proxy topology only); `None`
+                // on same-env and direct serving.
+                daemon_env_surface,
+                // Disclose an ORPHANED daemon: one that still answers but is no
+                // longer the daemon clients discover. `None` for the recorded
+                // daemon and for every non-daemon topology.
+                orphaned_daemon_pid: crate::daemon::unrecorded_daemon_pid(),
+                project_name: &self.project_name,
+                project_root,
+                index_ready: guard.is_ready(),
+                index_files: guard.file_count(),
+                index_symbols: guard.symbol_count(),
+                ledger: &ledger,
+                session_tokens: self.session_context.snapshot().total_tokens,
+                store: self.stel_ledger_store.as_deref(),
+                trailing_lines,
+            },
+        )
     }
 
     /// Render the proxy-owned `status` line-set from THIS server's OWN ledger +
@@ -9013,15 +7376,7 @@ impl SymForgeServer {
     /// while claiming embed behavior (T038 round-2 cfg-lens finding; both
     /// removed).
     pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
-        match self.reset_calibration() {
-            Some(cleared) => format!(
-                "calibration_reset: cleared {cleared} sample(s) + active tuning (state -> deferred)"
-            ),
-            None => {
-                "calibration_reset: no durable store; in-memory calibration is already deferred"
-                    .to_string()
-            }
-        }
+        crate::stel::runtime::calibration_reset_note(self.reset_calibration())
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -9120,42 +7475,25 @@ impl SymForgeServer {
         tools_called: Option<Vec<String>>,
         tuned: Option<&crate::stel::ledger_store::TunedEstimateConstants>,
     ) -> String {
-        use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision_tuned};
-        use crate::stel::ledger::{
-            LedgerCaptureInput, capture_ledger, format_ledger_envelope_line,
-        };
-
-        let response_tokens = handler::estimate_tokens(body);
-        // T032: record the prediction the predictor ACTUALLY made for this call —
-        // tuned when a validated tuning is in force, static otherwise — so the
-        // ledger's predicted-vs-actual residual reflects the live estimator and
-        // the next tuning pass measures progress against it (hysteresis).
-        let metrics = metrics_for_decision_tuned(
-            plan_summary,
-            decision,
-            plan,
-            response_tokens,
-            session_tokens_served,
-            tuned,
-        );
-        let (event, meta) = capture_ledger(&LedgerCaptureInput {
-            plan,
-            decision,
-            economics: &metrics.economics,
-            selected_tool,
-            tools_called: tools_called.as_deref(),
-            legacy_executed,
-            output_body: body,
-            surface,
-        });
-        self.stel_ledger.lock().push(event.clone());
-        // US3/T028: durable write-through after the in-memory push. Single
-        // ledger path (no double-count); degrades to a logged no-op on a store
-        // error and never fails the request (FR-011). Compile-time no-op on
-        // stdio/embed builds where no durable store is wired.
-        self.persist_ledger_event_durably(&event);
-        let ledger_line = format_ledger_envelope_line(&event, &meta);
-        finalize_symforge_output(metrics, ledger_line, body)
+        crate::stel::runtime::finalize_with_ledger(
+            &self.stel_ledger.lock(),
+            crate::stel::runtime::FacadeLedgerInput {
+                surface,
+                plan,
+                decision,
+                plan_summary,
+                session_tokens_served,
+                body,
+                legacy_executed,
+                selected_tool,
+                tools_called,
+                tuned,
+            },
+            // US3/T028: durable write-through after the in-memory push.
+            // Compile-time no-op on stdio/embed builds where no durable store
+            // is wired.
+            |event| self.persist_ledger_event_durably(event),
+        )
     }
 
     #[tool(
@@ -14638,6 +12976,627 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// MCP side of the embed health parity golden (`tests/embed_health.rs`):
+    /// the same three-partial fixture and paging must render the same
+    /// quarantine lines through the MCP `health` / `health_compact` handlers.
+    #[tokio::test]
+    async fn health_quarantine_paging_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join(".git")).expect("git marker");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .expect("source");
+        for name in ["a", "b", "c"] {
+            fs::write(
+                repo.path().join(format!("src/broken_{name}.rs")),
+                "pub fn broken( {\n",
+            )
+            .expect("broken source");
+        }
+        let server = SymForgeServer::new(
+            crate::live_index::LiveIndex::load(repo.path()).expect("index"),
+            "embed-parity-golden".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(repo.path().to_path_buf()),
+            None,
+        );
+        let full = server
+            .health(Parameters(super::HealthInput {
+                quarantine_limit: Some(1),
+                quarantine_offset: Some(1),
+            }))
+            .await;
+        for golden in [
+            "Watcher: off",
+            "Parse/span quarantine registry: total=3 unexpected_partial=3 failed=0 showing=1 offset=1 omitted=1",
+            "\n  2. src/broken_b.rs [unexpected_partial] - repo-owned partial parse; best-effort symbols may be incomplete",
+            "\n  (use health with quarantine_limit/quarantine_offset to page the full list)",
+            "\nCapabilities:\n  frecency: ",
+            "\n── Worktree-awareness misuse ──\nedit tool calls without working_directory (last hour): 0",
+        ] {
+            assert!(
+                full.contains(golden),
+                "MCP health lacks `{golden}`:\n{full}"
+            );
+        }
+        let compact = server.health_compact().await;
+        assert!(
+            compact.contains(
+                "\nParse/span quarantine: total=3 unexpected_partial=3 failed=0 showing=3 offset=0 omitted=0"
+            ),
+            "{compact}"
+        );
+        assert!(compact.contains("| Worktree misuse/hour: 0"), "{compact}");
+    }
+
+    fn embed_parity_server(root: &Path) -> SymForgeServer {
+        SymForgeServer::new(
+            crate::live_index::LiveIndex::load(root).expect("index"),
+            "embed-parity-golden".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(root.to_path_buf()),
+            None,
+        )
+    }
+
+    /// MCP `status` parity: the same golden `tests/embed_stel_status.rs` asserts
+    /// against an embedded source with a durable store. `{root}`, `{project}` and
+    /// `{version}` stand for the bound root, the project name and the version.
+    const STATUS_FULL_GOLDEN: &str = "── stel status ──\n\
+        surface: full\n\
+        symforge_version: {version}\n\
+        phase0_go: 07b42a8\n\
+        phase0_evidence: 08f7d14\n\
+        l1_planner: wired\n\
+        l2_economics: wired\n\
+        l3_bypass: wired\n\
+        l4_ledger: in_memory\n\
+        handler_symforge: wired\n\
+        handler_status: wired\n\
+        handler_symforge_edit: preview-and-apply\n\
+        ledger_events: 0\n\
+        project_root: {root}\n\
+        index_ready: true\n\
+        index_files: 1\n\
+        deferred: b_results\n\
+        superseded: multi_step_planner (client agentic loop + find-fusion)\n\
+        ──\n\
+        project: {project}\n\
+        index_symbols: 1\n\
+        session_tokens: 0\n\
+        last_ledger_decision: none\n\
+        last_ledger_route: none\n\
+        durable_ledger: events=0 net_vs_manual=0 sessions=0\n\
+        ── calibration (observational) ──\n\
+        events: 0\n\
+        serve: 0\n\
+        degrade: 0\n\
+        bypass: 0\n\
+        cache_hit: 0\n\
+        pff_bypass: 0\n\
+        legacy_executed: 0\n\
+        schema_tokens: 0\n\
+        invoke_tokens: 0\n\
+        predicted_net_total: 0\n\
+        predicted_response_tokens: 0\n\
+        actual_response_tokens: 0\n\
+        calibration: deferred\n\
+        tuning: deferred\n\
+        ──\n\
+        secret_dismissals: 0";
+
+    #[test]
+    fn status_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .expect("source");
+        let root = dunce::canonicalize(repo.path()).expect("canonical root");
+        let store = crate::stel::ledger_store::StelLedgerStore::open_in_memory("status-golden")
+            .expect("in-memory durable store");
+        let server = embed_parity_server(&root).with_stel_ledger_store(std::sync::Arc::new(store));
+        let golden = STATUS_FULL_GOLDEN
+            .replace("{version}", env!("CARGO_PKG_VERSION"))
+            .replace("{root}", &crate::daemon::normalized_path_string(&root))
+            .replace("{project}", "embed-parity-golden");
+        let full = crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+            connection_surface: Some("full".to_string()),
+            ..Default::default()
+        };
+        // The daemon-instance line depends on this test process's runtime
+        // records; the embedded host reports that line not applicable.
+        let render = |request: &crate::stel::StelStatusRequest| {
+            server
+                .render_stel_status_body(request)
+                .lines()
+                .filter(|line| !line.starts_with("daemon_instance: "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(render(&full), golden);
+        let reset = crate::stel::StelStatusRequest {
+            reset_calibration: Some(true),
+            ..full
+        };
+        assert_eq!(
+            render(&reset),
+            format!(
+                "{golden}\ncalibration_reset: cleared 0 sample(s) + active tuning (state -> deferred)"
+            )
+        );
+    }
+
+    /// MCP side of the compact-facade golden shared with
+    /// `tests/embed_symforge.rs`: every case in
+    /// `tests/fixtures/stel_facade/parity.json` renders the recorded text, with
+    /// the bound root written as `{root}`, and reports the recorded outcome.
+    /// The observed answers are also written to
+    /// `target/stel-facade-parity.observed.json` for diagnosis.
+    #[tokio::test]
+    async fn symforge_facade_matches_embed_parity_golden() {
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("stel_facade")
+            .join("parity.json");
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&fixture_path).expect("fixture"))
+                .expect("fixture json");
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            fixture["lib_rs"].as_str().expect("lib_rs"),
+        )
+        .expect("source");
+        let root = dunce::canonicalize(repo.path()).expect("canonical root");
+        let server = embed_parity_server(&root);
+        let root_text = crate::daemon::normalized_path_string(&root);
+        let expected = fixture.clone();
+        for case in fixture["cases"].as_array_mut().expect("cases") {
+            let request: crate::stel::StelRequest =
+                serde_json::from_value(case["request"].clone()).expect("request");
+            let result = server
+                .symforge_stel_handler(&request)
+                .await
+                .expect("facade answer");
+            let outcome = super::super::result_status::observed_outcome_class(result.meta.as_ref());
+            let serialized = serde_json::to_value(&result).expect("serialize");
+            case["outcome"] = serde_json::to_value(outcome).expect("outcome");
+            case["rendered"] = serde_json::Value::String(
+                tool_result_text(&serialized).replace(&root_text, "{root}"),
+            );
+        }
+        let observed = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("stel-facade-parity.observed.json");
+        let _ = fs::write(
+            &observed,
+            serde_json::to_string_pretty(&fixture).expect("observed json"),
+        );
+        assert_eq!(
+            fixture,
+            expected,
+            "MCP facade answers drifted from the shared golden; see {}",
+            observed.display()
+        );
+    }
+
+    /// MCP side of the embed edit-plan golden (`tests/embed_edit_plan.rs`):
+    /// symbol, `path::name`, file and missing targets render the same plan.
+    #[tokio::test]
+    async fn edit_plan_matches_embed_parity_golden() {
+        const SYMBOL_GOLDEN: &str = "── Edit Plan ──\nFound 1 symbol(s) matching 'target':\n  Function target in src/lib.rs (lines 1-1)\n\nReferences: 1 call sites across the project\n\nSuggested tool sequence:\n  1. get_symbol_context(name=\"target\", path=\"src/lib.rs\", bundle=true) — understand full context\n  2. Choose edit approach:\n     - Small change: edit_within_symbol(path=\"src/lib.rs\", name=\"target\", old_text=..., new_text=...)\n     - Full rewrite: replace_symbol_body(path=\"src/lib.rs\", name=\"target\", new_body=...)\n     - Rename: batch_rename(path=\"src/lib.rs\", name=\"target\", new_name=..., dry_run=true)\n     - Delete: delete_symbol(path=\"src/lib.rs\", name=\"target\", dry_run=true)\n  3. analyze_file_impact(path=\"src/lib.rs\") — verify changes";
+        const QUALIFIED_GOLDEN: &str = "── Edit Plan ──\nFound 1 symbol(s) matching 'src/lib.rs::target':\n  Function target in src/lib.rs (lines 1-1)\n\nReferences: 1 call sites across the project\n\nSuggested tool sequence:\n  1. get_symbol_context(name=\"target\", path=\"src/lib.rs\", bundle=true) — understand full context\n  2. Choose edit approach:\n     - Small change: edit_within_symbol(path=\"src/lib.rs\", name=\"target\", old_text=..., new_text=...)\n     - Full rewrite: replace_symbol_body(path=\"src/lib.rs\", name=\"target\", new_body=...)\n     - Rename: batch_rename(path=\"src/lib.rs\", name=\"target\", new_name=..., dry_run=true)\n     - Delete: delete_symbol(path=\"src/lib.rs\", name=\"target\", dry_run=true)\n  3. analyze_file_impact(path=\"src/lib.rs\") — verify changes";
+        const FILE_GOLDEN: &str = "── Edit Plan ──\nFound file: notes.md\n\nSuggested approach:\n  1. get_file_context(path=\"notes.md\", sections=[\"outline\"]) — understand structure\n  2. get_symbol(path=\"notes.md\", name=\"<target>\") — read specific symbols\n  3. Use edit_within_symbol or replace_symbol_body for changes\n  4. analyze_file_impact(path=\"notes.md\") — verify";
+        const MISSING_GOLDEN: &str = "── Edit Plan ──\nTarget 'does_not_exist' not found.\nTry: search_symbols(query=\"...\") to find the correct name.";
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn target() {}\n\npub fn caller() {\n    target();\n}\n",
+        )
+        .expect("source");
+        fs::write(repo.path().join("notes.md"), "# Notes\n").expect("notes");
+        let server = embed_parity_server(repo.path());
+        let plan = |target: &str| {
+            server.edit_plan(Parameters(
+                serde_json::from_value(serde_json::json!({ "target": target })).expect("input"),
+            ))
+        };
+        assert_eq!(plan("target").await, SYMBOL_GOLDEN);
+        assert_eq!(plan("src/lib.rs::target").await, QUALIFIED_GOLDEN);
+        assert_eq!(plan("notes.md").await, FILE_GOLDEN);
+        assert_eq!(plan("does_not_exist").await, MISSING_GOLDEN);
+    }
+
+    /// `src/lib.rs` before and after the impact edit: the same byte length, so
+    /// with its mtime restored the embedded worker's scout cannot see the edit.
+    const IMPACT_LIB_BEFORE: &str =
+        "// round 3\npub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n";
+    const IMPACT_LIB_AFTER: &str =
+        "// round 3\npub fn alpha() -> u32 {\n    7\n}\n\npub fn zeta() -> u32 {\n    2\n}\n";
+    const IMPACT_EDIT_GOLDEN: &str = "── Impact: src/lib.rs ──\nStatus: changed on disk since last index\n  [Added]   fn zeta\n  [Changed] fn alpha\n  [Removed] fn beta\n\nCallers to review:\n  Callers of alpha():\n    src/caller.rs  line 2";
+    const IMPACT_ESTIMATE_GOLDEN: &str =
+        "Estimate for analyze_file_impact: ~265 tokens (include_co_changes=true)";
+    const IMPACT_MISSING_GOLDEN: &str = "File not found on disk: src/missing.rs";
+    const IMPACT_NEW_FILE_GOLDEN: &str =
+        "Language: Rust\nSymbols: 1 fn, 1 struct\n[Indexed, 0 callers yet]";
+
+    /// Three commits in which `src/lib.rs` and `src/other.rs` change together.
+    fn impact_parity_fixture(root: &Path) {
+        let repository = git2::Repository::init(root).expect("init");
+        fs::create_dir_all(root.join("src")).expect("src");
+        for round in 1..=3 {
+            let files = [
+                (".gitignore", ".symforge/\n".to_string()),
+                (
+                    "src/lib.rs",
+                    IMPACT_LIB_BEFORE.replace("round 3", &format!("round {round}")),
+                ),
+                (
+                    "src/other.rs",
+                    format!("pub fn other() -> u32 {{\n    {round}\n}}\n"),
+                ),
+                (
+                    "src/caller.rs",
+                    "pub fn call() -> u32 {\n    alpha()\n}\n".to_string(),
+                ),
+            ];
+            let mut index = repository.index().expect("index");
+            for (path, content) in &files {
+                fs::write(root.join(path), content).expect("write");
+                index.add_path(Path::new(path)).expect("add");
+            }
+            index.write().expect("index write");
+            let tree = repository
+                .find_tree(index.write_tree().expect("tree"))
+                .expect("find tree");
+            let signature =
+                git2::Signature::now("Fixture", "fixture@example.invalid").expect("sig");
+            let parent = repository
+                .head()
+                .ok()
+                .and_then(|head| head.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+            repository
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "round",
+                    &tree,
+                    &parents,
+                )
+                .expect("commit");
+        }
+    }
+
+    fn assert_impact_edit_golden(text: &str) {
+        let co_change_tail = format!(
+            "Ownership:\n  Fixture: 3 commits (100%)\n\nCo-changing files (top 1):\n  {:<50} coupling: 1.000  (3 shared commits)",
+            "src/other.rs"
+        );
+        assert!(
+            text.starts_with(&format!(
+                "{IMPACT_EDIT_GOLDEN}\n\nGit temporal data for src/lib.rs\n\nChurn score: "
+            )),
+            "{text}"
+        );
+        assert!(text.contains(" (3 commits)\nLast commit: "), "{text}");
+        assert!(text.ends_with(&co_change_tail), "{text}");
+    }
+
+    /// MCP side of the embed impact golden (`tests/embed_file_impact.rs`): a
+    /// modified file with co-changes, the estimate, a missing new file and a new
+    /// file render the same text.
+    #[tokio::test]
+    async fn analyze_file_impact_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        impact_parity_fixture(repo.path());
+        let server = embed_parity_server(repo.path());
+        let data_plane = server.index.data_plane();
+        let fence = data_plane.git_temporal_publication_fence();
+        assert!(data_plane.update_git_temporal_at_fence(
+            crate::live_index::git_temporal::GitTemporalIndex::compute(repo.path()),
+            &fence,
+        ));
+        let impact = |input: serde_json::Value| {
+            server.analyze_file_impact(Parameters(serde_json::from_value(input).expect("input")))
+        };
+
+        let lib = repo.path().join("src/lib.rs");
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&lib).expect("meta"));
+        fs::write(&lib, IMPACT_LIB_AFTER).expect("edit");
+        filetime::set_file_mtime(&lib, mtime).expect("mtime");
+        let edited = impact(serde_json::json!({
+            "path": "src/lib.rs",
+            "include_co_changes": true,
+            "co_changes_limit": 5
+        }))
+        .await;
+        assert_impact_edit_golden(&edited);
+
+        let estimate = impact(serde_json::json!({
+            "path": "src/lib.rs",
+            "estimate": true,
+            "include_co_changes": true,
+            "co_changes_limit": 5
+        }))
+        .await;
+        assert_eq!(estimate, IMPACT_ESTIMATE_GOLDEN);
+        let missing =
+            impact(serde_json::json!({ "path": "src/missing.rs", "new_file": true })).await;
+        assert_eq!(missing, IMPACT_MISSING_GOLDEN);
+
+        fs::write(
+            repo.path().join("src/fresh.rs"),
+            "pub struct Fresh;\n\npub fn make() -> Fresh {\n    Fresh\n}\n",
+        )
+        .expect("fresh");
+        let fresh = impact(serde_json::json!({ "path": "src/fresh.rs", "new_file": true })).await;
+        assert_eq!(fresh, IMPACT_NEW_FILE_GOLDEN);
+    }
+
+    /// MCP side of the embed freshen golden (`tests/embed_disk_parity.rs`):
+    /// a write completed after the publication is served fresh by the
+    /// synchronous exact-path freshen.
+    #[tokio::test]
+    async fn targeted_read_freshen_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        let file = repo.path().join("lib.rs");
+        fs::write(&file, "pub fn before_write() {}\n").expect("source");
+        let server = embed_parity_server(repo.path());
+        let read = || {
+            server.get_file_content(Parameters(
+                serde_json::from_value(serde_json::json!({ "path": "lib.rs" })).expect("input"),
+            ))
+        };
+        assert!(read().await.contains("before_write"));
+        fs::write(&file, "pub fn after_write() {}\n").expect("rewrite");
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(later))
+            .expect("mtime");
+        let fresh = read().await;
+        assert!(fresh.contains("pub fn after_write() {}"), "{fresh}");
+        assert!(!fresh.contains("before_write"), "{fresh}");
+    }
+
+    /// MCP side of the embed syntax golden (`tests/embed_disk_parity.rs`): the
+    /// indexed report, the authoritative disk parse of an unindexed file, and
+    /// the admission refusal with its withheld findings.
+    #[tokio::test]
+    async fn validate_file_syntax_matches_embed_parity_golden() {
+        let repo = init_git_repo();
+        for dir in ["src", "ignored", "config"] {
+            fs::create_dir_all(repo.path().join(dir)).expect("dir");
+        }
+        fs::write(repo.path().join(".gitignore"), "ignored/\n").expect("ignore");
+        fs::write(repo.path().join("src/broken.rs"), "pub fn broken( {\n").expect("src");
+        fs::write(
+            repo.path().join("ignored/scratch.rs"),
+            "pub fn scratch( {\n",
+        )
+        .expect("ignored");
+        fs::write(
+            repo.path().join("config/app.json"),
+            "{\n  \"password\": \"S3cretValue9xAb\"\n}\n",
+        )
+        .expect("secret");
+        let server = embed_parity_server(repo.path());
+        let validate = |path: &str| {
+            let input: super::ValidateFileSyntaxInput =
+                serde_json::from_value(serde_json::json!({ "path": path })).expect("input");
+            let server = &server;
+            async move {
+                crate::protocol::withheld::with_withheld_scope(async {
+                    let text = server.validate_file_syntax(Parameters(input)).await;
+                    (text, crate::protocol::withheld::take_pending_withheld())
+                })
+                .await
+            }
+        };
+        assert_eq!(
+            validate("src/broken.rs").await.0,
+            "Syntax validation: src/broken.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn broken( {` (line 1, column 1)\nByte span: 0..16\nSymbols extracted: 0"
+        );
+        assert_eq!(
+            validate("ignored/scratch.rs").await.0,
+            "Syntax validation: ignored/scratch.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn scratch( {` (line 1, column 1)\nByte span: 0..17\nSymbols extracted: 0"
+        );
+        let (refusal, withheld) = validate("config/app.json").await;
+        assert!(
+            refusal.starts_with("Content withheld by admission policy: config/app.json."),
+            "{refusal}"
+        );
+        let withheld = withheld.expect("withheld findings");
+        assert_eq!(withheld.path, "config/app.json");
+        let lines: Vec<(u32, u32, &str)> = withheld
+            .findings
+            .iter()
+            .map(|finding| {
+                (
+                    finding.line_start,
+                    finding.line_end,
+                    finding.rule_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(lines, vec![(2, 2, "secret.context-assignment")]);
+    }
+
+    /// MCP side of the embed untracked-sweep golden
+    /// (`tests/embed_disk_parity.rs`): a zero-hit search over a publication
+    /// that does not know a late untracked file names it.
+    #[tokio::test]
+    async fn search_text_untracked_sweep_matches_embed_parity_golden() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("src");
+        fs::write(repo.path().join("src/lib.rs"), "pub fn indexed() {}\n").expect("lib");
+        let server = embed_parity_server(repo.path());
+        fs::write(
+            repo.path().join("src/late_0.rs"),
+            "fn late() { let _ = \"late_needle_0\"; }\n",
+        )
+        .expect("late");
+        let rendered = server
+            .search_text(Parameters(
+                serde_json::from_value(serde_json::json!({ "query": "late_needle_0" }))
+                    .expect("input"),
+            ))
+            .await;
+        assert!(
+            rendered.ends_with(
+                "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"src/late_0.rs\", new_file=true)."
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// The query-parity fixture repository: each commit's files committed with a
+    /// fixed signature and time, so commit ids are the same on every run and
+    /// host, then the working-tree files written uncommitted. Returns the commit
+    /// ids in order.
+    fn query_parity_repo(spec: &serde_json::Value, root: &Path) -> Vec<String> {
+        let repository = git2::Repository::init(root).expect("init");
+        let signature = git2::Signature::new(
+            "Fixture",
+            "fixture@example.invalid",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .expect("signature");
+        let mut commits: Vec<String> = Vec::new();
+        for commit in spec["commits"].as_array().expect("commits") {
+            let mut index = repository.index().expect("index");
+            for (path, content) in commit["files"].as_object().expect("files") {
+                let file = root.join(path);
+                fs::create_dir_all(file.parent().expect("parent")).expect("dir");
+                fs::write(&file, content.as_str().expect("content")).expect("write");
+                index.add_path(Path::new(path)).expect("add");
+            }
+            index.write().expect("index write");
+            let tree = repository
+                .find_tree(index.write_tree().expect("tree"))
+                .expect("find tree");
+            let parent = commits.last().map(|id| {
+                repository
+                    .find_commit(git2::Oid::from_str(id).unwrap())
+                    .unwrap()
+            });
+            let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+            let id = repository
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "fixture",
+                    &tree,
+                    &parents,
+                )
+                .expect("commit");
+            commits.push(id.to_string());
+        }
+        for (path, content) in spec["working"].as_object().expect("working") {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().expect("parent")).expect("dir");
+            fs::write(&file, content.as_str().expect("content")).expect("write");
+        }
+        commits
+    }
+
+    /// Substitute `{base}` and `{target}` with the fixture's commit ids.
+    fn query_parity_input(input: &serde_json::Value, commits: &[String]) -> serde_json::Value {
+        let text = serde_json::to_string(input)
+            .unwrap()
+            .replace("{base}", &commits[0])
+            .replace("{target}", &commits[1]);
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Fold the fixture's commit ids and root back to placeholders.
+    fn query_parity_text(text: &str, commits: &[String], root: &Path) -> String {
+        let mut folded = text.to_string();
+        for (id, placeholder) in commits.iter().zip(["{base}", "{target}"]) {
+            folded = folded.replace(id.as_str(), placeholder);
+            for short in [12, 8, 7] {
+                folded = folded.replace(&id[..short], placeholder);
+            }
+        }
+        let mut roots = vec![root.display().to_string()];
+        if let Ok(canonical) = dunce::canonicalize(root) {
+            roots.push(canonical.display().to_string());
+        }
+        let slashed: Vec<String> = roots.iter().map(|root| root.replace('\\', "/")).collect();
+        roots.extend(slashed);
+        roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+        for root in roots {
+            folded = folded.replace(&root, "{root}");
+        }
+        folded
+    }
+
+    /// MCP side of the query golden shared with `tests/embed_query_goldens.rs`
+    /// (`tests/fixtures/query_parity/changes.json`): `what_changed`,
+    /// `diff_symbols`, `detect_impact`, `explore`, `ask` and the
+    /// `symforge://repo/changes/uncommitted` resource on one fixture. Observed
+    /// answers are written to `target/query-parity.observed.json`.
+    #[tokio::test]
+    async fn change_queries_match_embed_parity_golden() {
+        let fixture_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/query_parity/changes.json");
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&fixture_path).unwrap()).unwrap();
+        let expected = fixture.clone();
+        let repos = fixture["repos"].clone();
+        for case in fixture["cases"].as_array_mut().unwrap() {
+            let repo = TempDir::new().expect("temp repo");
+            let commits = query_parity_repo(&repos[case["repo"].as_str().unwrap()], repo.path());
+            let server = embed_parity_server(repo.path());
+            let text = match case["resource"].as_str() {
+                Some(uri) => {
+                    let result = server.read_resource_uri(uri).await.expect("resource");
+                    match &result.contents[0] {
+                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                            text.clone()
+                        }
+                        other => panic!("expected text resource, got {other:?}"),
+                    }
+                }
+                None => {
+                    server
+                        .dispatch_tool_for_tests(
+                            case["tool"].as_str().unwrap(),
+                            query_parity_input(&case["input"], &commits),
+                        )
+                        .await
+                }
+            };
+            case["expected"] =
+                serde_json::Value::String(query_parity_text(&text, &commits, repo.path()));
+        }
+        let observed =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/query-parity.observed.json");
+        let _ = fs::write(&observed, serde_json::to_string_pretty(&fixture).unwrap());
+        assert_eq!(
+            fixture,
+            expected,
+            "MCP change and query answers drifted from the shared golden; see {}",
+            observed.display()
+        );
     }
 
     #[tokio::test]

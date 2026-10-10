@@ -2,12 +2,19 @@
 
 pub(crate) mod changes;
 pub mod conventions;
+pub(crate) mod edit_body;
+pub(crate) mod edit_plan;
+pub(crate) mod edit_route;
 pub(crate) mod exploration;
 pub mod explore;
+pub(crate) mod file_impact;
 pub(crate) mod file_read;
 pub(crate) mod file_search;
 pub(crate) mod filters;
+pub(crate) mod freshen;
+pub(crate) mod health;
 pub(crate) mod impact;
+pub mod outcome;
 pub(crate) mod read_admission_format;
 pub(crate) mod read_context;
 pub(crate) mod read_contract;

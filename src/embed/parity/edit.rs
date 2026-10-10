@@ -4,10 +4,50 @@
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
+use crate::embed::lifecycle::embed_edit_body::{EditBodyParts, RouteContext};
 use crate::embed::lifecycle::public_api::EmbedSourceRefusal;
 
 mod wire;
 pub use wire::*;
+
+/// MCP's answer text for one edit: the text the matching MCP edit tool
+/// (`replace_symbol_body`, `insert_symbol`, `delete_symbol`,
+/// `edit_within_symbol`, `batch_edit`, `batch_insert`, `batch_rename`) returns
+/// for the same edit, composed by the shared renderer the MCP handlers use.
+/// It serializes as [`EditBody::render`]; `Debug` shows its length only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EditBody {
+    pub(crate) parts: EditBodyParts,
+}
+
+impl EditBody {
+    pub(crate) fn new(parts: EditBodyParts) -> Self {
+        Self { parts }
+    }
+
+    /// The answer for this edit made without `working_directory`. An edit
+    /// routed with [`EmbeddedSourceHandle::route_edit`] renders through
+    /// [`EditRoute::render_body`] instead, which adds MCP's reroute report.
+    ///
+    /// [`EmbeddedSourceHandle::route_edit`]: crate::embed::EmbeddedSourceHandle::route_edit
+    pub fn render(&self) -> String {
+        self.parts.render(None)
+    }
+}
+
+impl std::fmt::Debug for EditBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditBody")
+            .field("rendered_bytes", &self.render().len())
+            .finish()
+    }
+}
+
+impl serde::Serialize for EditBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.render())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +74,10 @@ pub struct EditGuard {
     pub(crate) authority_publication: crate::lifecycle_identity::PublicationIdentity,
     pub(crate) content_hash: String,
     pub(crate) symbol_hash: String,
+    /// The name as the plan's target spelled it (for example `Type::method`
+    /// for the resolved `method`). MCP's single-symbol answers report the
+    /// requested spelling, so the answers here do too.
+    pub(crate) selector: String,
 }
 
 impl EditGuard {
@@ -295,6 +339,8 @@ pub struct BatchEditPreview {
     pub rendered: String,
     pub truncated: bool,
     pub redacted: bool,
+    /// MCP's dry-run answer (`batch_edit`, `batch_insert` or `batch_rename`).
+    pub body: EditBody,
 }
 
 impl std::fmt::Debug for BatchEditPreview {
@@ -307,6 +353,7 @@ impl std::fmt::Debug for BatchEditPreview {
             .field("rendered_bytes", &self.rendered.len())
             .field("truncated", &self.truncated)
             .field("redacted", &self.redacted)
+            .field("body", &self.body)
             .finish()
     }
 }
@@ -316,6 +363,34 @@ pub struct BatchEditApplied {
     pub files: Vec<(String, String)>,
     pub replayed: bool,
     pub refresh_ticket_identity: Option<String>,
+    /// MCP's answer for the whole batch. Each part of a routed batch carries
+    /// the same answer as [`RoutedBatchApplied::body`].
+    pub body: EditBody,
+}
+
+/// One admitted source's share of a batch whose per-action
+/// `working_directory` routes files into different worktrees (MCP
+/// `batch_edit` / `batch_insert` per-edit overrides): the source, the write
+/// authority the host minted for it, and the actions that land there, with
+/// guards rebased onto it by `EmbeddedSourceHandle::rebase_guard`.
+pub struct RoutedBatchPart<'a, R = BatchEditRequest> {
+    pub handle: &'a crate::embed::EmbeddedSourceHandle,
+    pub authority: &'a EditApplyAuthority,
+    pub request: R,
+    /// The `working_directory` this part's actions carried, exactly as given;
+    /// `None` when they carried none. It is reported, never resolved: the
+    /// host chose `handle` for it.
+    pub working_directory: Option<PathBuf>,
+}
+
+/// A routed batch's result, one entry per part in request order. All parts
+/// share one staged commit, one rollback and one replay record.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RoutedBatchApplied {
+    pub parts: Vec<BatchEditApplied>,
+    pub replayed: bool,
+    /// MCP's answer for the batch, with each routed file's reroute report.
+    pub body: EditBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -337,6 +412,9 @@ pub struct StructuralPreview {
     pub rendered: String,
     pub truncated: bool,
     pub redacted: bool,
+    /// MCP's dry-run answer (`insert_symbol`, `delete_symbol` or
+    /// `edit_within_symbol`).
+    pub body: EditBody,
 }
 
 impl std::fmt::Debug for StructuralPreview {
@@ -352,6 +430,7 @@ impl std::fmt::Debug for StructuralPreview {
             .field("rendered_bytes", &self.rendered.len())
             .field("truncated", &self.truncated)
             .field("redacted", &self.redacted)
+            .field("body", &self.body)
             .finish()
     }
 }
@@ -362,6 +441,8 @@ pub struct StructuralApplied {
     pub post_image_hash: String,
     pub replayed: bool,
     pub refresh_ticket_identity: Option<String>,
+    /// MCP's answer for this edit.
+    pub body: EditBody,
 }
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize)]
@@ -376,6 +457,8 @@ pub struct ReplacePreview {
     pub rendered: String,
     pub truncated: bool,
     pub redacted: bool,
+    /// MCP's `replace_symbol_body` dry-run answer.
+    pub body: EditBody,
 }
 
 impl std::fmt::Debug for ReplacePreview {
@@ -391,6 +474,7 @@ impl std::fmt::Debug for ReplacePreview {
             .field("rendered_bytes", &self.rendered.len())
             .field("truncated", &self.truncated)
             .field("redacted", &self.redacted)
+            .field("body", &self.body)
             .finish()
     }
 }
@@ -422,6 +506,63 @@ impl EditApplyAuthority {
     }
 }
 
+/// A host-admitted source an edit may be routed into with
+/// `working_directory`, with the write authority the host minted for it after
+/// its own room rights check. Like federation's admitted list, this list is the
+/// complete authority boundary: routing never discovers or opens another root.
+#[derive(Clone, Copy)]
+pub struct AdmittedEditTarget<'a> {
+    pub handle: &'a crate::embed::EmbeddedSourceHandle,
+    pub authority: &'a EditApplyAuthority,
+}
+
+/// MCP's resolved edit target for a supplied `working_directory`
+/// (`crate::worktree::ResolvedTarget` plus the requested directory).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ResolvedEditTarget {
+    pub working_directory: PathBuf,
+    /// `true` when the edit lands in another worktree than the bound source.
+    pub rerouted: bool,
+    /// Absolute path the edit writes (`wrote_to`).
+    pub target_path: PathBuf,
+    /// Absolute path of the bound source's copy.
+    pub indexed_path: PathBuf,
+}
+
+impl ResolvedEditTarget {
+    /// The exact suffix MCP appends to an edit given `working_directory`.
+    pub fn reroute_suffix(&self) -> String {
+        crate::embed::lifecycle::guidance::edit_route::format_reroute_suffix(
+            Some(&self.working_directory),
+            self.rerouted,
+            &self.target_path,
+            &self.indexed_path,
+        )
+    }
+}
+
+/// Where one edit path lands. `target` is `None` when `working_directory` is
+/// the bound source itself; otherwise run the operation on `target.handle`
+/// with `target.authority`, after rebasing its guards with
+/// `EmbeddedSourceHandle::rebase_guard`.
+pub struct EditRoute<'a> {
+    pub target: Option<AdmittedEditTarget<'a>>,
+    pub resolved: ResolvedEditTarget,
+    pub(crate) path: String,
+    pub(crate) bound_root: PathBuf,
+    pub(crate) context: RouteContext,
+}
+
+impl EditRoute<'_> {
+    /// MCP's answer for an edit made through this route: the edit's own
+    /// answer with MCP's reroute report, and for an edit rerouted into another
+    /// worktree the source authority, stale-reference warnings, trust suffix
+    /// and impact footer MCP reads from the bound (indexed) project.
+    pub fn render_body(&self, body: &EditBody) -> String {
+        body.parts.render(Some(&self.context))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ReplaceApplied {
     pub path: String,
@@ -429,6 +570,8 @@ pub struct ReplaceApplied {
     pub replayed: bool,
     /// Queued refresh identity; publication completion must be observed separately.
     pub refresh_ticket_identity: Option<String>,
+    /// MCP's `replace_symbol_body` answer for this edit.
+    pub body: EditBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -436,7 +579,9 @@ pub enum EditErrorKind {
     InvalidPath,
     FileNotAdmitted,
     SymbolNotFound,
-    AmbiguousSymbol { candidate_lines: Vec<u32> },
+    AmbiguousSymbol {
+        candidate_lines: Vec<u32>,
+    },
     UnsafeContent,
     StaleGeneration,
     StaleContent,
@@ -448,8 +593,24 @@ pub enum EditErrorKind {
     Cancelled,
     InvalidReplacement,
     ConflictingTargeting,
-    OccurrenceOutOfRange { requested: u32, total: usize },
+    OccurrenceOutOfRange {
+        requested: u32,
+        total: usize,
+    },
     TextNotFound,
+    /// `working_directory` names no host-admitted source (MCP
+    /// `WorkingDirectoryNotARecognizedWorktree`; embed never opens it).
+    WorkingDirectoryNotAdmitted,
+    /// The admitted source is not a worktree of the bound repository.
+    WorkingDirectoryNotAWorktree,
+    /// The routed worktree has no admitted file at the edit path (MCP
+    /// `TargetFileMissing`).
+    TargetFileMissing,
+    /// Enforce mode refused the edit: the project's config is untrusted.
+    /// Carries MCP's exact `ProjectConfigTrustEnforced` refusal text.
+    ProjectConfigTrustEnforced {
+        message: String,
+    },
 }
 
 #[derive(Debug)]

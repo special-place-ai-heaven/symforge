@@ -257,18 +257,28 @@ pub(crate) fn compute_detect_impact(
                 });
             };
 
+            // Seeds follow source order, each name once: iterating the maps
+            // themselves listed the same change in a different order on
+            // every call.
             // Added (in current, not base) or modified (body hash differs).
-            for (name, cur_hash) in &current_by_name {
+            let mut seen = std::collections::HashSet::new();
+            for (name, _) in &current_syms {
+                let name = name.as_str();
+                if !seen.insert(name) {
+                    continue;
+                }
                 match base_by_name.get(name) {
                     None => seed(name),
-                    Some(base_hash) if base_hash != cur_hash => seed(name),
+                    Some(base_hash) if Some(base_hash) != current_by_name.get(name) => seed(name),
                     _ => {}
                 }
             }
             // Removed (in base, not current) — seeded so downstream callers
             // of a deleted symbol still appear in the blast radius.
-            for name in base_by_name.keys() {
-                if !current_by_name.contains_key(name) {
+            let mut seen = std::collections::HashSet::new();
+            for (name, _) in &base_syms {
+                let name = name.as_str();
+                if seen.insert(name) && !current_by_name.contains_key(name) {
                     seed(name);
                 }
             }

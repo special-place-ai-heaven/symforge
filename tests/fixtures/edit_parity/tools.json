@@ -1,0 +1,226 @@
+{
+  "files": {
+    "src/lib.rs": "pub mod other;\n\npub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target() + target()\n}\n\npub fn spare() {}\n",
+    "src/other.rs": "use crate::target;\n\npub fn user() -> u32 {\n    target()\n}\n",
+    "src/widget.rs": "pub struct Widget;\n\nimpl Widget {\n    pub fn size(&self) -> u32 {\n        1\n    }\n}\n\npub fn measure(widget: &Widget) -> u32 {\n    widget.size()\n}\n"
+  },
+  "cases": [
+    {
+      "name": "replace preview",
+      "tool": "replace_symbol_body",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "target",
+        "new_body": "pub fn target(x: u32) -> u32 {\n    x\n}",
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:3`\n[DRY RUN] Would replace `target` in src/lib.rs (old: 32 bytes -> new: 38 bytes)"
+    },
+    {
+      "name": "replace apply with stale references",
+      "tool": "replace_symbol_body",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "target",
+        "new_body": "pub fn target(x: u32) -> u32 {\n    x\n}"
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:3`\nsrc/lib.rs — replaced fn `target` (32 → 38 bytes)\n[!] Signature of `target` may have changed — 2 reference(s) to check:\n  src/other.rs:1\n  src/other.rs:4 (in user)\n\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+    },
+    {
+      "name": "insert preview",
+      "tool": "insert_symbol",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "spare",
+        "content": "pub fn added() {}",
+        "position": "after",
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:11`\n[DRY RUN] Would insert after `spare` in src/lib.rs (17 bytes of content)"
+    },
+    {
+      "name": "insert apply",
+      "tool": "insert_symbol",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "spare",
+        "content": "pub fn added() {}",
+        "position": "after"
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:11`\nsrc/lib.rs — inserted after `spare` (17 bytes)\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+    },
+    {
+      "name": "delete preview",
+      "tool": "delete_symbol",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "spare",
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:11`\n[DRY RUN] Would delete `spare` in src/lib.rs (17 bytes)"
+    },
+    {
+      "name": "delete apply",
+      "tool": "delete_symbol",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "spare"
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:11`\nsrc/lib.rs — deleted fn `spare` (17 bytes)\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+    },
+    {
+      "name": "edit within preview with first-of-several note",
+      "tool": "edit_within_symbol",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "caller",
+        "old_text": "target()",
+        "new_text": "target() * 2",
+        "dry_run": true
+      },
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:7`\n[DRY RUN] Would edit within `caller` in src/lib.rs (1 replacement(s))\nNote: `old_text` occurs 2 times within `caller`; this targets the FIRST. Pass `occurrence: N` or `near_line: L` to pick another."
+    },
+    {
+      "name": "edit within apply with first-of-several note",
+      "tool": "edit_within_symbol",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "caller",
+        "old_text": "target()",
+        "new_text": "target() * 2"
+      },
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:7`\nsrc/lib.rs — edited within `caller` (1 replacement(s), 50 → 54 bytes)\nNote: `old_text` occurred 2 times within `caller`; edited the FIRST. Pass `occurrence: N` or `near_line: L` to target another.\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+    },
+    {
+      "name": "batch edit preview",
+      "tool": "batch_edit",
+      "input": {
+        "edits": [
+          {
+            "path": "src/lib.rs",
+            "name": "spare",
+            "operation": {
+              "type": "delete"
+            }
+          },
+          {
+            "path": "src/lib.rs",
+            "name": "target",
+            "operation": {
+              "type": "replace",
+              "new_body": "pub fn target() -> u32 {\n    7\n}"
+            }
+          }
+        ],
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: exact\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: 2 edit target(s) across 1 file(s)\n2 edit(s) across 1 file(s):\n  [DRY RUN] Would src/lib.rs — deleted fn `spare` (17 bytes)\n  [DRY RUN] Would src/lib.rs — replaced fn `target` (32 → 32 bytes)\n\n[impact: 1 dependents]"
+    },
+    {
+      "name": "batch edit apply",
+      "tool": "batch_edit",
+      "input": {
+        "edits": [
+          {
+            "path": "src/lib.rs",
+            "name": "spare",
+            "operation": {
+              "type": "delete"
+            }
+          },
+          {
+            "path": "src/lib.rs",
+            "name": "target",
+            "operation": {
+              "type": "replace",
+              "new_body": "pub fn target() -> u32 {\n    7\n}"
+            }
+          }
+        ]
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: exact\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: transactional write + rollback + reindex\nEvidence: 2 edit target(s) across 1 file(s)\n2 edit(s) across 1 file(s):\n  src/lib.rs — deleted fn `spare` (17 bytes)\n  Tee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n  src/lib.rs — replaced fn `target` (32 → 32 bytes)\n\n[impact: 1 dependents]"
+    },
+    {
+      "name": "batch insert preview",
+      "tool": "batch_insert",
+      "input": {
+        "targets": [
+          {
+            "path": "src/lib.rs",
+            "name": "target"
+          },
+          {
+            "path": "src/lib.rs",
+            "name": "spare"
+          }
+        ],
+        "content": "// marker",
+        "position": "before",
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: exact\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: 2 target(s) across 1 file(s)\n2 edit(s) across 1 file(s):\n  [DRY RUN] Would src/lib.rs — inserted before `spare` (9 bytes)\n  [DRY RUN] Would src/lib.rs — inserted before `target` (9 bytes)\n\n[impact: 1 dependents]"
+    },
+    {
+      "name": "batch insert apply",
+      "tool": "batch_insert",
+      "input": {
+        "targets": [
+          {
+            "path": "src/lib.rs",
+            "name": "target"
+          },
+          {
+            "path": "src/lib.rs",
+            "name": "spare"
+          }
+        ],
+        "content": "// marker",
+        "position": "before"
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: exact\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: transactional write + rollback + reindex\nEvidence: 2 target(s) across 1 file(s)\n2 edit(s) across 1 file(s):\n  src/lib.rs — inserted before `spare` (9 bytes)\n  src/lib.rs — inserted before `target` (9 bytes)\n\n[impact: 1 dependents]"
+    },
+    {
+      "name": "batch rename preview",
+      "tool": "batch_rename",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "target",
+        "new_name": "renamed",
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: constrained\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: definition `src/lib.rs` + project-wide constrained references\nDry run: `target` → `renamed`\n\n── Confident matches (will be applied) — 5 site(s) across 2 file(s) ──\n  src/lib.rs (3 site(s))\n    L3: pub fn target() -> u32 {\n    L8: target() + target()\n    L8: target() + target()\n  src/other.rs (2 site(s))\n    L1: use crate::target;\n    L4: target()\n[impact: 1 dependents]"
+    },
+    {
+      "name": "batch rename apply",
+      "tool": "batch_rename",
+      "input": {
+        "path": "src/lib.rs",
+        "name": "target",
+        "new_name": "renamed"
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: constrained\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: transactional write + rollback + reindex\nEvidence: definition `src/lib.rs` + project-wide constrained references\nRenamed `target` → `renamed` — 5 site(s) across 2 file(s)\n[impact: 1 dependents]"
+    },
+    {
+      "name": "replace through a qualified method selector",
+      "tool": "replace_symbol_body",
+      "input": {
+        "path": "src/widget.rs",
+        "name": "Widget::size",
+        "new_body": "pub fn size(&self, scale: u32) -> u32 {\n    scale\n}"
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/widget.rs:4`\nsrc/widget.rs — replaced fn `Widget::size` (43 → 63 bytes)\nTee snapshot: `<tee>` preserves `src/widget.rs` before this write.\n[impact: 0 dependents]"
+    },
+    {
+      "name": "edit within through a qualified method selector preview",
+      "tool": "edit_within_symbol",
+      "input": {
+        "path": "src/widget.rs",
+        "name": "Widget::size",
+        "old_text": "1",
+        "new_text": "2",
+        "dry_run": true
+      },
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/widget.rs:4`\n[DRY RUN] Would edit within `Widget::size` in src/widget.rs (1 replacement(s))"
+    }
+  ]
+}

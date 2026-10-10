@@ -608,8 +608,7 @@ impl SymForgeServer {
                 // No tokio runtime (sync test / embed context): record inline so
                 // events are never dropped. There is no async worker to protect
                 // here, so blocking is acceptable.
-                store.record(event);
-                Self::maybe_persist_tuning(store);
+                crate::stel::runtime::record_durably_inline(store, event);
             }
         }
     }
@@ -636,72 +635,7 @@ impl SymForgeServer {
     /// and never serves a bad tuning. NO frecency bump (Principle V).
     #[cfg(feature = "server")]
     fn maybe_persist_tuning(store: &crate::stel::ledger_store::StelLedgerStore) {
-        use crate::stel::calibration::{
-            CalibrationVerdict, NO_CORRECTION_FACTOR, PredictionSample, compute_calibration_verdict,
-        };
-        use crate::stel::controller::active_tuning_in_force;
-        use crate::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX};
-
-        // Newest-first current-version samples (excludes pre-013). Bounded by the
-        // retention cap so the pass is O(cap) at worst.
-        let Ok(records) =
-            store.samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX)
-        else {
-            return;
-        };
-        let samples: Vec<PredictionSample> = records.iter().map(PredictionSample::from).collect();
-
-        // In-force correction factor = the active tuning's if present (D13
-        // hysteresis anchor: a re-tune must beat the correction already LIVE),
-        // else the identity 1.0 (no tuning). The validate gate scores a candidate
-        // against this, so a re-tune must out-perform what is already applied.
-        let active = store
-            .load_active_tuning(CURRENT_ESTIMATOR_VERSION)
-            .ok()
-            .flatten();
-        let in_force = active_tuning_in_force(active.clone(), CURRENT_ESTIMATOR_VERSION);
-        let in_force_factor = in_force
-            .as_ref()
-            .map_or(NO_CORRECTION_FACTOR, |c| c.response_correction_factor);
-
-        let (verdict, candidate) = compute_calibration_verdict(&samples, in_force_factor);
-        if !matches!(verdict, CalibrationVerdict::Tuned { .. }) {
-            return;
-        }
-        let Some(mut candidate) = candidate else {
-            return;
-        };
-
-        // Idempotence / oscillation guard: if the accepted candidate's correction
-        // equals what is already stored, do not re-write (the validate gate already
-        // requires a >= margin beat over the in-force factor, so this only fires on
-        // an exact-equal stored factor — pure churn avoidance).
-        if let Some(existing) = active.as_ref()
-            && existing.response_correction_factor == candidate.response_correction_factor
-        {
-            return;
-        }
-
-        candidate.tuned_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        // Audited gated action (FR-008): store_active_tuning persists the new
-        // correction factor, sample_size, error_before/after (the held-out real
-        // residual baseline + corrected), tuned_at. Degrades silently on a store
-        // error (never fails a request; never a bad tuning).
-        if let Err(error) = store.store_active_tuning(&candidate) {
-            tracing::warn!(error = %error, "stel tuning persist failed; keeping prior constants");
-        } else {
-            tracing::info!(
-                response_correction_factor = candidate.response_correction_factor,
-                sample_size = candidate.sample_size,
-                error_before = candidate.error_before,
-                error_after = candidate.error_after,
-                "stel auto-tune accepted: persisted calibrated correction (013 US2)"
-            );
-        }
+        crate::stel::runtime::maybe_persist_tuning(store)
     }
 
     /// The validated tuned-constant set currently IN FORCE for the current
@@ -719,12 +653,7 @@ impl SymForgeServer {
     pub(crate) fn active_tuning_for_economics(
         &self,
     ) -> Option<crate::stel::ledger_store::TunedEstimateConstants> {
-        use crate::stel::controller::active_tuning_in_force;
-        use crate::stel::ledger_store::CURRENT_ESTIMATOR_VERSION;
-
-        let store = self.stel_ledger_store.as_ref()?;
-        let loaded = store.load_active_tuning(CURRENT_ESTIMATOR_VERSION).ok()?;
-        active_tuning_in_force(loaded, CURRENT_ESTIMATOR_VERSION)
+        crate::stel::runtime::active_tuning_for_economics(self.stel_ledger_store.as_deref())
     }
 
     /// Compute the honest [`CalibrationVerdict`] from the DURABLE calibration
@@ -745,37 +674,7 @@ impl SymForgeServer {
     pub(crate) fn durable_calibration_verdict(
         &self,
     ) -> Option<crate::stel::calibration::CalibrationVerdict> {
-        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_CORPUS};
-        use crate::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX};
-
-        let store = self.stel_ledger_store.as_ref()?;
-        // A wired but failing store cannot prove any tuning is in force.
-        let records =
-            match store.samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX) {
-                Ok(records) => records,
-                Err(_) => return Some(CalibrationVerdict::Deferred),
-            };
-        let n = records.len();
-
-        // An active, in-force tuning with a real reduction artifact reads `Tuned`.
-        if let Some(active) = self.active_tuning_for_economics()
-            && active.error_before > active.error_after
-        {
-            return Some(CalibrationVerdict::Tuned {
-                sample_size: active.sample_size as usize,
-                error_before: active.error_before,
-                error_after: active.error_after,
-            });
-        }
-
-        if n == 0 {
-            Some(CalibrationVerdict::Deferred)
-        } else {
-            Some(CalibrationVerdict::Accumulating {
-                n,
-                min: TUNING_MIN_CORPUS,
-            })
-        }
+        crate::stel::runtime::durable_calibration_verdict(self.stel_ledger_store.as_deref())
     }
 
     /// Clear accumulated calibration for the current estimator (feature 013,
@@ -783,11 +682,7 @@ impl SymForgeServer {
     /// or `None` when no durable store is wired. Never rebuilds the index.
     #[cfg(feature = "server")]
     pub(crate) fn reset_calibration(&self) -> Option<usize> {
-        use crate::stel::ledger_store::CURRENT_ESTIMATOR_VERSION;
-        let store = self.stel_ledger_store.as_ref()?;
-        store
-            .clear_calibration_for_estimator(CURRENT_ESTIMATOR_VERSION)
-            .ok()
+        crate::stel::runtime::reset_calibration(self.stel_ledger_store.as_deref())
     }
 
     #[cfg(not(feature = "server"))]
@@ -816,22 +711,7 @@ impl SymForgeServer {
     /// [`subsystem_state`]: crate::stel::ledger_store::StelLedgerStore::subsystem_state
     #[cfg(feature = "server")]
     fn durable_ledger_summary_for_status(&self) -> crate::stel::status::DurableLedgerState {
-        use crate::stel::ledger_store::LedgerSubsystemState;
-        use crate::stel::status::{DurableLedgerState, DurableLedgerSummary};
-
-        let Some(store) = self.stel_ledger_store.as_ref() else {
-            return DurableLedgerState::Unavailable;
-        };
-        match store.subsystem_state() {
-            LedgerSubsystemState::Durable { summary } => {
-                DurableLedgerState::Durable(DurableLedgerSummary {
-                    total_events: summary.total_events,
-                    total_net_vs_manual: summary.total_net_vs_manual,
-                    session_count: summary.session_count,
-                })
-            }
-            LedgerSubsystemState::Disabled { reason } => DurableLedgerState::Disabled { reason },
-        }
+        crate::stel::runtime::durable_ledger_state(self.stel_ledger_store.as_deref())
     }
 
     #[cfg(not(feature = "server"))]
@@ -2061,6 +1941,8 @@ impl SymForgeServer {
             "edit_plan" => call!(edit_plan, tools::EditPlanInput),
             "index_folder" => call!(index_folder, tools::IndexFolderInput),
             "detect_impact" => call!(detect_impact, tools::DetectImpactInput),
+            "what_changed" => call!(what_changed, tools::WhatChangedInput),
+            "diff_symbols" => call!(diff_symbols, tools::DiffSymbolsInput),
             "explore" => call!(explore, tools::ExploreInput),
             "ask" => call!(ask, tools::SmartQueryInput),
             "get_repo_map" => call!(get_repo_map, tools::GetRepoMapInput),

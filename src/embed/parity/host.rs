@@ -251,7 +251,16 @@ impl OperationControl {
 #[non_exhaustive]
 pub enum HostRequest {
     Status,
+    /// MCP `status` parity: the typed status plus the shared STEL readout over
+    /// this room's query session. `reset_calibration` deletes persisted
+    /// calibration state, so it additionally requires the checkpoint right.
+    StatusReport(crate::embed::parity::stel::StelStatusRequest),
     Health,
+    /// MCP `health` parity: the typed health plus the shared full report,
+    /// with quarantine-registry paging.
+    HealthReport(HostHealthRequest),
+    /// MCP `health_compact` parity: the shared compact projection.
+    HealthCompact,
     Catalog,
     Resource(HostResourceRequest),
     Prompt(HostPromptRequest),
@@ -263,6 +272,10 @@ pub enum HostRequest {
         request: WireEditRequest,
         operation_key: Option<String>,
     },
+    /// MCP `symforge_edit`: the compact edit facade over this room's source.
+    /// A preview needs the query right; an apply needs the edit right and
+    /// replays by the request's own `idempotency_key`.
+    SymforgeEdit(crate::embed::parity::stel::StelEditRequest),
     Knowledge {
         request: WireKnowledgeRequest,
         operation_key: Option<String>,
@@ -280,10 +293,30 @@ pub enum HostRequest {
         operation_key: String,
     },
     Refresh,
+    /// MCP `index_folder` parity for the bound source: in-place reset and
+    /// idempotent replay. Requires the refresh right; `reset` additionally
+    /// requires the checkpoint right because it deletes persisted snapshot state.
+    RefreshWith(HostRefreshRequest),
     Checkpoint {
         verify_after_write: bool,
         export_artifact: bool,
     },
+}
+
+/// MCP `index_folder` options that apply to an already bound source.
+/// `path` is the room grant and `allow_protected_root` is the trusted open
+/// option; `add` is explicit federation over separately opened sources.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRefreshRequest {
+    /// MCP reset (`SYMFORGE_INDEX_FOLDER_RESET=1`): delete the snapshot scope
+    /// before the full reload. A replayed request never repeats it.
+    #[serde(default)]
+    pub reset: bool,
+    /// MCP `idempotency_key`: an identical request with the same key returns
+    /// the original receipt; a different request with the key is refused.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +414,14 @@ pub struct HostProgress {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStatusReport {
+    pub status: HostStatus,
+    /// The shared MCP `status` readout. `None` only when no bound data plane
+    /// could be captured.
+    pub report: Option<crate::embed::parity::stel::StelStatusReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatus {
     pub room_id: String,
     pub engine: HostEngineIdentity,
@@ -444,6 +485,40 @@ pub struct HostHealth {
     pub status: HostStatus,
     /// `None` means no current, source-proofed publication was captured.
     pub current: Option<HostPublishedHealth>,
+}
+
+/// Quarantine-registry paging for the full health report, the MCP `health`
+/// `quarantine_limit` / `quarantine_offset` options. `None` keeps the MCP
+/// defaults: offset 0, limit 10; the limit is clamped to 1..=1000.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostHealthRequest {
+    pub quarantine_limit: Option<u32>,
+    pub quarantine_offset: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostHealthProjection {
+    Full,
+    Compact,
+}
+
+/// A health section the MCP server renders from a process an embedded host
+/// does not have. Reported, never silently omitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostHealthNotApplicable {
+    pub section: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostHealthReport {
+    pub health: HostHealth,
+    pub projection: HostHealthProjection,
+    /// The shared MCP `health` / `health_compact` rendering for this source,
+    /// in any phase. `None` only when no bound data plane could be captured.
+    pub report: Option<String>,
+    pub not_applicable: Vec<HostHealthNotApplicable>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +649,16 @@ pub struct HostAuthorityIdentity {
 pub struct HostRefreshReceipt {
     pub ticket_identity: String,
     pub requested_source_version: u64,
+    /// The snapshot reset this request performed, when `reset` was requested.
+    #[serde(default)]
+    pub reset: Option<crate::embed::parity::source_options::SnapshotResetReceipt>,
+    /// This receipt was returned from the idempotency record, not re-executed.
+    #[serde(default)]
+    pub replayed: bool,
+    /// With an idempotency key: whether this receipt was durably recorded
+    /// (`Some(false)` mirrors MCP's "failed to store replay result" warning).
+    #[serde(default)]
+    pub replay_recorded: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +722,7 @@ pub struct HostResourceReply {
 #[allow(clippy::large_enum_variant)]
 pub enum HostResourceContent {
     Health(HostHealth),
+    HealthReport(HostHealthReport),
     Query(HostQueryReply),
     Catalog(HostCatalog),
     Text(String),
@@ -660,12 +746,15 @@ pub struct HostPromptReply {
 #[non_exhaustive]
 pub enum HostResponse {
     Status(HostStatus),
+    StatusReport(HostStatusReport),
     Health(HostHealth),
+    HealthReport(HostHealthReport),
     Catalog(HostCatalog),
     Resource(HostResourceReply),
     Prompt(HostPromptReply),
     Query(HostQueryReply),
     Edit(serde_json::Value),
+    SymforgeEdit(crate::embed::parity::stel::SymforgeEditAnswer),
     Knowledge(serde_json::Value),
     SecretFindings(SecretFindingsClaim),
     SecretPreview(SecretRemediationPreview),
@@ -678,12 +767,15 @@ impl std::fmt::Debug for HostResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self {
             Self::Status(_) => "Status",
+            Self::StatusReport(_) => "StatusReport",
             Self::Health(_) => "Health",
+            Self::HealthReport(_) => "HealthReport",
             Self::Catalog(_) => "Catalog",
             Self::Resource(_) => "Resource",
             Self::Prompt(_) => "Prompt",
             Self::Query(_) => "Query",
             Self::Edit(_) => "Edit",
+            Self::SymforgeEdit(_) => "SymforgeEdit",
             Self::Knowledge(_) => "Knowledge",
             Self::SecretFindings(_) => "SecretFindings",
             Self::SecretPreview(_) => "SecretPreview",
@@ -1025,6 +1117,7 @@ pub struct HostRoom {
     room_token: Option<Arc<()>>,
     session: Mutex<Option<Arc<QuerySession>>>,
     secret_external_tool: Option<SecretExternalTool>,
+    open_options: EmbeddedOpenOptions,
 }
 
 impl HostRoom {
@@ -1215,7 +1308,95 @@ impl HostRoom {
             room_token,
             session: Mutex::new(None),
             secret_external_tool: grant.secret_external_tool,
+            open_options: owner
+                .map(|owner| owner.open_options.clone())
+                .unwrap_or_default(),
         })
+    }
+
+    /// MCP `index_folder` on the bound source, through the shared
+    /// `idempotency::begin_index_folder_replay` and snapshot reset engines.
+    fn refresh_with(
+        &self,
+        request: &HostRefreshRequest,
+    ) -> Result<HostRefreshReceipt, HostRefusal> {
+        use crate::idempotency::{IdempotencyError, ReplayStart};
+        let (active, stored) = match request.idempotency_key.as_deref() {
+            None => (None, None),
+            Some(raw_key) => {
+                let directory = self
+                    .open_options
+                    .replay_control_directory
+                    .as_ref()
+                    .ok_or_else(|| HostRefusal::new(HostRefusalKind::PersistenceUnavailable))?;
+                let control = crate::domain::ControlStateDir::new(directory.join("embed-host"));
+                match crate::idempotency::begin_index_folder_replay(
+                    &control,
+                    &self.source_root,
+                    raw_key,
+                    request.reset,
+                    self.open_options.allow_protected_root,
+                    // One bound source per room: the refresh IS the activation.
+                    true,
+                ) {
+                    Ok(ReplayStart::FirstExecution(active)) => (Some(active), None),
+                    Ok(ReplayStart::Replay(response)) => (None, Some(response)),
+                    Err(IdempotencyError::Conflict { .. } | IdempotencyError::EmptyKey) => {
+                        return Err(HostRefusal::new(HostRefusalKind::InvalidRequest));
+                    }
+                    Err(_) => {
+                        return Err(HostRefusal::new(HostRefusalKind::PersistenceUnavailable));
+                    }
+                }
+            }
+        };
+        if let Some(stored) = stored {
+            // MCP replays still reload the source but never repeat the reset.
+            self.source
+                .request_refresh()
+                .map_err(|_| HostRefusal::new(HostRefusalKind::SourceUnavailable))?;
+            let mut receipt: HostRefreshReceipt = serde_json::from_str(&stored)
+                .map_err(|_| HostRefusal::new(HostRefusalKind::PersistenceUnavailable))?;
+            receipt.replayed = true;
+            receipt.replay_recorded = Some(true);
+            return Ok(receipt);
+        }
+        let outcome = if request.reset {
+            self.source
+                .request_refresh_with_reset()
+                .map(|(ticket, reset)| (ticket, Some(reset)))
+        } else {
+            self.source.request_refresh().map(|ticket| (ticket, None))
+        };
+        let (ticket, reset) = match outcome {
+            Ok(outcome) => outcome,
+            Err(refusal) => {
+                let kind = match refusal.kind() {
+                    crate::embed::SourceRefusalKind::AdmissionUnavailable => {
+                        HostRefusalKind::PersistenceUnavailable
+                    }
+                    _ => HostRefusalKind::SourceUnavailable,
+                };
+                if let Some(active) = &active {
+                    let _ = active.fail(format!("Refresh refused: {kind:?}"));
+                }
+                return Err(HostRefusal::new(kind));
+            }
+        };
+        let mut receipt = HostRefreshReceipt {
+            ticket_identity: ticket.ticket_identity().to_owned(),
+            requested_source_version: ticket.requested_source_version(),
+            reset,
+            replayed: false,
+            replay_recorded: None,
+        };
+        if let Some(active) = &active {
+            let recorded = serde_json::to_string(&receipt)
+                .ok()
+                .is_some_and(|text| active.complete(text).is_ok());
+            receipt.replay_recorded = Some(recorded);
+        }
+        Ok(receipt)
     }
 
     fn query_session(&self) -> Result<Arc<QuerySession>, HostRefusal> {
@@ -1337,6 +1518,8 @@ impl HostRoom {
                     "ContextInventory",
                     "InvestigationSuggest",
                     "Retrieve",
+                    "EditPlan",
+                    "Symforge",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -1352,6 +1535,7 @@ impl HostRoom {
                     "batch_edit",
                     "batch_insert",
                     "batch_rename",
+                    "symforge_edit",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -1500,9 +1684,19 @@ impl HostRoom {
         control: &OperationControl,
     ) -> Result<HostResourceReply, HostRefusal> {
         let (uri, content) = match resource {
-            HostResourceRequest::RepoHealth => ("symforge://repo/health",
-                HostResourceContent::Health(crate::embed::lifecycle::embed_host::health(
-                    &self.source, &self.room_id, &self.engine))),
+            // MCP renders this resource as `health` with default paging.
+            HostResourceRequest::RepoHealth => (
+                "symforge://repo/health",
+                HostResourceContent::HealthReport(
+                    crate::embed::lifecycle::embed_host::health_report(
+                        &self.source,
+                        &self.room_id,
+                        &self.engine,
+                        HostHealthProjection::Full,
+                        &HostHealthRequest::default(),
+                    ),
+                ),
+            ),
             HostResourceRequest::RepoOutline => {
                 return self.query_resource(
                     "symforge://repo/outline",
@@ -1532,15 +1726,21 @@ impl HostRoom {
             HostResourceRequest::FileContext { path, max_tokens } => {
                 return self.query_resource(
                     "symforge://file/context",
-                    QueryRequest::FileContext(crate::embed::parity::read_context::FileContextRequest {
-                        path: path.clone(),
-                        max_tokens: *max_tokens,
-                        ..Default::default()
-                    }),
+                    QueryRequest::FileContext(
+                        crate::embed::parity::read_context::FileContextRequest {
+                            path: path.clone(),
+                            max_tokens: *max_tokens,
+                            ..Default::default()
+                        },
+                    ),
                     control,
                 );
             }
-            HostResourceRequest::FileContent { path, start_line, end_line } => {
+            HostResourceRequest::FileContent {
+                path,
+                start_line,
+                end_line,
+            } => {
                 return self.query_resource(
                     "symforge://file/content",
                     QueryRequest::FileContent(crate::embed::parity::read::FileContentRequest {
@@ -1553,7 +1753,11 @@ impl HostRoom {
                 );
             }
             HostResourceRequest::FileContentOptions(options) => {
-                return self.query_resource("symforge://file/content", QueryRequest::FileContent(options.clone()), control);
+                return self.query_resource(
+                    "symforge://file/content",
+                    QueryRequest::FileContent(options.clone()),
+                    control,
+                );
             }
             HostResourceRequest::SymbolDetail { selector } => {
                 return self.query_resource(
@@ -1569,28 +1773,48 @@ impl HostRoom {
                 );
             }
             HostResourceRequest::SymbolDetailOptions(options) => {
-                return self.query_resource("symforge://symbol/detail", QueryRequest::SymbolRead(options.clone()), control);
+                return self.query_resource(
+                    "symforge://symbol/detail",
+                    QueryRequest::SymbolRead(options.clone()),
+                    control,
+                );
             }
             HostResourceRequest::SymbolContext { selector } => {
                 return self.query_resource(
                     "symforge://symbol/context",
-                    QueryRequest::SymbolContext(crate::embed::parity::symbol_context::SymbolContextRequest {
-                        name: selector.name.clone(),
-                        file: Some(selector.path.clone()),
-                        symbol_kind: selector.kind.clone(),
-                        symbol_line: selector.line,
-                        ..Default::default()
-                    }),
+                    QueryRequest::SymbolContext(
+                        crate::embed::parity::symbol_context::SymbolContextRequest {
+                            name: selector.name.clone(),
+                            file: Some(selector.path.clone()),
+                            symbol_kind: selector.kind.clone(),
+                            symbol_line: selector.line,
+                            ..Default::default()
+                        },
+                    ),
                     control,
                 );
             }
             HostResourceRequest::SymbolContextOptions(options) => {
-                return self.query_resource("symforge://symbol/context", QueryRequest::SymbolContext(options.clone()), control);
+                return self.query_resource(
+                    "symforge://symbol/context",
+                    QueryRequest::SymbolContext(options.clone()),
+                    control,
+                );
             }
-            HostResourceRequest::ToolsCatalog => ("symforge://tools/catalog",
-                HostResourceContent::Catalog(self.catalog())),
-            HostResourceRequest::Glossary => ("symforge://glossary",
-                HostResourceContent::Text("SymForge indexes an admitted source publication. A room's source proof identifies the exact publication examined; query limits and partial/withheld counts describe the returned projection. Checkpoint persists local recovery state. Replay requires the same request hash and verified post-image before a cached mutation result is reusable.".to_owned())),
+            // MCP parity: both resources render the shared static guidance text.
+            // Room rights still gate the typed `HostRequest::Catalog` operations.
+            HostResourceRequest::ToolsCatalog => (
+                "symforge://tools/catalog",
+                HostResourceContent::Text(
+                    crate::embed::lifecycle::guidance::smart_query::render_tool_catalog(),
+                ),
+            ),
+            HostResourceRequest::Glossary => (
+                "symforge://glossary",
+                HostResourceContent::Text(
+                    crate::embed::lifecycle::guidance::smart_query::render_glossary(),
+                ),
+            ),
         };
         Ok(HostResourceReply {
             uri: uri.to_owned(),
@@ -1700,11 +1924,51 @@ impl HostRoom {
                     &self.engine,
                 ))
             }
+            HostRequest::StatusReport(status) => {
+                if status.reset_calibration == Some(true) && !self.rights.checkpoint {
+                    return Err(HostRefusal::new(HostRefusalKind::Denied));
+                }
+                // `status` answers in every phase, as MCP's does; a room whose
+                // source has not yet reached Current has no session ledger.
+                let session = self.query_session().ok();
+                HostResponse::StatusReport(HostStatusReport {
+                    status: crate::embed::lifecycle::embed_host::status(
+                        &self.source,
+                        &self.room_id,
+                        &self.engine,
+                    ),
+                    report: self.source.stel_status(
+                        status,
+                        session.as_deref(),
+                        QueryPolicy {
+                            allow_derived_state_preparation: self.rights.derived_state_prepare,
+                        },
+                    ),
+                })
+            }
             HostRequest::Health => {
                 HostResponse::Health(crate::embed::lifecycle::embed_host::health(
                     &self.source,
                     &self.room_id,
                     &self.engine,
+                ))
+            }
+            HostRequest::HealthReport(options) => {
+                HostResponse::HealthReport(crate::embed::lifecycle::embed_host::health_report(
+                    &self.source,
+                    &self.room_id,
+                    &self.engine,
+                    HostHealthProjection::Full,
+                    options,
+                ))
+            }
+            HostRequest::HealthCompact => {
+                HostResponse::HealthReport(crate::embed::lifecycle::embed_host::health_report(
+                    &self.source,
+                    &self.room_id,
+                    &self.engine,
+                    HostHealthProjection::Compact,
+                    &HostHealthRequest::default(),
                 ))
             }
             HostRequest::Catalog => HostResponse::Catalog(self.catalog()),
@@ -1797,6 +2061,42 @@ impl HostRoom {
                     }
                     refusal
                 })?)
+            }
+            HostRequest::SymforgeEdit(edit) => {
+                let apply = edit.apply == Some(true);
+                if !(self.rights.query && (!apply || self.rights.edit)) {
+                    return Err(HostRefusal::new(HostRefusalKind::Denied));
+                }
+                let authority = if apply {
+                    Some(
+                        EditApplyAuthority::for_source_root(
+                            self.source_root.clone(),
+                            self.replay_scope(),
+                            Arc::clone(&control.cancelled),
+                        )
+                        .map_err(|kind| HostRefusal::from_edit(EditError::Edit(kind)))?,
+                    )
+                } else {
+                    None
+                };
+                let session = self.query_session()?;
+                HostResponse::SymforgeEdit(
+                    self.source
+                        .symforge_edit(
+                            edit,
+                            Some(&session),
+                            QueryPolicy {
+                                allow_derived_state_preparation: self.rights.derived_state_prepare,
+                            },
+                            authority.as_ref().map(|authority| {
+                                crate::embed::parity::stel::SymforgeEditAuthority {
+                                    authority,
+                                    admitted: &[],
+                                }
+                            }),
+                        )
+                        .map_err(|_| HostRefusal::new(HostRefusalKind::SourceUnavailable))?,
+                )
             }
             HostRequest::Knowledge {
                 request: knowledge,
@@ -1932,7 +2232,16 @@ impl HostRoom {
                 HostResponse::Refresh(HostRefreshReceipt {
                     ticket_identity: ticket.ticket_identity().to_owned(),
                     requested_source_version: ticket.requested_source_version(),
+                    reset: None,
+                    replayed: false,
+                    replay_recorded: None,
                 })
+            }
+            HostRequest::RefreshWith(refresh) => {
+                if !self.rights.refresh || (refresh.reset && !self.rights.checkpoint) {
+                    return Err(HostRefusal::new(HostRefusalKind::Denied));
+                }
+                HostResponse::Refresh(self.refresh_with(refresh)?)
             }
             HostRequest::Checkpoint {
                 verify_after_write,

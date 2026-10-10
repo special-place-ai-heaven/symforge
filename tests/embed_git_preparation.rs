@@ -45,6 +45,7 @@ fn memory_only_git_preparation_uses_only_explicit_bounded_scratch_and_reuses_obj
             EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()),
             EmbeddedOpenOptions {
                 state: EmbeddedStateSelection::MemoryOnly,
+                ..Default::default()
             },
         )
         .unwrap();

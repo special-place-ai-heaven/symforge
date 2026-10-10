@@ -1,9 +1,11 @@
 //! Full content selection through shared admission, rendering, and session engines.
+use super::activation::ProjectSourceAuthority;
 use super::embed_query::{Budget, EmbeddedQuerySnapshot, validate_path};
 use super::embed_session::QuerySession;
 use super::guidance::{file_read, read_contract, read_gate, source};
 use crate::embed::parity::read::*;
 use crate::embed::parity::{QueryObservation, QueryOutput, QueryRefusalKind};
+use crate::lifecycle_identity::PublicationIdentity;
 use crate::live_index::{IndexedFile, search::ContentContext};
 
 fn authority_refusal(refusal: super::authority::AuthorityRefusal) -> QueryRefusalKind {
@@ -59,8 +61,42 @@ pub(super) fn admit(
     bytes: Option<&[u8]>,
     budget: &mut Budget,
 ) -> Result<(), QueryRefusalKind> {
+    admit_in(
+        &snapshot.generation.live,
+        &snapshot.authority,
+        Some(snapshot.authority_publication),
+        path,
+        bytes,
+        budget,
+    )
+}
+
+/// Read bounded bytes beneath the admitted root, bound to `expected` when the
+/// caller holds a publication and to the root anchor alone when it does not.
+fn read_beneath(
+    authority: &ProjectSourceAuthority,
+    expected: Option<PublicationIdentity>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, super::authority::AuthorityRefusal> {
+    let relative = std::path::Path::new(path);
+    let max = crate::knowledge::SECRET_SCAN_MAX_BYTES;
+    match expected {
+        Some(expected) => authority.read_regular_beneath_expected(expected, relative, max),
+        None => authority.read_regular_beneath_anchor(relative, max),
+    }
+}
+
+/// [`admit`] over the admission state of `live`, the latest published
+/// generation, which MCP's disk lane also consults while not Ready.
+fn admit_in(
+    live: &crate::live_index::LiveIndex,
+    authority: &ProjectSourceAuthority,
+    expected: Option<PublicationIdentity>,
+    path: &str,
+    bytes: Option<&[u8]>,
+    budget: &mut Budget,
+) -> Result<(), QueryRefusalKind> {
     refuse_scope(path)?;
-    let live = &snapshot.generation.live;
     let mut record = |meta| budget.withheld = Some(meta);
     if read_gate::refuse_by_policy_with(live, path, &mut record).is_some() {
         // Recorded content demotion has no positions in the manifest. Recover
@@ -73,11 +109,7 @@ pub(super) fn admit(
             }) = live.capture_file_disposition(path)
         {
             budget.withheld = Some(WithheldMeta::unscanned(path));
-            if let Ok(Some(bytes)) = snapshot.authority.read_regular_beneath_expected(
-                snapshot.authority_publication,
-                std::path::Path::new(path),
-                crate::knowledge::SECRET_SCAN_MAX_BYTES,
-            ) {
+            if let Ok(Some(bytes)) = read_beneath(authority, expected, path) {
                 let (_, findings) =
                     read_gate::recorded_finding_evidence_from_bytes(path, &bytes, rule_ids);
                 if !findings.is_empty() {
@@ -179,6 +211,63 @@ fn selected_content_range(
     }
     Ok(())
 }
+/// MCP `validate_file_syntax`'s authoritative disk-parse lane: the file is
+/// unindexed, or its freshen did not publish. The bytes on disk right now are
+/// read through the original-root capability, admitted by the same policy and
+/// classification as every other read (a refusal carries the same withheld
+/// findings), and parsed exactly as MCP parses them.
+pub(super) fn observe_for_syntax(
+    snapshot: &EmbeddedQuerySnapshot,
+    path: &str,
+    budget: &mut Budget,
+) -> Result<IndexedFile, QueryRefusalKind> {
+    observe_syntax_in(
+        &snapshot.generation.live,
+        &snapshot.authority,
+        Some(snapshot.authority_publication),
+        path,
+        budget,
+    )
+}
+
+/// The disk parse behind [`observe_for_syntax`]. With `expected = None` the
+/// read binds the admitted root anchor only and claims no publication.
+pub(super) fn observe_syntax_in(
+    live: &crate::live_index::LiveIndex,
+    authority: &ProjectSourceAuthority,
+    expected: Option<PublicationIdentity>,
+    path: &str,
+    budget: &mut Budget,
+) -> Result<IndexedFile, QueryRefusalKind> {
+    refuse_scope(path)?;
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    let language = crate::domain::LanguageId::from_extension(extension)
+        .ok_or(QueryRefusalKind::UnsupportedOption)?;
+    let relative = std::path::Path::new(path);
+    let spelled = match expected {
+        Some(expected) => authority.verify_exact_spelling_expected(expected, relative),
+        None => authority.verify_exact_spelling_anchor(relative),
+    };
+    if !spelled.map_err(authority_refusal)? {
+        return Err(QueryRefusalKind::NotFound);
+    }
+    admit_in(live, authority, expected, path, None, budget)?;
+    let bytes = read_beneath(authority, expected, path)
+        .map_err(authority_refusal)?
+        .ok_or(QueryRefusalKind::NotFound)?;
+    admit_in(live, authority, expected, path, Some(&bytes), budget)?;
+    let result = crate::parsing::process_file_with_classification(
+        path,
+        &bytes,
+        language,
+        crate::domain::FileClassification::for_code_path(path),
+    );
+    Ok(IndexedFile::from_parse_result(result, bytes))
+}
+
 pub(super) fn page(
     snapshot: &EmbeddedQuerySnapshot,
     request: &SourcePageRequest,

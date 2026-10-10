@@ -473,3 +473,198 @@ fn test_normalize_git_path_backslash() {
 fn test_normalize_git_path_forward_slash_unchanged() {
     assert_eq!(normalize_git_path("src/foo/bar.rs"), "src/foo/bar.rs");
 }
+
+// ── Producer parity: MCP open vs the embedded source-root open ───────
+
+/// One commit over top-level files only; `None` removes a file.
+fn fixture_commit(
+    repo: &git2::Repository,
+    parents: &[git2::Oid],
+    files: &[(&str, Option<&str>)],
+    hours_ago: i64,
+    message: &str,
+) -> git2::Oid {
+    let parent_commits: Vec<git2::Commit<'_>> = parents
+        .iter()
+        .map(|oid| repo.find_commit(*oid).unwrap())
+        .collect();
+    let base = parent_commits.first().map(|commit| commit.tree().unwrap());
+    let mut builder = repo.treebuilder(base.as_ref()).unwrap();
+    for (name, content) in files {
+        match content {
+            Some(content) => {
+                let blob = repo.blob(content.as_bytes()).unwrap();
+                builder.insert(name, blob, 0o100644).unwrap();
+            }
+            None => builder.remove(name).unwrap(),
+        }
+    }
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let signature = git2::Signature::new(
+        "Fixture",
+        "fixture@example.invalid",
+        &git2::Time::new(now - hours_ago * 3600, 0),
+    )
+    .unwrap();
+    let parent_refs: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
+    repo.commit(None, &signature, &signature, message, &tree, &parent_refs)
+        .unwrap()
+}
+
+/// Six commits: a root, two coupled edits, a side branch, a rename
+/// (`a.rs` to `e.rs`) and a merge of the side branch.
+fn producer_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let root = fixture_commit(
+        &repo,
+        &[],
+        &[
+            ("a.rs", Some("a0")),
+            ("b.rs", Some("b0")),
+            ("c.rs", Some("c0")),
+        ],
+        10,
+        "root",
+    );
+    let second = fixture_commit(
+        &repo,
+        &[root],
+        &[("a.rs", Some("a1")), ("b.rs", Some("b1"))],
+        9,
+        "couple a and b",
+    );
+    let third = fixture_commit(
+        &repo,
+        &[second],
+        &[("a.rs", Some("a2")), ("b.rs", Some("b2"))],
+        8,
+        "couple a and b again",
+    );
+    let side = fixture_commit(
+        &repo,
+        &[second],
+        &[("c.rs", Some("c1")), ("d.rs", Some("d0"))],
+        7,
+        "side branch",
+    );
+    let renamed = fixture_commit(
+        &repo,
+        &[third],
+        &[("a.rs", None), ("e.rs", Some("a2"))],
+        6,
+        "rename a to e",
+    );
+    let merge = fixture_commit(
+        &repo,
+        &[renamed, side],
+        &[("c.rs", Some("c1")), ("d.rs", Some("d0"))],
+        5,
+        "merge side",
+    );
+    repo.reference("refs/heads/fixture", merge, true, "fixture")
+        .unwrap();
+    repo.set_head("refs/heads/fixture").unwrap();
+    dir
+}
+
+type ProducerRow = (String, String, String, String, Vec<String>);
+
+fn producer_rows(commits: &[ParsedCommit]) -> Vec<ProducerRow> {
+    commits
+        .iter()
+        .map(|commit| {
+            let mut files = commit.files.clone();
+            files.sort();
+            (
+                commit.hash.clone(),
+                commit.timestamp.clone(),
+                commit.author.clone(),
+                commit.message.clone(),
+                files,
+            )
+        })
+        .collect()
+}
+
+type CoChangeRow = (
+    String,
+    Vec<(String, u32, u32)>,
+    Vec<(String, u32, u32)>,
+    u32,
+);
+
+fn co_change_rows(index: &GitTemporalIndex) -> Vec<CoChangeRow> {
+    let entries = |list: &[CoChangeEntry]| {
+        list.iter()
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    entry.shared_commits,
+                    entry.coupling_score.to_bits(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut rows: Vec<CoChangeRow> = index
+        .files
+        .iter()
+        .map(|(path, history)| {
+            (
+                path.clone(),
+                entries(&history.co_changes),
+                entries(&history.weak_co_changes),
+                history.commit_count,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn mcp_and_embedded_producers_walk_identical_history_and_aggregate_identically() {
+    let dir = producer_fixture();
+
+    // MCP producer: `compute` opens with `GitRepo::open` (discovery).
+    let mcp = load_commits(dir.path()).unwrap();
+    // Embedded producer: the source-root open with a live stop poll.
+    let repo = crate::git::GitRepo::open_worktree_root(dir.path()).unwrap();
+    let embedded = load_commits_from(&repo, &mut || false).unwrap();
+    assert_eq!(producer_rows(&mcp), producer_rows(&embedded));
+
+    let rows = producer_rows(&mcp);
+    let messages: Vec<&str> = rows.iter().map(|row| row.3.as_str()).collect();
+    assert_eq!(
+        messages,
+        [
+            "merge side",
+            "rename a to e",
+            "side branch",
+            "couple a and b again",
+            "couple a and b",
+            "root"
+        ]
+    );
+    // Merge: diffed against its first parent only. Rename: no similarity
+    // detection, so both the removed and the added path are listed.
+    assert_eq!(rows[0].4, ["c.rs", "d.rs"]);
+    assert_eq!(rows[1].4, ["a.rs", "e.rs"]);
+
+    let mcp_index = GitTemporalIndex::compute(dir.path());
+    let embedded_index = GitTemporalIndex::compute_from_repo(&repo, &mut || false);
+    assert_eq!(mcp_index.state, GitTemporalState::Ready);
+    assert_eq!(embedded_index.state, GitTemporalState::Ready);
+    assert_eq!(co_change_rows(&mcp_index), co_change_rows(&embedded_index));
+    let b = &mcp_index.files["b.rs"];
+    assert_eq!(b.co_changes[0].path, "a.rs");
+    assert_eq!(b.co_changes[0].shared_commits, 3);
+
+    // The embedded stop abandons the walk instead of reporting partial history.
+    let stopped = GitTemporalIndex::compute_from_repo(&repo, &mut || true);
+    assert!(matches!(stopped.state, GitTemporalState::Unavailable(_)));
+}

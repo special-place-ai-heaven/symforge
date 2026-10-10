@@ -16,12 +16,9 @@ use serde_json::{Map, Value, json};
 
 use super::SymForgeServer;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceProfile {
-    Full,
-    Compact,
-    Meta,
-}
+pub use crate::stel::surface::{
+    SurfaceProfile, surface_label_from_str, surface_profile_from_label, surface_profile_label,
+};
 
 pub fn surface_profile_from_env() -> SurfaceProfile {
     // Default surface is FULL (spike-gate verdict 2026-07-03: no target harness
@@ -41,31 +38,6 @@ pub fn surface_profile_from_env() -> SurfaceProfile {
     }
 }
 
-/// Canonical lowercase label (`full`/`compact`/`meta`) for a surface profile.
-///
-/// Single source of the wording used by the `status` readout AND threaded across
-/// the adapter→daemon proxy boundary, so both processes agree on the exact
-/// string (see `StelStatusRequest::connection_surface`).
-pub fn surface_profile_label(profile: SurfaceProfile) -> &'static str {
-    match profile {
-        SurfaceProfile::Full => "full",
-        SurfaceProfile::Meta => "meta",
-        SurfaceProfile::Compact => "compact",
-    }
-}
-
-/// Map a proxy-threaded connection-surface string back to a canonical static
-/// label. Returns `None` for anything the adapter would never send, so an
-/// unrecognized value falls back to the daemon's own env rather than echoing
-/// arbitrary text into the trust readout.
-///
-/// Delegates to [`surface_profile_from_label`] — the single canonical str→enum
-/// parser — so a new [`SurfaceProfile`] variant is added in exactly one place;
-/// this label round-trip inherits it instead of drifting behind a private table.
-pub fn surface_label_from_str(value: &str) -> Option<&'static str> {
-    surface_profile_from_label(value).map(surface_profile_label)
-}
-
 /// HTTP header the front-end adapter stamps on every proxied daemon tool call
 /// with the surface actually served on THIS connection (D23).
 ///
@@ -76,21 +48,6 @@ pub fn surface_label_from_str(value: &str) -> Option<&'static str> {
 /// skew directions: an old daemon never reads it, a new daemon falls back to its
 /// own env when an old adapter never sends it.
 pub const CONNECTION_SURFACE_HEADER: &str = "x-symforge-connection-surface";
-
-/// Map a canonical connection-surface label back to a [`SurfaceProfile`].
-///
-/// Mirrors [`surface_label_from_str`] but yields the profile the guard renderer
-/// needs. Returns `None` for anything an adapter would never send, so an
-/// unrecognized header falls back to the daemon's own env rather than trusting
-/// arbitrary text.
-pub fn surface_profile_from_label(value: &str) -> Option<SurfaceProfile> {
-    match value {
-        "full" => Some(SurfaceProfile::Full),
-        "meta" => Some(SurfaceProfile::Meta),
-        "compact" => Some(SurfaceProfile::Compact),
-        _ => None,
-    }
-}
 
 tokio::task_local! {
     /// Surface served on the connection whose proxied tool call the daemon is

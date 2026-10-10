@@ -19,9 +19,60 @@ pub enum EmbeddedStateSelection {
     MemoryOnly,
 }
 
+/// MCP `index_folder` parity for an embedded open. `add` has no option:
+/// additive multi-source opens are explicit federation
+/// (`federation::query_sources`) over separately opened sources.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmbeddedOpenOptions {
     pub state: EmbeddedStateSelection,
+    /// MCP `allow_protected_root`: direct authority to index the exact
+    /// protected root in read/index-only mode. Never inherited.
+    pub allow_protected_root: bool,
+    /// MCP `index_folder` reset (`SYMFORGE_INDEX_FOLDER_RESET=1`): delete the
+    /// persisted snapshot scope before opening so the source loads fresh.
+    /// The outcome is reported by `EmbeddedSourceHandle::open_reset_receipt`.
+    pub reset_snapshot_state: bool,
+    /// Existing, absolute, host-protected directory for the state MCP keeps
+    /// in process control state, beneath its `embed-host` child: `index_folder`
+    /// idempotency records, and the edit-safety project-config trust store
+    /// (`embed-host/edit-safety/trust.json`) whose verdict the edit answers
+    /// report. `None` refuses idempotency keys as persistence-unavailable, as
+    /// MCP does, and reports the trust store unavailable, as MCP does when it
+    /// has no user-local control directory.
+    pub replay_control_directory: Option<PathBuf>,
+    /// Whether an edit refuses when the project's `.symforge` config is
+    /// untrusted. The host chooses; the library never reads
+    /// `SYMFORGE_PROJECT_CONFIG_TRUST_MODE` from the process environment.
+    pub project_config_trust_mode: ProjectConfigTrustMode,
+}
+
+/// MCP's project-config trust mode, chosen by the embedding host.
+/// `LogOnly` (the default, as in MCP) applies the edit and carries the
+/// warning suffix; `Enforce` refuses the edit before any write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectConfigTrustMode {
+    #[default]
+    LogOnly,
+    Enforce,
+}
+
+/// Outcome of an `index_folder`-style snapshot reset: the shared
+/// `persist::reset_snapshot_state` scope and its observed file counts.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotResetReceipt {
+    pub scope: String,
+    pub removed: u64,
+    pub missing: u64,
+}
+
+impl SnapshotResetReceipt {
+    pub(crate) fn from_report(report: &crate::live_index::persist::SnapshotResetReport) -> Self {
+        Self {
+            scope: crate::live_index::persist::SNAPSHOT_RESET_SCOPE_LABEL.to_owned(),
+            removed: report.removed_count() as u64,
+            missing: report.missing_count() as u64,
+        }
+    }
 }
 
 /// Host-only bounds and placement for disposable Git read artifacts.

@@ -92,7 +92,8 @@ pub use crate::index_lifecycle::public_api::{
 /// so this file stays the only embed file that names the boundary.
 pub(crate) mod lifecycle {
     pub(crate) use crate::index_lifecycle::{
-        embed_federation, embed_host, embed_query, embed_session, guidance, public_api,
+        embed_edit_body, embed_federation, embed_host, embed_query, embed_session, guidance,
+        public_api,
     };
 }
 

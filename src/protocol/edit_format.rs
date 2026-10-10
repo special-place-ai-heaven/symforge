@@ -9,99 +9,12 @@
 /// duplicated across files. The exact wording/behavior is unchanged.
 pub(crate) const WRITE_MODE_FAILED_SENTINEL: &str = "Write mode: failed";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EditSafetyMode {
-    StructuralEditSafe,
-    TextEditSafe,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EditSourceAuthority {
-    DiskRefreshed,
-    CurrentIndex,
-    /// The edit base was re-read and re-parsed from the rerouted worktree
-    /// TARGET because it had diverged from the indexed copy (a prior routed
-    /// edit). Splicing into index content here would silently discard those
-    /// earlier routed edits (review finding 5, post-v7.19.0).
-    WorktreeTarget,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EditWriteSemantics {
-    DryRunNoWrites,
-    AtomicWriteAndReindex,
-    TransactionalWriteRollbackAndReindex,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MatchType {
-    Exact,
-    Constrained,
-}
-
-fn safety_mode_label(mode: EditSafetyMode) -> &'static str {
-    match mode {
-        EditSafetyMode::StructuralEditSafe => "structural-edit-safe",
-        EditSafetyMode::TextEditSafe => "text-edit-safe",
-    }
-}
-
-fn source_authority_label(authority: EditSourceAuthority) -> &'static str {
-    match authority {
-        EditSourceAuthority::DiskRefreshed => "disk-refreshed",
-        EditSourceAuthority::CurrentIndex => "current index",
-        EditSourceAuthority::WorktreeTarget => "worktree target (rebased)",
-    }
-}
-
-fn write_semantics_label(semantics: EditWriteSemantics) -> &'static str {
-    match semantics {
-        EditWriteSemantics::DryRunNoWrites => "dry run (no writes)",
-        EditWriteSemantics::AtomicWriteAndReindex => "atomic write + reindex",
-        EditWriteSemantics::TransactionalWriteRollbackAndReindex => {
-            "transactional write + rollback + reindex"
-        }
-    }
-}
-
-fn match_type_label(match_type: MatchType) -> &'static str {
-    match match_type {
-        MatchType::Exact => "exact",
-        MatchType::Constrained => "constrained",
-    }
-}
-
-pub(crate) fn format_edit_envelope(
-    safety_mode: EditSafetyMode,
-    source_authority: EditSourceAuthority,
-    write_semantics: EditWriteSemantics,
-    evidence_anchor: &str,
-) -> String {
-    format!(
-        "Edit safety: {}\nPath authority: repository-bound\nSource authority: {}\nWrite semantics: {}\nEvidence: symbol anchor `{}`",
-        safety_mode_label(safety_mode),
-        source_authority_label(source_authority),
-        write_semantics_label(write_semantics),
-        evidence_anchor
-    )
-}
-
-pub(crate) fn format_batch_envelope(
-    safety_mode: EditSafetyMode,
-    match_type: MatchType,
-    source_authority: EditSourceAuthority,
-    write_semantics: EditWriteSemantics,
-    evidence: &str,
-) -> String {
-    format!(
-        "Edit safety: {}\nMatch type: {}\nPath authority: repository-bound\nSource authority: {}\nWrite semantics: {}\nEvidence: {}",
-        safety_mode_label(safety_mode),
-        match_type_label(match_type),
-        source_authority_label(source_authority),
-        write_semantics_label(write_semantics),
-        evidence
-    )
-}
+pub(crate) use super::edit::edit_body::{
+    EditSafetyMode, EditSourceAuthority, EditWriteSemantics, MatchType, format_batch_summary,
+    format_delete, format_edit_within, format_insert, format_replace, format_stale_warnings,
+};
+#[cfg(test)]
+use super::edit::edit_body::{format_batch_envelope, format_edit_envelope};
 
 pub(crate) fn format_capability_warning(
     tool_name: &str,
@@ -115,68 +28,6 @@ pub(crate) fn format_capability_warning(
     )
 }
 
-/// Format the result of a replace_symbol_body operation.
-pub(crate) fn format_replace(
-    path: &str,
-    name: &str,
-    kind: &str,
-    old_bytes: usize,
-    new_bytes: usize,
-) -> String {
-    format!("{path} — replaced {kind} `{name}` ({old_bytes} → {new_bytes} bytes)")
-}
-
-/// Format the result of an insert operation.
-pub(crate) fn format_insert(
-    path: &str,
-    name: &str,
-    position: &str,
-    inserted_bytes: usize,
-) -> String {
-    format!("{path} — inserted {position} `{name}` ({inserted_bytes} bytes)")
-}
-
-/// Format the result of a delete operation.
-pub(crate) fn format_delete(path: &str, name: &str, kind: &str, deleted_bytes: usize) -> String {
-    format!("{path} — deleted {kind} `{name}` ({deleted_bytes} bytes)")
-}
-
-/// Format the result of an edit-within-symbol operation.
-pub(crate) fn format_edit_within(
-    path: &str,
-    name: &str,
-    replacements: usize,
-    old_bytes: usize,
-    new_bytes: usize,
-) -> String {
-    format!(
-        "{path} — edited within `{name}` ({replacements} replacement(s), {old_bytes} → {new_bytes} bytes)"
-    )
-}
-
-/// Format stale reference warnings after a signature-changing edit.
-pub(crate) fn format_stale_warnings(
-    _path: &str,
-    name: &str,
-    refs: &[(String, u32, Option<String>)],
-) -> String {
-    if refs.is_empty() {
-        return String::new();
-    }
-    let mut out = format!(
-        "\n[!] Signature of `{name}` may have changed — {} reference(s) to check:\n",
-        refs.len()
-    );
-    for (ref_path, line, enclosing) in refs {
-        out.push_str(&format!("  {ref_path}:{line}"));
-        if let Some(enc) = enclosing {
-            out.push_str(&format!(" (in {enc})"));
-        }
-        out.push('\n');
-    }
-    out
-}
-
 /// Format the worktree-routing suffix appended to edit responses when the caller
 /// supplied `working_directory`. Produces concise target evidence so agents can
 /// verify the requested workspace, actual write target, indexed path, and
@@ -186,27 +37,12 @@ pub(crate) fn format_reroute_suffix(
     working_directory: Option<&std::path::Path>,
     resolved: &crate::worktree::ResolvedTarget,
 ) -> String {
-    let Some(working_directory) = working_directory else {
-        return String::new();
-    };
-    format!(
-        "\nworking_directory: {}\nrerouted: {}\nwrote_to: {}\nindexed_path: {}",
-        working_directory.display(),
+    crate::index_lifecycle::guidance::edit_route::format_reroute_suffix(
+        working_directory,
         resolved.rerouted,
-        resolved.target_path.display(),
-        resolved.indexed_path.display(),
+        &resolved.target_path,
+        &resolved.indexed_path,
     )
-}
-
-/// Format a batch edit summary.
-pub(crate) fn format_batch_summary(results: &[String], file_count: usize) -> String {
-    let mut out = format!("{} edit(s) across {} file(s):\n", results.len(), file_count);
-    for r in results {
-        out.push_str("  ");
-        out.push_str(r);
-        out.push('\n');
-    }
-    out
 }
 
 const WRITE_SEMANTICS_LINE_PREFIX: &str = "Write semantics: ";

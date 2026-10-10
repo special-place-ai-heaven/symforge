@@ -2,7 +2,7 @@
 
 use super::embed_query::{Budget, text_line};
 use crate::embed::parity::guidance::{
-    Conventions, Exploration, ExploreRequest, ExploreSymbol, RelatedFile,
+    Conventions, EditPlanGuidance, Exploration, ExploreRequest, ExploreSymbol, RelatedFile,
 };
 use crate::embed::parity::search::SearchEstimate;
 use crate::embed::parity::{QueryOutput, QueryRefusalKind};
@@ -42,6 +42,23 @@ pub(super) fn conventions(
         common_imports: strings(result.common_imports, budget),
         file_organization: result.file_organization,
         complexity: result.complexity,
+    }))
+}
+
+/// The MCP `edit_plan` handler body over the captured publication: one
+/// capture, so plan structure and co-change data agree.
+pub(super) fn edit_plan(
+    live: &LiveIndex,
+    temporal: &crate::live_index::git_temporal::GitTemporalIndex,
+    target: &str,
+    budget: &mut Budget,
+) -> Result<QueryOutput, QueryRefusalKind> {
+    budget.check()?;
+    let rendered = super::guidance::edit_plan::plan_edit(live, temporal, target);
+    budget.required(target.len() + rendered.len())?;
+    Ok(QueryOutput::EditPlan(EditPlanGuidance {
+        target: target.to_owned(),
+        rendered,
     }))
 }
 
@@ -168,7 +185,7 @@ fn project_exploration(
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
-    Ok(QueryOutput::Exploration(Exploration {
+    let mut exploration = Exploration {
         label: result.display_label.clone(),
         depth: result.depth,
         symbols,
@@ -179,5 +196,8 @@ fn project_exploration(
         derived_seed_files,
         enriched_imports: strings(result.enriched_imports.iter().cloned(), budget),
         hidden_noise_results: result.noise_hidden as u64,
-    }))
+        rendered: String::new(),
+    };
+    exploration.rendered = super::embed_ask::exploration_text(&exploration);
+    Ok(QueryOutput::Exploration(exploration))
 }

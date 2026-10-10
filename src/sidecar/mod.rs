@@ -197,14 +197,7 @@ impl TokenStats {
 // SymbolSnapshot — lightweight copy of a symbol for pre/post diff in impact handler
 // ---------------------------------------------------------------------------
 
-/// Lightweight snapshot of a symbol used to detect pre/post-edit changes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SymbolSnapshot {
-    pub name: String,
-    pub kind: String,
-    pub line_range: (u32, u32),
-    pub byte_range: (u32, u32),
-}
+pub use crate::index_lifecycle::guidance::file_impact::SymbolSnapshot;
 
 /// Public cache shape retained for sidecar embedders.
 pub type SymbolSnapshotCache = HashMap<String, Vec<SymbolSnapshot>>;

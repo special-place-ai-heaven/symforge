@@ -1,0 +1,188 @@
+{
+  "repos": {
+    "changes": {
+      "commits": [
+        {
+          "files": {
+            ".gitignore": ".symforge/\n",
+            "README.md": "# Before\n",
+            "src/lib.rs": "pub fn old() {}\npub fn changed() -> u8 { 1 }\n",
+            "src/caller.rs": "use crate::changed;\n\npub fn call() -> u8 {\n    changed()\n}\n"
+          }
+        },
+        {
+          "files": {
+            "README.md": "# After\n",
+            "src/lib.rs": "pub fn added() {}\npub fn changed() -> u16 { 2 }\n"
+          }
+        }
+      ],
+      "working": {
+        "src/lib.rs": "pub fn working() {}\npub fn changed() -> u32 { 3 }\n",
+        "notes.json": "{\"note\":\"fixture\"}\n"
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "what_changed uncommitted with symbol diff",
+      "repo": "changes",
+      "tool": "what_changed",
+      "input": {
+        "uncommitted": true,
+        "include_symbol_diff": true
+      },
+      "expected": "Match type: exact (uncommitted working tree)\nSource authority: git working tree\nParse state: degraded (git path diff + lexical symbol diff — regex extraction may miss nested symbols)\nCompleteness: full for filtered scope (1 of 2 path(s) shown)\nScope: uncommitted working tree; code-only filter; symbol diff appended\nEvidence: paths `src/lib.rs`\n\nsrc/lib.rs\n\nSymbol diff: HEAD...working tree\n1 files changed\n\n  src/lib.rs (+1: working, -1: added, ~1: changed)\nSummary: +1 added, -1 removed, ~1 modified"
+    },
+    {
+      "name": "what_changed uncommitted including non-code files",
+      "repo": "changes",
+      "tool": "what_changed",
+      "input": {
+        "uncommitted": true,
+        "code_only": false
+      },
+      "expected": "Match type: exact (uncommitted working tree)\nSource authority: git working tree\nParse state: not-applicable (git path diff)\nCompleteness: full for current scope\nScope: uncommitted working tree\nEvidence: paths `notes.json`, `src/lib.rs`\n\nnotes.json\nsrc/lib.rs"
+    },
+    {
+      "name": "what_changed against the first commit",
+      "repo": "changes",
+      "tool": "what_changed",
+      "input": {
+        "git_ref": "{base}",
+        "path_prefix": "src/",
+        "language": "Rust"
+      },
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: not-applicable (git path diff)\nCompleteness: full for filtered scope (1 of 2 path(s) shown)\nScope: git diff from `{base}` to `HEAD`; path prefix `src`; language `Rust`\nEvidence: paths `src/lib.rs`\n\nsrc/lib.rs"
+    },
+    {
+      "name": "what_changed estimate",
+      "repo": "changes",
+      "tool": "what_changed",
+      "input": {
+        "uncommitted": true,
+        "estimate": true
+      },
+      "expected": "Estimate for what_changed: ~200 tokens (include_symbol_diff=false)"
+    },
+    {
+      "name": "resource symforge://repo/changes/uncommitted",
+      "repo": "changes",
+      "resource": "symforge://repo/changes/uncommitted",
+      "expected": "Match type: exact (uncommitted working tree)\nSource authority: git working tree\nParse state: not-applicable (git path diff)\nCompleteness: full for filtered scope (1 of 2 path(s) shown)\nScope: uncommitted working tree; code-only filter\nEvidence: paths `src/lib.rs`\n\nsrc/lib.rs"
+    },
+    {
+      "name": "diff_symbols between the two commits",
+      "repo": "changes",
+      "tool": "diff_symbols",
+      "input": {
+        "base": "{base}",
+        "target": "{target}"
+      },
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\n── src/lib.rs ──\n  + added\n  - old\n  ~ changed\n\nSummary: +1 added, -1 removed, ~1 modified"
+    },
+    {
+      "name": "diff_symbols compact",
+      "repo": "changes",
+      "tool": "diff_symbols",
+      "input": {
+        "base": "{base}",
+        "target": "{target}",
+        "compact": true
+      },
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`; compact output\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\n  src/lib.rs (+1: added, -1: old, ~1: changed)\nSummary: +1 added, -1 removed, ~1 modified\n(1 file(s) with only non-symbol changes omitted)"
+    },
+    {
+      "name": "diff_symbols summary only",
+      "repo": "changes",
+      "tool": "diff_symbols",
+      "input": {
+        "base": "{base}",
+        "target": "{target}",
+        "summary_only": true
+      },
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`; summary-only output\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\nSummary: +1 added, -1 removed, ~1 modified"
+    },
+    {
+      "name": "diff_symbols filtered to Rust under src",
+      "repo": "changes",
+      "tool": "diff_symbols",
+      "input": {
+        "base": "{base}",
+        "target": "{target}",
+        "path_prefix": "src",
+        "language": "Rust",
+        "code_only": true
+      },
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta (1 of 2 changed file(s) shown)\nScope: git diff `{base}`...`{target}`; path prefix `src`; language `Rust`; code-only filter\nEvidence: paths `src/lib.rs`\n\nSymbol diff: {base}...{target}\n1 files changed\n\n── src/lib.rs ──\n  + added\n  - old\n  ~ changed\n\nSummary: +1 added, -1 removed, ~1 modified"
+    },
+    {
+      "name": "detect_impact since the previous commit",
+      "repo": "changes",
+      "tool": "detect_impact",
+      "input": {
+        "since": "HEAD~1",
+        "depth": 2,
+        "scope": "symbols"
+      },
+      "expected": "Impact analysis: 1 changed file(s), 3 changed symbol(s), 1 blast-radius node(s) (0 critical / 1 high / 0 medium / 0 low)\n\n--- impact payload ---\n{\n  \"blast_radius\": [\n    {\n      \"hop\": 1,\n      \"risk\": \"high\",\n      \"symbol\": \"src/caller.rs::call\"\n    }\n  ],\n  \"changed_files\": [\n    \"src/lib.rs\"\n  ],\n  \"changed_symbols\": [\n    {\n      \"kind\": \"fn\",\n      \"name\": \"working\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"changed\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"old\",\n      \"path\": \"src/lib.rs\"\n    }\n  ],\n  \"pagination\": {\n    \"blast_radius\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_files\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_symbols\": {\n      \"returned\": 3,\n      \"total\": 3,\n      \"truncated\": false\n    }\n  },\n  \"risk_summary\": {\n    \"critical\": 0,\n    \"high\": 1,\n    \"low\": 0,\n    \"medium\": 0\n  },\n  \"source_filter\": {\n    \"applied\": true,\n    \"excluded_paths\": 2,\n    \"hint\": \"non-source changed paths are excluded by default; pass include_data=true to include them\"\n  }\n}"
+    },
+    {
+      "name": "detect_impact by file",
+      "repo": "changes",
+      "tool": "detect_impact",
+      "input": {
+        "since": "HEAD~1",
+        "depth": 1,
+        "scope": "files"
+      },
+      "expected": "Impact analysis: 1 changed file(s), 3 changed symbol(s), 1 blast-radius node(s) (0 critical / 1 high / 0 medium / 0 low)\n\n--- impact payload ---\n{\n  \"blast_radius\": [\n    {\n      \"hop\": 1,\n      \"risk\": \"high\",\n      \"symbol\": \"src/caller.rs\"\n    }\n  ],\n  \"changed_files\": [\n    \"src/lib.rs\"\n  ],\n  \"changed_symbols\": [\n    {\n      \"kind\": \"fn\",\n      \"name\": \"working\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"changed\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"old\",\n      \"path\": \"src/lib.rs\"\n    }\n  ],\n  \"pagination\": {\n    \"blast_radius\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_files\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_symbols\": {\n      \"returned\": 3,\n      \"total\": 3,\n      \"truncated\": false\n    }\n  },\n  \"risk_summary\": {\n    \"critical\": 0,\n    \"high\": 1,\n    \"low\": 0,\n    \"medium\": 0\n  },\n  \"source_filter\": {\n    \"applied\": true,\n    \"excluded_paths\": 2,\n    \"hint\": \"non-source changed paths are excluded by default; pass include_data=true to include them\"\n  }\n}"
+    },
+    {
+      "name": "explore a concept",
+      "repo": "changes",
+      "tool": "explore",
+      "input": {
+        "query": "changed"
+      },
+      "expected": "── Exploring: 'changed' ──\n\nSymbols (2 found):\n  fn changed  src/lib.rs  [1.00; reason: strong match]\n  fn call  src/caller.rs  [0.83; reason: strong match]\n\nCode patterns (2 found):\n  src/caller.rs\n    > 4:     changed()\n  src/lib.rs\n    > 2: pub fn changed() -> u32 { 3 }\n\nRelated files:\n  src/caller.rs  (2 matches)\n  src/lib.rs  (2 matches)\n\nranked by: concept match + symbol-token alignment + path proximity"
+    },
+    {
+      "name": "explore depth 2",
+      "repo": "changes",
+      "tool": "explore",
+      "input": {
+        "query": "changed",
+        "depth": 2
+      },
+      "expected": "── Exploring: 'changed' ──\n\nSymbols (2 found):\n  pub fn changed() -> u32 { 3 }  [fn, src/lib.rs]  [1.00; reason: strong match]\n    <- used by: src/caller.rs\n  pub fn call() -> u8  [fn, src/caller.rs]  [0.83; reason: strong match]\n\nCode patterns (2 found):\n  src/caller.rs\n    > 4:     changed()\n  src/lib.rs\n    > 2: pub fn changed() -> u32 { 3 }\n\nRelated files:\n  src/caller.rs  (2 matches)\n  src/lib.rs  (2 matches)\n\nranked by: concept match + symbol-token alignment + path proximity"
+    },
+    {
+      "name": "ask who calls",
+      "repo": "changes",
+      "tool": "ask",
+      "input": {
+        "query": "who calls changed"
+      },
+      "expected": "Route confidence: exact\nChosen tool: find_references\nInvocation: find_references(name=\"changed\")\nRationale: matched explicit caller/reference phrasing\n[Routed to: find_references(name=\"changed\")]\n\nTrust: constrained (repo-wide name match) | current index | parsed | full for current scope — usage-trace recall is best-effort; dynamic dispatch, macro-generated, reflective, and cross-language usages may be missed\nScope: repo-wide symbol token `changed`\nEvidence: reference anchors `src/caller.rs:1`, `src/caller.rs:4`, `src/caller.rs:1`\n\n3 references to \"changed\" in 1 files\nTarget definition candidates: 1 exact-name indexed symbols; indexed-file parse coverage complete. Unique among indexed records: yes (compiler resolution not available).\n  src/lib.rs:L2 [fn] bytes 20..49\nsrc/caller.rs\n  AST declaration headers for returned sites: 1 distinct (showing 1; 0 omitted by metadata cap; 1 caller headers unavailable; final response token budget may truncate):\n    caller: definition L3-5 bytes 21..58; [function_item] header L3 bytes 21..41; signature start L3\n      caller identity: call bytes 28..32\n  :1 \n  :4   [AST caller function_item definition L3-5 bytes 21..58; header L3 bytes 21..41; signature start L3]\n  :1 [qualified-path scan: confident]"
+    },
+    {
+      "name": "ask find symbol",
+      "repo": "changes",
+      "tool": "ask",
+      "input": {
+        "query": "find symbol changed"
+      },
+      "expected": "Route confidence: exact\nChosen tool: search_symbols\nInvocation: search_symbols(query=\"changed\")\nRationale: matched explicit definition/lookup phrasing\n[Routed to: search_symbols(query=\"changed\")]\n\nTrust: exact | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)\nScope: repo-wide; tests filter active (heuristic); generated filter active (heuristic); vendor filter active (heuristic); personal tooling filtered\nEvidence: symbol anchors `src/lib.rs:2`\n\n1 matches in 1 files\n── Exact matches ──\n  2: fn changed  (src/lib.rs)  [1.00]\n\nText path fallback (sparse symbol hits):\nsrc/caller.rs:1"
+    },
+    {
+      "name": "ask tool help",
+      "repo": "changes",
+      "tool": "ask",
+      "input": {
+        "query": "which tool should I use for impact analysis"
+      },
+      "expected": "Route confidence: exact\nChosen tool: ask\nInvocation: ask(query=\"which tool should I use for impact?\")\nRationale: matched a tool-recommendation question about SymForge's own tool surface\nSuggested next step: Pick a tool from the catalog below, or ask `which tool should I use for <topic>?` to narrow it.\n[Routed to: ask(query=\"which tool should I use for impact?\")]\n\nSymForge tools for \"impact\":\n\n## impact-analysis — Understand what a change touches and what would break.\n  find_references, find_dependents, get_symbol_context, analyze_file_impact, what_changed, diff_symbols\n\nTip: omit the topic to see the full tool catalog."
+    }
+  ]
+}

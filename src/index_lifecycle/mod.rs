@@ -45,7 +45,11 @@ mod embed_changes;
 #[cfg(feature = "embed")]
 mod embed_detect_impact;
 #[cfg(feature = "embed")]
+pub(crate) mod embed_edit_body;
+#[cfg(feature = "embed")]
 pub(crate) mod embed_federation;
+#[cfg(feature = "embed")]
+mod embed_file_impact;
 #[cfg(feature = "embed")]
 mod embed_file_search;
 #[cfg(feature = "embed")]
@@ -75,13 +79,23 @@ pub(crate) mod embed_remediation;
 #[cfg(feature = "embed")]
 pub(super) mod embed_restore;
 #[cfg(feature = "embed")]
+mod embed_route;
+#[cfg(feature = "embed")]
 mod embed_search;
 #[cfg(feature = "embed")]
 pub(crate) mod embed_session;
 #[cfg(feature = "embed")]
+mod embed_stel;
+#[cfg(feature = "embed")]
 mod embed_symbol;
 #[cfg(feature = "embed")]
 mod embed_symbol_context;
+#[cfg(feature = "embed")]
+mod embed_symforge;
+#[cfg(feature = "embed")]
+mod embed_symforge_edit;
+#[cfg(feature = "embed")]
+mod embed_temporal;
 #[cfg(feature = "embed")]
 mod embed_usage;
 #[cfg(feature = "embed")]

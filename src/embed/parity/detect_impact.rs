@@ -87,4 +87,7 @@ pub struct DetectImpactResult {
     pub effective_depth: u8,
     pub base_branch: Option<String>,
     pub staleness_note: Option<String>,
+    /// MCP `detect_impact`'s text: the summary and the impact payload.
+    #[serde(default)]
+    pub rendered: String,
 }

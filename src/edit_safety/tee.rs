@@ -352,7 +352,14 @@ fn enforce_retention(tee_dir: &Path, retention: TeeRetention) -> io::Result<()> 
 }
 
 fn display_relative(repo_root: &Path, path: &Path) -> String {
-    let display_path = path.strip_prefix(repo_root).unwrap_or(path);
+    // Compare the ordinary spellings: a Windows verbatim (`\\?\`) root and a
+    // plain path to the same file are one location, and showing it absolute
+    // for one spelling and relative for the other made the hint depend on
+    // how the caller reached the file.
+    let path = dunce::simplified(path);
+    let display_path = path
+        .strip_prefix(dunce::simplified(repo_root))
+        .unwrap_or(path);
     display_path.to_string_lossy().replace('\\', "/")
 }
 

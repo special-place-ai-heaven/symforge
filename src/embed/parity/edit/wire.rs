@@ -25,6 +25,9 @@ pub struct WireEditGuard {
     pub content_generation: u64,
     pub content_hash: String,
     pub symbol_hash: String,
+    /// The requested spelling of `name`, when it differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
 }
 
 impl From<&EditGuard> for WireEditGuard {
@@ -41,6 +44,7 @@ impl From<&EditGuard> for WireEditGuard {
             content_generation: guard.content_generation,
             content_hash: guard.content_hash.clone(),
             symbol_hash: guard.symbol_hash.clone(),
+            selector: (guard.selector != guard.name).then(|| guard.selector.clone()),
         }
     }
 }
@@ -50,6 +54,7 @@ impl WireEditGuard {
         EditGuard {
             root: root.to_path_buf(),
             path: self.path,
+            selector: self.selector.unwrap_or_else(|| self.name.clone()),
             name: self.name,
             kind: self.kind,
             symbol_line: self.symbol_line,

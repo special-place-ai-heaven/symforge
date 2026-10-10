@@ -957,6 +957,136 @@ pub(crate) fn changed_rows(
     (hits, weak_hits)
 }
 
+/// The `Capability:` evidence line MCP appends to a ranked file search.
+pub fn capability_evidence_line(evidence: &CapabilityEvidence) -> String {
+    let mut line = format!("Capability: {} {}", evidence.capability, evidence.status);
+    if let Some(detail) = evidence.detail.as_deref().map(str::trim)
+        && !detail.is_empty()
+    {
+        let detail = detail.trim_end_matches('.');
+        line.push_str(" - ");
+        line.push_str(detail);
+    }
+    line.push('.');
+    line
+}
+
+/// MCP `search_files`' rendered answer for a ranked path search: the result
+/// envelope or the filter summary, the view, the ranking evidence and notes,
+/// and the zero-hit untracked diagnostic `untracked_paths` sweeps on demand.
+pub(crate) fn render_ranked_files(
+    generation: &crate::live_index::store::PublishedGeneration,
+    ranked: RankedFiles,
+    input: &SearchFilesInput,
+    include_vendor: bool,
+    include_personal_tooling: bool,
+    untracked_paths: impl FnOnce() -> Vec<String>,
+) -> String {
+    let rank_by_path_cochange = input.rank_by.as_deref() == Some("path+cochange");
+    let rank_by_frecency = input.rank_by.as_deref() == Some("frecency");
+    let view = ranked.view;
+    let hidden_noise_count = ranked.hidden_noise_count;
+    let cochange_evidence = ranked.cochange_evidence;
+    let frecency_evidence = ranked.frecency_evidence;
+    let ranking_diagnostics = ranked.ranking_diagnostics;
+    let debug_ranking = ranking_diagnostics.explain;
+    let envelope = match &view {
+        SearchFilesView::Found {
+            hits,
+            overflow_count,
+            ..
+        } => {
+            let scope = match input.current_file.as_deref() {
+                Some(current_file) => {
+                    format!("ranked indexed file paths; current file boost `{current_file}`")
+                }
+                None => "ranked indexed file paths".to_string(),
+            };
+            Some(super::search_envelope::format_search_envelope(
+                super::search_envelope::search_files_match_type_label(&view),
+                // The two composite labels already differ from the bare
+                // "current index" sentinel, so they never collapse the
+                // envelope; only the plain arm needed measuring. They do
+                // still say "current" unconditionally — worth revisiting
+                // once every lane derives its own prefix.
+                if rank_by_path_cochange {
+                    super::search_envelope::SourceAuthority::never_collapse(
+                        "current index + optional coupling store",
+                    )
+                } else if rank_by_frecency {
+                    super::search_envelope::SourceAuthority::never_collapse(
+                        "current index + optional frecency history",
+                    )
+                } else {
+                    super::search_envelope::SourceAuthority::from_freshness(&generation.freshness)
+                },
+                super::reference_read::search_parse_state_for_paths(
+                    &generation.live,
+                    hits.iter().map(|hit| hit.path.as_str()),
+                ),
+                &super::search_envelope::search_completeness_label(
+                    *overflow_count,
+                    hidden_noise_count,
+                ),
+                &super::search_envelope::search_files_scope_summary(
+                    scope,
+                    include_vendor,
+                    include_personal_tooling,
+                ),
+                &super::changes::search_paths_evidence(hits.iter().map(|hit| hit.path.as_str())),
+            ))
+        }
+        _ => None,
+    };
+    let output = super::search_render::search_files_result_view(&view);
+    let had_envelope = envelope.is_some();
+    let mut result = match envelope {
+        Some(envelope) => format!("{envelope}\n\n{output}"),
+        None => output,
+    };
+    if !had_envelope {
+        super::search_envelope::append_search_files_filter_summary(
+            &mut result,
+            include_vendor,
+            include_personal_tooling,
+        );
+    }
+    if let Some(evidence) = cochange_evidence.as_ref() {
+        result.push_str("\n\n");
+        result.push_str(&capability_evidence_line(evidence));
+    }
+    if let Some(evidence) = frecency_evidence.as_ref() {
+        result.push_str("\n\n");
+        result.push_str(&capability_evidence_line(evidence));
+    }
+    if let Some(evidence) = ranking_diagnostics.evidence.as_ref() {
+        result.push_str("\n\n");
+        result.push_str(&capability_evidence_line(evidence));
+    }
+    if debug_ranking {
+        result.push_str("\n\n");
+        result.push_str(&search_files_ranking_explanation(
+            &view,
+            input.rank_by.as_deref(),
+            cochange_evidence.as_ref(),
+            frecency_evidence.as_ref(),
+        ));
+    }
+    if let Some(note) = super::search_envelope::search_files_hidden_noise_note(
+        hidden_noise_count,
+        include_vendor,
+        include_personal_tooling,
+    ) {
+        result.push_str("\n\n");
+        result.push_str(&note);
+    }
+    if matches!(view, SearchFilesView::NotFound { .. }) {
+        let matching_untracked_paths = untracked_paths();
+        super::search::append_untracked_file_diagnostic(&mut result, &matching_untracked_paths);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

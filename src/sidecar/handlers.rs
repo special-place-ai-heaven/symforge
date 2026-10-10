@@ -14,12 +14,17 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::domain::LanguageId;
+use crate::index_lifecycle::guidance::file_impact;
+#[cfg(test)]
+use crate::index_lifecycle::guidance::file_impact::{
+    find_record_matching_snapshot, symbol_body_bytes_changed,
+};
 use crate::index_lifecycle::guidance::read_context::ContextSourceAuthority;
 #[cfg(test)]
 use crate::index_lifecycle::guidance::read_context::{
     append_parse_status_lines, is_intra_workspace_path, parse_state_label,
 };
-use crate::sidecar::{SidecarState, SymbolSnapshot, SymbolSnapshotCache, build_with_budget};
+use crate::sidecar::{SidecarState, SymbolSnapshot, SymbolSnapshotCache};
 use crate::watcher;
 
 // ---------------------------------------------------------------------------
@@ -752,642 +757,89 @@ async fn impact_text(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let is_new_file = params.new_file.unwrap_or(false);
-
-    if is_new_file {
-        // HOOK-06: Index a new file from disk.
-        return handle_new_file_impact(
-            state,
+    let worker = state.clone();
+    let render = tokio::task::spawn_blocking(move || {
+        let shared = worker.index.data_plane().clone();
+        let mut cache = SidecarImpactCache {
+            state: &worker,
+            expected_generation,
+        };
+        file_impact::analyze_file_impact(
+            &shared,
             &root,
             &normalized_path,
-            options,
+            is_new_file,
             expected_generation,
             baseline,
-        )
-        .await;
-    }
-
-    let should_auto_index_new_file = {
-        // AAP-002: `from_path` (not `from_extension`) so extensionless narrative
-        // entry points and dotfiles (README, .env, .gitignore) auto-index the
-        // same way discovery admits them.
-        let is_supported = crate::domain::LanguageId::from_path(&normalized_path).is_some();
-        let indexed = {
-            let guard = state.index.data_plane().read();
-            guard.get_file(&normalized_path).is_some()
-        };
-        is_supported && !indexed && root.join(&normalized_path).is_file()
-    };
-
-    if should_auto_index_new_file {
-        return handle_new_file_impact(
-            state,
-            &root,
-            &normalized_path,
-            options,
-            expected_generation,
-            baseline,
-        )
-        .await;
-    }
-
-    // HOOK-05: Re-index existing file and compute symbol diff.
-    handle_edit_impact(
-        state,
-        &root,
-        &normalized_path,
-        options,
-        expected_generation,
-        baseline,
-    )
-    .await
-}
-
-fn impact_skipped_text(published: &crate::live_index::PublishedGeneration, path: &str) -> String {
-    use crate::domain::index::AdmissionTier;
-
-    let view = published.live.capture_admission_tier_lookup_view(path);
-    let Some(view) = view else {
-        return format!(
-            "Not indexed: {path} is excluded by repository scope. The admission gate applies to \
-             analyze_file_impact the same as bulk load and the watcher (no force-admit)."
-        );
-    };
-    let tier_label = match view.tier {
-        AdmissionTier::Normal => "Tier 1",
-        AdmissionTier::MetadataOnly => "Tier 2 (metadata only)",
-        AdmissionTier::HardSkip => "Tier 3 (hard skip)",
-    };
-    let reason = view
-        .reason
-        .map(|reason| reason.to_string())
-        .unwrap_or_else(|| "policy".to_string());
-    let size_mb = view.size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
-
-    // SF-AAP-002 is scoped to genuinely NON-PARSER files (no code parser exists
-    // for the type — the artifact/binary case). A parser-supported file demoted
-    // for SIZE is NOT this case: it keeps the honest oversize refusal that
-    // impact_admission (a frozen behavioral contract) pins. `from_path` is the
-    // same parser-support signal impact_text uses for auto-indexing (and that
-    // discovery admits by), so the wording stays truthful in both branches.
-    // AAP-002: `from_path` (not `from_extension`) recognizes extensionless
-    // Text/Env entry points (README, .env, .gitignore) as parser-supported, so a
-    // demoted one keeps the oversize refusal; `.bin` still reads as non-parser.
-    let has_code_parser = crate::domain::LanguageId::from_path(path).is_some();
-
-    // Key the recovery sentence on the read gate's predicted verdict (spec-023):
-    // "Use get_file_content" must never point at a read the gate will refuse.
-    let raw_read_advice =
-        if crate::protocol::read_gate::disk_read_would_refuse(&published.live, path, view.size) {
-            "Its contents are withheld by the admission policy — get_file_content will refuse \
-         this file."
-        } else {
-            "Use get_file_content for raw reads."
-        };
-
-    if has_code_parser {
-        return format!(
-            "Not indexed: {path} is {tier_label} — reason: {reason}, size {size_mb:.1} MB. \
-             The admission gate applies to analyze_file_impact the same as bulk load \
-             and the watcher (no force-admit). {raw_read_advice}"
-        );
-    }
-
-    let generation = published.project_generation;
-    // Reconciled non-parser file: EXISTS in the catalog, analysis simply
-    // unsupported. Report truthful existence + generation/Tier evidence and a
-    // typed unsupported-analysis outcome — never false absence for a tracked file.
-    format!(
-        "── Impact: {path} ──\n\
-         Status: exists (analysis unsupported — {tier_label}, no code parser)\n\
-         exists: true\n\
-         Tier: {tier_label} — reason: {reason}, size {size_mb:.1} MB\n\
-         Generation: {generation}\n\
-         The file IS tracked (metadata only), not absent; impact/symbol analysis is \
-         unsupported for this file type. {raw_read_advice}"
-    )
-}
-
-fn impact_receipt_publication(
-    receipt: &crate::live_index::single_file::ReindexReceipt,
-    baseline: &std::sync::Arc<crate::live_index::PublishedGeneration>,
-) -> Result<std::sync::Arc<crate::live_index::PublishedGeneration>, StatusCode> {
-    if let Some(published) = &receipt.published {
-        return Ok(std::sync::Arc::clone(published));
-    }
-    if crate::live_index::store::PublicationFence::from_published(baseline.as_ref())
-        == receipt.observed_at
-    {
-        return Ok(std::sync::Arc::clone(baseline));
-    }
-    Err(StatusCode::SERVICE_UNAVAILABLE)
-}
-
-async fn handle_new_file_impact(
-    state: SidecarState,
-    root: &std::path::Path,
-    path: &str,
-    options: RenderOptions,
-    expected_generation: u64,
-    baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
-) -> Result<ImpactToolOutput, StatusCode> {
-    if state.index.data_plane().current_project_generation() != expected_generation {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    let abs_path = root.join(path);
-    let path_owned = path.to_string();
-    let index = state.index.data_plane().clone();
-    let receipt = tokio::task::spawn_blocking(move || {
-        crate::watcher::admit_and_index_single_path_with_receipt(
-            &path_owned,
-            &abs_path,
-            &index,
-            expected_generation,
+            &mut |path, abs_path| {
+                crate::watcher::admit_and_index_single_path_with_receipt(
+                    path,
+                    abs_path,
+                    &shared,
+                    expected_generation,
+                )
+            },
+            &mut cache,
         )
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|failure| match failure {
+        file_impact::ImpactFailure::NotFound => StatusCode::NOT_FOUND,
+        file_impact::ImpactFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    })?;
 
-    if state.index.data_plane().current_project_generation() != expected_generation {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    match &receipt.outcome {
-        crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
-        crate::watcher::ReindexResult::Skipped => {
-            let published = impact_receipt_publication(&receipt, &baseline)?;
-            return Ok(ImpactToolOutput {
-                text: impact_skipped_text(published.as_ref(), path),
-                published,
-            });
-        }
-        crate::watcher::ReindexResult::PublicationRejected => {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
-            if state.index.data_plane().publication_fence() != receipt.observed_at {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+    let mut text = render.text;
+    match render.stats {
+        file_impact::ImpactStats::None => {}
+        file_impact::ImpactStats::Write => {
+            if options.record_stats {
+                state.token_stats.record_write();
             }
-            return Err(StatusCode::NOT_FOUND);
         }
-        crate::watcher::ReindexResult::ReadError(_) => {
-            let published = impact_receipt_publication(&receipt, &baseline)?;
-            return Ok(ImpactToolOutput {
-                text: format!(
-                    "Not indexed: {path} is temporarily unreadable; last-valid state was retained."
-                ),
-                published,
-            });
+        file_impact::ImpactStats::Edit { file_bytes } => {
+            let output_bytes = text.len() as u64;
+            if options.include_savings_footer {
+                text.push_str(&crate::protocol::format::compact_savings_footer(
+                    output_bytes as usize,
+                    file_bytes as usize,
+                ));
+            }
+            if options.record_stats {
+                state.token_stats.record_edit(file_bytes, output_bytes);
+            }
         }
     }
-
-    // Build symbol kind breakdown.
-    let mut kind_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let published = receipt
-        .published
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    if published.project_generation != expected_generation {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    let (language, post_symbols) = {
-        let file = published.live.get_file(path).ok_or(StatusCode::NOT_FOUND)?;
-        for symbol in &file.symbols {
-            *kind_counts.entry(symbol.kind.to_string()).or_insert(0) += 1;
-        }
-        let symbols = file
-            .symbols
-            .iter()
-            .map(|symbol| SymbolSnapshot {
-                name: symbol.name.clone(),
-                kind: symbol.kind.to_string(),
-                line_range: symbol.line_range,
-                byte_range: symbol.byte_range,
-            })
-            .collect();
-        (file.language, symbols)
-    };
-
-    let mut kind_parts: Vec<String> = kind_counts
-        .iter()
-        .map(|(k, v)| format!("{} {}", v, k))
-        .collect();
-    kind_parts.sort();
-    let kinds_str = if kind_parts.is_empty() {
-        "0 symbols".to_string()
-    } else {
-        kind_parts.join(", ")
-    };
-
-    if receipt.snapshot_created {
-        let replacement = crate::live_index::store::PublicationFence::from_published(published);
-        let _ = state
-            .index
-            .data_plane()
-            .take_pre_update_snapshot_for_publication_at_generation(
-                path,
-                expected_generation,
-                replacement,
-            );
-    }
-    // The next edit must diff against the newly indexed file, not an empty
-    // baseline that would report every existing symbol as added.
-    store_cached_symbols_at_generation(&state, path, post_symbols, expected_generation)?;
-
-    if options.record_stats {
-        state.token_stats.record_write();
-    }
-
-    let text = format!(
-        "Language: {:?}\nSymbols: {}\n[Indexed, 0 callers yet]",
-        language, kinds_str,
-    );
-
     Ok(ImpactToolOutput {
         text,
-        published: std::sync::Arc::clone(published),
+        published: render.published,
     })
 }
 
-/// Locate the SymbolRecord in an indexed file that corresponds to a
-/// pre-recorded SymbolSnapshot.
-///
-/// Used by analyze_file_impact so it can walk the symbol's parent impl
-/// block and type-scope the "Callers to review" list. Matches on the
-/// triple (name, kind, byte_range) — overloaded names are common, so
-/// name alone is insufficient.
-fn find_record_matching_snapshot<'a>(
-    file: &'a crate::live_index::store::IndexedFile,
-    sym: &SymbolSnapshot,
-) -> Option<&'a crate::domain::SymbolRecord> {
-    file.symbols.iter().find(|s| {
-        s.name == sym.name && s.kind.to_string() == sym.kind && s.byte_range == sym.byte_range
-    })
-}
-
-fn slice_byte_range(bytes: &[u8], range: (u32, u32)) -> Option<&[u8]> {
-    let start = range.0 as usize;
-    let end = range.1 as usize;
-    (start < end && end <= bytes.len()).then(|| &bytes[start..end])
-}
-
-/// True when the matched symbol's core body text changed, not merely shifted byte
-/// offsets after a prefix insertion (e.g. top-of-file comment edits).
-fn symbol_body_bytes_changed(
-    pre_bytes: &[u8],
-    post_bytes: &[u8],
-    pre: &SymbolSnapshot,
-    post: &SymbolSnapshot,
-) -> bool {
-    match (
-        slice_byte_range(pre_bytes, pre.byte_range),
-        slice_byte_range(post_bytes, post.byte_range),
-    ) {
-        (Some(pre_slice), Some(post_slice)) => pre_slice != post_slice,
-        _ => pre.line_range != post.line_range || pre.byte_range != post.byte_range,
-    }
-}
-async fn handle_edit_impact(
-    state: SidecarState,
-    root: &std::path::Path,
-    path: &str,
-    options: RenderOptions,
+/// The sidecar's generation-checked symbol cache as the impact engine's
+/// last-resort baseline.
+struct SidecarImpactCache<'a> {
+    state: &'a SidecarState,
     expected_generation: u64,
-    baseline: std::sync::Arc<crate::live_index::PublishedGeneration>,
-) -> Result<ImpactToolOutput, StatusCode> {
-    if state.index.data_plane().current_project_generation() != expected_generation {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    // Get pre-edit symbols and bytes from the exact index-owned baseline first.
-    // The public symbols-only cache is a last-resort compatibility fallback: it
-    // cannot prove symbol-body identity, so it must never shadow available
-    // content from a pre-update snapshot or the current indexed file.
-    //
-    // The index pre-update snapshot (`take_pre_update_snapshot`) fixes a race
-    // where the watcher re-indexes the file before this hook fires, causing the
-    // current index to already contain post-edit symbols/content while the hook
-    // still needs the pre-edit baseline for an accurate diff.
-    let pre_update = state
-        .index
-        .data_plane()
-        .peek_pre_update_snapshot_at_generation(path, expected_generation);
-    if state.index.data_plane().current_project_generation() != expected_generation {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    let pre_snapshot_replacement = pre_update.as_ref().map(|(_, replacement)| *replacement);
-    let (pre_symbols, pre_content): (Vec<SymbolSnapshot>, Option<Vec<u8>>) = {
-        if let Some((pre, _)) = pre_update {
-            let symbols = pre
-                .symbols
-                .into_iter()
-                .map(|s| SymbolSnapshot {
-                    name: s.name,
-                    kind: s.kind,
-                    line_range: s.line_range,
-                    byte_range: s.byte_range,
-                })
-                .collect();
-            (symbols, Some(pre.content))
-        } else if let Some(file) = state.index.data_plane().read().get_file(path).cloned() {
-            let symbols = file
-                .symbols
-                .iter()
-                .map(|s| SymbolSnapshot {
-                    name: s.name.clone(),
-                    kind: s.kind.to_string(),
-                    line_range: s.line_range,
-                    byte_range: s.byte_range,
-                })
-                .collect();
-            (symbols, Some(file.content))
-        } else if let Some(cached) =
-            cached_symbols_at_generation(&state, path, expected_generation)?
-        {
-            (cached, None)
-        } else {
-            (Vec::new(), None)
-        }
-    };
+}
 
-    // File byte_len before re-indexing (content baseline comes from `pre_content` above).
-    let file_bytes_pre: u64 = pre_content.as_ref().map_or(0, |b| b.len() as u64);
-
-    let abs_path = root.join(path);
-    let path_owned = path.to_string();
-    let index = state.index.data_plane().clone();
-    let receipt = tokio::task::spawn_blocking(move || {
-        crate::watcher::admit_and_index_single_path_with_receipt(
-            &path_owned,
-            &abs_path,
-            &index,
-            expected_generation,
-        )
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if state.index.data_plane().current_project_generation() != expected_generation {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+impl file_impact::ImpactSymbolCache for SidecarImpactCache<'_> {
+    fn get(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<Vec<SymbolSnapshot>>, file_impact::ImpactFailure> {
+        cached_symbols_at_generation(self.state, path, self.expected_generation)
+            .map_err(|_| file_impact::ImpactFailure::Unavailable)
     }
 
-    match &receipt.outcome {
-        crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
-        crate::watcher::ReindexResult::Skipped => {
-            let published = impact_receipt_publication(&receipt, &baseline)?;
-            return Ok(ImpactToolOutput {
-                text: impact_skipped_text(published.as_ref(), path),
-                published,
-            });
-        }
-        crate::watcher::ReindexResult::PublicationRejected => {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        crate::watcher::ReindexResult::ReadError(_) => {
-            let published = impact_receipt_publication(&receipt, &baseline)?;
-            return Ok(ImpactToolOutput {
-                text: format!(
-                    "── Impact: {path} ──\nStatus: temporarily unreadable — last-valid state retained"
-                ),
-                published,
-            });
-        }
-        crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
-            let published = impact_receipt_publication(&receipt, &baseline)?;
-            // One latency-bounded observation cannot distinguish a durable
-            // deletion from delete→recreate disk ABA. Retain last-valid state;
-            // the watcher retry/reconciliation path owns confirmed removal.
-            let prev_symbol_count = pre_symbols.len();
-            let root_display = root.display().to_string();
-            let has_index_record = published.live.get_file(path).is_some();
-            let (status, detail) = if has_index_record {
-                (
-                    "last-valid index state retained pending watcher confirmation",
-                    format!("Previously indexed symbols: {prev_symbol_count}."),
-                )
-            } else {
-                (
-                    "no index record remains; watcher confirmation pending",
-                    "No prior symbol count was observed.".to_string(),
-                )
-            };
-            return Ok(ImpactToolOutput {
-                text: format!(
-                    "── Impact: {path} ──\nStatus: not found under {root_display} — {status}\n{detail}"
-                ),
-                published,
-            });
-        }
+    fn store(
+        &mut self,
+        path: &str,
+        symbols: Vec<SymbolSnapshot>,
+    ) -> Result<(), file_impact::ImpactFailure> {
+        store_cached_symbols_at_generation(self.state, path, symbols, self.expected_generation)
+            .map_err(|_| file_impact::ImpactFailure::Unavailable)
     }
-
-    // Use the immutable generation returned by this request's winning
-    // publication seam. Sampling current state here could accidentally adopt a
-    // later watcher update and consume that update's snapshot.
-    let post_generation = receipt
-        .published
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    if post_generation.project_generation != expected_generation
-        || state.index.data_plane().current_project_generation() != expected_generation
-    {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    let (post_symbols, post_content) = {
-        let file = post_generation
-            .live
-            .get_file(path)
-            .ok_or(StatusCode::NOT_FOUND)?;
-        let symbols: Vec<SymbolSnapshot> = file
-            .symbols
-            .iter()
-            .map(|symbol| SymbolSnapshot {
-                name: symbol.name.clone(),
-                kind: symbol.kind.to_string(),
-                line_range: symbol.line_range,
-                byte_range: symbol.byte_range,
-            })
-            .collect();
-        (symbols, file.content.clone())
-    };
-    if receipt.snapshot_created {
-        let replacement =
-            crate::live_index::store::PublicationFence::from_published(post_generation);
-        let _ = state
-            .index
-            .data_plane()
-            .take_pre_update_snapshot_for_publication_at_generation(
-                path,
-                expected_generation,
-                replacement,
-            );
-    } else if matches!(receipt.outcome, crate::watcher::ReindexResult::HashSkip)
-        && let Some(replacement) = pre_snapshot_replacement
-    {
-        let _ = state
-            .index
-            .data_plane()
-            .take_pre_update_snapshot_for_publication_at_generation(
-                path,
-                expected_generation,
-                replacement,
-            );
-    }
-    let file_bytes: u64 = (post_content.len() as u64).max(file_bytes_pre);
-
-    // Compute symbol diff using positional proximity for duplicate name+kind pairs.
-    let mut matched_pre = vec![false; pre_symbols.len()];
-    let mut matched_post = vec![false; post_symbols.len()];
-    let mut changed_post: Vec<usize> = Vec::new();
-
-    for (pi, ps) in post_symbols.iter().enumerate() {
-        // Find the closest unmatched pre-symbol with the same name+kind.
-        let best = pre_symbols
-            .iter()
-            .enumerate()
-            .filter(|(i, pr)| !matched_pre[*i] && pr.name == ps.name && pr.kind == ps.kind)
-            .min_by_key(|(_, pr)| (pr.line_range.0 as i64 - ps.line_range.0 as i64).unsigned_abs());
-        if let Some((pri, pr)) = best {
-            matched_pre[pri] = true;
-            matched_post[pi] = true;
-            let body_changed = match pre_content.as_deref() {
-                Some(pre_bytes) => symbol_body_bytes_changed(pre_bytes, &post_content, pr, ps),
-                None => true,
-            };
-            if body_changed {
-                changed_post.push(pi);
-            }
-        }
-    }
-
-    let added: Vec<&SymbolSnapshot> = post_symbols
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !matched_post[*i])
-        .map(|(_, s)| s)
-        .collect();
-
-    let removed: Vec<&SymbolSnapshot> = pre_symbols
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !matched_pre[*i])
-        .map(|(_, s)| s)
-        .collect();
-
-    let changed: Vec<&SymbolSnapshot> = changed_post.iter().map(|&i| &post_symbols[i]).collect();
-
-    // Update cache with post-edit snapshot.
-    store_cached_symbols_at_generation(&state, path, post_symbols.clone(), expected_generation)?;
-
-    // Build response lines.
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("── Impact: {} ──", path));
-
-    if added.is_empty() && changed.is_empty() && removed.is_empty() {
-        lines.push(format!(
-            "Status: indexed and unchanged\nSymbols: {}\nTip: Use what_changed to see recent modifications.",
-            post_symbols.len()
-        ));
-    } else {
-        lines.push("Status: changed on disk since last index".to_string());
-        for sym in &added {
-            lines.push(format!("  [Added]   {} {}", sym.kind, sym.name));
-        }
-        for sym in &changed {
-            lines.push(format!("  [Changed] {} {}", sym.kind, sym.name));
-        }
-        for sym in &removed {
-            lines.push(format!("  [Removed] {} {}", sym.kind, sym.name));
-        }
-
-        // Show callers for Changed + Removed symbols.
-        //
-        // For CHANGED symbols that live inside an `impl` block, scope the
-        // caller list to files that also reference the parent type —
-        // prevents `MathMachine::new` from flagging every unrelated `new()`
-        // call. Mirrors the filter in protocol::edit::detect_stale_references.
-        //
-        // REMOVED symbols cannot be type-scoped here: the post-edit file no
-        // longer contains the SymbolRecord, so `find_record_matching_snapshot`
-        // returns None and the filter short-circuits to name-only matching.
-        // Acceptable trade-off: removing a same-named method from one of many
-        // types is rare, and carrying parent_type through SymbolSnapshot would
-        // widen the schema for a corner case. Revisit if the false positive
-        // surfaces in real usage.
-        let impacted: Vec<&SymbolSnapshot> =
-            changed.iter().chain(removed.iter()).copied().collect();
-        if !impacted.is_empty() {
-            let guard = post_generation.live.as_ref();
-            let post_file = guard.get_file(path);
-            let mut callers_lines: Vec<String> = Vec::new();
-            for sym in &impacted {
-                // Derive the parent impl/class type for this symbol, if any.
-                // Look the symbol up in the POST-edit file by name+byte_range so
-                // overloaded names do not confuse the walker.
-                let parent_type: Option<String> = post_file.as_ref().and_then(|file| {
-                    find_record_matching_snapshot(file, sym).and_then(|record| {
-                        crate::protocol::edit::find_parent_impl_type(file, record)
-                    })
-                });
-
-                // When we know the parent type, collect the set of files that
-                // reference it. Only those files could plausibly call
-                // `ParentType::method_name()`.
-                let type_files: Option<std::collections::HashSet<String>> =
-                    parent_type.as_ref().map(|tn| {
-                        guard
-                            .find_references_for_name(tn, None, false)
-                            .into_iter()
-                            .map(|(fp, _)| fp.to_string())
-                            .collect()
-                    });
-
-                let callers = guard.find_references_for_name(&sym.name, None, false);
-                let external: Vec<_> = callers
-                    .iter()
-                    .filter(|(fp, _)| *fp != path)
-                    .filter(|(fp, _)| match &type_files {
-                        Some(tf) => tf.contains(*fp),
-                        None => true,
-                    })
-                    .take(5)
-                    .collect();
-                if !external.is_empty() {
-                    callers_lines.push(format!("  Callers of {}():", sym.name));
-                    for (caller_file, r) in &external {
-                        callers_lines.push(format!(
-                            "    {}  line {}",
-                            caller_file,
-                            r.line_range.0 + 1
-                        ));
-                    }
-                }
-            }
-            if !callers_lines.is_empty() {
-                lines.push(String::new());
-                lines.push("Callers to review:".to_string());
-                lines.extend(callers_lines);
-            }
-        }
-    }
-
-    // Apply budget (150 tokens = 600 bytes).
-    let (mut text, _) = build_with_budget(&lines, 600);
-
-    let output_bytes = text.len() as u64;
-    if options.include_savings_footer {
-        text.push_str(&crate::protocol::format::compact_savings_footer(
-            output_bytes as usize,
-            file_bytes as usize,
-        ));
-    }
-
-    if options.record_stats {
-        state.token_stats.record_edit(file_bytes, output_bytes);
-    }
-
-    Ok(ImpactToolOutput {
-        text,
-        published: std::sync::Arc::clone(post_generation),
-    })
 }
 
 /// `GET /symbol-context?name=<name>[&file=<path>]` — all references to a named symbol.

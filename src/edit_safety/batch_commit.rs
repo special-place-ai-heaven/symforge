@@ -278,6 +278,9 @@ impl BatchIo for ProtocolBatchIo<'_> {
 pub(crate) struct EmbeddedBatchIo {
     write: crate::live_index::index_lifecycle::activation::WriteAuthority,
     last_receipt: Option<crate::live_index::index_lifecycle::physical_root::WriteReceipt>,
+    /// The pre-write snapshot `ProtocolBatchIo` takes through
+    /// `atomic_write_file`, for the lanes whose MCP twin reports it.
+    tee: Option<super::tee::Tee>,
 }
 
 impl EmbeddedBatchIo {
@@ -287,7 +290,16 @@ impl EmbeddedBatchIo {
         Self {
             write,
             last_receipt: None,
+            tee: None,
         }
+    }
+
+    /// Snapshot each target into the tee before writing it, as MCP's batch
+    /// writer does.
+    #[cfg(feature = "embed")]
+    pub(crate) fn with_tee(mut self, tee: super::tee::Tee) -> Self {
+        self.tee = Some(tee);
+        self
     }
 
     pub(crate) fn finish(mut self) -> Result<(), String> {
@@ -301,7 +313,7 @@ impl EmbeddedBatchIo {
 }
 
 impl BatchIo for EmbeddedBatchIo {
-    type Report = ();
+    type Report = Option<super::tee::TeeSnapshot>;
 
     fn matches(&mut self, image: &StagedImage, expected: Option<&[u8]>) -> Result<bool, String> {
         self.write
@@ -310,6 +322,13 @@ impl BatchIo for EmbeddedBatchIo {
     }
 
     fn write(&mut self, image: &StagedImage, bytes: &[u8]) -> Result<Self::Report, String> {
+        let tee = self.tee.as_ref().map(|tee| {
+            tee.snapshot(&image.absolute)
+                .unwrap_or_else(|err| super::tee::TeeSnapshot::Warning {
+                    original_path: image.absolute.clone(),
+                    message: format!("unexpected tee snapshot error: {err}"),
+                })
+        });
         let receipt = if image.owner_only {
             self.write.write_owner_only(&image.relative, bytes)
         } else {
@@ -317,7 +336,7 @@ impl BatchIo for EmbeddedBatchIo {
         }
         .map_err(|_| "batch_source_write_uncertain".to_string())?;
         self.last_receipt = Some(receipt);
-        Ok(())
+        Ok(tee)
     }
 }
 

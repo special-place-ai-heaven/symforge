@@ -1,0 +1,100 @@
+{
+  "files": {
+    "src/lib.rs": "pub fn number() -> u32 {\n    1\n}\n\npub fn helper() -> u32 {\n    number()\n}\n",
+    "src/other.rs": "pub fn other() -> u32 {\n    3\n}\n"
+  },
+  "cases": [
+    {
+      "name": "replace routed into the worktree",
+      "tool": "replace_symbol_body",
+      "worktree_files": {},
+      "input": {
+        "path": "src/lib.rs",
+        "name": "number",
+        "new_body": "pub fn number() -> u32 {\n    2\n}",
+        "working_directory": "{worktree}"
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:1`\nsrc/lib.rs — replaced fn `number` (32 → 32 bytes)\nTee snapshot: `<tee>` preserves `{worktree}/src/lib.rs` before this write.\nworking_directory: {worktree}\nrerouted: true\nwrote_to: {worktree}/src/lib.rs\nindexed_path: {main}/src/lib.rs\n[impact: 0 dependents]"
+    },
+    {
+      "name": "replace preview routed into the worktree",
+      "tool": "replace_symbol_body",
+      "worktree_files": {},
+      "input": {
+        "path": "src/lib.rs",
+        "name": "number",
+        "new_body": "pub fn number() -> u32 {\n    2\n}",
+        "working_directory": "{worktree}",
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would replace `number` in src/lib.rs (old: 32 bytes -> new: 32 bytes)"
+    },
+    {
+      "name": "edit within through the bound root",
+      "tool": "edit_within_symbol",
+      "worktree_files": {},
+      "input": {
+        "path": "src/lib.rs",
+        "name": "helper",
+        "old_text": "number()",
+        "new_text": "number() + 1",
+        "working_directory": "{main}"
+      },
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:5`\nsrc/lib.rs — edited within `helper` (1 replacement(s), 39 → 43 bytes)\nworking_directory: {main}\nrerouted: false\nwrote_to: {main}/src/lib.rs\nindexed_path: {main}/src/lib.rs\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 0 dependents]"
+    },
+    {
+      "name": "insert rebased onto a diverged worktree copy",
+      "tool": "insert_symbol",
+      "worktree_files": {
+        "src/other.rs": "pub fn other() -> u32 {\n    4\n}\n"
+      },
+      "input": {
+        "path": "src/other.rs",
+        "name": "other",
+        "content": "pub fn more() {}",
+        "position": "after",
+        "working_directory": "{worktree}"
+      },
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: worktree target (rebased)\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/other.rs:1`\nsrc/other.rs — inserted after `other` (16 bytes)\nworking_directory: {worktree}\nrerouted: true\nwrote_to: {worktree}/src/other.rs\nindexed_path: {main}/src/other.rs\nTee snapshot: `<tee>` preserves `{worktree}/src/other.rs` before this write.\n[impact: 0 dependents]"
+    },
+    {
+      "name": "batch edit across two worktrees",
+      "tool": "batch_edit",
+      "worktree_files": {},
+      "input": {
+        "edits": [
+          {
+            "path": "src/lib.rs",
+            "name": "number",
+            "operation": {
+              "type": "replace",
+              "new_body": "pub fn number() -> u32 {\n    5\n}"
+            }
+          },
+          {
+            "path": "src/other.rs",
+            "name": "other",
+            "working_directory": "{worktree}",
+            "operation": {
+              "type": "replace",
+              "new_body": "pub fn other() -> u32 {\n    6\n}"
+            }
+          }
+        ]
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: exact\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: transactional write + rollback + reindex\nEvidence: 2 edit target(s) across 2 file(s)\n2 edit(s) across 2 file(s):\n  src/lib.rs — replaced fn `number` (32 → 32 bytes)\n  Tee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n  src/other.rs — replaced fn `other` (31 → 31 bytes)\n  Tee snapshot: `<tee>` preserves `{worktree}/src/other.rs` before this write.\n  working_directory: {worktree}\n  rerouted: true\n  wrote_to: {worktree}/src/other.rs\n  indexed_path: {main}/src/other.rs\n\n[impact: 0 dependents]"
+    },
+    {
+      "name": "batch rename routed into the worktree",
+      "tool": "batch_rename",
+      "worktree_files": {},
+      "input": {
+        "path": "src/lib.rs",
+        "name": "number",
+        "new_name": "count",
+        "working_directory": "{worktree}"
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: constrained\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: transactional write + rollback + reindex\nEvidence: definition `src/lib.rs` + project-wide constrained references\nRenamed `number` → `count` — 2 site(s) across 1 file(s)\nworking_directory: {worktree}\nrerouted: true\nwrote_to: {worktree}/src/lib.rs\nindexed_path: {main}/src/lib.rs\n[impact: 0 dependents]"
+    }
+  ]
+}

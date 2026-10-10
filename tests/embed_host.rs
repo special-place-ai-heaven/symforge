@@ -168,8 +168,17 @@ fn wire_dispatch_is_source_bound_and_refuses_untrusted_lifecycle_requests() {
         panic!("catalog response")
     };
     assert!(catalog.query_operations.contains(&"File".to_owned()));
+    // MCP lists `file-content` under `resources/templates/list`, not
+    // `resources/list` (`resource_template_definitions` in
+    // src/protocol/resources.rs); the host catalog mirrors that split.
     assert!(
         catalog
+            .resource_templates
+            .iter()
+            .any(|template| template.name == "file-content")
+    );
+    assert!(
+        !catalog
             .resources
             .iter()
             .any(|resource| resource.name == "file-content")

@@ -1,0 +1,144 @@
+{
+  "cases": [
+    {
+      "body": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would replace `target` in src/lib.rs (old: 32 bytes -> new: 32 bytes)",
+      "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": false,
+      "name": "preview replace",
+      "outcome": "found",
+      "plain_text": null,
+      "replay": false,
+      "request": {
+        "body": "pub fn target() -> u32 {\n    2\n}",
+        "path": "src/lib.rs",
+        "symbol": "target"
+      },
+      "routing": "Mode: preview-only (dry_run); default when apply is omitted or false\nRoute confidence: exact\nChosen tool: replace_symbol_body\nInvocation: {\"dry_run\":true,\"name\":\"target\",\"new_body\":\"pub fn target() -> u32 {\\n    2\\n}\",\"path\":\"src/lib.rs\"}\nRationale: explicit path, symbol, and body\nEconomics: serve (predicted_net=-185 (est.); structural edit always serves)",
+      "tamper": null
+    },
+    {
+      "body": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would insert after `target` in src/lib.rs (17 bytes of content)",
+      "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": false,
+      "name": "preview insert",
+      "outcome": "found",
+      "plain_text": null,
+      "replay": false,
+      "request": {
+        "body": "pub fn added() {}",
+        "op": "insert_after",
+        "path": "src/lib.rs",
+        "symbol": "target"
+      },
+      "routing": "Mode: preview-only (dry_run); default when apply is omitted or false\nRoute confidence: exact\nChosen tool: insert_symbol\nInvocation: {\"content\":\"pub fn added() {}\",\"dry_run\":true,\"name\":\"target\",\"path\":\"src/lib.rs\",\"position\":\"after\"}\nRationale: explicit path, insert-after anchor, and body\nEconomics: serve (predicted_net=-185 (est.); structural edit always serves)",
+      "tamper": null
+    },
+    {
+      "body": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:5`\n[DRY RUN] Would edit within `caller` in src/lib.rs (1 replacement(s))",
+      "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": false,
+      "name": "preview edit_within",
+      "outcome": "found",
+      "plain_text": null,
+      "replay": false,
+      "request": {
+        "new_text": "target() + 1",
+        "old_text": "target()",
+        "op": "edit_within",
+        "path": "src/lib.rs",
+        "symbol": "caller"
+      },
+      "routing": "Mode: preview-only (dry_run); default when apply is omitted or false\nRoute confidence: exact\nChosen tool: edit_within_symbol\nInvocation: {\"dry_run\":true,\"name\":\"caller\",\"new_text\":\"target() + 1\",\"old_text\":\"target()\",\"path\":\"src/lib.rs\",\"replace_all\":false}\nRationale: explicit path, symbol scope, and old/new text\nEconomics: serve (predicted_net=-185 (est.); structural edit always serves)",
+      "tamper": null
+    },
+    {
+      "body": "Symbol not found: missing",
+      "file": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": true,
+      "name": "missing symbol",
+      "outcome": "not_found",
+      "plain_text": null,
+      "replay": false,
+      "request": {
+        "body": "pub fn missing() {}",
+        "path": "src/lib.rs",
+        "symbol": "missing"
+      },
+      "routing": "Mode: preview-only (dry_run); default when apply is omitted or false\nRoute confidence: exact\nChosen tool: replace_symbol_body\nInvocation: {\"dry_run\":true,\"name\":\"missing\",\"new_body\":\"pub fn missing() {}\",\"path\":\"src/lib.rs\"}\nRationale: explicit path, symbol, and body\nEconomics: serve (predicted_net=-185 (est.); structural edit always serves)",
+      "tamper": null
+    },
+    {
+      "body": "Write mode: committed\nChanged file: src/lib.rs\nSymbol: target\nByte range: 0-32\nLine range: 1-3\n\nEdit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:1`\nsrc/lib.rs — replaced fn `target` (32 → 32 bytes)\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 0 dependents]",
+      "file": "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": false,
+      "name": "apply replace",
+      "outcome": "found",
+      "plain_text": null,
+      "replay": false,
+      "request": {
+        "apply": true,
+        "body": "pub fn target() -> u32 {\n    2\n}",
+        "idempotency_key": "parity-key",
+        "path": "src/lib.rs",
+        "symbol": "target"
+      },
+      "routing": "Mode: guarded apply (committed when validation succeeds)\nRoute confidence: exact\nChosen tool: replace_symbol_body\nInvocation: {\"dry_run\":false,\"idempotency_key\":\"parity-key\",\"name\":\"target\",\"new_body\":\"pub fn target() -> u32 {\\n    2\\n}\",\"path\":\"src/lib.rs\"}\nRationale: explicit path, symbol, and body\nEconomics: serve (predicted_net=-177 (est.); structural edit always serves)",
+      "tamper": null
+    },
+    {
+      "body": null,
+      "file": "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": false,
+      "name": "idempotent replay",
+      "outcome": "found",
+      "plain_text": null,
+      "replay": true,
+      "request": {
+        "apply": true,
+        "body": "pub fn target() -> u32 {\n    2\n}",
+        "idempotency_key": "parity-key",
+        "path": "src/lib.rs",
+        "symbol": "target"
+      },
+      "routing": null,
+      "tamper": null
+    },
+    {
+      "body": null,
+      "file": "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": true,
+      "name": "same key, different request",
+      "outcome": "invalid_request",
+      "plain_text": "Idempotency conflict:",
+      "replay": false,
+      "request": {
+        "apply": true,
+        "body": "pub fn target() -> u32 {\n    3\n}",
+        "idempotency_key": "parity-key",
+        "path": "src/lib.rs",
+        "symbol": "target"
+      },
+      "routing": null,
+      "tamper": null
+    },
+    {
+      "body": null,
+      "file": "pub fn target() -> u32 {\n    9\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+      "is_error": true,
+      "name": "refused replay",
+      "outcome": "invalid_request",
+      "plain_text": "Error: Idempotency replay unavailable: stored operation requires reconciliation.",
+      "replay": false,
+      "request": {
+        "apply": true,
+        "body": "pub fn target() -> u32 {\n    2\n}",
+        "idempotency_key": "parity-key",
+        "path": "src/lib.rs",
+        "symbol": "target"
+      },
+      "routing": null,
+      "tamper": "pub fn target() -> u32 {\n    9\n}\n\npub fn caller() -> u32 {\n    target()\n}\n"
+    }
+  ],
+  "lib_rs": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n"
+}

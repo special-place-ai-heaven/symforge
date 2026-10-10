@@ -686,6 +686,18 @@ impl ProjectSourceAuthority {
         })
     }
 
+    /// [`Self::verify_exact_spelling_expected`] bound to the admitted root only,
+    /// for disk observations that claim no publication (Loading included).
+    #[cfg(feature = "embed")]
+    pub(crate) fn verify_exact_spelling_anchor(
+        &self,
+        relative: &Path,
+    ) -> Result<bool, AuthorityRefusal> {
+        self.with_anchored_read(None, |lease| {
+            super::physical_root::exact_spelling_beneath(lease, relative)
+        })
+    }
+
     /// Attribute a bounded disk read to this authority's admitted physical root
     /// and its exact live publication. This grants no mutation capability.
     #[cfg(feature = "embed")]
@@ -734,7 +746,6 @@ impl ProjectSourceAuthority {
 
     /// Stream a replay postimage digest from the admitted root, including while
     /// that publication is refreshing. The opened file never follows a link.
-    #[cfg(feature = "embed")]
     pub(crate) fn digest_regular_beneath_anchor(
         &self,
         relative: &Path,

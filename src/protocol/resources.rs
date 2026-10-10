@@ -195,7 +195,7 @@ impl SymForgeServer {
                 .await
             }
             ResourceRequest::ToolsCatalog => crate::protocol::smart_query::render_tool_catalog(),
-            ResourceRequest::Glossary => render_glossary(),
+            ResourceRequest::Glossary => crate::protocol::smart_query::render_glossary(),
             ResourceRequest::FileContext { path, max_tokens } => {
                 self.get_file_context(Parameters(GetFileContextInput {
                     project: None,
@@ -336,49 +336,6 @@ pub(crate) fn file_context_resource(path: &str, max_tokens: Option<u64>) -> Reso
         "file-context",
         "File context",
         "File outline plus key external references.",
-    )
-}
-
-/// Render the `symforge://glossary` resource: a concise legend of the surface
-/// vocabulary so callers stop misusing it (e.g. treating the within-project
-/// `path:` filter as a project selector). Static markdown; no index access.
-fn render_glossary() -> String {
-    String::from(
-        "SymForge glossary — surface vocabulary.\n\
-         \n\
-         ## Query parameters (`symforge` tool)\n\
-         - `query` (required): a natural-language phrase to route. Omitting it returns a clean\n\
-           \"query is required\" error.\n\
-         - `intent` (optional hint): orient | find | read | trace | impact | edit | meta | auto.\n\
-           Routes to the matching tool family; `auto` infers from the query.\n\
-         - `path` (optional): a WITHIN-PROJECT file/dir FILTER. It does NOT select or switch the\n\
-           project; a path outside the bound project is rejected. To answer about a different\n\
-           project, retarget the connection (declare workspace roots, or `index_folder`).\n\
-         - `symbol` (optional): when set, it is the symbol to read/trace; it is honored over\n\
-           query-token extraction.\n\
-         \n\
-         ## Project binding\n\
-         - A connection is bound to ONE project, derived from its declared workspace roots (not the\n\
-           server's launch directory). Every `status`/`symforge` response surfaces the bound\n\
-           `project_root` so a stale/wrong binding is visible, not silent.\n\
-         - `base + overlay` index model: an immutable base (shared, keyed by canonical-root + commit)\n\
-           plus a per-connection copy-on-write overlay of uncommitted edits; one connection's edits\n\
-           are never visible to another.\n\
-         \n\
-         ## Run modes\n\
-         - `stdio` — one MCP process per client over stdin/stdout (the usual editor attach).\n\
-         - `daemon` — a shared background process holding warm indexes; stdio front-ends proxy to it.\n\
-         - `serve` — an operator HTTP server exposing `/mcp` and `/admin`.\n\
-         - `init` — writes MCP attach config into a client; it does not index.\n\
-         \n\
-         ## Economy figures (trust envelope)\n\
-         - `saved`/`predicted`/`net` token numbers are ESTIMATES from heuristics, not measured\n\
-           savings. Treat them as indicative, not as a billing-grade measurement.\n\
-         \n\
-         ## Status fields\n\
-         - `index_ready` / `index_files` / `index_symbols`: the bound project's in-memory index.\n\
-         - `project_root`: the canonical root currently answering (see Project binding).\n\
-         - `deferred`: capabilities present in the surface but not yet wired.\n",
     )
 }
 

@@ -684,6 +684,65 @@ async fn ac6_matrix_covers_indexed_root_and_missing_file_cases() {
     assert_contains(&result_b, "git ls-tree");
 }
 
+/// A batch whose per-edit `working_directory` routes one file into a linked
+/// worktree commits both files in one transaction, and its replay receipt
+/// binds each target to the authority whose root holds it: a same-key retry
+/// replays the stored answer and writes nothing, while a retry after the
+/// worktree's post-image changed still refuses with reconciliation.
+#[tokio::test]
+async fn batch_edit_routed_across_two_worktrees_replays_by_key() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS), ("src/other.rs", HELLO_RS)]);
+    let params = json!({
+        "idempotency_key": "cross-worktree-batch",
+        "edits": [
+            {
+                "path": "src/lib.rs",
+                "name": "world",
+                "operation": {
+                    "type": "edit_within",
+                    "old_text": "world",
+                    "new_text": "MAIN_SIDE"
+                }
+            },
+            {
+                "path": "src/other.rs",
+                "name": "world",
+                "working_directory": fx.worktree_root.to_str().unwrap(),
+                "operation": {
+                    "type": "edit_within",
+                    "old_text": "world",
+                    "new_text": "WORKTREE_SIDE"
+                }
+            }
+        ]
+    });
+
+    let first = call(&fx.server, "batch_edit", params.clone()).await;
+    assert_contains(&fx.read_indexed("src/lib.rs"), "MAIN_SIDE");
+    assert_contains(&fx.read_worktree("src/other.rs"), "WORKTREE_SIDE");
+    assert_not_contains(&fx.read_indexed("src/other.rs"), "WORKTREE_SIDE");
+    assert_not_contains(&first, "Idempotency warning");
+
+    let replayed = call(&fx.server, "batch_edit", params.clone()).await;
+    assert_eq!(
+        replayed, first,
+        "a same-key retry must replay the stored answer"
+    );
+    assert_eq!(
+        fx.read_indexed("src/lib.rs").matches("MAIN_SIDE").count(),
+        1,
+        "the replay must not write again"
+    );
+
+    let tampered = "fn hello() {}
+";
+    fs::write(fx.worktree_root.join("src/other.rs"), tampered).expect("tamper worktree");
+    let refused = call(&fx.server, "batch_edit", params).await;
+    assert_contains(&refused, "requires reconciliation");
+    assert_eq!(fx.read_worktree("src/other.rs"), tampered);
+}
+
 /// Every routed edit surface, including batch tools, reports the resolved
 /// target when `working_directory` is supplied.
 #[tokio::test]
@@ -1473,5 +1532,118 @@ async fn routed_batch_edit_on_identical_target_still_allowed() {
     assert!(
         !indexed_after.contains("BATCH_FRESH"),
         "indexed copy must stay untouched: {indexed_after}"
+    );
+}
+
+// --- Routed edit answers shared with the embedded lanes ----------------------
+
+/// Substitute `{main}` and `{worktree}` in every string of `value`.
+fn with_roots(value: &Value, main: &Path, worktree: &Path) -> Value {
+    match value {
+        Value::String(text) => Value::String(
+            text.replace("{main}", main.to_str().unwrap())
+                .replace("{worktree}", worktree.to_str().unwrap()),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| with_roots(item, main, worktree))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), with_roots(item, main, worktree)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Fold both roots back to placeholders and tee paths to `<tee>`.
+fn routed_golden_text(text: &str, main: &Path, worktree: &Path) -> String {
+    let mut roots = vec![
+        (main.display().to_string(), "{main}"),
+        (worktree.display().to_string(), "{worktree}"),
+    ];
+    for (root, placeholder) in [(main, "{main}"), (worktree, "{worktree}")] {
+        if let Ok(canonical) = dunce::canonicalize(root) {
+            roots.push((canonical.display().to_string(), placeholder));
+        }
+    }
+    // Paths outside the root's own display (the tee's preserved original)
+    // render with forward slashes.
+    let slashed: Vec<(String, &str)> = roots
+        .iter()
+        .map(|(root, placeholder)| (root.replace('\\', "/"), *placeholder))
+        .collect();
+    roots.extend(slashed);
+    roots.sort_by_key(|(root, _)| std::cmp::Reverse(root.len()));
+    let mut folded = text.to_string();
+    for (root, placeholder) in roots {
+        folded = folded.replace(&root, placeholder);
+    }
+    // Platform separators: the golden is shared by every host.
+    folded
+        .replace('\\', "/")
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            match trimmed
+                .strip_prefix("Tee snapshot: `")
+                .and_then(|rest| rest.split_once('`'))
+            {
+                Some((_, tail)) => format!("{indent}Tee snapshot: `<tee>`{tail}"),
+                None => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// MCP side of the routed edit golden shared with `tests/embed_edit_route.rs`
+/// (`tests/fixtures/edit_parity/routed.json`): edits routed into a linked
+/// worktree, through the bound root, onto a diverged worktree copy, a batch
+/// across both worktrees and a routed rename. Observed answers are written to
+/// `target/edit-routed-parity.observed.json`.
+#[tokio::test]
+async fn routed_edit_answers_match_embed_parity_golden() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/edit_parity/routed.json");
+    let mut fixture: Value =
+        serde_json::from_str(&fs::read_to_string(&fixture_path).unwrap()).unwrap();
+    let expected = fixture.clone();
+    let files: Vec<(String, String)> = fixture["files"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(path, content)| (path.clone(), content.as_str().unwrap().to_string()))
+        .collect();
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    for case in fixture["cases"].as_array_mut().unwrap() {
+        let fx = WorktreeFixture::new(&files);
+        // A Windows checkout may materialize CRLF; the golden is LF.
+        for (path, content) in &files {
+            fs::write(fx.worktree_root.join(path), content).unwrap();
+        }
+        for (path, content) in case["worktree_files"].as_object().unwrap() {
+            fs::write(fx.worktree_root.join(path), content.as_str().unwrap()).unwrap();
+        }
+        let input = with_roots(&case["input"], &fx.root, &fx.worktree_root);
+        let text = call(&fx.server, case["tool"].as_str().unwrap(), input).await;
+        case["expected"] = Value::String(routed_golden_text(&text, &fx.root, &fx.worktree_root));
+    }
+    let observed =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/edit-routed-parity.observed.json");
+    let _ = fs::write(&observed, serde_json::to_string_pretty(&fixture).unwrap());
+    assert_eq!(
+        fixture,
+        expected,
+        "MCP routed edit answers drifted from the shared golden; see {}",
+        observed.display()
     );
 }

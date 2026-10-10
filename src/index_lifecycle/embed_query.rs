@@ -33,6 +33,13 @@ pub(super) struct EmbeddedQuerySnapshot {
     pub authority_publication: crate::lifecycle_identity::PublicationIdentity,
     pub authority: Arc<super::activation::ProjectSourceAuthority>,
     pub state_anchor: Option<super::embedded::AdmittedStateAnchor>,
+    /// The binding's git temporal cache (see `embed_temporal`).
+    pub temporal_cache: Arc<super::embed_temporal::TemporalCache>,
+    /// The host's control-state directory, holding the edit-safety trust
+    /// store MCP keeps in process control state.
+    pub control_directory: Option<PathBuf>,
+    /// The host's chosen project-config trust mode.
+    pub trust_mode: crate::embed::parity::source_options::ProjectConfigTrustMode,
 }
 
 /// A process incarnation namespace, separate from the frozen core's counters.
@@ -244,6 +251,52 @@ impl std::fmt::Display for QueryRefusal {
 
 impl std::error::Error for QueryRefusal {}
 
+/// MCP `validate_file_syntax`'s disk lane without a Current publication. See
+/// [`DiskSyntaxObservation`]: nothing here binds or claims a publication.
+pub(super) fn validate_syntax_from_disk(
+    handle: &EmbeddedSourceHandle,
+    path: &str,
+    limits: QueryLimits,
+) -> Result<DiskSyntaxObservation, QueryRefusal> {
+    let request = QueryRequest::Syntax {
+        path: path.to_owned(),
+    };
+    let normalized =
+        serde_json::to_vec(&("symforge.embed.syntax-disk", API_VERSION, &request, limits))
+            .expect("syntax request fields serialize");
+    let identity = crate::hash::digest_hex(&normalized);
+    let refuse = |kind, withheld| QueryRefusal {
+        kind,
+        operation: QueryOperationKind::Syntax,
+        operation_identity: identity.clone(),
+        retry: if kind == QueryRefusalKind::SourceUnavailable {
+            RetryAdvice::OnEvent
+        } else {
+            RetryAdvice::Never
+        },
+        withheld,
+    };
+    let mut budget = Budget::new(limits, None).map_err(|kind| refuse(kind, None))?;
+    validate_request(&request).map_err(|kind| refuse(kind, None))?;
+    let (authority, generation, source_phase) = handle
+        .capture_disk_observation_context()
+        .ok_or_else(|| refuse(QueryRefusalKind::SourceUnavailable, None))?;
+    let file =
+        super::embed_read::observe_syntax_in(&generation.live, &authority, None, path, &mut budget)
+            .map_err(|kind| refuse(kind, budget.withheld.take()))?;
+    let syntax = syntax_output(
+        path,
+        &file,
+        read::ReadAuthority::DiskObservation,
+        &mut budget,
+    )
+    .map_err(|kind| refuse(kind, None))?;
+    Ok(DiskSyntaxObservation {
+        syntax,
+        source_phase,
+    })
+}
+
 pub(super) fn execute(
     handle: &EmbeddedSourceHandle,
     request: &QueryRequest,
@@ -360,6 +413,54 @@ fn execute_inner(
     budget
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
+    if let Some(path) = request.freshen_path() {
+        match handle.freshen_exact_path(path) {
+            Ok(()) => {}
+            Err(refusal)
+                if refusal.permits_authoritative_disk_fallback()
+                    && matches!(request, QueryRequest::Syntax { .. }) =>
+            {
+                budget.syntax_disk_fallback = true;
+            }
+            Err(_) => {
+                return Err(refuse(
+                    QueryRefusalKind::StalePublication,
+                    RetryAdvice::OnEvent,
+                ));
+            }
+        }
+    }
+    if let QueryRequest::Symforge(input) = request {
+        // MCP's planned read primitives each freshen their exact path when
+        // the facade dispatches them; the facade freshens them all before it
+        // captures the one publication every step answers from.
+        for path in super::embed_symforge::freshen_paths(input) {
+            if handle.freshen_exact_path(&path).is_err() {
+                return Err(refuse(
+                    QueryRefusalKind::StalePublication,
+                    RetryAdvice::OnEvent,
+                ));
+            }
+        }
+        budget.stel_store = handle.stel_store(policy);
+    }
+    if let QueryRequest::FileImpact(input) = request
+        && input.estimate != Some(true)
+    {
+        let admission = handle
+            .analyze_file_impact(input, &|| budget.check())
+            .map_err(|kind| {
+                refuse(
+                    kind,
+                    if kind == QueryRefusalKind::StalePublication {
+                        RetryAdvice::OnEvent
+                    } else {
+                        RetryAdvice::Never
+                    },
+                )
+            })?;
+        budget.file_impact = Some(admission);
+    }
     let snapshot = handle
         .capture_query_snapshot(&normalized)
         .map_err(|error| {
@@ -546,50 +647,60 @@ fn execute_inner(
     // admitted while the source-bound session operation gate is still held.
     // An Ask commits what its routed query returned, exactly as that query
     // would have committed it when called directly.
-    let committed_value = match result.value() {
-        QueryOutput::Ask(ask) => ask.output.as_deref(),
-        value => Some(value),
-    };
-    let committed_path = match committed_value {
-        None => None,
-        Some(value) => match value {
-            QueryOutput::File { file, .. } => Some(file.path.as_str()),
-            QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
-            QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
-            QueryOutput::SymbolContext(context)
-                if context.estimate.is_none() && context.refusal.is_none() =>
-            {
-                context.path.as_deref()
-            }
-            QueryOutput::FileContent(content) if !content.cache_hit => Some(content.path.as_str()),
-            QueryOutput::FileContext(content)
-                if !content.cache_hit && content.estimated_tokens.is_none() =>
-            {
-                Some(content.path.as_str())
-            }
-            QueryOutput::SourcePage(page) => Some(page.path.as_str()),
-            _ => None,
-        },
-    };
-    if let Some(path) = committed_path {
-        snapshot.record_commitment(&[PathBuf::from(path)]);
-    }
-    if let Some(QueryOutput::SymbolRead(content)) = committed_value
-        && !content.cache_hit
-        && content.estimated_tokens.is_none()
-    {
-        let paths = content
-            .entries
+    // A facade commits what each of its executed primitives returned.
+    let committed_values: Vec<Option<&QueryOutput>> = match result.value() {
+        QueryOutput::Ask(ask) => vec![ask.output.as_deref()],
+        QueryOutput::Symforge(answer) => answer
+            .steps
             .iter()
-            .filter(|entry| entry.source.is_some())
-            .map(|entry| PathBuf::from(&entry.path))
-            .collect::<Vec<_>>();
-        snapshot.record_commitment(&paths);
-    }
-    if let Some(QueryOutput::InspectMatch(content)) = committed_value
-        && content.estimated_tokens.is_none()
-    {
-        snapshot.record_commitment(&[PathBuf::from(&content.path)]);
+            .map(|step| step.output.as_deref())
+            .collect(),
+        value => vec![Some(value)],
+    };
+    for committed_value in committed_values {
+        let committed_path = match committed_value {
+            None => None,
+            Some(value) => match value {
+                QueryOutput::File { file, .. } => Some(file.path.as_str()),
+                QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
+                QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
+                QueryOutput::SymbolContext(context)
+                    if context.estimate.is_none() && context.refusal.is_none() =>
+                {
+                    context.path.as_deref()
+                }
+                QueryOutput::FileContent(content) if !content.cache_hit => {
+                    Some(content.path.as_str())
+                }
+                QueryOutput::FileContext(content)
+                    if !content.cache_hit && content.estimated_tokens.is_none() =>
+                {
+                    Some(content.path.as_str())
+                }
+                QueryOutput::SourcePage(page) => Some(page.path.as_str()),
+                _ => None,
+            },
+        };
+        if let Some(path) = committed_path {
+            snapshot.record_commitment(&[PathBuf::from(path)]);
+        }
+        if let Some(QueryOutput::SymbolRead(content)) = committed_value
+            && !content.cache_hit
+            && content.estimated_tokens.is_none()
+        {
+            let paths = content
+                .entries
+                .iter()
+                .filter(|entry| entry.source.is_some())
+                .map(|entry| PathBuf::from(&entry.path))
+                .collect::<Vec<_>>();
+            snapshot.record_commitment(&paths);
+        }
+        if let Some(QueryOutput::InspectMatch(content)) = committed_value
+            && content.estimated_tokens.is_none()
+        {
+            snapshot.record_commitment(&[PathBuf::from(&content.path)]);
+        }
     }
     if let Some(session) = session {
         session.commit_observation(result.value());
@@ -602,6 +713,16 @@ fn execute_inner(
     if let Some(operation) = session_operation {
         let committed = operation.commit();
         debug_assert_eq!(Some(committed), result.session_evidence);
+    }
+    // MCP's facade records its economics event in the session ledger and the
+    // durable store once the answer is served; here, once it is committed.
+    if let Some(event) = budget.stel_event.take() {
+        if let Some(session) = session {
+            session.stel_ledger().push(event.clone());
+        }
+        if let Some(store) = budget.stel_store.as_deref() {
+            crate::stel::runtime::record_durably_inline(store, &event);
+        }
     }
     Ok(result)
 }
@@ -616,6 +737,16 @@ pub(super) struct Budget {
     pub(super) reused_handle: Option<String>,
     pub(super) cache_output: Option<QueryOutput>,
     pub(super) cache_truncated: bool,
+    /// The exact-path freshen's publication was rejected: MCP
+    /// `validate_file_syntax` then distrusts the indexed hit and answers from
+    /// its authoritative disk parse.
+    pub(super) syntax_disk_fallback: bool,
+    /// The `FileImpact` re-admission's answer, taken by `project`.
+    pub(super) file_impact: Option<super::embed_file_impact::FileImpactAdmission>,
+    /// The source's durable STEL ledger for a `Symforge` facade query.
+    pub(super) stel_store: Option<Arc<crate::stel::ledger_store::StelLedgerStore>>,
+    /// The facade's ledger event, recorded only once its answer is committed.
+    pub(super) stel_event: Option<crate::stel::types::StelLedgerEvent>,
 }
 
 #[cfg(test)]
@@ -793,6 +924,10 @@ impl Budget {
             reused_handle: None,
             cache_output: None,
             cache_truncated: false,
+            syntax_disk_fallback: self.syntax_disk_fallback,
+            file_impact: None,
+            stel_store: None,
+            stel_event: None,
         }
     }
     pub(super) fn limits(&self) -> QueryLimits {
@@ -843,6 +978,10 @@ impl Budget {
             reused_handle: None,
             cache_output: None,
             cache_truncated: false,
+            syntax_disk_fallback: false,
+            file_impact: None,
+            stel_store: None,
+            stel_event: None,
         })
     }
 
@@ -1008,7 +1147,11 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         QueryRequest::DiffSymbols(input) => super::embed_changes::validate_diff_symbols(input)?,
         QueryRequest::DetectImpact(input) => super::embed_detect_impact::validate(input)?,
         QueryRequest::Ask(input) => super::embed_ask::validate(input)?,
-        QueryRequest::Conventions | QueryRequest::ContextInventory => {}
+        QueryRequest::Symforge(_) => {}
+        // MCP accepts any target string; the shared planner reports a miss.
+        QueryRequest::Conventions
+        | QueryRequest::ContextInventory
+        | QueryRequest::EditPlan { .. } => {}
         QueryRequest::InvestigationSuggest { focus } => {
             if focus
                 .as_ref()
@@ -1057,6 +1200,7 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         | QueryRequest::Syntax { path }
         | QueryRequest::Diff { path, .. }
         | QueryRequest::Impact { path, .. } => validate_path(path, false)?,
+        QueryRequest::FileImpact(input) => super::embed_file_impact::validate(input)?,
         QueryRequest::SearchSymbols {
             path_prefix, kind, ..
         } => {
@@ -1345,6 +1489,45 @@ fn scope(prefix: Option<&str>) -> PathScope {
     })
 }
 
+/// The `QuerySyntax` projection of one parsed file, shared by the claim lane
+/// and the publication-free disk lane.
+fn syntax_output(
+    path: &str,
+    file: &IndexedFile,
+    authority: read::ReadAuthority,
+    budget: &mut Budget,
+) -> Result<QuerySyntax, QueryRefusalKind> {
+    let diagnostic = file
+        .parse_diagnostic
+        .as_ref()
+        .map(|diagnostic| diagnostic.message.clone());
+    let rendered = super::guidance::file_read::validate_file_syntax_result(path, file);
+    budget.required(
+        path.len()
+            + file.content_hash.len()
+            + parse_status(file).len()
+            + diagnostic.as_ref().map_or(0, String::len)
+            + rendered.len(),
+    )?;
+    Ok(QuerySyntax {
+        path: path.to_owned(),
+        content_hash: file.content_hash.clone(),
+        valid: matches!(file.parse_status, ParseStatus::Parsed),
+        parse_status: parse_status(file).into(),
+        diagnostic,
+        line: file
+            .parse_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.line),
+        column: file
+            .parse_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.column),
+        authority,
+        rendered,
+    })
+}
+
 pub(super) fn project(
     snapshot: &EmbeddedQuerySnapshot,
     request: &QueryRequest,
@@ -1411,7 +1594,16 @@ pub(super) fn project(
         QueryRequest::Ask(input) => {
             super::embed_ask::project(snapshot, input, budget, observations, session, policy)
         }
+        QueryRequest::Symforge(input) => {
+            super::embed_symforge::project(snapshot, input, budget, observations, session, policy)
+        }
         QueryRequest::Conventions => super::embed_guidance::conventions(live, budget),
+        QueryRequest::EditPlan { target } => super::embed_guidance::edit_plan(
+            live,
+            &*super::embed_temporal::temporal(snapshot, policy, budget)?,
+            target,
+            budget,
+        ),
         QueryRequest::File {
             path,
             start_line,
@@ -1583,32 +1775,20 @@ pub(super) fn project(
             graph(live, path_prefix.as_deref(), *offset, budget).map(QueryOutput::Graph)
         }
         QueryRequest::Syntax { path } => {
-            let file = file(live, path)?;
-            let diagnostic = file
-                .parse_diagnostic
-                .as_ref()
-                .map(|diagnostic| diagnostic.message.clone());
-            budget.required(
-                path.len()
-                    + file.content_hash.len()
-                    + parse_status(file).len()
-                    + diagnostic.as_ref().map_or(0, String::len),
-            )?;
-            Ok(QueryOutput::Syntax(QuerySyntax {
-                path: path.clone(),
-                content_hash: file.content_hash.clone(),
-                valid: matches!(file.parse_status, ParseStatus::Parsed),
-                parse_status: parse_status(file).into(),
-                diagnostic,
-                line: file
-                    .parse_diagnostic
-                    .as_ref()
-                    .and_then(|diagnostic| diagnostic.line),
-                column: file
-                    .parse_diagnostic
-                    .as_ref()
-                    .and_then(|diagnostic| diagnostic.column),
-            }))
+            let indexed = if budget.syntax_disk_fallback {
+                None
+            } else {
+                live.get_file(path)
+            };
+            let observed;
+            let (file, authority) = match indexed {
+                Some(file) => (file, read::ReadAuthority::PublishedGeneration),
+                None => {
+                    observed = super::embed_read::observe_for_syntax(snapshot, path, budget)?;
+                    (&observed, read::ReadAuthority::DiskObservation)
+                }
+            };
+            syntax_output(path, file, authority, budget).map(QueryOutput::Syntax)
         }
         QueryRequest::Diff {
             path,
@@ -1623,6 +1803,9 @@ pub(super) fn project(
             observations,
         )
         .map(QueryOutput::Diff),
+        QueryRequest::FileImpact(input) => {
+            super::embed_file_impact::project(snapshot, input, policy, budget)
+        }
         QueryRequest::Impact { path, base_ref } => {
             let diff = diff(snapshot, path, base_ref, None, budget, observations)?;
             let dependents = references(live, live.find_dependents_for_file(path), true, budget)?;

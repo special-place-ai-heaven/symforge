@@ -2,8 +2,10 @@
 //!
 //! Phase 2 P2-S3: normative admission states (`serve | degrade | bypass | cache_hit`).
 
-use crate::protocol::format::{competent_manual_baseline_chars, estimate_tokens_from_chars};
-use crate::protocol::session::SessionContext;
+use crate::index_lifecycle::guidance::file_read::{
+    competent_manual_baseline_chars, estimate_tokens_from_chars,
+};
+use crate::index_lifecycle::guidance::session::SessionContext;
 
 use super::ledger_store::TunedEstimateConstants;
 use super::types::{
@@ -800,7 +802,15 @@ mod tests {
         session.record_symbol_fetch(
             "src/lib.rs",
             "cfg_if",
-            crate::protocol::session::hash_symbol_params(None, None, None, 0, "unavailable", 0, 0),
+            crate::index_lifecycle::guidance::session::hash_symbol_params(
+                None,
+                None,
+                None,
+                0,
+                "unavailable",
+                0,
+                0,
+            ),
             128,
             "deadbeefcafe",
         );

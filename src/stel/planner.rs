@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::protocol::smart_query;
+use crate::index_lifecycle::guidance::smart_query;
 
 use super::executor::{
     COMPACT_SERVE_FIND_REFERENCES_FILE_LIMIT, COMPACT_SERVE_FIND_REFERENCES_MAX_PER_FILE,
