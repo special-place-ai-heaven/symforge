@@ -178,3 +178,36 @@ Remaining differences, with evidence:
 - Temporal data is walked from the source root's own repository
   (`GitRepo::open_worktree_root`), like embed's other git lanes, not from the
   host-prepared isolated view, which no query lane reads.
+
+## Status update: STEL facades, status and residuals (appended 2026-10-10)
+
+`crate::stel` now compiles under `embed`: the planner, economics, executor,
+ledger, status and edit planner are feature-neutral, with only the rmcp tool
+schemas (`stel::surface_list`) left server-only. The MCP handlers and the
+embedded host call one shared runtime (`stel::runtime`) for the durable
+calibration store, the `status` body and the facade ledger, and one shared
+search composition (`guidance::search`, `guidance::file_search`) for the
+`search_text`, `search_symbols` and `search_files` answers.
+
+| Row | Status | Fixture |
+|---|---|---|
+| 3 status | FULL: `HostRequest::StatusReport` and `EmbeddedSourceHandle::stel_status` render the shared STEL readout with the session ledger and a durable calibration store opened in the source's state directory under derived-state permission. `reset_calibration` clears that store and needs the checkpoint right at the host. The daemon instance, daemon env surface, degraded fallback, daemon version and proxy overlay lines are reported not applicable with reasons | `tests/embed_stel_status.rs`; MCP golden `status_matches_embed_parity_golden` |
+| 39 symforge | FULL: `QueryRequest::Symforge` runs the shared planner, grounding, tuned economics, bypass, degrade, compact caps, find fusion and chain-failure rules, executes each planned primitive on its native lane and renders the shared serve bodies, envelope and ledger. All nine golden cases render MCP's bytes and outcome class | `tests/embed_symforge.rs`; MCP golden `symforge_facade_matches_embed_parity_golden`; shared fixture `tests/fixtures/stel_facade/parity.json` |
+| 40 symforge_edit | Routing, economics, envelope, ledger, outcome class, error flag and resulting bytes match MCP for previews of all three ops, a missing symbol, a keyed apply, its idempotent replay, a conflicting key and a refused replay after the file moved (the 2d733398 rule holds). See remaining differences below | `tests/embed_symforge.rs`; MCP golden `symforge_edit_matches_embed_parity_golden`; shared fixture `tests/fixtures/stel_facade/edit_parity.json` |
+| 14 search_files | The ranked lane now runs MCP's zero-hit untracked sweep (`FileSearchResult::untracked_paths`); the audit's FULL verdict had missed it | `tests/embed_disk_parity.rs` |
+| 21 analyze_file_impact | Reload deviation closed: the embedded refresh keeps the watcher's per-file pre-update baseline | `tests/embed_file_impact.rs` |
+| 30 ask | Search routes now carry MCP's result envelope and CCR budget through the shared search composition | `tests/embed_ask.rs` |
+| 32-38 MCP | MCP defect fixed: a batch routed across two worktrees binds each target to its own admitted authority, so a same-key retry replays. The per-target read (`post_image_digest_beneath`) is the one the embedded routed batch uses | `batch_edit_routed_across_two_worktrees_replays_by_key` in `tests/worktree_awareness.rs` |
+
+Row census after this batch (59 surfaces):
+
+- FULL with a recorded fixture: tools 1-21, 26-29, 31, 39 and 41; tools 32-38 at the typed-lane standard their batch recorded; every resource except `repo/changes/uncommitted`; all 8 prompts.
+- Implemented with every MCP option and native fixtures, but never compared with an MCP golden and carrying no verdict in this file: tools 22 `what_changed`, 23 `diff_symbols`, 24 `detect_impact`, 25 `explore`, 30 `ask` (routing only) and the `repo/changes/uncommitted` resource.
+- Tool 40 `symforge_edit` is not FULL, and no limit is proven: see below.
+
+Remaining differences, with evidence:
+
+- `symforge_edit`'s primitive body is the embedded edit lane's own rendering of its typed result (summary line, bounded diff, post-image hash, reroute suffix), not MCP's legacy tool text. MCP's text carries pieces the embedded edit lanes do not produce: a tee snapshot written before the write (`edit::format_tee_snapshot_suffix`), stale-reference warnings (`edit::detect_stale_references`), the project-config trust suffix and the impact footer. The embedded lanes write no tee snapshot at all, which also applies to rows 32-38.
+- An idempotent `symforge_edit` replay writes nothing and reports `replayed: true`, but its text is a replay notice, not the original answer: the embedded replay store keeps only response and post-image digests (`ReplayOutcome` in `src/embed/parity/replay.rs`), where MCP's `FileReplayStore` keeps the response text. A same-key conflict refuses with the same class; its text names each store's own request hashes.
+- A facade step whose native lane refuses (for example a missing file) reports the typed refusal as its body (`Error: <tool> refused: <kind>`) with MCP's outcome class, where the MCP primitive renders its own message.
+- The CCR handle a facade search step offloads to lives in the embedded session's CCR store, so its footer hash differs from MCP's for the same bytes.
