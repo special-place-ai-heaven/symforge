@@ -1,6 +1,6 @@
 //! Embedded knowledge review over the shared MCP dossier engine.
 
-use crate::index_lifecycle::public_api::EmbedSourceRefusal;
+use crate::embed::lifecycle::public_api::EmbedSourceRefusal;
 pub use crate::knowledge::curation_contract::{
     CurateKnowledgeInput, KnowledgePolicyActionInput, KnowledgePolicyAuthorityDomainInput,
     KnowledgePolicyEntryInput, KnowledgePolicyEvidenceInput, KnowledgePolicyLifecycleInput,

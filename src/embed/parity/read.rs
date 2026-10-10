@@ -74,6 +74,6 @@ pub struct FileReadEstimate {
     pub authority: ReadAuthority,
 }
 
-pub use crate::index_lifecycle::guidance::withheld::{
+pub use crate::embed::lifecycle::guidance::withheld::{
     RemediationActionAvailability, RemediationActionName, WithheldFinding, WithheldMeta,
 };

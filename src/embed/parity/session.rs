@@ -1,6 +1,6 @@
 //! Explicit source-bound context history and bounded retrieval of served output.
 
-pub use crate::index_lifecycle::embed_session::QuerySession;
+pub use crate::embed::lifecycle::embed_session::QuerySession;
 
 /// Trusted per-session cache bounds. The native facade accepts lower limits than
 /// the engine defaults, including zero to disable offloading. Not deserializable.

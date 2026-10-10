@@ -1,7 +1,7 @@
 //! Rich reference and dependent queries over admitted source publications.
 use serde::{Deserialize, Serialize};
 
-pub use crate::index_lifecycle::guidance::reference_contract::FindReferencesInput as ReferenceSearchRequest;
+pub use crate::embed::lifecycle::guidance::reference_contract::FindReferencesInput as ReferenceSearchRequest;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

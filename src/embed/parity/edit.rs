@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
-use crate::index_lifecycle::public_api::EmbedSourceRefusal;
+use crate::embed::lifecycle::public_api::EmbedSourceRefusal;
 
 mod wire;
 pub use wire::*;

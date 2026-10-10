@@ -88,6 +88,14 @@ pub use crate::index_lifecycle::public_api::{
     TextSearchResult,
 };
 
+/// Crate-internal door to the lifecycle modules the parity children consume,
+/// so this file stays the only embed file that names the boundary.
+pub(crate) mod lifecycle {
+    pub(crate) use crate::index_lifecycle::{
+        embed_federation, embed_host, embed_query, embed_session, guidance, public_api,
+    };
+}
+
 /// Additive engine query contracts, versioned separately from the frozen V11 core.
 pub mod parity;
 

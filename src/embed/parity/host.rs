@@ -1499,7 +1499,7 @@ impl HostRoom {
     ) -> Result<HostResourceReply, HostRefusal> {
         let (uri, content) = match resource {
             HostResourceRequest::RepoHealth => ("symforge://repo/health",
-                HostResourceContent::Health(crate::index_lifecycle::embed_host::health(
+                HostResourceContent::Health(crate::embed::lifecycle::embed_host::health(
                     &self.source, &self.room_id, &self.engine))),
             HostResourceRequest::RepoOutline => {
                 return self.query_resource(
@@ -1692,14 +1692,14 @@ impl HostRoom {
         }
         let response = match request {
             HostRequest::Status => {
-                HostResponse::Status(crate::index_lifecycle::embed_host::status(
+                HostResponse::Status(crate::embed::lifecycle::embed_host::status(
                     &self.source,
                     &self.room_id,
                     &self.engine,
                 ))
             }
             HostRequest::Health => {
-                HostResponse::Health(crate::index_lifecycle::embed_host::health(
+                HostResponse::Health(crate::embed::lifecycle::embed_host::health(
                     &self.source,
                     &self.room_id,
                     &self.engine,
@@ -1939,7 +1939,7 @@ impl HostRoom {
                 if !self.rights.checkpoint || (*export_artifact && !self.rights.export_artifact) {
                     return Err(HostRefusal::new(HostRefusalKind::Denied));
                 }
-                HostResponse::Checkpoint(crate::index_lifecycle::embed_host::checkpoint(
+                HostResponse::Checkpoint(crate::embed::lifecycle::embed_host::checkpoint(
                     &self.source,
                     self.limits,
                     *verify_after_write,

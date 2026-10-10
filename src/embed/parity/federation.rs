@@ -3,7 +3,7 @@ use super::session::QuerySession;
 use super::{QueryClaim, QueryPolicy, QueryRefusal, QueryUsage};
 use crate::embed::EmbeddedSourceHandle;
 
-pub use crate::index_lifecycle::embed_federation::query_sources;
+pub use crate::embed::lifecycle::embed_federation::query_sources;
 
 /// This list is the complete authority boundary for federation. Construct it
 /// from host-granted handles; selectors never discover or open another root.

@@ -28,7 +28,7 @@ pub mod symbol_context;
 /// Contract version of the additive query namespace.
 pub const API_VERSION: u32 = 1;
 
-pub use crate::index_lifecycle::embed_query::{QueryClaim, QueryOperationReceipt, QueryRefusal};
+pub use crate::embed::lifecycle::embed_query::{QueryClaim, QueryOperationReceipt, QueryRefusal};
 
 /// Trusted host policy. This grant is supplied in process and is never decoded
 /// from a query request. Preparation additionally requires admitted state.
