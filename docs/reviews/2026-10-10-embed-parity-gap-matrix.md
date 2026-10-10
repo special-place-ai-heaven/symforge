@@ -109,3 +109,16 @@ following rows moved from PARTIAL to FULL on branch `feat/embed-parity-v2`.
 | repo/health resource | FULL | `tests/embed_health.rs` |
 | tools/catalog resource | FULL | `tests/embed_health.rs` |
 | glossary resource | FULL | `tests/embed_health.rs` |
+
+## Status update: class B read and search batch (appended 2026-10-10)
+
+| Row | Status | Fixture |
+|---|---|---|
+| 6 validate_file_syntax | FULL: indexed report, disk re-parse when unindexed or the freshen did not publish, shared refusal metadata. A not-Current source refuses rather than parsing disk, because every embedded claim binds a Current publication (`capture_query_snapshot` in `src/index_lifecycle/embedded.rs`) | `tests/embed_disk_parity.rs`; MCP golden `validate_file_syntax_matches_embed_parity_golden` |
+| 7 get_file_content | FULL: shared synchronous exact-path freshen before capture. The same freshen also runs for file context and symbol context, which MCP freshens too | `tests/embed_disk_parity.rs`; MCP golden `targeted_read_freshen_matches_embed_parity_golden` |
+| 13 search_text | FULL: shared zero-hit untracked sweep with the MCP diagnostic | `tests/embed_disk_parity.rs`; MCP golden `search_text_untracked_sweep_matches_embed_parity_golden` |
+
+Red embed-cell fixtures, root causes (2026-10-10):
+
+- `tests/embed_host.rs` `wire_dispatch_is_source_bound_and_refuses_untrusted_lifecycle_requests` asserted `file-content` in the catalog's static resources. MCP lists it as a resource template, and the catalog already mirrors that, so the assertion was corrected to the template list. Green.
+- `tests/embed_git_isolated_config.rs` (two tests) is blocked, not fixed. `PreparedGitView::repository` (`src/index_lifecycle/embed_git.rs:28-36`) and the fixture open the repository with libgit2 open flag `1 << 5`, described as supplied by "the pinned local libgit2 patch". No such patch exists: `Cargo.toml` `[patch.crates-io]` carries no `libgit2-sys` entry and `vendor/` has no libgit2. Upstream libgit2 ignores the unknown flag, so global config, attributes and excludes are still read; `prepare_git_view` refuses `InvalidRepository` on a malformed global include, and the raw open still sees global attributes. Making it pass needs a vendored, patched `libgit2-sys`, which is a vendor and dependency change.
