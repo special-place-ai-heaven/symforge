@@ -25,17 +25,25 @@ pub(super) struct PreparedGitView {
 
 impl PreparedGitView {
     pub(super) fn repository(&self) -> Result<git2::Repository, GitPreparationRefusal> {
-        // Opt-in flag supplied by the pinned local libgit2 patch. The embed
-        // dependency feature must enforce that patched library at link time.
-        const LOCAL_CONFIG_ONLY: u32 = 1 << 5;
+        let gitdir = self.artifact.path().join("repo/.git");
+        // libgit2 has no public open that skips global/XDG/system config: every
+        // open path loads them (repository.c, obtain_config_and_set_oid_type), so
+        // a malformed ambient config still refuses here. What we can own is the
+        // config the handle uses afterwards: only the artifact's own file, whose
+        // attributes/excludes paths `prepare` pinned inside the artifact.
         let repository = git2::Repository::open_ext(
-            self.artifact.path().join("repo/.git"),
-            git2::RepositoryOpenFlags::NO_SEARCH
-                | git2::RepositoryOpenFlags::NO_DOTGIT
-                | git2::RepositoryOpenFlags::from_bits_retain(LOCAL_CONFIG_ONLY),
+            &gitdir,
+            git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::NO_DOTGIT,
             &[] as &[&std::ffi::OsStr],
         )
         .map_err(|_| refusal(Refusal::InvalidRepository))?;
+        let mut config = git2::Config::new().map_err(|_| refusal(Refusal::InvalidRepository))?;
+        config
+            .add_file(&gitdir.join("config"), git2::ConfigLevel::Local, false)
+            .map_err(|_| refusal(Refusal::InvalidRepository))?;
+        repository
+            .set_config(&config)
+            .map_err(|_| refusal(Refusal::InvalidRepository))?;
         Ok(repository)
     }
 }
@@ -56,6 +64,9 @@ struct Capture<'a> {
     bytes: u64,
     entries: u64,
 }
+
+/// Artifact-relative empty file standing in for unset attributes/excludes paths.
+const EMPTY_FILE: &str = "empty";
 
 fn refusal(kind: Refusal) -> GitPreparationRefusal {
     GitPreparationRefusal { kind }
@@ -363,6 +374,14 @@ pub(super) fn prepare(
             config_entries.push((entry.name, None, entry.value));
         }
     }
+    // With no admitted value libgit2 falls back to XDG `git/attributes` and
+    // `git/ignore` (attrcache.c, attr_cache__lookup_path). Pin both to an
+    // empty file inside the artifact so no ambient fallback applies.
+    for key in ["core.attributesfile", "core.excludesfile"] {
+        if !config_entries.iter().any(|(name, _, _)| name == key) {
+            config_entries.push((key.to_owned(), Some(PathBuf::from(EMPTY_FILE)), None));
+        }
+    }
     check(control)?;
     let argument_bytes = serde_json::to_vec(&(
         "symforge.embed.git-preparation.v1",
@@ -449,11 +468,22 @@ pub(super) fn prepare(
     )
     .map_err(|_| refusal(Refusal::StateUnavailable))?;
     std::fs::write(&destination, []).map_err(|_| refusal(Refusal::StateUnavailable))?;
+    std::fs::write(artifact.path().join(EMPTY_FILE), [])
+        .map_err(|_| refusal(Refusal::StateUnavailable))?;
     let mut config =
         git2::Config::open(&destination).map_err(|_| refusal(Refusal::InvalidRepository))?;
     for (name, path, value) in config_entries {
         let value = path
-            .map(|path| artifact.path().join(path).to_string_lossy().into_owned())
+            .map(|path| {
+                let value = artifact.path().join(path).to_string_lossy().into_owned();
+                // libgit2 reads a written `\` back as an escape ("invalid
+                // escape"); Windows accepts `/` as the separator.
+                if cfg!(windows) {
+                    value.replace('\\', "/")
+                } else {
+                    value
+                }
+            })
             .or(value)
             .unwrap_or_else(|| "true".to_owned());
         config

@@ -1476,6 +1476,13 @@ impl EmbeddedSourceHandle {
         Ok(claim)
     }
 
+    /// Open the current prepared Git view exactly as production does.
+    #[cfg(all(feature = "embed", feature = "__test-internals"))]
+    pub fn prepared_git_repository_for_test(&self) -> Option<git2::Repository> {
+        let view = self.binding.as_ref()?.git_view.lock().ok()?.clone()?;
+        view.repository().ok()
+    }
+
     /// Execute a bounded query against one admitted, immutable publication.
     #[cfg(feature = "embed")]
     pub fn query(
