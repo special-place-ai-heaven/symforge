@@ -5944,7 +5944,7 @@ mod tests {
         match &live.snapshot_verify_state {
             SnapshotVerifyState::Completed(report) => {
                 assert_eq!(report.mismatched_paths, vec!["src/dir.rs".to_string()]);
-                #[cfg(feature = "server")]
+                #[cfg(any(feature = "server", feature = "embed"))]
                 {
                     // Re-read, and the failed re-read withholds it.
                     assert!(
@@ -5953,7 +5953,7 @@ mod tests {
                         "{report:?}"
                     );
                 }
-                #[cfg(not(feature = "server"))]
+                #[cfg(not(any(feature = "server", feature = "embed")))]
                 assert!(
                     report.reason.as_deref().is_some_and(
                         |reason| reason.contains("could not be read for the spot check")
@@ -7320,14 +7320,15 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "server"))]
+    #[cfg(any(feature = "server", feature = "embed"))]
     #[tokio::test]
-    async fn test_background_verify_embed_folds_stat_changed_into_mismatches() {
-        // Embed contract (no watcher): a file the stat-check flags as changed must
-        // degrade freshness even when the 10% content-hash spot sample would clear
-        // it. Isolate the stat-only path — identical content on disk and in the
-        // snapshot (so spot_verify sees no mismatch), but the recorded snapshot
-        // mtime is older than the on-disk mtime (so stat_check flags it changed).
+    async fn test_background_verify_rereads_stat_changed_through_the_canonical_seam() {
+        // Embed and server share one contract: a file the stat-check flags as
+        // changed is re-read through the source-anchor seam, not folded into
+        // mismatches unread. Isolate the stat-only path — identical content on
+        // disk and in the snapshot (so spot_verify sees no mismatch), but the
+        // recorded snapshot mtime is older than the on-disk mtime (so stat_check
+        // flags it changed). The re-read then reconciles it.
         let tmp = TempDir::new().unwrap();
         let file_path = tmp.path().join("src").join("main.rs");
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
@@ -7355,7 +7356,7 @@ mod tests {
         // `build_snapshot` re-stats the disk mtime, so the recorded mtime currently
         // equals the on-disk mtime. Force it OLDER so `stat_check_files_from_view`
         // reports the file as changed while the byte-identical content keeps the
-        // spot sample clean — isolating the embed-only fold-in path.
+        // spot sample clean — isolating the stat-changed re-read path.
         snapshot_mtimes.insert("src/main.rs".to_string(), disk_mtime.saturating_sub(1_000));
 
         let loaded = snapshot_to_live_index(snapshot, tmp.path());
@@ -7373,24 +7374,32 @@ mod tests {
         match &published.snapshot_verify_state {
             SnapshotVerifyState::Completed(report) => {
                 assert!(
-                    report.mismatched_paths.contains(&"src/main.rs".to_string()),
-                    "stat-changed file must be folded into mismatches under embed, got {:?}",
-                    report.mismatched_paths
+                    report.mismatched_paths.is_empty() && report.unverified.is_empty(),
+                    "a stat-changed file the re-read reconciles is not a mismatch: {report:?}"
                 );
             }
             other => panic!("expected completed snapshot verify report, got {other:?}"),
         }
-
-        match &*shared.freshness_status() {
-            crate::domain::FreshnessStatus::Degraded { reason_codes, .. } => {
-                assert!(
-                    reason_codes
-                        .contains(&crate::domain::FreshnessReason::SnapshotVerificationFailed),
-                    "expected SnapshotVerificationFailed, got {reason_codes:?}"
-                );
-            }
-            other => panic!("expected Degraded freshness under embed, got {other:?}"),
-        }
+        assert_eq!(
+            shared
+                .read()
+                .files
+                .get("src/main.rs")
+                .map(|file| file.content.as_slice()),
+            Some(b"fn main() {}
+".as_slice()),
+            "the re-read keeps the reconciled row"
+        );
+        assert!(
+            !matches!(
+                &*shared.freshness_status(),
+                crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                    if reason_codes
+                        .contains(&crate::domain::FreshnessReason::SnapshotVerificationFailed)
+            ),
+            "a reconciled verify must not degrade freshness, got {:?}",
+            shared.freshness_status()
+        );
     }
 
     #[test]
