@@ -8512,6 +8512,15 @@ impl SymForgeServer {
                                 "symforge_edit",
                                 handler::estimate_tokens(&stored_response),
                             );
+                            // A probe hit can be an unservable record's
+                            // "Error: Idempotency replay unavailable" refusal;
+                            // that is a refusal, not a served result.
+                            if is_error_output(&stored_response) {
+                                return Ok(ResultStatus::new(Self::mutation_refusal_outcome(
+                                    &stored_response,
+                                ))
+                                .into_mutation_call_tool_result(stored_response));
+                            }
                             return statused_tool_result(stored_response, OutcomeClass::Found);
                         }
                         Ok(None) => {}
