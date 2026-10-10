@@ -1909,10 +1909,23 @@ fn all_ingress_uses_exact_typed_authority_branch() {
         include_str!("../src/protocol/tools.rs")
             .matches("pub estimate: Option<bool>")
             .count(),
+        // The read/search/reference input structs now live in the guidance
+        // contract files and are re-exported by the protocol modules; the
+        // per-file split follows where a struct is declared, the total and the
+        // disposition table below are what pin the ingress set.
+        include_str!("../src/index_lifecycle/guidance/read_contract.rs")
+            .matches("pub estimate: Option<bool>")
+            .count(),
+        include_str!("../src/index_lifecycle/guidance/search_contract.rs")
+            .matches("pub estimate: Option<bool>")
+            .count(),
+        include_str!("../src/index_lifecycle/guidance/reference_contract.rs")
+            .matches("pub estimate: Option<bool>")
+            .count(),
     ];
     assert_eq!(
         estimate_field_counts,
-        [8, 4, 4],
+        [7, 0, 4, 1, 3, 1],
         "advertised estimate ingress declarations moved across protocol modules"
     );
     assert_eq!(
