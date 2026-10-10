@@ -484,7 +484,6 @@ use crate::sidecar::handlers::{
     symbol_context_tool_text_for_generation,
 };
 use crate::sidecar::{SidecarState, TokenStats};
-use crate::watcher;
 
 use super::SymForgeServer;
 
@@ -889,43 +888,10 @@ fn suggest_similar_files(index: &crate::live_index::LiveIndex, path: &str) -> Ve
     suggestions
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TargetedFreshenRefusal {
-    ProjectGenerationChanged,
-    PublicationRejected,
-}
-
-impl TargetedFreshenRefusal {
-    fn message(self, relative_path: &str) -> String {
-        match self {
-            Self::ProjectGenerationChanged => format!(
-                "Index refresh interrupted: project changed while refreshing '{relative_path}'; retry the read."
-            ),
-            Self::PublicationRejected => format!(
-                "Index refresh interrupted: refresh for '{relative_path}' did not publish; retry the read."
-            ),
-        }
-    }
-
-    fn permits_authoritative_disk_fallback(self) -> bool {
-        matches!(self, Self::PublicationRejected)
-    }
-}
-
-fn classify_targeted_freshen_result(
-    result: watcher::FreshenResult,
-) -> Result<bool, TargetedFreshenRefusal> {
-    match result {
-        watcher::FreshenResult::Fresh => Ok(false),
-        watcher::FreshenResult::StaleReindexed | watcher::FreshenResult::StaleRemoved => Ok(true),
-        watcher::FreshenResult::GenerationMismatch => {
-            Err(TargetedFreshenRefusal::ProjectGenerationChanged)
-        }
-        watcher::FreshenResult::PublicationRejected => {
-            Err(TargetedFreshenRefusal::PublicationRejected)
-        }
-    }
-}
+#[cfg(test)]
+use crate::index_lifecycle::guidance::freshen::classify_targeted_freshen_result;
+pub(crate) use crate::index_lifecycle::guidance::freshen::safe_repo_path_for_freshen;
+use crate::index_lifecycle::guidance::freshen::{TargetedFreshenRefusal, freshen_exact_path};
 
 fn freshen_exact_path_for_targeted_retrieval(
     server: &SymForgeServer,
@@ -938,48 +904,17 @@ fn freshen_exact_path_for_targeted_retrieval(
     let Some(repo_root) = server.capture_repo_root() else {
         return Ok(false);
     };
-    let Ok(abs_path) = safe_repo_path_for_freshen(&repo_root, relative_path) else {
-        return Ok(false);
-    };
     // V11 observation lane (C4c): a request-path freshen observes under the
     // incarnation current at call time (the C3b synchronous-facade ruling).
     let lane_authority =
         crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
-    let lane_observer = lane_authority.active_observer();
-    classify_targeted_freshen_result(watcher::freshen_file_if_stale(
-        relative_path,
-        &abs_path,
+    freshen_exact_path(
         server.index.data_plane(),
         expected_gen,
+        &repo_root,
         &lane_authority,
-        lane_observer,
-    ))
-}
-
-pub(crate) fn safe_repo_path_for_freshen(
-    repo_root: &std::path::Path,
-    relative_path: &str,
-) -> Result<PathBuf, String> {
-    let relative = std::path::Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(format!("path '{relative_path}' is outside the repository"));
-    }
-    match edit::resolve_repo_path(repo_root, relative_path)? {
-        Some(path) => Ok(path),
-        // Only a spelling with nothing on disk falls back, so the freshen lane
-        // can confirm a deletion. Every refusal and every other I/O error
-        // propagates instead of becoming a path the lane would follow.
-        None => {
-            let canon_root = repo_root
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve repo root: {e}"))?;
-            Ok(canon_root.join(relative))
-        }
-    }
+        relative_path,
+    )
 }
 
 fn search_scope_summary(
@@ -14406,6 +14341,42 @@ mod tests {
             "{compact}"
         );
         assert!(compact.contains("| Worktree misuse/hour: 0"), "{compact}");
+    }
+
+    fn embed_parity_server(root: &Path) -> SymForgeServer {
+        SymForgeServer::new(
+            crate::live_index::LiveIndex::load(root).expect("index"),
+            "embed-parity-golden".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(root.to_path_buf()),
+            None,
+        )
+    }
+
+    /// MCP side of the embed freshen golden (`tests/embed_disk_parity.rs`):
+    /// a write completed after the publication is served fresh by the
+    /// synchronous exact-path freshen.
+    #[tokio::test]
+    async fn targeted_read_freshen_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        let file = repo.path().join("lib.rs");
+        fs::write(&file, "pub fn before_write() {}\n").expect("source");
+        let server = embed_parity_server(repo.path());
+        let read = || {
+            server.get_file_content(Parameters(
+                serde_json::from_value(serde_json::json!({ "path": "lib.rs" })).expect("input"),
+            ))
+        };
+        assert!(read().await.contains("before_write"));
+        fs::write(&file, "pub fn after_write() {}\n").expect("rewrite");
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(later))
+            .expect("mtime");
+        let fresh = read().await;
+        assert!(fresh.contains("pub fn after_write() {}"), "{fresh}");
+        assert!(!fresh.contains("before_write"), "{fresh}");
     }
 
     #[tokio::test]

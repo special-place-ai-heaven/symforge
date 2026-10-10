@@ -699,6 +699,62 @@ impl EmbeddedBinding {
         self.publish_observed_current()
     }
 
+    /// MCP's synchronous exact-path freshen before a targeted read
+    /// (`freshen_exact_path_for_targeted_retrieval`): re-admit one changed
+    /// path through the shared single-file seam and publish the result as the
+    /// next Current publication, so the read captured after it serves the
+    /// bytes on disk. Only a Current source is freshened; every other phase
+    /// belongs to the worker, and the capture that follows refuses it.
+    // ponytail: the single-file seam reads by path beneath the bound root, not
+    // through the original-root capability; a replaced root is caught after the
+    // fact because every served read re-verifies its bytes through that
+    // capability and refuses a mismatch as a stale publication.
+    #[cfg(feature = "embed")]
+    fn freshen_exact_path(
+        &self,
+        relative_path: &str,
+    ) -> Result<(), super::guidance::freshen::TargetedFreshenRefusal> {
+        if self.shutdown_started.load(Ordering::Acquire)
+            || self.authority.verify_physical_root_anchor().is_err()
+            || self.state.lock().expect("embedded state mutex").phase
+                != super::public_api::SourceRuntimePhase::Current
+        {
+            return Ok(());
+        }
+        let shared = self.runtime.data_plane();
+        let expected_gen = shared.current_project_generation();
+        if super::guidance::freshen::freshen_exact_path(
+            shared,
+            expected_gen,
+            &self.root,
+            &self.authority,
+            relative_path,
+        )? {
+            self.publish_freshened();
+        }
+        Ok(())
+    }
+
+    /// Advance the Current publication to the data plane's after a freshen,
+    /// unless the worker has taken the source out of Current meanwhile.
+    #[cfg(feature = "embed")]
+    fn publish_freshened(&self) {
+        let mut state = self.state.lock().expect("embedded state mutex");
+        let published = self.runtime.data_plane().published_generation();
+        if self.shutdown_started.load(Ordering::Acquire)
+            || state.phase != super::public_api::SourceRuntimePhase::Current
+            || !matches!(published.freshness.as_ref(), FreshnessStatus::Current)
+        {
+            return;
+        }
+        state.source_version = state.source_version.saturating_add(1).max(1);
+        state.current_publication_identity = Some(format!(
+            "embed-publication-{}-{}",
+            self.identity.raw(),
+            published.publication_generation
+        ));
+    }
+
     fn publish_observed_current(&self) -> Option<String> {
         #[cfg(feature = "embed")]
         if self.authority.verify_physical_root_anchor().is_err() {
@@ -1566,6 +1622,21 @@ impl EmbeddedSourceHandle {
     pub(super) fn bound_state_anchor(&self) -> Option<AdmittedStateAnchor> {
         self.bound_replay_placement()?;
         self.binding.as_ref()?.state_anchor.clone()
+    }
+
+    /// Freshen one exact path before a targeted read; see the binding's
+    /// `freshen_exact_path`.
+    #[cfg(feature = "embed")]
+    pub(super) fn freshen_exact_path(
+        &self,
+        relative_path: &str,
+    ) -> Result<(), super::guidance::freshen::TargetedFreshenRefusal> {
+        match &self.binding {
+            Some(binding) if !self.closed.load(Ordering::Acquire) => {
+                binding.freshen_exact_path(relative_path)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Internal read capture shared by parity queries and edit previews. It is

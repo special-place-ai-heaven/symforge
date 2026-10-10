@@ -21,16 +21,13 @@ pub use crate::watcher_state::{WatcherInfo, WatcherState};
 // Relocated to `live_index::single_file` (task #24) so the embed facade can
 // expose the SAME single-file admission seam; the watcher keeps its exact
 // call surface through this re-export.
-#[cfg(test)]
-pub(crate) use crate::live_index::single_file::read_and_index_with_stable_read;
 pub(crate) use crate::live_index::single_file::{
-    ReindexOutcome as ReindexResult, admit_and_index_single_path_with_receipt, maybe_reindex,
-    read_and_index,
+    FreshenResult, ReindexOutcome as ReindexResult, admit_and_index_single_path_with_receipt,
+    freshen_file_if_stale, read_and_index, refuses_observed_admission_into_cold_bootstrap,
+    supported_language,
 };
-
-fn refuses_observed_admission_into_cold_bootstrap(shared: &SharedIndex) -> bool {
-    shared.read().refuses_watcher_observed_admission()
-}
+#[cfg(test)]
+pub(crate) use crate::live_index::single_file::{maybe_reindex, read_and_index_with_stable_read};
 
 fn read_and_index_observed<L>(
     relative_path: &str,
@@ -49,25 +46,6 @@ where
         return ReindexResult::Skipped;
     }
     read_and_index(relative_path, abs_path, shared, language, expected_gen)
-}
-
-fn maybe_reindex_observed<L>(
-    relative_path: &str,
-    abs_path: &Path,
-    shared: &SharedIndex,
-    language: L,
-    expected_gen: u64,
-) -> ReindexResult
-where
-    L: Into<Option<LanguageId>>,
-{
-    if refuses_observed_admission_into_cold_bootstrap(shared) {
-        trace!(
-            "watcher: refusing observed reindex into cold bootstrap placeholder: {relative_path}"
-        );
-        return ReindexResult::Skipped;
-    }
-    maybe_reindex(relative_path, abs_path, shared, language, expected_gen)
 }
 
 /// Tracks event bursts to adaptively extend the debounce window.
@@ -150,15 +128,6 @@ impl Default for BurstTracker {
 // Plan 02: Event processing, path normalization, content hash skip, ENOENT
 // ---------------------------------------------------------------------------
 
-#[must_use]
-pub(crate) enum FreshenResult {
-    Fresh,
-    StaleReindexed,
-    StaleRemoved,
-    GenerationMismatch,
-    PublicationRejected,
-}
-
 /// Strip `\\?\` Windows extended-length path prefix and normalize backslashes.
 ///
 /// Returns the relative forward-slash path if `abs_path` is inside `repo_root`,
@@ -191,111 +160,12 @@ pub(crate) fn normalize_event_path(abs_path: &Path, repo_root: &Path) -> Option<
         .map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
-/// Return the authoritative `LanguageId` for a complete repository path.
-/// Extensionless narrative files and configuration dotfiles are path-classified.
-pub(crate) fn supported_language(path: &Path) -> Option<LanguageId> {
-    path.to_str().and_then(LanguageId::from_path)
-}
-
 /// Return `true` for Create, Modify, or Remove events; `false` for Access and others.
 pub(crate) fn is_relevant_event(event: &DebouncedEvent) -> bool {
     matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     )
-}
-
-/// Mtime-based freshness check for a single file.
-///
-/// Compares the file's current mtime on disk against the value stored in the
-/// index. If they differ (or the file is not yet indexed), re-indexes it
-/// immediately before the caller proceeds.
-///
-/// Returns a structured freshness outcome so callers can distinguish a
-/// confirmed deletion from a stale project-generation mismatch.
-pub(crate) fn freshen_file_if_stale(
-    relative_path: &str,
-    abs_path: &Path,
-    shared: &SharedIndex,
-    expected_gen: u64,
-    authority: &crate::live_index::index_lifecycle::activation::ProjectSourceAuthority,
-    observer: crate::live_index::index_lifecycle::observer::ObserverId,
-) -> FreshenResult {
-    if shared.current_project_generation() != expected_gen {
-        if shared.remove_file_at_generation(relative_path, expected_gen)
-            && authority.observe_removal(observer, relative_path).is_err()
-        {
-            debug!("freshen: stale incarnation's removal observation refused");
-        }
-        return FreshenResult::GenerationMismatch;
-    }
-
-    // 1. Stat the file on disk
-    let disk_mtime = std::fs::metadata(abs_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // 2. Compare against indexed mtime (read lock, released immediately)
-    let indexed_mtime = {
-        let index = shared.read();
-        index
-            .get_file(relative_path)
-            .map(|f| f.mtime_secs)
-            .unwrap_or(u64::MAX)
-    };
-
-    if disk_mtime == 0 && indexed_mtime == 0 {
-        return FreshenResult::Fresh; // both unknown — treat as fresh to avoid churn
-    }
-    if disk_mtime != 0 && disk_mtime == indexed_mtime {
-        return FreshenResult::Fresh; // already fresh
-    }
-
-    // 3. Stale — re-index
-    let language = supported_language(abs_path);
-
-    debug!("freshness guard: stale file detected, re-indexing {relative_path}");
-    let result = maybe_reindex_observed(relative_path, abs_path, shared, language, expected_gen);
-    // V11 observation lane (C4c): observe on the mutation EVIDENCE (the
-    // reindex outcome), before the generation re-check — a commit that landed
-    // just ahead of a reload must still be observed; a spurious observation
-    // only dirties the next cut, a missed one loses the change.
-    if matches!(result, ReindexResult::Reindexed)
-        && authority
-            .observe_admission(observer, relative_path)
-            .is_err()
-    {
-        debug!("freshen: stale incarnation's admission observation refused");
-    }
-    if matches!(result, ReindexResult::Removed)
-        && authority.observe_removal(observer, relative_path).is_err()
-    {
-        debug!("freshen: stale incarnation's removal observation refused");
-    }
-    if shared.current_project_generation() != expected_gen {
-        if shared.remove_file_at_generation(relative_path, expected_gen)
-            && authority.observe_removal(observer, relative_path).is_err()
-        {
-            debug!("freshen: stale incarnation's removal observation refused");
-        }
-        return FreshenResult::GenerationMismatch;
-    }
-
-    match result {
-        ReindexResult::HashSkip | ReindexResult::Reindexed | ReindexResult::ReadError(_) => {
-            FreshenResult::StaleReindexed
-        }
-        // Admission demoted the file to Tier 2/3: the index WAS reconciled
-        // (any prior Tier-1 entry removed, skip record recorded), so the file is
-        // no longer parsed/indexed. Report it as a refresh — the caller's stale
-        // state has been resolved — without claiming the file is still indexed.
-        ReindexResult::Skipped => FreshenResult::StaleReindexed,
-        ReindexResult::NotFound | ReindexResult::Removed => FreshenResult::StaleRemoved,
-        ReindexResult::PublicationRejected => FreshenResult::PublicationRejected,
-    }
 }
 
 /// Resolve the generation the watcher should fence its mutations against for

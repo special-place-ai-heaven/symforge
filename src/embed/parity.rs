@@ -206,6 +206,20 @@ pub enum QueryRequest {
 }
 
 impl QueryRequest {
+    /// The one exact path MCP freshens synchronously before serving this
+    /// request (`freshen_exact_path_for_targeted_retrieval`): the read,
+    /// file-context, symbol-context and syntax lanes.
+    pub(crate) fn freshen_path(&self) -> Option<&str> {
+        match self {
+            Self::FileContent(input) => Some(&input.path),
+            Self::SourcePage(input) => Some(&input.path),
+            Self::FileContext(input) => Some(&input.path),
+            Self::SymbolContext(input) => input.path.as_deref().or(input.file.as_deref()),
+            Self::Syntax { path } => Some(path),
+            _ => None,
+        }
+    }
+
     pub fn operation(&self) -> QueryOperationKind {
         match self {
             Self::TextSearch(_) => QueryOperationKind::SearchText,

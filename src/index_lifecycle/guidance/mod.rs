@@ -7,6 +7,7 @@ pub mod explore;
 pub(crate) mod file_read;
 pub(crate) mod file_search;
 pub(crate) mod filters;
+pub(crate) mod freshen;
 pub(crate) mod health;
 pub(crate) mod impact;
 pub(crate) mod read_admission_format;

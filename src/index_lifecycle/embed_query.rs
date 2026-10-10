@@ -360,6 +360,14 @@ fn execute_inner(
     budget
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
+    if let Some(path) = request.freshen_path() {
+        if handle.freshen_exact_path(path).is_err() {
+            return Err(refuse(
+                QueryRefusalKind::StalePublication,
+                RetryAdvice::OnEvent,
+            ));
+        }
+    }
     let snapshot = handle
         .capture_query_snapshot(&normalized)
         .map_err(|error| {
