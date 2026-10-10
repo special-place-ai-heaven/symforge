@@ -384,6 +384,18 @@ pub struct QuerySyntax {
     pub diagnostic: Option<String>,
     pub line: Option<u32>,
     pub column: Option<u32>,
+    /// Whose bytes were parsed: the publication's, or the disk's when the
+    /// file is unindexed or its freshen did not publish (MCP
+    /// `validate_file_syntax`'s authoritative disk-parse lane).
+    #[serde(default = "published_generation")]
+    pub authority: read::ReadAuthority,
+    /// The exact report MCP `validate_file_syntax` renders for these bytes.
+    #[serde(default)]
+    pub rendered: String,
+}
+
+fn published_generation() -> read::ReadAuthority {
+    read::ReadAuthority::PublishedGeneration
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

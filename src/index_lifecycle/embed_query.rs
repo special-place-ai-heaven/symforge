@@ -361,11 +361,20 @@ fn execute_inner(
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
     if let Some(path) = request.freshen_path() {
-        if handle.freshen_exact_path(path).is_err() {
-            return Err(refuse(
-                QueryRefusalKind::StalePublication,
-                RetryAdvice::OnEvent,
-            ));
+        match handle.freshen_exact_path(path) {
+            Ok(()) => {}
+            Err(refusal)
+                if refusal.permits_authoritative_disk_fallback()
+                    && matches!(request, QueryRequest::Syntax { .. }) =>
+            {
+                budget.syntax_disk_fallback = true;
+            }
+            Err(_) => {
+                return Err(refuse(
+                    QueryRefusalKind::StalePublication,
+                    RetryAdvice::OnEvent,
+                ));
+            }
         }
     }
     let snapshot = handle
@@ -623,6 +632,10 @@ pub(super) struct Budget {
     pub(super) reused_handle: Option<String>,
     pub(super) cache_output: Option<QueryOutput>,
     pub(super) cache_truncated: bool,
+    /// The exact-path freshen's publication was rejected: MCP
+    /// `validate_file_syntax` then distrusts the indexed hit and answers from
+    /// its authoritative disk parse.
+    pub(super) syntax_disk_fallback: bool,
 }
 
 #[cfg(test)]
@@ -800,6 +813,7 @@ impl Budget {
             reused_handle: None,
             cache_output: None,
             cache_truncated: false,
+            syntax_disk_fallback: self.syntax_disk_fallback,
         }
     }
     pub(super) fn limits(&self) -> QueryLimits {
@@ -850,6 +864,7 @@ impl Budget {
             reused_handle: None,
             cache_output: None,
             cache_truncated: false,
+            syntax_disk_fallback: false,
         })
     }
 
@@ -1590,16 +1605,30 @@ pub(super) fn project(
             graph(live, path_prefix.as_deref(), *offset, budget).map(QueryOutput::Graph)
         }
         QueryRequest::Syntax { path } => {
-            let file = file(live, path)?;
+            let indexed = if budget.syntax_disk_fallback {
+                None
+            } else {
+                live.get_file(path)
+            };
+            let observed;
+            let (file, authority) = match indexed {
+                Some(file) => (file, read::ReadAuthority::PublishedGeneration),
+                None => {
+                    observed = super::embed_read::observe_for_syntax(snapshot, path, budget)?;
+                    (&observed, read::ReadAuthority::DiskObservation)
+                }
+            };
             let diagnostic = file
                 .parse_diagnostic
                 .as_ref()
                 .map(|diagnostic| diagnostic.message.clone());
+            let rendered = super::guidance::file_read::validate_file_syntax_result(path, file);
             budget.required(
                 path.len()
                     + file.content_hash.len()
                     + parse_status(file).len()
-                    + diagnostic.as_ref().map_or(0, String::len),
+                    + diagnostic.as_ref().map_or(0, String::len)
+                    + rendered.len(),
             )?;
             Ok(QueryOutput::Syntax(QuerySyntax {
                 path: path.clone(),
@@ -1615,6 +1644,8 @@ pub(super) fn project(
                     .parse_diagnostic
                     .as_ref()
                     .and_then(|diagnostic| diagnostic.column),
+                authority,
+                rendered,
             }))
         }
         QueryRequest::Diff {

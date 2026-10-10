@@ -18,6 +18,10 @@ use symforge::embed::{
     EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase,
 };
 
+/// Shared with the MCP goldens.
+const INDEXED_SYNTAX_GOLDEN: &str = "Syntax validation: src/broken.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn broken( {` (line 1, column 1)\nByte span: 0..16\nSymbols extracted: 0";
+const UNINDEXED_SYNTAX_GOLDEN: &str = "Syntax validation: ignored/scratch.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn scratch( {` (line 1, column 1)\nByte span: 0..17\nSymbols extracted: 0";
+
 fn open(runtime: &ProcessIndexRuntime, root: &Path) -> EmbeddedSourceHandle {
     let handle = runtime
         .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.to_path_buf()))
@@ -96,5 +100,81 @@ fn targeted_read_serves_a_write_completed_after_capture_like_mcp() {
         panic!("source page");
     };
     assert_eq!(page.bytes, b"pub fn paged_write() {}\n");
+    handle.close().unwrap();
+}
+
+fn syntax_fixture() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    git2::Repository::init(root.path()).unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::create_dir_all(root.path().join("ignored")).unwrap();
+    fs::create_dir_all(root.path().join("config")).unwrap();
+    fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+    fs::write(root.path().join("src/broken.rs"), "pub fn broken( {\n").unwrap();
+    fs::write(
+        root.path().join("ignored/scratch.rs"),
+        "pub fn scratch( {\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("config/app.json"),
+        "{\n  \"password\": \"S3cretValue9xAb\"\n}\n",
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn syntax_reparses_unindexed_disk_bytes_and_refuses_with_mcp_metadata() {
+    let root = syntax_fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+
+    let QueryOutput::Syntax(indexed) = query_current(
+        &handle,
+        &QueryRequest::Syntax {
+            path: "src/broken.rs".into(),
+        },
+    ) else {
+        panic!("syntax");
+    };
+    assert_eq!(indexed.authority, ReadAuthority::PublishedGeneration);
+    assert_eq!(indexed.rendered, INDEXED_SYNTAX_GOLDEN);
+
+    let QueryOutput::Syntax(unindexed) = query_current(
+        &handle,
+        &QueryRequest::Syntax {
+            path: "ignored/scratch.rs".into(),
+        },
+    ) else {
+        panic!("syntax");
+    };
+    assert_eq!(unindexed.authority, ReadAuthority::DiskObservation);
+    assert_eq!(unindexed.rendered, UNINDEXED_SYNTAX_GOLDEN);
+    assert!(!unindexed.valid);
+
+    let refused = handle
+        .query(
+            &QueryRequest::Syntax {
+                path: "config/app.json".into(),
+            },
+            QueryLimits::default(),
+        )
+        .unwrap_err();
+    assert_eq!(refused.kind(), QueryRefusalKind::AdmissionUnavailable);
+    let withheld = refused.withheld().expect("withheld findings");
+    assert_eq!(withheld.path, "config/app.json");
+    let lines: Vec<(u32, u32, &str)> = withheld
+        .findings
+        .iter()
+        .map(|finding| {
+            (
+                finding.line_start,
+                finding.line_end,
+                finding.rule_id.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(lines, vec![(2, 2, "secret.context-assignment")]);
     handle.close().unwrap();
 }

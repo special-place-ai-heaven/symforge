@@ -678,6 +678,63 @@ pub fn append_dedup_hint_footer(
     )
 }
 
+pub fn validate_file_syntax_result(path: &str, file: &IndexedFile) -> String {
+    let mut lines = vec![
+        format!("Syntax validation: {path}"),
+        format!("Language: {}", file.language),
+    ];
+
+    match &file.parse_status {
+        crate::live_index::ParseStatus::Parsed => {
+            lines.push("Status: ok".to_string());
+        }
+        crate::live_index::ParseStatus::PartialParse { warning } => {
+            // SF-003: a TypeScript import-type immediately followed by `[]`
+            // (e.g. `import('rxjs').Subscription[]`) is mis-parsed by
+            // tree-sitter-typescript 0.23.2 even though it is valid TS. When the
+            // partial parse is provably caused only by this grammar limitation,
+            // report it as ok with an explanatory note rather than a syntax
+            // error.
+            if crate::parsing::is_expected_typescript_import_type_array_limitation(
+                &file.language,
+                &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
+            ) {
+                lines.push("Status: ok".to_string());
+                lines.push(
+                    "Note: parser limitation (tree-sitter-typescript 0.23.2 mis-parses an \
+                     import-type followed by `[]`; the source is valid TypeScript)"
+                        .to_string(),
+                );
+            } else {
+                lines.push("Status: partial".to_string());
+                if let Some(diagnostic) = &file.parse_diagnostic {
+                    lines.push(format!("Diagnostic: {}", diagnostic.summary()));
+                    if let Some((start, end)) = diagnostic.byte_span {
+                        lines.push(format!("Byte span: {start}..{end}"));
+                    }
+                } else {
+                    lines.push(format!("Diagnostic: {warning}"));
+                }
+            }
+        }
+        crate::live_index::ParseStatus::Failed { error } => {
+            lines.push("Status: failed".to_string());
+            if let Some(diagnostic) = &file.parse_diagnostic {
+                lines.push(format!("Diagnostic: {}", diagnostic.summary()));
+                if let Some((start, end)) = diagnostic.byte_span {
+                    lines.push(format!("Byte span: {start}..{end}"));
+                }
+            } else {
+                lines.push(format!("Diagnostic: {error}"));
+            }
+        }
+    }
+
+    lines.push(format!("Symbols extracted: {}", file.symbols.len()));
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod raw_selection_tests {
     use super::*;

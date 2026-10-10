@@ -181,6 +181,50 @@ fn selected_content_range(
     }
     Ok(())
 }
+/// MCP `validate_file_syntax`'s authoritative disk-parse lane: the file is
+/// unindexed, or its freshen did not publish. The bytes on disk right now are
+/// read through the original-root capability, admitted by the same policy and
+/// classification as every other read (a refusal carries the same withheld
+/// findings), and parsed exactly as MCP parses them.
+pub(super) fn observe_for_syntax(
+    snapshot: &EmbeddedQuerySnapshot,
+    path: &str,
+    budget: &mut Budget,
+) -> Result<IndexedFile, QueryRefusalKind> {
+    refuse_scope(path)?;
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    let language = crate::domain::LanguageId::from_extension(extension)
+        .ok_or(QueryRefusalKind::UnsupportedOption)?;
+    if !snapshot
+        .authority
+        .verify_exact_spelling_expected(snapshot.authority_publication, std::path::Path::new(path))
+        .map_err(authority_refusal)?
+    {
+        return Err(QueryRefusalKind::NotFound);
+    }
+    admit(snapshot, path, None, budget)?;
+    let bytes = snapshot
+        .authority
+        .read_regular_beneath_expected(
+            snapshot.authority_publication,
+            std::path::Path::new(path),
+            crate::knowledge::SECRET_SCAN_MAX_BYTES,
+        )
+        .map_err(authority_refusal)?
+        .ok_or(QueryRefusalKind::NotFound)?;
+    admit(snapshot, path, Some(&bytes), budget)?;
+    let result = crate::parsing::process_file_with_classification(
+        path,
+        &bytes,
+        language,
+        crate::domain::FileClassification::for_code_path(path),
+    );
+    Ok(IndexedFile::from_parse_result(result, bytes))
+}
+
 pub(super) fn page(
     snapshot: &EmbeddedQuerySnapshot,
     request: &SourcePageRequest,

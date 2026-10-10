@@ -14379,6 +14379,69 @@ mod tests {
         assert!(!fresh.contains("before_write"), "{fresh}");
     }
 
+    /// MCP side of the embed syntax golden (`tests/embed_disk_parity.rs`): the
+    /// indexed report, the authoritative disk parse of an unindexed file, and
+    /// the admission refusal with its withheld findings.
+    #[tokio::test]
+    async fn validate_file_syntax_matches_embed_parity_golden() {
+        let repo = init_git_repo();
+        for dir in ["src", "ignored", "config"] {
+            fs::create_dir_all(repo.path().join(dir)).expect("dir");
+        }
+        fs::write(repo.path().join(".gitignore"), "ignored/\n").expect("ignore");
+        fs::write(repo.path().join("src/broken.rs"), "pub fn broken( {\n").expect("src");
+        fs::write(
+            repo.path().join("ignored/scratch.rs"),
+            "pub fn scratch( {\n",
+        )
+        .expect("ignored");
+        fs::write(
+            repo.path().join("config/app.json"),
+            "{\n  \"password\": \"S3cretValue9xAb\"\n}\n",
+        )
+        .expect("secret");
+        let server = embed_parity_server(repo.path());
+        let validate = |path: &str| {
+            let input: super::ValidateFileSyntaxInput =
+                serde_json::from_value(serde_json::json!({ "path": path })).expect("input");
+            let server = &server;
+            async move {
+                crate::protocol::withheld::with_withheld_scope(async {
+                    let text = server.validate_file_syntax(Parameters(input)).await;
+                    (text, crate::protocol::withheld::take_pending_withheld())
+                })
+                .await
+            }
+        };
+        assert_eq!(
+            validate("src/broken.rs").await.0,
+            "Syntax validation: src/broken.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn broken( {` (line 1, column 1)\nByte span: 0..16\nSymbols extracted: 0"
+        );
+        assert_eq!(
+            validate("ignored/scratch.rs").await.0,
+            "Syntax validation: ignored/scratch.rs\nLanguage: Rust\nStatus: partial\nDiagnostic: tree-sitter: syntax error near `pub fn scratch( {` (line 1, column 1)\nByte span: 0..17\nSymbols extracted: 0"
+        );
+        let (refusal, withheld) = validate("config/app.json").await;
+        assert!(
+            refusal.starts_with("Content withheld by admission policy: config/app.json."),
+            "{refusal}"
+        );
+        let withheld = withheld.expect("withheld findings");
+        assert_eq!(withheld.path, "config/app.json");
+        let lines: Vec<(u32, u32, &str)> = withheld
+            .findings
+            .iter()
+            .map(|finding| {
+                (
+                    finding.line_start,
+                    finding.line_end,
+                    finding.rule_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(lines, vec![(2, 2, "secret.context-assignment")]);
+    }
+
     #[tokio::test]
     async fn test_index_folder_reset_deletes_snapshot_scope_and_reports_fresh_status() {
         let _reset_env = EnvVarGuard::set(super::INDEX_FOLDER_RESET_ENV, "1");
