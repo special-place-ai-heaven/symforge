@@ -335,6 +335,26 @@ impl PhysicalRootLease {
         Ok(opened)
     }
 
+    /// An owned second handle to this lease's own opened directory: same
+    /// identity, same revocation, and the same directory object, with no path
+    /// re-resolution in between.
+    #[cfg(feature = "embed")]
+    pub(crate) fn duplicated(&self) -> Result<Self, RootRefusal> {
+        let dir = self
+            .capability()?
+            .try_clone()
+            .map_err(|error| RootRefusal::Unreadable {
+                path: self.root.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            identity: self.identity,
+            root: self.root.clone(),
+            dir: Some(dir),
+            revoked: Arc::clone(&self.revoked),
+        })
+    }
+
     /// Open a child directory through this lease, sharing its revocation.
     pub(crate) fn child_directory(
         &self,

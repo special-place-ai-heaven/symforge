@@ -996,6 +996,7 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         }
         QueryRequest::WhatChanged(input) => super::embed_changes::validate_what_changed(input)?,
         QueryRequest::DiffSymbols(input) => super::embed_changes::validate_diff_symbols(input)?,
+        QueryRequest::DetectImpact(input) => super::embed_detect_impact::validate(input)?,
         QueryRequest::Conventions | QueryRequest::ContextInventory => {}
         QueryRequest::InvestigationSuggest { focus } => {
             if focus
@@ -1392,6 +1393,9 @@ fn project(
         }
         QueryRequest::DiffSymbols(input) => {
             super::embed_changes::diff_symbols(snapshot, input, budget)
+        }
+        QueryRequest::DetectImpact(input) => {
+            super::embed_detect_impact::project(snapshot, input, budget)
         }
         QueryRequest::Conventions => super::embed_guidance::conventions(live, budget),
         QueryRequest::File {

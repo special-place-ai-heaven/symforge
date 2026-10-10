@@ -7,6 +7,7 @@
 //! The original V11 facade remains source-compatible.
 
 pub mod changes;
+pub mod detect_impact;
 pub mod edit;
 pub mod federation;
 pub mod guidance;
@@ -101,6 +102,7 @@ pub enum QueryOperationKind {
     Retrieve,
     WhatChanged,
     DiffSymbols,
+    DetectImpact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -195,6 +197,8 @@ pub enum QueryRequest {
     WhatChanged(changes::WhatChangedRequest),
     /// Repository-wide symbol delta between two refs (MCP `diff_symbols`).
     DiffSymbols(changes::DiffSymbolsRequest),
+    /// Git blast radius over the call graph (MCP `detect_impact`).
+    DetectImpact(detect_impact::DetectImpactRequest),
 }
 
 impl QueryRequest {
@@ -231,6 +235,7 @@ impl QueryRequest {
             Self::Retrieve { .. } => QueryOperationKind::Retrieve,
             Self::WhatChanged(_) => QueryOperationKind::WhatChanged,
             Self::DiffSymbols(_) => QueryOperationKind::DiffSymbols,
+            Self::DetectImpact(_) => QueryOperationKind::DetectImpact,
         }
     }
 }
@@ -439,4 +444,5 @@ pub enum QueryOutput {
     },
     WhatChanged(changes::WhatChangedResult),
     DiffSymbols(changes::DiffSymbolsResult),
+    DetectImpact(detect_impact::DetectImpactResult),
 }

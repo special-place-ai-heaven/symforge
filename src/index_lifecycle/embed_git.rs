@@ -266,7 +266,10 @@ pub(super) fn prepare(
     let source = Arc::new(
         snapshot
             .authority
-            .with_source_anchor_read(|root| root.child_directory(Path::new("."), false))
+            // The anchored root itself, as an owned second handle to the same
+            // opened directory object. `child_directory(".")` resolves no
+            // component and is refused as an escape.
+            .with_source_anchor_read(|root| root.duplicated())
             .map_err(|_| refusal(Refusal::SourceUnavailable))?,
     );
     let source_key = source
@@ -299,8 +302,9 @@ pub(super) fn prepare(
         bytes: 0,
         entries: 0,
     };
-    capture.tree(&git, Path::new(""), Path::new("repo/.git"), false)?;
-    capture.tree(&source, Path::new(""), Path::new("repo"), true)?;
+    // `.` names the leased directory itself; an empty path names nothing.
+    capture.tree(&git, Path::new("."), Path::new("repo/.git"), false)?;
+    capture.tree(&source, Path::new("."), Path::new("repo"), true)?;
     // Neither libgit2 nor the config parser sees source paths. A gitfile,
     // common-dir or object alternate needs a separately admitted graph before
     // it can be rewritten into this owned view.

@@ -791,5 +791,6 @@ fn operation_name(operation: QueryOperationKind) -> &'static str {
         QueryOperationKind::Retrieve => "symforge_retrieve",
         QueryOperationKind::WhatChanged => "what_changed",
         QueryOperationKind::DiffSymbols => "diff_symbols",
+        QueryOperationKind::DetectImpact => "detect_impact",
     }
 }
