@@ -1657,10 +1657,20 @@ impl HostRoom {
                     control,
                 );
             }
-            HostResourceRequest::ToolsCatalog => ("symforge://tools/catalog",
-                HostResourceContent::Catalog(self.catalog())),
-            HostResourceRequest::Glossary => ("symforge://glossary",
-                HostResourceContent::Text("SymForge indexes an admitted source publication. A room's source proof identifies the exact publication examined; query limits and partial/withheld counts describe the returned projection. Checkpoint persists local recovery state. Replay requires the same request hash and verified post-image before a cached mutation result is reusable.".to_owned())),
+            // MCP parity: both resources render the shared static guidance text.
+            // Room rights still gate the typed `HostRequest::Catalog` operations.
+            HostResourceRequest::ToolsCatalog => (
+                "symforge://tools/catalog",
+                HostResourceContent::Text(
+                    crate::embed::lifecycle::guidance::smart_query::render_tool_catalog(),
+                ),
+            ),
+            HostResourceRequest::Glossary => (
+                "symforge://glossary",
+                HostResourceContent::Text(
+                    crate::embed::lifecycle::guidance::smart_query::render_glossary(),
+                ),
+            ),
         };
         Ok(HostResourceReply {
             uri: uri.to_owned(),

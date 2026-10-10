@@ -257,3 +257,55 @@ fn health_report_renders_frecency_section_when_enabled() {
         ],
     );
 }
+
+#[test]
+fn tools_catalog_and_glossary_resources_render_the_mcp_text() {
+    let root = fixture();
+    let room = open_room(root.path());
+    let control = room.control().unwrap();
+    let text = |request: HostResourceRequest| {
+        let HostResponse::Resource(reply) = room
+            .dispatch(&HostRequest::Resource(request), &control)
+            .unwrap()
+        else {
+            panic!("resource response")
+        };
+        let HostResourceContent::Text(text) = reply.content else {
+            panic!("static resources render text")
+        };
+        (reply.uri, text)
+    };
+    let (uri, catalog) = text(HostResourceRequest::ToolsCatalog);
+    assert_eq!(uri, "symforge://tools/catalog");
+    assert!(catalog.starts_with("SymForge tool catalog — grouped by workflow."));
+    assert_in_order(
+        &catalog,
+        &[
+            "\n## orientation — ",
+            "\n## search — ",
+            "\n## dry-run-edits — ",
+            "\n## diagnostics — ",
+            "\nTip: ask `which tool should I use for <topic>?`",
+        ],
+    );
+    let (uri, glossary) = text(HostResourceRequest::Glossary);
+    assert_eq!(uri, "symforge://glossary");
+    assert!(glossary.starts_with("SymForge glossary — surface vocabulary."));
+    assert!(glossary.contains("## Project binding"));
+
+    // Room rights still gate the typed operation catalog.
+    let HostResponse::Catalog(typed) = room.dispatch(&HostRequest::Catalog, &control).unwrap()
+    else {
+        panic!("catalog response")
+    };
+    assert!(typed.edit_operations.is_empty(), "read-only room");
+
+    #[cfg(feature = "server")]
+    {
+        assert_eq!(
+            catalog,
+            symforge::protocol::smart_query::render_tool_catalog()
+        );
+        assert_eq!(glossary, symforge::protocol::smart_query::render_glossary());
+    }
+}
