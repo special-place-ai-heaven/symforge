@@ -667,6 +667,17 @@ pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
     chars.div_ceil(4) as u64
 }
 
+pub fn append_dedup_hint_footer(
+    output: String,
+    kind: &str,
+    age_secs: u64,
+    approx_tokens: u32,
+) -> String {
+    format!(
+        "{output}\n\n[session: same {kind} fetched {age_secs}s ago (~{approx_tokens} est tokens); reuse prior unless content changed]"
+    )
+}
+
 #[cfg(test)]
 mod raw_selection_tests {
     use super::*;
@@ -690,15 +701,4 @@ mod raw_selection_tests {
         assert!(rendered.contains("3: second needle"));
         assert!(!rendered.contains("first needle"));
     }
-}
-
-pub fn append_dedup_hint_footer(
-    output: String,
-    kind: &str,
-    age_secs: u64,
-    approx_tokens: u32,
-) -> String {
-    format!(
-        "{output}\n\n[session: same {kind} fetched {age_secs}s ago (~{approx_tokens} est tokens); reuse prior unless content changed]"
-    )
 }

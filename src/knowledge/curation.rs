@@ -75,10 +75,12 @@ impl CurationStateIo {
     ) -> Result<Option<Self>, String> {
         if let Some((parked, key)) = admitted {
             let base = parked.reopened_matching_stable_key(key).map_err(|_| {
-                "Error: durable_mutation_replay_unavailable; selected state directory changed.".to_string()
+                "Error: durable_mutation_replay_unavailable; selected state directory changed."
+                    .to_string()
             })?;
             let relative = selected.strip_prefix(base.root()).map_err(|_| {
-                "Error: durable_mutation_replay_unavailable; state path escaped admission.".to_string()
+                "Error: durable_mutation_replay_unavailable; state path escaped admission."
+                    .to_string()
             })?;
             if relative.as_os_str().is_empty() {
                 return Ok(Some(Self { root: base }));
@@ -93,7 +95,8 @@ impl CurationStateIo {
                 Err(error) => return Err(durable_state_error(&error)),
             }
             let root = base.child_directory(relative, false).map_err(|_| {
-                "Error: durable_mutation_replay_unavailable; selected state directory changed.".to_string()
+                "Error: durable_mutation_replay_unavailable; selected state directory changed."
+                    .to_string()
             })?;
             return Ok(Some(Self { root }));
         }
@@ -107,15 +110,19 @@ impl CurationStateIo {
         }
     }
 
-    fn open(selected: &Path, admitted: Option<(&PhysicalRootLease, [u8; 16])>) -> Result<Self, String> {
+    fn open(
+        selected: &Path,
+        admitted: Option<(&PhysicalRootLease, [u8; 16])>,
+    ) -> Result<Self, String> {
         let root = if let Some((parked, key)) = admitted {
             (|| {
                 let base = parked.reopened_matching_stable_key(key)?;
-                let relative = selected.strip_prefix(base.root()).map_err(|_| {
-                    RootRefusal::EscapesRoot {
-                        requested: selected.to_path_buf(),
-                    }
-                })?;
+                let relative =
+                    selected
+                        .strip_prefix(base.root())
+                        .map_err(|_| RootRefusal::EscapesRoot {
+                            requested: selected.to_path_buf(),
+                        })?;
                 if relative.as_os_str().is_empty() {
                     Ok(base)
                 } else {
@@ -130,7 +137,10 @@ impl CurationStateIo {
                 .ok_or(RootRefusal::LeaseRevoked)
                 .map(|_| opened)
         }
-        .map_err(|_| "Error: durable_mutation_replay_unavailable; selected state directory changed.".to_string())?;
+        .map_err(|_| {
+            "Error: durable_mutation_replay_unavailable; selected state directory changed."
+                .to_string()
+        })?;
         Ok(Self { root })
     }
 
@@ -143,7 +153,10 @@ impl CurationStateIo {
     fn child(&self, path: &Path, create: bool) -> Result<PhysicalRootLease, String> {
         self.root
             .child_directory(self.relative(path)?, create)
-            .map_err(|_| "Error: durable_mutation_replay_unavailable; state directory is unavailable.".to_string())
+            .map_err(|_| {
+                "Error: durable_mutation_replay_unavailable; state directory is unavailable."
+                    .to_string()
+            })
     }
 
     fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -165,13 +178,9 @@ impl CurationStateIo {
         let parent_lease = self.root.child_directory(parent, true).map_err(|_| {
             "Error: durable_mutation_replay_unavailable; state parent is unavailable.".to_string()
         })?;
-        durable_replace_root_file_beneath(
-            &parent_lease,
-            Path::new(leaf),
-            bytes,
-            prefix,
-            |_, _| Ok::<(), String>(()),
-        )
+        durable_replace_root_file_beneath(&parent_lease, Path::new(leaf), bytes, prefix, |_, _| {
+            Ok::<(), String>(())
+        })
         .map_err(|error| match error {
             DurableReplaceError::Root(_) | DurableReplaceError::ImageMismatch => {
                 "Error: durable_mutation_replay_unavailable; state image could not be committed."
@@ -189,13 +198,23 @@ impl CurationStateIo {
         match dir.symlink_metadata(relative) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
-            Ok(_) => return Err("Error: durable_mutation_replay_unavailable; state replay directory is unsafe.".to_string()),
+            Ok(_) => {
+                return Err(
+                    "Error: durable_mutation_replay_unavailable; state replay directory is unsafe."
+                        .to_string(),
+                );
+            }
             Err(error) => return Err(durable_state_error(&error)),
         }
         let child = self.child(path, false)?;
-        let entries = match child.directory_capability().map_err(|_| {
-            "Error: durable_mutation_replay_unavailable; state replay directory is unavailable.".to_string()
-        })?.read_dir(".") {
+        let entries = match child
+            .directory_capability()
+            .map_err(|_| {
+                "Error: durable_mutation_replay_unavailable; state replay directory is unavailable."
+                    .to_string()
+            })?
+            .read_dir(".")
+        {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(durable_state_error(&error)),
@@ -219,7 +238,10 @@ impl CurationStateIo {
         self.root
             .child_directory(relative.parent().unwrap_or(Path::new(".")), false)
             .and_then(|parent| parent.sync_directory())
-            .map_err(|_| "Error: durable_mutation_replay_unavailable; state removal could not be synced.".to_string())
+            .map_err(|_| {
+                "Error: durable_mutation_replay_unavailable; state removal could not be synced."
+                    .to_string()
+            })
     }
 
     fn lock(&self, path: &Path) -> Result<File, String> {
@@ -230,7 +252,9 @@ impl CurationStateIo {
         })?;
         match dir.symlink_metadata(relative) {
             Ok(metadata) if metadata.is_symlink() || !metadata.is_file() => {
-                return Err("Error: durable_mutation_replay_unavailable; state lock is unsafe.".to_string());
+                return Err(
+                    "Error: durable_mutation_replay_unavailable; state lock is unsafe.".to_string(),
+                );
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -243,9 +267,13 @@ impl CurationStateIo {
             use cap_std::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
         }
-        let file = dir.open_with(relative, &options).map_err(|error| durable_state_error(&error))?;
+        let file = dir
+            .open_with(relative, &options)
+            .map_err(|error| durable_state_error(&error))?;
         if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-            return Err("Error: durable_mutation_replay_unavailable; state lock is unsafe.".to_string());
+            return Err(
+                "Error: durable_mutation_replay_unavailable; state lock is unsafe.".to_string(),
+            );
         }
         let file = file.into_std();
         file.lock().map_err(|error| durable_state_error(&error))?;
@@ -287,11 +315,11 @@ impl CurationStateIo {
 
     fn probe(&self, directory: &Path) -> Result<(), String> {
         use cap_std::fs::OpenOptions as CapOpenOptions;
-        static NEXT_PROBE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
+        static NEXT_PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let parent = self.child(directory, true)?;
         let dir = parent.directory_capability().map_err(|_| {
-            "Error: durable_mutation_replay_unavailable; state probe root is unavailable.".to_string()
+            "Error: durable_mutation_replay_unavailable; state probe root is unavailable."
+                .to_string()
         })?;
         let mut options = CapOpenOptions::new();
         options.write(true).create_new(true);
@@ -308,15 +336,25 @@ impl CurationStateIo {
                     Err(error) => Some(Err(durable_state_error(&error))),
                 }
             })
-            .ok_or_else(|| "Error: durable_mutation_replay_unavailable; no state probe name is free.".to_string())??;
+            .ok_or_else(|| {
+                "Error: durable_mutation_replay_unavailable; no state probe name is free."
+                    .to_string()
+            })??;
         file.write_all(b"before")
             .and_then(|()| file.sync_all())
             .map_err(|error| durable_state_error(&error))?;
         drop(file);
         let result = (|| {
-            self.write(&directory.join(&name), b"after", ".symforge-curation-probe-")?;
+            self.write(
+                &directory.join(&name),
+                b"after",
+                ".symforge-curation-probe-",
+            )?;
             if self.read(&directory.join(&name))?.as_deref() != Some(b"after".as_slice()) {
-                return Err("Error: durable_mutation_replay_unavailable; state probe readback failed.".to_string());
+                return Err(
+                    "Error: durable_mutation_replay_unavailable; state probe readback failed."
+                        .to_string(),
+                );
             }
             Ok(())
         })();
@@ -478,6 +516,7 @@ impl KnowledgeCurationCoordinator {
 
     /// Embed uses the same coordinator, replay, and policy writer as MCP, but
     /// pins its host-authorized mutation to the captured source publication.
+    #[cfg(feature = "embed")]
     pub(crate) fn execute_guarded(
         &self,
         index: &SharedIndex,
@@ -529,6 +568,7 @@ impl KnowledgeCurationCoordinator {
 
     /// Read-only Completed replay for an old serialized Embed guard. It never
     /// reserves a new key or weakens the publication check for a fresh write.
+    #[cfg(feature = "embed")]
     pub(crate) fn replay_completed_guarded(
         &self,
         index: &SharedIndex,
@@ -556,9 +596,10 @@ impl KnowledgeCurationCoordinator {
         )
         .map_err(unavailable)?;
         let curation_dir = state_dir.join(CURATION_STATE_DIR);
-        let state_io = CurationStateIo::open_existing(&state_dir, Some(state_anchor))?.ok_or_else(|| {
-            "Error: stale_publication; no completed curation replay is available.".to_string()
-        })?;
+        let state_io =
+            CurationStateIo::open_existing(&state_dir, Some(state_anchor))?.ok_or_else(|| {
+                "Error: stale_publication; no completed curation replay is available.".to_string()
+            })?;
         let key = input
             .idempotency_key
             .as_deref()
@@ -574,7 +615,14 @@ impl KnowledgeCurationCoordinator {
             let record = state_io.read_record(&record_path)?.ok_or_else(|| {
                 "Error: stale_publication; no completed curation replay is available.".to_string()
             })?;
-            verify_binding(&state_io, repo_root, &curation_dir, &record.binding, &plan, false)?;
+            verify_binding(
+                &state_io,
+                repo_root,
+                &curation_dir,
+                &record.binding,
+                &plan,
+                false,
+            )?;
             let request_hash = canonical_request_hash(input);
             if record.request_hash != request_hash {
                 return Err(
@@ -589,7 +637,12 @@ impl KnowledgeCurationCoordinator {
             if cancel.load(Ordering::Acquire) {
                 return Err("Error: curation_cancelled; no replay was acknowledged.".to_string());
             }
-            render_verified_completed_replay(repo_root, Some(source_authority), receipt, &request_hash)
+            render_verified_completed_replay(
+                repo_root,
+                Some(source_authority),
+                receipt,
+                &request_hash,
+            )
         })();
         let _ = unlock_file(&lock_file);
         result
@@ -756,7 +809,12 @@ impl KnowledgeCurationCoordinator {
             return Ok(());
         };
         if state_io
-            .list(&selected_state.as_path().join(CURATION_STATE_DIR).join(REPLAY_DIR))?
+            .list(
+                &selected_state
+                    .as_path()
+                    .join(CURATION_STATE_DIR)
+                    .join(REPLAY_DIR),
+            )?
             .is_empty()
         {
             tracing::info!("curation/no replay dir — early return (probed)");
@@ -857,6 +915,7 @@ impl KnowledgeCurationCoordinator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         index: &SharedIndex,
@@ -904,7 +963,16 @@ impl KnowledgeCurationCoordinator {
             // Pre-lock fast path is strictly read-only: any binding outcome
             // that would quarantine the record or append catalog lineage is
             // deferred to the locked path below.
-            if verify_binding(&state_io, repo_root, &curation_dir, &record.binding, &plan, false).is_ok() {
+            if verify_binding(
+                &state_io,
+                repo_root,
+                &curation_dir,
+                &record.binding,
+                &plan,
+                false,
+            )
+            .is_ok()
+            {
                 if record.request_hash != request_hash {
                     return "Error: idempotency_conflict; the key is already bound to a different canonical request."
                         .to_string();
@@ -943,19 +1011,25 @@ impl KnowledgeCurationCoordinator {
             Err(error) => return error,
         };
         #[cfg(test)]
-        if let Some(moved_state_root) = self.state_swap_before_record_write.lock().take() {
-            if let Err(error) = fs::rename(&state_dir, moved_state_root)
-                .and_then(|()| fs::create_dir(&state_dir))
-            {
-                return durable_state_error(&error);
-            }
+        if let Some(moved_state_root) = self.state_swap_before_record_write.lock().take()
+            && let Err(error) =
+                fs::rename(&state_dir, moved_state_root).and_then(|()| fs::create_dir(&state_dir))
+        {
+            return durable_state_error(&error);
         }
 
         let output = (|| {
             let mut generation = index.published_source_set().current_generation();
             let mut plan = curation_plan_current(&generation)?;
             if let Some(record) = state_io.read_record(&record_path)? {
-                verify_record_binding(&state_io, repo_root, &curation_dir, &record_path, &record, &plan)?;
+                verify_record_binding(
+                    &state_io,
+                    repo_root,
+                    &curation_dir,
+                    &record_path,
+                    &record,
+                    &plan,
+                )?;
             }
             self.recover_pending_records(
                 &state_io,
@@ -970,7 +1044,14 @@ impl KnowledgeCurationCoordinator {
             generation = index.published_source_set().current_generation();
             plan = curation_plan_current(&generation)?;
             let mut record = if let Some(record) = state_io.read_record(&record_path)? {
-                verify_record_binding(&state_io, repo_root, &curation_dir, &record_path, &record, &plan)?;
+                verify_record_binding(
+                    &state_io,
+                    repo_root,
+                    &curation_dir,
+                    &record_path,
+                    &record,
+                    &plan,
+                )?;
                 if record.request_hash != request_hash {
                     return Ok("Error: idempotency_conflict; the key is already bound to a different canonical request."
                         .to_string());
@@ -1061,9 +1142,9 @@ impl KnowledgeCurationCoordinator {
             // protocol failure drops the authority through the re-scout
             // recovery lane (scope-dirty full baseline); the replay record
             // stays `PendingWrite` for the durable recovery to replay.
-            let authority = source_authority.cloned().unwrap_or_else(||
+            let authority = source_authority.cloned().unwrap_or_else(|| {
                 crate::live_index::index_lifecycle::activation::project_source_authority(repo_root)
-            );
+            });
             if cancel.is_some_and(|signal| signal.load(Ordering::Acquire)) {
                 return Err(
                     "Error: curation_cancelled; pending policy write requires recovery."
@@ -1120,6 +1201,7 @@ impl KnowledgeCurationCoordinator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_existing_record(
         &self,
         state_io: &CurationStateIo,
@@ -1137,9 +1219,14 @@ impl KnowledgeCurationCoordinator {
             Ok(plan) => plan,
             Err(error) => return error,
         };
-        if let Err(error) =
-            verify_record_binding(state_io, repo_root, curation_dir, record_path, &record, &plan)
-        {
+        if let Err(error) = verify_record_binding(
+            state_io,
+            repo_root,
+            curation_dir,
+            record_path,
+            &record,
+            &plan,
+        ) {
             return error;
         }
         if record.request_hash != request_hash {
@@ -1148,7 +1235,12 @@ impl KnowledgeCurationCoordinator {
         }
         match &record.state {
             ReplayState::Succeeded { receipt } => {
-                match render_verified_completed_replay(repo_root, source_authority, receipt, request_hash) {
+                match render_verified_completed_replay(
+                    repo_root,
+                    source_authority,
+                    receipt,
+                    request_hash,
+                ) {
                     Ok(rendered) => rendered,
                     Err(error) => error,
                 }
@@ -1198,9 +1290,11 @@ impl KnowledgeCurationCoordinator {
                     // so it takes the same delegated permit lane; a failed
                     // protocol drops the authority through the re-scout
                     // recovery lane and leaves the record `PendingWrite`.
-                    let authority = source_authority.cloned().unwrap_or_else(||
-                        crate::live_index::index_lifecycle::activation::project_source_authority(repo_root)
-                    );
+                    let authority = source_authority.cloned().unwrap_or_else(|| {
+                        crate::live_index::index_lifecycle::activation::project_source_authority(
+                            repo_root,
+                        )
+                    });
                     if cancel.is_some_and(|signal| signal.load(Ordering::Acquire)) {
                         return "Error: curation_cancelled; pending policy write requires recovery."
                             .to_string();
@@ -1272,6 +1366,7 @@ impl KnowledgeCurationCoordinator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recover_pending_records(
         &self,
         state_io: &CurationStateIo,
@@ -1332,7 +1427,8 @@ impl KnowledgeCurationCoordinator {
         curation_dir: &Path,
         state_io: &CurationStateIo,
     ) -> Result<(), CapabilityUnavailableReason> {
-        state_io.child(curation_dir, true)
+        state_io
+            .child(curation_dir, true)
             .map_err(|_| CapabilityUnavailableReason::DurableMutationReplayUnavailable)?;
         let mut directories = vec![repo_root.to_path_buf()];
         if curation_dir != repo_root {
@@ -1351,16 +1447,22 @@ impl KnowledgeCurationCoordinator {
                 Err(CapabilityUnavailableReason::AtomicDurabilityUnavailable)
             } else {
                 if directory == curation_dir {
-                    state_io.probe(curation_dir).map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
+                    state_io
+                        .probe(curation_dir)
+                        .map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
                 } else {
-                    durability_probe(&canonical).map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
+                    durability_probe(&canonical)
+                        .map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
                 }
             };
             #[cfg(not(test))]
             let result = if directory == curation_dir {
-                state_io.probe(curation_dir).map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
+                state_io
+                    .probe(curation_dir)
+                    .map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
             } else {
-                durability_probe(&canonical).map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
+                durability_probe(&canonical)
+                    .map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable)
             };
             self.probe_cache.lock().insert(canonical, result);
             result?;
@@ -1381,7 +1483,8 @@ impl KnowledgeCurationCoordinator {
                     #[cfg(test)]
                     if let Some(corrupt) = self.temp_corruption.lock().take() {
                         use std::io::{Seek as _, SeekFrom};
-                        file.set_len(0).map_err(|error| durable_state_error(&error))?;
+                        file.set_len(0)
+                            .map_err(|error| durable_state_error(&error))?;
                         file.seek(SeekFrom::Start(0))
                             .map_err(|error| durable_state_error(&error))?;
                         file.write_all(&corrupt)
@@ -2391,7 +2494,14 @@ fn verify_record_binding(
     record: &ReplayRecord,
     plan: &CurationReviewPlan,
 ) -> Result<(), String> {
-    if let Err(foreign) = verify_binding(state_io, repo_root, curation_dir, &record.binding, plan, true) {
+    if let Err(foreign) = verify_binding(
+        state_io,
+        repo_root,
+        curation_dir,
+        &record.binding,
+        plan,
+        true,
+    ) {
         state_io.quarantine_record(curation_dir, record_path, record)?;
         return Err(foreign);
     }
@@ -2427,9 +2537,10 @@ fn verify_or_append_lineage(
         return Ok(());
     }
     let lineage_path = curation_dir.join("catalog-lineage.json");
-    let mut edges = if let Some(bytes) = state_io.read(&lineage_path).map_err(|_| {
-        "Error: foreign_source_conflict; catalog lineage is unreadable.".to_string()
-    })? {
+    let mut edges = if let Some(bytes) = state_io
+        .read(&lineage_path)
+        .map_err(|_| "Error: foreign_source_conflict; catalog lineage is unreadable.".to_string())?
+    {
         serde_json::from_slice::<Vec<CatalogLineageEdge>>(&bytes).map_err(|_| {
             "Error: foreign_source_conflict; catalog lineage is malformed.".to_string()
         })?
@@ -2535,7 +2646,9 @@ fn read_policy_bytes_bound(
     authority
         .read_regular_beneath_anchor(Path::new(POLICY_FILE), MAX_POLICY_BYTES)
         .map(|bytes| bytes.unwrap_or_default())
-        .map_err(|_| "Error: policy_authority_unavailable; admitted policy could not be read.".to_string())
+        .map_err(|_| {
+            "Error: policy_authority_unavailable; admitted policy could not be read.".to_string()
+        })
 }
 
 /// A durable success is replayable only while the actual policy postimage is
@@ -2556,8 +2669,11 @@ fn render_verified_completed_replay(
         if authority.admitted_root() != repo_root {
             return Err("Error: stale_replay_image; source binding changed.".to_string());
         }
-        authority.read_regular_beneath_anchor(Path::new(POLICY_FILE), MAX_POLICY_BYTES)
-            .map_err(|_| "Error: stale_replay_image; admitted policy post-image is unavailable.".to_string())?
+        authority
+            .read_regular_beneath_anchor(Path::new(POLICY_FILE), MAX_POLICY_BYTES)
+            .map_err(|_| {
+                "Error: stale_replay_image; admitted policy post-image is unavailable.".to_string()
+            })?
     } else {
         crate::live_index::index_lifecycle::physical_root::read_regular_beneath_root(
             repo_root,
@@ -3267,7 +3383,10 @@ mod tests {
 
         let replay = fixture.execute(&coordinator);
         assert!(replay.contains("foreign_source_conflict"), "{replay}");
-        assert_eq!(fs::read(policy_path).expect("unchanged policy"), original_policy);
+        assert_eq!(
+            fs::read(policy_path).expect("unchanged policy"),
+            original_policy
+        );
     }
 
     #[test]

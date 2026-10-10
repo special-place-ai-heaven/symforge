@@ -123,7 +123,9 @@ fn query_sources_using(
         QueryRequest::SearchKnowledge(input) => Some((&mut input.project, &mut input.projects)),
         QueryRequest::ReferenceSearch(input) => Some((&mut input.project, &mut input.projects)),
         QueryRequest::SymbolRead(input) => Some((&mut input.project, &mut single_source_projects)),
-        QueryRequest::SymbolContext(input) => Some((&mut input.project, &mut single_source_projects)),
+        QueryRequest::SymbolContext(input) => {
+            Some((&mut input.project, &mut single_source_projects))
+        }
         QueryRequest::RepoMap(input) => Some((&mut input.project, &mut single_source_projects)),
         QueryRequest::FileContext(input) => Some((&mut input.project, &mut single_source_projects)),
         QueryRequest::DependentSearch(input) => {

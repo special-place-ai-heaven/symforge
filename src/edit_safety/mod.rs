@@ -1,5 +1,6 @@
 pub mod atomic_write;
 pub(crate) mod batch_commit;
+#[cfg(feature = "embed")]
 pub(crate) mod preview;
 pub(crate) mod rename;
 pub(crate) mod secret_remediation;

@@ -339,14 +339,6 @@ fn build_admin_instructions(project_name: &str, dashboard_url: Option<&str>) -> 
     crate::prompt_engine::build_admin_instructions(project_name, dashboard_url)
 }
 
-/// Shared surface-mapping preamble for the six tool-driven prompt bodies. The
-/// step tool names below are the full-surface spellings, directly callable on
-/// the default full surface. On the opt-in compact surface
-/// (`SYMFORGE_SURFACE=compact`) the agent has only
-/// `symforge`/`symforge_edit`/`status`, so the mapping is stated once here
-/// instead of dual-spelling every step. `build_admin_instructions` is excluded:
-/// it drives the `symforge admin` CLI verb, not the MCP tool surface.
-
 fn build_code_review_instructions(project_name: &str, input: &CodeReviewPromptInput) -> String {
     crate::prompt_engine::build_code_review_instructions(
         project_name,

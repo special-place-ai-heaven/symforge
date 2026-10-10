@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use crate::knowledge::secret_dismissals::{
-    self, DISMISSAL_STORE_MAX_BYTES, DISMISSAL_STORE_REL,
-};
+use crate::knowledge::secret_dismissals::{self, DISMISSAL_STORE_MAX_BYTES, DISMISSAL_STORE_REL};
 use crate::knowledge::secret_remediation::{self, SelectedFile, SelectionRefusal};
 
 use super::batch_commit::StagedImage;
@@ -26,6 +24,7 @@ pub(crate) enum EncryptError {
     InvalidFormat,
     Unavailable,
     ResourceLimit,
+    #[cfg(feature = "embed")]
     Cancelled,
     DeadlineExceeded,
     SourceUnavailable,
@@ -162,7 +161,10 @@ pub(crate) fn stage_externalize(
             if value.contains('\r') || value.contains('\n') {
                 return Err(StageError::InvalidRequest);
             }
-            if let Some(existing) = env.lines().find(|entry| entry.starts_with(&format!("{key}="))) {
+            if let Some(existing) = env
+                .lines()
+                .find(|entry| entry.starts_with(&format!("{key}=")))
+            {
                 if existing.split_once('=').map(|(_, current)| current) != Some(value) {
                     return Err(StageError::WriteConflict);
                 }
@@ -187,9 +189,11 @@ pub(crate) fn stage_externalize(
         ignore.push_str(".env\n");
     }
     let mut images = vec![image(root, ".env", original_env, env.into_bytes(), true)];
-    images.extend(plans.into_iter().map(|plan| {
-        image(root, &plan.path, Some(plan.original), plan.rewritten, false)
-    }));
+    images.extend(
+        plans
+            .into_iter()
+            .map(|plan| image(root, &plan.path, Some(plan.original), plan.rewritten, false)),
+    );
     images.push(image(
         root,
         ".gitignore",
@@ -207,7 +211,10 @@ pub(crate) fn stage_dismiss(
 ) -> Result<Vec<StagedImage>, StageError> {
     let records = secret_remediation::plan_dismiss(selected).map_err(StageError::Selection)?;
     let original = read(DISMISSAL_STORE_REL)?;
-    if original.as_ref().is_some_and(|bytes| bytes.len() as u64 > DISMISSAL_STORE_MAX_BYTES) {
+    if original
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() as u64 > DISMISSAL_STORE_MAX_BYTES)
+    {
         return Err(StageError::ResourceLimit);
     }
     let mut merged = match original.as_deref() {

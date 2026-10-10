@@ -4091,7 +4091,6 @@ mod tests {
         assert!(!is_binary_content(content));
     }
 
-
     #[test]
     fn scout_utf8_sample_boundary_uses_declared_file_size() {
         let sniff = crate::domain::index::BINARY_SNIFF_BYTES;
@@ -4099,15 +4098,24 @@ mod tests {
         let sample = &bytes[..sniff];
         assert!(std::str::from_utf8(sample).is_err());
         assert_eq!(
-            classify_admission(std::path::Path::new("large.rs"), bytes.len() as u64, Some(sample)).tier,
+            classify_admission(
+                std::path::Path::new("large.rs"),
+                bytes.len() as u64,
+                Some(sample)
+            )
+            .tier,
             AdmissionTier::Normal,
         );
         assert_eq!(
-            classify_admission(std::path::Path::new("incomplete.rs"), sample.len() as u64, Some(sample)).tier,
+            classify_admission(
+                std::path::Path::new("incomplete.rs"),
+                sample.len() as u64,
+                Some(sample)
+            )
+            .tier,
             AdmissionTier::MetadataOnly,
         );
     }
-
 
     // ── classify_admission tests ──
 

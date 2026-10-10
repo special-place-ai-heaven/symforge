@@ -124,11 +124,16 @@ fn ask_executes_all_shared_routes_under_one_source_and_one_outer_session_operati
         panic!("inventory")
     };
     assert!(
-        inventory.fetched_symbols.iter().any(|symbol| symbol.name == "selected_task"),
+        inventory
+            .fetched_symbols
+            .iter()
+            .any(|symbol| symbol.name == "selected_task"),
         "Ask records context actually returned by its routed query"
     );
-    assert!(serde_json::from_value::<AskRequest>(
-        serde_json::json!({"query":"what changed","ambient_projects":true})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<AskRequest>(
+            serde_json::json!({"query":"what changed","ambient_projects":true})
+        )
+        .is_err()
+    );
 }

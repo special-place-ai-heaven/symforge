@@ -612,7 +612,10 @@ impl EmbeddedBinding {
         }
         self.set_phase(super::public_api::SourceRuntimePhase::Stopped);
         #[cfg(feature = "embed")]
-        self.git_view.lock().expect("embedded Git view mutex").take();
+        self.git_view
+            .lock()
+            .expect("embedded Git view mutex")
+            .take();
     }
 
     fn wait_refresh_visibility_or_stop(&self) -> bool {
@@ -1282,26 +1285,37 @@ impl EmbeddedSourceHandle {
         crate::embed::parity::source_options::GitPreparationClaim,
         crate::embed::parity::source_options::GitPreparationRefusal,
     > {
-        use crate::embed::parity::source_options::{GitPreparationRefusal, GitPreparationRefusalKind};
+        use crate::embed::parity::source_options::{
+            GitPreparationRefusal, GitPreparationRefusalKind,
+        };
         let unavailable = || GitPreparationRefusal {
             kind: GitPreparationRefusalKind::SourceUnavailable,
         };
-        let snapshot = self.capture_query_snapshot(b"symforge.embed.git-preparation.v1")
+        let snapshot = self
+            .capture_query_snapshot(b"symforge.embed.git-preparation.v1")
             .map_err(|_| unavailable())?;
         let binding = self.binding.as_ref().ok_or_else(unavailable)?;
         let mut current = binding.git_view.lock().expect("embedded Git view mutex");
-        let (prepared, claim) = super::embed_git::prepare(&snapshot, options, control, current.as_ref())?;
-        let final_snapshot = self.capture_query_snapshot(b"symforge.embed.git-preparation.v1")
+        let (prepared, claim) =
+            super::embed_git::prepare(&snapshot, options, control, current.as_ref())?;
+        let final_snapshot = self
+            .capture_query_snapshot(b"symforge.embed.git-preparation.v1")
             .map_err(|_| unavailable())?;
         if final_snapshot.serving_publication_identity != snapshot.serving_publication_identity
             || binding.shutdown_started.load(Ordering::Acquire)
         {
             return Err(unavailable());
         }
-        control.check().map_err(|stop| GitPreparationRefusal { kind: match stop {
-            crate::embed::parity::host::OperationStop::Cancelled => GitPreparationRefusalKind::Cancelled,
-            crate::embed::parity::host::OperationStop::DeadlineExceeded => GitPreparationRefusalKind::DeadlineExceeded,
-        }})?;
+        control.check().map_err(|stop| GitPreparationRefusal {
+            kind: match stop {
+                crate::embed::parity::host::OperationStop::Cancelled => {
+                    GitPreparationRefusalKind::Cancelled
+                }
+                crate::embed::parity::host::OperationStop::DeadlineExceeded => {
+                    GitPreparationRefusalKind::DeadlineExceeded
+                }
+            },
+        })?;
         *current = Some(prepared);
         Ok(claim)
     }

@@ -336,7 +336,6 @@ pub fn repo_outline_view(view: &RepoOutlineView, project_name: &str) -> String {
     lines.join("\n")
 }
 
-
 pub fn build_with_budget(items: &[String], max_bytes: u64) -> (String, usize) {
     if max_bytes == 0 || items.is_empty() {
         return (items.join("\n"), 0);
@@ -386,7 +385,6 @@ fn budget_truncation_suffix(max_bytes: u64, remaining: usize) -> String {
         "\n{CANONICAL_TRUNCATION_MARKER} Truncated at ~{max_tokens} tokens. {remaining} additional output line(s) not shown."
     )
 }
-
 
 pub(crate) fn is_intra_workspace_path(path: &str) -> bool {
     if path.contains(':') || path.starts_with('/') || path.starts_with('\\') {
@@ -611,7 +609,6 @@ pub(crate) fn repo_map_text_for_generation(
     text
 }
 
-
 #[derive(Clone, Copy)]
 pub(crate) enum ContextSourceAuthority {
     DiskRefreshed,
@@ -739,7 +736,6 @@ pub(crate) fn append_parse_status_lines(
         }
     }
 }
-
 
 pub(crate) struct OutlineProjectionParams {
     pub path: String,
@@ -975,7 +971,7 @@ pub(crate) fn outline_text_for_generation(
     let max_bytes = match params.max_tokens {
         Some(n) => n * 4,
         None if include_savings_footer => 200 * 4, // hook path: compact
-        None => 0,                                         // tool path: unlimited (0 = no cap)
+        None => 0,                                 // tool path: unlimited (0 = no cap)
     };
     let (body_text, remaining) = build_with_budget(&body_lines, max_bytes);
     let completeness = if remaining > 0 || budget_omissions {
@@ -1010,8 +1006,10 @@ pub(crate) fn outline_text_for_generation(
     Some((text, file_bytes, output_bytes))
 }
 
-
-use super::file_read::{SMALL_FILE_CHAR_THRESHOLD, COMPETENT_READ_WINDOW_LINES, competent_manual_baseline_chars, estimate_tokens_from_chars};
+use super::file_read::{
+    COMPETENT_READ_WINDOW_LINES, SMALL_FILE_CHAR_THRESHOLD, competent_manual_baseline_chars,
+    estimate_tokens_from_chars,
+};
 
 pub const SMALL_FILE_LINE_THRESHOLD: usize = 50;
 
@@ -1064,7 +1062,6 @@ pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String
     }
     format!("\n\n{}", parts.join("; "))
 }
-
 
 pub fn collapse_large_test_modules(
     text: String,
@@ -1150,7 +1147,6 @@ fn leading_space_count(line: &str) -> usize {
     line.bytes().take_while(|byte| *byte == b' ').count()
 }
 
-
 pub(crate) fn withheld_listing(
     unverified: &std::collections::BTreeMap<String, String>,
     scope: Option<&str>,
@@ -1195,4 +1191,3 @@ pub fn withheld_not_searched_note(
          A successful re-read releases each one, and index_folder rebuilds the project from source."
     ))
 }
-

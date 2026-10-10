@@ -38,6 +38,7 @@ pub(crate) struct ExploreResult {
     pub enriched_imports: Vec<String>,
     pub depth: u32,
     pub noise_hidden: usize,
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))] // read only by embed_* consumers
     pub overflow_count: usize,
 }
 
@@ -458,7 +459,7 @@ pub(crate) fn explore(
         let remainder = compute_remainder_terms(&request.query, key);
         let mut sym_q: Vec<String> = c.symbol_queries.iter().map(|s| s.to_string()).collect();
         // Convention-aware enrichment: add project-specific imports related to the concept.
-        let project_imports = super::conventions::extract_top_import_roots(&guard, 100);
+        let project_imports = super::conventions::extract_top_import_roots(guard, 100);
         let enrichment = super::explore::enrich_concept_with_imports(c, &project_imports);
         enriched_imports = enrichment;
         sym_q.extend(enriched_imports.iter().cloned());
@@ -585,7 +586,7 @@ pub(crate) fn explore(
             return Err(ExploreError::Stopped);
         }
         let term_key = sq.to_ascii_lowercase();
-        let result = search::search_symbols(&guard, sq, None, limit * 3);
+        let result = search::search_symbols(guard, sq, None, limit * 3);
         let is_remainder_term = remainder_term_keys.contains(&term_key);
         let mut seen_paths = HashSet::new();
         for hit in &result.hits {
@@ -678,7 +679,7 @@ pub(crate) fn explore(
         if let Some(ref lang) = lang_filter {
             options.language_filter = Some(*lang);
         }
-        let result = search::search_text_with_options(&guard, Some(tq), None, false, &options);
+        let result = search::search_text_with_options(guard, Some(tq), None, false, &options);
         if let Ok(r) = result {
             let term_key = tq.to_ascii_lowercase();
             for file in &r.files {
@@ -718,7 +719,7 @@ pub(crate) fn explore(
     }
 
     let derived_cluster = if fallback_mode {
-        derive_explore_cluster(&guard, &symbol_queries, &file_signals, limit)
+        derive_explore_cluster(guard, &symbol_queries, &file_signals, limit)
     } else {
         None
     };
@@ -733,7 +734,7 @@ pub(crate) fn explore(
                 .iter()
                 .any(|existing| existing.eq_ignore_ascii_case(derived_query))
             {
-                let result = search::search_symbols(&guard, derived_query, None, limit * 2);
+                let result = search::search_symbols(guard, derived_query, None, limit * 2);
                 let mut seen_paths = HashSet::new();
                 for hit in &result.hits {
                     let entry = (hit.name.clone(), hit.kind.clone(), hit.path.clone());
@@ -759,7 +760,7 @@ pub(crate) fn explore(
             }
 
             if let Ok(result) =
-                search::search_text_with_options(&guard, Some(derived_query), None, false, &options)
+                search::search_text_with_options(guard, Some(derived_query), None, false, &options)
             {
                 for file in &result.files {
                     if !file.matches.is_empty() {

@@ -290,9 +290,8 @@ pub fn explore_result_view(input: ExploreResultViewInput<'_>) -> String {
     lines.join("\n")
 }
 
-
-use crate::live_index::{search, SearchFilesResolveView, SearchFilesTier, SearchFilesView};
 use super::source::is_noise_line;
+use crate::live_index::{SearchFilesResolveView, SearchFilesTier, SearchFilesView, search};
 
 pub fn search_symbols_result_view(result: &search::SymbolSearchResult, query: &str) -> String {
     if result.hits.is_empty() {
@@ -346,7 +345,6 @@ pub fn search_symbols_result_view(result: &search::SymbolSearchResult, query: &s
 
     lines.join("\n")
 }
-
 
 /// Context for building context-aware suggestions on a zero-hit search.
 ///
@@ -714,7 +712,6 @@ pub fn search_text_result_view(
     )
 }
 
-
 pub fn search_files_resolve_result_view(view: &SearchFilesResolveView) -> String {
     match view {
         SearchFilesResolveView::EmptyHint => "Path hint must not be empty.".to_string(),
@@ -746,7 +743,6 @@ pub fn search_files_resolve_result_view(view: &SearchFilesResolveView) -> String
         }
     }
 }
-
 
 pub fn search_files_result_view(view: &SearchFilesView) -> String {
     match view {
@@ -819,4 +815,3 @@ pub fn search_files_result_view(view: &SearchFilesView) -> String {
         }
     }
 }
-

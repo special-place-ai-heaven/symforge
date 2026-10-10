@@ -459,18 +459,28 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("docs")).unwrap();
         fs::create_dir(root.join("src")).unwrap();
-        fs::write(root.join("docs/current.md"), "# Current behavior\nThe source is byte exact.\n").unwrap();
+        fs::write(
+            root.join("docs/current.md"),
+            "# Current behavior\nThe source is byte exact.\n",
+        )
+        .unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn exact() -> bool { true }\n").unwrap();
         {
             let git = git2::Repository::init(&root).unwrap();
             let mut git_index = git.index().unwrap();
-            git_index.add_path(std::path::Path::new("docs/current.md")).unwrap();
-            git_index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+            git_index
+                .add_path(std::path::Path::new("docs/current.md"))
+                .unwrap();
+            git_index
+                .add_path(std::path::Path::new("src/lib.rs"))
+                .unwrap();
             git_index.write().unwrap();
             let tree_oid = git_index.write_tree().unwrap();
             let tree = git.find_tree(tree_oid).unwrap();
-            let signature = git2::Signature::now("SymForge fixture", "fixture@example.invalid").unwrap();
-            git.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[]).unwrap();
+            let signature =
+                git2::Signature::now("SymForge fixture", "fixture@example.invalid").unwrap();
+            git.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+                .unwrap();
         }
         let wire_path = outer.path().join("curation-request.json");
         let child = crate::process_util::hidden_command(std::env::current_exe().unwrap())
@@ -482,12 +492,18 @@ mod tests {
             .status()
             .unwrap();
         assert!(child.success(), "initial process did not complete curation");
-        let request: WireKnowledgeRequest = serde_json::from_slice(&fs::read(&wire_path).unwrap()).unwrap();
+        let request: WireKnowledgeRequest =
+            serde_json::from_slice(&fs::read(&wire_path).unwrap()).unwrap();
         let displaced = outer.path().join("original-source");
         fs::rename(&root, &displaced).unwrap();
         copy_tree(&displaced, &root);
-        fs::write(root.join(".git"), format!("gitdir: {}\n", displaced.join(".git").display())).unwrap();
-        let repository = git2::Repository::open(&root).expect("replacement reuses the original gitdir");
+        fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", displaced.join(".git").display()),
+        )
+        .unwrap();
+        let repository =
+            git2::Repository::open(&root).expect("replacement reuses the original gitdir");
         assert_eq!(
             fs::canonicalize(repository.path()).unwrap(),
             fs::canonicalize(displaced.join(".git")).unwrap()
@@ -499,7 +515,10 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         while handle.runtime_view().phase != SourceRuntimePhase::Current {
-            assert!(Instant::now() < deadline, "replacement source did not publish");
+            assert!(
+                Instant::now() < deadline,
+                "replacement source did not publish"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         let authority = EditApplyAuthority::for_source_root(
@@ -508,9 +527,15 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        let result = handle.apply_wire_knowledge(&request, &authority, "fixture-knowledge-process-op");
+        let result =
+            handle.apply_wire_knowledge(&request, &authority, "fixture-knowledge-process-op");
         assert!(
-            matches!(result, Err(WireKnowledgeError::Curation(KnowledgeCurationError::ReplayConflict))),
+            matches!(
+                result,
+                Err(WireKnowledgeError::Curation(
+                    KnowledgeCurationError::ReplayConflict
+                ))
+            ),
             "copied curation state was accepted for a different physical root"
         );
         handle.close().unwrap();

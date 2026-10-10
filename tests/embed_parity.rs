@@ -942,9 +942,14 @@ fn parity_explore_supports_estimate_and_token_capped_retrieval() {
     request.depth = 2;
     request.estimate = Some(true);
     let estimate = handle
-        .query(&QueryRequest::Explore(request.clone()), QueryLimits::default())
+        .query(
+            &QueryRequest::Explore(request.clone()),
+            QueryLimits::default(),
+        )
         .unwrap();
-    assert!(matches!(estimate.value(), QueryOutput::SearchEstimate(value) if value.approximate_tokens == 1_500));
+    assert!(
+        matches!(estimate.value(), QueryOutput::SearchEstimate(value) if value.approximate_tokens == 1_500)
+    );
 
     request.estimate = None;
     request.max_tokens = Some(40);

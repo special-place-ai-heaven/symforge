@@ -240,7 +240,11 @@ pub(crate) fn disk_read_would_refuse(
 /// callers render the refusal. The `_without_lines` twins the sweeps use never
 /// re-read, since the sweeps drop it.
 pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<String> {
-    crate::index_lifecycle::guidance::read_gate::refuse_by_policy_with(live, relative_path, &mut crate::protocol::withheld::record_pending_withheld)
+    crate::index_lifecycle::guidance::read_gate::refuse_by_policy_with(
+        live,
+        relative_path,
+        &mut crate::protocol::withheld::record_pending_withheld,
+    )
 }
 
 /// A caller's path as a catalog key: separators forward, no leading `./`,
@@ -430,7 +434,9 @@ fn recorded_finding_evidence(
         return (Vec::new(), Vec::new());
     };
     crate::index_lifecycle::guidance::read_gate::recorded_finding_evidence_from_bytes(
-        relative_path, &bytes, recorded,
+        relative_path,
+        &bytes,
+        recorded,
     )
 }
 
@@ -544,7 +550,12 @@ fn disk_read(
 
 /// Classify bytes the gate is holding. `None` admits them.
 fn classify_admitted_bytes(live: &LiveIndex, relative_path: &str, bytes: &[u8]) -> Option<String> {
-    crate::index_lifecycle::guidance::read_gate::classify_admitted_bytes_with(live, relative_path, bytes, &mut crate::protocol::withheld::record_pending_withheld)
+    crate::index_lifecycle::guidance::read_gate::classify_admitted_bytes_with(
+        live,
+        relative_path,
+        bytes,
+        &mut crate::protocol::withheld::record_pending_withheld,
+    )
 }
 
 // ── Frozen seam anchor (C5) ────────────────────────────────────────────────

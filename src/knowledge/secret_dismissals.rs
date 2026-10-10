@@ -332,7 +332,8 @@ fn filter_scan_with_records(
         mut finding_count,
         mut line_ranges,
         mut findings,
-    } = scan else {
+    } = scan
+    else {
         return scan;
     };
     if records.is_empty() || findings.len() != finding_count as usize {

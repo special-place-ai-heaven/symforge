@@ -1,6 +1,10 @@
 #![cfg(feature = "embed")]
 
-use std::{fs, path::Path, time::{Duration, Instant}};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use symforge::embed::parity::detect_impact::{DetectImpactRequest, ImpactScope};
 use symforge::embed::parity::host::OperationControl;
@@ -19,8 +23,15 @@ fn commit(repo: &git2::Repository, paths: &[&str]) {
     let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
     let previous = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
     let parents: Vec<_> = previous.iter().collect();
-    repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &parents)
-        .unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "fixture",
+        &tree,
+        &parents,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -29,7 +40,14 @@ fn bound_detect_impact_preserves_body_delta_blast_and_full_risk_counts() {
     let scratch = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("src")).unwrap();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cbm_impact");
-    let paths = ["Cargo.toml", "src/lib.rs", "src/a.rs", "src/b.rs", "src/c.rs", "src/main.rs"];
+    let paths = [
+        "Cargo.toml",
+        "src/lib.rs",
+        "src/a.rs",
+        "src/b.rs",
+        "src/c.rs",
+        "src/main.rs",
+    ];
     for path in &paths {
         fs::copy(fixture.join(path), root.path().join(path)).unwrap();
     }
@@ -44,7 +62,9 @@ fn bound_detect_impact_preserves_body_delta_blast_and_full_risk_counts() {
 
     let runtime = ProcessIndexRuntime::acquire().unwrap();
     let handle = runtime
-        .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()))
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
         .unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while handle.runtime_view().phase != SourceRuntimePhase::Current {

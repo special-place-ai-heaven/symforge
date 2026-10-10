@@ -397,7 +397,9 @@ fn load_serve_index(
                 .physical_root();
             if source_authority.admission_binding().physical_root() != admitted_physical_root {
                 return Err(ServeError::IndexLoad {
-                    source: anyhow::anyhow!("admitted serve source changed before snapshot restore"),
+                    source: anyhow::anyhow!(
+                        "admitted serve source changed before snapshot restore"
+                    ),
                 });
             }
 
@@ -410,8 +412,7 @@ fn load_serve_index(
             )
             .map_err(|refusal| ServeError::IndexLoad {
                 source: anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"),
-            })?
-            {
+            })? {
                 let file_count = snapshot.files.len();
                 let snapshot_mtimes: std::collections::HashMap<String, u64> = snapshot
                     .files
@@ -450,7 +451,13 @@ fn load_serve_index(
 
             let index = LiveIndex::load_for_state_placement(&root, &state_placement)
                 .map_err(|source| ServeError::IndexLoad { source })?;
-            Ok((index, Some(root), Some(state_placement), None, Some(source_authority)))
+            Ok((
+                index,
+                Some(root),
+                Some(state_placement),
+                None,
+                Some(source_authority),
+            ))
         }
         None => Ok((LiveIndex::empty(), None, None, None, None)),
     }

@@ -45,19 +45,34 @@ fn symbol_read_supports_global_resolution_batch_exact_bytes_and_ambiguity() {
     assert_eq!(global.entries[0].path, "lib.rs");
     assert!(global.rendered.contains("pub fn selected() -> usize { 9 }"));
     let ambiguous = handle
-            .query(
-                &QueryRequest::SymbolRead(SymbolReadRequest {
-                    name: "run".into(),
-                    ..Default::default()
-                }),
-                QueryLimits::default()
-            )
-            .unwrap();
-    let QueryOutput::SymbolRead(ambiguous) = ambiguous.value() else { panic!("ambiguity evidence") };
-    assert_eq!(ambiguous.entries[0].refusal, Some(QueryRefusalKind::AmbiguousSymbol));
+        .query(
+            &QueryRequest::SymbolRead(SymbolReadRequest {
+                name: "run".into(),
+                ..Default::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::SymbolRead(ambiguous) = ambiguous.value() else {
+        panic!("ambiguity evidence")
+    };
+    assert_eq!(
+        ambiguous.entries[0].refusal,
+        Some(QueryRefusalKind::AmbiguousSymbol)
+    );
     assert_eq!(ambiguous.entries[0].candidates.len(), 2);
-    assert!(ambiguous.entries[0].candidates.iter().any(|symbol| symbol.path == "other.rs"));
-    assert!(ambiguous.entries[0].candidates.iter().any(|symbol| symbol.path == "lib.rs"));
+    assert!(
+        ambiguous.entries[0]
+            .candidates
+            .iter()
+            .any(|symbol| symbol.path == "other.rs")
+    );
+    assert!(
+        ambiguous.entries[0]
+            .candidates
+            .iter()
+            .any(|symbol| symbol.path == "lib.rs")
+    );
     let batch = handle
         .query(
             &QueryRequest::SymbolRead(SymbolReadRequest {

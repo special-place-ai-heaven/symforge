@@ -17,8 +17,8 @@ use crate::edit_safety::batch_commit::{
     BatchIo, EmbeddedBatchIo, StagedImage, commit_staged_locked, with_staged_locks,
 };
 use crate::edit_safety::secret_remediation as shared_stage;
-use crate::knowledge::secret_remediation::{self, SelectionRefusal};
 use crate::knowledge;
+use crate::knowledge::secret_remediation::{self, SelectionRefusal};
 use crate::protocol::SymForgeServer;
 use crate::protocol::edit_tools::fail_and_return_mutation_replay;
 use crate::protocol::result_status::{OutcomeClass, ResultStatus};
@@ -47,7 +47,6 @@ pub struct SecretRemediateInput {
 fn default_preview_true() -> bool {
     true
 }
-
 
 #[tool_router(router = secret_remediate_tool_router, vis = "pub(crate)")]
 impl SymForgeServer {
@@ -166,7 +165,10 @@ impl SymForgeServer {
             return Ok(out);
         }
 
-        let selected_paths = selected.iter().map(|file| file.path.clone()).collect::<Vec<_>>();
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
         let staged = shared_stage::stage_externalize(&root, selected, |path| {
             crate::index_lifecycle::physical_root::read_regular_beneath_root(
                 &root,
@@ -175,8 +177,20 @@ impl SymForgeServer {
             )
             .map_err(|_| shared_stage::StageError::SourceUnavailable)
         })
-        .map_err(|_| fail_and_return_mutation_replay(idempotency, "Error: externalize staging refused".into()))?;
-        let source = guarded_commit(self, &root, generation, state_dir.as_deref(), &staged, idempotency)?;
+        .map_err(|_| {
+            fail_and_return_mutation_replay(
+                idempotency,
+                "Error: externalize staging refused".into(),
+            )
+        })?;
+        let source = guarded_commit(
+            self,
+            &root,
+            generation,
+            state_dir.as_deref(),
+            &staged,
+            idempotency,
+        )?;
         let mut rescan = String::from("clean");
         for path in &selected_paths {
             match source.read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES) {
@@ -192,7 +206,10 @@ impl SymForgeServer {
                 _ => rescan = "indeterminate source_unavailable".into(),
             }
         }
-        let mut out = format!("secret_remediate apply (externalize)\n{}\nwritten:\n", apply_status_for_rescan(&rescan));
+        let mut out = format!(
+            "secret_remediate apply (externalize)\n{}\nwritten:\n",
+            apply_status_for_rescan(&rescan)
+        );
         for image in &staged {
             out.push_str(&format!("- {}\n", image.relative.display()));
         }
@@ -224,24 +241,30 @@ impl SymForgeServer {
         let (root, generation, state_dir) = planning_binding(self)?;
         let selected = select_bounded(&root, paths, &input.finding_ids, "encrypt")
             .map_err(|error| fail_and_return_mutation_replay(idempotency, error))?;
-        secret_remediation::ensure_encrypt_formats(&selected)
-            .map_err(|error| fail_and_return_mutation_replay(
-                idempotency,
-                selection_error_text(error, "encrypt"),
-            ))?;
+        secret_remediation::ensure_encrypt_formats(&selected).map_err(|error| {
+            fail_and_return_mutation_replay(idempotency, selection_error_text(error, "encrypt"))
+        })?;
         if input.preview {
-            let mut out = String::from("secret_remediate preview (encrypt)\nFiles that would be created or modified:\n");
+            let mut out = String::from(
+                "secret_remediate preview (encrypt)\nFiles that would be created or modified:\n",
+            );
             for file in &selected {
                 out.push_str(&format!("- {}\n", file.path));
             }
             out.push_str("\nMasked summary:\n");
             for file in &selected {
-                out.push_str(&format!("- {}: SOPS encryption with age recipient (public only)\n", file.path));
+                out.push_str(&format!(
+                    "- {}: SOPS encryption with age recipient (public only)\n",
+                    file.path
+                ));
             }
             return Ok(out);
         }
 
-        let selected_paths = selected.iter().map(|file| file.path.clone()).collect::<Vec<_>>();
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
         let deadline = Instant::now() + std::time::Duration::from_secs(300);
         let mut staged = Vec::with_capacity(selected.len());
         for file in selected {
@@ -260,10 +283,12 @@ impl SymForgeServer {
                 timeout,
                 || None,
             )
-            .map_err(|reason| fail_and_return_mutation_replay(
-                idempotency,
-                format!("Error: encrypt preparation refused ({reason:?})"),
-            ))?;
+            .map_err(|reason| {
+                fail_and_return_mutation_replay(
+                    idempotency,
+                    format!("Error: encrypt preparation refused ({reason:?})"),
+                )
+            })?;
             if secret_remediation::contains_selected_plaintext(&encrypted, &file) {
                 return Err(fail_and_return_mutation_replay(
                     idempotency,
@@ -278,15 +303,28 @@ impl SymForgeServer {
                 owner_only: false,
             });
         }
-        let source = guarded_commit(self, &root, generation, state_dir.as_deref(), &staged, idempotency)?;
+        let source = guarded_commit(
+            self,
+            &root,
+            generation,
+            state_dir.as_deref(),
+            &staged,
+            idempotency,
+        )?;
         let mut rescan = String::from("clean");
         let mut details = String::new();
         for path in &selected_paths {
-            let finding = match source.read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES) {
+            let finding = match source
+                .read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES)
+            {
                 Ok(Some(bytes)) => match knowledge::scan_secret_bytes(path, &bytes) {
                     knowledge::SecretScan::Clean => "clean".to_string(),
-                    knowledge::SecretScan::Sensitive { finding_count, .. } => format!("still_sensitive finding_count={finding_count}"),
-                    knowledge::SecretScan::Indeterminate { reason } => format!("indeterminate {reason:?}"),
+                    knowledge::SecretScan::Sensitive { finding_count, .. } => {
+                        format!("still_sensitive finding_count={finding_count}")
+                    }
+                    knowledge::SecretScan::Indeterminate { reason } => {
+                        format!("indeterminate {reason:?}")
+                    }
                 },
                 _ => "indeterminate source_unavailable".to_string(),
             };
@@ -320,13 +358,13 @@ impl SymForgeServer {
         let (root, generation, state_dir) = planning_binding(self)?;
         let selected = select_bounded(&root, paths, &input.finding_ids, "dismiss")
             .map_err(|error| fail_and_return_mutation_replay(idempotency, error))?;
-        let records = secret_remediation::plan_dismiss(&selected)
-            .map_err(|error| fail_and_return_mutation_replay(
-                idempotency,
-                selection_error_text(error, "dismiss"),
-            ))?;
+        let records = secret_remediation::plan_dismiss(&selected).map_err(|error| {
+            fail_and_return_mutation_replay(idempotency, selection_error_text(error, "dismiss"))
+        })?;
         if input.preview {
-            let mut out = String::from("secret_remediate preview (dismiss)\nFiles that would be created or modified:\n");
+            let mut out = String::from(
+                "secret_remediate preview (dismiss)\nFiles that would be created or modified:\n",
+            );
             out.push_str(&format!("- {DISMISSAL_STORE_REL}\n\nMasked summary:\n"));
             for record in &records {
                 out.push_str(&format!(
@@ -338,7 +376,10 @@ impl SymForgeServer {
             }
             return Ok(out);
         }
-        let selected_paths = selected.iter().map(|file| file.path.clone()).collect::<Vec<_>>();
+        let selected_paths = selected
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
         let staged = shared_stage::stage_dismiss(&root, &selected, |path| {
             crate::index_lifecycle::physical_root::read_regular_beneath_root(
                 &root,
@@ -356,14 +397,21 @@ impl SymForgeServer {
             };
             fail_and_return_mutation_replay(idempotency, reason)
         })?;
-        let source = guarded_commit(self, &root, generation, state_dir.as_deref(), &staged, idempotency)?;
+        let source = guarded_commit(
+            self,
+            &root,
+            generation,
+            state_dir.as_deref(),
+            &staged,
+            idempotency,
+        )?;
         let actual_store = source
             .read_regular_beneath_anchor(Path::new(DISMISSAL_STORE_REL), MAX_REMEDIATION_FILE_BYTES)
             .ok()
             .flatten();
-        let current_records = actual_store
-            .as_deref()
-            .and_then(|bytes| crate::knowledge::secret_dismissals::parse_dismissals_bytes(bytes).ok());
+        let current_records = actual_store.as_deref().and_then(|bytes| {
+            crate::knowledge::secret_dismissals::parse_dismissals_bytes(bytes).ok()
+        });
         use crate::live_index::single_file::{
             ReindexOutcome, admit_and_index_single_path, reconcile_secret_dismissals,
         };
@@ -390,20 +438,35 @@ impl SymForgeServer {
                 ReindexOutcome::Skipped => "withheld",
                 ReindexOutcome::NotFound | ReindexOutcome::Removed => "absent",
                 ReindexOutcome::ReadError(_) => "unreadable",
-                ReindexOutcome::PublicationRejected => "publication rejected by a concurrent index change; index unchanged",
+                ReindexOutcome::PublicationRejected => {
+                    "publication rejected by a concurrent index change; index unchanged"
+                }
             };
-            let finding = match (&current_records, source.read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES)) {
-                (Some(records), Ok(Some(bytes))) => match crate::knowledge::secret_dismissals::scan_with_records(path, &bytes, records) {
-                    knowledge::SecretScan::Clean => "clean".to_string(),
-                    knowledge::SecretScan::Sensitive { finding_count, .. } => format!("still_sensitive finding_count={finding_count}"),
-                    knowledge::SecretScan::Indeterminate { reason } => format!("indeterminate {reason:?}"),
-                },
+            let finding = match (
+                &current_records,
+                source.read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES),
+            ) {
+                (Some(records), Ok(Some(bytes))) => {
+                    match crate::knowledge::secret_dismissals::scan_with_records(
+                        path, &bytes, records,
+                    ) {
+                        knowledge::SecretScan::Clean => "clean".to_string(),
+                        knowledge::SecretScan::Sensitive { finding_count, .. } => {
+                            format!("still_sensitive finding_count={finding_count}")
+                        }
+                        knowledge::SecretScan::Indeterminate { reason } => {
+                            format!("indeterminate {reason:?}")
+                        }
+                    }
+                }
                 _ => "indeterminate source_unavailable".to_string(),
             };
             if finding != "clean" {
                 rescan = finding.clone();
             }
-            details.push_str(&format!("rescan ({path}) : {finding}\nindex ({path}) : {index_outcome}\n"));
+            details.push_str(&format!(
+                "rescan ({path}) : {finding}\nindex ({path}) : {index_outcome}\n"
+            ));
         }
         let mut out = format!(
             "secret_remediate apply (dismiss)\n{}\nwritten:\n- {DISMISSAL_STORE_REL}\n",
@@ -442,10 +505,10 @@ fn resolved_project_state(
         return Err("Error: admitted remediation source changed".to_string());
     }
     let server_state = server.capture_project_state_dir();
-    if let (Some(runtime), Some(server_state)) = (runtime, server_state.as_ref()) {
-        if runtime.as_path() != server_state.as_path() {
-            return Err("Error: durable project-state placement changed".to_string());
-        }
+    if let (Some(runtime), Some(server_state)) = (runtime, server_state.as_ref())
+        && runtime.as_path() != server_state.as_path()
+    {
+        return Err("Error: durable project-state placement changed".to_string());
     }
     Ok(server_state.or_else(|| runtime.cloned()))
 }
@@ -520,7 +583,10 @@ fn select_bounded(
     action: &str,
 ) -> Result<Vec<secret_remediation::SelectedFile>, String> {
     if paths.len() > MAX_REMEDIATION_SCAN_FILES {
-        return Err(selection_error_text(SelectionRefusal::ResourceLimit, action));
+        return Err(selection_error_text(
+            SelectionRefusal::ResourceLimit,
+            action,
+        ));
     }
     let mut total = 0usize;
     secret_remediation::select_requested_checked(paths, finding_ids, |path| {
@@ -549,7 +615,7 @@ fn guarded_commit(
     staged: &[StagedImage],
     idempotency: &Option<crate::idempotency::ActiveReplay>,
 ) -> Result<Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>, String> {
-    let locked = with_staged_locks(staged, |order| {
+    with_staged_locks(staged, |order| {
         server.index.with_admitted_write_binding(
             |root, state, generation, authority, publication| {
                 if root != planned_root
@@ -578,12 +644,11 @@ fn guarded_commit(
                         }
                     }
                 }
-                if let Some(active) = idempotency {
-                    if active.mark_started().is_err() {
+                if let Some(active) = idempotency
+                    && active.mark_started().is_err() {
                         let _ = io.finish();
                         return Err("Error: durable remediation start record unavailable".to_string());
                     }
-                }
                 let committed = commit_staged_locked(staged, order, &mut io, None);
                 let finished = io.finish();
                 if committed.is_err() || finished.is_err() {
@@ -598,8 +663,7 @@ fn guarded_commit(
     })
     .map_err(|_| "Error: remediation target lock unavailable".to_string())?
     .map_err(|_| "Error: admitted source binding unavailable".to_string())?
-    .ok_or_else(|| "Error: admitted source is not current".to_string())?;
-    locked
+    .ok_or_else(|| "Error: admitted source is not current".to_string())?
 }
 
 fn complete_guarded_replay(
@@ -609,7 +673,10 @@ fn complete_guarded_replay(
     output: &mut String,
 ) -> Result<(), String> {
     let Some(active) = idempotency else {
-        return Err("secret_remediate apply\napply_status: incomplete\nreason: missing_replay_lease\n".to_string());
+        return Err(
+            "secret_remediate apply\napply_status: incomplete\nreason: missing_replay_lease\n"
+                .to_string(),
+        );
     };
     let targets = staged
         .iter()
@@ -654,13 +721,15 @@ fn encrypt_runtime_availability(server: &SymForgeServer) -> (bool, String) {
 }
 
 fn sops_binary_on_path() -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths).find_map(|dir| {
-                let candidate = dir.join(if cfg!(windows) { "sops.exe" } else { "sops" });
-                candidate.is_file().then(|| std::fs::canonicalize(candidate).ok()).flatten()
-            })
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(if cfg!(windows) { "sops.exe" } else { "sops" });
+            candidate
+                .is_file()
+                .then(|| std::fs::canonicalize(candidate).ok())
+                .flatten()
         })
+    })
 }
 
 fn resolve_age_recipient(root: &Path) -> Result<String, String> {
@@ -750,7 +819,6 @@ fn selection_error_text(error: SelectionRefusal, action: &str) -> String {
         }
     }
 }
-
 
 /// Same honesty rule for externalize, encrypt, and dismiss: a rescan that
 /// is still sensitive is not `ok`.

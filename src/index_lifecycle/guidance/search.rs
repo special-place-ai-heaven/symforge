@@ -227,16 +227,16 @@ pub(crate) fn execute_text_search(
     }
     let mut is_regex = input.regex.unwrap_or(false);
     let mut auto_detected_regex = false;
-    if !is_regex && let Some(query) = &input.query {
-        if ["\\w", "\\d", "\\s", "\\b", "\\W", "\\D", "\\S"]
+    if !is_regex
+        && let Some(query) = &input.query
+        && ["\\w", "\\d", "\\s", "\\b", "\\W", "\\D", "\\S"]
             .iter()
             .any(|escape| query.contains(escape))
-        {
-            is_regex = true;
-            auto_detected_regex = true;
-            if input.include_tests.is_none() {
-                options.noise_policy.include_tests = true;
-            }
+    {
+        is_regex = true;
+        auto_detected_regex = true;
+        if input.include_tests.is_none() {
+            options.noise_policy.include_tests = true;
         }
     }
     if options.ranked {

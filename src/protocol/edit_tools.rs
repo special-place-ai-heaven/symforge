@@ -682,25 +682,33 @@ fn begin_mutation_replay<T: Serialize>(
         map.remove("idempotency_key");
     }
 
-    server.index.with_admitted_replay_source(|_, project_state, source| {
-        let project_state = project_state.ok_or_else(|| {
-            "Error: durable project-state replay is unavailable for this binding.".to_string()
-        })?;
-        match crate::idempotency::begin_tool_replay_verified_bound(
-            project_state, tool_name, raw_key, &request, source,
-        ) {
-            Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
-                Ok(Some(BoundMutationReplay {
-                    active,
-                    source: Arc::clone(source),
-                }))
+    server
+        .index
+        .with_admitted_replay_source(|_, project_state, source| {
+            let project_state = project_state.ok_or_else(|| {
+                "Error: durable project-state replay is unavailable for this binding.".to_string()
+            })?;
+            match crate::idempotency::begin_tool_replay_verified_bound(
+                project_state,
+                tool_name,
+                raw_key,
+                &request,
+                source,
+            ) {
+                Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
+                    Ok(Some(BoundMutationReplay {
+                        active,
+                        source: Arc::clone(source),
+                    }))
+                }
+                Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
+                Err(error) => Err(crate::idempotency::format_tool_error(&error)),
             }
-            Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
-            Err(error) => Err(crate::idempotency::format_tool_error(&error)),
-        }
-    })
-    .map_err(|_| "Error: durable project-state replay is unavailable for this admission.".to_string())?
-    .ok_or_else(|| "Error: durable project-state replay has no bound source.".to_string())?
+        })
+        .map_err(|_| {
+            "Error: durable project-state replay is unavailable for this admission.".to_string()
+        })?
+        .ok_or_else(|| "Error: durable project-state replay has no bound source.".to_string())?
 }
 
 /// NON-RESERVING replay probe mirroring [`begin_mutation_replay`]'s hashing.
@@ -739,17 +747,25 @@ fn probe_mutation_replay<T: Serialize>(
         map.remove("idempotency_key");
     }
 
-    server.index.with_admitted_replay_source(|_, project_state, source| {
-        let project_state = project_state.ok_or_else(|| {
-            "Error: durable project-state replay is unavailable for this binding.".to_string()
-        })?;
-        crate::idempotency::probe_tool_replay_verified_bound(
-            project_state, tool_name, raw_key, &request, source,
-        )
-        .map_err(|error| crate::idempotency::format_tool_error(&error))
-    })
-    .map_err(|_| "Error: durable project-state replay is unavailable for this admission.".to_string())?
-    .ok_or_else(|| "Error: durable project-state replay has no bound source.".to_string())?
+    server
+        .index
+        .with_admitted_replay_source(|_, project_state, source| {
+            let project_state = project_state.ok_or_else(|| {
+                "Error: durable project-state replay is unavailable for this binding.".to_string()
+            })?;
+            crate::idempotency::probe_tool_replay_verified_bound(
+                project_state,
+                tool_name,
+                raw_key,
+                &request,
+                source,
+            )
+            .map_err(|error| crate::idempotency::format_tool_error(&error))
+        })
+        .map_err(|_| {
+            "Error: durable project-state replay is unavailable for this admission.".to_string()
+        })?
+        .ok_or_else(|| "Error: durable project-state replay has no bound source.".to_string())?
 }
 
 /// NON-RESERVING replay probe for a `symforge_edit` apply, keyed off the plan
@@ -828,21 +844,23 @@ fn complete_bound_mutation_replay_with_receipt(
     output: &mut String,
     post_image: Option<crate::idempotency::PostImageReceipt>,
 ) {
-    let Some(idempotency) = idempotency else { return };
+    let Some(idempotency) = idempotency else {
+        return;
+    };
     let bound = post_image.and_then(|receipt| {
         crate::idempotency::bind_post_image_to_source(receipt, &idempotency.source)
     });
-    if let Err(error) = idempotency.active.complete_with_post_image(output.clone(), bound) {
+    if let Err(error) = idempotency
+        .active
+        .complete_with_post_image(output.clone(), bound)
+    {
         output.push_str(&format!(
             "\nIdempotency warning: failed to store replay result: {error}"
         ));
     }
 }
 
-fn fail_mutation_replay(
-    idempotency: &Option<BoundMutationReplay>,
-    output: &str,
-) {
+fn fail_mutation_replay(idempotency: &Option<BoundMutationReplay>, output: &str) {
     if let Some(idempotency) = idempotency {
         let _ = idempotency.active.fail(output.to_string());
     }
@@ -1030,7 +1048,9 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}"));
+            }
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -1107,7 +1127,10 @@ impl SymForgeServer {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {error}"));
+                return fail_and_return_bound_mutation_replay(
+                    &idempotency,
+                    format!("Error: {error}"),
+                );
             }
         };
         let old_bytes = prepared.old_bytes;
@@ -1317,7 +1340,9 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}"));
+            }
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -1539,7 +1564,9 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}"));
+            }
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -1758,7 +1785,9 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}"));
+            }
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {

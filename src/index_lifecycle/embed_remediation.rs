@@ -9,8 +9,8 @@ use crate::edit_safety::batch_commit::{
 };
 use crate::edit_safety::secret_remediation::{self as shared_stage, StageError};
 use crate::embed::parity::replay::{
-    OutcomeKind, ReplayKey, ReplayOutcome, ReplayRecord, ReplayState, ReplayStore, RequestFingerprint,
-    ReserveOutcome,
+    OutcomeKind, ReplayKey, ReplayOutcome, ReplayRecord, ReplayState, ReplayStore,
+    RequestFingerprint, ReserveOutcome,
 };
 
 use crate::embed::parity::host::{OperationControl, OperationStop};
@@ -24,8 +24,8 @@ use crate::embed::parity::remediation::{
 use crate::knowledge::SecretSpansScan;
 use crate::knowledge::secret_remediation::{self, SelectedFile, SelectionRefusal};
 
-use super::embedded::EmbeddedSourceHandle;
 use super::activation::ProjectSourceAuthority;
+use super::embedded::EmbeddedSourceHandle;
 use super::physical_root::read_regular_beneath_root;
 
 const MAX_SCOPE_PATHS: usize = 100_000;
@@ -108,12 +108,9 @@ mod real_sops_tests {
         let selected_bytes = b"{\"marker\":\"selected\"}\n".to_vec();
         let later_bytes = b"{\"marker\":\"later\"}\n";
         std::fs::write(root.join(path), later_bytes).unwrap();
-        let tool = SecretExternalTool::new(
-            PathBuf::from(binary),
-            recipient,
-            Duration::from_secs(20),
-        )
-        .expect("admitted SOPS descriptor");
+        let tool =
+            SecretExternalTool::new(PathBuf::from(binary), recipient, Duration::from_secs(20))
+                .expect("admitted SOPS descriptor");
         let authority = SecretApplyAuthority::for_source_root(
             root.to_path_buf(),
             "live-sops-test".to_string(),
@@ -150,7 +147,10 @@ mod real_sops_tests {
         assert!(output.status.success(), "SOPS decrypt refused ciphertext");
         let plaintext: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("SOPS decrypted JSON");
-        assert!(plaintext["marker"] == "selected", "encrypted later path bytes");
+        assert!(
+            plaintext["marker"] == "selected",
+            "encrypted later path bytes"
+        );
     }
 }
 
@@ -336,7 +336,11 @@ fn encrypt_file(
             if authority.cancel.load(Ordering::Acquire) {
                 return Some(shared_stage::EncryptError::Cancelled);
             }
-            match authority.control.as_ref().and_then(|control| control.check().err()) {
+            match authority
+                .control
+                .as_ref()
+                .and_then(|control| control.check().err())
+            {
                 Some(OperationStop::Cancelled) => Some(shared_stage::EncryptError::Cancelled),
                 Some(OperationStop::DeadlineExceeded) => {
                     Some(shared_stage::EncryptError::DeadlineExceeded)
@@ -347,12 +351,22 @@ fn encrypt_file(
     )
     .map_err(|error| {
         let kind = match error {
-            shared_stage::EncryptError::InvalidFormat => SecretRemediationRefusalKind::InvalidRequest,
-            shared_stage::EncryptError::Unavailable => SecretRemediationRefusalKind::ExternalToolUnavailable,
-            shared_stage::EncryptError::ResourceLimit => SecretRemediationRefusalKind::ResourceLimit,
+            shared_stage::EncryptError::InvalidFormat => {
+                SecretRemediationRefusalKind::InvalidRequest
+            }
+            shared_stage::EncryptError::Unavailable => {
+                SecretRemediationRefusalKind::ExternalToolUnavailable
+            }
+            shared_stage::EncryptError::ResourceLimit => {
+                SecretRemediationRefusalKind::ResourceLimit
+            }
             shared_stage::EncryptError::Cancelled => SecretRemediationRefusalKind::Cancelled,
-            shared_stage::EncryptError::DeadlineExceeded => SecretRemediationRefusalKind::DeadlineExceeded,
-            shared_stage::EncryptError::SourceUnavailable => SecretRemediationRefusalKind::SourceUnavailable,
+            shared_stage::EncryptError::DeadlineExceeded => {
+                SecretRemediationRefusalKind::DeadlineExceeded
+            }
+            shared_stage::EncryptError::SourceUnavailable => {
+                SecretRemediationRefusalKind::SourceUnavailable
+            }
         };
         refusal(kind)
     })
@@ -427,10 +441,12 @@ fn source_rescan_status(
             Path::new(crate::knowledge::secret_dismissals::DISMISSAL_STORE_REL),
             crate::knowledge::secret_dismissals::DISMISSAL_STORE_MAX_BYTES as usize,
         ) {
-            Ok(Some(bytes)) => match crate::knowledge::secret_dismissals::parse_dismissals_bytes(&bytes) {
-                Ok(records) => Some(records),
-                Err(_) => return SecretApplyStatus::Indeterminate,
-            },
+            Ok(Some(bytes)) => {
+                match crate::knowledge::secret_dismissals::parse_dismissals_bytes(&bytes) {
+                    Ok(records) => Some(records),
+                    Err(_) => return SecretApplyStatus::Indeterminate,
+                }
+            }
             _ => return SecretApplyStatus::Indeterminate,
         }
     } else {
@@ -518,8 +534,9 @@ impl EmbeddedSourceHandle {
         let root_anchor_key = bound_authority
             .physical_root_stable_key()
             .ok_or_else(|| refusal(SecretRemediationRefusalKind::SourceUnavailable))?;
-        let replay = ReplayStore::open_bound(&bound_root, state_dir, &authority.scope, root_anchor_key)
-            .map_err(|_| refusal(SecretRemediationRefusalKind::ReplayUnavailable))?;
+        let replay =
+            ReplayStore::open_bound(&bound_root, state_dir, &authority.scope, root_anchor_key)
+                .map_err(|_| refusal(SecretRemediationRefusalKind::ReplayUnavailable))?;
         let fingerprint = request_fingerprint(preview, authority)?;
         let completed = |record: ReplayRecord| {
             if record.request != fingerprint
@@ -536,7 +553,11 @@ impl EmbeddedSourceHandle {
                 return Err(refusal(SecretRemediationRefusalKind::ReplayConflict));
             }
             Ok(SecretRemediationApplied {
-                status: source_rescan_status(&bound_authority, &preview.files, preview.request.action),
+                status: source_rescan_status(
+                    &bound_authority,
+                    &preview.files,
+                    preview.request.action,
+                ),
                 written: preview.would_write.clone(),
                 replayed: true,
                 refresh_ticket_identity: None,
@@ -695,10 +716,11 @@ impl EmbeddedSourceHandle {
             let _ = replay.mark_uncertain(&lease);
             refusal(SecretRemediationRefusalKind::WriteUncertain)
         })?;
-        let manifest = post_image_manifest(&snapshot.authority, &preview.would_write).map_err(|_| {
-            let _ = replay.mark_uncertain(&lease);
-            refusal(SecretRemediationRefusalKind::WriteUncertain)
-        })?;
+        let manifest =
+            post_image_manifest(&snapshot.authority, &preview.would_write).map_err(|_| {
+                let _ = replay.mark_uncertain(&lease);
+                refusal(SecretRemediationRefusalKind::WriteUncertain)
+            })?;
         if expected_manifest(&staged, &preview.would_write)
             .ok()
             .as_deref()
@@ -721,7 +743,11 @@ impl EmbeddedSourceHandle {
             refusal(SecretRemediationRefusalKind::WriteUncertain)
         })?;
         Ok(SecretRemediationApplied {
-            status: source_rescan_status(&snapshot.authority, &preview.files, preview.request.action),
+            status: source_rescan_status(
+                &snapshot.authority,
+                &preview.files,
+                preview.request.action,
+            ),
             written: preview.would_write.clone(),
             replayed: false,
             refresh_ticket_identity: Some(refresh.ticket_identity().to_owned()),

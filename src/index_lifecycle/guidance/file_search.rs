@@ -29,32 +29,6 @@ pub(crate) fn normalize_exact_path(input: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_resolution_applies_scope_before_ambiguity() {
-        let root = tempfile::tempdir().unwrap();
-        for path in ["src/a", "src/b", "vendor"] {
-            std::fs::create_dir_all(root.path().join(path)).unwrap();
-            std::fs::write(root.path().join(path).join("lib.rs"), "pub fn item() {}\n").unwrap();
-        }
-        let shared = LiveIndex::load(root.path()).unwrap();
-        let input: SearchFilesInput = serde_json::from_value(serde_json::json!({
-            "query":"lib.rs", "resolve":true, "path_prefix":"src/a"
-        }))
-        .unwrap();
-        let (resolved, _) = resolve_files(&shared.read(), &input);
-        assert_eq!(
-            resolved,
-            SearchFilesResolveView::Resolved {
-                path: "src/a/lib.rs".into()
-            }
-        );
-    }
-}
-
 const MAX_CO_CHANGE_PARTNERS_PER_ANCHOR: u32 = 20;
 
 struct SearchFilesCoChangeResolution {
@@ -710,7 +684,10 @@ pub(crate) fn rank_files(
         allow_prepare,
         |paths, now_ts| match repo_root {
             Some(root) => crate::live_index::frecency::ranking_scores_for_paths(
-                root, project_state, paths, now_ts,
+                root,
+                project_state,
+                paths,
+                now_ts,
             ),
             None => Ok(None),
         },
@@ -726,13 +703,16 @@ pub(crate) fn rank_files_with_frecency(
     ranking_scores: impl FnOnce(
         &[&Path],
         i64,
-    ) -> Result<Option<crate::live_index::frecency::FrecencyRankingSnapshot>, String>,
+    ) -> Result<
+        Option<crate::live_index::frecency::FrecencyRankingSnapshot>,
+        String,
+    >,
 ) -> RankedFiles {
     let include_vendor = input.include_vendor.unwrap_or(false);
     let include_personal_tooling = input.include_personal_tooling.unwrap_or(false);
     let rank_by_path_cochange = input.rank_by.as_deref() == Some("path+cochange");
     let rank_by_frecency = input.rank_by.as_deref() == Some("frecency");
-    let ranking_diagnostics = search_files_debug_ranking_requested(&input);
+    let ranking_diagnostics = search_files_debug_ranking_requested(input);
     let mut cochange_evidence: Option<CapabilityEvidence> = None;
     let mut frecency_evidence: Option<CapabilityEvidence> = None;
     let mut hidden_noise_count = 0usize;
@@ -975,4 +955,30 @@ pub(crate) fn changed_rows(
         .collect();
 
     (hits, weak_hits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_resolution_applies_scope_before_ambiguity() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["src/a", "src/b", "vendor"] {
+            std::fs::create_dir_all(root.path().join(path)).unwrap();
+            std::fs::write(root.path().join(path).join("lib.rs"), "pub fn item() {}\n").unwrap();
+        }
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let input: SearchFilesInput = serde_json::from_value(serde_json::json!({
+            "query":"lib.rs", "resolve":true, "path_prefix":"src/a"
+        }))
+        .unwrap();
+        let (resolved, _) = resolve_files(&shared.read(), &input);
+        assert_eq!(
+            resolved,
+            SearchFilesResolveView::Resolved {
+                path: "src/a/lib.rs".into()
+            }
+        );
+    }
 }

@@ -241,10 +241,8 @@ impl QuerySession {
             request.force_refresh,
         )?;
         state.cache.get(&meta.retrieve_handle)?;
-        let body = super::guidance::source::format_session_cache_hit_body(
-            &meta,
-            "session_repeat_read",
-        );
+        let body =
+            super::guidance::source::format_session_cache_hit_body(&meta, "session_repeat_read");
         Some((meta.retrieve_handle, body))
     }
 
@@ -389,10 +387,14 @@ impl QuerySession {
             }
             QueryOutput::SymbolContext(content) if content.estimate.is_none() => {
                 if let Some(symbol) = &content.symbol {
-                    state.context.record_symbol(&symbol.path, &symbol.name, tokens);
+                    state
+                        .context
+                        .record_symbol(&symbol.path, &symbol.name, tokens);
                 }
                 for candidate in &content.candidates {
-                    state.context.record_listed_symbol(&candidate.path, &candidate.name);
+                    state
+                        .context
+                        .record_listed_symbol(&candidate.path, &candidate.name);
                 }
             }
             QueryOutput::SymbolRead(content) if content.estimated_tokens.is_none() => {

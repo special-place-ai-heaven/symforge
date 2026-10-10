@@ -100,7 +100,8 @@ fn selected_user_local_base_is_partitioned_by_source_root() {
         let control = room.control().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let HostResponse::Status(status) = room.dispatch(&HostRequest::Status, &control).unwrap()
+            let HostResponse::Status(status) =
+                room.dispatch(&HostRequest::Status, &control).unwrap()
             else {
                 panic!("status reply");
             };
@@ -125,14 +126,20 @@ fn selected_user_local_base_is_partitioned_by_source_root() {
         .map(|entry| entry.unwrap().path())
         .collect();
     assert_eq!(children.len(), 2);
-    assert!(children.iter().all(|child| child.join("index.bin").is_file()));
+    assert!(
+        children
+            .iter()
+            .all(|child| child.join("index.bin").is_file())
+    );
     assert!(!first.path().join(".symforge").exists());
     assert!(!second.path().join(".symforge").exists());
     for room in rooms {
         room.close(&room.control().unwrap()).unwrap();
     }
     owner
-        .shutdown(&symforge::embed::parity::host::OperationControl::new(Duration::from_secs(20)).unwrap())
+        .shutdown(
+            &symforge::embed::parity::host::OperationControl::new(Duration::from_secs(20)).unwrap(),
+        )
         .unwrap();
 }
 

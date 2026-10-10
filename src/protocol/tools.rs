@@ -48,11 +48,11 @@ pub(crate) use super::read_tools::{
 };
 #[cfg(test)]
 pub(crate) use super::search_tools::normalize_search_text_glob;
+pub(crate) use super::search_tools::parse_language_filter;
 pub use super::search_tools::{
     CurateKnowledgeInput, FindReferencesInput, ReviewKnowledgeInput, SearchFilesInput,
     SearchKnowledgeInput, SearchSymbolsInput, SearchTextInput,
 };
-pub(crate) use super::search_tools::parse_language_filter;
 pub(crate) use crate::index_lifecycle::guidance::search_contract::{
     search_symbols_options_from_input, search_text_options_from_input,
 };
@@ -474,8 +474,7 @@ use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkipReason};
 use crate::domain::{FileClassification, LanguageId};
 use crate::live_index::qualified_usages;
 use crate::live_index::{
-    IndexedFile,
-    SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
+    IndexedFile, SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
     store::{IndexState, LiveIndex},
 };
 use crate::protocol::edit;
@@ -1033,7 +1032,6 @@ fn suggest_similar_files(index: &crate::live_index::LiveIndex, path: &str) -> Ve
     suggestions
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetedFreshenRefusal {
     ProjectGenerationChanged,
@@ -1457,10 +1455,6 @@ fn append_changed_with_deprecation_warning(mut result: String) -> String {
     result.push_str(CHANGED_WITH_DEPRECATION_WARNING);
     result
 }
-
-
-
-
 
 fn search_files_hidden_noise_note(
     hidden_count: usize,
@@ -2138,7 +2132,6 @@ use crate::index_lifecycle::guidance::reference_read::find_references_scope_summ
 /// extracted reliably, so they earn no caveat (and `implementations` mode never
 /// reaches this label — it has its own branch). `None`/`"all"` default includes
 /// type/value usages, so it is best-effort too.
-
 use crate::index_lifecycle::guidance::reference_read::find_references_completeness_label;
 
 /// Tier-2 honesty sweep (dogfood finding #1, 2026-07-06): the reference scan
@@ -2166,9 +2159,10 @@ fn tier2_reference_disclosure(
     name: &str,
 ) -> Option<String> {
     crate::index_lifecycle::guidance::reference_read::tier2_reference_disclosure_with(
-        candidates, name, repo_root.is_some(), |path, _| {
-            read_gate::observe_disk_beneath_without_lines(live, repo_root?, path).ok()
-        },
+        candidates,
+        name,
+        repo_root.is_some(),
+        |path, _| read_gate::observe_disk_beneath_without_lines(live, repo_root?, path).ok(),
     )
 }
 
@@ -2177,7 +2171,6 @@ use crate::index_lifecycle::guidance::reference_read::find_references_evidence;
 use crate::index_lifecycle::guidance::reference_read::find_references_kind_filter;
 
 use crate::index_lifecycle::guidance::reference_read::should_collect_qualified_usages;
-
 
 use crate::index_lifecycle::guidance::reference_read::merge_qualified_usages_into_view;
 
@@ -2328,7 +2321,6 @@ fn render_diff_symbols_output(
     format!("{envelope}\n\n{output}")
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn render_search_text_output(
     server: &SymForgeServer,
@@ -2421,9 +2413,6 @@ fn render_search_text_output(
     append_untracked_file_diagnostic(&mut rendered, &matching_untracked_paths);
     rendered
 }
-
-
-
 
 fn sidecar_state_for_server(server: &SymForgeServer) -> SidecarState {
     SidecarState {
@@ -2666,8 +2655,13 @@ fn capture_trace_symbol_view_for_generation(
     sections: Option<&[String]>,
 ) -> crate::live_index::TraceSymbolView {
     crate::index_lifecycle::guidance::symbol_context::capture_trace_symbol_view(
-        published, &params.path, &params.name, params.kind.as_deref(),
-        params.symbol_line, sections, include_tests_from_sections(params.sections.as_ref()),
+        published,
+        &params.path,
+        &params.name,
+        params.kind.as_deref(),
+        params.symbol_line,
+        sections,
+        include_tests_from_sections(params.sections.as_ref()),
     )
 }
 
@@ -2749,7 +2743,10 @@ impl SymForgeServer {
         symbol_line: Option<u32>,
     ) -> SymbolNameLookup {
         crate::index_lifecycle::guidance::symbol_read::resolve_symbol_path_by_name(
-            &self.index.data_plane().read(), name, kind, symbol_line,
+            &self.index.data_plane().read(),
+            name,
+            kind,
+            symbol_line,
         )
     }
 
@@ -4888,7 +4885,8 @@ impl SymForgeServer {
             }
             let commit_count = temporal.stats.total_commits_analyzed;
             if let Some(history) = temporal.files.get(target_path.as_str()) {
-                let (hits, weak_hits) = crate::index_lifecycle::guidance::file_search::changed_rows(history);
+                let (hits, weak_hits) =
+                    crate::index_lifecycle::guidance::file_search::changed_rows(history);
                 if hits.is_empty() {
                     if !weak_hits.is_empty() {
                         let total = weak_hits.len();
@@ -5000,8 +4998,11 @@ impl SymForgeServer {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
             crate::index_lifecycle::guidance::file_search::rank_files(
-                &generation, self.capture_repo_root().as_deref(),
-                self.capture_project_state_dir().as_ref(), &params.0, true,
+                &generation,
+                self.capture_repo_root().as_deref(),
+                self.capture_project_state_dir().as_ref(),
+                &params.0,
+                true,
             )
         };
         let view = ranked.view;

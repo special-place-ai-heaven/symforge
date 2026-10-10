@@ -2725,6 +2725,7 @@ fn hydrate_snapshot_with_proof(
 /// Returns `None` once `stop` reports true; it is polled every
 /// [`SNAPSHOT_VERIFY_STOP_EVERY`] files and after new-file discovery.
 #[cfg(any(test, not(feature = "embed")))]
+#[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
 fn stat_check_files_from_view(
     verify_view: &VerifyIndexView,
     snapshot_mtimes: &HashMap<String, u64>,
@@ -3128,6 +3129,7 @@ const SNAPSHOT_VERIFY_STOP_EVERY: usize = 1024;
 /// the sampled paths that could not be read at all (neither is verified).
 /// Default: 10% (pass 0.10).
 #[cfg(any(test, not(feature = "embed")))]
+#[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
 fn spot_verify_sample_from_view(
     verify_view: &VerifyIndexView,
     root: &Path,
@@ -3721,10 +3723,10 @@ fn reverify_through_canonical_seam(
         )
         .ok_or_else(|| "the admitted source publication was refused".to_string())?;
         if receipt.refused.is_empty() {
-            if !receipt.indexed.is_empty() {
-                if let Err(active) = authority.observe_admission(observer, rel_path) {
-                    tracing::debug!(?observer, ?active, %rel_path, "stale verify admission observation refused");
-                }
+            if !receipt.indexed.is_empty()
+                && let Err(active) = authority.observe_admission(observer, rel_path)
+            {
+                tracing::debug!(?observer, ?active, %rel_path, "stale verify admission observation refused");
             }
             return Ok(());
         }
@@ -3766,6 +3768,7 @@ fn snapshot_verify_mismatch_reason(
     parts.join("; ")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_background_verify<F, C>(
     index: &crate::live_index::store::SharedIndex,
     root: &Path,

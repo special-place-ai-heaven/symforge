@@ -1,11 +1,19 @@
 //! Shared symbol-context renderers, trace capture, and reference-section evidence.
+use super::file_read::{not_found_file, not_found_symbol_names};
+use super::read_context::{
+    ContextSourceAuthority, build_with_budget, format_context_envelope, parse_state_label,
+};
+use super::reference_read::{
+    OutputLimits, find_dependents_compact_view, find_dependents_result_view,
+    implementations_result_view,
+};
+use super::source::enforce_token_budget;
 #[cfg(feature = "server")]
 use crate::live_index::LiveIndex;
-use crate::live_index::{IndexedFile, ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView, ContextBundleView, ImplBlockSuggestionView, TypeDependencyView};
-use super::file_read::{not_found_file, not_found_symbol_names};
-use super::reference_read::{OutputLimits, find_dependents_result_view, find_dependents_compact_view, implementations_result_view};
-use super::source::enforce_token_budget;
-use super::read_context::{ContextSourceAuthority, format_context_envelope, parse_state_label, build_with_budget};
+use crate::live_index::{
+    ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
+    ContextBundleView, ImplBlockSuggestionView, IndexedFile, TypeDependencyView,
+};
 
 /// Get full context bundle for a symbol: definition body + callers + callees + type usages.
 ///
@@ -908,7 +916,7 @@ fn format_impl_block_suggestion(suggestion: &ImplBlockSuggestionView) -> String 
 }
 
 use crate::index_lifecycle::guidance::source::{
-    token_truncation_notice, token_truncation_footer, truncate_text_at_line_boundary,
+    token_truncation_footer, token_truncation_notice, truncate_text_at_line_boundary,
 };
 
 fn format_bundle_truncation_notice(max_tokens: u64, omitted_dependencies: Option<usize>) -> String {
@@ -1169,11 +1177,11 @@ pub(crate) fn symbol_context_references(
 ) -> (String, u64, usize) {
     let guard = published.live.as_ref();
 
-    let references = if let Some(path) = params.path.as_deref() {
+    let references = if let Some(path) = params.path {
         match guard.find_exact_references_for_symbol(
             path,
-            &params.name,
-            params.symbol_kind.as_deref(),
+            params.name,
+            params.symbol_kind,
             params.symbol_line,
             None,
         ) {
@@ -1181,7 +1189,7 @@ pub(crate) fn symbol_context_references(
             Err(error) => return (error, 0, 0),
         }
     } else {
-        guard.find_references_for_name(&params.name, None, false)
+        guard.find_references_for_name(params.name, None, false)
     };
 
     // Group by file, applying optional file filter, capping at 10 total matches.
@@ -1193,8 +1201,8 @@ pub(crate) fn symbol_context_references(
 
     for (file_path, reference) in &references {
         grand_total += 1;
-        if let Some(ref filter_file) = params.file
-            && *file_path != *filter_file
+        if let Some(filter_file) = params.file
+            && *file_path != filter_file
         {
             continue;
         }
@@ -1210,9 +1218,7 @@ pub(crate) fn symbol_context_references(
             guard
                 .get_file(file_path)
                 .and_then(|f| f.symbols.get(idx as usize))
-                .map(|s| {
-                    super::symbol_read::symbol_kind_name_label(&s.kind.to_string(), &s.name)
-                })
+                .map(|s| super::symbol_read::symbol_kind_name_label(&s.kind.to_string(), &s.name))
         });
 
         map.entry(file_path.to_string()).or_default().push((
@@ -1230,14 +1236,14 @@ pub(crate) fn symbol_context_references(
         .map(|f| f.byte_len)
         .sum();
 
-    let parse_state = if let Some(path) = params.path.as_deref() {
+    let parse_state = if let Some(path) = params.path {
         guard
             .get_file(path)
             .map(parse_state_label)
             .unwrap_or_else(|| {
                 aggregate_parse_state_label(std::iter::empty(), published.health.as_ref())
             })
-    } else if let Some(file) = params.file.as_deref() {
+    } else if let Some(file) = params.file {
         guard
             .get_file(file)
             .map(parse_state_label)
@@ -1324,8 +1330,7 @@ pub(crate) fn symbol_context_references(
 
     // Apply the references-section budget. Tool calls get ~1000 tokens
     // (4000 bytes); the prompt-context hook stays at ~100 tokens (400 bytes).
-    let (body_text, remaining) =
-        build_with_budget(&body_lines, references_budget_bytes);
+    let (body_text, remaining) = build_with_budget(&body_lines, references_budget_bytes);
     let completeness = if total < grand_total {
         "truncated"
     } else if remaining > 0 {
@@ -1340,7 +1345,7 @@ pub(crate) fn symbol_context_references(
     } else {
         "heuristic"
     };
-    let evidence = if let Some(path) = params.path.as_deref() {
+    let evidence = if let Some(path) = params.path {
         match params.symbol_line {
             Some(line) => format!(
                 "exact selector `{path}:{line}` for symbol `{}`",
@@ -1348,7 +1353,7 @@ pub(crate) fn symbol_context_references(
             ),
             None => format!("path-constrained symbol `{}` in `{path}`", params.name),
         }
-    } else if let Some(file) = params.file.as_deref() {
+    } else if let Some(file) = params.file {
         format!("file filter `{file}` for symbol `{}`", params.name)
     } else if evidence_anchors.is_empty() {
         format!(
@@ -1372,12 +1377,12 @@ pub(crate) fn symbol_context_references(
             )
         }
     };
-    let scope = if let Some(path) = params.path.as_deref() {
+    let scope = if let Some(path) = params.path {
         match params.symbol_line {
             Some(line) => format!("path `{path}`; exact selector line {line}"),
             None => format!("path `{path}`; symbol-scoped references"),
         }
-    } else if let Some(file) = params.file.as_deref() {
+    } else if let Some(file) = params.file {
         format!("file filter `{file}`; symbol token `{}`", params.name)
     } else {
         format!("repo-wide symbol token `{}`", params.name)

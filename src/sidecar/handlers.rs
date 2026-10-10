@@ -14,9 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::domain::LanguageId;
-use crate::index_lifecycle::guidance::read_context::{
-    ContextSourceAuthority,
-};
+use crate::index_lifecycle::guidance::read_context::ContextSourceAuthority;
 #[cfg(test)]
 use crate::index_lifecycle::guidance::read_context::{
     append_parse_status_lines, is_intra_workspace_path, parse_state_label,
@@ -138,7 +136,6 @@ fn no_high_confidence_prompt_context_message() -> String {
     // multi-line report — this lands in the agent's prompt on EVERY submit.
     "Prompt-context signal: none (no file/symbol/repo-map cue in prompt)".to_string()
 }
-
 
 fn freshen_sidecar_path_if_stale_at_generation(
     state: &SidecarState,
@@ -1473,13 +1470,22 @@ fn symbol_context_text_for_generation(
     options: RenderOptions,
     source_authority: ContextSourceAuthority,
 ) -> Result<String, StatusCode> {
-    use crate::index_lifecycle::guidance::symbol_context::{SymbolContextSelector, symbol_context_references};
+    use crate::index_lifecycle::guidance::symbol_context::{
+        SymbolContextSelector, symbol_context_references,
+    };
     let selector = SymbolContextSelector {
-        name: &params.name, file: params.file.as_deref(), path: params.path.as_deref(),
-        symbol_kind: params.symbol_kind.as_deref(), symbol_line: params.symbol_line,
+        name: &params.name,
+        file: params.file.as_deref(),
+        path: params.path.as_deref(),
+        symbol_kind: params.symbol_kind.as_deref(),
+        symbol_line: params.symbol_line,
     };
     let (mut text, total_bytes, _) = symbol_context_references(
-        published, &selector, options.symbol_context_references_budget_bytes, 10, source_authority,
+        published,
+        &selector,
+        options.symbol_context_references_budget_bytes,
+        10,
+        source_authority,
     );
     let output_bytes = text.len() as u64;
     if options.include_savings_footer {

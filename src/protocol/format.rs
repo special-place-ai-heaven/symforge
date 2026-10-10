@@ -35,17 +35,17 @@ use crate::live_index::query::{
     EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON, EXPECTED_TEMPLATE_DSL_PARTIAL_PARSE_REASON,
     EXPECTED_TEST_FIXTURE_PARTIAL_PARSE_REASON, EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
 };
+#[cfg(test)]
 use crate::live_index::{
-    FileOutlineView,
-    HealthStats, IndexLoadSource, IndexedFile,
-    LiveIndex, PublishedIndexState, RepoOutlineFileView, RepoOutlineView,
-    SnapshotVerifyState,
-    WhatChangedTimestampView, search,
+    ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
+    ContextBundleView, FindReferencesView, ImplBlockSuggestionView, TypeDependencyView,
+};
+use crate::live_index::{
+    FileOutlineView, HealthStats, IndexLoadSource, IndexedFile, LiveIndex, PublishedIndexState,
+    RepoOutlineFileView, RepoOutlineView, SnapshotVerifyState, WhatChangedTimestampView, search,
 };
 use crate::protocol::surface_probe::{SurfaceProfile, connection_surface_or_env};
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
-#[cfg(test)]
-use crate::live_index::{FindReferencesView, ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView, ContextBundleView, ImplBlockSuggestionView, TypeDependencyView};
 
 const PARSE_QUARANTINE_ENTRY_LIMIT: usize = 10;
 
@@ -776,10 +776,13 @@ pub fn file_outline_view(view: &FileOutlineView) -> String {
     render_file_outline(&view.relative_path, &view.symbols)
 }
 
-pub use crate::index_lifecycle::guidance::symbol_read::{symbol_detail, symbol_detail_from_indexed_file, symbol_detail_view, code_slice_view, code_slice_from_indexed_file};
 pub use crate::index_lifecycle::guidance::symbol_read::inspect_match_result_view;
 #[cfg(test)]
 use crate::index_lifecycle::guidance::symbol_read::symbol_kind_name_label;
+pub use crate::index_lifecycle::guidance::symbol_read::{
+    code_slice_from_indexed_file, code_slice_view, symbol_detail, symbol_detail_from_indexed_file,
+    symbol_detail_view,
+};
 
 /// Search for symbols matching a query (case-insensitive), with 3-tier scored ranking.
 ///
@@ -849,8 +852,10 @@ pub fn search_text_result_with_options(
     )
 }
 
-pub use crate::index_lifecycle::guidance::search_render::{SearchSuggestionContext, search_text_result_view};
 pub(crate) use crate::index_lifecycle::guidance::search_render::append_excluded_knowledge_note;
+pub use crate::index_lifecycle::guidance::search_render::{
+    SearchSuggestionContext, search_text_result_view,
+};
 
 /// Generate a depth-limited source file tree with symbol counts per file and directory.
 ///
@@ -880,7 +885,9 @@ pub fn file_tree_view_with_skipped(
     path: &str,
     depth: u32,
 ) -> String {
-    crate::index_lifecycle::guidance::read_context::file_tree_view_with_skipped(files, skipped, path, depth)
+    crate::index_lifecycle::guidance::read_context::file_tree_view_with_skipped(
+        files, skipped, path, depth,
+    )
 }
 /// Generate a directory-tree overview of the repo.
 ///
@@ -2141,10 +2148,12 @@ pub fn search_files(index: &LiveIndex, query: &str, limit: usize) -> String {
 
 pub use crate::index_lifecycle::guidance::search_render::search_files_result_view;
 
-pub use crate::index_lifecycle::guidance::file_read::{
-    file_content, file_content_from_indexed_file, file_content_from_indexed_file_with_context, file_content_view, not_found_file, not_found_file_match, not_found_symbol, GET_FILE_CONTENT_MAX_BYTES, append_nul_byte_warning, cap_file_content_output
-};
 pub(crate) use crate::index_lifecycle::guidance::file_read::render_file_content_bytes;
+pub use crate::index_lifecycle::guidance::file_read::{
+    GET_FILE_CONTENT_MAX_BYTES, append_nul_byte_warning, cap_file_content_output, file_content,
+    file_content_from_indexed_file, file_content_from_indexed_file_with_context, file_content_view,
+    not_found_file, not_found_file_match, not_found_symbol,
+};
 
 pub fn validate_file_syntax_result(path: &str, file: &IndexedFile) -> String {
     let mut lines = vec![
@@ -2203,8 +2212,6 @@ pub fn validate_file_syntax_result(path: &str, file: &IndexedFile) -> String {
     lines.join("\n")
 }
 
-/// "File not found: {path}"
-
 /// Explicit "outside the repository root" error for a path that escapes the
 /// indexed repo (e.g. `../../../etc/passwd`). Distinct from `not_found_file` so a
 /// traversal attempt is reported as a containment violation rather than a
@@ -2231,9 +2238,6 @@ pub use crate::index_lifecycle::guidance::read_admission_format::content_withhel
 /// Refusal for a file a PATH rule excluded: a credential container by name
 /// (`.env`, private keys, cloud credential stores). Names the rule.
 pub use crate::index_lifecycle::guidance::read_admission_format::content_withheld_by_path_rule;
-
-/// `1, 3-5, 9`: the first ten ranges; the scan keeps one more only to say
-/// there are more.
 
 /// Refusal for a file the admission pipeline could not INSPECT at all — over the
 /// deterministic scan budget, or not decodable as searchable text.
@@ -2349,27 +2353,29 @@ pub fn not_indexed_skipped_file(
     }
 }
 
-/// "No matches for '{query}' in {path}"
-
-
-/// "No symbol {name} in {path}. Close matches: {top 5 fuzzy matches}. Use get_file_context with sections=['outline'] for the full list."
-
-
 /// Simple edit-distance score for fuzzy matching (lower is closer).
+pub use crate::index_lifecycle::guidance::reference_read::{
+    find_dependents_compact_view, find_dependents_dot, find_dependents_mermaid,
+    find_dependents_result, find_dependents_result_view, find_references_compact_view,
+    find_references_result, find_references_result_view, implementations_result_view,
+};
 
-
-pub use crate::index_lifecycle::guidance::reference_read::{find_references_result, find_references_result_view, find_references_compact_view, implementations_result_view, find_dependents_result, find_dependents_result_view, find_dependents_compact_view, find_dependents_mermaid, find_dependents_dot};
-
-pub use crate::index_lifecycle::guidance::symbol_context::{context_bundle_result, context_bundle_result_view, context_bundle_impl_suggestion_tip, context_bundle_callees_text, context_bundle_result_view_with_max_tokens, trace_symbol_result_view};
-#[cfg(test)]
-use crate::index_lifecycle::guidance::symbol_context::{apply_verbosity, auto_summarize, heuristic_from_name, format_type_dependencies};
+use crate::index_lifecycle::guidance::source::CANONICAL_TRUNCATION_MARKER;
 #[cfg(test)]
 use crate::index_lifecycle::guidance::source::extract_signature;
-use crate::index_lifecycle::guidance::source::CANONICAL_TRUNCATION_MARKER;
+#[cfg(test)]
+use crate::index_lifecycle::guidance::symbol_context::{
+    apply_verbosity, auto_summarize, format_type_dependencies, heuristic_from_name,
+};
+pub use crate::index_lifecycle::guidance::symbol_context::{
+    context_bundle_callees_text, context_bundle_impl_suggestion_tip, context_bundle_result,
+    context_bundle_result_view, context_bundle_result_view_with_max_tokens,
+    trace_symbol_result_view,
+};
 
 pub use crate::index_lifecycle::guidance::source::{
-    enforce_token_budget, enforce_token_budget_flagged,
-    downgrade_full_completeness_after_truncation,
+    downgrade_full_completeness_after_truncation, enforce_token_budget,
+    enforce_token_budget_flagged,
 };
 
 /// The loading-guard refusal: "Index is loading...", then the indexing
@@ -2650,11 +2656,17 @@ pub use crate::index_lifecycle::guidance::file_read::resolve_read_max_tokens;
 pub use crate::index_lifecycle::guidance::file_read::estimate_tokens_from_chars;
 
 pub fn saved_tokens_whole_file(response_chars: usize, raw_chars: usize) -> u64 {
-    crate::index_lifecycle::guidance::read_context::saved_tokens_whole_file(response_chars, raw_chars)
+    crate::index_lifecycle::guidance::read_context::saved_tokens_whole_file(
+        response_chars,
+        raw_chars,
+    )
 }
 
 pub fn saved_tokens_vs_competent_manual(response_chars: usize, raw_chars: usize) -> u64 {
-    crate::index_lifecycle::guidance::read_context::saved_tokens_vs_competent_manual(response_chars, raw_chars)
+    crate::index_lifecycle::guidance::read_context::saved_tokens_vs_competent_manual(
+        response_chars,
+        raw_chars,
+    )
 }
 /// Baseline for search/reference listing tools without a single raw file length.
 pub fn estimate_listing_baseline_chars(output_chars: usize) -> usize {
@@ -2667,7 +2679,10 @@ pub fn estimate_listing_baseline_chars(output_chars: usize) -> usize {
 /// Estimate tokens saved by a structured response vs raw file content.
 /// Returns a one-line footer string, or empty string if no meaningful savings.
 pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String {
-    crate::index_lifecycle::guidance::read_context::compact_savings_footer(response_chars, raw_chars)
+    crate::index_lifecycle::guidance::read_context::compact_savings_footer(
+        response_chars,
+        raw_chars,
+    )
 }
 
 pub use crate::index_lifecycle::guidance::source::format_session_cache_hit_body;
@@ -2863,7 +2878,9 @@ pub fn format_frecency_last_bumps(entries: &[crate::live_index::frecency::BumpEn
     lines.join("\n")
 }
 
-pub use crate::index_lifecycle::guidance::search_render::{ExploreResultViewInput, explore_result_view};
+pub use crate::index_lifecycle::guidance::search_render::{
+    ExploreResultViewInput, explore_result_view,
+};
 
 /// Format git temporal data for a single file: churn, ownership, co-changes, last commit.
 pub fn co_changes_result_view(
@@ -3066,7 +3083,10 @@ pub fn diff_symbols_result_view(
     summary_only: bool,
 ) -> String {
     let view = crate::index_lifecycle::guidance::changes::capture_symbol_diff(
-        base, target, changed_files, |reference, path| {
+        base,
+        target,
+        changed_files,
+        |reference, path| {
             if reference.is_empty() {
                 crate::protocol::read_gate::admit_worktree_text(live, repo, path)
             } else {
@@ -3076,9 +3096,6 @@ pub fn diff_symbols_result_view(
     );
     crate::index_lifecycle::guidance::changes::render_symbol_diff(&view, compact, summary_only)
 }
-
-/// Check if a word is a well-known type keyword that would appear between
-/// `const` and the actual variable name in C#, Java, or TypeScript.
 
 /// Try to extract a declaration name from a line of code.
 #[cfg(test)]

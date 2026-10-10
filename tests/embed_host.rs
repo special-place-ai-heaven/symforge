@@ -9,10 +9,10 @@ use symforge::embed::parity::host::{
     HostRequest, HostResourceContent, HostResourceRequest, HostResponse, HostRights, HostRoom,
     HostRoomConfig, HostRoomGrant, HostRuntimeOwner, OperationControl, OperationStop,
 };
+use symforge::embed::parity::read::FileContentRequest;
 use symforge::embed::parity::{
     QueryLimits, QueryOperationKind, QueryOutput, QueryRefusalKind, QueryRequest,
 };
-use symforge::embed::parity::read::FileContentRequest;
 
 fn fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
@@ -330,7 +330,8 @@ fn room_session_retrieval_is_isolated_and_reset_expires_handles() {
     let control_b = room_b.control().expect("room control");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let HostResponse::Status(status) = room_a.dispatch(&HostRequest::Status, &control_a).unwrap()
+        let HostResponse::Status(status) =
+            room_a.dispatch(&HostRequest::Status, &control_a).unwrap()
         else {
             panic!("status response")
         };
@@ -423,7 +424,11 @@ fn withheld_file_refusal_carries_only_redacted_shared_metadata() {
     let metadata = refusal.withheld.as_ref().expect("shared redacted findings");
     assert_eq!(metadata.path, "config.json");
     assert!(!metadata.findings.is_empty());
-    assert!(!serde_json::to_string(&refusal).unwrap().contains(&synthetic));
+    assert!(
+        !serde_json::to_string(&refusal)
+            .unwrap()
+            .contains(&synthetic)
+    );
 }
 
 #[test]

@@ -712,7 +712,6 @@ pub(crate) fn open_regular_beneath(
 pub(crate) struct AnchoredEntryMetadata {
     pub len: u64,
     pub modified_secs: u64,
-    pub is_regular: bool,
 }
 
 #[cfg(any(feature = "server", feature = "embed"))]
@@ -739,10 +738,12 @@ pub(crate) fn entry_metadata_beneath(
             component: target.path(),
         });
     }
-    let modified = metadata.modified().map_err(|error| RootRefusal::Unreadable {
-        path: target.path(),
-        message: error.to_string(),
-    })?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.path(),
+            message: error.to_string(),
+        })?;
     Ok(Some(AnchoredEntryMetadata {
         len: metadata.len(),
         modified_secs: modified
@@ -750,7 +751,6 @@ pub(crate) fn entry_metadata_beneath(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        is_regular: metadata.is_file(),
     }))
 }
 
@@ -782,10 +782,13 @@ fn exact_spelling_from_dir(
         });
     };
     let mut exact = false;
-    for entry in directory.read_dir(".").map_err(|error| RootRefusal::Unreadable {
-        path: target.to_path_buf(),
-        message: error.to_string(),
-    })? {
+    for entry in directory
+        .read_dir(".")
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.to_path_buf(),
+            message: error.to_string(),
+        })?
+    {
         if entry
             .map_err(|error| RootRefusal::Unreadable {
                 path: target.to_path_buf(),
@@ -832,10 +835,12 @@ fn exact_spelling_from_dir(
             message: "path component is not a directory".to_owned(),
         });
     }
-    let child = directory.open_dir(name).map_err(|error| RootRefusal::Unreadable {
-        path: target.to_path_buf(),
-        message: error.to_string(),
-    })?;
+    let child = directory
+        .open_dir(name)
+        .map_err(|error| RootRefusal::Unreadable {
+            path: target.to_path_buf(),
+            message: error.to_string(),
+        })?;
     exact_spelling_from_dir(&child, components, target)
 }
 
@@ -871,10 +876,12 @@ pub(crate) fn observe_regular_beneath(
         message: error.to_string(),
     })?;
     let bytes = if let Some(max_bytes) = read_limit {
-        let limit = max_bytes.checked_add(1).ok_or_else(|| RootRefusal::Unreadable {
-            path: path.clone(),
-            message: "bounded read limit overflow".to_owned(),
-        })?;
+        let limit = max_bytes
+            .checked_add(1)
+            .ok_or_else(|| RootRefusal::Unreadable {
+                path: path.clone(),
+                message: "bounded read limit overflow".to_owned(),
+            })?;
         if before.len() > max_bytes as u64 {
             return Err(RootRefusal::Unreadable {
                 path,
@@ -1019,7 +1026,12 @@ pub(crate) fn list_directory_beneath(
         }
         // The owned child keeps the opened directory stable throughout this
         // chunk even if the path spelling changes concurrently.
-        return list_opened_directory(&lease.child_directory(relative, false)?, relative, max_entries).map(Some);
+        return list_opened_directory(
+            &lease.child_directory(relative, false)?,
+            relative,
+            max_entries,
+        )
+        .map(Some);
     };
     list_entries_from_dir(directory, lease.root(), relative, max_entries).map(Some)
 }
@@ -1030,7 +1042,12 @@ fn list_opened_directory(
     relative: &Path,
     max_entries: usize,
 ) -> Result<Vec<AnchoredDirectoryEntry>, RootRefusal> {
-    list_entries_from_dir(opened.directory_capability()?, opened.root(), relative, max_entries)
+    list_entries_from_dir(
+        opened.directory_capability()?,
+        opened.root(),
+        relative,
+        max_entries,
+    )
 }
 
 #[cfg(any(feature = "server", feature = "embed"))]
@@ -1041,19 +1058,25 @@ fn list_entries_from_dir(
     max_entries: usize,
 ) -> Result<Vec<AnchoredDirectoryEntry>, RootRefusal> {
     let mut entries = Vec::new();
-    for entry in directory.read_dir(".").map_err(|error| RootRefusal::Unreadable {
-        path: root.to_path_buf(),
-        message: error.to_string(),
-    })? {
+    for entry in directory
+        .read_dir(".")
+        .map_err(|error| RootRefusal::Unreadable {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?
+    {
         let entry = entry.map_err(|error| RootRefusal::Unreadable {
             path: root.to_path_buf(),
             message: error.to_string(),
         })?;
         let name = entry.file_name();
-        let metadata = directory.symlink_metadata(&name).map_err(|error| RootRefusal::Unreadable {
-            path: root.join(&name),
-            message: error.to_string(),
-        })?;
+        let metadata =
+            directory
+                .symlink_metadata(&name)
+                .map_err(|error| RootRefusal::Unreadable {
+                    path: root.join(&name),
+                    message: error.to_string(),
+                })?;
         let kind = if metadata.is_symlink() {
             AnchoredEntryKind::Link
         } else if metadata.is_dir() {
@@ -1123,6 +1146,7 @@ pub(crate) fn read_regular_beneath(
 
 /// Hash an opened regular file without buffering its whole contents. Replay
 /// postimage checks may cover files larger than the bounded content-read cap.
+#[cfg(feature = "embed")]
 pub(crate) fn digest_regular_beneath(
     lease: &PhysicalRootLease,
     relative: &Path,
@@ -1202,7 +1226,7 @@ pub(crate) fn read_regular_beneath_root(
 /// Read-only regular-file size through the same root capability and no-link
 /// checks as a bounded source read. This opens the file but never reads bytes,
 /// so aggregate estimates can account for files beyond the content scan cap.
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 pub(crate) fn regular_file_size_beneath_root(
     root: &Path,
     relative: &Path,
@@ -1212,6 +1236,7 @@ pub(crate) fn regular_file_size_beneath_root(
 }
 
 /// Read-only metadata from an already pinned root capability.
+#[cfg(feature = "embed")]
 pub(crate) fn regular_file_size_beneath(
     lease: &PhysicalRootLease,
     relative: &Path,
@@ -1233,7 +1258,11 @@ pub(crate) fn sync_root_file_beneath(
     relative: &Path,
 ) -> Result<(), RootRefusal> {
     let target = lease.resolve_beneath(relative)?;
-    if target.relative().parent().is_some_and(|parent| !parent.as_os_str().is_empty()) {
+    if target
+        .relative()
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
         return Err(RootRefusal::EscapesRoot {
             requested: relative.to_path_buf(),
         });
@@ -1249,11 +1278,12 @@ pub(crate) fn sync_root_file_beneath(
         message: error.to_string(),
     })?;
     #[cfg(unix)]
-    sync_directory_beneath_capability(lease.capability()?)
-        .map_err(|error| RootRefusal::Unreadable {
+    sync_directory_beneath_capability(lease.capability()?).map_err(|error| {
+        RootRefusal::Unreadable {
             path: lease.root().to_path_buf(),
             message: error.to_string(),
-        })?;
+        }
+    })?;
     #[cfg(not(any(unix, windows)))]
     return Err(RootRefusal::Unreadable {
         path: lease.root().to_path_buf(),
@@ -1495,13 +1525,21 @@ pub(crate) fn durable_replace_root_file_beneath<E>(
 ) -> Result<(), DurableReplaceError<E>> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
-    let target = lease.resolve_beneath(relative).map_err(DurableReplaceError::Root)?;
-    if target.relative().parent().is_some_and(|parent| !parent.as_os_str().is_empty()) {
+    let target = lease
+        .resolve_beneath(relative)
+        .map_err(DurableReplaceError::Root)?;
+    if target
+        .relative()
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
         return Err(DurableReplaceError::Root(RootRefusal::EscapesRoot {
             requested: relative.to_path_buf(),
         }));
     }
-    lease.refuse_link_relative(target.relative()).map_err(DurableReplaceError::Root)?;
+    lease
+        .refuse_link_relative(target.relative())
+        .map_err(DurableReplaceError::Root)?;
     let dir = lease.capability().map_err(DurableReplaceError::Root)?;
     let unreadable = |path: PathBuf, error: std::io::Error| {
         DurableReplaceError::Root(RootRefusal::Unreadable {
@@ -1581,7 +1619,9 @@ pub(crate) fn durable_replace_root_file_beneath<E>(
     file.sync_all()
         .map_err(|error| unreadable(lease.root().join(&temp_relative), error))?;
     stage(DurableReplaceStage::TempSynced, &mut file).map_err(DurableReplaceError::Stage)?;
-    lease.refuse_link_relative(target.relative()).map_err(DurableReplaceError::Root)?;
+    lease
+        .refuse_link_relative(target.relative())
+        .map_err(DurableReplaceError::Root)?;
     if !lease.is_live() {
         return Err(DurableReplaceError::Root(RootRefusal::LeaseRevoked));
     }
@@ -1593,7 +1633,8 @@ pub(crate) fn durable_replace_root_file_beneath<E>(
         .map_err(|error| unreadable(target.path(), error))?;
     cleanup.armed = false;
     stage(DurableReplaceStage::Replaced, &mut file).map_err(DurableReplaceError::Stage)?;
-    file.sync_all().map_err(|error| unreadable(target.path(), error))?;
+    file.sync_all()
+        .map_err(|error| unreadable(target.path(), error))?;
     #[cfg(unix)]
     sync_directory_beneath_capability(dir)
         .map_err(|error| unreadable(lease.root().to_path_buf(), error))?;
@@ -1753,15 +1794,13 @@ fn stage_replacement_with_policy(
         });
     };
 
-    if owner_only {
-        if let Err(error) = protect_owner_only(&handle) {
-            drop(handle);
-            let _ = dir.remove_file(&temp_relative);
-            return Err(RootRefusal::Unreadable {
-                path: lease.root().join(&temp_relative),
-                message: error.to_string(),
-            });
-        }
+    if owner_only && let Err(error) = protect_owner_only(&handle) {
+        drop(handle);
+        let _ = dir.remove_file(&temp_relative);
+        return Err(RootRefusal::Unreadable {
+            path: lease.root().join(&temp_relative),
+            message: error.to_string(),
+        });
     }
 
     let written = handle.write_all(contents).and_then(|()| handle.sync_all());
@@ -1902,6 +1941,7 @@ mod capability_read_tests {
         assert!(read_regular_beneath_root(root.path(), Path::new("../escape"), 64).is_err());
     }
 
+    #[cfg(feature = "embed")]
     #[test]
     fn regular_size_observes_large_file_without_reading_its_content() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -1962,6 +2002,7 @@ mod capability_read_tests {
         assert!(list_directory_beneath(&lease, Path::new("nested"), 0).is_err());
     }
 
+    #[cfg(feature = "embed")]
     #[test]
     fn streamed_digest_covers_large_regular_file_and_refuses_invalid_targets() {
         let root = tempfile::tempdir().expect("temporary root");

@@ -222,8 +222,14 @@ fn state_directory_fences_project_and_isolates_room_scopes() {
     let first_lease = acquired(room_a.reserve(&key, &request).unwrap());
     let _second_lease = acquired(room_b.reserve(&key, &request).unwrap());
     room_a.mark_started(&first_lease).unwrap();
-    assert_eq!(room_a.inspect(&key).unwrap().unwrap().state, ReplayState::Started);
-    assert_eq!(room_b.inspect(&key).unwrap().unwrap().state, ReplayState::NotStarted);
+    assert_eq!(
+        room_a.inspect(&key).unwrap().unwrap().state,
+        ReplayState::Started
+    );
+    assert_eq!(
+        room_b.inspect(&key).unwrap().unwrap().state,
+        ReplayState::NotStarted
+    );
 }
 
 #[test]
@@ -439,10 +445,12 @@ fn copied_replay_state_cannot_rebind_to_replaced_physical_root_after_restart() {
     drop(store);
 
     let first = dir.path().join("same-root-child");
-    assert!(child("inspect_binding", &root, &state, &first)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        child("inspect_binding", &root, &state, &first)
+            .status()
+            .unwrap()
+            .success()
+    );
     assert_eq!(fs::read(&first).unwrap(), b"completed");
 
     let old_root = dir.path().join("original-physical-root");
@@ -468,11 +476,16 @@ fn copied_replay_state_cannot_rebind_to_replaced_physical_root_after_restart() {
             }
         }
     }
-    assert!(copied_db, "the physical-root probe must copy the live replay DB");
+    assert!(
+        copied_db,
+        "the physical-root probe must copy the live replay DB"
+    );
     let second = dir.path().join("replacement-root-child");
-    assert!(child("inspect_binding", &root, &copied_state, &second)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        child("inspect_binding", &root, &copied_state, &second)
+            .status()
+            .unwrap()
+            .success()
+    );
     assert_eq!(fs::read(&second).unwrap(), b"wrong_physical_root");
 }

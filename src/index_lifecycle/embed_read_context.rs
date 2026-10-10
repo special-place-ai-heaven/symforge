@@ -83,7 +83,10 @@ pub(super) fn repo_map(
                 .files
                 .iter()
                 .filter(|file| {
-                    request.path.as_ref().is_none_or(|path| file.relative_path.starts_with(path))
+                    request
+                        .path
+                        .as_ref()
+                        .is_none_or(|path| file.relative_path.starts_with(path))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -137,10 +140,9 @@ pub(super) fn repo_map(
         rendered.push_str("\n\n");
         rendered.push_str(&knowledge_model::render_repository_knowledge_map(published));
     }
-    if let Some(note) = read_context::withheld_not_searched_note(
-        published.live.withheld_since_restore(),
-        None,
-    ) {
+    if let Some(note) =
+        read_context::withheld_not_searched_note(published.live.withheld_since_restore(), None)
+    {
         rendered.push_str("\n\n");
         rendered.push_str(&note);
     }
@@ -195,9 +197,7 @@ pub(super) fn repo_map(
     }))
 }
 
-pub(super) fn validate_file_context(
-    request: &FileContextRequest,
-) -> Result<(), QueryRefusalKind> {
+pub(super) fn validate_file_context(request: &FileContextRequest) -> Result<(), QueryRefusalKind> {
     validate_path(&request.path, false)?;
     if request.max_tokens == Some(0) {
         return Err(QueryRefusalKind::InvalidRequest);
@@ -242,9 +242,9 @@ pub(super) fn file_context(
             cache_hit: false,
         }));
     }
-    if let Some((handle, body)) = session.and_then(|session| {
-        session.file_context_cache_hit(snapshot, request, budget.limits())
-    }) {
+    if let Some((handle, body)) = session
+        .and_then(|session| session.file_context_cache_hit(snapshot, request, budget.limits()))
+    {
         budget.charge_bytes(request.path.len())?;
         let rendered = budget.text(&body)?;
         budget.reused_handle = Some(handle);
@@ -331,7 +331,8 @@ pub(super) fn file_context(
         if large_default_summary {
             let note = format!(
                 "Large file summary: outline+imports only ({} symbols, {} references); omitted consumers/references/git; request sections=[\"consumers\"], sections=[\"references\"], sections=[\"git\"] or higher max_tokens.",
-                file.symbols.len(), file.references.len()
+                file.symbols.len(),
+                file.references.len()
             );
             body = if let Some((envelope, rest)) = body.split_once("\n\n") {
                 format!("{envelope}\n\n{note}\n\n{rest}")
@@ -374,7 +375,9 @@ pub(super) fn file_context(
                 .any(|section| section == "consumers" || section == "references")
     });
     let withheld_note = project_wide
-        .then(|| read_context::withheld_not_searched_note(published.live.withheld_since_restore(), None))
+        .then(|| {
+            read_context::withheld_not_searched_note(published.live.withheld_since_restore(), None)
+        })
         .flatten();
     if truncated {
         let mixed_knowledge_sections = request.sections.as_ref().is_some_and(|sections| {
@@ -415,7 +418,12 @@ pub(super) fn file_context(
         cache_hit: false,
     };
     budget.charge_bytes(
-        full.path.len() + full.selected_sections.iter().map(String::len).sum::<usize>(),
+        full.path.len()
+            + full
+                .selected_sections
+                .iter()
+                .map(String::len)
+                .sum::<usize>(),
     )?;
     budget.cache_output = Some(QueryOutput::FileContext(full));
     budget.cache_truncated = truncated;

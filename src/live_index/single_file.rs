@@ -372,6 +372,9 @@ pub(crate) fn admit_and_index_single_path_with_receipt(
 /// and the caller sends that path through the canonical seam instead. `base`
 /// is the row the stat pass saw; matching bytes reuse it without a parse.
 #[cfg(all(feature = "server", not(feature = "embed")))]
+// Staged snapshot-verify parity work, see the `health` row of
+// docs/contracts/embed-parity-v1-coverage.md; no caller until it lands.
+#[allow(dead_code)]
 pub(crate) fn prepare_snapshot_verify_admission(
     relative_path: &str,
     abs_path: &Path,

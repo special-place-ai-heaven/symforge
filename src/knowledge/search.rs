@@ -251,7 +251,9 @@ pub(crate) fn budget_summary(rendered: &str, max_tokens: Option<u64>) -> String 
 
 pub(crate) struct KnowledgeSearchProjection {
     pub rendered: String,
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))] // read only by embed_* consumers
     pub retrieval: Option<KnowledgeRetrieveResult>,
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))] // read only by embed_* consumers
     pub scope: KnowledgeSourceScope,
 }
 

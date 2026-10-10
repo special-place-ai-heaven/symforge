@@ -193,7 +193,9 @@ fn committed_batch_overflow_has_bound_recovery_and_replays_after_rebind() {
         assert!(Instant::now() < deadline, "refresh did not publish");
         std::thread::sleep(Duration::from_millis(10));
     }
-    small.close(&control).expect("close old source before rebind");
+    small
+        .close(&control)
+        .expect("close old source before rebind");
     let large = room(root.path(), 65_536, rights);
     let large_control = large.control().expect("room control");
     let full = large
@@ -216,8 +218,11 @@ fn committed_batch_overflow_has_bound_recovery_and_replays_after_rebind() {
 fn shared_source_rooms_isolate_replay_keys_and_fence_duplicate_active_ids() {
     let root = tempfile::tempdir().expect("repository");
     git2::Repository::init(root.path()).expect("git repository");
-    fs::write(root.path().join("lib.rs"), b"pub fn target() -> u32 { 1 }\n")
-        .expect("source");
+    fs::write(
+        root.path().join("lib.rs"),
+        b"pub fn target() -> u32 { 1 }\n",
+    )
+    .expect("source");
     let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
     let rights = HostRights {
         edit: true,
@@ -242,7 +247,10 @@ fn shared_source_rooms_isolate_replay_keys_and_fence_duplicate_active_ids() {
     let first = open("first-room").expect("first room");
     let second = open("second-room").expect("second room");
     assert_eq!(
-        open("first-room").err().expect("duplicate active room refused").kind,
+        open("first-room")
+            .err()
+            .expect("duplicate active room refused")
+            .kind,
         HostRefusalKind::Denied
     );
     let control = first.control().expect("control");

@@ -169,14 +169,14 @@ mod process_replay_tests {
             let child = crate::process_util::hidden_command(
                 std::env::current_exe().expect("test executable"),
             )
-                .arg("completed_batch_replay_survives_process_restart")
-                .arg("--nocapture")
-                .env("SYMFORGE_EMBED_REPLAY_CHILD_ROOT", repository.path())
-                .env("SYMFORGE_EMBED_REPLAY_GUARD", &wire_path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .expect("child test process");
+            .arg("completed_batch_replay_survives_process_restart")
+            .arg("--nocapture")
+            .env("SYMFORGE_EMBED_REPLAY_CHILD_ROOT", repository.path())
+            .env("SYMFORGE_EMBED_REPLAY_GUARD", &wire_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("child test process");
             assert!(child.success(), "child failed to complete guarded mutation");
             let request: WireEditRequest =
                 serde_json::from_slice(&fs::read(&wire_path).expect("serialized edit request"))

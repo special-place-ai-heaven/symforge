@@ -3927,7 +3927,7 @@ impl ProjectInstance {
                 &source_authority,
                 &background_load,
             )
-                .map(|index| (index, ColdIndex::Loaded)),
+            .map(|index| (index, ColdIndex::Loaded)),
         };
         let index = match bootstrapped {
             Ok((index, ColdIndex::Loaded)) => {
@@ -4381,7 +4381,12 @@ fn bootstrap_project_index(
     source_authority: &Arc<live_index::index_lifecycle::activation::ProjectSourceAuthority>,
     background: &Arc<BackgroundLoad>,
 ) -> anyhow::Result<SharedIndex> {
-    match restore_project_snapshot(canonical_root, state_placement, source_authority, background)? {
+    match restore_project_snapshot(
+        canonical_root,
+        state_placement,
+        source_authority,
+        background,
+    )? {
         Some(index) => Ok(index),
         None => cold_load_project_index(canonical_root, state_placement),
     }
@@ -4627,9 +4632,12 @@ fn bootstrap_project_index_within(
     persistence_status: CapabilityStatus,
     background: &Arc<BackgroundLoad>,
 ) -> anyhow::Result<(SharedIndex, ColdIndex)> {
-    if let Some(index) =
-        restore_project_snapshot(canonical_root, state_placement, source_authority, background)?
-    {
+    if let Some(index) = restore_project_snapshot(
+        canonical_root,
+        state_placement,
+        source_authority,
+        background,
+    )? {
         return Ok((index, ColdIndex::Loaded));
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -4723,12 +4731,9 @@ fn restore_project_snapshot(
 ) -> anyhow::Result<Option<SharedIndex>> {
     let source_exclusions =
         crate::discovery::SourceExclusions::for_state_placement(canonical_root, state_placement);
-    if let Some(snapshot) = live_index::persist::load_snapshot_bound(
-        canonical_root,
-        state_placement,
-        source_authority,
-    )
-    .map_err(|refusal| anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"))?
+    if let Some(snapshot) =
+        live_index::persist::load_snapshot_bound(canonical_root, state_placement, source_authority)
+            .map_err(|refusal| anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"))?
     {
         let file_count = snapshot.files.len();
         let snapshot_mtimes: HashMap<String, u64> = snapshot

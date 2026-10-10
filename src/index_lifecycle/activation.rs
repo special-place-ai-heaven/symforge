@@ -688,6 +688,7 @@ impl ProjectSourceAuthority {
 
     /// Attribute a bounded disk read to this authority's admitted physical root
     /// and its exact live publication. This grants no mutation capability.
+    #[cfg(feature = "embed")]
     pub(crate) fn read_regular_beneath_expected(
         &self,
         expected: PublicationIdentity,
@@ -710,7 +711,8 @@ impl ProjectSourceAuthority {
         observe: impl FnOnce(&mut std::fs::File) -> Result<R, super::physical_root::RootRefusal>,
     ) -> Result<Option<R>, AuthorityRefusal> {
         self.with_anchored_read(Some(expected), |lease| {
-            let Some((file, _)) = super::physical_root::open_regular_beneath(lease, relative)? else {
+            let Some((file, _)) = super::physical_root::open_regular_beneath(lease, relative)?
+            else {
                 return Ok(None);
             };
             let mut file = file.into_std();
@@ -732,6 +734,7 @@ impl ProjectSourceAuthority {
 
     /// Stream a replay postimage digest from the admitted root, including while
     /// that publication is refreshing. The opened file never follows a link.
+    #[cfg(feature = "embed")]
     pub(crate) fn digest_regular_beneath_anchor(
         &self,
         relative: &Path,
@@ -750,6 +753,7 @@ impl ProjectSourceAuthority {
         })
     }
 
+    #[cfg(feature = "embed")]
     pub(crate) fn regular_file_size_beneath_expected(
         &self,
         expected: PublicationIdentity,
@@ -999,6 +1003,7 @@ impl ObservationLane {
 
 impl WriteAuthority {
     /// Bounded read from the same physical root lease that will perform writes.
+    #[cfg(feature = "embed")]
     pub(crate) fn read_regular_beneath(
         &self,
         relative: &Path,
@@ -1363,7 +1368,8 @@ impl ProjectRuntimeHandle {
                 Ok(operation(root, state_dir, &authority))
             };
             if let Some(slot) = &self.admission {
-                slot.with_live_write_scope(run).and_then(std::convert::identity)
+                slot.with_live_write_scope(run)
+                    .and_then(std::convert::identity)
             } else {
                 run()
             }

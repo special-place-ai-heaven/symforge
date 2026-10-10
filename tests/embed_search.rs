@@ -3,26 +3,49 @@
 #[test]
 fn search_token_caps_keep_full_shared_result_in_session_cache() {
     let root = tempfile::tempdir().unwrap();
-    let source = (0..24).map(|i| format!("pub fn selected_{i}() {{}}\n")).collect::<String>();
+    let source = (0..24)
+        .map(|i| format!("pub fn selected_{i}() {{}}\n"))
+        .collect::<String>();
     std::fs::write(root.path().join("lib.rs"), source).unwrap();
     let runtime = ProcessIndexRuntime::acquire().unwrap();
     let handle = open(&runtime, root.path());
     let session = handle.new_query_session().unwrap();
-    let result = handle.query_with_session(
-        &QueryRequest::SymbolSearch(SymbolSearchRequest {
-            query: Some("selected".into()), limit: Some(24), max_tokens: Some(120),
-            ..Default::default()
-        }),
-        QueryLimits::default(), &session, None,
-    ).unwrap();
+    let result = handle
+        .query_with_session(
+            &QueryRequest::SymbolSearch(SymbolSearchRequest {
+                query: Some("selected".into()),
+                limit: Some(24),
+                max_tokens: Some(120),
+                ..Default::default()
+            }),
+            QueryLimits::default(),
+            &session,
+            None,
+        )
+        .unwrap();
     assert!(result.truncated());
-    let full = handle.query_with_session(
-        &QueryRequest::Retrieve { handle: result.retrieve_handle().unwrap().into(), offset: 0 },
-        QueryLimits::default(), &session, None,
-    ).unwrap();
-    let QueryOutput::RetrievedOutput(full) = full.value() else { panic!("full search cache"); };
+    let full = handle
+        .query_with_session(
+            &QueryRequest::Retrieve {
+                handle: result.retrieve_handle().unwrap().into(),
+                offset: 0,
+            },
+            QueryLimits::default(),
+            &session,
+            None,
+        )
+        .unwrap();
+    let QueryOutput::RetrievedOutput(full) = full.value() else {
+        panic!("full search cache");
+    };
     let output: serde_json::Value = serde_json::from_slice(&full.bytes).unwrap();
-    assert_eq!(output["output"]["SymbolSearch"]["symbols"].as_array().unwrap().len(), 24);
+    assert_eq!(
+        output["output"]["SymbolSearch"]["symbols"]
+            .as_array()
+            .unwrap()
+            .len(),
+        24
+    );
 }
 
 use std::fs;

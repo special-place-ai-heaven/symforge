@@ -1696,6 +1696,7 @@ fn verify_in_flight(state: &SnapshotVerifyState) -> bool {
 
 /// Whether the file still has the size and mtime it was read at.
 #[cfg(any(not(feature = "embed"), test))]
+#[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
 fn snapshot_verified_stamp_matches(scouted: &crate::domain::ScoutedEntry) -> bool {
     let Some(path) = scouted.absolute_path.as_deref() else {
         return false;
@@ -4680,6 +4681,7 @@ impl SharedIndexHandle {
     ///
     /// `None` means the project was retargeted and nothing was published.
     #[cfg(any(not(feature = "embed"), test))]
+    #[cfg(any(test, not(any(feature = "server", feature = "embed"))))]
     pub(crate) fn publish_snapshot_verify_at_generation(
         &self,
         expected_gen: u64,
@@ -4703,6 +4705,7 @@ impl SharedIndexHandle {
     /// The same publication transaction with caller-bound filesystem checks.
     /// Native callers observe each path through their retained source anchor;
     /// the ordinary wrapper retains its existing metadata checks unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_snapshot_verify_with_observation(
         &self,
         expected_gen: u64,

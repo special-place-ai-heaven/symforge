@@ -13,21 +13,44 @@ use symforge::embed::{
 #[test]
 fn reference_query_row_budget_includes_nested_callsite_evidence() {
     let root = tempfile::tempdir().unwrap();
-    let calls = (0..24).map(|_| "    external_call();\n").collect::<String>();
-    fs::write(root.path().join("lib.rs"), format!("pub fn caller() {{\n{calls}}}\n")).unwrap();
+    let calls = (0..24)
+        .map(|_| "    external_call();\n")
+        .collect::<String>();
+    fs::write(
+        root.path().join("lib.rs"),
+        format!("pub fn caller() {{\n{calls}}}\n"),
+    )
+    .unwrap();
     let runtime = ProcessIndexRuntime::acquire().unwrap();
     let handle = open(&runtime, root.path());
-    let claim = handle.query(
-        &QueryRequest::ReferenceSearch(ReferenceSearchRequest {
-            name: "external_call".into(), kind: Some("call".into()),
-            max_per_file: Some(50), ..Default::default()
-        }),
-        QueryLimits {max_results:3,max_bytes:65536},
-    ).unwrap();
-    let QueryOutput::ReferenceSearch(result)=claim.value() else {panic!("references")};
-    let records=result.files.iter().map(|file| file.hits.len()+file.caller_declarations.len()).sum::<usize>()
-        + result.target_candidates.len()+result.implementations.len();
-    assert!(records <= 3, "nested evidence records exceed the aggregate row bound");
+    let claim = handle
+        .query(
+            &QueryRequest::ReferenceSearch(ReferenceSearchRequest {
+                name: "external_call".into(),
+                kind: Some("call".into()),
+                max_per_file: Some(50),
+                ..Default::default()
+            }),
+            QueryLimits {
+                max_results: 3,
+                max_bytes: 65536,
+            },
+        )
+        .unwrap();
+    let QueryOutput::ReferenceSearch(result) = claim.value() else {
+        panic!("references")
+    };
+    let records = result
+        .files
+        .iter()
+        .map(|file| file.hits.len() + file.caller_declarations.len())
+        .sum::<usize>()
+        + result.target_candidates.len()
+        + result.implementations.len();
+    assert!(
+        records <= 3,
+        "nested evidence records exceed the aggregate row bound"
+    );
     assert!(claim.truncated());
     assert!(claim.usage().rows <= 3);
 }
@@ -47,23 +70,35 @@ fn open(runtime: &ProcessIndexRuntime, root: &std::path::Path) -> EmbeddedSource
 #[test]
 fn implementation_estimate_does_not_spend_budget_on_unreturned_evidence() {
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("lib.rs"), "pub trait Contract {}\npub struct Item;\nimpl Contract for Item {}\n").unwrap();
+    fs::write(
+        root.path().join("lib.rs"),
+        "pub trait Contract {}\npub struct Item;\nimpl Contract for Item {}\n",
+    )
+    .unwrap();
     let runtime = ProcessIndexRuntime::acquire().unwrap();
     let handle = open(&runtime, root.path());
-    let claim = handle.query(
-        &QueryRequest::ReferenceSearch(ReferenceSearchRequest {
-            name: "Contract".into(), mode: Some("implementations".into()),
-            estimate: Some(true), ..Default::default()
-        }),
-        QueryLimits { max_results: 1, max_bytes: 4096 },
-    ).unwrap();
-    let QueryOutput::ReferenceSearch(result) = claim.value() else { panic!("estimate") };
+    let claim = handle
+        .query(
+            &QueryRequest::ReferenceSearch(ReferenceSearchRequest {
+                name: "Contract".into(),
+                mode: Some("implementations".into()),
+                estimate: Some(true),
+                ..Default::default()
+            }),
+            QueryLimits {
+                max_results: 1,
+                max_bytes: 4096,
+            },
+        )
+        .unwrap();
+    let QueryOutput::ReferenceSearch(result) = claim.value() else {
+        panic!("estimate")
+    };
     assert!(result.estimated_tokens.unwrap() > 0);
     assert!(result.implementations.is_empty());
     assert_eq!(claim.usage().rows, 1);
     assert!(!claim.truncated());
 }
-
 
 #[test]
 fn reference_search_keeps_caller_declarations_scoping_limits_and_implementations() {

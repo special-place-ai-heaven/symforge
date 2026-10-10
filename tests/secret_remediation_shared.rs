@@ -77,7 +77,10 @@ async fn multi_file_externalize_uses_one_guarded_commit_and_exact_replay() {
         "other_response"
     };
     assert!(text.contains("apply"), "guarded apply category: {category}");
-    assert!(!text.contains(&synthetic), "response exposed selected source bytes");
+    assert!(
+        !text.contains(&synthetic),
+        "response exposed selected source bytes"
+    );
     for path in ["config/first.json", "config/second.json"] {
         let after = std::fs::read_to_string(repository.path().join(path)).unwrap();
         let refusal_class = if text.contains("source binding changed") {
@@ -108,6 +111,12 @@ async fn multi_file_externalize_uses_one_guarded_commit_and_exact_replay() {
     }
     let replay = dispatch(&server, "secret_remediate", input).await;
     let replay_text = replay["content"][0]["text"].as_str().unwrap();
-    assert!(replay_text.contains("apply"), "same key did not replay applied result");
-    assert!(!replay_text.contains(&synthetic), "replay exposed selected source bytes");
+    assert!(
+        replay_text.contains("apply"),
+        "same key did not replay applied result"
+    );
+    assert!(
+        !replay_text.contains(&synthetic),
+        "replay exposed selected source bytes"
+    );
 }

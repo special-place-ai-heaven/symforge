@@ -1466,7 +1466,10 @@ impl LiveIndex {
         include_personal_tooling: bool,
     ) -> SearchFilesResolveView {
         self.capture_search_files_resolve_view_with_scope(
-            hint, include_vendor, include_personal_tooling, &PathScope::Any,
+            hint,
+            include_vendor,
+            include_personal_tooling,
+            &PathScope::Any,
         )
     }
 

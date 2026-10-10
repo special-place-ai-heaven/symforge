@@ -160,52 +160,6 @@ pub(crate) enum GuardedWriteOutcome {
 /// strictly BEFORE the write-time on-disk re-read, so the subsequent re-read
 /// observes the injected divergence deterministically (no sleep, no extra
 /// thread). It is compiled out of release builds.
-#[cfg(test)]
-mod write_interleave {
-    use std::cell::RefCell;
-
-    type Hook = Box<dyn Fn()>;
-
-    thread_local! {
-        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// RAII guard that uninstalls the hook on drop so tests cannot leak it
-    /// across the thread-local into a sibling test on the same thread.
-    #[cfg(feature = "server")]
-    pub(crate) struct InterleaveGuard;
-
-    #[cfg(feature = "server")]
-    impl Drop for InterleaveGuard {
-        fn drop(&mut self) {
-            HOOK.with(|h| *h.borrow_mut() = None);
-        }
-    }
-
-    /// Install a callback fired at the next guarded-write interleave point.
-    ///
-    /// The hook is consumed on first fire (see [`fire`]), so it runs at most
-    /// once per `install` — a second guarded write on the same thread does not
-    /// re-trigger it. This keeps the T022 interleave deterministic: exactly one
-    /// simulated concurrent write lands in the guarded window.
-    #[cfg(feature = "server")]
-    pub(crate) fn install(hook: impl Fn() + 'static) -> InterleaveGuard {
-        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-        InterleaveGuard
-    }
-
-    /// Fire the installed hook if one is present, consuming it so it fires at
-    /// most once. Called from the guarded write path before the on-disk
-    /// re-read. `take()` removes the hook before invoking it so a re-entrant or
-    /// subsequent guarded write does not fire it again.
-    pub(crate) fn fire() {
-        let hook = HOOK.with(|h| h.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-}
-
 #[cfg(all(test, feature = "server"))]
 pub(crate) use write_interleave::install as install_write_interleave_hook;
 
@@ -357,4 +311,50 @@ pub(crate) fn format_tee_snapshot_suffix(report: &AtomicWriteReport) -> String {
         .response_hint()
         .map(|hint| format!("\n{hint}"))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod write_interleave {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// RAII guard that uninstalls the hook on drop so tests cannot leak it
+    /// across the thread-local into a sibling test on the same thread.
+    #[cfg(feature = "server")]
+    pub(crate) struct InterleaveGuard;
+
+    #[cfg(feature = "server")]
+    impl Drop for InterleaveGuard {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Install a callback fired at the next guarded-write interleave point.
+    ///
+    /// The hook is consumed on first fire (see [`fire`]), so it runs at most
+    /// once per `install` — a second guarded write on the same thread does not
+    /// re-trigger it. This keeps the T022 interleave deterministic: exactly one
+    /// simulated concurrent write lands in the guarded window.
+    #[cfg(feature = "server")]
+    pub(crate) fn install(hook: impl Fn() + 'static) -> InterleaveGuard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        InterleaveGuard
+    }
+
+    /// Fire the installed hook if one is present, consuming it so it fires at
+    /// most once. Called from the guarded write path before the on-disk
+    /// re-read. `take()` removes the hook before invoking it so a re-entrant or
+    /// subsequent guarded write does not fire it again.
+    pub(crate) fn fire() {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }

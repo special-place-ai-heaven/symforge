@@ -81,7 +81,6 @@ pub(crate) fn lenient_u32_required<'de, D: Deserializer<'de>>(
     }
 }
 
-
 /// Deserialize an `i64` from either a JSON number or a stringified number.
 pub(crate) fn lenient_i64<'de, D: Deserializer<'de>>(
     deserializer: D,
@@ -100,7 +99,6 @@ pub(crate) fn lenient_i64<'de, D: Deserializer<'de>>(
         NumOrStr::Null => Ok(None),
     }
 }
-
 
 /// Leniently deserialize a `Vec<T>` — accepts a native JSON array, a stringified
 /// JSON array (as sent by some MCP clients like Kilo Code), or a native array of
@@ -481,7 +479,9 @@ pub struct InspectMatchInput {
     pub max_tokens: Option<u64>,
 }
 
-pub(crate) use crate::index_lifecycle::guidance::read_contract::{normalize_file_content_aliases, file_content_options_from_input};
+pub(crate) use crate::index_lifecycle::guidance::read_contract::{
+    file_content_options_from_input, normalize_file_content_aliases,
+};
 
 fn add_sections_allowlist(schema: &mut Schema, values: &[&str]) {
     if let Some(serde_json::Value::Object(properties)) = schema.get_mut("properties")

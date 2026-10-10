@@ -33,8 +33,11 @@ pub(crate) enum BatchAbort {
         index: usize,
     },
     Cancelled {
+        #[cfg_attr(not(feature = "embed"), allow(dead_code))] // read only by embed_* consumers
         attempted: usize,
+        #[cfg_attr(not(feature = "embed"), allow(dead_code))] // read only by embed_* consumers
         restored: usize,
+        #[cfg_attr(not(feature = "embed"), allow(dead_code))] // read only by embed_* consumers
         uncertain: Vec<usize>,
     },
     WriteFailed {
@@ -45,6 +48,7 @@ pub(crate) enum BatchAbort {
     },
 }
 
+#[cfg(feature = "embed")]
 impl BatchAbort {
     pub(crate) fn no_source_write(&self) -> bool {
         matches!(
@@ -392,6 +396,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embed")]
     #[test]
     fn third_image_is_never_overwritten_during_rollback() {
         let root = tempfile::tempdir().expect("temporary root");

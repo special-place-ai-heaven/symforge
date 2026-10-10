@@ -198,10 +198,12 @@ fn changes_bound_rows_preserve_full_cache_and_reject_unknown_filters() {
         panic!("full changes")
     };
     let full: serde_json::Value = serde_json::from_slice(&restored.bytes).unwrap();
-    assert!(full["output"]["WhatChanged"]["rendered"]
-        .as_str()
-        .unwrap()
-        .contains("two.rs"));
+    assert!(
+        full["output"]["WhatChanged"]["rendered"]
+            .as_str()
+            .unwrap()
+            .contains("two.rs")
+    );
     let estimate = handle
         .query(
             &QueryRequest::WhatChanged(WhatChangedRequest {
@@ -225,8 +227,10 @@ fn changes_bound_rows_preserve_full_cache_and_reject_unknown_filters() {
         )
         .unwrap_err();
     assert_eq!(refusal.kind(), QueryRefusalKind::UnsupportedOption);
-    assert!(serde_json::from_value::<WhatChangedRequest>(
-        serde_json::json!({"since":0,"ignore_scope":true})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<WhatChangedRequest>(
+            serde_json::json!({"since":0,"ignore_scope":true})
+        )
+        .is_err()
+    );
 }

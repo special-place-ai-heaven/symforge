@@ -370,7 +370,12 @@ impl ReplayStore {
         scope: &str,
         expected_anchor: [u8; 16],
     ) -> Result<Self, ReplayError> {
-        Self::open_with_anchor(project_root, project_state_dir, scope, Some(expected_anchor))
+        Self::open_with_anchor(
+            project_root,
+            project_state_dir,
+            scope,
+            Some(expected_anchor),
+        )
     }
 
     fn open_with_anchor(
@@ -387,7 +392,8 @@ impl ReplayStore {
             return Err(ReplayError::InvalidStatePath);
         }
         let root = fs::canonicalize(project_root)?;
-        let root_lease = crate::live_index::index_lifecycle::physical_root::PhysicalRootLease::take(&root);
+        let root_lease =
+            crate::live_index::index_lifecycle::physical_root::PhysicalRootLease::take(&root);
         let root_anchor_key = root_lease
             .opened_stable_key()
             .ok_or(ReplayError::WrongPhysicalRoot)?;
@@ -396,7 +402,8 @@ impl ReplayStore {
         }
         fs::create_dir_all(project_state_dir)?;
         let state = fs::canonicalize(project_state_dir)?;
-        let state_lease = crate::live_index::index_lifecycle::physical_root::PhysicalRootLease::take(&state);
+        let state_lease =
+            crate::live_index::index_lifecycle::physical_root::PhysicalRootLease::take(&state);
         let state_anchor_key = state_lease
             .opened_stable_key()
             .ok_or(ReplayError::WrongStateDirectory)?;
@@ -413,7 +420,10 @@ impl ReplayStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(ReplayError::Io(error)),
         };
-        if original_meta.as_ref().is_some_and(|meta| meta.file_type().is_symlink()) {
+        if original_meta
+            .as_ref()
+            .is_some_and(|meta| meta.file_type().is_symlink())
+        {
             return Err(ReplayError::SymlinkStatePath);
         }
         let original_scope = if original_meta.is_some() {

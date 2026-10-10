@@ -1,9 +1,15 @@
 #![cfg(feature = "embed")]
 
-use std::{fs, path::Path, time::{Duration, Instant}};
-use symforge::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 use symforge::embed::parity::host::OperationControl;
-use symforge::embed::parity::source_options::{EmbeddedOpenOptions, EmbeddedStateSelection, GitPreparationOptions};
+use symforge::embed::parity::source_options::{
+    EmbeddedOpenOptions, EmbeddedStateSelection, GitPreparationOptions,
+};
+use symforge::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
 
 fn commit(root: &Path, body: &str) {
     let repo = git2::Repository::open(root).unwrap();
@@ -16,7 +22,15 @@ fn commit(root: &Path, body: &str) {
     let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
     let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
     let parents: Vec<_> = parent.iter().collect();
-    repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &parents).unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "fixture",
+        &tree,
+        &parents,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -26,10 +40,14 @@ fn memory_only_git_preparation_uses_only_explicit_bounded_scratch_and_reuses_obj
     git2::Repository::init(root.path()).unwrap();
     commit(root.path(), "pub fn first() {}\n");
     let runtime = ProcessIndexRuntime::acquire().unwrap();
-    let source = runtime.open_embedded_source_with_options(
-        EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()),
-        EmbeddedOpenOptions { state: EmbeddedStateSelection::MemoryOnly },
-    ).unwrap();
+    let source = runtime
+        .open_embedded_source_with_options(
+            EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()),
+            EmbeddedOpenOptions {
+                state: EmbeddedStateSelection::MemoryOnly,
+            },
+        )
+        .unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while source.runtime_view().phase != SourceRuntimePhase::Current {
         assert!(Instant::now() < until);
@@ -58,7 +76,11 @@ fn git_preparation_obeys_cancellation_and_capacity_before_publishing_a_view() {
     git2::Repository::init(root.path()).unwrap();
     commit(root.path(), "pub fn bounded() {}\n");
     let runtime = ProcessIndexRuntime::acquire().unwrap();
-    let source = runtime.open_embedded_source(EmbeddedSourceSpec::current_worktree(root.path().to_path_buf())).unwrap();
+    let source = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
+        .unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while source.runtime_view().phase != SourceRuntimePhase::Current {
         assert!(Instant::now() < until);

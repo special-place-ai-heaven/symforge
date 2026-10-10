@@ -13,7 +13,9 @@ pub enum EmbeddedStateSelection {
     Automatic,
     ProjectLocal,
     /// Existing, host-protected base. Each source receives `projects/<root_id>`.
-    UserLocal { base_directory: PathBuf },
+    UserLocal {
+        base_directory: PathBuf,
+    },
     MemoryOnly,
 }
 
@@ -37,7 +39,12 @@ pub struct GitPreparationOptions {
 
 impl GitPreparationOptions {
     pub fn new(workspace: PathBuf, max_bytes: u64, max_files: u64) -> Self {
-        Self { workspace, max_bytes, max_files, metadata_directories: Vec::new() }
+        Self {
+            workspace,
+            max_bytes,
+            max_files,
+            metadata_directories: Vec::new(),
+        }
     }
 
     /// Explicitly admit a Git/common/include directory outside the source root.
@@ -68,7 +75,9 @@ pub struct GitPreparationRefusal {
 }
 
 impl GitPreparationRefusal {
-    pub fn kind(&self) -> GitPreparationRefusalKind { self.kind }
+    pub fn kind(&self) -> GitPreparationRefusalKind {
+        self.kind
+    }
     pub fn kind_name(&self) -> &'static str {
         match self.kind {
             GitPreparationRefusalKind::InvalidOptions => "InvalidOptions",
@@ -96,14 +105,25 @@ pub struct GitPreparationClaim {
 }
 
 impl GitPreparationClaim {
-    pub fn view_identity(&self) -> &str { &self.view_identity }
-    pub fn serving_publication_identity(&self) -> &str { &self.serving_publication_identity }
-    pub fn canonical_argument_hash(&self) -> &str { &self.canonical_argument_hash }
-    pub fn copied_bytes(&self) -> u64 { self.copied_bytes }
-    pub fn copied_files(&self) -> u64 { self.copied_files }
-    pub fn reused_files(&self) -> u64 { self.reused_files }
+    pub fn view_identity(&self) -> &str {
+        &self.view_identity
+    }
+    pub fn serving_publication_identity(&self) -> &str {
+        &self.serving_publication_identity
+    }
+    pub fn canonical_argument_hash(&self) -> &str {
+        &self.canonical_argument_hash
+    }
+    pub fn copied_bytes(&self) -> u64 {
+        self.copied_bytes
+    }
+    pub fn copied_files(&self) -> u64 {
+        self.copied_files
+    }
+    pub fn reused_files(&self) -> u64 {
+        self.reused_files
+    }
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StateSelectionError {
@@ -116,9 +136,7 @@ pub(crate) fn select_state_placement(
     options: &EmbeddedOpenOptions,
 ) -> Result<StatePlacement, StateSelectionError> {
     match &options.state {
-        EmbeddedStateSelection::Automatic => {
-            Ok(crate::discovery::resolve_state_placement(binding))
-        }
+        EmbeddedStateSelection::Automatic => Ok(crate::discovery::resolve_state_placement(binding)),
         EmbeddedStateSelection::MemoryOnly => Ok(StatePlacement::MemoryOnly {
             failures: Vec::new(),
         }),
@@ -191,9 +209,7 @@ fn prepare_child(path: &Path) -> Result<(), StateSelectionError> {
             #[cfg(unix)]
             let created = {
                 use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(path)
+                std::fs::DirBuilder::new().mode(0o700).create(path)
             };
             #[cfg(not(unix))]
             let created = std::fs::create_dir(path);
@@ -202,8 +218,8 @@ fn prepare_child(path: &Path) -> Result<(), StateSelectionError> {
             {
                 return Err(StateSelectionError::Unavailable);
             }
-            let metadata = std::fs::symlink_metadata(path)
-                .map_err(|_| StateSelectionError::Unavailable)?;
+            let metadata =
+                std::fs::symlink_metadata(path).map_err(|_| StateSelectionError::Unavailable)?;
             if crate::paths::state_directory_metadata_is_unsafe(&metadata) {
                 return Err(StateSelectionError::InvalidSelection);
             }

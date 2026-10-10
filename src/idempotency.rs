@@ -245,10 +245,11 @@ pub(crate) fn verify_post_image_bound(
         let Ok(relative) = target_path.strip_prefix(admitted_root) else {
             return false;
         };
-        let observed = match source.read_regular_beneath_anchor(relative, MAX_BOUND_REPLAY_FILE_BYTES) {
-            Ok(observed) => observed,
-            Err(_) => return false,
-        };
+        let observed =
+            match source.read_regular_beneath_anchor(relative, MAX_BOUND_REPLAY_FILE_BYTES) {
+                Ok(observed) => observed,
+                Err(_) => return false,
+            };
         match observed {
             Some(bytes) => {
                 total_bytes = total_bytes.saturating_add(bytes.len());
@@ -612,8 +613,13 @@ impl FileReplayStore {
         self.ensure_same_hash(&record, request_hash)?;
         let valid = matches!(
             (record.status, status),
-            (ReplayStatus::Reserved, ReplayStatus::Started | ReplayStatus::Completed | ReplayStatus::Failed)
-                | (ReplayStatus::Started, ReplayStatus::Completed | ReplayStatus::Uncertain)
+            (
+                ReplayStatus::Reserved,
+                ReplayStatus::Started | ReplayStatus::Completed | ReplayStatus::Failed
+            ) | (
+                ReplayStatus::Started,
+                ReplayStatus::Completed | ReplayStatus::Uncertain
+            )
         );
         if !valid {
             return Err(IdempotencyError::InvalidTransition);
@@ -634,7 +640,10 @@ impl FileReplayStore {
         let key_hash = key.key_hash();
         let record = self.load_existing(&key_hash)?;
         self.ensure_same_hash(&record, request_hash)?;
-        if !matches!(record.status, ReplayStatus::Reserved | ReplayStatus::Started) {
+        if !matches!(
+            record.status,
+            ReplayStatus::Reserved | ReplayStatus::Started
+        ) {
             return Err(IdempotencyError::InvalidTransition);
         }
         let mut updated =
@@ -1006,14 +1015,14 @@ fn probe_tool_replay_verified_with(
     let store = FileReplayStore::open(project_state)?;
 
     match store.replay_if_present(&key, &request_hash)? {
-        Some(record) if record.status == ReplayStatus::Completed
-            && record.post_image.as_ref().is_some_and(verify) =>
+        Some(record)
+            if record.status == ReplayStatus::Completed
+                && record.post_image.as_ref().is_some_and(verify) =>
         {
             Ok(Some(replay_response(&record)))
         }
         Some(_) => Ok(Some(
-            "Idempotency replay unavailable: stored operation requires reconciliation."
-                .to_owned(),
+            "Idempotency replay unavailable: stored operation requires reconciliation.".to_owned(),
         )),
         None => Ok(None),
     }
@@ -1166,7 +1175,11 @@ mod tests {
         let key = IdempotencyKey::new("started-key").unwrap();
         let hash = RequestHash::for_tool_request("secret_remediate", &request).unwrap();
         assert_eq!(
-            store.replay_if_present(&key, &hash).unwrap().unwrap().status,
+            store
+                .replay_if_present(&key, &hash)
+                .unwrap()
+                .unwrap()
+                .status,
             ReplayStatus::Uncertain
         );
     }
@@ -1231,10 +1244,13 @@ mod tests {
         let source = root.join("source.txt");
         std::fs::write(&source, b"committed").unwrap();
         let request = json!({ "path": "source.txt" });
-        let ReplayStart::FirstExecution(active) =
-            begin_tool_replay_verified(&state, "replace_symbol_body", "physical-root-key", &request)
-                .unwrap()
-        else {
+        let ReplayStart::FirstExecution(active) = begin_tool_replay_verified(
+            &state,
+            "replace_symbol_body",
+            "physical-root-key",
+            &request,
+        )
+        .unwrap() else {
             panic!("first use must reserve");
         };
         active.mark_started().unwrap();
@@ -1247,10 +1263,13 @@ mod tests {
         std::fs::rename(&root, &displaced).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&source, b"committed").unwrap();
-        let ReplayStart::Replay(response) =
-            begin_tool_replay_verified(&state, "replace_symbol_body", "physical-root-key", &request)
-                .unwrap()
-        else {
+        let ReplayStart::Replay(response) = begin_tool_replay_verified(
+            &state,
+            "replace_symbol_body",
+            "physical-root-key",
+            &request,
+        )
+        .unwrap() else {
             panic!("same key must not execute again");
         };
         assert!(response.contains("requires reconciliation"));
@@ -1284,7 +1303,9 @@ mod tests {
             panic!("first use must reserve");
         };
         active.mark_started().unwrap();
-        active.complete_with_post_image("applied", Some(receipt)).unwrap();
+        active
+            .complete_with_post_image("applied", Some(receipt))
+            .unwrap();
         assert!(matches!(
             begin_tool_replay_verified_bound(
                 &state,
@@ -1587,8 +1608,7 @@ mod tests {
         std::fs::create_dir_all(project_state.as_path()).unwrap();
         let request = json!({ "path": "src/x.rs" });
         let ReplayStart::FirstExecution(active) =
-            begin_tool_replay_verified(&project_state, "t", "race-key", &request)
-                .unwrap()
+            begin_tool_replay_verified(&project_state, "t", "race-key", &request).unwrap()
         else {
             panic!("fresh key must be a first execution");
         };
