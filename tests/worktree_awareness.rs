@@ -684,6 +684,65 @@ async fn ac6_matrix_covers_indexed_root_and_missing_file_cases() {
     assert_contains(&result_b, "git ls-tree");
 }
 
+/// A batch whose per-edit `working_directory` routes one file into a linked
+/// worktree commits both files in one transaction, and its replay receipt
+/// binds each target to the authority whose root holds it: a same-key retry
+/// replays the stored answer and writes nothing, while a retry after the
+/// worktree's post-image changed still refuses with reconciliation.
+#[tokio::test]
+async fn batch_edit_routed_across_two_worktrees_replays_by_key() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS), ("src/other.rs", HELLO_RS)]);
+    let params = json!({
+        "idempotency_key": "cross-worktree-batch",
+        "edits": [
+            {
+                "path": "src/lib.rs",
+                "name": "world",
+                "operation": {
+                    "type": "edit_within",
+                    "old_text": "world",
+                    "new_text": "MAIN_SIDE"
+                }
+            },
+            {
+                "path": "src/other.rs",
+                "name": "world",
+                "working_directory": fx.worktree_root.to_str().unwrap(),
+                "operation": {
+                    "type": "edit_within",
+                    "old_text": "world",
+                    "new_text": "WORKTREE_SIDE"
+                }
+            }
+        ]
+    });
+
+    let first = call(&fx.server, "batch_edit", params.clone()).await;
+    assert_contains(&fx.read_indexed("src/lib.rs"), "MAIN_SIDE");
+    assert_contains(&fx.read_worktree("src/other.rs"), "WORKTREE_SIDE");
+    assert_not_contains(&fx.read_indexed("src/other.rs"), "WORKTREE_SIDE");
+    assert_not_contains(&first, "Idempotency warning");
+
+    let replayed = call(&fx.server, "batch_edit", params.clone()).await;
+    assert_eq!(
+        replayed, first,
+        "a same-key retry must replay the stored answer"
+    );
+    assert_eq!(
+        fx.read_indexed("src/lib.rs").matches("MAIN_SIDE").count(),
+        1,
+        "the replay must not write again"
+    );
+
+    let tampered = "fn hello() {}
+";
+    fs::write(fx.worktree_root.join("src/other.rs"), tampered).expect("tamper worktree");
+    let refused = call(&fx.server, "batch_edit", params).await;
+    assert_contains(&refused, "requires reconciliation");
+    assert_eq!(fx.read_worktree("src/other.rs"), tampered);
+}
+
 /// Every routed edit surface, including batch tools, reports the resolved
 /// target when `working_directory` is supplied.
 #[tokio::test]

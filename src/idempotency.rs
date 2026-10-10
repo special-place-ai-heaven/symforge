@@ -145,12 +145,24 @@ pub struct PostImageReceipt {
     /// Old receipts lack this field and require explicit reconciliation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<PostImageSourceBinding>,
+    /// Linked worktrees an operation routed targets into. Each is verified
+    /// through its own admitted authority, never through `source`'s root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_sources: Vec<LinkedPostImageSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PostImageSourceBinding {
     pub project_id: String,
     pub physical_root_key: [u8; 16],
+}
+
+/// A linked worktree root that holds some of a receipt's targets, bound to the
+/// physical root its write was admitted under.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkedPostImageSource {
+    pub root: String,
+    pub binding: PostImageSourceBinding,
 }
 
 /// Digest a SINGLE target's post-image from bytes already in hand — the
@@ -170,6 +182,7 @@ pub fn post_image_from_written_bytes(path: &Path, bytes: &[u8]) -> PostImageRece
             content_digest: Some(crate::hash::digest_hex(bytes)),
         }],
         source: None,
+        linked_sources: Vec::new(),
     }
 }
 
@@ -198,28 +211,67 @@ pub fn capture_post_image(written: &[PathBuf]) -> Option<PostImageReceipt> {
     Some(PostImageReceipt {
         targets,
         source: None,
+        linked_sources: Vec::new(),
     })
 }
 
 const MAX_BOUND_REPLAY_TARGETS: usize = 4096;
-const MAX_BOUND_REPLAY_FILE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BOUND_REPLAY_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+fn source_binding(
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Option<PostImageSourceBinding> {
+    Some(PostImageSourceBinding {
+        project_id: canonical_project_key(source.admitted_root()),
+        physical_root_key: source.physical_root_stable_key()?,
+    })
+}
 
 /// Attach the source admitted for this effect only after checking the exact
 /// post-image through its original physical-root anchor.
 pub(crate) fn bind_post_image_to_source(
-    mut receipt: PostImageReceipt,
+    receipt: PostImageReceipt,
     source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
 ) -> Option<PostImageReceipt> {
-    receipt.source = Some(PostImageSourceBinding {
-        project_id: canonical_project_key(source.admitted_root()),
-        physical_root_key: source.physical_root_stable_key()?,
-    });
+    bind_post_image_to_sources(receipt, source, &[])
+}
+
+/// [`bind_post_image_to_source`] for an operation that also routed targets
+/// into linked worktrees: every linked root is bound to its own admitted
+/// authority, and the receipt is kept only when each target verifies through
+/// the authority whose root holds it.
+pub(crate) fn bind_post_image_to_sources(
+    mut receipt: PostImageReceipt,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    linked: &[std::sync::Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>],
+) -> Option<PostImageReceipt> {
+    receipt.source = Some(source_binding(source)?);
+    receipt.linked_sources = linked
+        .iter()
+        .map(|linked| {
+            Some(LinkedPostImageSource {
+                root: linked.admitted_root().display().to_string(),
+                binding: source_binding(linked)?,
+            })
+        })
+        .collect::<Option<_>>()?;
     verify_post_image_bound(&receipt, source).then_some(receipt)
 }
 
-/// Verify recorded bytes only through the retained admitted source anchor.
-/// Worktree targets outside that root need a separately admitted authority.
+/// The one per-authority post-image read shared by MCP replay receipts and
+/// the embedded routed batch's replay manifest: stream the digest of a target
+/// beneath the admitted source whose root holds it, never following a link
+/// out of that root, including while its publication refreshes.
+pub(crate) fn post_image_digest_beneath(
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    relative: &Path,
+) -> Option<Option<String>> {
+    source.digest_regular_beneath_anchor(relative).ok()
+}
+
+/// Verify recorded bytes only through retained admitted source anchors: the
+/// indexed root's, and for a target routed into a linked worktree, that
+/// worktree's own authority, whose physical root must still be the one the
+/// write was bound to.
 pub(crate) fn verify_post_image_bound(
     receipt: &PostImageReceipt,
     source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
@@ -229,42 +281,48 @@ pub(crate) fn verify_post_image_bound(
     };
     if receipt.targets.is_empty()
         || receipt.targets.len() > MAX_BOUND_REPLAY_TARGETS
-        || binding.project_id != canonical_project_key(source.admitted_root())
-        || source.physical_root_stable_key() != Some(binding.physical_root_key)
+        || source_binding(source).as_ref() != Some(binding)
     {
         return false;
     }
-    let mut total_bytes = 0usize;
-    for target in &receipt.targets {
-        // Windows canonicalization can add a verbatim-path prefix to the
+    let mut linked = Vec::with_capacity(receipt.linked_sources.len());
+    for recorded in &receipt.linked_sources {
+        let authority =
+            crate::index_lifecycle::activation::project_source_authority(Path::new(&recorded.root));
+        if source_binding(&authority).as_ref() != Some(&recorded.binding) {
+            return false;
+        }
+        linked.push(authority);
+    }
+    let sources: Vec<&crate::index_lifecycle::activation::ProjectSourceAuthority> =
+        std::iter::once(source)
+            .chain(linked.iter().map(|authority| authority.as_ref()))
+            .collect();
+    receipt.targets.iter().all(|target| {
+        // Windows canonicalization can add a verbatim-path prefix to an
         // authority root while a tool's absolute target retains its plain
         // spelling. Simplify only that syntax; the anchored read below still
-        // enforces the original physical directory and rejects links.
+        // enforces the original physical directory and rejects links. The
+        // deepest holding root wins, so a worktree nested beneath the indexed
+        // root is read through its own authority.
         let target_path = dunce::simplified(Path::new(&target.path));
-        let admitted_root = dunce::simplified(source.admitted_root());
-        let Ok(relative) = target_path.strip_prefix(admitted_root) else {
+        let Some((owner, relative)) = sources
+            .iter()
+            .filter_map(|owner| {
+                let root = dunce::simplified(owner.admitted_root());
+                target_path
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|relative| (owner, relative, root.components().count()))
+            })
+            .max_by_key(|(_, _, depth)| *depth)
+            .map(|(owner, relative, _)| (owner, relative))
+        else {
             return false;
         };
-        let observed =
-            match source.read_regular_beneath_anchor(relative, MAX_BOUND_REPLAY_FILE_BYTES) {
-                Ok(observed) => observed,
-                Err(_) => return false,
-            };
-        match observed {
-            Some(bytes) => {
-                total_bytes = total_bytes.saturating_add(bytes.len());
-                let observed_digest = crate::hash::digest_hex(&bytes);
-                if total_bytes > MAX_BOUND_REPLAY_TOTAL_BYTES
-                    || target.content_digest.as_deref() != Some(observed_digest.as_str())
-                {
-                    return false;
-                }
-            }
-            None if target.content_digest.is_none() => {}
-            None => return false,
-        }
-    }
-    true
+        post_image_digest_beneath(owner, relative)
+            .is_some_and(|observed| observed == target.content_digest)
+    })
 }
 
 /// True only when every receipt target matches the CURRENT disk state:

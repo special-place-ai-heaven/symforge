@@ -838,10 +838,11 @@ pub(crate) fn probe_symforge_edit_apply_replay(
 /// batch executors, which know only paths in `edit_tools.rs`). Edit tools
 /// never delete files, so a receipt with any absent or unreadable target
 /// means the read-back failed and the record must never replay (no receipt).
-fn complete_mutation_replay(
+fn complete_mutation_replay<'a>(
     idempotency: &Option<BoundMutationReplay>,
     output: &mut String,
     written: &[std::path::PathBuf],
+    working_directories: impl IntoIterator<Item = Option<&'a str>>,
 ) {
     let post_image = crate::idempotency::capture_post_image(written).filter(|receipt| {
         !receipt.targets.is_empty()
@@ -850,19 +851,61 @@ fn complete_mutation_replay(
                 .iter()
                 .all(|target| target.content_digest.is_some())
     });
-    complete_bound_mutation_replay_with_receipt(idempotency, output, post_image);
+    let working_directories: Vec<_> = working_directories.into_iter().collect();
+    complete_bound_mutation_replay_with_receipt(
+        idempotency,
+        output,
+        post_image,
+        &working_directories,
+    );
+}
+
+/// The admitted authority of every linked worktree a routed write landed in:
+/// each caller `working_directory` outside the indexed root that holds a
+/// receipt target. Edit hooks resolved each one before anything was written;
+/// binding it here lets the receipt verify that target through its own root.
+fn routed_worktree_authorities(
+    indexed_root: &std::path::Path,
+    receipt: &crate::idempotency::PostImageReceipt,
+    working_directories: &[Option<&str>],
+) -> Vec<Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>> {
+    let indexed_root = dunce::simplified(indexed_root);
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for directory in working_directories.iter().flatten() {
+        let Ok(root) = crate::worktree::canonicalize(std::path::Path::new(directory)) else {
+            continue;
+        };
+        let root = dunce::simplified(&root).to_path_buf();
+        let holds_target = receipt
+            .targets
+            .iter()
+            .any(|target| dunce::simplified(std::path::Path::new(&target.path)).starts_with(&root));
+        if root != indexed_root && holds_target && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+        .iter()
+        .map(|root| crate::index_lifecycle::activation::project_source_authority(root))
+        .collect()
 }
 
 fn complete_bound_mutation_replay_with_receipt(
     idempotency: &Option<BoundMutationReplay>,
     output: &mut String,
     post_image: Option<crate::idempotency::PostImageReceipt>,
+    working_directories: &[Option<&str>],
 ) {
     let Some(idempotency) = idempotency else {
         return;
     };
     let bound = post_image.and_then(|receipt| {
-        crate::idempotency::bind_post_image_to_source(receipt, &idempotency.source)
+        let linked = routed_worktree_authorities(
+            idempotency.source.admitted_root(),
+            &receipt,
+            working_directories,
+        );
+        crate::idempotency::bind_post_image_to_sources(receipt, &idempotency.source, &linked)
     });
     if let Err(error) = idempotency
         .active
@@ -1260,6 +1303,7 @@ impl SymForgeServer {
                 &resolved_target.target_path,
                 &new_content,
             )),
+            &[params.0.working_directory.as_deref()],
         );
         result
     }
@@ -1489,6 +1533,7 @@ impl SymForgeServer {
                 &resolved_target.target_path,
                 &new_content,
             )),
+            &[params.0.working_directory.as_deref()],
         );
         out
     }
@@ -1708,6 +1753,7 @@ impl SymForgeServer {
                 &resolved_target.target_path,
                 &new_content,
             )),
+            &[params.0.working_directory.as_deref()],
         );
         out
     }
@@ -2007,6 +2053,7 @@ impl SymForgeServer {
                 &resolved_target.target_path,
                 &new_content,
             )),
+            &[params.0.working_directory.as_deref()],
         );
         out
     }
@@ -2146,7 +2193,18 @@ impl SymForgeServer {
                 if let Some(primary) = params.0.edits.first() {
                     self.append_impact_footer(&mut result, &primary.path);
                 }
-                complete_mutation_replay(&idempotency, &mut result, &written_paths);
+                complete_mutation_replay(
+                    &idempotency,
+                    &mut result,
+                    &written_paths,
+                    std::iter::once(params.0.working_directory.as_deref()).chain(
+                        params
+                            .0
+                            .edits
+                            .iter()
+                            .map(|edit| edit.working_directory.as_deref()),
+                    ),
+                );
                 result
             }
             Err(e) => {
@@ -2260,7 +2318,12 @@ impl SymForgeServer {
                     project_config_trust_suffix.as_deref(),
                 );
                 self.append_impact_footer(&mut result, &params.0.path);
-                complete_mutation_replay(&idempotency, &mut result, &written_paths);
+                complete_mutation_replay(
+                    &idempotency,
+                    &mut result,
+                    &written_paths,
+                    [params.0.working_directory.as_deref()],
+                );
                 result
             }
             Err(e) => {
@@ -2390,7 +2453,18 @@ impl SymForgeServer {
                 if let Some(primary) = params.0.targets.first() {
                     self.append_impact_footer(&mut result, &primary.path);
                 }
-                complete_mutation_replay(&idempotency, &mut result, &written_paths);
+                complete_mutation_replay(
+                    &idempotency,
+                    &mut result,
+                    &written_paths,
+                    std::iter::once(params.0.working_directory.as_deref()).chain(
+                        params
+                            .0
+                            .targets
+                            .iter()
+                            .map(|target| target.working_directory.as_deref()),
+                    ),
+                );
                 result
             }
             Err(e) => {

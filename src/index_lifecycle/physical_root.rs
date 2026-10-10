@@ -1166,7 +1166,6 @@ pub(crate) fn read_regular_beneath(
 
 /// Hash an opened regular file without buffering its whole contents. Replay
 /// postimage checks may cover files larger than the bounded content-read cap.
-#[cfg(feature = "embed")]
 pub(crate) fn digest_regular_beneath(
     lease: &PhysicalRootLease,
     relative: &Path,

@@ -708,6 +708,7 @@ fn complete_guarded_replay(
     let receipt = crate::idempotency::PostImageReceipt {
         targets,
         source: None,
+        linked_sources: Vec::new(),
     };
     let Some(receipt) = crate::idempotency::bind_post_image_to_source(receipt, source) else {
         let _ = active.mark_uncertain();

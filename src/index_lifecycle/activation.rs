@@ -746,7 +746,6 @@ impl ProjectSourceAuthority {
 
     /// Stream a replay postimage digest from the admitted root, including while
     /// that publication is refreshing. The opened file never follows a link.
-    #[cfg(feature = "embed")]
     pub(crate) fn digest_regular_beneath_anchor(
         &self,
         relative: &Path,

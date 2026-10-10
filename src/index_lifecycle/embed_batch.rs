@@ -336,9 +336,8 @@ fn manifest_entries(
 ) -> Result<Vec<(String, String)>, EditErrorKind> {
     let mut entries = Vec::with_capacity(staged.len());
     for image in staged {
-        let digest = authority
-            .digest_regular_beneath_anchor(&image.relative)
-            .map_err(|_| EditErrorKind::WriteUncertain)?
+        let digest = crate::idempotency::post_image_digest_beneath(authority, &image.relative)
+            .ok_or(EditErrorKind::WriteUncertain)?
             .ok_or(EditErrorKind::WriteUncertain)?;
         entries.push((image.relative.to_string_lossy().to_string(), digest));
     }
@@ -377,9 +376,8 @@ fn current_manifest_for_paths(
     with_staged_locks(&images, |_| {
         let mut entries = Vec::with_capacity(images.len());
         for image in &images {
-            let digest = authority
-                .digest_regular_beneath_anchor(&image.relative)
-                .map_err(|_| EditErrorKind::ReplayConflict)?
+            let digest = crate::idempotency::post_image_digest_beneath(authority, &image.relative)
+                .ok_or(EditErrorKind::ReplayConflict)?
                 .ok_or(EditErrorKind::ReplayConflict)?;
             entries.push((image.relative.to_string_lossy().to_string(), digest));
         }
