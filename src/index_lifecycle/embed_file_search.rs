@@ -5,7 +5,7 @@ use crate::embed::parity::search::*;
 use crate::embed::parity::{QueryOutput, QueryPolicy, QueryRefusalKind};
 use crate::live_index::{SearchFilesResolveView, SearchFilesView};
 
-fn input(request: &FileSearchRequest) -> search_contract::SearchFilesInput {
+pub(super) fn input(request: &FileSearchRequest) -> search_contract::SearchFilesInput {
     search_contract::SearchFilesInput {
         project: None,
         projects: None,
@@ -169,6 +169,7 @@ pub(super) fn execute(
         cochange: None,
         ranking: Vec::new(),
         ranking_explanation: None,
+        untracked_paths: Vec::new(),
     };
     if request.resolve == Some(true) {
         let (view, noise) = file_search::resolve_files(&snapshot.generation.live, &input);
@@ -305,7 +306,22 @@ pub(super) fn execute(
                 budget.truncated |= overflow_count > 0;
                 result.hits = project_hits(hits, budget);
             }
-            SearchFilesView::NotFound { .. } => {}
+            SearchFilesView::NotFound { .. } => {
+                result.untracked_paths = super::embed_changes::open_repository(&snapshot.root)
+                    .map(|repo| {
+                        super::guidance::search::matching_untracked_paths_for_search_files(
+                            &repo,
+                            &snapshot.generation.live,
+                            &input.query,
+                            input.include_vendor.unwrap_or(false),
+                            input.include_personal_tooling.unwrap_or(false),
+                        )
+                    })
+                    .unwrap_or_default();
+                for path in &result.untracked_paths {
+                    budget.charge_bytes(path.len())?;
+                }
+            }
             SearchFilesView::EmptyQuery => return Err(QueryRefusalKind::InvalidRequest),
         }
     }

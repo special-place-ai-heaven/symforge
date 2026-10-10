@@ -1,0 +1,70 @@
+{
+  "cases": [
+    {
+      "outcome": "found",
+      "rendered": "── stel · read → get_file_context (exact) · bypass · ~156 tok served (est.) ──\n\nDecision: bypass\nEconomics: bypass (predicted_net=-117 <= 0; economics bypass via host_read `src/lib.rs`)\nAction: host_read\nHost read: `src/lib.rs` lines 1-80\nPredicted manual tokens: 19\nPredicted SymForge tokens avoided: 136\n\nSymForge did not execute a legacy tool for this request.\nOpen `src/lib.rs` in your editor and read the suggested line range directly.\n\n--- bypass payload ---\n{\n  \"action\": \"host_read\",\n  \"path\": \"src/lib.rs\",\n  \"start_line\": 1,\n  \"end_line\": 80,\n  \"predicted_manual_tokens\": 19,\n  \"predicted_symforge_tokens\": 136,\n  \"reason\": \"predicted_net=-117 <= 0; host_read `src/lib.rs` cheaper than serve\"\n}\nproject_root: {root}",
+      "request": {
+        "query": "outline src/lib.rs"
+      }
+    },
+    {
+      "outcome": "found",
+      "rendered": "── stel · read → get_symbol (exact) · bypass · ~156 tok served (est.) ──\n\nDecision: bypass\nEconomics: bypass (predicted_net=-117 <= 0; economics bypass via host_read `src/lib.rs`)\nAction: host_read\nHost read: `src/lib.rs` lines 1-80\nPredicted manual tokens: 19\nPredicted SymForge tokens avoided: 136\n\nSymForge did not execute a legacy tool for this request.\nOpen `src/lib.rs` in your editor and read the suggested line range directly.\n\n--- bypass payload ---\n{\n  \"action\": \"host_read\",\n  \"path\": \"src/lib.rs\",\n  \"start_line\": 1,\n  \"end_line\": 80,\n  \"predicted_manual_tokens\": 19,\n  \"predicted_symforge_tokens\": 136,\n  \"reason\": \"predicted_net=-117 <= 0; host_read `src/lib.rs` cheaper than serve\"\n}\nproject_root: {root}",
+      "request": {
+        "query": "body of target in src/lib.rs"
+      }
+    },
+    {
+      "outcome": "found",
+      "rendered": "── stel · trace → find_references (exact) · serve · ~298 tok served (est.) ──\n\nStep 1: Route confidence: exact\nChosen tool: find_references\nInvocation: {\"compact\":true,\"limit\":100,\"max_per_file\":10,\"name\":\"target\"}\nRationale: caller/reference phrasing\nEconomics: serve (predicted_net=275 > margin=50)\n\nTrust: constrained (repo-wide name match) | current index | parsed | full for current scope — usage-trace recall is best-effort; dynamic dispatch, macro-generated, reflective, and cross-language usages may be missed\nScope: repo-wide symbol token `target`\nEvidence: reference anchors `src/lib.rs:6`\n\n1 references to \"target\" in 1 files\nTarget definition candidates: 1 exact-name indexed symbols; indexed-file parse coverage complete. Unique among indexed records: yes (compiler resolution not available).\n  src/lib.rs:L1 [fn] bytes 0..32\nsrc/lib.rs\n  AST declaration headers for returned sites: 1 distinct (showing 1; 0 omitted by metadata cap; 0 caller headers unavailable; final response token budget may truncate):\n    caller: definition L5-7 bytes 34..73; [function_item] header L5 bytes 34..57; signature start L5\n      caller identity: caller bytes 41..47\n  :6   [AST caller function_item definition L5-7 bytes 34..73; header L5 bytes 34..57; signature start L5]\nproject_root: {root}",
+      "request": {
+        "query": "who calls target"
+      }
+    },
+    {
+      "outcome": "found",
+      "rendered": "── stel · find → search_files → search_text (inferred) · serve · ~236 tok served (est.) ──\n\nStep 1: Route confidence: inferred\nChosen tool: search_files\nInvocation: {\"query\":\"find caller\",\"rank_by\":\"path+cochange\"}\nRationale: find fusion: path/file ranking with co-change\nEconomics: serve (predicted_net=675 > margin=50)\n\nNo indexed source files matching 'find caller'\n\nfilters: vendor filter active (heuristic); personal tooling filtered\nStep 2: Route confidence: inferred\nChosen tool: search_text\nInvocation: {\"group_by\":\"symbol\",\"terms\":[\"find\",\"caller\"]}\nRationale: multi-hop chain step\nEconomics: serve (predicted_net=675 > margin=50)\n\nTrust: constrained (OR-literal terms) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)\nScope: repo-wide; tests filter active (heuristic); generated filter active (heuristic); vendor filter active (heuristic); personal tooling filtered\nEvidence: line anchors `src/lib.rs:5`\n\n1 matches in 1 files  [0.95]\nsrc/lib.rs\n  fn caller (lines 5-7): 1 match\nproject_root: {root}",
+      "request": {
+        "query": "find caller"
+      }
+    },
+    {
+      "outcome": "invalid_request",
+      "rendered": "── stel · find → search_symbols (inferred) · reject · ~103 tok served (est.) ──\n\nStep 1: Route confidence: inferred\nChosen tool: search_symbols\nInvocation: {\"query\":\"locate symbol target\"}\nRationale: symbol locate phrasing\nEconomics: reject (multi-hop chain failed at step 1 tool=search_symbols outcome=empty_result)\n\nNo symbols matching 'locate symbol target'. Try: search_text(query=\"locate symbol target\") for text matches, or explore(query=\"locate symbol target\") for concept-based discovery.\nproject_root: {root}",
+      "request": {
+        "query": "locate symbol target"
+      }
+    },
+    {
+      "outcome": "found",
+      "rendered": "── stel · find → search_files → search_text (inferred) · serve · ~236 tok served (est.) ──\n\nStep 1: Route confidence: inferred\nChosen tool: search_files\nInvocation: {\"query\":\"grep caller\",\"rank_by\":\"path+cochange\"}\nRationale: find fusion: path/file ranking with co-change\nEconomics: serve (predicted_net=675 > margin=50)\n\nNo indexed source files matching 'grep caller'\n\nfilters: vendor filter active (heuristic); personal tooling filtered\nStep 2: Route confidence: inferred\nChosen tool: search_text\nInvocation: {\"group_by\":\"symbol\",\"terms\":[\"grep\",\"caller\"]}\nRationale: multi-hop chain step\nEconomics: serve (predicted_net=675 > margin=50)\n\nTrust: constrained (OR-literal terms) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)\nScope: repo-wide; tests filter active (heuristic); generated filter active (heuristic); vendor filter active (heuristic); personal tooling filtered\nEvidence: line anchors `src/lib.rs:5`\n\n1 matches in 1 files  [0.95]\nsrc/lib.rs\n  fn caller (lines 5-7): 1 match\nproject_root: {root}",
+      "request": {
+        "query": "grep caller"
+      }
+    },
+    {
+      "outcome": "invalid_request",
+      "rendered": "`path:` requires a repo-relative path: it is a within-project filter, not an absolute filesystem path or project selector.",
+      "request": {
+        "path": "/etc/passwd",
+        "query": "read the outline"
+      }
+    },
+    {
+      "outcome": "invalid_request",
+      "rendered": "`symbol` must be a bare identifier like `is_fresh`, not prose (got `how does this work`); put a phrase in `query=` instead and use `symbol=` only for an exact symbol name.",
+      "request": {
+        "query": "who calls it",
+        "symbol": "how does this work"
+      }
+    },
+    {
+      "outcome": "found",
+      "rendered": "── stel · orient → explore (inferred) · serve · ~57 tok served (est.) ──\n\nStep 1: Route confidence: inferred\nChosen tool: explore\nInvocation: {\"depth\":2,\"max_tokens\":750,\"query\":\"the\"}\nRationale: smart_query fallback\nEconomics: serve (predicted_net=275 > margin=50)\n\nExplore requires a non-empty query.\nproject_root: {root}",
+      "request": {
+        "query": "the"
+      }
+    }
+  ],
+  "lib_rs": "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n"
+}

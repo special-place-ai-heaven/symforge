@@ -167,7 +167,14 @@ pub(super) fn project(
         super::embed_query::validate_request(nested)?;
         let output =
             super::embed_query::project(snapshot, nested, budget, observations, session, policy)?;
-        let rendered = render_routed(nested, &output)?;
+        // Search routes carry MCP's result envelope, rendered by the same
+        // shared search composition the MCP tools and the facade use.
+        let rendered = match super::embed_symforge::render_search(
+            snapshot, session, policy, nested, &output,
+        ) {
+            Some(rendered) => rendered?,
+            None => render_routed(nested, &output)?,
+        };
         result.output = Some(Box::new(output));
         rendered
     } else if let smart_query::QueryIntent::ToolHelp { topic } = &intent {
@@ -198,7 +205,10 @@ pub(super) fn project(
     Ok(QueryOutput::Ask(result))
 }
 
-fn render_routed(request: &QueryRequest, output: &QueryOutput) -> Result<String, QueryRefusalKind> {
+pub(super) fn render_routed(
+    request: &QueryRequest,
+    output: &QueryOutput,
+) -> Result<String, QueryRefusalKind> {
     use crate::embed::parity::search as dto;
     use crate::live_index::search as engine;
     Ok(match (request, output) {

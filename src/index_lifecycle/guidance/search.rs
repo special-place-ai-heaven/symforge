@@ -547,6 +547,254 @@ pub(crate) fn matching_untracked_paths_for_search_text(
         .collect()
 }
 
+pub(crate) fn untracked_path_has_component(path: &str, component: &str) -> bool {
+    path.split('/')
+        .any(|part| part.eq_ignore_ascii_case(component))
+}
+
+pub(crate) fn untracked_common_path_filters_allow(
+    path: &str,
+    include_vendor: bool,
+    include_personal_tooling: bool,
+) -> bool {
+    (include_vendor || !crate::live_index::query::is_vendor_path(path))
+        && (include_personal_tooling || !crate::live_index::query::is_personal_tooling_path(path))
+}
+
+pub(crate) fn untracked_path_matches_search_files_query(path: &str, query: &str) -> bool {
+    let normalized_query = normalize_untracked_search_path(query);
+    if normalized_query.is_empty() {
+        return false;
+    }
+
+    let is_glob = normalized_query.contains('*')
+        || normalized_query.contains('?')
+        || normalized_query.contains('[');
+    if is_glob
+        && let Ok(glob) = globset::GlobBuilder::new(&normalized_query)
+            .literal_separator(false)
+            .build()
+    {
+        return glob.compile_matcher().is_match(path);
+    }
+
+    let path_lower = path.to_ascii_lowercase();
+    let normalized_query_lower = normalized_query.to_ascii_lowercase();
+    let has_path_context = normalized_query.contains('/');
+    if path_lower == normalized_query_lower
+        || (has_path_context && path_lower.ends_with(&normalized_query_lower))
+    {
+        return true;
+    }
+
+    let tokens: Vec<String> = normalized_query
+        .split(|ch: char| ch == '/' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let Some(basename_token) = tokens.last() else {
+        return false;
+    };
+    let component_tokens = if tokens.len() > 1 {
+        &tokens[..tokens.len() - 1]
+    } else {
+        &[][..]
+    };
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name.eq_ignore_ascii_case(basename_token)
+        && component_tokens
+            .iter()
+            .all(|component| untracked_path_has_component(path, component))
+    {
+        return true;
+    }
+
+    if basename_token.len() >= 3 {
+        let file_stem = Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if file_stem.to_ascii_lowercase().starts_with(basename_token) {
+            return true;
+        }
+    }
+
+    tokens.iter().all(|token| path_lower.contains(token))
+}
+
+/// MCP `search_text`'s rendered answer over one publication: the result
+/// envelope, the grouped view and the zero-hit untracked diagnostic for
+/// `matching_untracked_paths`, which the caller swept from its own git root.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_search_text_output(
+    // T046: the caller's entry capture — banner and parse-state come off the
+    // SAME publication that produced the rows, not fresh loads taken here.
+    generation: &crate::live_index::store::PublishedGeneration,
+    result: Result<search::TextSearchResult, search::TextSearchError>,
+    query: Option<&str>,
+    structural: bool,
+    group_by: Option<&str>,
+    terms: Option<&[String]>,
+    options: &search::TextSearchOptions,
+    is_regex: bool,
+    auto_detected_regex: bool,
+    auto_corrected_regex: bool,
+    matching_untracked_paths: &[String],
+) -> String {
+    use super::search_envelope::{
+        SourceAuthority, format_search_envelope, search_completeness_label, search_scope_summary,
+        search_text_evidence, search_text_match_type_label,
+    };
+    let envelope = match &result {
+        Ok(result) if !result.files.is_empty() => Some(format_search_envelope(
+            &search_text_match_type_label(
+                structural,
+                is_regex,
+                terms,
+                auto_detected_regex,
+                auto_corrected_regex,
+                options.ranked,
+            ),
+            SourceAuthority::from_freshness(&generation.freshness),
+            super::reference_read::search_parse_state_for_paths(
+                &generation.live,
+                result.files.iter().map(|file| file.path.as_str()),
+            ),
+            &search_completeness_label(result.overflow_count, result.suppressed_by_noise),
+            &search_scope_summary(
+                &options.path_scope,
+                options.language_filter.as_ref(),
+                &options.noise_policy,
+                options.include_personal_tooling,
+                options.glob.as_deref(),
+                options.exclude_glob.as_deref(),
+                options.ranked,
+            ),
+            &search_text_evidence(result),
+        )),
+        _ => None,
+    };
+    let confidence = if auto_corrected_regex {
+        0.75f32
+    } else if is_regex && auto_detected_regex {
+        0.80
+    } else if is_regex {
+        0.85
+    } else if options.ranked {
+        0.80
+    } else {
+        0.95
+    };
+    let output = super::search_render::search_text_result_view(
+        result,
+        group_by,
+        terms,
+        Some(confidence),
+        super::search_render::SearchSuggestionContext {
+            regex: is_regex,
+            include_tests: options.noise_policy.include_tests,
+            multi_word_literal: !is_regex
+                && query.is_some_and(|q| q.trim().contains(char::is_whitespace)),
+        },
+    );
+    let mut rendered = match envelope {
+        Some(envelope) => format!("{envelope}\n\n{output}"),
+        None => output,
+    };
+    append_untracked_file_diagnostic(&mut rendered, matching_untracked_paths);
+    rendered
+}
+
+/// MCP `search_symbols`' rendered answer over one publication: the result
+/// envelope, the tiered view and the sparse-hit text fallback.
+pub(crate) fn render_symbol_search(
+    generation: &crate::live_index::store::PublishedGeneration,
+    execution: &SymbolSearchExecution,
+    query: &str,
+) -> String {
+    use super::search_envelope::{
+        SourceAuthority, format_search_envelope, search_completeness_label, search_scope_summary,
+        search_symbols_evidence, search_symbols_match_type_label,
+    };
+    let result = &execution.result;
+    let options = &execution.options;
+    let is_browse = query.is_empty();
+    // Browse ordering is owned by the engine (search::search_symbols_with_options),
+    // which ranks browse results by importance (reference count -> kind -> path ->
+    // line). Do NOT re-sort here: a tool-level re-sort would override that order and
+    // reintroduce the symbol_kind_priority display-kind mismatch ("fn" -> 0.1). (018 US2)
+    let envelope = if result.hits.is_empty() {
+        None
+    } else {
+        Some(format_search_envelope(
+            search_symbols_match_type_label(result, is_browse),
+            SourceAuthority::from_freshness(&generation.freshness),
+            super::reference_read::search_parse_state_for_paths(
+                &generation.live,
+                result.hits.iter().map(|hit| hit.path.as_str()),
+            ),
+            &search_completeness_label(result.overflow_count, execution.suppressed_by_noise),
+            &search_scope_summary(
+                &options.path_scope,
+                options.language_filter.as_ref(),
+                &options.noise_policy,
+                options.include_personal_tooling,
+                None,
+                None,
+                false,
+            ),
+            &search_symbols_evidence(result),
+        ))
+    };
+    let output = super::search_render::search_symbols_result_view(result, query);
+    let output = match envelope {
+        Some(envelope) => format!("{envelope}\n\n{output}"),
+        None => output,
+    };
+    if execution.text_fallback.is_empty() {
+        output
+    } else {
+        let paths: Vec<_> = execution
+            .text_fallback
+            .iter()
+            .map(|(path, line)| format!("{path}:{line}"))
+            .collect();
+        format!(
+            "{output}\n\nText path fallback (sparse symbol hits):\n{}",
+            paths.join("\n")
+        )
+    }
+}
+
+/// MCP `search_files`' zero-hit diagnostic: untracked worktree paths the
+/// publication does not know whose names match `query`.
+pub(crate) fn matching_untracked_paths_for_search_files(
+    repo: &crate::git::GitRepo,
+    live: &LiveIndex,
+    query: &str,
+    include_vendor: bool,
+    include_personal_tooling: bool,
+) -> Vec<String> {
+    untracked_paths_not_in_index(repo, live)
+        .into_iter()
+        .filter(|path| {
+            untracked_common_path_filters_allow(path, include_vendor, include_personal_tooling)
+                && untracked_path_matches_search_files_query(path, query)
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_untracked_search_path(raw: &str) -> String {
+    let mut normalized = raw.trim().replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    normalized.trim_matches('/').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

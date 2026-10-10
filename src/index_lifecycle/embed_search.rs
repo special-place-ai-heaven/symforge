@@ -8,7 +8,7 @@ use crate::embed::parity::{QueryOutput, QueryRefusalKind};
 use crate::live_index::search as engine;
 use std::collections::{BTreeSet, HashMap};
 
-fn text_input(input: &TextSearchRequest) -> search_contract::SearchTextInput {
+pub(super) fn text_input(input: &TextSearchRequest) -> search_contract::SearchTextInput {
     search_contract::SearchTextInput {
         query: input.query.clone(),
         terms: input.terms.clone(),
@@ -45,7 +45,7 @@ fn text_input(input: &TextSearchRequest) -> search_contract::SearchTextInput {
         projects: None,
     }
 }
-fn symbol_input(input: &SymbolSearchRequest) -> search_contract::SearchSymbolsInput {
+pub(super) fn symbol_input(input: &SymbolSearchRequest) -> search_contract::SearchSymbolsInput {
     search_contract::SearchSymbolsInput {
         query: input.query.clone(),
         kind: input.kind.clone(),

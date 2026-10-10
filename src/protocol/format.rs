@@ -46,18 +46,7 @@ use crate::live_index::{
 use crate::protocol::surface_probe::{SurfaceProfile, connection_surface_or_env};
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
 
-pub fn capability_evidence_line(evidence: &crate::capability::CapabilityEvidence) -> String {
-    let mut line = format!("Capability: {} {}", evidence.capability, evidence.status);
-    if let Some(detail) = evidence.detail.as_deref().map(str::trim)
-        && !detail.is_empty()
-    {
-        let detail = detail.trim_end_matches('.');
-        line.push_str(" - ");
-        line.push_str(detail);
-    }
-    line.push('.');
-    line
-}
+pub use crate::index_lifecycle::guidance::file_search::capability_evidence_line;
 
 /// Format the file outline for a given path.
 ///
@@ -353,58 +342,7 @@ pub fn what_changed_result(index: &LiveIndex, since_ts: i64) -> String {
     what_changed_timestamp_view(&view, since_ts)
 }
 
-/// Render `detect_impact`'s JSON payload wrapped in a short plain-text
-/// summary. MCP tool responses here are always text, never raw JSON (house
-/// convention — see `tools.rs` module doc); the exact contract shape
-/// (contracts/detect-impact.md § Output) is embedded verbatim after the
-/// `--- impact payload ---` marker so callers can parse it directly, the same
-/// pattern `format_session_cache_hit_body` uses for its cache payload.
-pub fn detect_impact_result(
-    payload: &serde_json::Value,
-    requested_depth: u8,
-    effective_depth: u8,
-    base_ref: Option<&str>,
-    staleness_note: Option<&str>,
-) -> String {
-    // Counts come from the per-list `pagination` totals, NOT the (capped) arrays,
-    // so the summary reports the FULL change/blast size even when the lists are
-    // truncated (Wave 1 Fix 1).
-    let pagination = &payload["pagination"];
-    let changed_files = pagination["changed_files"]["total"].as_u64().unwrap_or(0);
-    let changed_symbols = pagination["changed_symbols"]["total"].as_u64().unwrap_or(0);
-    let total_blast = pagination["blast_radius"]["total"].as_u64().unwrap_or(0);
-    let risk = &payload["risk_summary"];
-    let mut summary = format!(
-        "Impact analysis: {changed_files} changed file(s), {changed_symbols} changed symbol(s), \
-         {total_blast} blast-radius node(s) ({} critical / {} high / {} medium / {} low)",
-        risk["critical"], risk["high"], risk["medium"], risk["low"],
-    );
-    // Self-describing base ref + staleness disclosure (Wave 1 Fix 6).
-    if let Some(base) = base_ref {
-        summary.push_str(&format!("\nbase: {base}"));
-    }
-    if let Some(note) = staleness_note {
-        summary.push_str(&format!("\nnote: {note}"));
-    }
-    // Truncation disclosure in the human summary (machine-readable totals live in
-    // `pagination`), using the house truncation marker (Wave 1 Fix 1).
-    let any_truncated = ["changed_files", "changed_symbols", "blast_radius"]
-        .iter()
-        .any(|list| pagination[*list]["truncated"].as_bool().unwrap_or(false));
-    if any_truncated {
-        summary.push_str(&format!(
-            "\n{CANONICAL_TRUNCATION_MARKER} one or more lists capped; see `pagination` for full totals and returned counts."
-        ));
-    }
-    let json = serde_json::to_string_pretty(payload).expect("detect_impact payload serializes");
-    let mut out = format!("{summary}\n\n--- impact payload ---\n{json}");
-    if requested_depth > effective_depth {
-        out.push_str(&format!(
-            "\n\nWarning: depth clamped to {effective_depth} (requested {requested_depth})."
-        ));
-    }
-    out
-}
+pub use crate::index_lifecycle::guidance::changes::detect_impact_result;
 
 pub(crate) use crate::index_lifecycle::guidance::changes::{
     what_changed_paths_result, what_changed_timestamp_view,
@@ -576,7 +514,6 @@ pub use crate::index_lifecycle::guidance::reference_read::{
     find_references_result, find_references_result_view, implementations_result_view,
 };
 
-use crate::index_lifecycle::guidance::source::CANONICAL_TRUNCATION_MARKER;
 #[cfg(test)]
 use crate::index_lifecycle::guidance::source::extract_signature;
 #[cfg(test)]

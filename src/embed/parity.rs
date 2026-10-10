@@ -108,6 +108,7 @@ pub enum QueryOperationKind {
     DiffSymbols,
     DetectImpact,
     Ask,
+    Symforge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -214,6 +215,9 @@ pub enum QueryRequest {
     DetectImpact(detect_impact::DetectImpactRequest),
     /// Natural-language routing plus native execution (MCP `ask`).
     Ask(ask::AskRequest),
+    /// MCP `symforge`: the compact facade's planner and economics, routed to
+    /// this source's native lanes.
+    Symforge(stel::StelRequest),
 }
 
 impl QueryRequest {
@@ -267,6 +271,7 @@ impl QueryRequest {
             Self::DiffSymbols(_) => QueryOperationKind::DiffSymbols,
             Self::DetectImpact(_) => QueryOperationKind::DetectImpact,
             Self::Ask(_) => QueryOperationKind::Ask,
+            Self::Symforge(_) => QueryOperationKind::Symforge,
         }
     }
 }
@@ -508,4 +513,5 @@ pub enum QueryOutput {
     DiffSymbols(changes::DiffSymbolsResult),
     DetectImpact(detect_impact::DetectImpactResult),
     Ask(ask::AskResult),
+    Symforge(stel::SymforgeAnswer),
 }

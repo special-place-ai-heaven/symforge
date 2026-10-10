@@ -93,7 +93,7 @@ use crate::domain::LanguageId;
 use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkipReason};
 use crate::live_index::qualified_usages;
 use crate::live_index::{
-    IndexedFile, SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
+    IndexedFile, SearchFilesResolveView, SearchFilesView, search,
     store::{IndexState, LiveIndex},
 };
 use crate::protocol::edit;
@@ -539,63 +539,11 @@ fn freshen_exact_path_for_targeted_retrieval(
     )
 }
 
-fn search_scope_summary(
-    path_scope: &search::PathScope,
-    language_filter: Option<&LanguageId>,
-    noise_policy: &search::NoisePolicy,
-    include_personal_tooling: bool,
-    glob: Option<&str>,
-    exclude_glob: Option<&str>,
-    ranked: bool,
-) -> String {
-    let mut parts = Vec::new();
-    match path_scope {
-        search::PathScope::Any => parts.push("repo-wide".to_string()),
-        search::PathScope::Exact(path) => parts.push(format!("path `{path}`")),
-        search::PathScope::Prefix(prefix) => parts.push(format!("path prefix `{prefix}`")),
-    }
-    if let Some(language) = language_filter {
-        parts.push(format!("language `{language}`"));
-    }
-    // SF-STRESS-011 honesty fix: these are HEURISTIC path-based filters, not a
-    // guaranteed outcome. Detection keys on path segments (vendor/, deps/,
-    // dist/, test_data/, ...) and basename patterns, so a vendored/generated
-    // file with an unconventional path can still appear in results. The header
-    // says "filter active (heuristic)" rather than asserting the file class was
-    // actually removed, which the previous "vendor filtered" wording overstated.
-    parts.push(if noise_policy.include_tests {
-        "tests included".to_string()
-    } else {
-        "tests filter active (heuristic)".to_string()
-    });
-    parts.push(if noise_policy.include_generated {
-        "generated included".to_string()
-    } else {
-        "generated filter active (heuristic)".to_string()
-    });
-    parts.push(if noise_policy.include_vendor {
-        "vendor included".to_string()
-    } else {
-        "vendor filter active (heuristic)".to_string()
-    });
-    parts.push(if include_personal_tooling {
-        "personal tooling included".to_string()
-    } else {
-        "personal tooling filtered".to_string()
-    });
-    if let Some(glob) = glob {
-        parts.push(format!("glob `{glob}`"));
-    }
-    if let Some(exclude_glob) = exclude_glob {
-        parts.push(format!("exclude `{exclude_glob}`"));
-    }
-    if ranked {
-        parts.push("ranked ordering enabled".to_string());
-    }
-    parts.join("; ")
-}
-
 use crate::index_lifecycle::guidance::reference_read::search_parse_state_for_paths;
+use crate::index_lifecycle::guidance::search_envelope::{
+    append_search_files_filter_summary, search_completeness_label, search_files_hidden_noise_note,
+    search_files_scope_summary,
+};
 
 fn parse_state_for_file(file: &IndexedFile) -> &'static str {
     match &file.parse_status {
@@ -620,95 +568,6 @@ fn parse_state_for_file(file: &IndexedFile) -> &'static str {
 
 use crate::index_lifecycle::guidance::symbol_context::context_bundle_completeness_label;
 
-fn search_completeness_label(overflow_count: usize, suppressed_by_noise: usize) -> String {
-    // Honesty (trust): the index is built by a discovery walk with the `ignore`
-    // crate default `.hidden(true)`, so hidden / dotdir paths (`.github/`,
-    // `.gitlab-ci.yml`, …) are NOT indexed and never appear in results. A bare
-    // "full" claim would mislead an agent into trusting the file count as
-    // exhaustive (the dogfood report: `search_text` silently omitted
-    // `.github/workflows/release-please.yml` that ripgrep found). Qualify the
-    // claim so the agent knows to use a raw grep for hidden paths.
-    let mut parts = vec![if overflow_count > 0 {
-        format!("truncated by result cap ({overflow_count} more omitted)")
-    } else {
-        "full for indexed scope (hidden/dotdir paths not indexed — grep those)".to_string()
-    }];
-    if suppressed_by_noise > 0 {
-        if suppressed_by_noise > search::SUPPRESSED_TEXT_MATCH_DISPLAY_CAP {
-            parts.push(format!(
-                "{}+ noise-filtered match(es) suppressed",
-                search::SUPPRESSED_TEXT_MATCH_DISPLAY_CAP
-            ));
-        } else {
-            parts.push(format!(
-                "{suppressed_by_noise} noise-filtered match(es) suppressed"
-            ));
-        }
-    }
-    parts.join("; ")
-}
-
-fn search_text_match_type_label(
-    structural: bool,
-    is_regex: bool,
-    terms: Option<&[String]>,
-    auto_detected_regex: bool,
-    auto_corrected_regex: bool,
-    ranked: bool,
-) -> String {
-    if structural {
-        "structural (ast-grep)".to_string()
-    } else if auto_corrected_regex {
-        "heuristic (auto-corrected regex)".to_string()
-    } else if is_regex && auto_detected_regex {
-        "heuristic (auto-detected regex)".to_string()
-    } else if is_regex {
-        "heuristic (regex)".to_string()
-    } else if ranked {
-        match terms {
-            Some(terms) if !terms.is_empty() => "heuristic (ranked OR-literal terms)".to_string(),
-            _ => "heuristic (ranked literal)".to_string(),
-        }
-    } else if matches!(terms, Some(terms) if !terms.is_empty()) {
-        "constrained (OR-literal terms)".to_string()
-    } else {
-        "constrained (literal)".to_string()
-    }
-}
-
-fn search_symbols_match_type_label(
-    result: &search::SymbolSearchResult,
-    is_browse: bool,
-) -> &'static str {
-    if is_browse {
-        "constrained (scoped browse)"
-    } else {
-        match result.hits.first().map(|hit| hit.tier) {
-            Some(search::SymbolMatchTier::Exact) => "exact",
-            Some(search::SymbolMatchTier::Prefix) => "constrained (prefix tier)",
-            Some(search::SymbolMatchTier::Substring) => "heuristic (substring tier)",
-            None => "constrained",
-        }
-    }
-}
-
-fn search_files_match_type_label(view: &SearchFilesView) -> &'static str {
-    match view {
-        SearchFilesView::Found { hits, .. } => match hits.first().map(|hit| hit.tier) {
-            Some(SearchFilesTier::CoChange) => "heuristic (git-temporal coupling)",
-            Some(SearchFilesTier::StrongPath) | Some(SearchFilesTier::Basename) => {
-                "constrained (tiered path relevance)"
-            }
-            Some(SearchFilesTier::LoosePath) => "heuristic (loose path relevance)",
-            Some(SearchFilesTier::MetadataOnly) => "heuristic (Tier-2 metadata-only path)",
-            None => "constrained",
-        },
-        _ => "constrained",
-    }
-}
-
-use crate::index_lifecycle::guidance::file_search::search_files_ranking_explanation;
-
 fn worktree_routing_health_status() -> String {
     match crate::worktree::routing_policy_from_env() {
         WorktreeRoutingPolicy::ExplicitCallTime => "explicit-call enabled".to_string(),
@@ -724,76 +583,6 @@ fn append_changed_with_deprecation_warning(mut result: String) -> String {
     result
 }
 
-fn search_files_hidden_noise_note(
-    hidden_count: usize,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) -> Option<String> {
-    if hidden_count == 0 || (include_vendor && include_personal_tooling) {
-        return None;
-    }
-
-    let mut flags = Vec::new();
-    if !include_vendor {
-        flags.push("include_vendor=true");
-    }
-    if !include_personal_tooling {
-        flags.push("include_personal_tooling=true");
-    }
-
-    let noun = if hidden_count == 1 {
-        "path candidate"
-    } else {
-        "path candidates"
-    };
-    Some(format!(
-        "{hidden_count} vendor/personal-tooling {noun} hidden by default; pass {} to include suppressed noise.",
-        flags.join(" or ")
-    ))
-}
-
-fn search_files_filter_summary(include_vendor: bool, include_personal_tooling: bool) -> String {
-    // SF-STRESS-011 honesty fix: vendor detection is a heuristic path filter, so
-    // the header says "filter active (heuristic)" rather than asserting the file
-    // class was actually removed. Personal-tooling paths are an exact prefix
-    // match, so that claim stays definite.
-    let vendor = if include_vendor {
-        "vendor included"
-    } else {
-        "vendor filter active (heuristic)"
-    };
-    let personal = if include_personal_tooling {
-        "personal tooling included"
-    } else {
-        "personal tooling filtered"
-    };
-    format!("filters: {vendor}; {personal}")
-}
-
-fn search_files_scope_summary(
-    base_scope: impl Into<String>,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) -> String {
-    format!(
-        "{}; {}",
-        base_scope.into(),
-        search_files_filter_summary(include_vendor, include_personal_tooling)
-    )
-}
-
-fn append_search_files_filter_summary(
-    result: &mut String,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) {
-    result.push_str("\n\n");
-    result.push_str(&search_files_filter_summary(
-        include_vendor,
-        include_personal_tooling,
-    ));
-}
-
 fn search_files_resolve_match_type_label(view: &SearchFilesResolveView) -> &'static str {
     match view {
         SearchFilesResolveView::Resolved { .. } => "exact (resolve)",
@@ -803,119 +592,6 @@ fn search_files_resolve_match_type_label(view: &SearchFilesResolveView) -> &'sta
         SearchFilesResolveView::Ambiguous { .. } => "constrained (resolve candidates)",
         _ => "constrained",
     }
-}
-
-use crate::index_lifecycle::guidance::reference_read::anchored_search_evidence;
-
-fn search_text_evidence(result: &search::TextSearchResult) -> String {
-    let anchors = result
-        .files
-        .iter()
-        .flat_map(|file| {
-            file.matches
-                .iter()
-                .take(2)
-                .map(move |line_match| format!("{}:{}", file.path, line_match.line_number))
-        })
-        .take(3)
-        .collect();
-    anchored_search_evidence(anchors, "line anchors")
-}
-
-fn search_symbols_evidence(result: &search::SymbolSearchResult) -> String {
-    let anchors = result
-        .hits
-        .iter()
-        .take(3)
-        .map(|hit| format!("{}:{}", hit.path, hit.line))
-        .collect();
-    anchored_search_evidence(anchors, "symbol anchors")
-}
-
-fn normalize_untracked_search_path(raw: &str) -> String {
-    let mut normalized = raw.trim().replace('\\', "/");
-    while normalized.starts_with("./") {
-        normalized = normalized[2..].to_string();
-    }
-    normalized.trim_matches('/').to_string()
-}
-
-fn untracked_path_has_component(path: &str, component: &str) -> bool {
-    path.split('/')
-        .any(|part| part.eq_ignore_ascii_case(component))
-}
-
-fn untracked_common_path_filters_allow(
-    path: &str,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) -> bool {
-    (include_vendor || !crate::live_index::query::is_vendor_path(path))
-        && (include_personal_tooling || !crate::live_index::query::is_personal_tooling_path(path))
-}
-
-fn untracked_path_matches_search_files_query(path: &str, query: &str) -> bool {
-    let normalized_query = normalize_untracked_search_path(query);
-    if normalized_query.is_empty() {
-        return false;
-    }
-
-    let is_glob = normalized_query.contains('*')
-        || normalized_query.contains('?')
-        || normalized_query.contains('[');
-    if is_glob
-        && let Ok(glob) = globset::GlobBuilder::new(&normalized_query)
-            .literal_separator(false)
-            .build()
-    {
-        return glob.compile_matcher().is_match(path);
-    }
-
-    let path_lower = path.to_ascii_lowercase();
-    let normalized_query_lower = normalized_query.to_ascii_lowercase();
-    let has_path_context = normalized_query.contains('/');
-    if path_lower == normalized_query_lower
-        || (has_path_context && path_lower.ends_with(&normalized_query_lower))
-    {
-        return true;
-    }
-
-    let tokens: Vec<String> = normalized_query
-        .split(|ch: char| ch == '/' || ch.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let Some(basename_token) = tokens.last() else {
-        return false;
-    };
-    let component_tokens = if tokens.len() > 1 {
-        &tokens[..tokens.len() - 1]
-    } else {
-        &[][..]
-    };
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if file_name.eq_ignore_ascii_case(basename_token)
-        && component_tokens
-            .iter()
-            .all(|component| untracked_path_has_component(path, component))
-    {
-        return true;
-    }
-
-    if basename_token.len() >= 3 {
-        let file_stem = Path::new(path)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("");
-        if file_stem.to_ascii_lowercase().starts_with(basename_token) {
-            return true;
-        }
-    }
-
-    tokens.iter().all(|token| path_lower.contains(token))
 }
 
 fn matching_untracked_paths_for_search_files(
@@ -931,19 +607,18 @@ fn matching_untracked_paths_for_search_files(
     let Ok(repo) = crate::git::GitRepo::open(&repo_root) else {
         return Vec::new();
     };
-    untracked_paths_not_in_index(&repo, live)
-        .into_iter()
-        .filter(|path| {
-            untracked_common_path_filters_allow(path, include_vendor, include_personal_tooling)
-                && untracked_path_matches_search_files_query(path, query)
-        })
-        .collect()
+    crate::index_lifecycle::guidance::search::matching_untracked_paths_for_search_files(
+        &repo,
+        live,
+        query,
+        include_vendor,
+        include_personal_tooling,
+    )
 }
 
 use crate::index_lifecycle::guidance::search::{
     append_untracked_file_diagnostic,
     matching_untracked_paths_for_search_text as shared_untracked_text_sweep,
-    untracked_paths_not_in_index,
 };
 
 fn matching_untracked_paths_for_search_text(
@@ -1338,38 +1013,8 @@ fn render_search_text_output(
     auto_detected_regex: bool,
     auto_corrected_regex: bool,
 ) -> String {
-    let envelope = match &result {
-        Ok(result) if !result.files.is_empty() => {
-            let guard = Arc::clone(&generation.live);
-            Some(search_format::format_search_envelope(
-                &search_text_match_type_label(
-                    structural,
-                    is_regex,
-                    terms,
-                    auto_detected_regex,
-                    auto_corrected_regex,
-                    options.ranked,
-                ),
-                search_format::SourceAuthority::from_freshness(&generation.freshness),
-                search_parse_state_for_paths(
-                    &guard,
-                    result.files.iter().map(|file| file.path.as_str()),
-                ),
-                &search_completeness_label(result.overflow_count, result.suppressed_by_noise),
-                &search_scope_summary(
-                    &options.path_scope,
-                    options.language_filter.as_ref(),
-                    &options.noise_policy,
-                    options.include_personal_tooling,
-                    options.glob.as_deref(),
-                    options.exclude_glob.as_deref(),
-                    options.ranked,
-                ),
-                &search_text_evidence(result),
-            ))
-        }
-        _ => None,
-    };
+    // The zero-hit untracked sweep reads this server's git root; the rest of
+    // the rendering is the shared engine the embedded facade also runs.
     let matching_untracked_paths = match &result {
         Ok(result) if result.files.is_empty() && result.suppressed_by_noise == 0 => {
             matching_untracked_paths_for_search_text(
@@ -1384,35 +1029,19 @@ fn render_search_text_output(
         }
         _ => Vec::new(),
     };
-    let confidence = if auto_corrected_regex {
-        0.75f32
-    } else if is_regex && auto_detected_regex {
-        0.80
-    } else if is_regex {
-        0.85
-    } else if options.ranked {
-        0.80
-    } else {
-        0.95
-    };
-    let output = format::search_text_result_view(
+    crate::index_lifecycle::guidance::search::render_search_text_output(
+        generation,
         result,
+        query,
+        structural,
         group_by,
         terms,
-        Some(confidence),
-        format::SearchSuggestionContext {
-            regex: is_regex,
-            include_tests: options.noise_policy.include_tests,
-            multi_word_literal: !is_regex
-                && query.is_some_and(|q| q.trim().contains(char::is_whitespace)),
-        },
-    );
-    let mut rendered = match envelope {
-        Some(envelope) => format!("{envelope}\n\n{output}"),
-        None => output,
-    };
-    append_untracked_file_diagnostic(&mut rendered, &matching_untracked_paths);
-    rendered
+        options,
+        is_regex,
+        auto_detected_regex,
+        auto_corrected_regex,
+        &matching_untracked_paths,
+    )
 }
 
 fn sidecar_state_for_server(server: &SymForgeServer) -> SidecarState {
@@ -3230,55 +2859,12 @@ impl SymForgeServer {
                 Err(message) => return message,
             }
         };
+        let output = crate::index_lifecycle::guidance::search::render_symbol_search(
+            &generation,
+            &execution,
+            query_str,
+        );
         let result = execution.result;
-        let options = execution.options;
-        let hidden_noise_count = execution.suppressed_by_noise;
-        // Browse ordering is owned by the engine (search::search_symbols_with_options),
-        // which ranks browse results by importance (reference count -> kind -> path ->
-        // line). Do NOT re-sort here: a tool-level re-sort would override that order and
-        // reintroduce the symbol_kind_priority display-kind mismatch ("fn" -> 0.1). (018 US2)
-        let envelope = if result.hits.is_empty() {
-            None
-        } else {
-            let guard = Arc::clone(&generation.live);
-            Some(search_format::format_search_envelope(
-                search_symbols_match_type_label(&result, is_browse),
-                search_format::SourceAuthority::from_freshness(&generation.freshness),
-                search_parse_state_for_paths(
-                    &guard,
-                    result.hits.iter().map(|hit| hit.path.as_str()),
-                ),
-                &search_completeness_label(result.overflow_count, hidden_noise_count),
-                &search_scope_summary(
-                    &options.path_scope,
-                    options.language_filter.as_ref(),
-                    &options.noise_policy,
-                    options.include_personal_tooling,
-                    None,
-                    None,
-                    false,
-                ),
-                &search_symbols_evidence(&result),
-            ))
-        };
-        let output = format::search_symbols_result_view(&result, query_str);
-        let output = match envelope {
-            Some(envelope) => format!("{envelope}\n\n{output}"),
-            None => output,
-        };
-        let output = if execution.text_fallback.is_empty() {
-            output
-        } else {
-            let paths: Vec<_> = execution
-                .text_fallback
-                .iter()
-                .map(|(path, line)| format!("{path}:{line}"))
-                .collect();
-            format!(
-                "{output}\n\nText path fallback (sparse symbol hits):\n{}",
-                paths.join("\n")
-            )
-        };
         self.record_tool_savings_named(
             "search_symbols",
             format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
@@ -3946,8 +3532,6 @@ impl SymForgeServer {
             return "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files).".to_string();
         }
 
-        let rank_by_path_cochange = params.0.rank_by.as_deref() == Some("path+cochange");
-        let rank_by_frecency = params.0.rank_by.as_deref() == Some("frecency");
         let ranked = {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
@@ -3959,103 +3543,22 @@ impl SymForgeServer {
                 true,
             )
         };
-        let view = ranked.view;
-        let hidden_noise_count = ranked.hidden_noise_count;
-        let cochange_evidence = ranked.cochange_evidence;
-        let frecency_evidence = ranked.frecency_evidence;
-        let ranking_diagnostics = ranked.ranking_diagnostics;
-        let debug_ranking = ranking_diagnostics.explain;
-        let envelope = match &view {
-            SearchFilesView::Found {
-                hits,
-                overflow_count,
-                ..
-            } => {
-                let guard = Arc::clone(&generation.live);
-                let scope = match params.0.current_file.as_deref() {
-                    Some(current_file) => {
-                        format!("ranked indexed file paths; current file boost `{current_file}`")
-                    }
-                    None => "ranked indexed file paths".to_string(),
-                };
-                Some(search_format::format_search_envelope(
-                    search_files_match_type_label(&view),
-                    // The two composite labels already differ from the bare
-                    // "current index" sentinel, so they never collapse the
-                    // envelope; only the plain arm needed measuring. They do
-                    // still say "current" unconditionally — worth revisiting
-                    // once every lane derives its own prefix.
-                    if rank_by_path_cochange {
-                        search_format::SourceAuthority::never_collapse(
-                            "current index + optional coupling store",
-                        )
-                    } else if rank_by_frecency {
-                        search_format::SourceAuthority::never_collapse(
-                            "current index + optional frecency history",
-                        )
-                    } else {
-                        search_format::SourceAuthority::from_freshness(&generation.freshness)
-                    },
-                    search_parse_state_for_paths(&guard, hits.iter().map(|hit| hit.path.as_str())),
-                    &search_completeness_label(*overflow_count, hidden_noise_count),
-                    &search_files_scope_summary(scope, include_vendor, include_personal_tooling),
-                    &search_paths_evidence(hits.iter().map(|hit| hit.path.as_str())),
-                ))
-            }
-            _ => None,
-        };
-        let output = format::search_files_result_view(&view);
-        let had_envelope = envelope.is_some();
-        let mut result = match envelope {
-            Some(envelope) => format!("{envelope}\n\n{output}"),
-            None => output,
-        };
-        if !had_envelope {
-            append_search_files_filter_summary(
-                &mut result,
-                include_vendor,
-                include_personal_tooling,
-            );
-        }
-        if let Some(evidence) = cochange_evidence.as_ref() {
-            result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(evidence));
-        }
-        if let Some(evidence) = frecency_evidence.as_ref() {
-            result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(evidence));
-        }
-        if let Some(evidence) = ranking_diagnostics.evidence.as_ref() {
-            result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(evidence));
-        }
-        if debug_ranking {
-            result.push_str("\n\n");
-            result.push_str(&search_files_ranking_explanation(
-                &view,
-                params.0.rank_by.as_deref(),
-                cochange_evidence.as_ref(),
-                frecency_evidence.as_ref(),
-            ));
-        }
-        if let Some(note) = search_files_hidden_noise_note(
-            hidden_noise_count,
+        let result = crate::index_lifecycle::guidance::file_search::render_ranked_files(
+            &generation,
+            ranked,
+            &params.0,
             include_vendor,
             include_personal_tooling,
-        ) {
-            result.push_str("\n\n");
-            result.push_str(&note);
-        }
-        if matches!(view, SearchFilesView::NotFound { .. }) {
-            let matching_untracked_paths = matching_untracked_paths_for_search_files(
-                self,
-                &generation.live,
-                &params.0.query,
-                include_vendor,
-                include_personal_tooling,
-            );
-            append_untracked_file_diagnostic(&mut result, &matching_untracked_paths);
-        }
+            || {
+                matching_untracked_paths_for_search_files(
+                    self,
+                    &generation.live,
+                    &params.0.query,
+                    include_vendor,
+                    include_personal_tooling,
+                )
+            },
+        );
         self.session_context.record_summary_output(
             "search_files",
             (result.len() / 4).min(u32::MAX as usize) as u32,
@@ -13644,6 +13147,62 @@ mod tests {
             format!(
                 "{golden}\ncalibration_reset: cleared 0 sample(s) + active tuning (state -> deferred)"
             )
+        );
+    }
+
+    /// MCP side of the compact-facade golden shared with
+    /// `tests/embed_symforge.rs`: every case in
+    /// `tests/fixtures/stel_facade/parity.json` renders the recorded text, with
+    /// the bound root written as `{root}`, and reports the recorded outcome.
+    /// The observed answers are also written to
+    /// `target/stel-facade-parity.observed.json` for diagnosis.
+    #[tokio::test]
+    async fn symforge_facade_matches_embed_parity_golden() {
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("stel_facade")
+            .join("parity.json");
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&fixture_path).expect("fixture"))
+                .expect("fixture json");
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            fixture["lib_rs"].as_str().expect("lib_rs"),
+        )
+        .expect("source");
+        let root = dunce::canonicalize(repo.path()).expect("canonical root");
+        let server = embed_parity_server(&root);
+        let root_text = crate::daemon::normalized_path_string(&root);
+        let expected = fixture.clone();
+        for case in fixture["cases"].as_array_mut().expect("cases") {
+            let request: crate::stel::StelRequest =
+                serde_json::from_value(case["request"].clone()).expect("request");
+            let result = server
+                .symforge_stel_handler(&request)
+                .await
+                .expect("facade answer");
+            let outcome = super::super::result_status::observed_outcome_class(result.meta.as_ref());
+            let serialized = serde_json::to_value(&result).expect("serialize");
+            case["outcome"] = serde_json::to_value(outcome).expect("outcome");
+            case["rendered"] = serde_json::Value::String(
+                tool_result_text(&serialized).replace(&root_text, "{root}"),
+            );
+        }
+        let observed = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("stel-facade-parity.observed.json");
+        let _ = fs::write(
+            &observed,
+            serde_json::to_string_pretty(&fixture).expect("observed json"),
+        );
+        assert_eq!(
+            fixture,
+            expected,
+            "MCP facade answers drifted from the shared golden; see {}",
+            observed.display()
         );
     }
 

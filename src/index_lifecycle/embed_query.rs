@@ -425,6 +425,20 @@ fn execute_inner(
             }
         }
     }
+    if let QueryRequest::Symforge(input) = request {
+        // MCP's planned read primitives each freshen their exact path when
+        // the facade dispatches them; the facade freshens them all before it
+        // captures the one publication every step answers from.
+        for path in super::embed_symforge::freshen_paths(input) {
+            if handle.freshen_exact_path(&path).is_err() {
+                return Err(refuse(
+                    QueryRefusalKind::StalePublication,
+                    RetryAdvice::OnEvent,
+                ));
+            }
+        }
+        budget.stel_store = handle.stel_store(policy);
+    }
     if let QueryRequest::FileImpact(input) = request
         && input.estimate != Some(true)
     {
@@ -628,50 +642,60 @@ fn execute_inner(
     // admitted while the source-bound session operation gate is still held.
     // An Ask commits what its routed query returned, exactly as that query
     // would have committed it when called directly.
-    let committed_value = match result.value() {
-        QueryOutput::Ask(ask) => ask.output.as_deref(),
-        value => Some(value),
-    };
-    let committed_path = match committed_value {
-        None => None,
-        Some(value) => match value {
-            QueryOutput::File { file, .. } => Some(file.path.as_str()),
-            QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
-            QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
-            QueryOutput::SymbolContext(context)
-                if context.estimate.is_none() && context.refusal.is_none() =>
-            {
-                context.path.as_deref()
-            }
-            QueryOutput::FileContent(content) if !content.cache_hit => Some(content.path.as_str()),
-            QueryOutput::FileContext(content)
-                if !content.cache_hit && content.estimated_tokens.is_none() =>
-            {
-                Some(content.path.as_str())
-            }
-            QueryOutput::SourcePage(page) => Some(page.path.as_str()),
-            _ => None,
-        },
-    };
-    if let Some(path) = committed_path {
-        snapshot.record_commitment(&[PathBuf::from(path)]);
-    }
-    if let Some(QueryOutput::SymbolRead(content)) = committed_value
-        && !content.cache_hit
-        && content.estimated_tokens.is_none()
-    {
-        let paths = content
-            .entries
+    // A facade commits what each of its executed primitives returned.
+    let committed_values: Vec<Option<&QueryOutput>> = match result.value() {
+        QueryOutput::Ask(ask) => vec![ask.output.as_deref()],
+        QueryOutput::Symforge(answer) => answer
+            .steps
             .iter()
-            .filter(|entry| entry.source.is_some())
-            .map(|entry| PathBuf::from(&entry.path))
-            .collect::<Vec<_>>();
-        snapshot.record_commitment(&paths);
-    }
-    if let Some(QueryOutput::InspectMatch(content)) = committed_value
-        && content.estimated_tokens.is_none()
-    {
-        snapshot.record_commitment(&[PathBuf::from(&content.path)]);
+            .map(|step| step.output.as_deref())
+            .collect(),
+        value => vec![Some(value)],
+    };
+    for committed_value in committed_values {
+        let committed_path = match committed_value {
+            None => None,
+            Some(value) => match value {
+                QueryOutput::File { file, .. } => Some(file.path.as_str()),
+                QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
+                QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
+                QueryOutput::SymbolContext(context)
+                    if context.estimate.is_none() && context.refusal.is_none() =>
+                {
+                    context.path.as_deref()
+                }
+                QueryOutput::FileContent(content) if !content.cache_hit => {
+                    Some(content.path.as_str())
+                }
+                QueryOutput::FileContext(content)
+                    if !content.cache_hit && content.estimated_tokens.is_none() =>
+                {
+                    Some(content.path.as_str())
+                }
+                QueryOutput::SourcePage(page) => Some(page.path.as_str()),
+                _ => None,
+            },
+        };
+        if let Some(path) = committed_path {
+            snapshot.record_commitment(&[PathBuf::from(path)]);
+        }
+        if let Some(QueryOutput::SymbolRead(content)) = committed_value
+            && !content.cache_hit
+            && content.estimated_tokens.is_none()
+        {
+            let paths = content
+                .entries
+                .iter()
+                .filter(|entry| entry.source.is_some())
+                .map(|entry| PathBuf::from(&entry.path))
+                .collect::<Vec<_>>();
+            snapshot.record_commitment(&paths);
+        }
+        if let Some(QueryOutput::InspectMatch(content)) = committed_value
+            && content.estimated_tokens.is_none()
+        {
+            snapshot.record_commitment(&[PathBuf::from(&content.path)]);
+        }
     }
     if let Some(session) = session {
         session.commit_observation(result.value());
@@ -684,6 +708,16 @@ fn execute_inner(
     if let Some(operation) = session_operation {
         let committed = operation.commit();
         debug_assert_eq!(Some(committed), result.session_evidence);
+    }
+    // MCP's facade records its economics event in the session ledger and the
+    // durable store once the answer is served; here, once it is committed.
+    if let Some(event) = budget.stel_event.take() {
+        if let Some(session) = session {
+            session.stel_ledger().push(event.clone());
+        }
+        if let Some(store) = budget.stel_store.as_deref() {
+            crate::stel::runtime::record_durably_inline(store, &event);
+        }
     }
     Ok(result)
 }
@@ -704,6 +738,10 @@ pub(super) struct Budget {
     pub(super) syntax_disk_fallback: bool,
     /// The `FileImpact` re-admission's answer, taken by `project`.
     pub(super) file_impact: Option<super::embed_file_impact::FileImpactAdmission>,
+    /// The source's durable STEL ledger for a `Symforge` facade query.
+    pub(super) stel_store: Option<Arc<crate::stel::ledger_store::StelLedgerStore>>,
+    /// The facade's ledger event, recorded only once its answer is committed.
+    pub(super) stel_event: Option<crate::stel::types::StelLedgerEvent>,
 }
 
 #[cfg(test)]
@@ -883,6 +921,8 @@ impl Budget {
             cache_truncated: false,
             syntax_disk_fallback: self.syntax_disk_fallback,
             file_impact: None,
+            stel_store: None,
+            stel_event: None,
         }
     }
     pub(super) fn limits(&self) -> QueryLimits {
@@ -935,6 +975,8 @@ impl Budget {
             cache_truncated: false,
             syntax_disk_fallback: false,
             file_impact: None,
+            stel_store: None,
+            stel_event: None,
         })
     }
 
@@ -1100,6 +1142,7 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         QueryRequest::DiffSymbols(input) => super::embed_changes::validate_diff_symbols(input)?,
         QueryRequest::DetectImpact(input) => super::embed_detect_impact::validate(input)?,
         QueryRequest::Ask(input) => super::embed_ask::validate(input)?,
+        QueryRequest::Symforge(_) => {}
         // MCP accepts any target string; the shared planner reports a miss.
         QueryRequest::Conventions
         | QueryRequest::ContextInventory
@@ -1545,6 +1588,9 @@ pub(super) fn project(
         }
         QueryRequest::Ask(input) => {
             super::embed_ask::project(snapshot, input, budget, observations, session, policy)
+        }
+        QueryRequest::Symforge(input) => {
+            super::embed_symforge::project(snapshot, input, budget, observations, session, policy)
         }
         QueryRequest::Conventions => super::embed_guidance::conventions(live, budget),
         QueryRequest::EditPlan { target } => super::embed_guidance::edit_plan(

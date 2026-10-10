@@ -272,6 +272,10 @@ pub enum HostRequest {
         request: WireEditRequest,
         operation_key: Option<String>,
     },
+    /// MCP `symforge_edit`: the compact edit facade over this room's source.
+    /// A preview needs the query right; an apply needs the edit right and
+    /// replays by the request's own `idempotency_key`.
+    SymforgeEdit(crate::embed::parity::stel::StelEditRequest),
     Knowledge {
         request: WireKnowledgeRequest,
         operation_key: Option<String>,
@@ -750,6 +754,7 @@ pub enum HostResponse {
     Prompt(HostPromptReply),
     Query(HostQueryReply),
     Edit(serde_json::Value),
+    SymforgeEdit(crate::embed::parity::stel::SymforgeEditAnswer),
     Knowledge(serde_json::Value),
     SecretFindings(SecretFindingsClaim),
     SecretPreview(SecretRemediationPreview),
@@ -770,6 +775,7 @@ impl std::fmt::Debug for HostResponse {
             Self::Prompt(_) => "Prompt",
             Self::Query(_) => "Query",
             Self::Edit(_) => "Edit",
+            Self::SymforgeEdit(_) => "SymforgeEdit",
             Self::Knowledge(_) => "Knowledge",
             Self::SecretFindings(_) => "SecretFindings",
             Self::SecretPreview(_) => "SecretPreview",
@@ -1513,6 +1519,7 @@ impl HostRoom {
                     "InvestigationSuggest",
                     "Retrieve",
                     "EditPlan",
+                    "Symforge",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -1528,6 +1535,7 @@ impl HostRoom {
                     "batch_edit",
                     "batch_insert",
                     "batch_rename",
+                    "symforge_edit",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -2053,6 +2061,42 @@ impl HostRoom {
                     }
                     refusal
                 })?)
+            }
+            HostRequest::SymforgeEdit(edit) => {
+                let apply = edit.apply == Some(true);
+                if !(self.rights.query && (!apply || self.rights.edit)) {
+                    return Err(HostRefusal::new(HostRefusalKind::Denied));
+                }
+                let authority = if apply {
+                    Some(
+                        EditApplyAuthority::for_source_root(
+                            self.source_root.clone(),
+                            self.replay_scope(),
+                            Arc::clone(&control.cancelled),
+                        )
+                        .map_err(|kind| HostRefusal::from_edit(EditError::Edit(kind)))?,
+                    )
+                } else {
+                    None
+                };
+                let session = self.query_session()?;
+                HostResponse::SymforgeEdit(
+                    self.source
+                        .symforge_edit(
+                            edit,
+                            Some(&session),
+                            QueryPolicy {
+                                allow_derived_state_preparation: self.rights.derived_state_prepare,
+                            },
+                            authority.as_ref().map(|authority| {
+                                crate::embed::parity::stel::SymforgeEditAuthority {
+                                    authority,
+                                    admitted: &[],
+                                }
+                            }),
+                        )
+                        .map_err(|_| HostRefusal::new(HostRefusalKind::SourceUnavailable))?,
+                )
             }
             HostRequest::Knowledge {
                 request: knowledge,

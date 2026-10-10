@@ -145,6 +145,46 @@ impl QuerySession {
         self.inner.lock().context.snapshot().total_tokens
     }
 
+    /// Run `observe` over the session context, as MCP's facade reads its own.
+    pub(super) fn with_context<R>(&self, observe: impl FnOnce(&SessionContext) -> R) -> R {
+        observe(&self.inner.lock().context)
+    }
+
+    /// MCP's `apply_ccr_budget` over this session's CCR store: the tool's
+    /// token budget (the caller's or its profile default), offloading the
+    /// complete text to a retrievable handle when the tool is CCR-eligible.
+    pub(super) fn apply_ccr_budget(
+        &self,
+        snapshot: &EmbeddedQuerySnapshot,
+        tool: &str,
+        result: String,
+        max_tokens: Option<u64>,
+    ) -> String {
+        use super::guidance::compression;
+        let budget = compression::resolve_tool_max_tokens(tool, max_tokens);
+        if compression::profile_for_tool(tool).is_some_and(|profile| profile.ccr_eligible) {
+            let publication = self.publication(snapshot);
+            let mut state = self.inner.lock();
+            return compression::enforce_token_budget_with_ccr(
+                &mut state.cache,
+                tool,
+                result,
+                budget,
+                Some(publication),
+            );
+        }
+        super::guidance::source::enforce_token_budget(result, budget)
+    }
+
+    /// MCP `context_inventory`'s rendered answer over this session.
+    pub(super) fn render_inventory(&self) -> String {
+        let state = self.inner.lock();
+        super::guidance::session::format_context_inventory(
+            &state.context.snapshot(),
+            state.cache.economics(),
+        )
+    }
+
     pub(super) fn begin_operation(&self) -> SessionOperation<'_> {
         let guard = self.operation_gate.lock();
         SessionOperation {
@@ -753,6 +793,15 @@ fn record_context(context: &mut SessionContext, output: &QueryOutput, tokens: u3
         }
         // An Ask records exactly what its routed query returned, under the
         // same rules that query would have recorded on its own.
+        // The facade records what each executed primitive returned, as MCP's
+        // primitives record themselves when the facade dispatches them.
+        QueryOutput::Symforge(answer) => {
+            for step in &answer.steps {
+                if let Some(output) = step.output.as_deref() {
+                    record_context(context, output, tokens);
+                }
+            }
+        }
         QueryOutput::Ask(ask) => {
             if let Some(output) = ask.output.as_deref() {
                 record_context(context, output, tokens);
@@ -790,5 +839,6 @@ fn operation_name(operation: QueryOperationKind) -> &'static str {
         QueryOperationKind::DiffSymbols => "diff_symbols",
         QueryOperationKind::DetectImpact => "detect_impact",
         QueryOperationKind::Ask => "ask",
+        QueryOperationKind::Symforge => "symforge",
     }
 }

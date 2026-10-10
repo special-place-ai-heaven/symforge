@@ -1829,6 +1829,15 @@ impl EmbeddedSourceHandle {
         Some((Arc::clone(&binding.authority), generation, phase))
     }
 
+    /// The bound root's admitted authority, in any phase: it reads a committed
+    /// post-image beneath the original anchor even while the worker refreshes.
+    #[cfg(feature = "embed")]
+    pub(super) fn source_authority(
+        &self,
+    ) -> Option<Arc<super::activation::ProjectSourceAuthority>> {
+        Some(Arc::clone(&self.binding.as_ref()?.authority))
+    }
+
     /// This source's durable STEL ledger under `policy`, opened on first use
     /// in the binding's own state placement.
     #[cfg(feature = "embed")]

@@ -310,3 +310,43 @@ fn zero_hit_text_search_sweeps_matching_untracked_files_like_mcp() {
     assert!(swept, "no attempt observed a zero-hit search");
     handle.close().unwrap();
 }
+
+/// MCP `search_files` sweeps untracked worktree paths whose names match a
+/// ranked search that found nothing indexed; the embedded lane returns the
+/// same paths, which the facade renders with MCP's diagnostic.
+#[test]
+fn zero_hit_file_search_sweeps_matching_untracked_paths_like_mcp() {
+    use symforge::embed::parity::search::FileSearchRequest;
+
+    let root = tempfile::tempdir().unwrap();
+    git2::Repository::init(root.path()).unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/lib.rs"), "pub fn indexed() {}\n").unwrap();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+
+    let mut swept = false;
+    for attempt in 0..20 {
+        let name = format!("zebrafile{attempt}");
+        let path = format!("src/{name}.rs");
+        fs::write(root.path().join(&path), "fn late() {}\n").unwrap();
+        let QueryOutput::FileSearch(result) = query_current(
+            &handle,
+            &QueryRequest::FileSearch(FileSearchRequest {
+                query: name,
+                ..Default::default()
+            }),
+        ) else {
+            panic!("file search");
+        };
+        if !result.hits.is_empty() {
+            assert!(result.untracked_paths.is_empty());
+            continue;
+        }
+        assert_eq!(result.untracked_paths, vec![path.clone()]);
+        swept = true;
+        break;
+    }
+    assert!(swept, "no attempt observed a zero-hit file search");
+    handle.close().unwrap();
+}

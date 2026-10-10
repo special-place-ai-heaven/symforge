@@ -906,3 +906,88 @@ async fn symforge_edit_failed_guarded_apply_is_not_classified_as_found() {
     );
     assert_eq!(before, std::fs::read(&file_path).unwrap());
 }
+
+/// The `symforge_edit` answer shape the embed parity golden compares: the
+/// routing summary (`Mode:` through `Economics:`), the whole text of an answer
+/// with no trust envelope, the outcome, the error flag and the file after.
+fn edit_parity_observation(
+    text: &str,
+    outcome: &str,
+    is_error: bool,
+    file: &str,
+) -> serde_json::Value {
+    let routing = text.find("Mode: ").map(|start| {
+        let tail = &text[start..];
+        let end = tail
+            .find("\nEconomics: ")
+            .and_then(|economics| {
+                tail[economics + 1..]
+                    .find('\n')
+                    .map(|line| economics + 1 + line)
+            })
+            .unwrap_or(tail.len());
+        tail[..end].to_string()
+    });
+    serde_json::json!({
+        "outcome": outcome,
+        "is_error": is_error,
+        "routing": routing,
+        // A key conflict names each store's own request hashes; only the
+        // class of refusal is shared.
+        "plain_text": (!text.starts_with("──")).then(|| {
+            if text.starts_with("Idempotency conflict:") {
+                "Idempotency conflict:".to_string()
+            } else {
+                text.to_string()
+            }
+        }),
+        "file": file,
+    })
+}
+
+/// MCP side of the `symforge_edit` golden shared with `tests/embed_symforge.rs`
+/// (`tests/fixtures/stel_facade/edit_parity.json`): previews of the three ops,
+/// a missing symbol, a keyed apply, its idempotent replay, a conflicting key
+/// and a refused replay after the file moved past the recorded post-image.
+/// The observed answers are written to `target/stel-edit-parity.observed.json`.
+#[tokio::test]
+async fn symforge_edit_matches_embed_parity_golden() {
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stel_facade/edit_parity.json");
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&fixture_path).unwrap()).unwrap();
+    let expected = fixture.clone();
+    let (dir, file_path) = temp_rust_repo(fixture["lib_rs"].as_str().unwrap());
+    let server = server_for_repo(dir.path(), "edit-parity");
+    for case in fixture["cases"].as_array_mut().unwrap() {
+        if let Some(tamper) = case["tamper"].as_str() {
+            std::fs::write(&file_path, tamper).unwrap();
+        }
+        let request: StelEditRequest = serde_json::from_value(case["request"].clone()).unwrap();
+        let result = dispatch_symforge_edit_result(&server, &request).await;
+        let observed = edit_parity_observation(
+            tool_result_text(&result),
+            outcome_class(&result),
+            result["isError"].as_bool().unwrap_or(false),
+            &std::fs::read_to_string(&file_path).unwrap(),
+        );
+        for key in ["outcome", "is_error", "routing", "plain_text", "file"] {
+            case[key] = observed[key].clone();
+        }
+        if case["replay"].as_bool() == Some(true) {
+            // An embedded replay store keeps only digests, so the replayed
+            // text is not compared; outcome and bytes are.
+            case["routing"] = serde_json::Value::Null;
+            case["plain_text"] = serde_json::Value::Null;
+        }
+    }
+    let observed =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/stel-edit-parity.observed.json");
+    let _ = std::fs::write(&observed, serde_json::to_string_pretty(&fixture).unwrap());
+    assert_eq!(
+        fixture,
+        expected,
+        "MCP symforge_edit answers drifted from the shared golden; see {}",
+        observed.display()
+    );
+}
