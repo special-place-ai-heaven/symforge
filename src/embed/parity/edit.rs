@@ -422,6 +422,52 @@ impl EditApplyAuthority {
     }
 }
 
+/// A host-admitted source an edit may be routed into with
+/// `working_directory`, with the write authority the host minted for it after
+/// its own room rights check. Like federation's admitted list, this list is the
+/// complete authority boundary: routing never discovers or opens another root.
+#[derive(Clone, Copy)]
+pub struct AdmittedEditTarget<'a> {
+    pub handle: &'a crate::embed::EmbeddedSourceHandle,
+    pub authority: &'a EditApplyAuthority,
+}
+
+/// MCP's resolved edit target for a supplied `working_directory`
+/// (`crate::worktree::ResolvedTarget` plus the requested directory).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ResolvedEditTarget {
+    pub working_directory: PathBuf,
+    /// `true` when the edit lands in another worktree than the bound source.
+    pub rerouted: bool,
+    /// Absolute path the edit writes (`wrote_to`).
+    pub target_path: PathBuf,
+    /// Absolute path of the bound source's copy.
+    pub indexed_path: PathBuf,
+}
+
+impl ResolvedEditTarget {
+    /// The exact suffix MCP appends to an edit given `working_directory`.
+    pub fn reroute_suffix(&self) -> String {
+        crate::index_lifecycle::guidance::edit_route::format_reroute_suffix(
+            Some(&self.working_directory),
+            self.rerouted,
+            &self.target_path,
+            &self.indexed_path,
+        )
+    }
+}
+
+/// Where one edit path lands. `target` is `None` when `working_directory` is
+/// the bound source itself; otherwise run the operation on `target.handle`
+/// with `target.authority`, after rebasing its guards with
+/// `EmbeddedSourceHandle::rebase_guard`.
+pub struct EditRoute<'a> {
+    pub target: Option<AdmittedEditTarget<'a>>,
+    pub resolved: ResolvedEditTarget,
+    pub(crate) path: String,
+    pub(crate) bound_root: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ReplaceApplied {
     pub path: String,
@@ -436,7 +482,9 @@ pub enum EditErrorKind {
     InvalidPath,
     FileNotAdmitted,
     SymbolNotFound,
-    AmbiguousSymbol { candidate_lines: Vec<u32> },
+    AmbiguousSymbol {
+        candidate_lines: Vec<u32>,
+    },
     UnsafeContent,
     StaleGeneration,
     StaleContent,
@@ -448,8 +496,19 @@ pub enum EditErrorKind {
     Cancelled,
     InvalidReplacement,
     ConflictingTargeting,
-    OccurrenceOutOfRange { requested: u32, total: usize },
+    OccurrenceOutOfRange {
+        requested: u32,
+        total: usize,
+    },
     TextNotFound,
+    /// `working_directory` names no host-admitted source (MCP
+    /// `WorkingDirectoryNotARecognizedWorktree`; embed never opens it).
+    WorkingDirectoryNotAdmitted,
+    /// The admitted source is not a worktree of the bound repository.
+    WorkingDirectoryNotAWorktree,
+    /// The routed worktree has no admitted file at the edit path (MCP
+    /// `TargetFileMissing`).
+    TargetFileMissing,
 }
 
 #[derive(Debug)]

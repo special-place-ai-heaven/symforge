@@ -75,6 +75,8 @@ pub(crate) mod embed_remediation;
 #[cfg(feature = "embed")]
 pub(super) mod embed_restore;
 #[cfg(feature = "embed")]
+mod embed_route;
+#[cfg(feature = "embed")]
 mod embed_search;
 #[cfg(feature = "embed")]
 pub(crate) mod embed_session;

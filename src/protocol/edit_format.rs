@@ -186,15 +186,11 @@ pub(crate) fn format_reroute_suffix(
     working_directory: Option<&std::path::Path>,
     resolved: &crate::worktree::ResolvedTarget,
 ) -> String {
-    let Some(working_directory) = working_directory else {
-        return String::new();
-    };
-    format!(
-        "\nworking_directory: {}\nrerouted: {}\nwrote_to: {}\nindexed_path: {}",
-        working_directory.display(),
+    crate::index_lifecycle::guidance::edit_route::format_reroute_suffix(
+        working_directory,
         resolved.rerouted,
-        resolved.target_path.display(),
-        resolved.indexed_path.display(),
+        &resolved.target_path,
+        &resolved.indexed_path,
     )
 }
 
