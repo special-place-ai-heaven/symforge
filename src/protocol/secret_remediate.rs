@@ -189,19 +189,26 @@ impl SymForgeServer {
             idempotency,
         )?;
         let mut rescan = String::from("clean");
+        let mut details = String::new();
         for path in &selected_paths {
-            match source.read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES) {
+            let finding = match source
+                .read_regular_beneath_anchor(Path::new(path), MAX_REMEDIATION_FILE_BYTES)
+            {
                 Ok(Some(bytes)) => match knowledge::scan_secret_bytes(path, &bytes) {
-                    knowledge::SecretScan::Clean => {}
+                    knowledge::SecretScan::Clean => "clean".to_string(),
                     knowledge::SecretScan::Sensitive { finding_count, .. } => {
-                        rescan = format!("still_sensitive finding_count={finding_count}");
+                        format!("still_sensitive finding_count={finding_count}")
                     }
                     knowledge::SecretScan::Indeterminate { reason } => {
-                        rescan = format!("indeterminate {reason:?}");
+                        format!("indeterminate {reason:?}")
                     }
                 },
-                _ => rescan = "indeterminate source_unavailable".into(),
+                _ => "indeterminate source_unavailable".to_string(),
+            };
+            if finding != "clean" {
+                rescan = finding.clone();
             }
+            details.push_str(&format!("rescan ({path}) : {finding}\n"));
         }
         let mut out = format!(
             "secret_remediate apply (externalize)\n{}\nwritten:\n",
@@ -210,7 +217,9 @@ impl SymForgeServer {
         for image in &staged {
             out.push_str(&format!("- {}\n", image.relative.display()));
         }
-        out.push_str(&format!("rescan: {rescan}\n"));
+        out.push_str(&details);
+        out.push_str(&history_note(&root));
+        out.push('\n');
         complete_guarded_replay(idempotency, &source, &staged, &mut out)?;
         let _ = crate::watcher::reconcile_stale_files(&root, self.index.data_plane());
         Ok(out)
