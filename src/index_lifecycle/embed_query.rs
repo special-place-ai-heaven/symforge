@@ -38,6 +38,8 @@ pub(super) struct EmbeddedQuerySnapshot {
     /// The host's control-state directory, holding the edit-safety trust
     /// store MCP keeps in process control state.
     pub control_directory: Option<PathBuf>,
+    /// The host's chosen project-config trust mode.
+    pub trust_mode: crate::embed::parity::source_options::ProjectConfigTrustMode,
 }
 
 /// A process incarnation namespace, separate from the frozen core's counters.

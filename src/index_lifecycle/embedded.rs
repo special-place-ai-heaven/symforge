@@ -449,6 +449,8 @@ struct EmbeddedBinding {
     /// MCP's process control state for this source; `None` when the host gave none.
     #[cfg(feature = "embed")]
     control_directory: Option<PathBuf>,
+    #[cfg(feature = "embed")]
+    trust_mode: crate::embed::parity::source_options::ProjectConfigTrustMode,
     state: std::sync::Mutex<EmbeddedRuntimeState>,
     control: std::sync::Mutex<WorkerControl>,
     wake: Condvar,
@@ -527,6 +529,8 @@ impl EmbeddedBinding {
             crate::embed::parity::source_options::SnapshotResetReceipt,
         >,
         #[cfg(feature = "embed")] control_directory: Option<PathBuf>,
+        #[cfg(feature = "embed")]
+        trust_mode: crate::embed::parity::source_options::ProjectConfigTrustMode,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
@@ -552,6 +556,8 @@ impl EmbeddedBinding {
             open_reset: open_reset.clone(),
             #[cfg(feature = "embed")]
             control_directory,
+            #[cfg(feature = "embed")]
+            trust_mode,
             state: std::sync::Mutex::new(EmbeddedRuntimeState {
                 phase: super::public_api::SourceRuntimePhase::Loading,
                 current_publication_identity: None,
@@ -1102,7 +1108,15 @@ impl EmbeddedSourceFactory {
         state_placement: StatePlacement,
         owner: EmbeddedIdentity,
     ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
-        self.open_bound_with_reset(binding, state_placement, owner, false, None)
+        self.open_bound_with_reset(
+            binding,
+            state_placement,
+            owner,
+            false,
+            None,
+            #[cfg(feature = "embed")]
+            Default::default(),
+        )
     }
 
     /// `open_bound` plus the MCP `index_folder` snapshot reset. A failed reset
@@ -1114,6 +1128,8 @@ impl EmbeddedSourceFactory {
         owner: EmbeddedIdentity,
         reset_snapshot_state: bool,
         control_directory: Option<PathBuf>,
+        #[cfg(feature = "embed")]
+        trust_mode: crate::embed::parity::source_options::ProjectConfigTrustMode,
     ) -> Result<EmbeddedSourceHandle, EmbeddedOpenError> {
         let key = ProjectKey::new(&binding.root_id.0);
         let identity = EmbeddedIdentity::fresh();
@@ -1209,6 +1225,8 @@ impl EmbeddedSourceFactory {
             open_reset,
             #[cfg(feature = "embed")]
             control_directory,
+            #[cfg(feature = "embed")]
+            trust_mode,
         );
         rollback.bind(Arc::clone(&source));
         if source.start().is_err() {
@@ -1347,12 +1365,13 @@ impl super::public_api::ProcessRuntimeApi {
         };
         use crate::embed::parity::source_options::{StateSelectionError, select_state_placement};
         let normalized = format!(
-            "current_worktree={:?};state={:?};allow_protected_root={};reset_snapshot_state={};replay_control_directory={:?}",
+            "current_worktree={:?};state={:?};allow_protected_root={};reset_snapshot_state={};replay_control_directory={:?};project_config_trust_mode={:?}",
             spec.root,
             options.state,
             options.allow_protected_root,
             options.reset_snapshot_state,
-            options.replay_control_directory
+            options.replay_control_directory,
+            options.project_config_trust_mode
         );
         let refuse = |kind, retry| {
             bound_source_refusal(
@@ -1420,6 +1439,7 @@ impl super::public_api::ProcessRuntimeApi {
                 options
                     .replay_control_directory
                     .map(|directory| directory.join("embed-host")),
+                options.project_config_trust_mode,
             )
             .map_err(|error| match error {
                 EmbeddedOpenError::SourceAlreadyOpen => refuse(
@@ -1819,6 +1839,7 @@ impl EmbeddedSourceHandle {
             state_anchor: binding.state_anchor.clone(),
             temporal_cache: Arc::clone(&binding.temporal_cache),
             control_directory: binding.control_directory.clone(),
+            trust_mode: binding.trust_mode,
         })
     }
 

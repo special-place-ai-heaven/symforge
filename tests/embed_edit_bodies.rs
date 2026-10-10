@@ -382,3 +382,101 @@ fn project_config_trust_suffix_reads_the_host_store() {
     );
     handle.close().unwrap();
 }
+
+/// The host chooses the trust mode: `LogOnly` (default) applies an edit over
+/// an untrusted project config and carries MCP's warning suffix; `Enforce`
+/// refuses preview and apply with MCP's `ProjectConfigTrustEnforced` text
+/// before any write.
+#[test]
+fn project_config_trust_mode_is_the_hosts_choice() {
+    use symforge::embed::parity::edit::{EditError, EditErrorKind};
+    use symforge::embed::parity::source_options::{EmbeddedOpenOptions, ProjectConfigTrustMode};
+    let original = "pub fn number() -> u32 {\n    1\n}\n";
+    let mut files = serde_json::Map::new();
+    files.insert("src/lib.rs".into(), original.into());
+    let runtime = ProcessIndexRuntime::acquire().expect("runtime");
+    let repo = fixture_repo(&files);
+    fs::create_dir_all(repo.path().join(".symforge")).unwrap();
+    fs::write(repo.path().join(".symforge/config.toml"), "[index]\n").unwrap();
+    let control = tempfile::tempdir().unwrap();
+    let open_with = |mode| {
+        let handle = runtime
+            .open_embedded_source_with_options(
+                EmbeddedSourceSpec::current_worktree(repo.path().to_path_buf()),
+                EmbeddedOpenOptions {
+                    replay_control_directory: Some(fs::canonicalize(control.path()).unwrap()),
+                    project_config_trust_mode: mode,
+                    ..Default::default()
+                },
+            )
+            .expect("bound source");
+        let until = Instant::now() + Duration::from_secs(20);
+        while handle.runtime_view().phase != SourceRuntimePhase::Current {
+            assert!(Instant::now() < until, "source failed to publish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle
+    };
+    let request = |handle: &EmbeddedSourceHandle| ReplaceRequest {
+        guard: guard(handle, "src/lib.rs", "number"),
+        new_body: "pub fn number() -> u32 {\n    2\n}".into(),
+    };
+
+    let handle = open_with(ProjectConfigTrustMode::Enforce);
+    let request_enforced = request(&handle);
+    let authority = EditApplyAuthority::for_source_root(
+        fs::canonicalize(repo.path()).unwrap(),
+        "fixture-room/source".to_string(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let refusals = [
+        handle
+            .preview_replace(&request_enforced)
+            .map(|_| ())
+            .unwrap_err(),
+        handle
+            .apply_replace(&request_enforced, &authority, "trust-enforce-1")
+            .map(|_| ())
+            .unwrap_err(),
+    ];
+    for refusal in refusals {
+        let EditError::Edit(EditErrorKind::ProjectConfigTrustEnforced { message }) = refusal else {
+            panic!("expected the enforced trust refusal, got {refusal:?}");
+        };
+        assert!(
+            message.starts_with("ProjectConfigTrustEnforced: status=Untrusted actual_hash="),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "; mode=ENFORCE; operation_allowed=false; run `symforge trust project-config accept --project "
+            ) && message.ends_with("` with reviewed actual_hash before retrying"),
+            "{message}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+        original,
+        "an enforced refusal writes nothing"
+    );
+    handle.close().unwrap();
+
+    let handle = open_with(ProjectConfigTrustMode::LogOnly);
+    let applied = handle
+        .apply_replace(&request(&handle), &authority, "trust-logonly-1")
+        .expect("log-only applies");
+    assert!(
+        applied
+            .body
+            .render()
+            .contains("\nProjectConfigTrustWarning: status=Untrusted actual_hash="),
+        "{}",
+        applied.body.render()
+    );
+    assert_ne!(
+        fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+        original
+    );
+    handle.close().unwrap();
+}

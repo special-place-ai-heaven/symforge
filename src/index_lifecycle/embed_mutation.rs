@@ -440,6 +440,7 @@ impl EmbeddedSourceHandle {
     /// Compute the exact MCP replacement bytes without touching source or replay state.
     pub fn preview_replace(&self, request: &ReplaceRequest) -> Result<ReplacePreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-replace-symbol-body")?;
+        answer::enforce_trust(&snapshot)?;
         let (prepared, _) = prepare(&snapshot, request).map_err(EditError::Edit)?;
         let diff = preview_diff(&snapshot, &request.guard.path, &prepared.new_content)?;
         let (_, symbol, _) = validate_guard(&snapshot, &request.guard).map_err(EditError::Edit)?;
@@ -471,6 +472,7 @@ impl EmbeddedSourceHandle {
 
     pub fn preview_insert(&self, request: &InsertRequest) -> Result<StructuralPreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-insert-symbol")?;
+        answer::enforce_trust(&snapshot)?;
         let (prepared, _) = prepare_structural(
             &snapshot,
             &request.guard,
@@ -554,6 +556,7 @@ impl EmbeddedSourceHandle {
 
     pub fn preview_delete(&self, request: &DeleteRequest) -> Result<StructuralPreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-delete-symbol")?;
+        answer::enforce_trust(&snapshot)?;
         let (prepared, _) =
             prepare_structural(&snapshot, &request.guard, StructuralOperation::Delete)
                 .map_err(EditError::Edit)?;
@@ -626,6 +629,7 @@ impl EmbeddedSourceHandle {
         request: &EditWithinRequest,
     ) -> Result<EditWithinPreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-edit-within-symbol")?;
+        answer::enforce_trust(&snapshot)?;
         let (prepared, _, replacement_count, untargeted_extra) =
             prepare_within(&snapshot, request).map_err(EditError::Edit)?;
         let diff = preview_diff(&snapshot, &request.guard.path, &prepared.new_content)?;
@@ -809,6 +813,7 @@ impl EmbeddedSourceHandle {
             return Err(EditError::Edit(EditErrorKind::WriteAuthorityRefused));
         }
         let snapshot = self.capture_query_snapshot(operation.as_bytes())?;
+        answer::enforce_trust(&snapshot)?;
         if authority.root != snapshot.root {
             return Err(EditError::Edit(EditErrorKind::WriteAuthorityRefused));
         }

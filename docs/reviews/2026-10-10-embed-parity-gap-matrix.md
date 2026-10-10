@@ -295,3 +295,5 @@ explicitly:
 4. A routed `batch_rename` reads its impact footer from the routed worktree's
    post-image index. MCP reads the bound index after reindexing the written
    files. They agree whenever the untouched files of the two worktrees agree.
+
+Superseding item 3 above: the trust mode is now a typed host option, `EmbeddedOpenOptions::project_config_trust_mode` (default `LogOnly`); `Enforce` refuses every edit lane before any write with MCP's exact refusal text, proven by `project_config_trust_mode_is_the_hosts_choice`. The CI override remains unread.

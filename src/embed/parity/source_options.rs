@@ -40,6 +40,20 @@ pub struct EmbeddedOpenOptions {
     /// MCP does, and reports the trust store unavailable, as MCP does when it
     /// has no user-local control directory.
     pub replay_control_directory: Option<PathBuf>,
+    /// Whether an edit refuses when the project's `.symforge` config is
+    /// untrusted. The host chooses; the library never reads
+    /// `SYMFORGE_PROJECT_CONFIG_TRUST_MODE` from the process environment.
+    pub project_config_trust_mode: ProjectConfigTrustMode,
+}
+
+/// MCP's project-config trust mode, chosen by the embedding host.
+/// `LogOnly` (the default, as in MCP) applies the edit and carries the
+/// warning suffix; `Enforce` refuses the edit before any write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectConfigTrustMode {
+    #[default]
+    LogOnly,
+    Enforce,
 }
 
 /// Outcome of an `index_folder`-style snapshot reset: the shared

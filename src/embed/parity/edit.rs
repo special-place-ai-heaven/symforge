@@ -606,6 +606,11 @@ pub enum EditErrorKind {
     /// The routed worktree has no admitted file at the edit path (MCP
     /// `TargetFileMissing`).
     TargetFileMissing,
+    /// Enforce mode refused the edit: the project's config is untrusted.
+    /// Carries MCP's exact `ProjectConfigTrustEnforced` refusal text.
+    ProjectConfigTrustEnforced {
+        message: String,
+    },
 }
 
 #[derive(Debug)]

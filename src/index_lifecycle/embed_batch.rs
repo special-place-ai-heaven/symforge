@@ -750,6 +750,7 @@ impl EmbeddedSourceHandle {
         request: &BatchRenameRequest,
     ) -> Result<BatchRenamePreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-batch-rename")?;
+        answer::enforce_trust(&snapshot)?;
         let (staged, plan) = stage_rename(&snapshot, request).map_err(EditError::Edit)?;
         let mut rendered = crate::edit_safety::rename::render_rename_preview(
             &snapshot.generation.live,
@@ -821,6 +822,7 @@ impl EmbeddedSourceHandle {
         operation_key: &str,
     ) -> Result<BatchEditApplied, EditError> {
         let snapshot = self.capture_query_snapshot(b"apply-batch-rename")?;
+        answer::enforce_trust(&snapshot)?;
         if request.plan.guard.root != snapshot.root || request.plan.affected_paths.is_empty() {
             return Err(EditError::Edit(EditErrorKind::InvalidPath));
         }
@@ -905,6 +907,7 @@ impl EmbeddedSourceHandle {
         tool: BatchTool,
     ) -> Result<BatchEditPreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-batch-edit")?;
+        answer::enforce_trust(&snapshot)?;
         let staged = stage_batch(&snapshot, request).map_err(EditError::Edit)?;
         let body = preview_answer(
             &snapshot,
@@ -954,6 +957,7 @@ impl EmbeddedSourceHandle {
         tool: BatchTool,
     ) -> Result<BatchEditApplied, EditError> {
         let snapshot = self.capture_query_snapshot(b"apply-batch-edit")?;
+        answer::enforce_trust(&snapshot)?;
         let replay_paths = edit_paths(&snapshot.root, request).map_err(EditError::Edit)?;
         let fingerprint = request_fingerprint(request, authority).map_err(EditError::Edit)?;
         self.apply_staged_batch(
@@ -1255,6 +1259,7 @@ impl EmbeddedSourceHandle {
         tool: BatchTool,
     ) -> Result<RoutedBatchApplied, EditError> {
         let bound = self.capture_query_snapshot(b"apply-routed-batch-edit")?;
+        answer::enforce_trust(&bound)?;
         if authority.root != bound.root || authority.cancel.load(Ordering::Acquire) {
             return Err(EditError::Edit(EditErrorKind::WriteAuthorityRefused));
         }

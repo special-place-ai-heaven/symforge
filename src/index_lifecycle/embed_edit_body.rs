@@ -12,9 +12,10 @@
 //!   original into the source's admitted state directory (`<state>/tee`);
 //! - the project-config trust suffix evaluates the host's trust store
 //!   (`<replay_control_directory>/embed-host/edit-safety/trust.json`, the
-//!   embedded counterpart of MCP's process control state). Process
-//!   environment policy (enforce mode, the CI override) is host policy and is
-//!   not read, as with `SYMFORGE_WORKTREE_AWARE`.
+//!   embedded counterpart of MCP's process control state). The enforce mode
+//!   is the host's typed `project_config_trust_mode` option; process
+//!   environment policy (that variable, the CI override) is never read, as
+//!   with `SYMFORGE_WORKTREE_AWARE`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use super::guidance::edit_body::{
     self as shared, BatchEditAnswer, EditSafetyMode, EditSourceAuthority, EditWriteSemantics,
     MatchType, SingleEditAnswer,
 };
+use crate::embed::parity::source_options::ProjectConfigTrustMode;
 
 /// The inputs of MCP's stale-reference warning, re-evaluated against the
 /// bound index when the edit was rerouted.
@@ -331,8 +333,8 @@ pub(super) fn impact_footer(
 }
 
 /// MCP's project-config trust suffix for this source's root, read from the
-/// host's trust store. Enforce mode is not read, so this never refuses.
-pub(super) fn trust_suffix(snapshot: &EmbeddedQuerySnapshot) -> Option<String> {
+/// host's trust store, or its enforced refusal text.
+fn trust_verdict(snapshot: &EmbeddedQuerySnapshot) -> Result<Option<String>, String> {
     shared::project_config_trust_response_suffix(
         &snapshot.root,
         || {
@@ -343,8 +345,27 @@ pub(super) fn trust_suffix(snapshot: &EmbeddedQuerySnapshot) -> Option<String> {
             })
         },
         |trust| trust.evaluate_without_env_override(&snapshot.root),
-        || shared::ProjectConfigTrustMode::LogOnly,
+        || match snapshot.trust_mode {
+            ProjectConfigTrustMode::LogOnly => shared::ProjectConfigTrustMode::LogOnly,
+            ProjectConfigTrustMode::Enforce => shared::ProjectConfigTrustMode::Enforce,
+        },
     )
-    .ok()
-    .flatten()
+}
+
+/// Refuse an edit before any write when the host chose Enforce and the
+/// project's config is untrusted; MCP checks this first in every edit handler.
+pub(super) fn enforce_trust(
+    snapshot: &EmbeddedQuerySnapshot,
+) -> Result<(), crate::embed::parity::edit::EditError> {
+    trust_verdict(snapshot).map(|_| ()).map_err(|message| {
+        crate::embed::parity::edit::EditError::Edit(
+            crate::embed::parity::edit::EditErrorKind::ProjectConfigTrustEnforced { message },
+        )
+    })
+}
+
+/// The suffix an answer carries. Enforce refusals are raised by
+/// `enforce_trust` before the write, so only the LogOnly suffix reaches here.
+pub(super) fn trust_suffix(snapshot: &EmbeddedQuerySnapshot) -> Option<String> {
+    trust_verdict(snapshot).ok().flatten()
 }
