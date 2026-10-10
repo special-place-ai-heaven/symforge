@@ -448,7 +448,7 @@ pub struct ResolvedEditTarget {
 impl ResolvedEditTarget {
     /// The exact suffix MCP appends to an edit given `working_directory`.
     pub fn reroute_suffix(&self) -> String {
-        crate::index_lifecycle::guidance::edit_route::format_reroute_suffix(
+        crate::embed::lifecycle::guidance::edit_route::format_reroute_suffix(
             Some(&self.working_directory),
             self.rerouted,
             &self.target_path,
