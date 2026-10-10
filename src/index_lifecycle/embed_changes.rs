@@ -77,10 +77,11 @@ fn validate_filters(
 }
 
 pub(super) fn validate_what_changed(request: &WhatChangedRequest) -> Result<(), QueryRefusalKind> {
+    // MCP reads `max_tokens = 0` as "no cap", so it is not a malformed request here.
     validate_filters(
         request.path_prefix.as_deref(),
         request.language.as_deref(),
-        request.max_tokens,
+        None,
     )
 }
 
@@ -174,9 +175,16 @@ pub(super) fn what_changed(
             estimated_tokens: Some(tokens),
         }));
     }
+    // The MCP handler applies `max_tokens` (`enforce_token_budget`, which reads
+    // 0 as no cap) to the uncommitted report only; timestamp and git-ref
+    // reports are returned whole.
+    let max_tokens = match mode {
+        WhatChangedMode::Uncommitted => request.max_tokens.filter(|tokens| *tokens > 0),
+        WhatChangedMode::Timestamp(_) | WhatChangedMode::GitRef(_) => None,
+    };
     let report = what_changed_report(snapshot, &options, &mode, change_mode, repo.as_ref())?;
     budget.check()?;
-    cache_before_token_cap(budget, request.max_tokens, |budget| {
+    cache_before_token_cap(budget, max_tokens, |budget| {
         let rendered = budget.text(&report.rendered)?;
         let paths = strings(&report.paths, budget);
         let symbol_diff = match &report.symbol_diff {

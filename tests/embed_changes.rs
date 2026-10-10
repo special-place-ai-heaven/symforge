@@ -151,8 +151,13 @@ fn changes_preserve_timestamp_git_scope_worktree_and_symbol_evidence() {
 #[test]
 fn changes_bound_rows_preserve_full_cache_and_reject_unknown_filters() {
     let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join(".gitignore"), ".symforge/\n").unwrap();
     fs::write(root.path().join("one.rs"), "pub fn one() {}\n").unwrap();
     fs::write(root.path().join("two.rs"), "pub fn two() {}\n").unwrap();
+    let repo = git2::Repository::init(root.path()).unwrap();
+    commit(&repo, &[".gitignore", "one.rs", "two.rs"]);
+    fs::write(root.path().join("one.rs"), "pub fn one() -> u8 { 1 }\n").unwrap();
+    fs::write(root.path().join("two.rs"), "pub fn two() -> u8 { 2 }\n").unwrap();
     let runtime = ProcessIndexRuntime::acquire().unwrap();
     let handle = open(&runtime, root.path());
     let request = WhatChangedRequest {
@@ -170,12 +175,38 @@ fn changes_bound_rows_preserve_full_cache_and_reject_unknown_filters() {
         .unwrap();
     assert!(bounded.usage().rows <= 2);
     assert!(bounded.truncated());
+    // MCP applies `max_tokens` to the uncommitted report only: a timestamp
+    // report is returned whole, and 0 means no cap.
+    let timestamp = handle
+        .query(
+            &QueryRequest::WhatChanged(WhatChangedRequest {
+                max_tokens: Some(5),
+                ..request.clone()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    assert!(!timestamp.truncated());
+    let uncommitted = WhatChangedRequest {
+        uncommitted: Some(true),
+        ..Default::default()
+    };
+    let uncapped = handle
+        .query(
+            &QueryRequest::WhatChanged(WhatChangedRequest {
+                max_tokens: Some(0),
+                ..uncommitted.clone()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    assert!(!uncapped.truncated());
     let session = handle.new_query_session().unwrap();
     let capped = handle
         .query_with_session(
             &QueryRequest::WhatChanged(WhatChangedRequest {
                 max_tokens: Some(5),
-                ..request.clone()
+                ..uncommitted
             }),
             QueryLimits::default(),
             &session,
