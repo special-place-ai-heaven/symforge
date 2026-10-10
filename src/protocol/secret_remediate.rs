@@ -110,9 +110,6 @@ impl SymForgeServer {
             }
         };
 
-        if !input.preview && input.idempotency_key.as_deref().is_none_or(str::is_empty) {
-            return Err("Error: apply requires a non-empty idempotency_key".to_string());
-        }
         // Idempotency: preview never reserves; apply honors edit-lane replay.
         let idempotency = match begin_secret_replay(self, &input) {
             Ok(active) => active,
@@ -532,14 +529,12 @@ fn begin_secret_replay(
     server: &SymForgeServer,
     input: &SecretRemediateInput,
 ) -> Result<Option<crate::idempotency::ActiveReplay>, String> {
-    if input.preview {
+    // The key is optional (spec 034 contract): without one, apply runs
+    // unreplayed, exactly as the edit lane does. An empty key still reaches
+    // the idempotency module, which refuses it with its own typed error.
+    let Some(raw_key) = input.idempotency_key.as_deref().filter(|_| !input.preview) else {
         return Ok(None);
-    }
-    let raw_key = input
-        .idempotency_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| "Error: apply requires a non-empty idempotency_key".to_string())?;
+    };
     let mut request = serde_json::to_value(input)
         .map_err(|_| "Error: remediation request cannot be serialized".to_string())?;
     if let Value::Object(map) = &mut request {
@@ -686,11 +681,10 @@ fn complete_guarded_replay(
     staged: &[StagedImage],
     output: &mut String,
 ) -> Result<(), String> {
+    // Keyless apply has no replay record to complete; the guarded write
+    // already committed, so there is nothing left to report as incomplete.
     let Some(active) = idempotency else {
-        return Err(
-            "secret_remediate apply\napply_status: incomplete\nreason: missing_replay_lease\n"
-                .to_string(),
-        );
+        return Ok(());
     };
     let targets = staged
         .iter()
