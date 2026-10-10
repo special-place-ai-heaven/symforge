@@ -517,6 +517,17 @@ pub(crate) fn resolved_project_state(
     Ok(server_state.or_else(|| runtime.cloned()))
 }
 
+/// A replay lookup that found a record it cannot serve is a non-success, so
+/// its text carries the same `Error:` prefix as every other refusal. A served
+/// replay passes through unchanged.
+pub(crate) fn typed_replay_response(response: String) -> String {
+    if response.starts_with("Idempotency replay unavailable:") {
+        format!("Error: {response}")
+    } else {
+        response
+    }
+}
+
 fn begin_secret_replay(
     server: &SymForgeServer,
     input: &SecretRemediateInput,
@@ -557,13 +568,7 @@ fn begin_secret_replay(
         .ok_or_else(|| "Error: admitted remediation source unavailable".to_string())??;
     match decision {
         crate::idempotency::ReplayStart::FirstExecution(active) => Ok(Some(active)),
-        crate::idempotency::ReplayStart::Replay(response) => {
-            if response.starts_with("Idempotency replay unavailable:") {
-                Err(format!("Error: {response}"))
-            } else {
-                Err(response)
-            }
-        }
+        crate::idempotency::ReplayStart::Replay(response) => Err(typed_replay_response(response)),
     }
 }
 
