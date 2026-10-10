@@ -293,6 +293,7 @@ pub enum HostResourceRequest {
     RepoHealth,
     RepoOutline,
     RepoMap,
+    RepoChangesUncommitted,
     FileContext {
         path: String,
         max_tokens: Option<u64>,
@@ -1382,11 +1383,15 @@ impl HostRoom {
                 ("symforge://repo/health", "repo-health"),
                 ("symforge://repo/outline", "repo-outline"),
                 ("symforge://repo/map", "repo-map"),
+                ("symforge://repo/changes/uncommitted", "repo-changes-uncommitted"),
                 ("symforge://tools/catalog", "tools-catalog"),
                 ("symforge://glossary", "glossary"),
             ]
             .into_iter()
-            .filter(|(_, name)| self.rights.query || !matches!(*name, "repo-outline" | "repo-map"))
+            .filter(|(_, name)| {
+                self.rights.query
+                    || !matches!(*name, "repo-outline" | "repo-map" | "repo-changes-uncommitted")
+            })
             .map(|(uri, name)| HostResourceDefinition {
                 uri: uri.into(),
                 name: name.into(),
@@ -1504,6 +1509,15 @@ impl HostRoom {
                 return self.query_resource(
                     "symforge://repo/map",
                     QueryRequest::RepoMap(Default::default()),
+                    control,
+                );
+            }
+            HostResourceRequest::RepoChangesUncommitted => {
+                // Same request the MCP resource sends: every option unset, which
+                // resolves to the uncommitted mode when a repository root exists.
+                return self.query_resource(
+                    "symforge://repo/changes/uncommitted",
+                    QueryRequest::WhatChanged(Default::default()),
                     control,
                 );
             }
@@ -2069,6 +2083,11 @@ mod resource_contract_tests {
                 QueryOperationKind::RepoMap,
             ),
             (
+                HostResourceRequest::RepoChangesUncommitted,
+                "symforge://repo/changes/uncommitted",
+                QueryOperationKind::WhatChanged,
+            ),
+            (
                 HostResourceRequest::FileContext {
                     path: "src/a.rs".into(),
                     max_tokens: None,
@@ -2259,11 +2278,14 @@ mod frame_admission_tests {
         };
         current_version(&room);
         let session = room.query_session().unwrap();
-        let query = QueryRequest::File {
+        // The exact request the FileContent resource below dispatches, so the
+        // calibrated frame sizes are the ones the cap is applied to.
+        let query = QueryRequest::FileContent(crate::embed::parity::read::FileContentRequest {
             path: "docs/clip.txt".into(),
             start_line: None,
             end_line: None,
-        };
+            ..Default::default()
+        });
         let limits = QueryLimits {
             max_results: QueryLimits::default()
                 .max_results
