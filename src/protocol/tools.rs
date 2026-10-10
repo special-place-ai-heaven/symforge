@@ -27,8 +27,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::{
-    CapabilityCost, CapabilityEvidence, CapabilityFreshness, CapabilityName, CapabilitySafety,
-    CapabilityStatus, CouplingPreparePolicy, FrecencyCollectionPolicy, RankingDiagnosticsPolicy,
+    CouplingPreparePolicy, FrecencyCollectionPolicy, RankingDiagnosticsPolicy,
     WorktreeRoutingPolicy,
 };
 use crate::protocol::result_status::{OutcomeClass, ResultStatus};
@@ -53,8 +52,8 @@ pub use super::search_tools::{
     CurateKnowledgeInput, FindReferencesInput, ReviewKnowledgeInput, SearchFilesInput,
     SearchKnowledgeInput, SearchSymbolsInput, SearchTextInput,
 };
-pub(crate) use super::search_tools::{
-    fix_common_double_escapes, normalize_path_prefix, parse_language_filter,
+pub(crate) use super::search_tools::parse_language_filter;
+pub(crate) use crate::index_lifecycle::guidance::search_contract::{
     search_symbols_options_from_input, search_text_options_from_input,
 };
 
@@ -472,11 +471,10 @@ pub(crate) fn compact_tool_output_is_success(tool: &str, text: &str) -> bool {
 
 /// Deserialize a required `u32` from either a JSON number or a stringified number.
 use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkipReason};
-use crate::domain::{FileClassification, LanguageId, ReferenceKind};
-use crate::live_index::qualified_usages::{self, QualifiedUsage};
+use crate::domain::{FileClassification, LanguageId};
+use crate::live_index::qualified_usages;
 use crate::live_index::{
-    FindReferencesView, IndexedFile, ReferenceContextLineView, ReferenceFileView, ReferenceHitView,
-    SearchFilesCouplingEvidence, SearchFilesCouplingNeighbors, SearchFilesHit,
+    IndexedFile,
     SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
     store::{IndexState, LiveIndex},
 };
@@ -865,24 +863,6 @@ enum WhatChangedMode {
     Uncommitted,
 }
 
-#[derive(Default)]
-struct ExploreMatchScore {
-    raw_count: usize,
-    matched_terms: HashSet<String>,
-}
-
-#[derive(Default)]
-struct ExploreFileSignal {
-    raw_score: u64,
-    matched_terms: HashSet<String>,
-}
-
-struct DerivedExploreCluster {
-    seed_terms: Vec<String>,
-    promoted_symbols: Vec<String>,
-    seed_files: Vec<String>,
-}
-
 fn determine_what_changed_mode(
     input: &WhatChangedInput,
     has_repo_root: bool,
@@ -1011,21 +991,7 @@ fn is_unparsed_source_path(path: &str) -> bool {
     )
 }
 
-fn normalize_exact_path(input: &str) -> String {
-    let normalized = input
-        .trim()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .to_string();
-
-    if normalized.is_empty() {
-        input.trim().to_string()
-    } else {
-        normalized
-    }
-}
+use crate::index_lifecycle::guidance::file_search::normalize_exact_path;
 
 /// Find up to 5 similar file paths for "file not found" suggestions.
 /// Extracts the basename from the failed path and searches the index.
@@ -1067,68 +1033,6 @@ fn suggest_similar_files(index: &crate::live_index::LiveIndex, path: &str) -> Ve
     suggestions
 }
 
-fn enrich_with_callers(
-    index: &crate::live_index::LiveIndex,
-    result: &mut search::TextSearchResult,
-    file_limit: usize,
-) {
-    use std::collections::HashSet;
-
-    for file_matches in result.files.iter_mut().take(file_limit) {
-        // Collect unique enclosing symbol names from this file's matches
-        let mut symbol_names: HashSet<String> = HashSet::new();
-        for m in &file_matches.matches {
-            if let Some(ref enc) = m.enclosing_symbol {
-                symbol_names.insert(enc.name.clone());
-            }
-        }
-
-        if symbol_names.is_empty() {
-            continue;
-        }
-
-        let mut callers: Vec<search::CallerEntry> = Vec::new();
-        let mut seen: HashSet<(String, String)> = HashSet::new(); // (file, symbol) dedup
-
-        for sym_name in &symbol_names {
-            let refs = index.find_references_for_name(sym_name, None, false);
-            for (ref_file, ref_record) in refs {
-                // Get enclosing symbol of the reference
-                let enclosing_name = ref_record
-                    .enclosing_symbol_index
-                    .and_then(|idx| {
-                        index
-                            .get_file(ref_file)
-                            .and_then(|f| f.symbols.get(idx as usize))
-                            .map(|s| s.name.clone())
-                    })
-                    .unwrap_or_else(|| "(top-level)".to_string());
-
-                // Skip self-references only when the caller IS one of the matched
-                // symbols (same-file callers from different symbols are useful context)
-                if ref_file == file_matches.path && symbol_names.contains(&enclosing_name) {
-                    continue;
-                }
-
-                let key = (ref_file.to_string(), enclosing_name.clone());
-                if seen.insert(key) {
-                    callers.push(search::CallerEntry {
-                        file: ref_file.to_string(),
-                        symbol: enclosing_name,
-                        line: ref_record.line_range.0 + 1, // 0-based to 1-based
-                    });
-                }
-            }
-        }
-
-        // Cap at 10 callers to avoid noise
-        callers.truncate(10);
-
-        // Always set callers when follow_refs was requested — distinguishes
-        // "not requested" (None) from "ran but found nothing" (Some([]))
-        file_matches.callers = Some(callers);
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetedFreshenRefusal {
@@ -1279,20 +1183,7 @@ fn search_scope_summary(
     parts.join("; ")
 }
 
-fn search_parse_state_for_paths<'a, I>(index: &LiveIndex, paths: I) -> &'static str
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    if paths
-        .into_iter()
-        .filter_map(|path| index.get_file(path))
-        .any(|file| file.parse_diagnostic.is_some())
-    {
-        "partial"
-    } else {
-        "parsed"
-    }
-}
+use crate::index_lifecycle::guidance::reference_read::search_parse_state_for_paths;
 
 fn parse_state_for_file(file: &IndexedFile) -> &'static str {
     match &file.parse_status {
@@ -1315,28 +1206,7 @@ fn parse_state_for_file(file: &IndexedFile) -> &'static str {
     }
 }
 
-fn context_bundle_completeness_label(
-    view: &crate::live_index::ContextBundleFoundView,
-    rendered: &str,
-) -> String {
-    let section_overflow =
-        view.callers.overflow_count + view.callees.overflow_count + view.type_usages.overflow_count;
-    let mut parts = Vec::new();
-    if rendered.contains("Truncated at ~") {
-        parts.push("budget-limited".to_string());
-    }
-    if section_overflow > 0 {
-        parts.push(format!(
-            "section-capped ({} additional reference entries not shown)",
-            section_overflow
-        ));
-    }
-    if parts.is_empty() {
-        "full".to_string()
-    } else {
-        parts.join("; ")
-    }
-}
+use crate::index_lifecycle::guidance::symbol_context::context_bundle_completeness_label;
 
 fn search_completeness_label(overflow_count: usize, suppressed_by_noise: usize) -> String {
     // Honesty (trust): the index is built by a discovery walk with the `ignore`
@@ -1425,564 +1295,9 @@ fn search_files_match_type_label(view: &SearchFilesView) -> &'static str {
     }
 }
 
-const MAX_CO_CHANGE_PARTNERS_PER_ANCHOR: u32 = 20;
-
-struct SearchFilesCoChangeResolution {
-    neighbors: Option<SearchFilesCouplingNeighbors>,
-    evidence: CapabilityEvidence,
-}
-
-fn cochange_ranking_evidence(
-    status: CapabilityStatus,
-    freshness: CapabilityFreshness,
-    cost: CapabilityCost,
-    detail: impl Into<String>,
-) -> CapabilityEvidence {
-    CapabilityEvidence::new(CapabilityName::CoChangeRanking, status)
-        .with_freshness(freshness)
-        .with_cost(cost)
-        .with_safety(CapabilitySafety::ReadOnly)
-        .with_detail(detail)
-}
-
-/// Build the precise `FallbackUsed` co-change detail for the case where the
-/// coupling store loaded usable partner rows for the anchor, yet no returned
-/// candidate landed in the co-change tier. The four distinguishable reasons:
-///
-/// 1. chore-anchor excluded (`is_chore_anchor_path` fires before the gate),
-/// 2. anchor reached only prefix-tier path confidence (below the basename
-///    floor), with a `query="<basename>"` hint to clear it,
-/// 3. neighbors exist but none of them appear among the returned candidates
-///    (the genuine path-mismatch case),
-/// 4. neighbors appear among candidates but were filtered out by a later gate.
-///
-/// The anchor-confidence reason (1 and 2) is computed once at anchor level via
-/// [`crate::live_index::rank_signals::classify_anchor_cochange_rejection`], not per candidate.
-fn cochange_fallback_detail(
-    query: &str,
-    anchor_path: &str,
-    neighbors: &SearchFilesCouplingNeighbors,
-    candidate_paths: &[&str],
-) -> String {
-    let partner_count = neighbors.len();
-    let anchor_score = crate::live_index::query::anchor_path_match_score(query, anchor_path);
-    match crate::live_index::rank_signals::classify_anchor_cochange_rejection(
-        anchor_path,
-        anchor_score,
-    ) {
-        Some(crate::live_index::rank_signals::AnchorCoChangeRejection::ChoreAnchor) => {
-            format!(
-                "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but it is a chore anchor (lockfile/changelog/workflow) excluded from co-change promotion; path ranking returned"
-            )
-        }
-        Some(crate::live_index::rank_signals::AnchorCoChangeRejection::BelowConfidenceFloor) => {
-            let anchor_basename = std::path::Path::new(anchor_path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(anchor_path);
-            format!(
-                "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but the query reached only prefix-tier path confidence for the anchor (below the basename-tier floor); pass query=\"{anchor_basename}\" to clear it; path ranking returned"
-            )
-        }
-        None => {
-            let any_partner_in_candidates = candidate_paths
-                .iter()
-                .any(|path| neighbors.contains_key(*path));
-            if any_partner_in_candidates {
-                format!(
-                    "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s) present among returned candidates, but a later rank gate filtered them; path ranking returned"
-                )
-            } else {
-                format!(
-                    "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but none appear among the returned candidates; path ranking returned"
-                )
-            }
-        }
-    }
-}
-
-fn cochange_lazy_prepare_evidence(
-    root: &Path,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-    reason: &str,
-    fallback_detail: &str,
-) -> CapabilityEvidence {
-    let Some(project_state) = project_state else {
-        return cochange_ranking_evidence(
-            CapabilityStatus::Unavailable,
-            CapabilityFreshness::Unknown,
-            CapabilityCost::Free,
-            format!("{reason}; no project-state owner is available; {fallback_detail}"),
-        );
-    };
-    match crate::live_index::coupling::start_lazy_prepare(root, project_state) {
-        Ok(crate::live_index::coupling::LazyPrepareOutcome::Started) => cochange_ranking_evidence(
-            CapabilityStatus::Preparing,
-            CapabilityFreshness::Unknown,
-            CapabilityCost::Bounded,
-            format!("{reason}; bounded background preparation started; {fallback_detail}"),
-        ),
-        Ok(crate::live_index::coupling::LazyPrepareOutcome::AlreadyRunning) => {
-            cochange_ranking_evidence(
-                CapabilityStatus::Preparing,
-                CapabilityFreshness::Unknown,
-                CapabilityCost::Bounded,
-                format!(
-                    "{reason}; bounded background preparation already in progress; {fallback_detail}"
-                ),
-            )
-        }
-        Err(error) => cochange_ranking_evidence(
-            CapabilityStatus::Unavailable,
-            CapabilityFreshness::Unknown,
-            CapabilityCost::Bounded,
-            format!("{reason}; unable to start bounded preparation: {error}; {fallback_detail}"),
-        ),
-    }
-}
-
-fn cochange_stale_prepare_evidence(
-    root: &Path,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-) -> CapabilityEvidence {
-    let Some(project_state) = project_state else {
-        return cochange_ranking_evidence(
-            CapabilityStatus::Unavailable,
-            CapabilityFreshness::Stale,
-            CapabilityCost::Free,
-            "coupling store is stale but no project-state owner is available; path ranking returned",
-        );
-    };
-    match crate::live_index::coupling::start_lazy_prepare(root, project_state) {
-        Ok(crate::live_index::coupling::LazyPrepareOutcome::Started) => cochange_ranking_evidence(
-            CapabilityStatus::Stale,
-            CapabilityFreshness::Stale,
-            CapabilityCost::Bounded,
-            "coupling store is stale for the current HEAD; bounded background refresh started; path ranking returned",
-        ),
-        Ok(crate::live_index::coupling::LazyPrepareOutcome::AlreadyRunning) => {
-            cochange_ranking_evidence(
-                CapabilityStatus::Stale,
-                CapabilityFreshness::Stale,
-                CapabilityCost::Bounded,
-                "coupling store is stale for the current HEAD; bounded background refresh already in progress; path ranking returned",
-            )
-        }
-        Err(error) => cochange_ranking_evidence(
-            CapabilityStatus::Unavailable,
-            CapabilityFreshness::Stale,
-            CapabilityCost::Bounded,
-            format!(
-                "coupling store is stale for the current HEAD; unable to start bounded refresh: {error}; path ranking returned"
-            ),
-        ),
-    }
-}
-
-fn search_files_coupling_neighbors(
-    index: &LiveIndex,
-    repo_root: Option<&Path>,
-    project_state: Option<&crate::domain::ProjectStateDir>,
-    anchor_path: &str,
-) -> SearchFilesCoChangeResolution {
-    let anchor_path = normalize_exact_path(anchor_path);
-    if !index.files.contains_key(&anchor_path) {
-        return SearchFilesCoChangeResolution {
-            neighbors: None,
-            evidence: cochange_ranking_evidence(
-                CapabilityStatus::FallbackUsed,
-                CapabilityFreshness::Unknown,
-                CapabilityCost::Free,
-                format!("anchor_path={anchor_path} is not indexed; path ranking returned"),
-            ),
-        };
-    }
-
-    match crate::live_index::coupling::coupling_prepare_policy_from_env() {
-        CouplingPreparePolicy::Disabled => {
-            return SearchFilesCoChangeResolution {
-                neighbors: None,
-                evidence: cochange_ranking_evidence(
-                    CapabilityStatus::DisabledByPolicy,
-                    CapabilityFreshness::Unknown,
-                    CapabilityCost::Free,
-                    "operator policy disabled co-change preparation and ranking; path ranking returned",
-                ),
-            };
-        }
-        CouplingPreparePolicy::LazyOnRequest | CouplingPreparePolicy::WarmOnStart => {}
-    }
-
-    let store = if let Some(store) = index.coupling_store() {
-        Some(store.clone())
-    } else if let (Some(root), Some(project_state)) = (repo_root, project_state) {
-        match crate::live_index::coupling::open_existing_coupling_store(project_state) {
-            Ok(Some(store)) => Some((*store).clone()),
-            Ok(None) => {
-                return SearchFilesCoChangeResolution {
-                    neighbors: None,
-                    evidence: cochange_lazy_prepare_evidence(
-                        root,
-                        Some(project_state),
-                        "no coupling store exists for this workspace",
-                        "path ranking returned",
-                    ),
-                };
-            }
-            Err(error) => {
-                return SearchFilesCoChangeResolution {
-                    neighbors: None,
-                    evidence: cochange_ranking_evidence(
-                        CapabilityStatus::Unavailable,
-                        CapabilityFreshness::Unknown,
-                        CapabilityCost::Low,
-                        format!("unable to open coupling store: {error}; path ranking returned"),
-                    ),
-                };
-            }
-        }
-    } else {
-        return SearchFilesCoChangeResolution {
-            neighbors: None,
-            evidence: cochange_ranking_evidence(
-                CapabilityStatus::Unavailable,
-                CapabilityFreshness::Unknown,
-                CapabilityCost::Free,
-                "no repository root is bound; path ranking returned",
-            ),
-        };
-    };
-    let Some(store) = store else {
-        return SearchFilesCoChangeResolution {
-            neighbors: None,
-            evidence: cochange_ranking_evidence(
-                CapabilityStatus::Unavailable,
-                CapabilityFreshness::Unknown,
-                CapabilityCost::Free,
-                "no coupling store is available; path ranking returned",
-            ),
-        };
-    };
-
-    if let Some(root) = repo_root {
-        match store.cold_built_at() {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return SearchFilesCoChangeResolution {
-                    neighbors: None,
-                    evidence: cochange_lazy_prepare_evidence(
-                        root,
-                        project_state,
-                        "coupling store exists but has not completed a cold build",
-                        "path ranking returned",
-                    ),
-                };
-            }
-            Err(error) => {
-                return SearchFilesCoChangeResolution {
-                    neighbors: None,
-                    evidence: cochange_ranking_evidence(
-                        CapabilityStatus::Unavailable,
-                        CapabilityFreshness::Unknown,
-                        CapabilityCost::Low,
-                        format!(
-                            "unable to inspect coupling store build state: {error}; path ranking returned"
-                        ),
-                    ),
-                };
-            }
-        }
-
-        let stored_head = match store.last_head() {
-            Ok(head) => head,
-            Err(error) => {
-                return SearchFilesCoChangeResolution {
-                    neighbors: None,
-                    evidence: cochange_ranking_evidence(
-                        CapabilityStatus::Unavailable,
-                        CapabilityFreshness::Unknown,
-                        CapabilityCost::Low,
-                        format!(
-                            "unable to inspect coupling store HEAD state: {error}; path ranking returned"
-                        ),
-                    ),
-                };
-            }
-        };
-        let current_head = crate::git::head_sha(root).ok();
-        if stored_head != current_head {
-            return SearchFilesCoChangeResolution {
-                neighbors: None,
-                evidence: cochange_stale_prepare_evidence(root, project_state),
-            };
-        }
-    }
-
-    let rows = store
-        .query_with_floor(
-            &crate::live_index::coupling::AnchorKey::file(&anchor_path),
-            MAX_CO_CHANGE_PARTNERS_PER_ANCHOR,
-            crate::live_index::rank_signals::FILE_LEVEL_CO_CHANGE_FLOOR,
-        )
-        .map_err(|error| error.to_string());
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(error) => {
-            return SearchFilesCoChangeResolution {
-                neighbors: None,
-                evidence: cochange_ranking_evidence(
-                    CapabilityStatus::Unavailable,
-                    CapabilityFreshness::Unknown,
-                    CapabilityCost::Low,
-                    format!("unable to query coupling store: {error}; path ranking returned"),
-                ),
-            };
-        }
-    };
-    let mut neighbors = HashMap::new();
-    for row in rows {
-        let Some(partner_path) = row.partner.as_str().strip_prefix("file:") else {
-            continue;
-        };
-        let weighted_score = row.weighted_score as f32;
-        if !weighted_score.is_finite() || weighted_score <= 0.0 {
-            continue;
-        }
-        neighbors.insert(
-            partner_path.to_string(),
-            SearchFilesCouplingEvidence {
-                shared_commits: row.shared_commits,
-                weighted_score,
-            },
-        );
-    }
-    if neighbors.is_empty() {
-        SearchFilesCoChangeResolution {
-            neighbors: None,
-            evidence: cochange_ranking_evidence(
-                CapabilityStatus::FallbackUsed,
-                CapabilityFreshness::Empty,
-                CapabilityCost::Low,
-                format!(
-                    "ready coupling store has no usable partner rows for anchor_path={anchor_path}; path ranking returned"
-                ),
-            ),
-        }
-    } else {
-        SearchFilesCoChangeResolution {
-            neighbors: Some(neighbors),
-            evidence: cochange_ranking_evidence(
-                CapabilityStatus::Ready,
-                CapabilityFreshness::Current,
-                CapabilityCost::Low,
-                format!(
-                    "ready coupling store loaded usable partner rows for anchor_path={anchor_path}"
-                ),
-            ),
-        }
-    }
-}
-
-fn frecency_ranking_evidence(
-    status: CapabilityStatus,
-    detail: impl Into<String>,
-) -> CapabilityEvidence {
-    CapabilityEvidence::new(CapabilityName::FrecencyRanking, status)
-        .with_freshness(CapabilityFreshness::Current)
-        .with_safety(CapabilitySafety::ReadOnly)
-        .with_detail(detail)
-}
-
-const RANKING_DIAGNOSTICS_ENV: &str = "SYMFORGE_DEBUG_RANKING";
-
-fn ranking_diagnostics_policy_from_env() -> RankingDiagnosticsPolicy {
-    match std::env::var(RANKING_DIAGNOSTICS_ENV) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "" => RankingDiagnosticsPolicy::CallTimeExplain,
-            "1" | "true" | "on" | "yes" | "default-on" => RankingDiagnosticsPolicy::DefaultOn,
-            "0" | "false" | "no" | "off" | "disabled" | "disable" => {
-                RankingDiagnosticsPolicy::Disabled
-            }
-            _ => RankingDiagnosticsPolicy::Disabled,
-        },
-        Err(std::env::VarError::NotPresent) => RankingDiagnosticsPolicy::CallTimeExplain,
-        Err(std::env::VarError::NotUnicode(_)) => RankingDiagnosticsPolicy::Disabled,
-    }
-}
-
-struct SearchFilesRankingDiagnosticsDecision {
-    explain: bool,
-    evidence: Option<CapabilityEvidence>,
-}
-
-fn ranking_diagnostics_evidence(
-    status: CapabilityStatus,
-    detail: impl Into<String>,
-) -> CapabilityEvidence {
-    CapabilityEvidence::new(CapabilityName::RankingDiagnostics, status)
-        .with_freshness(CapabilityFreshness::Current)
-        .with_safety(CapabilitySafety::ReadOnly)
-        .with_detail(detail)
-}
-
-fn search_files_debug_ranking_requested(
-    input: &SearchFilesInput,
-) -> SearchFilesRankingDiagnosticsDecision {
-    match ranking_diagnostics_policy_from_env() {
-        RankingDiagnosticsPolicy::CallTimeExplain => SearchFilesRankingDiagnosticsDecision {
-            explain: input.debug_ranking.unwrap_or(false),
-            evidence: None,
-        },
-        RankingDiagnosticsPolicy::DefaultOn => SearchFilesRankingDiagnosticsDecision {
-            explain: true,
-            evidence: None,
-        },
-        RankingDiagnosticsPolicy::Disabled if input.debug_ranking.unwrap_or(false) => {
-            SearchFilesRankingDiagnosticsDecision {
-                explain: false,
-                evidence: Some(ranking_diagnostics_evidence(
-                    CapabilityStatus::DisabledByPolicy,
-                    "operator policy disabled ranking diagnostics; ranking explanation omitted",
-                )),
-            }
-        }
-        RankingDiagnosticsPolicy::Disabled => SearchFilesRankingDiagnosticsDecision {
-            explain: false,
-            evidence: None,
-        },
-    }
-}
-
-fn search_files_rank_mode_label(rank_by: Option<&str>) -> &'static str {
-    match rank_by {
-        Some("frecency") => "frecency",
-        Some("path+cochange") => "path+cochange",
-        _ => "default path",
-    }
-}
-
-fn search_files_tier_summary(view: &SearchFilesView) -> String {
-    let SearchFilesView::Found { hits, .. } = view else {
-        return "no returned files".to_string();
-    };
-    let mut cochange = 0usize;
-    let mut strong = 0usize;
-    let mut basename = 0usize;
-    let mut loose = 0usize;
-    let mut metadata = 0usize;
-    for hit in hits {
-        match hit.tier {
-            SearchFilesTier::CoChange => cochange += 1,
-            SearchFilesTier::StrongPath => strong += 1,
-            SearchFilesTier::Basename => basename += 1,
-            SearchFilesTier::LoosePath => loose += 1,
-            SearchFilesTier::MetadataOnly => metadata += 1,
-        }
-    }
-    let mut parts = Vec::new();
-    if cochange > 0 {
-        parts.push(format!("co-change={cochange}"));
-    }
-    if strong > 0 {
-        parts.push(format!("strong path={strong}"));
-    }
-    if basename > 0 {
-        parts.push(format!("basename={basename}"));
-    }
-    if loose > 0 {
-        parts.push(format!("loose path={loose}"));
-    }
-    if metadata > 0 {
-        parts.push(format!("metadata-only={metadata}"));
-    }
-    if parts.is_empty() {
-        "no returned files".to_string()
-    } else {
-        parts.join(", ")
-    }
-}
-
-fn search_files_signal_explanation(
-    signal: &str,
-    evidence: Option<&CapabilityEvidence>,
-    not_requested: bool,
-) -> String {
-    if not_requested {
-        return format!("{signal} signal: not requested");
-    }
-    match evidence {
-        Some(evidence) => {
-            let mut line = format!("{signal} signal: {}", evidence.status);
-            if let Some(detail) = evidence.detail.as_deref().map(str::trim)
-                && !detail.is_empty()
-            {
-                line.push_str(" - ");
-                line.push_str(detail.trim_end_matches('.'));
-            }
-            line
-        }
-        None => format!("{signal} signal: unavailable - no capability evidence was recorded"),
-    }
-}
-
-fn search_files_final_ordering_note(
-    rank_by: Option<&str>,
-    cochange_evidence: Option<&CapabilityEvidence>,
-    frecency_evidence: Option<&CapabilityEvidence>,
-) -> String {
-    match rank_by {
-        Some("frecency") => match frecency_evidence.map(|evidence| evidence.status) {
-            Some(CapabilityStatus::Applied) => {
-                "frecency fusion applied after path ranking; ties remain deterministic by path"
-                    .to_string()
-            }
-            Some(status) => format!(
-                "frecency requested but {status}; path-ranked ordering was returned"
-            ),
-            None => "frecency requested but no evidence was available; path-ranked ordering was returned"
-                .to_string(),
-        },
-        Some("path+cochange") => match cochange_evidence.map(|evidence| evidence.status) {
-            Some(CapabilityStatus::Applied) | Some(CapabilityStatus::Ready) => {
-                "co-change partners that passed gates were fused with path ranking; remaining files keep path tie-breakers"
-                    .to_string()
-            }
-            Some(status) => format!(
-                "path+cochange requested but {status}; path-ranked ordering was returned"
-            ),
-            None => "path+cochange requested but no evidence was available; path-ranked ordering was returned"
-                .to_string(),
-        },
-        _ => "tiered path relevance ordered the results with deterministic path tie-breakers"
-            .to_string(),
-    }
-}
-
-fn search_files_ranking_explanation(
-    view: &SearchFilesView,
-    rank_by: Option<&str>,
-    cochange_evidence: Option<&CapabilityEvidence>,
-    frecency_evidence: Option<&CapabilityEvidence>,
-) -> String {
-    let rank_mode = search_files_rank_mode_label(rank_by);
-    let frecency_not_requested = rank_by != Some("frecency");
-    let cochange_not_requested = rank_by != Some("path+cochange");
-    [
-        "Ranking explanation:".to_string(),
-        format!("requested rank mode: {rank_mode}"),
-        format!(
-            "path signal: applied - returned tier family: {}",
-            search_files_tier_summary(view)
-        ),
-        search_files_signal_explanation("frecency", frecency_evidence, frecency_not_requested),
-        search_files_signal_explanation("co-change", cochange_evidence, cochange_not_requested),
-        format!(
-            "final ordering: {}",
-            search_files_final_ordering_note(rank_by, cochange_evidence, frecency_evidence)
-        ),
-    ]
-    .join("\n")
-}
+use crate::index_lifecycle::guidance::file_search::{
+    ranking_diagnostics_policy_from_env, search_files_ranking_explanation,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapabilityStatusReport {
@@ -2143,47 +1458,9 @@ fn append_changed_with_deprecation_warning(mut result: String) -> String {
     result
 }
 
-fn search_files_total_matches(view: &SearchFilesView) -> usize {
-    match view {
-        SearchFilesView::Found { total_matches, .. } => *total_matches,
-        _ => 0,
-    }
-}
 
-fn search_symbols_total_matches(result: &search::SymbolSearchResult) -> usize {
-    result.hits.len().saturating_add(result.overflow_count)
-}
 
-fn hidden_search_symbols_noise_count(
-    index: &LiveIndex,
-    query: &str,
-    kind: Option<&str>,
-    options: &search::SymbolSearchOptions,
-    visible: &search::SymbolSearchResult,
-) -> usize {
-    if options.noise_policy.include_vendor && options.include_personal_tooling {
-        return 0;
-    }
 
-    let mut unfiltered_options = options.clone();
-    unfiltered_options.noise_policy.include_vendor = true;
-    unfiltered_options.include_personal_tooling = true;
-    let unfiltered = search::search_symbols_with_options(index, query, kind, &unfiltered_options);
-    search_symbols_total_matches(&unfiltered).saturating_sub(search_symbols_total_matches(visible))
-}
-
-fn search_files_resolve_candidate_count(view: &SearchFilesResolveView) -> usize {
-    match view {
-        SearchFilesResolveView::Resolved { .. }
-        | SearchFilesResolveView::ResolvedMetadataOnly { .. } => 1,
-        SearchFilesResolveView::Ambiguous {
-            matches,
-            overflow_count,
-            ..
-        } => matches.len().saturating_add(*overflow_count),
-        _ => 0,
-    }
-}
 
 fn search_files_hidden_noise_note(
     hidden_count: usize,
@@ -2266,18 +1543,7 @@ fn search_files_resolve_match_type_label(view: &SearchFilesResolveView) -> &'sta
     }
 }
 
-fn anchored_search_evidence(anchors: Vec<String>, noun: &str) -> String {
-    if anchors.is_empty() {
-        format!("no {noun} available")
-    } else {
-        let rendered = anchors
-            .into_iter()
-            .map(|anchor| format!("`{anchor}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{noun} {rendered}")
-    }
-}
+use crate::index_lifecycle::guidance::reference_read::anchored_search_evidence;
 
 fn search_text_evidence(result: &search::TextSearchResult) -> String {
     let anchors = result
@@ -2622,17 +1888,7 @@ struct AdmissionDegradationView {
 
 /// Appends the withheld-files note when the snapshot verify withheld files
 /// inside `scope`, so a project-wide answer never reads as complete.
-fn with_withheld_note(live: &LiveIndex, scope: Option<&str>, mut output: String) -> String {
-    let scope = scope
-        .map(crate::protocol::read_gate::normalize_requested_path)
-        .filter(|scope| !scope.is_empty());
-    if let Some(note) =
-        format::withheld_not_searched_note(live.withheld_since_restore(), scope.as_deref())
-    {
-        output = format!("{note}\n\n{output}");
-    }
-    output
-}
+use crate::index_lifecycle::guidance::reference_read::with_withheld_note;
 
 fn admission_degradation_view_from_lookup(
     view: crate::live_index::query::AdmissionTierLookupView,
@@ -2871,51 +2127,9 @@ fn admission_tier_file_degradation_for_path(
     ))
 }
 
-fn find_references_match_type_label(input: &FindReferencesInput, mode: &str) -> &'static str {
-    if mode == "implementations" {
-        return "constrained (implementations mode)";
-    }
-    if input.path.is_some() && input.symbol_line.is_some() {
-        "exact"
-    } else if input.path.is_some() {
-        "constrained (path-scoped symbol)"
-    } else if input.symbol_kind.is_some() || input.kind.as_deref().is_some_and(|kind| kind != "all")
-    {
-        "constrained (repo-wide filtered symbol)"
-    } else {
-        "constrained (repo-wide name match)"
-    }
-}
+use crate::index_lifecycle::guidance::reference_read::find_references_match_type_label;
 
-fn find_references_scope_summary(input: &FindReferencesInput, mode: &str) -> String {
-    let mut parts = Vec::new();
-    if mode == "implementations" {
-        parts.push(format!(
-            "repo-wide implementations for symbol token `{}`",
-            input.name
-        ));
-        parts.push(format!(
-            "direction `{}`",
-            input.direction.as_deref().unwrap_or("auto")
-        ));
-        return parts.join("; ");
-    }
-
-    match input.path.as_deref() {
-        Some(path) => parts.push(format!("path `{path}`")),
-        None => parts.push(format!("repo-wide symbol token `{}`", input.name)),
-    }
-    if let Some(line) = input.symbol_line {
-        parts.push(format!("exact selector line {line}"));
-    }
-    if let Some(symbol_kind) = input.symbol_kind.as_deref() {
-        parts.push(format!("symbol kind `{symbol_kind}`"));
-    }
-    if let Some(reference_kind) = input.kind.as_deref().filter(|kind| *kind != "all") {
-        parts.push(format!("reference kind `{reference_kind}`"));
-    }
-    parts.join("; ")
-}
+use crate::index_lifecycle::guidance::reference_read::find_references_scope_summary;
 
 /// True when the `references`-mode `kind` filter sweeps in type/value usages,
 /// whose recall is genuinely best-effort: the xref extractor resolves them
@@ -2924,60 +2138,8 @@ fn find_references_scope_summary(input: &FindReferencesInput, mode: &str) -> Str
 /// extracted reliably, so they earn no caveat (and `implementations` mode never
 /// reaches this label — it has its own branch). `None`/`"all"` default includes
 /// type/value usages, so it is best-effort too.
-fn find_references_kind_is_best_effort(kind: Option<&str>) -> bool {
-    // Mirror `find_references_kind_filter` rather than duplicating a string
-    // whitelist, so the caveat can never drift from the kinds actually returned.
-    // A filter result of `None` means "no kind filter" -> all kinds returned,
-    // INCLUDING best-effort type/value usages; that covers `all`/`None` AND any
-    // UNRECOGNIZED kind (the filter's `_ => None` arm), so a typo'd `kind` still
-    // gets the caveat instead of silently shipping a best-effort trace unmarked.
-    matches!(
-        find_references_kind_filter(kind),
-        None | Some(ReferenceKind::TypeUsage) | Some(ReferenceKind::ValueUse)
-    )
-}
 
-fn find_references_completeness_label(
-    view: &crate::live_index::FindReferencesView,
-    limits: &format::OutputLimits,
-    kind: Option<&str>,
-) -> String {
-    let shown_files = view.files.len().min(limits.max_files);
-    let mut shown_refs = 0usize;
-    for file in view.files.iter().take(limits.max_files) {
-        if shown_refs >= limits.total_hits {
-            break;
-        }
-        let remaining_budget = limits.total_hits.saturating_sub(shown_refs);
-        shown_refs += file
-            .hits
-            .len()
-            .min(limits.max_per_file)
-            .min(remaining_budget);
-    }
-    let omitted_refs = view.total_refs.saturating_sub(shown_refs);
-    let omitted_files = view.total_files.saturating_sub(shown_files);
-    // Recall-confidence caveat, targeted (not blanket): only type/value-usage
-    // traces are best-effort, so only they carry it. Riding the existing
-    // completeness label keeps it one site, one envelope, no ResultStatus bump.
-    let recall_caveat = if find_references_kind_is_best_effort(kind) {
-        " — usage-trace recall is best-effort; dynamic dispatch, macro-generated, \
-         reflective, and cross-language usages may be missed"
-    } else {
-        ""
-    };
-    if omitted_refs == 0 && omitted_files == 0 {
-        return format!("full for current scope{recall_caveat}");
-    }
-    let mut parts = vec!["truncated by result cap".to_string()];
-    if omitted_refs > 0 {
-        parts.push(format!("{omitted_refs} reference(s) omitted"));
-    }
-    if omitted_files > 0 {
-        parts.push(format!("{omitted_files} file(s) omitted"));
-    }
-    format!("{}{recall_caveat}", parts.join("; "))
-}
+use crate::index_lifecycle::guidance::reference_read::find_references_completeness_label;
 
 /// Tier-2 honesty sweep (dogfood finding #1, 2026-07-06): the reference scan
 /// covers Tier-1 files only, but first-party source demoted to Tier-2 for size
@@ -3003,390 +2165,32 @@ fn tier2_reference_disclosure(
     repo_root: Option<&std::path::Path>,
     name: &str,
 ) -> Option<String> {
-    if candidates.is_empty() || name.trim().is_empty() {
-        return None;
-    }
-    // ponytail: bounded whole-file reads + str::contains; the OS page cache
-    // makes repeated sweeps cheap. Budgets keep the pathological repo honest
-    // (reported as unswept) instead of slow.
-    const MAX_SWEEP_FILES: usize = 8;
-    const MAX_SWEEP_BYTES: u64 = 32 * 1024 * 1024;
-    let preview = |paths: &[&str]| -> String {
-        let shown: Vec<&str> = paths.iter().take(3).copied().collect();
-        let suffix = if paths.len() > shown.len() {
-            format!(", … (+{} more)", paths.len() - shown.len())
-        } else {
-            String::new()
-        };
-        format!("{}{}", shown.join(", "), suffix)
-    };
-    let Some(root) = repo_root else {
-        // No resolvable root: cannot sweep, but silence would be the lie.
-        let paths: Vec<&str> = candidates.iter().map(|(path, _)| path.as_str()).collect();
-        return Some(format!(
-            "Tier-2 exclusion: {} first-party file(s) over the size threshold (1MB data / 4MB code) were NOT reference-scanned \
-             (metadata-only) and could not be swept for \"{name}\" (no repo root): {}",
-            candidates.len(),
-            preview(&paths),
-        ));
-    };
-    let mut matched: Vec<&str> = Vec::new();
-    let mut unswept: Vec<&str> = Vec::new();
-    let mut bytes_budget = MAX_SWEEP_BYTES;
-    for (i, (path, size)) in candidates.iter().enumerate() {
-        if i >= MAX_SWEEP_FILES || bytes_budget < *size {
-            unswept.push(path.as_str());
-            continue;
-        }
-        // The gate owns the read and re-classifies the current bytes, so a file
-        // the manifest still records as merely oversized cannot have a textual
-        // match disclosed once its bytes turn sensitive. The refusal itself is
-        // discarded: only the path reaches the response, via `unswept`.
-        // T045: this is a DISK OBSERVATION by name — the sweep wants what is on
-        // disk right now, confined beneath the root. Manifest paths are
-        // relative and catalogued, so the confine never fires on them.
-        match read_gate::observe_disk_beneath_without_lines(live, root, path) {
-            Ok(bytes) => {
-                bytes_budget = bytes_budget.saturating_sub(bytes.len() as u64);
-                if String::from_utf8_lossy(&bytes).contains(name) {
-                    matched.push(path.as_str());
-                }
-            }
-            Err(_) => unswept.push(path.as_str()),
-        }
-    }
-    if matched.is_empty() && unswept.is_empty() {
-        return None;
-    }
-    let mut parts: Vec<String> = Vec::new();
-    if !matched.is_empty() {
-        parts.push(format!(
-            "\"{name}\" appears textually in {} size-demoted Tier-2 file(s) that were NOT \
-             reference-scanned (metadata-only): {} — grep or get_file_content to inspect",
-            matched.len(),
-            preview(&matched),
-        ));
-    }
-    if !unswept.is_empty() {
-        parts.push(format!(
-            "{} size-demoted Tier-2 file(s) not reference-scanned and not swept (budget or policy): {}",
-            unswept.len(),
-            preview(&unswept),
-        ));
-    }
-    Some(format!("Tier-2 exclusion: {}", parts.join("; ")))
-}
-
-fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> String {
-    let anchors = view
-        .files
-        .iter()
-        .flat_map(|file| {
-            let file_path = file.file_path.clone();
-            file.hits.iter().flat_map(move |hit| {
-                hit.context_lines
-                    .iter()
-                    .filter(|line| line.is_reference_line)
-                    .map({
-                        let file_path = file_path.clone();
-                        move |line| format!("{file_path}:{}", line.line_number)
-                    })
-            })
-        })
-        .take(3)
-        .collect();
-    anchored_search_evidence(anchors, "reference anchors")
-}
-
-fn find_references_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
-    match kind_filter {
-        Some("call") => Some(ReferenceKind::Call),
-        Some("import") => Some(ReferenceKind::Import),
-        Some("type_usage") => Some(ReferenceKind::TypeUsage),
-        Some("macro_use") => Some(ReferenceKind::MacroUse),
-        Some("value_use") => Some(ReferenceKind::ValueUse),
-        Some("all") | None => None,
-        _ => None,
-    }
-}
-
-fn should_collect_qualified_usages(input: &FindReferencesInput) -> bool {
-    input.path.is_none()
-        && !input.name.is_empty()
-        && matches!(
-            input.kind.as_deref(),
-            None | Some("all") | Some("type_usage")
-        )
-}
-
-fn qualified_usage_hit_view(usage: &QualifiedUsage) -> ReferenceHitView {
-    let confidence = if usage.confident {
-        "confident"
-    } else {
-        "uncertain"
-    };
-    let annotation = format!("[qualified-path scan: {confidence}]");
-
-    ReferenceHitView {
-        context_lines: vec![ReferenceContextLineView {
-            line_number: usage.line,
-            text: usage.line_text.clone(),
-            is_reference_line: true,
-            enclosing_annotation: Some(annotation),
-        }],
-    }
-}
-
-fn merge_qualified_usages_into_view(
-    view: &mut FindReferencesView,
-    mut usages: Vec<QualifiedUsage>,
-    mut seen_ranges: HashSet<(String, (u32, u32))>,
-) {
-    let mut known_files: HashSet<String> = seen_ranges
-        .iter()
-        .map(|(file_path, _)| file_path.clone())
-        .collect();
-    known_files.extend(view.files.iter().map(|file| file.file_path.clone()));
-
-    usages.sort_by(|a, b| {
-        a.file_path
-            .cmp(&b.file_path)
-            .then(a.line.cmp(&b.line))
-            .then(a.byte_range.0.cmp(&b.byte_range.0))
-    });
-
-    let mut added = 0usize;
-    for usage in usages {
-        let range_key = (usage.file_path.clone(), usage.byte_range);
-        if !seen_ranges.insert(range_key) {
-            continue;
-        }
-        let hit = qualified_usage_hit_view(&usage);
-        if let Some(file_view) = view
-            .files
-            .iter_mut()
-            .find(|file| file.file_path == usage.file_path)
-        {
-            file_view.hits.push(hit);
-        } else {
-            view.files.push(ReferenceFileView {
-                file_path: usage.file_path.clone(),
-                hits: vec![hit],
-                caller_declarations: Vec::new(),
-                caller_declaration_count: 0,
-                caller_declarations_omitted: 0,
-                caller_header_unavailable_count: 0,
-            });
-        }
-        known_files.insert(usage.file_path);
-        added += 1;
-    }
-
-    if added > 0 {
-        view.total_refs += added;
-        view.total_files = known_files.len();
-        view.files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-    }
-}
-
-fn implementations_parse_state_for_paths(
-    index: &LiveIndex,
-    view: &crate::live_index::ImplementationsView,
-) -> &'static str {
-    search_parse_state_for_paths(
-        index,
-        view.entries.iter().map(|entry| entry.file_path.as_str()),
+    crate::index_lifecycle::guidance::reference_read::tier2_reference_disclosure_with(
+        candidates, name, repo_root.is_some(), |path, _| {
+            read_gate::observe_disk_beneath_without_lines(live, repo_root?, path).ok()
+        },
     )
 }
 
-fn implementations_completeness_label(
-    view: &crate::live_index::ImplementationsView,
-    limits: &format::OutputLimits,
-) -> String {
-    let shown = view
-        .entries
-        .len()
-        .min(limits.max_files * limits.max_per_file);
-    let omitted = view.entries.len().saturating_sub(shown);
-    if omitted == 0 {
-        "full for current scope".to_string()
-    } else {
-        format!("truncated by result cap ({omitted} implementation entry(s) omitted)")
-    }
-}
+use crate::index_lifecycle::guidance::reference_read::find_references_evidence;
 
-fn implementations_evidence(view: &crate::live_index::ImplementationsView) -> String {
-    let anchors = view
-        .entries
-        .iter()
-        .take(3)
-        .map(|entry| format!("{}:{}", entry.file_path, entry.line + 1))
-        .collect();
-    anchored_search_evidence(anchors, "implementation anchors")
-}
+use crate::index_lifecycle::guidance::reference_read::find_references_kind_filter;
 
-fn explore_is_test_like_path(
-    path: &str,
-    classification: Option<&crate::domain::index::FileClassification>,
-) -> bool {
-    let path_lower = path.replace('\\', "/").to_ascii_lowercase();
-    classification.is_some_and(|c| c.is_test)
-        || path_lower.contains("/tests/")
-        || path_lower.contains("/test/")
-        || path_lower.contains("/__tests__/")
-        || path_lower.ends_with("/tests.rs")
-        || path_lower.ends_with("/test.rs")
-        || path_lower.ends_with("_test.rs")
-        || path_lower.ends_with("_spec.rs")
-}
+use crate::index_lifecycle::guidance::reference_read::should_collect_qualified_usages;
 
-fn explore_should_skip_path_boost(
-    path: &str,
-    classification: &crate::domain::index::FileClassification,
-    include_noise: bool,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) -> bool {
-    let suppress_vendor = !(include_noise || include_vendor);
-    let suppress_personal = !(include_noise || include_personal_tooling);
-    let suppress_other = !include_noise;
-    if !suppress_vendor && !suppress_personal && !suppress_other {
-        return false;
-    }
-    if suppress_other && explore_is_test_like_path(path, Some(classification)) {
-        return true;
-    }
-    if suppress_personal && crate::live_index::query::is_personal_tooling_path(path) {
-        return true;
-    }
-    if suppress_vendor && classification.is_vendor {
-        return true;
-    }
-    if suppress_other && (classification.is_generated || classification.is_config) {
-        return true;
-    }
-    false
-}
 
-/// Whether a concept `text_query` legitimately matches `line` at a word
-/// boundary, rather than as a coincidental substring inside a larger
-/// identifier.
-///
-/// SF-STRESS-013: concept text queries are matched by plain case-insensitive
-/// substring, so `"try {"` substring-matches `public string Country { ... }`
-/// (`coun-TRY-{`) and floods DTO-property results into "Error Handling". When a
-/// query begins with an identifier token, we require the character immediately
-/// before the match to be a non-word character (or the line start), so the
-/// token sits on a real word boundary. Queries that begin with punctuation
-/// (e.g. `.expect(`, `#[derive(Serialize`) are already specific and pass
-/// through unchanged. This only *rejects* false positives in explore; it never
-/// invents new matches.
-fn concept_text_query_matches_on_boundary(line: &str, query: &str) -> bool {
-    let line_lower = line.to_ascii_lowercase();
-    let query_lower = query.to_ascii_lowercase();
+use crate::index_lifecycle::guidance::reference_read::merge_qualified_usages_into_view;
 
-    // Anchor token = the leading run of word characters in the query.
-    let anchor: String = query_lower
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    if anchor.is_empty() {
-        // Punctuation-led query (e.g. `.expect(`); substring containment is the
-        // intended semantics and already specific.
-        return line_lower.contains(&query_lower);
-    }
+use crate::index_lifecycle::guidance::reference_read::implementations_parse_state_for_paths;
 
-    // Require at least one occurrence of the full query whose anchor token sits
-    // on a left word boundary.
-    let anchor_bytes = anchor.as_bytes();
-    let mut start = 0usize;
-    while let Some(rel) = line_lower[start..].find(&query_lower) {
-        let pos = start + rel;
-        let left_ok = pos == 0
-            || !line_lower.as_bytes()[pos - 1].is_ascii_alphanumeric()
-                && line_lower.as_bytes()[pos - 1] != b'_';
-        if left_ok {
-            // Anchor is a prefix of the query, so the right boundary of the
-            // anchor is the char at pos + anchor.len(); for code idioms the
-            // query already includes the trailing delimiter (e.g. `unwrap()`),
-            // so a left boundary is sufficient to reject identifier-internal
-            // hits like `coun|try {`.
-            debug_assert!(query_lower.as_bytes().starts_with(anchor_bytes));
-            return true;
-        }
-        // Advance past this occurrence to keep scanning.
-        start = pos + 1;
-        if start >= line_lower.len() {
-            break;
-        }
-    }
-    false
-}
+use crate::index_lifecycle::guidance::reference_read::implementations_completeness_label;
 
-fn explore_path_penalty(
-    path: &str,
-    classification: Option<&crate::domain::index::FileClassification>,
-) -> u64 {
-    let path_lower = path.replace('\\', "/").to_ascii_lowercase();
-    if explore_is_test_like_path(path, classification) {
-        return 2;
-    }
-    if classification.is_some_and(|c| c.is_config)
-        || path_lower.ends_with(".md")
-        || path_lower.ends_with(".html")
-        || path_lower.ends_with(".htm")
-        || path_lower.contains("/docs/")
-        || path_lower.contains("/doc/")
-        || path_lower.contains("/plans/")
-        || path_lower.contains("/manual/")
-        || path_lower.contains("changelog")
-        || path_lower.contains(".planning/")
-        || path_lower.contains(".auto-claude")
-    {
-        return 2;
-    }
-    if path_lower.contains("/examples/")
-        || path_lower.contains("/fixtures/")
-        || path_lower.contains("/bench/")
-        || path_lower.contains("/benches/")
-        || path_lower.contains("/sample/")
-        || path_lower.contains("/samples/")
-    {
-        return 3;
-    }
-    8
-}
+use crate::index_lifecycle::guidance::reference_read::implementations_evidence;
 
-// Explore scorer tuning (US2). The score blends a saturating NAME signal with an
-// additive concept-PROXIMITY term instead of multiplying correlated name-overlap
-// factors. Caps keep both signals bounded so no single symbol can run away and
-// pin the max-normalized top to 1.00 while the rest crater. W_NAME >= W_PROX
-// guarantees an exact-name query still ranks its target at/near the top.
-const EXPLORE_RAW_CAP: u64 = 8;
-const EXPLORE_COVERAGE_CAP: u64 = 8;
-const EXPLORE_PROX_CAP: u64 = 12;
-const EXPLORE_W_NAME: u64 = 3;
-const EXPLORE_W_PROX: u64 = 2;
-
-fn explore_fallback_alignment_multiplier(
-    query_term_count: usize,
-    matched_term_count: usize,
-) -> u64 {
-    if query_term_count <= 1 {
-        return 8;
-    }
-    match (query_term_count, matched_term_count) {
-        (_, 0) => 1,
-        (2, 1) => 3,
-        (2, _) => 8,
-        (3, 1) => 2,
-        (3, 2) => 6,
-        (3, _) => 8,
-        (_, 1) => 1,
-        (_, 2) => 4,
-        _ => 8,
-    }
-}
+#[cfg(test)]
+use crate::index_lifecycle::guidance::exploration::{
+    concept_text_query_matches_on_boundary, explore_path_penalty,
+};
 
 fn changed_paths_completeness_label(before_filter: usize, after_filter: usize) -> String {
     if before_filter == after_filter {
@@ -3524,36 +2328,6 @@ fn render_diff_symbols_output(
     format!("{envelope}\n\n{output}")
 }
 
-/// Strip vendor / personal-tooling paths from a `TextSearchResult` per the
-/// caller's `include_vendor` / `include_personal_tooling` flags. Suppressed
-/// match counts feed `suppressed_by_noise`, which renders into the existing
-/// "N noise-filtered match(es) suppressed" envelope footer.
-fn apply_path_predicate_filter(
-    result: &mut Result<search::TextSearchResult, search::TextSearchError>,
-    include_vendor: bool,
-    include_personal_tooling: bool,
-) {
-    if include_vendor && include_personal_tooling {
-        return;
-    }
-    if let Ok(r) = result {
-        let mut filtered: usize = 0;
-        r.files.retain(|file| {
-            if !include_vendor && crate::live_index::query::is_vendor_path(&file.path) {
-                filtered += file.matches.len();
-                return false;
-            }
-            if !include_personal_tooling
-                && crate::live_index::query::is_personal_tooling_path(&file.path)
-            {
-                filtered += file.matches.len();
-                return false;
-            }
-            true
-        });
-        r.suppressed_by_noise = r.suppressed_by_noise.saturating_add(filtered);
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 fn render_search_text_output(
@@ -3648,59 +2422,8 @@ fn render_search_text_output(
     rendered
 }
 
-fn search_text_compaction_query(query: Option<&str>, terms: Option<&[String]>) -> String {
-    if let Some(q) = query.filter(|s| !s.trim().is_empty()) {
-        return q.to_string();
-    }
-    terms
-        .map(|items| {
-            items
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default()
-}
 
-fn maybe_compact_text_search_result(
-    result: &mut Result<search::TextSearchResult, search::TextSearchError>,
-    query: &str,
-) {
-    if query.trim().is_empty() {
-        return;
-    }
-    if let Ok(text) = result {
-        crate::protocol::ccr::compact_text_search_result(text, query);
-    }
-}
 
-fn resolve_text_search_enclosing_symbols(
-    index: &LiveIndex,
-    result: &mut Result<search::TextSearchResult, search::TextSearchError>,
-) {
-    let Ok(result) = result else {
-        return;
-    };
-
-    for file_matches in &mut result.files {
-        let Some(file) = index.get_file(&file_matches.path) else {
-            continue;
-        };
-
-        for line_match in &mut file_matches.matches {
-            let zero_based_line = line_match.line_number.saturating_sub(1) as u32;
-            line_match.enclosing_symbol =
-                crate::domain::find_enclosing_symbol(&file.symbols, zero_based_line)
-                    .and_then(|idx| file.symbols.get(idx as usize))
-                    .map(|symbol| search::EnclosingMatchSymbol {
-                        name: symbol.name.clone(),
-                        kind: symbol.kind.to_string(),
-                        line_range: symbol.line_range,
-                    });
-        }
-    }
-}
 
 fn sidecar_state_for_server(server: &SymForgeServer) -> SidecarState {
     SidecarState {
@@ -3931,137 +2654,21 @@ fn overlay_proxy_status_lines(
     out
 }
 
-fn symbol_candidate_paths(index: &crate::live_index::store::LiveIndex, name: &str) -> Vec<String> {
-    let mut candidates: Vec<String> = index
-        .all_files()
-        .filter_map(|(path, file)| {
-            if file.symbols.iter().any(|s| s.name == name) {
-                Some(path.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
+use crate::index_lifecycle::guidance::reference_read::symbol_candidate_paths;
 
-fn format_ambiguous_symbol_context(name: &str, candidates: &[String]) -> String {
-    let mut output = format!(
-        "Ambiguous symbol selector: {} symbols named \"{}\" found.\nPass `path` or `file` to disambiguate.\nCandidate paths:",
-        candidates.len(),
-        name
-    );
-    for path in candidates {
-        output.push_str(&format!("\n- {path}"));
-    }
-    output
-}
+use crate::index_lifecycle::guidance::symbol_context::format_ambiguous_symbol_context;
 
-fn render_symbol_context_header(
-    file: &IndexedFile,
-    name: &str,
-    symbol_kind: Option<&str>,
-    symbol_line: Option<u32>,
-    verbosity: &str,
-    max_tokens: Option<u64>,
-) -> Option<String> {
-    use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
-
-    match resolve_symbol_selector(file, name, symbol_kind, symbol_line) {
-        SymbolSelectorMatch::Selected(_, sym) => {
-            let body = std::str::from_utf8(
-                &file.content[sym.byte_range.0 as usize..sym.byte_range.1 as usize],
-            )
-            .ok()?;
-            let (rendered, actual_level) = format::resolve_verbosity(
-                body,
-                Some(verbosity),
-                max_tokens,
-                0.7, // standalone symbol — allocate 70% of budget to body
-            );
-            let mut output = format!(
-                "{}\n[{}, {}:{}-{}]",
-                rendered,
-                sym.kind,
-                file.relative_path,
-                sym.line_range.0 + 1,
-                sym.line_range.1 + 1
-            );
-            if actual_level != "full" && actual_level != verbosity {
-                output.push_str(&format!(
-                    "\n[adaptive verbosity: {} — fits within {} token budget]",
-                    actual_level,
-                    max_tokens.unwrap_or(0)
-                ));
-            }
-            Some(output)
-        }
-        SymbolSelectorMatch::NotFound | SymbolSelectorMatch::Ambiguous(_) => None,
-    }
-}
+use crate::index_lifecycle::guidance::symbol_context::render_symbol_context_header;
 
 fn capture_trace_symbol_view_for_generation(
     published: &crate::live_index::PublishedGeneration,
     params: &TraceSymbolInput,
     sections: Option<&[String]>,
 ) -> crate::live_index::TraceSymbolView {
-    let mut trace_view = published.live.capture_trace_symbol_view(
-        &params.path,
-        &params.name,
-        params.kind.as_deref(),
-        params.symbol_line,
-        sections,
-        include_tests_from_sections(params.sections.as_ref()),
-    );
-
-    if let crate::live_index::TraceSymbolView::Found(ref mut found) = trace_view {
-        let wants_git = sections
-            .map(|values| values.iter().any(|value| value.eq_ignore_ascii_case("git")))
-            .unwrap_or(true);
-
-        if wants_git {
-            let temporal = &published.code_signals.temporal;
-            if temporal.state == crate::live_index::git_temporal::GitTemporalState::Ready
-                && let Some(history) = temporal.files.get(&params.path)
-            {
-                use crate::live_index::git_temporal::{churn_bar, churn_label, relative_time};
-
-                found.git_activity = Some(crate::live_index::GitActivityView {
-                    churn_score: history.churn_score,
-                    churn_bar: churn_bar(history.churn_score),
-                    churn_label: churn_label(history.churn_score).to_string(),
-                    commit_count: history.commit_count,
-                    last_relative: relative_time(history.last_commit.days_ago),
-                    last_hash: history.last_commit.hash.clone(),
-                    last_message: history.last_commit.message_head.clone(),
-                    last_author: history.last_commit.author.clone(),
-                    last_timestamp: history.last_commit.timestamp.clone(),
-                    owners: history
-                        .contributors
-                        .iter()
-                        .map(|contributor| {
-                            format!("{} {:.0}%", contributor.author, contributor.percentage)
-                        })
-                        .collect(),
-                    co_changes: history
-                        .co_changes
-                        .iter()
-                        .map(|entry| {
-                            (
-                                entry.path.clone(),
-                                entry.coupling_score,
-                                entry.shared_commits,
-                            )
-                        })
-                        .collect(),
-                });
-            }
-        }
-    }
-
-    trace_view
+    crate::index_lifecycle::guidance::symbol_context::capture_trace_symbol_view(
+        published, &params.path, &params.name, params.kind.as_deref(),
+        params.symbol_line, sections, include_tests_from_sections(params.sections.as_ref()),
+    )
 }
 
 enum CapturedGetSymbolsEntry {
@@ -4127,51 +2734,7 @@ fn loading_guard_message_from_published(
     }
 }
 
-/// Outcome of a name-only `get_symbol` lookup (Wave 1 Fix 2).
-enum SymbolNameLookup {
-    /// Exactly one match — path and canonical indexed symbol name.
-    Unique { path: String, symbol_name: String },
-    /// More than one exact-name match — a ready-to-return disambiguation listing.
-    Ambiguous(String),
-    /// No exact-name match — a ready-to-return loud not-found (D18 style).
-    NotFound(String),
-}
-
-/// Render the disambiguation listing for a name-only `get_symbol` hit that
-/// matched multiple symbols. Shows path + start line + kind per candidate,
-/// capped at 20 with a count disclosure, and names how to disambiguate.
-fn render_symbol_name_ambiguity(
-    name: &str,
-    hits: &[crate::live_index::search::SymbolSearchHit],
-    overflowed: bool,
-) -> String {
-    const MAX_CANDIDATES: usize = 20;
-    // Under the 500-hit search cap the exact count can under-report; when the
-    // search overflowed, disclose the total as a lower bound (Wave 1 Fix 4).
-    let total = if overflowed {
-        format!("more than {}", hits.len())
-    } else {
-        hits.len().to_string()
-    };
-    let mut output = format!(
-        "Ambiguous symbol selector: {total} symbols named \"{name}\" found across the index.\n\
-         Pass `path` (and `symbol_line` if a file has several) to disambiguate.\n\
-         Candidates:",
-    );
-    for hit in hits.iter().take(MAX_CANDIDATES) {
-        output.push_str(&format!(
-            "\n- {} (line {}, {})",
-            hit.path, hit.line, hit.kind
-        ));
-    }
-    if hits.len() > MAX_CANDIDATES {
-        output.push_str(&format!(
-            "\n... and {} more (use search_symbols to list them all)",
-            hits.len() - MAX_CANDIDATES
-        ));
-    }
-    output
-}
+use crate::index_lifecycle::guidance::symbol_read::SymbolNameLookup;
 
 #[tool_router(router = core_tool_router, vis = "pub(crate)")]
 impl SymForgeServer {
@@ -4185,100 +2748,9 @@ impl SymForgeServer {
         kind: Option<&str>,
         symbol_line: Option<u32>,
     ) -> SymbolNameLookup {
-        use crate::live_index::search::{
-            ResultLimit, SymbolMatchTier, SymbolSearchOptions, search_symbols_with_options,
-        };
-        let guard = self.index.data_plane().read();
-        // Permissive noise policy (the default) so a symbol defined only in a
-        // test/vendor/generated file is still resolvable by exact name — an
-        // explicit path already reaches those files. A generous limit keeps the
-        // ambiguity count honest without changing the O(symbols) scan cost.
-        let options = SymbolSearchOptions {
-            result_limit: ResultLimit::new(500),
-            ..Default::default()
-        };
-        let result = search_symbols_with_options(&guard, name, kind, &options);
-        // Under the 500-hit search cap, `overflow_count > 0` means more matches
-        // exist than were returned, so the ambiguity total must be a lower bound,
-        // never an exact under-report (Wave 1 Fix 4).
-        let overflowed = result.overflow_count > 0;
-        let hits = result.hits;
-        // Exact tier + exact (case-sensitive) name only — a name selector must
-        // not silently resolve to a prefix/substring neighbor.
-        let mut exact: Vec<crate::live_index::search::SymbolSearchHit> = hits
-            .iter()
-            .filter(|hit| hit.tier == SymbolMatchTier::Exact && hit.name == name)
-            .cloned()
-            .collect();
-        // `symbol_line` narrows to matches at that 1-based start line when it
-        // resolves at least one candidate (e.g. two files, one line each).
-        if let Some(line) = symbol_line {
-            let narrowed: Vec<_> = exact
-                .iter()
-                .filter(|hit| hit.line == line)
-                .cloned()
-                .collect();
-            if !narrowed.is_empty() {
-                exact = narrowed;
-            }
-        }
-        match exact.len() {
-            0 => {
-                // Kind-mismatch guard (Wave 1 Fix 1): before claiming the name is
-                // absent, re-check WITHOUT the kind filter. If it exists under other
-                // kinds, "No symbol named X" is factually false — name the kinds it
-                // DOES have so the caller can drop or correct the filter.
-                if let Some(requested_kind) = kind {
-                    let unfiltered = search_symbols_with_options(&guard, name, None, &options);
-                    let mut kinds: Vec<String> = unfiltered
-                        .hits
-                        .into_iter()
-                        .filter(|hit| hit.tier == SymbolMatchTier::Exact && hit.name == name)
-                        .map(|hit| hit.kind)
-                        .collect();
-                    kinds.sort();
-                    kinds.dedup();
-                    if !kinds.is_empty() {
-                        return SymbolNameLookup::NotFound(format!(
-                            "`{name}` exists in the index, but not as kind={requested_kind} \
-                             (found: {}). Drop the kind filter or pass the correct kind.",
-                            kinds.join(", ")
-                        ));
-                    }
-                }
-                // Unique snake_case prefix (`reconcile` → `reconcile_orders`) when the
-                // query names a single indexed symbol unambiguously.
-                if kind.is_none() {
-                    let prefix: Vec<_> = hits
-                        .iter()
-                        .filter(|hit| {
-                            hit.tier == SymbolMatchTier::Prefix
-                                && hit.name.starts_with(name)
-                                && hit.name.as_bytes().get(name.len()) == Some(&b'_')
-                        })
-                        .cloned()
-                        .collect();
-                    if prefix.len() == 1 {
-                        return SymbolNameLookup::Unique {
-                            path: prefix[0].path.clone(),
-                            symbol_name: prefix[0].name.clone(),
-                        };
-                    }
-                }
-                SymbolNameLookup::NotFound(format!(
-                    "No symbol named `{name}` in the index. \
-                     Use search_symbols(query=\"{name}\") for a fuzzy lookup, \
-                     or pass an explicit `path` if the file is not indexed."
-                ))
-            }
-            1 => SymbolNameLookup::Unique {
-                path: exact[0].path.clone(),
-                symbol_name: exact[0].name.clone(),
-            },
-            _ => {
-                SymbolNameLookup::Ambiguous(render_symbol_name_ambiguity(name, &exact, overflowed))
-            }
-        }
+        crate::index_lifecycle::guidance::symbol_read::resolve_symbol_path_by_name(
+            &self.index.data_plane().read(), name, kind, symbol_line,
+        )
     }
 
     /// Look up symbol(s) by file path and name. Single mode: provide path + name for one symbol.
@@ -4449,7 +2921,11 @@ impl SymForgeServer {
                     params.0.path = path;
                     params.0.name = symbol_name;
                 }
-                SymbolNameLookup::Ambiguous(message) | SymbolNameLookup::NotFound(message) => {
+                SymbolNameLookup::Ambiguous(message, candidates) => {
+                    debug_assert!(candidates.len() > 1);
+                    return message;
+                }
+                SymbolNameLookup::NotFound(message) => {
                     return message;
                 }
             }
@@ -5787,38 +4263,25 @@ impl SymForgeServer {
         // data then share the same fresh publication advertised by the local
         // fallback ProjectEvidence.
         let generation = self.capture_local_response_generation();
-        let options = match search_symbols_options_from_input(&params.0) {
-            Ok(options) => options,
-            Err(message) => return message,
-        };
-        let result = {
+        if let Some(notice) =
+            params.0.path_prefix.as_deref().and_then(|path| {
+                crate::protocol::read_gate::unverified_notice(&generation.live, path)
+            })
+        {
+            return notice;
+        }
+        let execution = {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
-            if let Some(notice) = params
-                .0
-                .path_prefix
-                .as_deref()
-                .and_then(|path| crate::protocol::read_gate::unverified_notice(&guard, path))
+            match crate::index_lifecycle::guidance::search::execute_symbol_search(&guard, &params.0)
             {
-                return notice;
+                Ok(execution) => execution,
+                Err(message) => return message,
             }
-            search::search_symbols_with_options(
-                &guard,
-                query_str,
-                params.0.kind.as_deref(),
-                &options,
-            )
         };
-        let hidden_noise_count = {
-            let guard = Arc::clone(&generation.live);
-            hidden_search_symbols_noise_count(
-                &guard,
-                query_str,
-                params.0.kind.as_deref(),
-                &options,
-                &result,
-            )
-        };
+        let result = execution.result;
+        let options = execution.options;
+        let hidden_noise_count = execution.suppressed_by_noise;
         // Browse ordering is owned by the engine (search::search_symbols_with_options),
         // which ranks browse results by importance (reference count -> kind -> path ->
         // line). Do NOT re-sort here: a tool-level re-sort would override that order and
@@ -5852,61 +4315,18 @@ impl SymForgeServer {
             Some(envelope) => format!("{envelope}\n\n{output}"),
             None => output,
         };
-        let output = if !is_browse
-            && query_str.len() >= 2
-            && result.hits.len() < options.result_limit.get() / 2
-        {
-            let text_fallback = {
-                let guard = Arc::clone(&generation.live);
-                loading_guard!(guard);
-                let mut text_options = search::TextSearchOptions::for_current_code_search();
-                text_options.path_scope = options.path_scope.clone();
-                text_options.noise_policy = options.noise_policy;
-                text_options.include_personal_tooling = options.include_personal_tooling;
-                text_options.language_filter = options.language_filter;
-                text_options.total_limit = 15;
-                text_options.max_per_file = 1;
-                search::search_text_with_options(
-                    &guard,
-                    Some(query_str),
-                    None,
-                    false,
-                    &text_options,
-                )
-                .unwrap_or_else(|_| search::TextSearchResult {
-                    label: String::new(),
-                    total_matches: 0,
-                    files: vec![],
-                    suppressed_by_noise: 0,
-                    overflow_count: 0,
-                    excluded_knowledge_files: 0,
-                    withheld_policy_files: 0,
-                    withheld_size_files: 0,
-                })
-            };
-            let symbol_paths: std::collections::HashSet<&str> =
-                result.hits.iter().map(|h| h.path.as_str()).collect();
-            let extra_paths: Vec<String> = text_fallback
-                .files
-                .iter()
-                .filter(|file| !symbol_paths.contains(file.path.as_str()))
-                .filter_map(|file| {
-                    file.matches
-                        .first()
-                        .map(|m| format!("{}:{}", file.path, m.line_number))
-                })
-                .take(10)
-                .collect();
-            if extra_paths.is_empty() {
-                output
-            } else {
-                format!(
-                    "{output}\n\nText path fallback (sparse symbol hits):\n{}",
-                    extra_paths.join("\n")
-                )
-            }
-        } else {
+        let output = if execution.text_fallback.is_empty() {
             output
+        } else {
+            let paths: Vec<_> = execution
+                .text_fallback
+                .iter()
+                .map(|(path, line)| format!("{path}:{line}"))
+                .collect();
+            format!(
+                "{output}\n\nText path fallback (sparse symbol hits):\n{}",
+                paths.join("\n")
+            )
         };
         self.record_tool_savings_named(
             "search_symbols",
@@ -6148,8 +4568,6 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("search_text", &params.0).await {
             return result;
         }
-        // Feature 012 (Phase 3): honest refusal for a cross-project request with
-        // no daemon (no working set on the local path).
         if let Some(refusal) = self
             .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
         {
@@ -6164,9 +4582,6 @@ impl SymForgeServer {
                 est, limit, per_file
             );
         }
-        // Capture only after daemon proxy/recovery has either returned or
-        // rebuilt the local index. The source-free estimate above deliberately
-        // remains before publication selection.
         let generation = self.capture_local_response_generation();
         if let Some(notice) =
             params.0.path_prefix.as_deref().and_then(|path| {
@@ -6175,233 +4590,47 @@ impl SymForgeServer {
         {
             return notice;
         }
-        // Structural (AST-pattern) search mode.
-        if params.0.structural.unwrap_or(false) {
-            let pattern = match params.0.query.as_deref() {
-                Some(p) if !p.trim().is_empty() => p.trim(),
-                _ => return "Error: `query` is required for structural search.".to_string(),
-            };
-            let options = match search_text_options_from_input(&params.0) {
-                Ok(o) => o,
-                Err(message) => return message,
-            };
-            let mut result = {
-                let guard = Arc::clone(&generation.live);
-                loading_guard!(guard);
-                let mut result = search::search_structural(&guard, pattern, &options);
-                resolve_text_search_enclosing_symbols(&guard, &mut result);
-                result
-            };
-            apply_path_predicate_filter(
-                &mut result,
-                params.0.include_vendor.unwrap_or(false),
-                params.0.include_personal_tooling.unwrap_or(false),
-            );
-            maybe_compact_text_search_result(&mut result, pattern);
-            let output = render_search_text_output(
-                self,
-                &generation,
-                result,
-                Some(pattern),
-                true,
-                params.0.group_by.as_deref(),
-                params.0.terms.as_deref(),
-                &options,
-                false,
-                false,
-                false,
-            );
-            self.session_context.record_summary_output(
-                "search_text",
-                (output.len() / 4).min(u32::MAX as usize) as u32,
-            );
-            return self.apply_ccr_budget(
-                "search_text",
-                with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), output),
-                params.0.max_tokens,
-            );
-        }
-
-        let mut options = match search_text_options_from_input(&params.0) {
-            Ok(options) => options,
-            Err(message) => return message,
-        };
-        let mut is_regex = params.0.regex.unwrap_or(false);
-        let mut auto_detected_regex = false;
-        let original_query = params.0.query.clone();
-
-        // Auto-detect regex patterns: if regex is not explicitly set and the
-        // query contains unambiguous regex sequences (\w, \d, \s, \b, .+, .*),
-        // enable regex mode automatically. These sequences never appear
-        // literally in code, so treating them as literals always gives 0 results.
-        if !is_regex && let Some(ref q) = params.0.query {
-            let has_regex_escape = q.contains("\\w")
-                || q.contains("\\d")
-                || q.contains("\\s")
-                || q.contains("\\b")
-                || q.contains("\\W")
-                || q.contains("\\D")
-                || q.contains("\\S");
-            if has_regex_escape {
-                is_regex = true;
-                auto_detected_regex = true;
-                // Relax noise policy for auto-detected regex — the user
-                // is doing a targeted pattern search and expects grep-like
-                // completeness, so include test files by default.
-                if params.0.include_tests.is_none() {
-                    options.noise_policy.include_tests = true;
-                }
-            }
-        }
-
-        // Extract churn scores from GitTemporalIndex BEFORE acquiring the
-        // LiveIndex read lock to avoid lock ordering issues.
-        if options.ranked {
-            let git_temporal = Arc::clone(&generation.code_signals.temporal);
-            if matches!(
-                git_temporal.state,
-                crate::live_index::git_temporal::GitTemporalState::Ready
-            ) {
-                let churn_map: std::collections::HashMap<String, f32> = git_temporal
-                    .files
-                    .iter()
-                    .map(|(path, history)| (path.clone(), history.churn_score))
-                    .collect();
-                if !churn_map.is_empty() {
-                    options.churn_scores = Some(churn_map);
-                }
-            }
-        }
-
-        let mut result = {
+        let execution = {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
-            let mut r = search::search_text_with_options(
-                &guard,
-                params.0.query.as_deref(),
-                params.0.terms.as_deref(),
-                is_regex,
-                &options,
-            );
-            resolve_text_search_enclosing_symbols(&guard, &mut r);
-            // Enrich with callers if follow_refs is set
-            if params.0.follow_refs.unwrap_or(false)
-                && let Ok(ref mut text_result) = r
-            {
-                let limit = params.0.follow_refs_limit.unwrap_or(3) as usize;
-                enrich_with_callers(&guard, text_result, limit);
+            match crate::index_lifecycle::guidance::search::execute_text_search(
+                &generation,
+                &params.0,
+            ) {
+                Ok(execution) => execution,
+                Err(message) => return message,
             }
-            r
         };
-        apply_path_predicate_filter(
-            &mut result,
-            params.0.include_vendor.unwrap_or(false),
-            params.0.include_personal_tooling.unwrap_or(false),
-        );
-
-        // Auto-correct double-escaped regex patterns: if regex=true and the
-        // result is InvalidRegex or Ok-but-empty, try fixing common
-        // double-escaped character classes (\\s → \s, \\d → \d, etc.).
-        if is_regex {
-            let should_retry = match &result {
-                Err(search::TextSearchError::InvalidRegex { .. }) => true,
-                Ok(r) if r.files.is_empty() => true,
-                _ => false,
-            };
-            if should_retry
-                && let Some(ref query) = original_query
-                && let Some(fixed) = fix_common_double_escapes(query)
-            {
-                let mut retry_result = {
-                    let guard = Arc::clone(&generation.live);
-                    loading_guard!(guard);
-                    let mut r = search::search_text_with_options(
-                        &guard,
-                        Some(fixed.as_str()),
-                        params.0.terms.as_deref(),
-                        true,
-                        &options,
-                    );
-                    resolve_text_search_enclosing_symbols(&guard, &mut r);
-                    if params.0.follow_refs.unwrap_or(false)
-                        && let Ok(ref mut text_result) = r
-                    {
-                        let limit = params.0.follow_refs_limit.unwrap_or(3) as usize;
-                        enrich_with_callers(&guard, text_result, limit);
-                    }
-                    r
-                };
-                apply_path_predicate_filter(
-                    &mut retry_result,
-                    params.0.include_vendor.unwrap_or(false),
-                    params.0.include_personal_tooling.unwrap_or(false),
-                );
-                // Use the retry result if it actually produced matches
-                if let Ok(ref retry_ok) = retry_result
-                    && !retry_ok.files.is_empty()
-                {
-                    let mut output = render_search_text_output(
-                        self,
-                        &generation,
-                        retry_result,
-                        Some(fixed.as_str()),
-                        false,
-                        params.0.group_by.as_deref(),
-                        params.0.terms.as_deref(),
-                        &options,
-                        true,
-                        auto_detected_regex,
-                        true,
-                    );
-                    output.push_str(&format!(
-                        "\n(auto-corrected double-escaped regex: `{}` → `{}`)",
-                        query, fixed
-                    ));
-                    self.session_context.record_summary_output(
-                        "search_text",
-                        (output.len() / 4).min(u32::MAX as usize) as u32,
-                    );
-                    return self.apply_ccr_budget(
-                        "search_text",
-                        with_withheld_note(
-                            &generation.live,
-                            params.0.path_prefix.as_deref(),
-                            output,
-                        ),
-                        params.0.max_tokens,
-                    );
-                }
-            }
-        }
-
-        let compaction_query =
-            search_text_compaction_query(params.0.query.as_deref(), params.0.terms.as_deref());
-        maybe_compact_text_search_result(&mut result, &compaction_query);
-        let output = render_search_text_output(
+        let mut output = render_search_text_output(
             self,
             &generation,
-            result,
-            params.0.query.as_deref(),
-            false,
+            execution.result,
+            execution.effective_query.as_deref(),
+            execution.structural,
             params.0.group_by.as_deref(),
             params.0.terms.as_deref(),
-            &options,
-            is_regex,
-            auto_detected_regex,
-            false,
+            &execution.options,
+            execution.is_regex,
+            execution.auto_detected_regex,
+            execution.auto_corrected_regex,
         );
-        let result = output;
+        if execution.auto_corrected_regex {
+            output.push_str(&format!(
+                "\n(auto-corrected double-escaped regex: `{}` → `{}`)",
+                params.0.query.as_deref().unwrap_or_default(),
+                execution.effective_query.as_deref().unwrap_or_default()
+            ));
+        }
         self.session_context.record_summary_output(
             "search_text",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            (output.len() / 4).min(u32::MAX as usize) as u32,
         );
-        // Intentionally NO frecency bump here — search_text is a discovery
-        // tool. Bumping on discovery would create a positive feedback loop
-        // (hot files get searched more, which would bump them more, which
-        // would rank them higher still). See wiki `[[SymForge Frecency-
-        // Weighted File Ranking]]` §"Search tools deliberately do NOT bump".
-        let result = with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), result);
-        self.apply_ccr_budget("search_text", result, params.0.max_tokens)
+        // Discovery stays neutral: only loaded context and mutations record frecency.
+        self.apply_ccr_budget(
+            "search_text",
+            with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), output),
+            params.0.max_tokens,
+        )
     }
 
     /// Internal: trace_symbol logic, called by get_symbol_context when sections are provided.
@@ -6538,22 +4767,10 @@ impl SymForgeServer {
             if params.0.query.is_empty() {
                 return "search_files with resolve=true requires a non-empty `query`.".to_string();
             }
-            let view = {
+            let (view, hidden_noise_count) = {
                 let guard = Arc::clone(&generation.live);
                 loading_guard!(guard);
-                guard.capture_search_files_resolve_view_with_noise(
-                    &params.0.query,
-                    include_vendor,
-                    include_personal_tooling,
-                )
-            };
-            let hidden_noise_count = if include_vendor && include_personal_tooling {
-                0
-            } else {
-                let guard = Arc::clone(&generation.live);
-                let unfiltered = guard.capture_search_files_resolve_view(&params.0.query);
-                search_files_resolve_candidate_count(&unfiltered)
-                    .saturating_sub(search_files_resolve_candidate_count(&view))
+                crate::index_lifecycle::guidance::file_search::resolve_files(&guard, &params.0)
             };
             let envelope = match &view {
                 SearchFilesResolveView::Resolved { path } => {
@@ -6671,28 +4888,7 @@ impl SymForgeServer {
             }
             let commit_count = temporal.stats.total_commits_analyzed;
             if let Some(history) = temporal.files.get(target_path.as_str()) {
-                let hits: Vec<SearchFilesHit> = history
-                    .co_changes
-                    .iter()
-                    .map(|entry| SearchFilesHit {
-                        tier: SearchFilesTier::CoChange,
-                        path: entry.path.clone(),
-                        coupling_score: Some(entry.coupling_score),
-                        shared_commits: Some(entry.shared_commits),
-                        metadata_reason: None,
-                    })
-                    .collect();
-                let weak_hits: Vec<SearchFilesHit> = history
-                    .weak_co_changes
-                    .iter()
-                    .map(|entry| SearchFilesHit {
-                        tier: SearchFilesTier::CoChange,
-                        path: entry.path.clone(),
-                        coupling_score: Some(entry.coupling_score),
-                        shared_commits: Some(entry.shared_commits),
-                        metadata_reason: None,
-                    })
-                    .collect();
+                let (hits, weak_hits) = crate::index_lifecycle::guidance::file_search::changed_rows(history);
                 if hits.is_empty() {
                     if !weak_hits.is_empty() {
                         let total = weak_hits.len();
@@ -6800,221 +4996,20 @@ impl SymForgeServer {
 
         let rank_by_path_cochange = params.0.rank_by.as_deref() == Some("path+cochange");
         let rank_by_frecency = params.0.rank_by.as_deref() == Some("frecency");
-        let ranking_diagnostics = search_files_debug_ranking_requested(&params.0);
-        let debug_ranking = ranking_diagnostics.explain;
-        let mut cochange_evidence: Option<CapabilityEvidence> = None;
-        let mut frecency_evidence: Option<CapabilityEvidence> = None;
-        let mut hidden_noise_count = 0usize;
-        let cochange_repo_root = if rank_by_path_cochange {
-            self.capture_repo_root()
-        } else {
-            None
-        };
-        let cochange_project_state = rank_by_path_cochange
-            .then(|| self.capture_project_state_dir())
-            .flatten();
-        let mut view = {
+        let ranked = {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
-            let cochange_resolution = if rank_by_path_cochange {
-                match params.0.anchor_path.as_deref() {
-                    Some(anchor_path) => Some(search_files_coupling_neighbors(
-                        &guard,
-                        cochange_repo_root.as_deref(),
-                        cochange_project_state.as_ref(),
-                        anchor_path,
-                    )),
-                    None => Some(SearchFilesCoChangeResolution {
-                        neighbors: None,
-                        evidence: cochange_ranking_evidence(
-                            CapabilityStatus::FallbackUsed,
-                            CapabilityFreshness::Unknown,
-                            CapabilityCost::Free,
-                            "`rank_by=\"path+cochange\"` requires `anchor_path=<path>`; path ranking returned",
-                        ),
-                    }),
-                }
-            } else {
-                None
-            };
-            if let Some(resolution) = &cochange_resolution {
-                cochange_evidence = Some(resolution.evidence.clone());
-            }
-            let coupling_neighbors = cochange_resolution
-                .as_ref()
-                .and_then(|resolution| resolution.neighbors.as_ref());
-            let coupling_context = params.0.anchor_path.as_deref().zip(coupling_neighbors);
-            // Optional path-prefix scoping, mirroring the `path_scope` axis of
-            // search_symbols/search_text: the scope is applied inside the capture
-            // (pre-count predicate), so total_matches/overflow_count/hits are all
-            // consistently scoped — including the overflow set, not just the
-            // visible hits.
-            let path_scope = normalize_path_prefix(params.0.path_prefix.as_deref());
-            let view = guard.capture_search_files_view_with_noise(
-                &params.0.query,
-                params.0.limit.unwrap_or(20) as usize,
-                params.0.current_file.as_deref(),
-                coupling_context,
-                include_vendor,
-                include_personal_tooling,
-                &path_scope,
-            );
-            if !(include_vendor && include_personal_tooling) {
-                // Same path_scope so hidden_noise_count compares like-for-like
-                // (noise hidden WITHIN the requested prefix, not repo-wide).
-                let unfiltered = guard.capture_search_files_view_with_noise(
-                    &params.0.query,
-                    params.0.limit.unwrap_or(20) as usize,
-                    params.0.current_file.as_deref(),
-                    coupling_context,
-                    true,
-                    true,
-                    &path_scope,
-                );
-                hidden_noise_count = search_files_total_matches(&unfiltered)
-                    .saturating_sub(search_files_total_matches(&view));
-            }
-            if rank_by_path_cochange && let Some((anchor_path, neighbors)) = coupling_context {
-                let applied_hits = match &view {
-                    SearchFilesView::Found { hits, .. } => hits
-                        .iter()
-                        .filter(|hit| hit.tier == SearchFilesTier::CoChange)
-                        .count(),
-                    _ => 0,
-                };
-                cochange_evidence = if applied_hits > 0 {
-                    Some(cochange_ranking_evidence(
-                        CapabilityStatus::Applied,
-                        CapabilityFreshness::Current,
-                        CapabilityCost::Low,
-                        format!(
-                            "anchor_path={anchor_path} loaded {} usable coupling partner(s); rows with shared-commit counts show applied evidence",
-                            neighbors.len()
-                        ),
-                    ))
-                } else {
-                    let candidate_paths: Vec<&str> = match &view {
-                        SearchFilesView::Found { hits, .. } => {
-                            hits.iter().map(|hit| hit.path.as_str()).collect()
-                        }
-                        _ => Vec::new(),
-                    };
-                    Some(cochange_ranking_evidence(
-                        CapabilityStatus::FallbackUsed,
-                        CapabilityFreshness::Current,
-                        CapabilityCost::Low,
-                        cochange_fallback_detail(
-                            &params.0.query,
-                            anchor_path,
-                            neighbors,
-                            &candidate_paths,
-                        ),
-                    ))
-                };
-            }
-            view
+            crate::index_lifecycle::guidance::file_search::rank_files(
+                &generation, self.capture_repo_root().as_deref(),
+                self.capture_project_state_dir().as_ref(), &params.0, true,
+            )
         };
-        // Optional frecency-fusion rerank. Activated when the caller requests
-        // `rank_by="frecency"`, independent of the old persistent-collection
-        // feature flag. Discovery still never opens a writeable frecency store:
-        // this branch only reads existing persistent rows and current-process
-        // session rows, then reports explicit evidence for every fallback.
-        if rank_by_frecency {
-            match crate::live_index::frecency::collection_policy_from_env() {
-                crate::capability::FrecencyCollectionPolicy::Disabled => {
-                    frecency_evidence = Some(frecency_ranking_evidence(
-                        CapabilityStatus::DisabledByPolicy,
-                        "operator policy disabled frecency collection and ranking; path ranking returned",
-                    ));
-                }
-                _ => match &mut view {
-                    SearchFilesView::Found { hits, .. } if hits.is_empty() => {
-                        frecency_evidence = Some(frecency_ranking_evidence(
-                            CapabilityStatus::FallbackUsed,
-                            "no returned candidates to score; path ranking returned",
-                        ));
-                    }
-                    SearchFilesView::Found { hits, .. } => {
-                        if let Some(repo_root) = self.capture_repo_root() {
-                            let project_state = self.capture_project_state_dir();
-                            let candidate_count = hits.len();
-                            let hit_paths: Vec<std::path::PathBuf> = hits
-                                .iter()
-                                .map(|hit| std::path::PathBuf::from(&hit.path))
-                                .collect();
-                            let path_refs: Vec<&std::path::Path> =
-                                hit_paths.iter().map(|path| path.as_path()).collect();
-                            let now_ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|duration| duration.as_secs() as i64)
-                                .unwrap_or(0);
-                            match crate::live_index::frecency::ranking_scores_for_paths(
-                                &repo_root,
-                                project_state.as_ref(),
-                                &path_refs,
-                                now_ts,
-                            ) {
-                                Ok(Some(snapshot)) if !snapshot.scores.is_empty() => {
-                                    let scored_count = snapshot.scores.len();
-                                    let breakdowns =
-                                        crate::live_index::search::score_hits_by_frecency_fusion(
-                                            hits,
-                                            &snapshot.scores,
-                                        );
-                                    let taken = std::mem::take(hits);
-                                    *hits =
-                                        crate::live_index::search::reorder_hits_by_frecency_fusion(
-                                            taken,
-                                            &breakdowns,
-                                        );
-                                    frecency_evidence = Some(frecency_ranking_evidence(
-                                        CapabilityStatus::Applied,
-                                        format!(
-                                            "{scored_count}/{candidate_count} returned candidates had frecency scores from {}; requested frecency ranking applied",
-                                            snapshot.source
-                                        ),
-                                    ));
-                                }
-                                Ok(Some(snapshot)) => {
-                                    frecency_evidence = Some(frecency_ranking_evidence(
-                                        CapabilityStatus::FallbackUsed,
-                                        format!(
-                                            "{} is empty or has no scores for returned candidates; path ranking returned",
-                                            snapshot.source
-                                        ),
-                                    ));
-                                }
-                                Ok(None) => {
-                                    frecency_evidence = Some(frecency_ranking_evidence(
-                                        CapabilityStatus::FallbackUsed,
-                                        "no frecency history found; path ranking returned",
-                                    ));
-                                }
-                                Err(reason) => {
-                                    frecency_evidence = Some(frecency_ranking_evidence(
-                                        CapabilityStatus::Unavailable,
-                                        format!(
-                                            "unable to read frecency history: {reason}; path ranking returned"
-                                        ),
-                                    ));
-                                }
-                            }
-                        } else {
-                            frecency_evidence = Some(frecency_ranking_evidence(
-                                CapabilityStatus::Unavailable,
-                                "no repository root is bound; path ranking returned",
-                            ));
-                        }
-                    }
-                    _ => {
-                        frecency_evidence = Some(frecency_ranking_evidence(
-                            CapabilityStatus::FallbackUsed,
-                            "no returned candidates to score; path ranking returned",
-                        ));
-                    }
-                },
-            }
-        }
+        let view = ranked.view;
+        let hidden_noise_count = ranked.hidden_noise_count;
+        let cochange_evidence = ranked.cochange_evidence;
+        let frecency_evidence = ranked.frecency_evidence;
+        let ranking_diagnostics = ranked.ranking_diagnostics;
+        let debug_ranking = ranking_diagnostics.explain;
         let envelope = match &view {
             SearchFilesView::Found {
                 hits,
@@ -9978,455 +7973,6 @@ impl SymForgeServer {
         format::enforce_token_budget(output, params.0.max_tokens)
     }
 
-    /// Extract query terms that aren't part of the matched concept key,
-    /// filtering out stopwords and short words.
-    fn compute_remainder_terms(query: &str, concept_key: &str) -> Vec<String> {
-        const STOPWORDS: &[&str] = &[
-            "a", "an", "the", "in", "on", "of", "for", "to", "and", "or", "is", "it", "my", "at",
-            "by", "do", "no", "so", "up", "if", "with", "from", "this", "that",
-        ];
-        let key_words: Vec<&str> = concept_key.split_whitespace().collect();
-        query
-            .split_whitespace()
-            .filter(|w| {
-                let lower = w.to_ascii_lowercase();
-                !key_words.iter().any(|kw| kw.eq_ignore_ascii_case(w))
-                    && !STOPWORDS.contains(&lower.as_str())
-                    && lower.len() >= 3
-            })
-            .map(|w| w.to_ascii_lowercase())
-            .collect()
-    }
-
-    fn explore_symbol_segments(name: &str) -> Vec<String> {
-        let mut segments = Vec::new();
-        let mut current = String::new();
-        for ch in name.chars() {
-            let is_separator =
-                !ch.is_alphanumeric() || matches!(ch, '_' | ':' | '-' | '/' | '\\' | '.');
-            if is_separator {
-                if !current.is_empty() {
-                    segments.push(current.to_ascii_lowercase());
-                    current.clear();
-                }
-                continue;
-            }
-
-            let split_before = ch.is_uppercase()
-                && !current.is_empty()
-                && current
-                    .chars()
-                    .last()
-                    .is_some_and(|prev| prev.is_lowercase() || prev.is_ascii_digit());
-            if split_before {
-                segments.push(current.to_ascii_lowercase());
-                current.clear();
-            }
-            current.push(ch);
-        }
-        if !current.is_empty() {
-            segments.push(current.to_ascii_lowercase());
-        }
-
-        segments
-    }
-
-    fn explore_fallback_symbol_match(name: &str, term: &str) -> bool {
-        if name.eq_ignore_ascii_case(term) {
-            return true;
-        }
-
-        let segments = Self::explore_symbol_segments(name);
-        segments.iter().any(|segment| segment == term)
-    }
-
-    fn explore_terms_related(lhs: &str, rhs: &str) -> bool {
-        if lhs.eq_ignore_ascii_case(rhs) {
-            return true;
-        }
-
-        let lhs = lhs.to_ascii_lowercase();
-        let rhs = rhs.to_ascii_lowercase();
-        let shared_prefix = lhs
-            .chars()
-            .zip(rhs.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-        shared_prefix >= 5
-    }
-
-    fn record_explore_file_signal(
-        file_signals: &mut HashMap<String, ExploreFileSignal>,
-        path: &str,
-        term: &str,
-        weight: u64,
-    ) {
-        let signal = file_signals.entry(path.to_string()).or_default();
-        signal.raw_score += weight;
-        signal.matched_terms.insert(term.to_string());
-    }
-
-    fn derive_explore_cluster(
-        index: &crate::live_index::LiveIndex,
-        query_terms: &[String],
-        file_signals: &HashMap<String, ExploreFileSignal>,
-        limit: usize,
-    ) -> Option<DerivedExploreCluster> {
-        const GENERIC_SYMBOLS: &[&str] = &[
-            "build", "create", "error", "get", "handle", "init", "main", "new", "parse", "process",
-            "result", "run", "set", "test", "update",
-        ];
-
-        if query_terms.len() < 2 {
-            return None;
-        }
-
-        let mut ranked_files: Vec<(String, u64, usize)> = file_signals
-            .iter()
-            .filter_map(|(path, signal)| {
-                let file = index.get_file(path)?;
-                let coverage = signal.matched_terms.len();
-                if coverage < 2 {
-                    return None;
-                }
-                let path_penalty = explore_path_penalty(path, Some(&file.classification));
-                let score = (signal.raw_score + ((coverage as u64) * (coverage as u64) * 10))
-                    * path_penalty;
-                Some((path.clone(), score, coverage))
-            })
-            .collect();
-        ranked_files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked_files.truncate(limit.clamp(1, 3));
-        if ranked_files.is_empty() {
-            return None;
-        }
-
-        let mut candidate_scores: HashMap<String, u64> = HashMap::new();
-        for (path, file_score, coverage) in &ranked_files {
-            let Some(file) = index.get_file(path) else {
-                continue;
-            };
-
-            for symbol in &file.symbols {
-                let lower = symbol.name.to_ascii_lowercase();
-                if lower.len() < 4 || GENERIC_SYMBOLS.contains(&lower.as_str()) {
-                    continue;
-                }
-
-                let segments = Self::explore_symbol_segments(&symbol.name);
-                let overlap = query_terms
-                    .iter()
-                    .filter(|term| {
-                        segments
-                            .iter()
-                            .any(|segment| Self::explore_terms_related(segment, term))
-                    })
-                    .count();
-                if overlap == 0 {
-                    continue;
-                }
-
-                let kind_bonus = match symbol.kind.to_string().as_str() {
-                    "struct" | "class" | "trait" | "interface" | "enum" => 5,
-                    "fn" | "method" => 4,
-                    "impl" | "mod" | "module" => 3,
-                    _ => 1,
-                } as u64;
-                let reverse_hits = index
-                    .reverse_index
-                    .get(&symbol.name)
-                    .map(|hits| hits.len())
-                    .unwrap_or(0);
-                let rarity_bonus = match reverse_hits {
-                    0 => 8,
-                    1..=2 => 6,
-                    3..=5 => 4,
-                    6..=10 => 2,
-                    _ => 1,
-                } as u64;
-                let length_bonus = (symbol.name.len().min(24) / 6) as u64;
-                let score = *file_score
-                    + ((*coverage as u64) * 5)
-                    + ((overlap as u64) * 12)
-                    + kind_bonus
-                    + rarity_bonus
-                    + length_bonus;
-
-                let entry = candidate_scores.entry(symbol.name.clone()).or_insert(0);
-                if score > *entry {
-                    *entry = score;
-                }
-            }
-        }
-
-        let mut ranked_symbols: Vec<(String, u64)> = candidate_scores.into_iter().collect();
-        ranked_symbols.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let promoted_symbols: Vec<String> = ranked_symbols
-            .into_iter()
-            .take(limit.clamp(1, 4))
-            .map(|(name, _)| name)
-            .collect();
-        if promoted_symbols.is_empty() {
-            return None;
-        }
-
-        Some(DerivedExploreCluster {
-            seed_terms: query_terms.to_vec(),
-            promoted_symbols,
-            seed_files: ranked_files.into_iter().map(|(path, _, _)| path).collect(),
-        })
-    }
-
-    fn ask_query_tokens(query: &str) -> Vec<String> {
-        let mut tokens = Vec::new();
-        for raw in query.split_whitespace() {
-            let token = raw
-                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
-                .to_string();
-            if token.is_empty() {
-                continue;
-            }
-            if token.len() < 2 {
-                continue;
-            }
-            if tokens
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(&token))
-            {
-                continue;
-            }
-            tokens.push(token);
-        }
-        tokens
-    }
-
-    fn ask_symbol_candidate_tokens(query: &str) -> Vec<String> {
-        Self::ask_query_tokens(query)
-            .into_iter()
-            .filter(|token| {
-                let is_symbol_like = token.contains('_')
-                    || token.contains("::")
-                    || token.chars().skip(1).any(|c| c.is_uppercase());
-                is_symbol_like && token.len() >= 4
-            })
-            .collect()
-    }
-
-    fn extract_exact_symbol_understanding_candidate(
-        index: &crate::live_index::LiveIndex,
-        query: &str,
-    ) -> Option<String> {
-        const GENERIC_SYMBOLS: &[&str] = &[
-            "build", "create", "get", "handle", "init", "main", "new", "parse", "process", "run",
-            "set", "test", "update",
-        ];
-
-        /// Score a single (path, symbol) match for prominence. Higher = more canonical.
-        fn score_match(path: &str, line_start: u32, line_end: u32) -> i32 {
-            let mut score = 0i32;
-            if path.starts_with("src/") || path.contains("/src/") {
-                score += 10;
-            }
-            let lower = path.to_ascii_lowercase();
-            if !lower.contains("test")
-                && !lower.contains("vendor")
-                && !lower.contains("example")
-                && !lower.contains("bench")
-            {
-                score += 5;
-            }
-            let span = line_end.saturating_sub(line_start);
-            score += ((span / 10) as i32).min(10);
-            score
-        }
-
-        /// Search `index` for an exact (case-insensitive) match for `token`.
-        /// Returns `Some((canonical_name, best_score))` when 1-5 matches are found.
-        fn find_token(index: &crate::live_index::LiveIndex, token: &str) -> Option<(String, i32)> {
-            let mut matches: Vec<(String, i32)> = Vec::new(); // (canonical_name, score)
-            for (path, file) in index.all_files() {
-                for symbol in &file.symbols {
-                    if symbol.name.eq_ignore_ascii_case(token) {
-                        let s =
-                            score_match(path.as_str(), symbol.line_range.0, symbol.line_range.1);
-                        matches.push((symbol.name.clone(), s));
-                    }
-                }
-            }
-            if matches.is_empty() || matches.len() > 5 {
-                return None;
-            }
-            // Pick the match with the highest score; stable (first wins on tie).
-            let best = matches
-                .into_iter()
-                .max_by_key(|(_, score)| *score)
-                .expect("non-empty; guarded by is_empty check above");
-            Some(best)
-        }
-
-        // Collect (canonical_name, score) for each qualifying token.
-        let mut candidates: Vec<(String, i32)> = Vec::new();
-        let tokens = Self::ask_symbol_candidate_tokens(query);
-        for token in &tokens {
-            if GENERIC_SYMBOLS.contains(&token.to_ascii_lowercase().as_str()) {
-                continue;
-            }
-            if let Some(hit) = find_token(index, token) {
-                candidates.push(hit);
-            }
-        }
-
-        // Compound token joining: try "token_a_token_b" for adjacent pairs when
-        // no single-token candidate was found yet.
-        if candidates.is_empty() && tokens.len() >= 2 {
-            for window in tokens.windows(2) {
-                let joined = format!("{}_{}", window[0], window[1]);
-                if GENERIC_SYMBOLS.contains(&joined.to_ascii_lowercase().as_str()) {
-                    continue;
-                }
-                if let Some(hit) = find_token(index, &joined) {
-                    candidates.push(hit);
-                }
-            }
-        }
-
-        if candidates.is_empty() {
-            return None;
-        }
-
-        // Deduplicate by canonical name, keeping the entry with the highest score.
-        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        candidates.dedup_by(|later, first| {
-            // `dedup_by` drops `later` when true is returned.  The sort above orders ascending
-            // by name, then descending by score within each name group, so `first` always holds
-            // the highest score for a given name — exactly the entry we want to keep.
-            later.0.eq_ignore_ascii_case(&first.0)
-        });
-
-        // Two or more DISTINCT symbols resolved (e.g. "how does X interact with Y").
-        // The question is about a relationship, not a single definition — fall through
-        // to Understand → explore rather than picking the highest-scoring subject.
-        if candidates.len() >= 2 {
-            return None;
-        }
-
-        // Pick the single candidate with the highest prominence score.
-        candidates
-            .into_iter()
-            .max_by_key(|(_, score)| *score)
-            .map(|(name, _)| name)
-    }
-
-    fn extract_exact_implementation_understanding_candidate(
-        index: &crate::live_index::LiveIndex,
-        query: &str,
-    ) -> Option<String> {
-        const IMPLEMENTATION_CUES: &[&str] = &[
-            "type",
-            "types",
-            "implementation",
-            "implementations",
-            "implementor",
-            "implementors",
-            "implementer",
-            "implementers",
-            "implements",
-        ];
-        const GENERIC_QUERY_WORDS: &[&str] = &[
-            "a",
-            "all",
-            "an",
-            "and",
-            "are",
-            "describe",
-            "does",
-            "explain",
-            "help",
-            "how",
-            "main",
-            "me",
-            "of",
-            "the",
-            "through",
-            "tell",
-            "type",
-            "types",
-            "understand",
-            "walk",
-            "what",
-            "work",
-        ];
-        let tokens = Self::ask_query_tokens(query);
-        if !tokens.iter().any(|token| {
-            IMPLEMENTATION_CUES
-                .iter()
-                .any(|cue| token.eq_ignore_ascii_case(cue))
-        }) {
-            return None;
-        }
-
-        let mut candidates = Vec::new();
-        for token in tokens {
-            let lower = token.to_ascii_lowercase();
-            if GENERIC_QUERY_WORDS.contains(&lower.as_str()) {
-                continue;
-            }
-
-            if let Some(candidate) = Self::exact_trait_like_symbol_candidate(index, &token) {
-                candidates.push(candidate);
-                continue;
-            }
-
-            if lower.ends_with('s') && lower.len() > 4 {
-                let singular = &token[..token.len() - 1];
-                if let Some(candidate) = Self::exact_trait_like_symbol_candidate(index, singular) {
-                    candidates.push(candidate);
-                }
-            }
-        }
-
-        candidates.sort();
-        candidates.dedup();
-        if candidates.len() == 1 {
-            candidates.into_iter().next()
-        } else {
-            None
-        }
-    }
-
-    fn exact_trait_like_symbol_candidate(
-        index: &crate::live_index::LiveIndex,
-        token: &str,
-    ) -> Option<String> {
-        let mut exact_match_count = 0usize;
-        let mut canonical_name: Option<String> = None;
-        for (_path, file) in index.all_files() {
-            for symbol in &file.symbols {
-                if !symbol.name.eq_ignore_ascii_case(token) {
-                    continue;
-                }
-                if !matches!(
-                    symbol.kind,
-                    crate::domain::index::SymbolKind::Trait
-                        | crate::domain::index::SymbolKind::Interface
-                        | crate::domain::index::SymbolKind::Type
-                ) {
-                    continue;
-                }
-                exact_match_count += 1;
-                if canonical_name.is_none() {
-                    canonical_name = Some(symbol.name.clone());
-                }
-            }
-        }
-
-        if exact_match_count == 1 {
-            canonical_name
-        } else {
-            None
-        }
-    }
-
     /// Start here when you don't know where to look. Accepts a natural-language concept
     /// and returns related symbols, patterns, and files. Set depth=2 for signatures and
     /// callers of top symbols (~1500 tokens). Set depth=3 for implementations and type
@@ -10471,645 +8017,42 @@ impl SymForgeServer {
             Ok(f) => f,
             Err(e) => return e,
         };
-        let limit = params.0.limit.unwrap_or(10) as usize;
-        let include_noise = params.0.include_noise.unwrap_or(false);
-        let include_vendor = params.0.include_vendor.unwrap_or(false);
-        let include_personal_tooling = params.0.include_personal_tooling.unwrap_or(false);
-        // B1 additive: vendor surfaces when include_noise OR include_vendor is true;
-        // personal-tooling surfaces when include_noise OR include_personal_tooling.
-        let suppress_vendor = !(include_noise || include_vendor);
-        let suppress_personal = !(include_noise || include_personal_tooling);
-        let suppress_other_noise = !include_noise;
-        let any_suppression = suppress_vendor || suppress_personal || suppress_other_noise;
         let guard = self.index.data_plane().read();
         *served = Some(Arc::clone(&guard));
         loading_guard!(guard);
-
-        let concept = super::explore::match_concept(&params.0.query);
-
-        // A single-word concept that matched ONLY via the stemmed fallback is a
-        // weak signal: the query never named the concept verbatim. When the query
-        // also carries specific terms (computed below) the header should let those
-        // terms lead and demote such a concept to a parenthetical hint, rather than
-        // collapsing the topic to a label the user did not type. Exact matches and
-        // multi-word concept keys keep leading the header.
-        let demote_stem_only_concept = matches!(
-            concept,
-            Some((key, _, super::explore::ConceptMatchKind::Stemmed))
-                if key.split_whitespace().count() == 1
-        );
-
-        let mut enriched_imports: Vec<String> = Vec::new();
-        let (label, symbol_queries, text_queries, remainder_terms) = if let Some((key, c, _)) =
-            concept
-        {
-            let remainder = Self::compute_remainder_terms(&params.0.query, key);
-            let mut sym_q: Vec<String> = c.symbol_queries.iter().map(|s| s.to_string()).collect();
-            // Convention-aware enrichment: add project-specific imports related to the concept.
-            let project_imports =
-                crate::protocol::conventions::extract_top_import_roots(&guard, 100);
-            let enrichment = super::explore::enrich_concept_with_imports(c, &project_imports);
-            enriched_imports = enrichment;
-            sym_q.extend(enriched_imports.iter().cloned());
-            (
-                c.label.to_string(),
-                sym_q,
-                c.text_queries
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>(),
-                remainder,
-            )
-        } else {
-            let terms = super::explore::fallback_terms(&params.0.query);
-            if terms.is_empty() {
-                return "Explore requires a non-empty query.".to_string();
-            }
-            (
-                format!("'{}'", params.0.query),
-                terms.clone(),
-                terms,
-                vec![],
-            )
+        let request = crate::index_lifecycle::guidance::exploration::ExploreRequest {
+            query: params.0.query.clone(),
+            limit: params.0.limit.unwrap_or(10) as usize,
+            depth: params.0.depth,
+            include_noise: params.0.include_noise.unwrap_or(false),
+            include_vendor: params.0.include_vendor.unwrap_or(false),
+            include_personal_tooling: params.0.include_personal_tooling.unwrap_or(false),
+            language: lang_filter,
+            path_prefix: params.0.path_prefix.clone(),
         };
-
-        // Phase 1: Symbol search — over-fetch and track both match counts and
-        // query-term coverage per symbol so multi-term hits outrank one-term noise.
-        let mut match_scores: HashMap<(String, String, String), ExploreMatchScore> = HashMap::new();
-        let mut file_signals: HashMap<String, ExploreFileSignal> = HashMap::new();
-
-        // Phase 0: Module-path boosting — symbols from files whose path segment
-        // matches a query term get a weight boost. +2 for exact segment match,
-        // +1 for substring segment match. Per-directory cap of `limit` symbols.
-        // For concept+remainder queries, boost on remainder terms only so path-scoping
-        // is driven by the narrowing terms (e.g., "watcher" in "error handling in the watcher").
-        let boost_terms = if remainder_terms.is_empty() {
-            symbol_queries.clone()
-        } else {
-            remainder_terms.clone()
+        let result = match crate::index_lifecycle::guidance::exploration::explore(
+            &guard,
+            &request,
+            &mut || true,
+        ) {
+            Ok(result) => result,
+            Err(_) => return "Explore requires a non-empty query.".to_string(),
         };
-        for term in &boost_terms {
-            let term_lower = term.to_ascii_lowercase();
-            for (file_path, file) in guard.all_files() {
-                if explore_should_skip_path_boost(
-                    file_path,
-                    &file.classification,
-                    include_noise,
-                    include_vendor,
-                    include_personal_tooling,
-                ) {
-                    continue;
-                }
-                let segments: Vec<&str> = file_path.split(&['/', '\\'][..]).collect();
-                let best_match = segments
-                    .iter()
-                    .filter_map(|seg| {
-                        let seg_lower = seg.to_ascii_lowercase();
-                        let seg_stem = seg_lower
-                            .strip_suffix(".rs")
-                            .or_else(|| seg_lower.strip_suffix(".py"))
-                            .or_else(|| seg_lower.strip_suffix(".ts"))
-                            .or_else(|| seg_lower.strip_suffix(".js"))
-                            .or_else(|| seg_lower.strip_suffix(".go"))
-                            .unwrap_or(&seg_lower);
-                        if seg_stem == term_lower {
-                            Some(2usize)
-                        } else if seg_stem.contains(&*term_lower) {
-                            Some(1usize)
-                        } else {
-                            None
-                        }
-                    })
-                    .max();
-                if let Some(weight) = best_match {
-                    Self::record_explore_file_signal(
-                        &mut file_signals,
-                        file_path,
-                        &term_lower,
-                        weight as u64,
-                    );
-                    for (injected, sym) in file.symbols.iter().enumerate() {
-                        if injected >= limit {
-                            break;
-                        }
-                        let entry = (sym.name.clone(), sym.kind.to_string(), file_path.clone());
-                        let score = match_scores.entry(entry).or_default();
-                        if score.raw_count == 0 {
-                            // Cap path-boost: only seed symbols that have no prior
-                            // matches. This prevents path-matching files from
-                            // dominating over content-matching files.
-                            score.raw_count = weight.min(1);
-                        }
-                        score.matched_terms.insert(term_lower.clone());
-                    }
-                }
-            }
-        }
-
-        // Merge remainder terms into symbol/text queries for Phases 1-2 so that compound
-        // queries like "error handling in the watcher" search concept queries AND "watcher".
-        let mut all_symbol_queries = symbol_queries.clone();
-        all_symbol_queries.extend(remainder_terms.iter().cloned());
-        let mut all_text_queries = text_queries.clone();
-        all_text_queries.extend(remainder_terms.iter().cloned());
-
-        // Lowercased remainder terms drive "specific term" detection below: a
-        // remainder noun that matches an indexed symbol name (e.g. "admission"
-        // -> AdmissionTier) must never be outranked by the concept bucket's
-        // generic symbol_queries (e.g. "index"), and it should keep the topic
-        // visible in the header instead of collapsing it to the concept label.
-        let remainder_term_keys: HashSet<String> = remainder_terms
-            .iter()
-            .map(|t| t.to_ascii_lowercase())
-            .collect();
-        // Remainder terms that actually resolve to an indexed symbol name via
-        // search_symbols' substring semantics. Populated during the symbol
-        // search loop so we don't pay for a second index pass.
-        let mut specific_terms: HashSet<String> = HashSet::new();
-
-        let fallback_mode = concept.is_none();
-        for sq in &all_symbol_queries {
-            let term_key = sq.to_ascii_lowercase();
-            let result = search::search_symbols(&guard, sq, None, limit * 3);
-            let is_remainder_term = remainder_term_keys.contains(&term_key);
-            let mut seen_paths = HashSet::new();
-            for hit in &result.hits {
-                if fallback_mode && !Self::explore_fallback_symbol_match(&hit.name, &term_key) {
-                    continue;
-                }
-                // A remainder noun that lands on a real symbol name is a
-                // load-bearing query term, not generic concept noise.
-                if !fallback_mode && is_remainder_term {
-                    specific_terms.insert(term_key.clone());
-                }
-                let entry = (hit.name.clone(), hit.kind.clone(), hit.path.clone());
-                let score = match_scores.entry(entry).or_default();
-                score.raw_count += 1;
-                score.matched_terms.insert(term_key.clone());
-                if seen_paths.insert(hit.path.clone()) {
-                    Self::record_explore_file_signal(&mut file_signals, &hit.path, &term_key, 2);
-                }
-            }
-        }
-
-        // Filter Phase 1 results by language and path_prefix
-        if lang_filter.is_some() || params.0.path_prefix.is_some() {
-            match_scores.retain(|(_, _, path), _| {
-                if let Some(ref prefix) = params.0.path_prefix
-                    && !path.starts_with(prefix.as_str())
-                {
-                    return false;
-                }
-                if let Some(ref lang) = lang_filter {
-                    let ext = path.rsplit('.').next().unwrap_or("");
-                    if crate::domain::index::LanguageId::from_extension(ext).as_ref() != Some(lang)
-                    {
-                        return false;
-                    }
-                }
-                true
-            });
-            file_signals.retain(|path, _| {
-                if let Some(ref prefix) = params.0.path_prefix
-                    && !path.starts_with(prefix.as_str())
-                {
-                    return false;
-                }
-                if let Some(ref lang) = lang_filter {
-                    let ext = path.rsplit('.').next().unwrap_or("");
-                    if crate::domain::index::LanguageId::from_extension(ext).as_ref() != Some(lang)
-                    {
-                        return false;
-                    }
-                }
-                true
-            });
-        }
-
-        if any_suppression {
-            file_signals.retain(|path, _| {
-                let Some(file) = guard.get_file(path) else {
-                    return false;
-                };
-                if suppress_other_noise
-                    && explore_is_test_like_path(path, Some(&file.classification))
-                {
-                    return false;
-                }
-                if suppress_personal && crate::live_index::query::is_personal_tooling_path(path) {
-                    return false;
-                }
-                let class = search::NoisePolicy::classify_path(path, None);
-                match class {
-                    search::NoiseClass::Vendor => !suppress_vendor,
-                    search::NoiseClass::Generated | search::NoiseClass::Ignored => {
-                        !suppress_other_noise
-                    }
-                    search::NoiseClass::None => true,
-                }
-            });
-        }
-
-        // Phase 2: Text search — collect text hits and inject enclosing symbols into match_counts
-        let mut text_hits: Vec<(String, String, usize)> = Vec::new(); // (path, line, line_number)
-        for tq in &all_text_queries {
-            let mut options = search::TextSearchOptions {
-                total_limit: limit.min(50),
-                max_per_file: limit, // need enough matches per file for enclosing symbol extraction
-                ..search::TextSearchOptions::for_current_code_search()
-            };
-            if let Some(ref prefix) = params.0.path_prefix {
-                options.path_scope = search::PathScope::Prefix(prefix.clone());
-            }
-            if let Some(ref lang) = lang_filter {
-                options.language_filter = Some(*lang);
-            }
-            let result = search::search_text_with_options(&guard, Some(tq), None, false, &options);
-            if let Ok(r) = result {
-                let term_key = tq.to_ascii_lowercase();
-                for file in &r.files {
-                    // SF-STRESS-013: require a word-boundary match so a concept
-                    // idiom like `try {` does not score off `Country {`. Filter
-                    // before recording the file signal so coincidental files do
-                    // not register at all.
-                    let boundary_matches: Vec<&search::TextLineMatch> = file
-                        .matches
-                        .iter()
-                        .filter(|m| concept_text_query_matches_on_boundary(&m.line, tq))
-                        .collect();
-                    if boundary_matches.is_empty() {
-                        continue;
-                    }
-                    Self::record_explore_file_signal(&mut file_signals, &file.path, &term_key, 3);
-                    for m in boundary_matches {
-                        if text_hits.len() < limit && !format::is_noise_line(&m.line) {
-                            text_hits.push((file.path.clone(), m.line.clone(), m.line_number));
-                        }
-                        // Inject enclosing symbol into match_counts.
-                        // Weight 2 so content matches outweigh path-only boosts.
-                        if let Some(ref enc) = m.enclosing_symbol {
-                            let entry = (enc.name.clone(), enc.kind.clone(), file.path.clone());
-                            let score = match_scores.entry(entry).or_default();
-                            score.raw_count += 2;
-                            score.matched_terms.insert(term_key.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Filter text hits by path_prefix (language already handled via TextSearchOptions)
-        if let Some(ref prefix) = params.0.path_prefix {
-            text_hits.retain(|(path, _, _)| path.starts_with(prefix.as_str()));
-        }
-
-        let derived_cluster = if fallback_mode {
-            Self::derive_explore_cluster(&guard, &symbol_queries, &file_signals, limit)
-        } else {
-            None
-        };
-
-        if let Some(cluster) = &derived_cluster {
-            for derived_query in &cluster.promoted_symbols {
-                let term_key = derived_query.to_ascii_lowercase();
-                if !all_symbol_queries
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(derived_query))
-                {
-                    let result = search::search_symbols(&guard, derived_query, None, limit * 2);
-                    let mut seen_paths = HashSet::new();
-                    for hit in &result.hits {
-                        let entry = (hit.name.clone(), hit.kind.clone(), hit.path.clone());
-                        let score = match_scores.entry(entry).or_default();
-                        score.raw_count += 1;
-                        score.matched_terms.insert(term_key.clone());
-                        if seen_paths.insert(hit.path.clone()) {
-                            Self::record_explore_file_signal(
-                                &mut file_signals,
-                                &hit.path,
-                                &term_key,
-                                2,
-                            );
-                        }
-                    }
-                }
-
-                let mut options = search::TextSearchOptions {
-                    total_limit: limit.min(50),
-                    max_per_file: limit,
-                    ..search::TextSearchOptions::for_current_code_search()
-                };
-                if let Some(ref prefix) = params.0.path_prefix {
-                    options.path_scope = search::PathScope::Prefix(prefix.clone());
-                }
-                if let Some(ref lang) = lang_filter {
-                    options.language_filter = Some(*lang);
-                }
-
-                if let Ok(result) = search::search_text_with_options(
-                    &guard,
-                    Some(derived_query),
-                    None,
-                    false,
-                    &options,
-                ) {
-                    for file in &result.files {
-                        if !file.matches.is_empty() {
-                            Self::record_explore_file_signal(
-                                &mut file_signals,
-                                &file.path,
-                                &term_key,
-                                2,
-                            );
-                        }
-                        for m in &file.matches {
-                            if text_hits.len() < limit && !format::is_noise_line(&m.line) {
-                                text_hits.push((file.path.clone(), m.line.clone(), m.line_number));
-                            }
-                            if let Some(ref enc) = m.enclosing_symbol {
-                                let entry = (enc.name.clone(), enc.kind.clone(), file.path.clone());
-                                let score = match_scores.entry(entry).or_default();
-                                score.raw_count += 1;
-                                score.matched_terms.insert(term_key.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 3: Filter noise, weight by kind and path, sort, truncate to limit.
-        // Exclude explore.rs itself (CONCEPT_MAP contains concept keywords in its body).
-        match_scores.retain(|(_, _, path), _| !path.ends_with("protocol/explore.rs"));
-
-        // Score each symbol: match_count * kind_weight, penalized for doc/generated files.
-        let scored: Vec<((String, String, String), u64)> = match_scores
-            .into_iter()
-            .map(|((name, kind, path), score_data)| {
-                // Kind weight: definition-like symbols rank higher than incidental matches.
-                let kind_weight: u64 = match kind.as_str() {
-                    "fn" | "method" => 4,
-                    "struct" | "class" | "trait" | "interface" | "enum" => 4,
-                    "impl" | "mod" | "module" => 3,
-                    "const" | "type" => 2,
-                    "variable" | "let" => 1,
-                    "key" | "section" => 1,
-                    _ => 2, // "other" (selectors, etc.)
-                };
-                let classification = guard.get_file(&path).map(|file| &file.classification);
-                let path_penalty = explore_path_penalty(&path, classification);
-                // Specific remainder terms (query nouns that resolved to a real
-                // indexed symbol name, e.g. "admission" -> AdmissionTier) are
-                // load-bearing, not generic concept noise. Each one counts as
-                // two extra terms toward coverage: enough that a single specific
-                // noun outranks a generic two-term concept-bucket hit (the
-                // failure this fix targets), but a symbol with genuine
-                // three-plus-term co-occurrence still wins. This only affects
-                // concept mode; fallback mode never populates the set.
-                let specific_match_count = score_data
-                    .matched_terms
-                    .iter()
-                    .filter(|term| specific_terms.contains(*term))
-                    .count() as u64;
-                let effective_terms =
-                    score_data.matched_terms.len() as u64 + 2 * specific_match_count;
-                let alignment_multiplier = if fallback_mode {
-                    explore_fallback_alignment_multiplier(
-                        symbol_queries.len(),
-                        score_data.matched_terms.len(),
-                    )
-                } else {
-                    8
-                };
-                // Saturating NAME signal. The old score multiplied three
-                // correlated name-overlap factors — raw_count * coverage^2 *
-                // alignment — which scaled the query-dependent part like
-                // k * k^2 * f(k) (~1:32:216 for 1/2/3-token matches). After the
-                // max-normalization below that pinned the best name match to 1.00
-                // and cratered everyone else onto a cliff ("lone 1.00, then
-                // crater"). Fold raw hit strength and term coverage into ONE
-                // additive, saturated value (coverage is now LINEAR, not squared)
-                // and scale by the bounded alignment/coverage-quality gate.
-                let raw_component = (score_data.raw_count as u64).min(EXPLORE_RAW_CAP);
-                let coverage_component = effective_terms.min(EXPLORE_COVERAGE_CAP);
-                let name_signal = (raw_component + 3 * coverage_component) * alignment_multiplier;
-                // Concept PROXIMITY: a symbol living in a file that >=2 query
-                // terms point at (path segment / content / co-located symbol name)
-                // earns an additive lift even when its own NAME shares no query
-                // token. This consumes `file_signals`, the per-file concept signal
-                // that was computed but previously never read by the scorer. Gated
-                // on the same >=2-term threshold `derive_explore_cluster` uses, so
-                // a coincidental single-term file cannot inflate everything in it.
-                let prox = file_signals
-                    .get(&path)
-                    .filter(|signal| signal.matched_terms.len() >= 2)
-                    .map(|signal| signal.raw_score.min(EXPLORE_PROX_CAP))
-                    .unwrap_or(0);
-                // Blend name and proximity ADDITIVELY with W_NAME >= W_PROX so an
-                // exact-name query still ranks its target top (no over-correction),
-                // while proximity can lift a concept-central symbol out of the
-                // crater the multiplicative curve used to bury it in.
-                let score = kind_weight
-                    * path_penalty
-                    * (EXPLORE_W_NAME * name_signal + EXPLORE_W_PROX * prox);
-                ((name, kind, path), score)
-            })
-            .collect();
-
-        // Noise filtering: hide vendor / generated / gitignored / personal-tooling
-        // by default. include_noise is the umbrella; include_vendor and
-        // include_personal_tooling are additive finer-grained overrides per B1.
-        let mut noise_hidden: usize = 0;
-        let should_hide_path = |path: &str| -> bool {
-            let Some(file) = guard.get_file(path) else {
-                return true;
-            };
-            if suppress_other_noise && explore_is_test_like_path(path, Some(&file.classification)) {
-                return true;
-            }
-            if suppress_personal && crate::live_index::query::is_personal_tooling_path(path) {
-                return true;
-            }
-            let class = search::NoisePolicy::classify_path(path, None);
-            match class {
-                search::NoiseClass::Vendor => suppress_vendor,
-                search::NoiseClass::Generated | search::NoiseClass::Ignored => suppress_other_noise,
-                search::NoiseClass::None => false,
-            }
-        };
-
-        let mut ranked = scored;
-        // Deterministic order (Constitution IV): score desc, then the full
-        // (name, kind, path) key ascending. HashMap iteration order is
-        // nondeterministic and the stable sort would otherwise preserve it for
-        // equal scores; the key is unique so this is a total order.
-        ranked.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then(a.0.0.cmp(&b.0.0))
-                .then(a.0.1.cmp(&b.0.1))
-                .then(a.0.2.cmp(&b.0.2))
-        });
-        // Filter out weak matches (score < 8 means single text-only hit in a doc file).
-        ranked.retain(|(_, score)| *score >= 8);
-        // SF-STRESS-013: drop hidden vendor/generated/test symbols BEFORE the
-        // limit truncation so they no longer consume the result budget. Running
-        // the noise filter after truncate starved real results (e.g. 1 visible
-        // symbol while 19 hidden vendor symbols had already eaten the limit).
-        if any_suppression {
-            ranked.retain(|(key, _)| {
-                let hide = should_hide_path(&key.2);
-                if hide {
-                    noise_hidden += 1;
-                }
-                !hide
-            });
-        }
-        ranked.truncate(limit);
-        let max_score = ranked.first().map(|(_, s)| *s as f32).unwrap_or(1.0);
-        let symbol_scores: Vec<f32> = ranked
-            .iter()
-            .map(|(_, s)| {
-                if max_score > 0.0 {
-                    (*s as f32 / max_score).min(1.0)
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let symbol_hits: Vec<(String, String, String)> =
-            ranked.into_iter().map(|(k, _)| k).collect();
-
-        // Text hits still pass through the same noise filter so hidden files
-        // never leak into the rendered pattern list.
-        let text_hits = if any_suppression {
-            text_hits
-                .into_iter()
-                .filter(|(path, _, _)| {
-                    let hide = should_hide_path(path);
-                    if hide {
-                        noise_hidden += 1;
-                    }
-                    !hide
-                })
-                .collect::<Vec<_>>()
-        } else {
-            text_hits
-        };
-
-        // Count files by symbol/text presence
-        let mut file_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for (_, _, path) in &symbol_hits {
-            *file_counts.entry(path.clone()).or_default() += 1;
-        }
-        for (path, _, _) in &text_hits {
-            *file_counts.entry(path.clone()).or_default() += 1;
-        }
-        let mut related_files: Vec<(String, usize)> = file_counts.into_iter().collect();
-        related_files.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-        related_files.truncate(limit);
-
-        // Depth 2+: enrich top symbol hits with signatures and dependents
-        let depth = params.0.depth.unwrap_or(1).clamp(1, 3);
-        let mut enriched_symbols: Vec<format::ExploreEnrichedSymbol> = Vec::new();
-        // (name, kind, path, signature, dependent_files)
-
-        if depth >= 2 {
-            let enrich_limit = 5.min(symbol_hits.len());
-            for (name, kind, path) in &symbol_hits[..enrich_limit] {
-                let signature = guard.get_file(path).and_then(|file| {
-                    let sym = file.symbols.iter().find(|s| {
-                        s.name == *name && s.kind.to_string().eq_ignore_ascii_case(kind)
-                    })?;
-                    let body = std::str::from_utf8(
-                        &file.content[sym.byte_range.0 as usize..sym.byte_range.1 as usize],
-                    )
-                    .ok()?;
-                    Some(format::apply_verbosity(body, "signature"))
-                });
-
-                let dependents = {
-                    let ref_view = guard.capture_find_references_view(name, None, 3);
-                    ref_view
-                        .files
-                        .iter()
-                        .take(3)
-                        .map(|f| f.file_path.clone())
-                        .collect()
-                };
-
-                enriched_symbols.push((
-                    name.clone(),
-                    kind.clone(),
-                    path.clone(),
-                    signature,
-                    dependents,
-                ));
-            }
-        }
-
-        // Depth 3: gather implementations AND type dependencies for top symbols
-        let mut symbol_impls: Vec<(String, Vec<String>)> = Vec::new();
-        let mut symbol_deps: Vec<(String, Vec<String>)> = Vec::new();
-        if depth >= 3 {
-            let impl_limit = 3.min(enriched_symbols.len());
-            for (name, _kind, path, _, _) in &enriched_symbols[..impl_limit] {
-                // Implementations (trait → implementors)
-                let impl_view = guard.capture_implementations_view(name, None);
-                let impl_names: Vec<String> = impl_view
-                    .entries
-                    .iter()
-                    .take(5)
-                    .map(|e| {
-                        format!(
-                            "{} impl {} ({}:{})",
-                            e.implementor, e.trait_name, e.file_path, e.line
-                        )
-                    })
-                    .collect();
-                if !impl_names.is_empty() {
-                    symbol_impls.push((name.clone(), impl_names));
-                }
-
-                // Type dependencies (what types does this symbol reference?)
-                let bundle = guard.capture_context_bundle_view(path, name, None, None);
-                if let crate::live_index::query::ContextBundleView::Found(found) = bundle {
-                    let dep_names: Vec<String> = found
-                        .dependencies
-                        .iter()
-                        .take(8)
-                        .map(|d| format!("{} {} ({})", d.kind_label, d.name, d.file_path))
-                        .collect();
-                    if !dep_names.is_empty() {
-                        symbol_deps.push((name.clone(), dep_names));
-                    }
-                }
-            }
-        }
-
-        // When a concept matched but the query also named specific terms that
-        // resolve to indexed symbols, keep those nouns visible in the header so
-        // the topic isn't silently collapsed to the generic concept label.
-        // Order by query position (remainder_terms preserves it) for stability.
-        let display_label = if !specific_terms.is_empty() {
-            let ordered: Vec<&str> = remainder_terms
-                .iter()
-                .filter(|t| specific_terms.contains(t.as_str()))
-                .map(|t| t.as_str())
-                .collect();
-            if demote_stem_only_concept {
-                // The concept matched only via a single-word stem misfire (e.g.
-                // "indexed" -> "Indexing") while the query named real terms. Lead
-                // with those specific terms and demote the concept to an honest
-                // parenthetical hint, instead of letting a label the user never
-                // typed front the header.
-                format!("{} (+ {label} signals)", ordered.join(", "))
-            } else {
-                format!("{label} + {}", ordered.join(", "))
-            }
-        } else {
-            label.clone()
-        };
+        let crate::index_lifecycle::guidance::exploration::ExploreResult {
+            display_label,
+            symbol_hits,
+            text_hits,
+            related_files,
+            enriched_symbols,
+            symbol_impls,
+            symbol_deps,
+            derived_cluster,
+            enriched_imports,
+            symbol_scores,
+            depth,
+            noise_hidden,
+            ..
+        } = result;
 
         let mut output = format::explore_result_view(format::ExploreResultViewInput {
             label: &display_label,
@@ -12800,26 +9743,11 @@ impl SymForgeServer {
             None => None,
         };
 
-        let (mut intent, mut matched_prefix) = smart_query::classify_intent_with_match(q);
-        if matches!(
-            intent,
-            smart_query::QueryIntent::Understand { .. } | smart_query::QueryIntent::Explore { .. }
-        ) {
+        let (intent, matched_prefix) = {
             let guard = self.index.data_plane().read();
-            if let Some(name) =
-                Self::extract_exact_implementation_understanding_candidate(&guard, q)
-            {
-                intent = smart_query::QueryIntent::UnderstandImplementations { name };
-                matched_prefix = false;
-            } else if let Some(symbol) =
-                Self::extract_exact_symbol_understanding_candidate(&guard, q)
-            {
-                intent = smart_query::QueryIntent::UnderstandSymbol { symbol };
-                matched_prefix = false;
-            }
-        }
+            crate::index_lifecycle::guidance::routing::resolve(&guard, q)
+        };
         let assessment = smart_query::assess_route(&intent, matched_prefix);
-        let route_desc = smart_query::route_description(&intent);
 
         let result = match &intent {
             smart_query::QueryIntent::FindCallers { symbol, path } => {
@@ -13054,21 +9982,7 @@ impl SymForgeServer {
             }
         };
 
-        let mut envelope = format!(
-            "Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}",
-            smart_query::route_confidence_label(assessment.confidence),
-            smart_query::route_tool_name(&intent),
-            smart_query::route_invocation(&intent),
-            assessment.rationale,
-        );
-        if original_q != q {
-            envelope.push_str(&format!("\nOriginal query: {original_q}"));
-        }
-        if let Some(next_step) = assessment.suggested_next_step {
-            envelope.push_str(&format!("\nSuggested next step: {next_step}"));
-        }
-
-        let output = format!("{envelope}\n{route_desc}\n\n{result}");
+        let output = smart_query::render_answer(&intent, assessment, original_q, q, &result);
         self.session_context
             .record_summary_output("ask", (output.len() / 4).min(u32::MAX as usize) as u32);
         format::enforce_token_budget(output, params.0.max_tokens)

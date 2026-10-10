@@ -216,6 +216,8 @@ pub struct LiveProjectSlot {
     placement: StatePlacement,
     owner: Option<OwnerIdentity>,
     revoked: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "server")]
+    write_scope_gate: std::sync::RwLock<()>,
 }
 
 impl LiveProjectSlot {
@@ -252,6 +254,19 @@ impl LiveProjectSlot {
         }
     }
 
+    /// Keep one already admitted write inside this slot's lifetime. The caller
+    /// takes path locks before entering; stop waits here without needing those
+    /// locks, and the scope never enters the registry while the gate is held.
+    #[cfg(feature = "server")]
+    pub(crate) fn with_live_write_scope<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> Result<R, RegistryRefusal> {
+        let _scope = self.write_scope_gate.read().expect("slot write scope lock");
+        self.binding()?;
+        Ok(operation())
+    }
+
     /// Its capacity owner, when one was attached.
     ///
     /// Refuses once stopped: charging against a retired slot's owner would
@@ -272,6 +287,11 @@ impl LiveProjectSlot {
     /// binding's liveness is shared across its clones, so retiring it here
     /// reaches authority that has already left this slot.
     fn revoke(&self) {
+        #[cfg(feature = "server")]
+        let _scope = self
+            .write_scope_gate
+            .write()
+            .expect("slot write scope lock");
         self.binding.revoke();
         self.revoked.store(true, Ordering::Release);
     }
@@ -466,6 +486,8 @@ impl ProjectRegistry {
             placement: pending.placement,
             owner,
             revoked: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "server")]
+            write_scope_gate: std::sync::RwLock::new(()),
         });
         state
             .keys

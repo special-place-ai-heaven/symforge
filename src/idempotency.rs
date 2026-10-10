@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,9 +14,16 @@ const KEY_HASH_FRAME_PREFIX: &[u8] = b"symforge-idempotency-key-v1\0";
 const REQUEST_HASH_FRAME_PREFIX: &[u8] = b"symforge-idempotency-request-v1\0";
 const REPLAY_RECORD_SCHEMA_VERSION: u8 = 1;
 const RECORD_FILE_NAME: &str = "record.json";
+const MAX_REPLAY_RESPONSE_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdempotencyKey(String);
+
+impl fmt::Debug for IdempotencyKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("IdempotencyKey(<redacted>)")
+    }
+}
 
 impl IdempotencyKey {
     pub fn new(raw: impl Into<String>) -> Result<Self, IdempotencyError> {
@@ -71,11 +79,13 @@ impl std::fmt::Display for RequestHash {
 #[serde(rename_all = "snake_case")]
 pub enum ReplayStatus {
     Reserved,
+    Started,
+    Uncertain,
     Completed,
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayRecord {
     pub schema_version: u8,
     pub key_hash: String,
@@ -93,6 +103,25 @@ pub struct ReplayRecord {
     /// v1 records (serde default), which is exactly the fail-closed case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_image: Option<PostImageReceipt>,
+}
+
+impl fmt::Debug for ReplayRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplayRecord")
+            .field("schema_version", &self.schema_version)
+            .field("key_hash", &self.key_hash)
+            .field("request_hash", &self.request_hash)
+            .field("status", &self.status)
+            .field("created_unix_millis", &self.created_unix_millis)
+            .field("updated_unix_millis", &self.updated_unix_millis)
+            .field(
+                "response_text",
+                &self.response_text.as_ref().map(|_| "<redacted>"),
+            )
+            .field("post_image", &self.post_image)
+            .finish()
+    }
 }
 
 /// One target the completed operation left on disk. `path` is the ABSOLUTE
@@ -113,6 +142,15 @@ pub struct PostImageTarget {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PostImageReceipt {
     pub targets: Vec<PostImageTarget>,
+    /// Old receipts lack this field and require explicit reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PostImageSourceBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PostImageSourceBinding {
+    pub project_id: String,
+    pub physical_root_key: [u8; 16],
 }
 
 /// Digest a SINGLE target's post-image from bytes already in hand — the
@@ -131,6 +169,7 @@ pub fn post_image_from_written_bytes(path: &Path, bytes: &[u8]) -> PostImageRece
             path: path.display().to_string(),
             content_digest: Some(crate::hash::digest_hex(bytes)),
         }],
+        source: None,
     }
 }
 
@@ -156,7 +195,75 @@ pub fn capture_post_image(written: &[PathBuf]) -> Option<PostImageReceipt> {
             content_digest,
         });
     }
-    Some(PostImageReceipt { targets })
+    Some(PostImageReceipt {
+        targets,
+        source: None,
+    })
+}
+
+const MAX_BOUND_REPLAY_TARGETS: usize = 4096;
+const MAX_BOUND_REPLAY_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BOUND_REPLAY_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+/// Attach the source admitted for this effect only after checking the exact
+/// post-image through its original physical-root anchor.
+pub(crate) fn bind_post_image_to_source(
+    mut receipt: PostImageReceipt,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Option<PostImageReceipt> {
+    receipt.source = Some(PostImageSourceBinding {
+        project_id: canonical_project_key(source.admitted_root()),
+        physical_root_key: source.physical_root_stable_key()?,
+    });
+    verify_post_image_bound(&receipt, source).then_some(receipt)
+}
+
+/// Verify recorded bytes only through the retained admitted source anchor.
+/// Worktree targets outside that root need a separately admitted authority.
+pub(crate) fn verify_post_image_bound(
+    receipt: &PostImageReceipt,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> bool {
+    let Some(binding) = &receipt.source else {
+        return false;
+    };
+    if receipt.targets.is_empty()
+        || receipt.targets.len() > MAX_BOUND_REPLAY_TARGETS
+        || binding.project_id != canonical_project_key(source.admitted_root())
+        || source.physical_root_stable_key() != Some(binding.physical_root_key)
+    {
+        return false;
+    }
+    let mut total_bytes = 0usize;
+    for target in &receipt.targets {
+        // Windows canonicalization can add a verbatim-path prefix to the
+        // authority root while a tool's absolute target retains its plain
+        // spelling. Simplify only that syntax; the anchored read below still
+        // enforces the original physical directory and rejects links.
+        let target_path = dunce::simplified(Path::new(&target.path));
+        let admitted_root = dunce::simplified(source.admitted_root());
+        let Ok(relative) = target_path.strip_prefix(admitted_root) else {
+            return false;
+        };
+        let observed = match source.read_regular_beneath_anchor(relative, MAX_BOUND_REPLAY_FILE_BYTES) {
+            Ok(observed) => observed,
+            Err(_) => return false,
+        };
+        match observed {
+            Some(bytes) => {
+                total_bytes = total_bytes.saturating_add(bytes.len());
+                let observed_digest = crate::hash::digest_hex(&bytes);
+                if total_bytes > MAX_BOUND_REPLAY_TOTAL_BYTES
+                    || target.content_digest.as_deref() != Some(observed_digest.as_str())
+                {
+                    return false;
+                }
+            }
+            None if target.content_digest.is_none() => {}
+            None => return false,
+        }
+    }
+    true
 }
 
 /// True only when every receipt target matches the CURRENT disk state:
@@ -219,6 +326,18 @@ pub struct ActiveReplay {
 }
 
 impl ActiveReplay {
+    /// Persist that the external effect may have begun before invoking it.
+    pub fn mark_started(&self) -> Result<ReplayRecord, IdempotencyError> {
+        self.store
+            .update_status(&self.key, &self.request_hash, ReplayStatus::Started)
+    }
+
+    /// Persist that the effect cannot be safely classified or retried.
+    pub fn mark_uncertain(&self) -> Result<ReplayRecord, IdempotencyError> {
+        self.store
+            .update_status(&self.key, &self.request_hash, ReplayStatus::Uncertain)
+    }
+
     pub fn complete(
         &self,
         response_text: impl Into<String>,
@@ -231,24 +350,22 @@ impl ActiveReplay {
         )
     }
 
-    /// Complete with the source-bound receipt the verified replay lanes
-    /// require. A `None` receipt stores a record that will never replay
-    /// through those lanes (capture failed — fail closed).
+    /// Publish the result and its source-bound receipt in one atomic record.
+    /// An absent receipt leaves the started operation requiring reconciliation.
     pub fn complete_with_post_image(
         &self,
         response_text: impl Into<String>,
         post_image: Option<PostImageReceipt>,
     ) -> Result<ReplayRecord, IdempotencyError> {
-        let record = self.store.update_status_with_response(
+        let Some(post_image) = post_image.filter(|receipt| !receipt.targets.is_empty()) else {
+            return Err(IdempotencyError::ReceiptRequired);
+        };
+        self.store.update_status_with_receipt(
             &self.key,
             &self.request_hash,
-            ReplayStatus::Completed,
-            Some(response_text.into()),
-        )?;
-        let mut record = record;
-        record.post_image = post_image;
-        self.store.write_record_atomic(&record)?;
-        Ok(record)
+            response_text.into(),
+            post_image,
+        )
     }
 
     pub fn fail(&self, response_text: impl Into<String>) -> Result<ReplayRecord, IdempotencyError> {
@@ -273,6 +390,14 @@ pub enum IdempotencyError {
     EmptyKey,
     #[error("tool name cannot be empty for idempotency request hashing")]
     EmptyToolName,
+    #[error("idempotency replay response exceeds the 1 MiB persistence limit")]
+    ResponseTooLarge,
+    #[error("idempotency replay response is sensitive or could not be safely scanned")]
+    UnsafeResponse,
+    #[error("verified replay completion requires a non-empty post-image receipt")]
+    ReceiptRequired,
+    #[error("idempotency record state transition requires reconciliation")]
+    InvalidTransition,
     #[error(
         "idempotency conflict for key hash {key_hash}: existing request {existing}, incoming request {incoming}"
     )]
@@ -283,6 +408,10 @@ pub enum IdempotencyError {
     },
     #[error("idempotency reservation for key hash {key_hash} is incomplete at {path}")]
     IncompleteReservation { key_hash: String, path: PathBuf },
+    #[error(
+        "idempotency reservation for key hash {key_hash} is publishing; retry without executing"
+    )]
+    Publishing { key_hash: String },
     #[error(
         "idempotency record at {path} is corrupt and was quarantined at {quarantine_path}: {reason}"
     )]
@@ -346,25 +475,96 @@ impl FileReplayStore {
         key: &IdempotencyKey,
         request_hash: &RequestHash,
     ) -> Result<ReplayDecision, IdempotencyError> {
+        self.check_or_reserve_with_hooks(key, request_hash, || {}, || {})
+    }
+
+    fn check_or_reserve_with_hooks(
+        &self,
+        key: &IdempotencyKey,
+        request_hash: &RequestHash,
+        before_publish: impl FnOnce(),
+        after_claim: impl FnOnce(),
+    ) -> Result<ReplayDecision, IdempotencyError> {
         let key_hash = key.key_hash();
         let key_dir = self.key_dir_for_hash(&key_hash);
+        if key_dir.exists() {
+            let record = self.load_existing(&key_hash)?;
+            self.ensure_same_hash(&record, request_hash)?;
+            return Ok(ReplayDecision::Replay(record));
+        }
+        fs::create_dir_all(&self.records_dir)?;
+        let staged = tempfile::Builder::new()
+            .prefix(".pending-reservation-")
+            .tempdir_in(&self.records_dir)?;
+        let record = ReplayRecord::reserved(key_hash.clone(), request_hash.clone());
+        let bytes = serde_json::to_vec_pretty(&record)?;
+        let mut staged_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staged.path().join(RECORD_FILE_NAME))?;
+        staged_file.write_all(&bytes)?;
+        staged_file.sync_all()?;
+        drop(staged_file);
 
-        match fs::create_dir(&key_dir) {
-            Ok(()) => {
-                let record = ReplayRecord::reserved(key_hash, request_hash.clone());
-                self.write_record_atomic(&record)?;
-                Ok(ReplayDecision::FirstExecution(record))
+        // The callback is a deterministic test seam for the publish boundary.
+        before_publish();
+        let marker = self.records_dir.join(format!("{key_hash}.claim"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(mut claim) => {
+                claim.write_all(request_hash.0.as_bytes())?;
+                claim.sync_all()?;
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let record = self.load_existing(&key_hash)?;
-                self.ensure_same_hash(&record, request_hash)?;
-                Ok(ReplayDecision::Replay(record))
+                return self.wait_for_publication(&key_hash, request_hash);
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&self.records_dir)?;
-                self.check_or_reserve(key, request_hash)
+            Err(error) => return Err(IdempotencyError::Io(error)),
+        }
+        after_claim();
+        let result = if key_dir.exists() {
+            self.replay_or_incomplete(&key_hash, request_hash)
+        } else {
+            match fs::rename(staged.path(), &key_dir) {
+                Ok(()) => Ok(ReplayDecision::FirstExecution(record)),
+                Err(_) if key_dir.exists() => self.replay_or_incomplete(&key_hash, request_hash),
+                Err(error) => Err(IdempotencyError::Io(error)),
             }
-            Err(error) => Err(IdempotencyError::Io(error)),
+        };
+        // A crash before this remove leaves an explicit fail-closed claim.
+        let _ = fs::remove_file(marker);
+        result
+    }
+
+    fn replay_or_incomplete(
+        &self,
+        key_hash: &str,
+        request_hash: &RequestHash,
+    ) -> Result<ReplayDecision, IdempotencyError> {
+        let record = self.load_existing(key_hash)?;
+        self.ensure_same_hash(&record, request_hash)?;
+        Ok(ReplayDecision::Replay(record))
+    }
+
+    fn wait_for_publication(
+        &self,
+        key_hash: &str,
+        request_hash: &RequestHash,
+    ) -> Result<ReplayDecision, IdempotencyError> {
+        let marker = self.records_dir.join(format!("{key_hash}.claim"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if self.key_dir_for_hash(key_hash).exists() {
+                return self.replay_or_incomplete(key_hash, request_hash);
+            }
+            if !marker.exists() || std::time::Instant::now() >= deadline {
+                return Err(IdempotencyError::Publishing {
+                    key_hash: key_hash.to_owned(),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -376,6 +576,10 @@ impl FileReplayStore {
         let key_hash = key.key_hash();
         let key_dir = self.key_dir_for_hash(&key_hash);
         if !key_dir.exists() {
+            let marker = self.records_dir.join(format!("{key_hash}.claim"));
+            if marker.exists() {
+                return Err(IdempotencyError::Publishing { key_hash });
+            }
             return Ok(None);
         }
 
@@ -400,10 +604,42 @@ impl FileReplayStore {
         status: ReplayStatus,
         response_text: Option<String>,
     ) -> Result<ReplayRecord, IdempotencyError> {
+        if let Some(response) = &response_text {
+            validate_replay_response(response)?;
+        }
         let key_hash = key.key_hash();
         let record = self.load_existing(&key_hash)?;
         self.ensure_same_hash(&record, request_hash)?;
+        let valid = matches!(
+            (record.status, status),
+            (ReplayStatus::Reserved, ReplayStatus::Started | ReplayStatus::Completed | ReplayStatus::Failed)
+                | (ReplayStatus::Started, ReplayStatus::Completed | ReplayStatus::Uncertain)
+        );
+        if !valid {
+            return Err(IdempotencyError::InvalidTransition);
+        }
         let updated = record.with_status_and_response(status, response_text);
+        self.write_record_atomic(&updated)?;
+        Ok(updated)
+    }
+
+    fn update_status_with_receipt(
+        &self,
+        key: &IdempotencyKey,
+        request_hash: &RequestHash,
+        response_text: String,
+        post_image: PostImageReceipt,
+    ) -> Result<ReplayRecord, IdempotencyError> {
+        validate_replay_response(&response_text)?;
+        let key_hash = key.key_hash();
+        let record = self.load_existing(&key_hash)?;
+        self.ensure_same_hash(&record, request_hash)?;
+        if !matches!(record.status, ReplayStatus::Reserved | ReplayStatus::Started) {
+            return Err(IdempotencyError::InvalidTransition);
+        }
+        let mut updated =
+            record.with_status_and_response(ReplayStatus::Completed, Some(response_text));
+        updated.post_image = Some(post_image);
         self.write_record_atomic(&updated)?;
         Ok(updated)
     }
@@ -537,6 +773,13 @@ impl FileReplayStore {
         tmp.as_file().sync_all()?;
         tmp.persist(&path)
             .map_err(|error| IdempotencyError::Io(error.error))?;
+        #[cfg(test)]
+        if std::env::var_os("SYMFORGE_REPLAY_COMPLETE_CRASH").is_some()
+            && record.status == ReplayStatus::Completed
+            && record.post_image.is_none()
+        {
+            std::process::exit(73);
+        }
         Ok(())
     }
 
@@ -673,44 +916,36 @@ pub fn probe_tool_replay(
     }
 }
 
-/// Test-only interleave hook: fires between the supersede claim and the
-/// double-checked re-read in [`begin_tool_replay_verified`], so an oracle can
-/// deterministically stand in for a concurrent contender that already
-/// superseded (the round-2 Critical's exact window). Same pattern as
-/// `edit.rs`'s `write_interleave`.
-#[cfg(test)]
-pub(crate) mod supersede_interleave {
-    use std::cell::Cell;
-    thread_local! {
-        static HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
-    }
-    pub fn install(hook: fn()) {
-        HOOK.with(|cell| cell.set(Some(hook)));
-    }
-    pub fn clear() {
-        HOOK.with(|cell| cell.set(None));
-    }
-    pub(super) fn fire() {
-        if let Some(hook) = HOOK.with(|cell| cell.get()) {
-            hook();
-        }
-    }
-}
-
-/// [`begin_tool_replay`] with the replay-authority fence (Feature 020
-/// Slice 4): a stored result is replayed ONLY when its source-bound
-/// post-image receipt verifies against the CURRENT bytes at the recorded
-/// written paths. A completed/failed record whose receipt is missing or no
-/// longer true is SUPERSEDED — the reservation is retaken and the caller
-/// executes fresh, so the record ends up holding the current truth instead
-/// of a claim the disk no longer supports. In-flight reservations keep their
-/// existing replay-unavailable answer; superseding a live reservation would
-/// race the owner.
+/// Legacy entrypoint without an admitted source. It may reserve a new key,
+/// but every existing completed record requires reconciliation. Callers with
+/// a retained source authority use `begin_tool_replay_verified_bound`.
 pub fn begin_tool_replay_verified(
     project_state: &ProjectStateDir,
     tool_name: &str,
     raw_key: &str,
     request: &Value,
+) -> Result<ReplayStart, IdempotencyError> {
+    begin_tool_replay_verified_with(project_state, tool_name, raw_key, request, |_| false)
+}
+
+pub(crate) fn begin_tool_replay_verified_bound(
+    project_state: &ProjectStateDir,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<ReplayStart, IdempotencyError> {
+    begin_tool_replay_verified_with(project_state, tool_name, raw_key, request, |receipt| {
+        verify_post_image_bound(receipt, source)
+    })
+}
+
+fn begin_tool_replay_verified_with(
+    project_state: &ProjectStateDir,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+    verify: impl Fn(&PostImageReceipt) -> bool,
 ) -> Result<ReplayStart, IdempotencyError> {
     let key = IdempotencyKey::new(raw_key)?;
     let request_hash = RequestHash::for_tool_request(tool_name, request)?;
@@ -723,90 +958,63 @@ pub fn begin_tool_replay_verified(
             request_hash,
         })),
         ReplayDecision::Replay(record) => {
-            let verified = record.post_image.as_ref().is_some_and(verify_post_image);
-            if verified || record.status == ReplayStatus::Reserved {
-                return Ok(ReplayStart::Replay(replay_response(&record)));
+            let verified = record.post_image.as_ref().is_some_and(verify);
+            if record.status == ReplayStatus::Completed && verified {
+                Ok(ReplayStart::Replay(replay_response(&record)))
+            } else {
+                Ok(ReplayStart::Replay(
+                    "Idempotency replay unavailable: stored operation requires reconciliation."
+                        .to_owned(),
+                ))
             }
-            // T038 round-1 repair: superseding must have ONE winner. Without
-            // the claim, two concurrent identical-key retries could both
-            // retake the reservation and both execute the mutation.
-            if !store.try_claim_supersede(&key.key_hash())? {
-                return Ok(ReplayStart::Replay(replay_response(
-                    &ReplayRecord::reserved(key.key_hash(), request_hash.clone()),
-                )));
-            }
-            #[cfg(test)]
-            supersede_interleave::fire();
-            // T038 round-2 repair (Critical): the read and verify above ran
-            // UNFENCED — a contender may have claimed, superseded, and
-            // released between our read and our claim, making the pre-claim
-            // decision stale. Re-read and RE-DECIDE under the marker
-            // (double-checked locking): only a record that is STILL the
-            // unverified completed/failed one may be superseded. A record
-            // now Reserved answers as reserved; a record whose fresh receipt
-            // now verifies replays the fresh truth. Recorded residual: the
-            // crash-orphan heal path can, in a multi-party interleave, strip
-            // a live marker — the double check bounds even that to two
-            // re-reads landing inside one contender's re-read-to-write
-            // window (microseconds), versus the pre-fix exposure of the
-            // whole verify window.
-            let decision = match store.replay_if_present(&key, &request_hash) {
-                Ok(Some(current)) => {
-                    let current_verified =
-                        current.post_image.as_ref().is_some_and(verify_post_image);
-                    if current_verified || current.status == ReplayStatus::Reserved {
-                        Some(replay_response(&current))
-                    } else {
-                        None
-                    }
-                }
-                // Record gone under the claim (external tampering): the
-                // conservative answer is the transient reserved response —
-                // never a blind re-execution off a vanished decision base.
-                Ok(None) => Some(replay_response(&ReplayRecord::reserved(
-                    key.key_hash(),
-                    request_hash.clone(),
-                ))),
-                Err(error) => {
-                    store.release_supersede(&key.key_hash());
-                    return Err(error);
-                }
-            };
-            if let Some(response) = decision {
-                store.release_supersede(&key.key_hash());
-                return Ok(ReplayStart::Replay(response));
-            }
-            let superseding = ReplayRecord::reserved(key.key_hash(), request_hash.clone());
-            let written = store.write_record_atomic(&superseding);
-            store.release_supersede(&key.key_hash());
-            written?;
-            Ok(ReplayStart::FirstExecution(ActiveReplay {
-                store,
-                key,
-                request_hash,
-            }))
         }
     }
 }
 
-/// [`probe_tool_replay`] with the replay-authority fence: non-reserving, so
-/// an unverified record simply answers `None` and the caller falls through
-/// to its normal (reserving) execution path, which supersedes it there.
+/// Non-reserving legacy probe without an admitted source. Existing records
+/// fail closed; use `probe_tool_replay_verified_bound` for attested replay.
 pub fn probe_tool_replay_verified(
     project_state: &ProjectStateDir,
     tool_name: &str,
     raw_key: &str,
     request: &Value,
 ) -> Result<Option<String>, IdempotencyError> {
+    probe_tool_replay_verified_with(project_state, tool_name, raw_key, request, |_| false)
+}
+
+pub(crate) fn probe_tool_replay_verified_bound(
+    project_state: &ProjectStateDir,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+) -> Result<Option<String>, IdempotencyError> {
+    probe_tool_replay_verified_with(project_state, tool_name, raw_key, request, |receipt| {
+        verify_post_image_bound(receipt, source)
+    })
+}
+
+fn probe_tool_replay_verified_with(
+    project_state: &ProjectStateDir,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+    verify: impl Fn(&PostImageReceipt) -> bool,
+) -> Result<Option<String>, IdempotencyError> {
     let key = IdempotencyKey::new(raw_key)?;
     let request_hash = RequestHash::for_tool_request(tool_name, request)?;
     let store = FileReplayStore::open(project_state)?;
 
     match store.replay_if_present(&key, &request_hash)? {
-        Some(record) => {
-            let verified = record.post_image.as_ref().is_some_and(verify_post_image);
-            Ok(verified.then(|| replay_response(&record)))
+        Some(record) if record.status == ReplayStatus::Completed
+            && record.post_image.as_ref().is_some_and(verify) =>
+        {
+            Ok(Some(replay_response(&record)))
         }
+        Some(_) => Ok(Some(
+            "Idempotency replay unavailable: stored operation requires reconciliation."
+                .to_owned(),
+        )),
         None => Ok(None),
     }
 }
@@ -842,10 +1050,19 @@ fn canonical_project_key(canonical_root: &Path) -> String {
 pub fn replay_response(record: &ReplayRecord) -> String {
     match (record.status, record.response_text.as_ref()) {
         (ReplayStatus::Completed | ReplayStatus::Failed, Some(response_text)) => {
-            response_text.clone()
+            if validate_replay_response(response_text).is_ok() {
+                response_text.clone()
+            } else {
+                "Idempotency replay unavailable: persisted response requires reconciliation."
+                    .to_owned()
+            }
         }
         (ReplayStatus::Reserved, _) => format!(
             "Idempotency replay unavailable: request for key hash {} is still reserved.",
+            record.key_hash
+        ),
+        (ReplayStatus::Started | ReplayStatus::Uncertain, _) => format!(
+            "Idempotency replay unavailable: request for key hash {} requires reconciliation.",
             record.key_hash
         ),
         (status, None) => format!(
@@ -853,6 +1070,19 @@ pub fn replay_response(record: &ReplayRecord) -> String {
             record.key_hash, status
         ),
     }
+}
+
+fn validate_replay_response(response: &str) -> Result<(), IdempotencyError> {
+    if response.len() > MAX_REPLAY_RESPONSE_BYTES {
+        return Err(IdempotencyError::ResponseTooLarge);
+    }
+    if !matches!(
+        crate::knowledge::scan_secret_bytes("replay-response", response.as_bytes()),
+        crate::knowledge::SecretScan::Clean
+    ) {
+        return Err(IdempotencyError::UnsafeResponse);
+    }
+    Ok(())
 }
 
 pub fn format_tool_error(error: &IdempotencyError) -> String {
@@ -908,6 +1138,398 @@ fn unix_millis() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn started_and_uncertain_are_durable_no_retry_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ProjectStateDir::new(dir.path().join("state"));
+        std::fs::create_dir_all(state.as_path()).unwrap();
+        let request = json!({ "path": "src/example.rs" });
+        let ReplayStart::FirstExecution(active) =
+            begin_tool_replay_verified(&state, "secret_remediate", "started-key", &request)
+                .unwrap()
+        else {
+            panic!("new key must execute once");
+        };
+        active.mark_started().unwrap();
+        assert!(matches!(
+            begin_tool_replay_verified(&state, "secret_remediate", "started-key", &request)
+                .unwrap(),
+            ReplayStart::Replay(_)
+        ));
+        active.mark_uncertain().unwrap();
+        assert!(matches!(
+            begin_tool_replay_verified(&state, "secret_remediate", "started-key", &request)
+                .unwrap(),
+            ReplayStart::Replay(_)
+        ));
+        let store = FileReplayStore::open(&state).unwrap();
+        let key = IdempotencyKey::new("started-key").unwrap();
+        let hash = RequestHash::for_tool_request("secret_remediate", &request).unwrap();
+        assert_eq!(
+            store.replay_if_present(&key, &hash).unwrap().unwrap().status,
+            ReplayStatus::Uncertain
+        );
+    }
+
+    #[test]
+    fn completed_receipt_crash_child() {
+        let Some(state_path) = std::env::var_os("SYMFORGE_REPLAY_CRASH_STATE") else {
+            return;
+        };
+        let state = ProjectStateDir::new(PathBuf::from(state_path));
+        let request = json!({});
+        let ReplayStart::FirstExecution(active) =
+            begin_tool_replay_verified(&state, "secret_remediate", "completed-crash", &request)
+                .unwrap()
+        else {
+            panic!("new key must execute once");
+        };
+        let source = state.as_path().join("source.txt");
+        std::fs::write(&source, b"committed").unwrap();
+        active
+            .complete_with_post_image(
+                "applied",
+                Some(post_image_from_written_bytes(&source, b"committed")),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn completed_receipt_publishes_atomically_across_process_crash_point() {
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut child = crate::process_util::hidden_command(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "internals::idempotency::tests::completed_receipt_crash_child",
+            ])
+            .env("SYMFORGE_REPLAY_CRASH_STATE", &state)
+            .env("SYMFORGE_REPLAY_COMPLETE_CRASH", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert_eq!(child.status().unwrap().code(), Some(0));
+        let project_state = ProjectStateDir::new(state);
+        let store = FileReplayStore::open(&project_state).unwrap();
+        let key = IdempotencyKey::new("completed-crash").unwrap();
+        let hash = RequestHash::for_tool_request("secret_remediate", &json!({})).unwrap();
+        let record = store.replay_if_present(&key, &hash).unwrap().unwrap();
+        assert_eq!(record.status, ReplayStatus::Completed);
+        assert!(record.post_image.as_ref().is_some_and(verify_post_image));
+    }
+
+    #[test]
+    fn completed_replay_refuses_replaced_physical_root_with_matching_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let displaced = dir.path().join("displaced");
+        let state = ProjectStateDir::new(dir.path().join("state"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(state.as_path()).unwrap();
+        let source = root.join("source.txt");
+        std::fs::write(&source, b"committed").unwrap();
+        let request = json!({ "path": "source.txt" });
+        let ReplayStart::FirstExecution(active) =
+            begin_tool_replay_verified(&state, "replace_symbol_body", "physical-root-key", &request)
+                .unwrap()
+        else {
+            panic!("first use must reserve");
+        };
+        active.mark_started().unwrap();
+        active
+            .complete_with_post_image(
+                "applied",
+                Some(post_image_from_written_bytes(&source, b"committed")),
+            )
+            .unwrap();
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source, b"committed").unwrap();
+        let ReplayStart::Replay(response) =
+            begin_tool_replay_verified(&state, "replace_symbol_body", "physical-root-key", &request)
+                .unwrap()
+        else {
+            panic!("same key must not execute again");
+        };
+        assert!(response.contains("requires reconciliation"));
+    }
+
+    #[test]
+    fn bound_receipt_replays_on_original_root_and_refuses_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let displaced = dir.path().join("displaced");
+        let state = ProjectStateDir::new(dir.path().join("state"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(state.as_path()).unwrap();
+        let source = root.join("source.txt");
+        std::fs::write(&source, b"committed").unwrap();
+        let authority = crate::index_lifecycle::activation::project_source_authority(&root);
+        let receipt = bind_post_image_to_source(
+            post_image_from_written_bytes(&source, b"committed"),
+            &authority,
+        )
+        .expect("original source postimage");
+        let request = json!({ "path": "source.txt" });
+        let ReplayStart::FirstExecution(active) = begin_tool_replay_verified_bound(
+            &state,
+            "replace_symbol_body",
+            "bound-physical-root-key",
+            &request,
+            &authority,
+        )
+        .unwrap() else {
+            panic!("first use must reserve");
+        };
+        active.mark_started().unwrap();
+        active.complete_with_post_image("applied", Some(receipt)).unwrap();
+        assert!(matches!(
+            begin_tool_replay_verified_bound(
+                &state,
+                "replace_symbol_body",
+                "bound-physical-root-key",
+                &request,
+                &authority,
+            )
+            .unwrap(),
+            ReplayStart::Replay(response) if response == "applied"
+        ));
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source, b"committed").unwrap();
+        let replacement = crate::index_lifecycle::activation::project_source_authority(&root);
+        for source_authority in [&authority, &replacement] {
+            let ReplayStart::Replay(response) = begin_tool_replay_verified_bound(
+                &state,
+                "replace_symbol_body",
+                "bound-physical-root-key",
+                &request,
+                source_authority,
+            )
+            .unwrap() else {
+                panic!("same key must never execute again");
+            };
+            assert!(response.contains("requires reconciliation"));
+        }
+    }
+
+    #[test]
+    fn key_debug_never_contains_caller_bytes() {
+        let key = IdempotencyKey::new("caller-private-marker").unwrap();
+        let diagnostic = format!("{key:?}");
+        assert!(diagnostic.contains("IdempotencyKey"));
+        assert!(!diagnostic.contains("caller-private-marker"));
+    }
+
+    #[test]
+    fn staged_reservation_is_invisible_until_fully_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileReplayStore::open_in(dir.path().join("idempotency")).unwrap();
+        let key = IdempotencyKey::new("atomic-publication").unwrap();
+        let request = RequestHash::for_tool_request("checkpoint_now", &json!({})).unwrap();
+
+        let first = store
+            .check_or_reserve_with_hooks(
+                &key,
+                &request,
+                || {
+                    assert!(store.replay_if_present(&key, &request).unwrap().is_none());
+                    assert!(matches!(
+                        store.check_or_reserve(&key, &request).unwrap(),
+                        ReplayDecision::FirstExecution(_)
+                    ));
+                },
+                || {},
+            )
+            .unwrap();
+        assert!(matches!(first, ReplayDecision::Replay(_)));
+        assert!(store.replay_if_present(&key, &request).unwrap().is_some());
+    }
+
+    #[test]
+    fn reservation_process_child() {
+        let Ok(action) = std::env::var("SYMFORGE_RESERVATION_PROCESS_ACTION") else {
+            return;
+        };
+        let state = std::path::PathBuf::from(
+            std::env::var_os("SYMFORGE_RESERVATION_PROCESS_STATE").unwrap(),
+        );
+        let store = FileReplayStore::open_in(state.clone()).unwrap();
+        let request = RequestHash::for_tool_request("checkpoint_now", &json!({})).unwrap();
+        let key = IdempotencyKey::new(if action == "crash" {
+            "crash-key"
+        } else {
+            "race-key"
+        })
+        .unwrap();
+        if action == "crash" {
+            let _ =
+                store.check_or_reserve_with_hooks(&key, &request, || {}, || std::process::exit(73));
+            unreachable!("crash hook must exit after the claim");
+        }
+        let barrier = state.join("start-race");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !barrier.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "race barrier timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let result = match store.check_or_reserve(&key, &request).unwrap() {
+            ReplayDecision::FirstExecution(_) => "first",
+            ReplayDecision::Replay(_) => "replay",
+        };
+        let result_path = std::env::var_os("SYMFORGE_RESERVATION_PROCESS_RESULT").unwrap();
+        fs::write(result_path, result).unwrap();
+    }
+
+    #[test]
+    fn real_process_race_and_crashed_claim_fail_closed() {
+        use std::process::Stdio;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("idempotency");
+        let store = FileReplayStore::open_in(state.clone()).unwrap();
+        let mut children = Vec::new();
+        let mut results = Vec::new();
+        for index in 0..8 {
+            let result = dir.path().join(format!("result-{index}"));
+            let mut command = crate::process_util::hidden_command(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "internals::idempotency::tests::reservation_process_child",
+                ])
+                .env("SYMFORGE_RESERVATION_PROCESS_ACTION", "race")
+                .env("SYMFORGE_RESERVATION_PROCESS_STATE", &state)
+                .env("SYMFORGE_RESERVATION_PROCESS_RESULT", &result)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            children.push(command.spawn().unwrap());
+            results.push(result);
+        }
+        fs::write(state.join("start-race"), b"go").unwrap();
+        for mut child in children {
+            assert!(child.wait().unwrap().success(), "reservation child failed");
+        }
+        let outcomes: Vec<String> = results
+            .iter()
+            .map(|path| fs::read_to_string(path).unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.as_str() == "first")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.as_str() == "replay")
+                .count(),
+            7
+        );
+
+        let mut crash = crate::process_util::hidden_command(std::env::current_exe().unwrap());
+        crash
+            .args([
+                "--exact",
+                "internals::idempotency::tests::reservation_process_child",
+            ])
+            .env("SYMFORGE_RESERVATION_PROCESS_ACTION", "crash")
+            .env("SYMFORGE_RESERVATION_PROCESS_STATE", &state)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert_eq!(crash.status().unwrap().code(), Some(73));
+        let key = IdempotencyKey::new("crash-key").unwrap();
+        let request = RequestHash::for_tool_request("checkpoint_now", &json!({})).unwrap();
+        assert!(matches!(
+            store.replay_if_present(&key, &request),
+            Err(IdempotencyError::Publishing { .. })
+        ));
+        assert!(matches!(
+            store.check_or_reserve(&key, &request),
+            Err(IdempotencyError::Publishing { .. })
+        ));
+
+        let old_key = IdempotencyKey::new("old-orphan").unwrap();
+        fs::create_dir(store.key_dir_for_hash(&old_key.key_hash())).unwrap();
+        assert!(matches!(
+            store.check_or_reserve(&old_key, &request),
+            Err(IdempotencyError::IncompleteReservation { .. })
+        ));
+    }
+
+    #[test]
+    fn persisted_outcomes_are_bounded_and_sensitive_text_is_never_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileReplayStore::open_in(dir.path().join("idempotency")).unwrap();
+        let key = IdempotencyKey::new("response-privacy").unwrap();
+        let request = RequestHash::for_tool_request("checkpoint_now", &json!({})).unwrap();
+        assert!(matches!(
+            store.check_or_reserve(&key, &request).unwrap(),
+            ReplayDecision::FirstExecution(_)
+        ));
+
+        let safe = "checkpoint complete".to_owned();
+        let completed = store
+            .update_status_with_response(
+                &key,
+                &request,
+                ReplayStatus::Completed,
+                Some(safe.clone()),
+            )
+            .unwrap();
+        assert_eq!(replay_response(&completed), safe);
+        assert_eq!(
+            replay_response(&store.replay_if_present(&key, &request).unwrap().unwrap()),
+            safe
+        );
+
+        let oversized = "x".repeat(MAX_REPLAY_RESPONSE_BYTES + 1);
+        assert!(matches!(
+            store.update_status_with_response(
+                &key,
+                &request,
+                ReplayStatus::Completed,
+                Some(oversized)
+            ),
+            Err(IdempotencyError::ResponseTooLarge)
+        ));
+        let synthetic = ["-----B", "EGIN P", "RIVATE", " KEY--", "---\n"].concat();
+        assert!(!matches!(
+            crate::knowledge::scan_secret_bytes("replay-response", synthetic.as_bytes()),
+            crate::knowledge::SecretScan::Clean
+        ));
+        assert!(matches!(
+            store.update_status_with_response(
+                &key,
+                &request,
+                ReplayStatus::Completed,
+                Some(synthetic.clone())
+            ),
+            Err(IdempotencyError::UnsafeResponse)
+        ));
+        assert_eq!(
+            store
+                .replay_if_present(&key, &request)
+                .unwrap()
+                .unwrap()
+                .response_text
+                .as_deref(),
+            Some(safe.as_str())
+        );
+
+        let mut legacy = completed;
+        legacy.response_text = Some(synthetic.to_owned());
+        assert!(!replay_response(&legacy).contains(&synthetic));
+        assert!(!format!("{legacy:?}").contains(&synthetic));
+    }
+
     /// T038 round-1 (replay supersede atomicity): the supersede claim has
     /// exactly one winner, releases cleanly, and heals a crash-orphaned
     /// marker by age. A deterministic RED for the underlying race is not
@@ -956,68 +1578,36 @@ mod tests {
         );
     }
 
-    /// T038 round-2 (Critical repair, deterministic interleave): the
-    /// pre-claim read and verify run UNFENCED, so a contender can claim,
-    /// supersede, and release between our read and our claim. The hook
-    /// stands in for that contender by rewriting the record to Reserved
-    /// right after we win the claim; `begin_tool_replay_verified` must
-    /// RE-DECIDE under the marker and answer as reserved — never
-    /// double-execute off the stale pre-claim decision.
+    /// A legacy Completed record without a source receipt remains inspectable
+    /// but cannot authorize another execution with the same key.
     #[test]
-    fn a_record_superseded_between_read_and_claim_is_not_double_executed() {
-        use std::sync::OnceLock;
-        static STATE: OnceLock<(ProjectStateDir, String)> = OnceLock::new();
-
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let project_state = ProjectStateDir::new(
-            dunce::canonicalize(dir.path())
-                .expect("canonical tempdir")
-                .join("state"),
-        );
-        std::fs::create_dir_all(project_state.as_path()).expect("state dir");
+    fn legacy_completed_without_receipt_requires_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_state = ProjectStateDir::new(dir.path().join("state"));
+        std::fs::create_dir_all(project_state.as_path()).unwrap();
         let request = json!({ "path": "src/x.rs" });
-
-        // Seed an UNVERIFIED completed record (v1 shape: no post-image).
         let ReplayStart::FirstExecution(active) =
             begin_tool_replay_verified(&project_state, "t", "race-key", &request)
-                .expect("first begin")
+                .unwrap()
         else {
             panic!("fresh key must be a first execution");
         };
-        active
-            .complete_with_post_image("first result".to_string(), None)
-            .expect("complete without receipt");
-
-        let key = IdempotencyKey::new("race-key").expect("key");
-        STATE
-            .set((project_state.clone(), key.key_hash()))
-            .expect("state slot");
-
-        // The stand-in contender: after our claim, the record becomes
-        // Reserved (as a real winner's superseding write would make it).
-        fn contender() {
-            let (project_state, key_hash) = STATE.get().expect("state");
-            let store = FileReplayStore::open(project_state).expect("store");
-            let request_hash =
-                RequestHash::for_tool_request("t", &json!({ "path": "src/x.rs" })).expect("hash");
-            store
-                .write_record_atomic(&ReplayRecord::reserved(key_hash.clone(), request_hash))
-                .expect("contender write");
-        }
-        supersede_interleave::install(contender);
-        let outcome = begin_tool_replay_verified(&project_state, "t", "race-key", &request);
-        supersede_interleave::clear();
-
-        match outcome.expect("begin under interleave") {
-            ReplayStart::Replay(response) => assert!(
-                response.contains("still reserved"),
-                "the re-decision under the claim must answer as reserved: {response}"
-            ),
-            ReplayStart::FirstExecution(_) => panic!(
-                "double execution: the stale pre-claim decision was acted on \
-                 although the record was superseded before the claim"
-            ),
-        }
+        active.complete("first result").unwrap();
+        let ReplayStart::Replay(response) =
+            begin_tool_replay_verified(&project_state, "t", "race-key", &request).unwrap()
+        else {
+            panic!("unverified legacy record must not re-execute");
+        };
+        assert!(response.contains("requires reconciliation"));
+        let key = IdempotencyKey::new("race-key").unwrap();
+        let hash = RequestHash::for_tool_request("t", &request).unwrap();
+        let record = FileReplayStore::open(&project_state)
+            .unwrap()
+            .replay_if_present(&key, &hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, ReplayStatus::Completed);
+        assert!(record.post_image.is_none());
     }
 
     #[test]

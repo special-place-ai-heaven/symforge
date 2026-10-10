@@ -7,6 +7,7 @@
 // per write cycle.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -656,13 +657,18 @@ fn prepare_project_wide_rename(
     }
 }
 
-pub(crate) fn begin_mutation_replay<T: Serialize>(
+struct BoundMutationReplay {
+    active: crate::idempotency::ActiveReplay,
+    source: Arc<crate::index_lifecycle::activation::ProjectSourceAuthority>,
+}
+
+fn begin_mutation_replay<T: Serialize>(
     server: &SymForgeServer,
     tool_name: &str,
     input: &T,
     idempotency_key: Option<&str>,
     dry_run: bool,
-) -> Result<Option<crate::idempotency::ActiveReplay>, String> {
+) -> Result<Option<BoundMutationReplay>, String> {
     if dry_run {
         return Ok(None);
     }
@@ -676,19 +682,25 @@ pub(crate) fn begin_mutation_replay<T: Serialize>(
         map.remove("idempotency_key");
     }
 
-    let project_state = server.capture_project_state_dir().ok_or_else(|| {
-        "Error: durable project-state replay is unavailable for this binding.".to_string()
-    })?;
-    match crate::idempotency::begin_tool_replay_verified(
-        &project_state,
-        tool_name,
-        raw_key,
-        &request,
-    ) {
-        Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Ok(Some(active)),
-        Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
-        Err(error) => Err(crate::idempotency::format_tool_error(&error)),
-    }
+    server.index.with_admitted_replay_source(|_, project_state, source| {
+        let project_state = project_state.ok_or_else(|| {
+            "Error: durable project-state replay is unavailable for this binding.".to_string()
+        })?;
+        match crate::idempotency::begin_tool_replay_verified_bound(
+            project_state, tool_name, raw_key, &request, source,
+        ) {
+            Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
+                Ok(Some(BoundMutationReplay {
+                    active,
+                    source: Arc::clone(source),
+                }))
+            }
+            Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
+            Err(error) => Err(crate::idempotency::format_tool_error(&error)),
+        }
+    })
+    .map_err(|_| "Error: durable project-state replay is unavailable for this admission.".to_string())?
+    .ok_or_else(|| "Error: durable project-state replay has no bound source.".to_string())?
 }
 
 /// NON-RESERVING replay probe mirroring [`begin_mutation_replay`]'s hashing.
@@ -727,11 +739,17 @@ fn probe_mutation_replay<T: Serialize>(
         map.remove("idempotency_key");
     }
 
-    let project_state = server.capture_project_state_dir().ok_or_else(|| {
-        "Error: durable project-state replay is unavailable for this binding.".to_string()
-    })?;
-    crate::idempotency::probe_tool_replay_verified(&project_state, tool_name, raw_key, &request)
+    server.index.with_admitted_replay_source(|_, project_state, source| {
+        let project_state = project_state.ok_or_else(|| {
+            "Error: durable project-state replay is unavailable for this binding.".to_string()
+        })?;
+        crate::idempotency::probe_tool_replay_verified_bound(
+            project_state, tool_name, raw_key, &request, source,
+        )
         .map_err(|error| crate::idempotency::format_tool_error(&error))
+    })
+    .map_err(|_| "Error: durable project-state replay is unavailable for this admission.".to_string())?
+    .ok_or_else(|| "Error: durable project-state replay has no bound source.".to_string())?
 }
 
 /// NON-RESERVING replay probe for a `symforge_edit` apply, keyed off the plan
@@ -791,7 +809,7 @@ pub(crate) fn probe_symforge_edit_apply_replay(
 /// never delete files, so a receipt with any absent or unreadable target
 /// means the read-back failed and the record must never replay (no receipt).
 fn complete_mutation_replay(
-    idempotency: &Option<crate::idempotency::ActiveReplay>,
+    idempotency: &Option<BoundMutationReplay>,
     output: &mut String,
     written: &[std::path::PathBuf],
 ) {
@@ -802,40 +820,50 @@ fn complete_mutation_replay(
                 .iter()
                 .all(|target| target.content_digest.is_some())
     });
-    complete_mutation_replay_with_receipt(idempotency, output, post_image);
+    complete_bound_mutation_replay_with_receipt(idempotency, output, post_image);
 }
 
-/// Complete a replay record from a receipt already built off bytes the
-/// caller wrote itself (T038 round-1: the single-target edit tools — no
-/// re-read, no post-permit window).
-pub(crate) fn complete_mutation_replay_with_receipt(
-    idempotency: &Option<crate::idempotency::ActiveReplay>,
+fn complete_bound_mutation_replay_with_receipt(
+    idempotency: &Option<BoundMutationReplay>,
     output: &mut String,
     post_image: Option<crate::idempotency::PostImageReceipt>,
 ) {
-    if let Some(idempotency) = idempotency
-        && let Err(error) = idempotency.complete_with_post_image(output.clone(), post_image)
-    {
+    let Some(idempotency) = idempotency else { return };
+    let bound = post_image.and_then(|receipt| {
+        crate::idempotency::bind_post_image_to_source(receipt, &idempotency.source)
+    });
+    if let Err(error) = idempotency.active.complete_with_post_image(output.clone(), bound) {
         output.push_str(&format!(
             "\nIdempotency warning: failed to store replay result: {error}"
         ));
     }
 }
 
-pub(crate) fn fail_mutation_replay(
-    idempotency: &Option<crate::idempotency::ActiveReplay>,
+fn fail_mutation_replay(
+    idempotency: &Option<BoundMutationReplay>,
     output: &str,
 ) {
     if let Some(idempotency) = idempotency {
-        let _ = idempotency.fail(output.to_string());
+        let _ = idempotency.active.fail(output.to_string());
     }
 }
 
+fn fail_and_return_bound_mutation_replay(
+    idempotency: &Option<BoundMutationReplay>,
+    output: String,
+) -> String {
+    fail_mutation_replay(idempotency, &output);
+    output
+}
+
+/// Shared remediation actions still own their unwrapped replay claim.
 pub(crate) fn fail_and_return_mutation_replay(
     idempotency: &Option<crate::idempotency::ActiveReplay>,
     output: String,
 ) -> String {
-    fail_mutation_replay(idempotency, &output);
+    if let Some(idempotency) = idempotency {
+        let _ = idempotency.fail(output.clone());
+    }
     output
 }
 
@@ -1002,7 +1030,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -1013,7 +1041,7 @@ impl SymForgeServer {
         let file = match file {
             Some(f) => f,
             None => {
-                return fail_and_return_mutation_replay(
+                return fail_and_return_bound_mutation_replay(
                     &idempotency,
                     format::not_found_file(&params.0.path),
                 );
@@ -1025,7 +1053,7 @@ impl SymForgeServer {
         // base would silently discard every earlier routed edit to this file.
         let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
             Ok(base) => base,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let source_authority = if edit_base.rebased {
             edit_format::EditSourceAuthority::WorktreeTarget
@@ -1038,7 +1066,7 @@ impl SymForgeServer {
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
             "replace_symbol_body",
         ) {
-            return fail_and_return_mutation_replay(&idempotency, warning);
+            return fail_and_return_bound_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -1047,7 +1075,7 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
@@ -1072,45 +1100,19 @@ impl SymForgeServer {
             append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
             return result;
         }
-        let old_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-        // Decide where the splice starts based on whether the caller
-        // supplied fresh docs in `new_body`:
-        //   * new_body starts with a doc marker → extend past the old
-        //     attached/orphaned docs so the new ones replace them
-        //     (prevents duplicate JSDoc/XML doc blocks).
-        //   * new_body has no doc marker → preserve existing attached docs
-        //     and attributes. If an inline doc marker shares the symbol line,
-        //     start just after that marker so the old modifier/signature is
-        //     still replaced by the caller's body.
-        // Preserving docs by default was the behavior users expected;
-        // swallowing them silently was the bug surfaced in the v7.5 review.
-        let new_body_supplies_docs = edit::body_starts_with_doc_comment(&params.0.new_body);
-        let effective = if new_body_supplies_docs {
-            sym.effective_start() as usize
-        } else {
-            sym.byte_range.0 as usize
+        let prepared = match crate::edit_safety::structural::prepare_replace(
+            &file.content,
+            &sym,
+            &params.0.new_body,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {error}"));
+            }
         };
-        let raw_line_start = file.content[..effective]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        let line_start = if new_body_supplies_docs {
-            edit::extend_past_orphaned_docs(&file.content, raw_line_start, &sym) as u32
-        } else {
-            edit::docless_replacement_splice_start(
-                &file.content,
-                raw_line_start,
-                sym.byte_range.0 as usize,
-            ) as u32
-        };
-        let indent = edit::detect_indentation(&file.content, sym.byte_range.0);
-        let line_ending = edit::detect_line_ending(&file.content);
-        let normalized = edit::normalize_line_endings(params.0.new_body.as_bytes(), line_ending);
-        let normalized_str = std::str::from_utf8(&normalized).unwrap_or(&params.0.new_body);
-        let indented = edit::apply_indentation(normalized_str, &indent, line_ending);
-        let new_content =
-            edit::apply_splice(&file.content, (line_start, sym.byte_range.1), &indented);
+        let old_bytes = prepared.old_bytes;
+        let inserted_bytes = prepared.inserted_bytes;
+        let new_content = prepared.new_content;
         // TR-06 / FR-009 (design D1): re-verify the `if_match` guard against the
         // bytes ACTUALLY on disk, in the same per-path-locked critical section
         // as the write. `file.content` is the exact base the splice in
@@ -1199,7 +1201,7 @@ impl SymForgeServer {
                 &params.0.name,
                 &sym.kind.to_string(),
                 old_bytes,
-                indented.len(),
+                inserted_bytes,
             )
         );
         result.push_str(&edit_format::format_stale_warnings(
@@ -1214,7 +1216,7 @@ impl SymForgeServer {
         ));
         append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut result, &params.0.path);
-        complete_mutation_replay_with_receipt(
+        complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut result,
             Some(crate::idempotency::post_image_from_written_bytes(
@@ -1315,7 +1317,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -1326,7 +1328,7 @@ impl SymForgeServer {
         let file = match file {
             Some(f) => f,
             None => {
-                return fail_and_return_mutation_replay(
+                return fail_and_return_bound_mutation_replay(
                     &idempotency,
                     format::not_found_file(&params.0.path),
                 );
@@ -1338,7 +1340,7 @@ impl SymForgeServer {
         // base would silently discard every earlier routed edit to this file.
         let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
             Ok(base) => base,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let source_authority = if edit_base.rebased {
             edit_format::EditSourceAuthority::WorktreeTarget
@@ -1351,7 +1353,7 @@ impl SymForgeServer {
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
             "insert_symbol",
         ) {
-            return fail_and_return_mutation_replay(&idempotency, warning);
+            return fail_and_return_bound_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -1360,7 +1362,7 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
@@ -1441,7 +1443,7 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay_with_receipt(
+        complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
             Some(crate::idempotency::post_image_from_written_bytes(
@@ -1537,7 +1539,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -1548,7 +1550,7 @@ impl SymForgeServer {
         let file = match file {
             Some(f) => f,
             None => {
-                return fail_and_return_mutation_replay(
+                return fail_and_return_bound_mutation_replay(
                     &idempotency,
                     format::not_found_file(&params.0.path),
                 );
@@ -1560,7 +1562,7 @@ impl SymForgeServer {
         // base would silently discard every earlier routed edit to this file.
         let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
             Ok(base) => base,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let source_authority = if edit_base.rebased {
             edit_format::EditSourceAuthority::WorktreeTarget
@@ -1573,7 +1575,7 @@ impl SymForgeServer {
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
             "delete_symbol",
         ) {
-            return fail_and_return_mutation_replay(&idempotency, warning);
+            return fail_and_return_bound_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -1582,7 +1584,7 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
@@ -1658,7 +1660,7 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay_with_receipt(
+        complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
             Some(crate::idempotency::post_image_from_written_bytes(
@@ -1756,7 +1758,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -1767,7 +1769,7 @@ impl SymForgeServer {
         let file = match file {
             Some(f) => f,
             None => {
-                return fail_and_return_mutation_replay(
+                return fail_and_return_bound_mutation_replay(
                     &idempotency,
                     format::not_found_file(&params.0.path),
                 );
@@ -1779,7 +1781,7 @@ impl SymForgeServer {
         // base would silently discard every earlier routed edit to this file.
         let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
             Ok(base) => base,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let source_authority = if edit_base.rebased {
             edit_format::EditSourceAuthority::WorktreeTarget
@@ -1792,7 +1794,7 @@ impl SymForgeServer {
             crate::parsing::config_extractors::EditCapability::TextEditSafe,
             "edit_within_symbol",
         ) {
-            return fail_and_return_mutation_replay(&idempotency, warning);
+            return fail_and_return_bound_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -1801,169 +1803,74 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         let sym_start = sym.effective_start() as usize;
         let sym_end = sym.byte_range.1 as usize;
-        let body = &file.content[sym_start..sym_end];
-        let body_str = match std::str::from_utf8(body) {
-            Ok(s) => s,
-            Err(_) => {
-                return fail_and_return_mutation_replay(
-                    &idempotency,
-                    "Error: symbol body is not valid UTF-8.".to_string(),
-                );
-            }
-        };
-        // Normalize both old_text and new_text to match file line endings.
-        let line_ending = edit::detect_line_ending(&file.content);
-        let normalized_old =
-            edit::normalize_line_endings(params.0.old_text.as_bytes(), line_ending);
-        let normalized_old_str =
-            String::from_utf8(normalized_old).unwrap_or_else(|_| params.0.old_text.clone());
-        let normalized_new =
-            edit::normalize_line_endings(params.0.new_text.as_bytes(), line_ending);
-        let normalized_new_str =
-            String::from_utf8(normalized_new).unwrap_or_else(|_| params.0.new_text.clone());
-        // Dogfood #4 (2026-07-06): `occurrence`/`near_line` target one exact
-        // match when `old_text` appears several times within the symbol
-        // (e.g. identical lines across match arms of a long fn).
-        let targeting_modes = usize::from(params.0.replace_all)
-            + usize::from(params.0.occurrence.is_some())
-            + usize::from(params.0.near_line.is_some());
-        if targeting_modes > 1 {
-            return fail_and_return_mutation_replay(
-                &idempotency,
-                "Error: `replace_all`, `occurrence`, and `near_line` are mutually exclusive — pass at most one targeting mode.".to_string(),
-            );
-        }
-        let (new_body, count, untargeted_extra) = if params.0.replace_all {
-            let count = body_str.matches(&normalized_old_str).count();
-            if count > 0 {
-                (
-                    body_str.replace(&normalized_old_str, &normalized_new_str),
-                    count,
-                    0,
-                )
-            } else {
-                // Fallback: try whitespace-flexible matching.
-                match edit::try_whitespace_flexible_replace(
-                    body_str,
-                    &normalized_old_str,
-                    &normalized_new_str,
-                    true,
-                ) {
-                    Some((body, count)) => (body, count, 0),
-                    None => (body_str.to_string(), 0, 0), // hits count==0 error below
-                }
-            }
-        } else if params.0.occurrence.is_some() || params.0.near_line.is_some() {
-            // Targeted single replacement: exact matches only (a targeted edit
-            // must never silently rebind to a whitespace-flexible guess).
-            let positions: Vec<usize> = body_str
-                .match_indices(normalized_old_str.as_str())
-                .map(|(pos, _)| pos)
-                .collect();
-            if positions.is_empty() {
-                (body_str.to_string(), 0, 0) // hits count==0 error below
-            } else {
-                let index = if let Some(n) = params.0.occurrence {
-                    let n = n as usize;
-                    if n == 0 || n > positions.len() {
-                        return fail_and_return_mutation_replay(
-                            &idempotency,
-                            format!(
-                                "Error: occurrence {n} is out of range — `old_text` has {} exact occurrence(s) within `{}`.",
-                                positions.len(),
-                                params.0.name
-                            ),
+        let body_str = file
+            .content
+            .get(sym_start..sym_end)
+            .and_then(|body| std::str::from_utf8(body).ok())
+            .unwrap_or("");
+        let selection = match crate::edit_safety::structural::select_edit_within_body(
+            &file.content,
+            &sym,
+            &params.0.old_text,
+            &params.0.new_text,
+            params.0.replace_all,
+            params.0.occurrence,
+            params.0.near_line,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                use crate::edit_safety::structural::WithinSelectionError;
+                let output = match error {
+                    WithinSelectionError::InvalidSpan | WithinSelectionError::InvalidUtf8 =>
+                        "Error: symbol body is not valid UTF-8.".to_string(),
+                    WithinSelectionError::ConflictingTargeting =>
+                        "Error: `replace_all`, `occurrence`, and `near_line` are mutually exclusive — pass at most one targeting mode.".to_string(),
+                    WithinSelectionError::OccurrenceOutOfRange { requested, total } =>
+                        format!("Error: occurrence {requested} is out of range — `old_text` has {total} exact occurrence(s) within `{}`.", params.0.name),
+                    WithinSelectionError::NotFound => {
+                        let preview_len = if body_str.len() <= 800 {
+                            body_str.len()
+                        } else {
+                            body_str.char_indices()
+                                .map(|(offset, _)| offset)
+                                .take_while(|offset| *offset <= 800)
+                                .last()
+                                .unwrap_or(0)
+                        };
+                        let preview = &body_str[..preview_len];
+                        let truncated = if preview_len < body_str.len() {
+                            format!("\n... ({} more bytes)", body_str.len() - preview_len)
+                        } else {
+                            String::new()
+                        };
+                        let candidate = format!(
+                            "Error: `{}` not found within symbol `{}`. The symbol body is ({} bytes):\n```\n{}{}\n```",
+                            params.0.old_text, params.0.name, body_str.len(), preview, truncated,
                         );
-                    }
-                    n - 1
-                } else {
-                    // near_line: pick the match whose file line is closest.
-                    let target = i64::from(params.0.near_line.unwrap_or(1));
-                    let line_of = |pos: usize| {
-                        1 + file.content[..sym_start + pos]
-                            .iter()
-                            .filter(|&&byte| byte == b'\n')
-                            .count() as i64
-                    };
-                    (0..positions.len())
-                        .min_by_key(|&i| (line_of(positions[i]) - target).abs())
-                        .unwrap_or(0)
-                };
-                let pos = positions[index];
-                let mut body = String::with_capacity(body_str.len() + normalized_new_str.len());
-                body.push_str(&body_str[..pos]);
-                body.push_str(&normalized_new_str);
-                body.push_str(&body_str[pos + normalized_old_str.len()..]);
-                (body, 1, 0)
-            }
-        } else {
-            match body_str.find(&normalized_old_str) {
-                Some(_) => (
-                    body_str.replacen(&normalized_old_str, &normalized_new_str, 1),
-                    1,
-                    body_str
-                        .matches(&normalized_old_str)
-                        .count()
-                        .saturating_sub(1),
-                ),
-                None => {
-                    // Fallback: try whitespace-flexible matching.
-                    match edit::try_whitespace_flexible_replace(
-                        body_str,
-                        &normalized_old_str,
-                        &normalized_new_str,
-                        false,
-                    ) {
-                        Some((body, count)) => (body, count, 0),
-                        None => {
-                            // Show a preview of the symbol body so the LLM can see what's actually there
-                            let preview_len = 800.min(body_str.len());
-                            let preview = &body_str[..preview_len];
-                            let truncated = if preview_len < body_str.len() {
-                                format!("\n... ({} more bytes)", body_str.len() - preview_len)
-                            } else {
-                                String::new()
-                            };
-                            let output = format!(
-                                "Error: `{}` not found within symbol `{}`. \
-                                 The symbol body is ({} bytes):\n```\n{}{}\n```",
-                                params.0.old_text,
-                                params.0.name,
-                                body_str.len(),
-                                preview,
-                                truncated
-                            );
-                            return fail_and_return_mutation_replay(&idempotency, output);
+                        if crate::knowledge::guard_query(&candidate).is_ok() {
+                            candidate
+                        } else {
+                            "Error: edit text not found; source preview withheld by safety policy.".to_string()
                         }
                     }
-                }
+                };
+                let output = if crate::knowledge::guard_query(&output).is_ok() {
+                    output
+                } else {
+                    "Error: edit target rejected by safety policy.".to_string()
+                };
+                return fail_and_return_bound_mutation_replay(&idempotency, output);
             }
         };
+        let new_body = selection.new_body;
+        let count = selection.count;
+        let untargeted_extra = selection.untargeted_extra;
         if params.0.dry_run == Some(true) {
-            if count == 0 {
-                let preview_len = 800.min(body_str.len());
-                let preview = &body_str[..preview_len];
-                let truncated = if preview_len < body_str.len() {
-                    format!("\n... ({} more bytes)", body_str.len() - preview_len)
-                } else {
-                    String::new()
-                };
-                let output = format!(
-                    "Error: `{}` not found within symbol `{}`. \
-                     The symbol body is ({} bytes):\n```\n{}{}\n```",
-                    params.0.old_text,
-                    params.0.name,
-                    body_str.len(),
-                    preview,
-                    truncated
-                );
-                return fail_and_return_mutation_replay(&idempotency, output);
-            }
             let mut result = format!(
                 "{}\n[DRY RUN] Would edit within `{}` in {} ({} replacement(s))",
                 edit_format::format_edit_envelope(
@@ -1985,25 +1892,6 @@ impl SymForgeServer {
             }
             append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
             return result;
-        }
-        if count == 0 {
-            let preview_len = 800.min(body_str.len());
-            let preview = &body_str[..preview_len];
-            let truncated = if preview_len < body_str.len() {
-                format!("\n... ({} more bytes)", body_str.len() - preview_len)
-            } else {
-                String::new()
-            };
-            let output = format!(
-                "Error: `{}` not found within symbol `{}`. \
-                 The symbol body is ({} bytes):\n```\n{}{}\n```",
-                params.0.old_text,
-                params.0.name,
-                body_str.len(),
-                preview,
-                truncated
-            );
-            return fail_and_return_mutation_replay(&idempotency, output);
         }
         let old_sym_bytes = sym_end - sym_start;
         let effective_range = (sym.effective_start(), sym.byte_range.1);
@@ -2069,7 +1957,7 @@ impl SymForgeServer {
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         self.append_impact_footer(&mut out, &params.0.path);
-        complete_mutation_replay_with_receipt(
+        complete_bound_mutation_replay_with_receipt(
             &idempotency,
             &mut out,
             Some(crate::idempotency::post_image_from_written_bytes(

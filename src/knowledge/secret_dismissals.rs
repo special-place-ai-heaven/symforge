@@ -122,8 +122,12 @@ pub fn load_dismissals(root: &Path) -> Result<Vec<DismissalRecord>, String> {
     let Some(bytes) = read_store_bytes(root)? else {
         return Ok(Vec::new());
     };
+    parse_dismissals_bytes(&bytes)
+}
+
+pub(crate) fn parse_dismissals_bytes(bytes: &[u8]) -> Result<Vec<DismissalRecord>, String> {
     let parsed: DismissalStoreFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse dismissal store: {e}"))?;
+        serde_json::from_slice(bytes).map_err(|e| format!("parse dismissal store: {e}"))?;
     Ok(parsed.records)
 }
 
@@ -241,6 +245,19 @@ pub fn scan_with_dismissals(root: &Path, path: &str, bytes: &[u8]) -> crate::kno
     filter_scan_with_dismissals(root, path, bytes, scan)
 }
 
+/// Apply a dismissal snapshot supplied by an already anchored caller.
+pub(crate) fn scan_with_records(
+    path: &str,
+    bytes: &[u8],
+    records: &[DismissalRecord],
+) -> crate::knowledge::SecretScan {
+    let scan = crate::knowledge::scan_secret_bytes(path, bytes);
+    if crate::knowledge::sensitive_path_rule(path).is_some() {
+        return scan;
+    }
+    filter_scan_with_records(path, bytes, scan, records)
+}
+
 /// Filter a sensitive scan: drop findings whose line digest is dismissed.
 /// If all findings are dismissed → Clean. Never admits Indeterminate via dismiss.
 pub fn filter_scan_with_dismissals(
@@ -251,10 +268,10 @@ pub fn filter_scan_with_dismissals(
 ) -> crate::knowledge::SecretScan {
     use crate::knowledge::SecretScan;
     let SecretScan::Sensitive {
-        mut rule_ids,
-        mut finding_count,
-        mut line_ranges,
-        mut findings,
+        rule_ids,
+        finding_count,
+        line_ranges,
+        findings,
     } = scan
     else {
         return scan;
@@ -290,6 +307,42 @@ pub fn filter_scan_with_dismissals(
             findings,
         };
     }
+    filter_scan_with_records(
+        path,
+        bytes,
+        SecretScan::Sensitive {
+            rule_ids,
+            finding_count,
+            line_ranges,
+            findings,
+        },
+        &records,
+    )
+}
+
+fn filter_scan_with_records(
+    path: &str,
+    bytes: &[u8],
+    scan: crate::knowledge::SecretScan,
+    records: &[DismissalRecord],
+) -> crate::knowledge::SecretScan {
+    use crate::knowledge::SecretScan;
+    let SecretScan::Sensitive {
+        mut rule_ids,
+        mut finding_count,
+        mut line_ranges,
+        mut findings,
+    } = scan else {
+        return scan;
+    };
+    if records.is_empty() || findings.len() != finding_count as usize {
+        return SecretScan::Sensitive {
+            rule_ids,
+            finding_count,
+            line_ranges,
+            findings,
+        };
+    }
     let mut kept_findings = Vec::new();
     let mut kept_ranges = Vec::new();
     for (idx, finding) in findings.into_iter().enumerate() {
@@ -298,7 +351,7 @@ pub fn filter_scan_with_dismissals(
             .unwrap_or_default();
         if digest.is_empty()
             || !rule_is_dismissable(finding.rule_id)
-            || !is_dismissed(&records, path, finding.rule_id, &digest)
+            || !is_dismissed(records, path, finding.rule_id, &digest)
         {
             kept_ranges.push(
                 line_ranges

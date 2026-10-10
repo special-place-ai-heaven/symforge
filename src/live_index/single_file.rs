@@ -371,6 +371,7 @@ pub(crate) fn admit_and_index_single_path_with_receipt(
 /// publication of its own (exclusion eviction, unreadable, unstable, missing),
 /// and the caller sends that path through the canonical seam instead. `base`
 /// is the row the stat pass saw; matching bytes reuse it without a parse.
+#[cfg(all(feature = "server", not(feature = "embed")))]
 pub(crate) fn prepare_snapshot_verify_admission(
     relative_path: &str,
     abs_path: &Path,
@@ -388,18 +389,20 @@ pub(crate) fn prepare_snapshot_verify_admission(
     {
         return None;
     }
-    let base_hash = base.map(|row| row.content_hash.clone());
-    let terminal = |scouted, disposition| SnapshotVerifiedFile {
-        path: relative_path.to_string(),
-        scouted,
-        admission: SnapshotVerifiedAdmission::Terminal(disposition),
-        base_hash: base_hash.clone(),
-    };
     let mut scouted = scout_single_path(relative_path, abs_path).ok()?;
-    if let Some(disposition) = catalog_terminal_disposition(&scouted.decision) {
-        return Some(terminal(scouted, disposition));
+    let prepare = |scouted, bytes| {
+        prepare_snapshot_verify_from_observation(
+            relative_path,
+            scouted,
+            bytes,
+            base,
+            |targets, bytes| classify_for_project(abs_path, relative_path, targets, bytes),
+        )
+    };
+    if catalog_terminal_disposition(&scouted.decision).is_some() {
+        return prepare(scouted, None);
     }
-    let ScoutDecision::Ingest { targets } = scouted.decision else {
+    let ScoutDecision::Ingest { .. } = scouted.decision else {
         return None;
     };
     if let Some(root) = project_root_from_paths(abs_path, relative_path)
@@ -408,19 +411,53 @@ pub(crate) fn prepare_snapshot_verify_admission(
         scouted.decision = ScoutDecision::MetadataOnly {
             reason: MetadataOnlyReason::GeneratedOrVendor,
         };
-        let disposition = catalog_terminal_disposition(&scouted.decision)?;
-        return Some(terminal(scouted, disposition));
+        return prepare(scouted, None);
     }
     let bytes = match crate::live_index::store::stable_read_file(abs_path, &scouted.stamp) {
         crate::live_index::store::StableReadOutcome::Accepted { bytes, .. } => bytes,
         crate::live_index::store::StableReadOutcome::HardSkip { reason } => {
             scouted.decision = ScoutDecision::HardSkip { reason };
-            return Some(terminal(scouted, FileDisposition::HardSkip { reason }));
+            return prepare(scouted, None);
         }
         _ => return None,
     };
+    prepare(scouted, Some(bytes))
+}
+
+/// Parse one already admitted, stable observation without reopening its path.
+/// The caller supplies the shared scout decision, enforces source exclusions
+/// and path spelling, and binds the content classifier to its admitted source.
+/// Missing bytes for an ingest decision are unsettled, never an empty file.
+pub(crate) fn prepare_snapshot_verify_from_observation(
+    relative_path: &str,
+    scouted: crate::domain::ScoutedEntry,
+    bytes: Option<Vec<u8>>,
+    base: Option<&Arc<IndexedFile>>,
+    classify: impl FnOnce(
+        crate::domain::IndexTargets,
+        &[u8],
+    ) -> crate::knowledge::StableContentAdmission,
+) -> Option<SnapshotVerifiedFile> {
+    #[cfg(test)]
+    if test_scout_failure_path().lock().as_deref() == Some(relative_path) {
+        return None;
+    }
+    let base_hash = base.map(|row| row.content_hash.clone());
+    let terminal = |scouted, disposition| SnapshotVerifiedFile {
+        path: relative_path.to_string(),
+        scouted,
+        admission: SnapshotVerifiedAdmission::Terminal(disposition),
+        base_hash: base_hash.clone(),
+    };
+    if let Some(disposition) = catalog_terminal_disposition(&scouted.decision) {
+        return Some(terminal(scouted, disposition));
+    }
+    let ScoutDecision::Ingest { targets } = scouted.decision else {
+        return None;
+    };
+    let bytes = bytes?;
     if let crate::knowledge::StableContentAdmission::MetadataOnly(reason) =
-        classify_for_project(abs_path, relative_path, targets, &bytes)
+        classify(targets, &bytes)
     {
         return Some(terminal(scouted, FileDisposition::MetadataOnly { reason }));
     }

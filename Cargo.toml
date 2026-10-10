@@ -91,7 +91,7 @@ server = [
 # query + git, exposed via the `symforge::embed` facade. Compiles NONE of the
 # daemon/sidecar/protocol-server/CLI surface, so server-side breakage (unsafe
 # syscalls, axum, rmcp, process signaling) structurally cannot reach an embedder.
-embed = []
+embed = ["dep:libgit2-sys"]
 # Program 015 Sprint-0 falsifier spike still pending promotion: the Rust
 # resolver only (`src/parsing/resolver/`, targeted at S3 — no consumer yet).
 # Graph BFS (C-S1A-002) and the zstd team-artifact round-trip (C-S1A-005) have
@@ -177,6 +177,7 @@ regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"], optional = true }
 globset = "0.4"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+libgit2-sys = { version = "0.18.5", optional = true, default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 libc = "0.2.183"
@@ -191,8 +192,11 @@ cap-std = "4.0.3"
 # Native Win32 calls: the self-update move-aside fallback (cli/update.rs),
 # sidecar process waits, and filesystem identity queries.
 windows = { version = "0.62", features = [
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Threading",
 ] }
 

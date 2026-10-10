@@ -782,6 +782,7 @@ impl StatePlacement {
 pub enum UserLocalPlacementReason {
     ExplicitProtected,
     ProjectLocalUnavailable { safe_reason: AccessErrorKind },
+    HostSelected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

@@ -3887,6 +3887,16 @@ impl ProjectInstance {
                 binding.root_id.0
             )
         })?;
+        let source_authority =
+            live_index::index_lifecycle::activation::project_source_authority(canonical_root);
+        let admitted_physical_root = admission
+            .slot()
+            .binding()
+            .map_err(|refusal| anyhow::anyhow!("project admission retired: {refusal:?}"))?
+            .physical_root();
+        if source_authority.admission_binding().physical_root() != admitted_physical_root {
+            anyhow::bail!("admitted project source changed before snapshot restore");
+        }
 
         let persistence_status = if matches!(
             &state_placement,
@@ -3905,12 +3915,18 @@ impl ProjectInstance {
             Some(budget) => bootstrap_project_index_within(
                 canonical_root,
                 &state_placement,
+                &source_authority,
                 budget,
                 &curation_coordinator,
                 persistence_status,
                 &background_load,
             ),
-            None => bootstrap_project_index(canonical_root, &state_placement, &background_load)
+            None => bootstrap_project_index(
+                canonical_root,
+                &state_placement,
+                &source_authority,
+                &background_load,
+            )
                 .map(|index| (index, ColdIndex::Loaded)),
         };
         let index = match bootstrapped {
@@ -4362,9 +4378,10 @@ fn spawn_local_ref_reconcile(
 fn bootstrap_project_index(
     canonical_root: &Path,
     state_placement: &StatePlacement,
+    source_authority: &Arc<live_index::index_lifecycle::activation::ProjectSourceAuthority>,
     background: &Arc<BackgroundLoad>,
 ) -> anyhow::Result<SharedIndex> {
-    match restore_project_snapshot(canonical_root, state_placement, background) {
+    match restore_project_snapshot(canonical_root, state_placement, source_authority, background)? {
         Some(index) => Ok(index),
         None => cold_load_project_index(canonical_root, state_placement),
     }
@@ -4604,12 +4621,15 @@ impl ColdLoadJob {
 fn bootstrap_project_index_within(
     canonical_root: &Path,
     state_placement: &StatePlacement,
+    source_authority: &Arc<live_index::index_lifecycle::activation::ProjectSourceAuthority>,
     budget: Duration,
     curation_coordinator: &Arc<crate::protocol::knowledge_curation::KnowledgeCurationCoordinator>,
     persistence_status: CapabilityStatus,
     background: &Arc<BackgroundLoad>,
 ) -> anyhow::Result<(SharedIndex, ColdIndex)> {
-    if let Some(index) = restore_project_snapshot(canonical_root, state_placement, background) {
+    if let Some(index) =
+        restore_project_snapshot(canonical_root, state_placement, source_authority, background)?
+    {
         return Ok((index, ColdIndex::Loaded));
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -4698,11 +4718,18 @@ fn degrade_on_capacity_refusal(
 fn restore_project_snapshot(
     canonical_root: &Path,
     state_placement: &StatePlacement,
+    source_authority: &Arc<live_index::index_lifecycle::activation::ProjectSourceAuthority>,
     background: &Arc<BackgroundLoad>,
-) -> Option<SharedIndex> {
+) -> anyhow::Result<Option<SharedIndex>> {
     let source_exclusions =
         crate::discovery::SourceExclusions::for_state_placement(canonical_root, state_placement);
-    if let Some(snapshot) = live_index::persist::load_snapshot(canonical_root, state_placement) {
+    if let Some(snapshot) = live_index::persist::load_snapshot_bound(
+        canonical_root,
+        state_placement,
+        source_authority,
+    )
+    .map_err(|refusal| anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"))?
+    {
         let file_count = snapshot.files.len();
         let snapshot_mtimes: HashMap<String, u64> = snapshot
             .files
@@ -4710,7 +4737,12 @@ fn restore_project_snapshot(
             .map(|(path, file)| (path.clone(), file.mtime_secs))
             .collect();
         let (live, code_signals) =
-            live_index::persist::snapshot_to_live_index_with_code_signals(snapshot, canonical_root);
+            live_index::persist::snapshot_to_live_index_with_code_signals_bound(
+                snapshot,
+                canonical_root,
+                source_authority,
+            )
+            .map_err(|refusal| anyhow::anyhow!("admitted snapshot source refused: {refusal:?}"))?;
         tracing::info!(
             files = file_count,
             load_source = ?live.load_source(),
@@ -4738,27 +4770,25 @@ fn restore_project_snapshot(
             // observer incarnation current at its spawn; the watcher's later
             // registration in `activate()` makes it stale, and the lane then
             // refuses its observations (late V10 callbacks unreachable).
-            let observer =
-                live_index::index_lifecycle::activation::project_source_authority(canonical_root)
-                    .active_observer();
+            let bg_authority = Arc::clone(source_authority);
             // A stopped slot retires this index; the verify stops with it
             // instead of re-reading a repository nobody will query.
             let background = Arc::clone(background);
             handle.spawn(async move {
-                live_index::persist::background_verify_cancellable(
+                live_index::persist::background_verify_cancellable_bound(
                     bg_index,
                     bg_root,
                     snapshot_mtimes,
-                    observer,
+                    bg_authority,
                     move || background.cancel.load(Ordering::Acquire),
                 )
                 .await;
             });
         }
 
-        return Some(shared);
+        return Ok(Some(shared));
     }
-    None
+    Ok(None)
 }
 
 fn cold_load_project_index(
@@ -17929,8 +17959,11 @@ mod tests {
             panic!("B must remain a valid automatic project root");
         };
         let placement_b = crate::discovery::resolve_state_placement(&binding_b);
-        let restored = bootstrap_project_index(&canonical_b, &placement_b, &Arc::default())
-            .expect("restore B from snapshot");
+        let authority_b =
+            live_index::index_lifecycle::activation::project_source_authority(&canonical_b);
+        let restored =
+            bootstrap_project_index(&canonical_b, &placement_b, &authority_b, &Arc::default())
+                .expect("restore B from snapshot");
         {
             let guard = restored.read();
             assert_eq!(
@@ -18712,6 +18745,7 @@ mod tests {
         let (index, cold) = bootstrap_project_index_within(
             &root,
             &placement,
+            &live_index::index_lifecycle::activation::project_source_authority(&root),
             Duration::from_secs(60),
             &coordinator,
             CapabilityStatus::Available,

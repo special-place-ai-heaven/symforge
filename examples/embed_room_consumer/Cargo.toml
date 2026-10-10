@@ -1,0 +1,11 @@
+[package]
+name = "embed-room-consumer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+symforge = { path = "../..", default-features = false, features = ["embed"] }
+serde_json = "1"

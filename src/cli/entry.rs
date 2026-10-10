@@ -575,7 +575,7 @@ async fn run_local_mcp_server_async(
         // V11 bootstrap (C4b): the local stdio project admits through the
         // process registry before its index is built; a refusal fails the
         // startup honestly.
-        live_index::index_lifecycle::activation::admit_project(
+        let admission = live_index::index_lifecycle::activation::admit_project(
             live_index::index_lifecycle::process_runtime::SurfaceKind::Stdio,
             &binding.canonical_root,
             &binding.root_id.0,
@@ -588,9 +588,21 @@ async fn run_local_mcp_server_async(
                 binding.root_id.0
             )
         })?;
+        let source_authority =
+            live_index::index_lifecycle::activation::project_source_authority(&root);
+        let admitted_physical_root = admission
+            .binding()
+            .map_err(|refusal| anyhow::anyhow!("project admission retired: {refusal:?}"))?
+            .physical_root();
+        if source_authority.admission_binding().physical_root() != admitted_physical_root {
+            anyhow::bail!("admitted local source changed before snapshot restore");
+        }
 
         // Try loading from persisted snapshot first (fast path: no re-parsing).
-        let index = if let Some(snapshot) = persist::load_snapshot(&root, &state_placement) {
+        let index = if let Some(snapshot) =
+            persist::load_snapshot_bound(&root, &state_placement, &source_authority)
+                .map_err(|refusal| anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"))?
+        {
             let file_count = snapshot.files.len();
             // Extract mtime map before consuming snapshot
             let snapshot_mtimes: std::collections::HashMap<String, u64> = snapshot
@@ -599,8 +611,12 @@ async fn run_local_mcp_server_async(
                 .map(|(k, v)| (k.clone(), v.mtime_secs))
                 .collect();
 
-            let (live, code_signals) =
-                persist::snapshot_to_live_index_with_code_signals(snapshot, &root);
+            let (live, code_signals) = persist::snapshot_to_live_index_with_code_signals_bound(
+                snapshot,
+                &root,
+                &source_authority,
+            )
+            .map_err(|refusal| anyhow::anyhow!("admitted snapshot source refused: {refusal:?}"))?;
             tracing::info!(
                 files = file_count,
                 load_source = ?live.load_source(),
@@ -621,10 +637,16 @@ async fn run_local_mcp_server_async(
             // V11 callbacks census (C3b): carry the observer incarnation
             // current at spawn; a later watcher registration makes it stale
             // and the lane refuses its observations.
-            let observer = live_index::index_lifecycle::activation::project_source_authority(&root)
-                .active_observer();
+            let bg_authority = source_authority.clone();
             tokio::spawn(async move {
-                persist::background_verify(bg_index, bg_root, snapshot_mtimes, observer).await;
+                persist::background_verify_cancellable_bound(
+                    bg_index,
+                    bg_root,
+                    snapshot_mtimes,
+                    bg_authority,
+                    || false,
+                )
+                .await;
             });
 
             shared

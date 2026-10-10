@@ -247,53 +247,7 @@ pub struct SidecarState {
 /// truncation occurred. A canonical truncation suffix is appended when
 /// items were dropped.
 pub fn build_with_budget(items: &[String], max_bytes: u64) -> (String, usize) {
-    if max_bytes == 0 || items.is_empty() {
-        return (items.join("\n"), 0);
-    }
-
-    let mut included = Vec::new();
-    let mut used_bytes: u64 = 0;
-
-    for (i, item) in items.iter().enumerate() {
-        // Each item costs: len + 1 newline (except the last).
-        let item_cost = item.len() as u64 + if i + 1 < items.len() { 1 } else { 0 };
-        if used_bytes + item_cost > max_bytes && !included.is_empty() {
-            // Would exceed budget — stop here.
-            let remaining = items.len() - included.len();
-            let mut text = included.join("\n");
-            text.push_str(&budget_truncation_suffix(max_bytes, remaining));
-            return (text, remaining);
-        }
-        used_bytes += item_cost;
-        included.push(item.as_str());
-    }
-
-    // After the loop: if fewer items were included than available (e.g. because
-    // the very first item exceeded max_bytes and forced inclusion while the rest
-    // were silently dropped), always append the truncation suffix so callers
-    // know output was cut short.
-    if included.len() < items.len() {
-        let remaining = items.len() - included.len();
-        let mut text = included.join("\n");
-        text.push_str(&budget_truncation_suffix(max_bytes, remaining));
-        return (text, remaining);
-    }
-
-    (included.join("\n"), 0)
-}
-
-const CANONICAL_TRUNCATION_MARKER: &str = "[truncated]";
-const APPROX_BYTES_PER_TOKEN: u64 = 4;
-
-fn approx_tokens_from_bytes(bytes: u64) -> u64 {
-    bytes.saturating_add(APPROX_BYTES_PER_TOKEN - 1) / APPROX_BYTES_PER_TOKEN
-}
-
-fn budget_truncation_suffix(max_bytes: u64, remaining: usize) -> String {
-    let max_tokens = approx_tokens_from_bytes(max_bytes);
-    format!(
-        "\n{CANONICAL_TRUNCATION_MARKER} Truncated at ~{max_tokens} tokens. {remaining} additional output line(s) not shown."
-    )
+    crate::index_lifecycle::guidance::read_context::build_with_budget(items, max_bytes)
 }
 
 // ---------------------------------------------------------------------------

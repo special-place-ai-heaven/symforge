@@ -21,10 +21,7 @@ use super::disambiguation::{
     is_receiver_method_call, matches_exact_symbol_qualified_name, matches_exact_symbol_reference,
     parse_reference_kind_filter,
 };
-// Only consumed by the server-gated `sidecar::handlers`; gating the re-export
-// keeps the engine-only `embed` build free of an unused-import error under
-// `warnings = "deny"` (the consumer is absent when `server` is off).
-#[cfg(feature = "server")]
+// Shared file-context rendering consumes this in both native and MCP builds.
 pub(crate) use super::health_view::is_expected_framework_partial_parse;
 pub use super::health_view::{
     AdmissionTierLookupView, EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
@@ -1468,6 +1465,18 @@ impl LiveIndex {
         include_vendor: bool,
         include_personal_tooling: bool,
     ) -> SearchFilesResolveView {
+        self.capture_search_files_resolve_view_with_scope(
+            hint, include_vendor, include_personal_tooling, &PathScope::Any,
+        )
+    }
+
+    pub(crate) fn capture_search_files_resolve_view_with_scope(
+        &self,
+        hint: &str,
+        include_vendor: bool,
+        include_personal_tooling: bool,
+        path_scope: &PathScope,
+    ) -> SearchFilesResolveView {
         const RESOLVE_PATH_AMBIGUOUS_CAP: usize = 10;
         let normalized_hint = normalize_path_query(hint);
         if normalized_hint.is_empty() {
@@ -1476,6 +1485,7 @@ impl LiveIndex {
         let path_allowed = |path: &str| -> bool {
             (include_vendor || !is_vendor_path(path))
                 && (include_personal_tooling || !is_personal_tooling_path(path))
+                && path_scope.matches(path)
         };
 
         if self.get_file(&normalized_hint).is_some() && path_allowed(&normalized_hint) {
@@ -1664,6 +1674,32 @@ impl LiveIndex {
         include_personal_tooling: bool,
         path_scope: &PathScope,
     ) -> SearchFilesView {
+        self.capture_search_files_view_with_test_filter(
+            query,
+            limit,
+            current_file,
+            coupling_context,
+            include_vendor,
+            include_personal_tooling,
+            path_scope,
+            true,
+        )
+    }
+
+    /// Apply test-file policy before ranking and limiting, including metadata
+    /// hits. The compatibility wrapper above preserves its inclusive behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_search_files_view_with_test_filter(
+        &self,
+        query: &str,
+        limit: usize,
+        current_file: Option<&str>,
+        coupling_context: Option<(&str, &SearchFilesCouplingNeighbors)>,
+        include_vendor: bool,
+        include_personal_tooling: bool,
+        path_scope: &PathScope,
+        include_tests: bool,
+    ) -> SearchFilesView {
         let limit = limit.clamp(1, 50);
         let normalized_query = normalize_path_query(query);
         if normalized_query.is_empty() {
@@ -1678,6 +1714,8 @@ impl LiveIndex {
             path_scope.matches(path)
                 && (include_vendor || !is_vendor_path(path))
                 && (include_personal_tooling || !is_personal_tooling_path(path))
+                && (include_tests
+                    || !crate::domain::FileClassification::for_code_path(path).is_test)
         };
 
         // Detect glob patterns and handle them with globset.
@@ -2349,7 +2387,7 @@ impl LiveIndex {
         out
     }
 
-    fn build_find_references_view(
+    pub(crate) fn build_find_references_view(
         &self,
         refs: &[(&str, &ReferenceRecord)],
         total_limit: usize,

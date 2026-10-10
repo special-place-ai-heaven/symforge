@@ -88,6 +88,9 @@ pub use crate::index_lifecycle::public_api::{
     TextSearchResult,
 };
 
+/// Additive engine query contracts, versioned separately from the frozen V11 core.
+pub mod parity;
+
 #[cfg(test)]
 mod contract {
     //! Compile-time tripwire for the semver-public V11 embedder facade.
