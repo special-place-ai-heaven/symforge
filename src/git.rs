@@ -35,6 +35,16 @@ impl GitRepo {
         Ok(Self { repo })
     }
 
+    /// The repository whose work tree IS `root`. Discovery that lands on an
+    /// enclosing repository would report paths relative to a different root,
+    /// so it is treated as "no repository".
+    #[cfg(any(feature = "embed", test))]
+    pub(crate) fn open_worktree_root(root: &Path) -> Option<Self> {
+        let repo = Self::open(root).ok()?;
+        let workdir = std::fs::canonicalize(repo.workdir()?).ok()?;
+        (workdir == std::fs::canonicalize(root).ok()?).then_some(repo)
+    }
+
     /// Return the set of paths tracked by the git index (staged tree), using
     /// `git ls-files` semantics: every entry currently recorded in the index.
     ///
@@ -319,6 +329,18 @@ impl GitRepo {
         max_commits: usize,
         since_days: u32,
     ) -> Result<Vec<LogEntry>, String> {
+        self.log_with_stats_until(max_commits, since_days, &mut || false)
+    }
+
+    /// [`Self::log_with_stats`] that polls `stop` before each commit and
+    /// returns `Err` once it reports true, so a bounded caller can abandon
+    /// the walk between commits. The walk itself is identical.
+    pub(crate) fn log_with_stats_until(
+        &self,
+        max_commits: usize,
+        since_days: u32,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<LogEntry>, String> {
         let mut revwalk = self
             .repo
             .revwalk()
@@ -342,6 +364,9 @@ impl GitRepo {
         for oid_result in revwalk {
             if entries.len() >= max_commits {
                 break;
+            }
+            if stop() {
+                return Err("git history walk stopped".to_string());
             }
 
             let oid = oid_result.map_err(|e| format!("revwalk error: {e}"))?;

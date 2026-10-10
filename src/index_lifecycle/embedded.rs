@@ -438,6 +438,8 @@ struct EmbeddedBinding {
     #[cfg(feature = "embed")]
     git_view: std::sync::Mutex<Option<Arc<super::embed_git::PreparedGitView>>>,
     #[cfg(feature = "embed")]
+    temporal_cache: Arc<super::embed_temporal::TemporalCache>,
+    #[cfg(feature = "embed")]
     open_reset: Option<crate::embed::parity::source_options::SnapshotResetReceipt>,
     state: std::sync::Mutex<EmbeddedRuntimeState>,
     control: std::sync::Mutex<WorkerControl>,
@@ -531,6 +533,8 @@ impl EmbeddedBinding {
             restored_mtimes: std::sync::Mutex::new(restored_mtimes),
             #[cfg(feature = "embed")]
             git_view: std::sync::Mutex::new(None),
+            #[cfg(feature = "embed")]
+            temporal_cache: Arc::default(),
             #[cfg(feature = "embed")]
             open_reset: open_reset.clone(),
             state: std::sync::Mutex::new(EmbeddedRuntimeState {
@@ -1746,6 +1750,7 @@ impl EmbeddedSourceHandle {
             authority_publication,
             authority,
             state_anchor: binding.state_anchor.clone(),
+            temporal_cache: Arc::clone(&binding.temporal_cache),
         })
     }
 

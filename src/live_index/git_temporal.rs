@@ -448,11 +448,30 @@ impl GitTemporalIndex {
     /// stats. Designed to run on a blocking thread.
     pub fn compute(repo_root: &Path) -> Self {
         let start = Instant::now();
+        match load_commits(repo_root) {
+            Ok(commits) => Self::aggregate(commits, start),
+            Err(reason) => Self::unavailable(reason),
+        }
+    }
 
-        let commits = match load_commits(repo_root) {
-            Ok(c) => c,
-            Err(reason) => return Self::unavailable(reason),
-        };
+    /// [`Self::compute`] over an already-open repository whose walk `stop`
+    /// may abandon between commits. The embedded lanes use this with their
+    /// operation budget; the producer and aggregator are the MCP ones.
+    #[cfg(any(feature = "embed", test))]
+    pub(crate) fn compute_from_repo(
+        repo: &crate::git::GitRepo,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Self {
+        let start = Instant::now();
+        match load_commits_from(repo, stop) {
+            Ok(commits) => Self::aggregate(commits, start),
+            Err(reason) => Self::unavailable(reason),
+        }
+    }
+
+    /// The aggregator shared by every producer: per-file churn, ownership,
+    /// Jaccard co-change, and repo-wide stats from the walked commits.
+    fn aggregate(commits: Vec<ParsedCommit>, start: Instant) -> Self {
         if commits.is_empty() {
             return Self {
                 files: HashMap::new(),
@@ -711,10 +730,17 @@ impl GitTemporalIndex {
 
 /// Load commits from git history using libgit2 (no child processes).
 fn load_commits(repo_root: &Path) -> Result<Vec<ParsedCommit>, String> {
-    use crate::git::GitRepo;
+    let repo = crate::git::GitRepo::open(repo_root)?;
+    load_commits_from(&repo, &mut || false)
+}
 
-    let repo = GitRepo::open(repo_root)?;
-    let entries = repo.log_with_stats(MAX_COMMITS as usize, WINDOW_DAYS)?;
+/// The history producer: the newest `MAX_COMMITS` commits within
+/// `WINDOW_DAYS`, each diffed against its first parent.
+fn load_commits_from(
+    repo: &crate::git::GitRepo,
+    stop: &mut dyn FnMut() -> bool,
+) -> Result<Vec<ParsedCommit>, String> {
+    let entries = repo.log_with_stats_until(MAX_COMMITS as usize, WINDOW_DAYS, stop)?;
 
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -871,223 +897,11 @@ impl ParsedCommitBuilder {
 
 #[cfg(test)]
 impl GitTemporalIndex {
-    /// Compute from a pre-built log string (skips the `git log` subprocess).
+    /// Compute from a pre-built log string through the shared aggregator.
     fn compute_from_log(raw_log: &str, now_unix: u64) -> Self {
         let start = Instant::now();
         let commits = parse_git_log(raw_log, now_unix);
-        // Re-use the same computation logic — just inline the post-parse path.
-        // We duplicate a bit to avoid making the `run_git_log` call.
-        Self::compute_from_parsed(commits, start)
-    }
-
-    fn compute_from_parsed(commits: Vec<ParsedCommit>, start: Instant) -> Self {
-        if commits.is_empty() {
-            return Self {
-                files: HashMap::new(),
-                stats: GitTemporalStats {
-                    total_commits_analyzed: 0,
-                    analysis_window_days: WINDOW_DAYS,
-                    hotspots: Vec::new(),
-                    most_coupled: Vec::new(),
-                    computed_at: SystemTime::now(),
-                    compute_duration: start.elapsed(),
-                },
-                state: GitTemporalState::Ready,
-            };
-        }
-
-        let total_commits = commits.len() as u32;
-        let decay_lambda = (2.0_f64).ln() / HALF_LIFE_DAYS;
-
-        let mut file_commit_indices: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut file_authors: HashMap<String, HashMap<String, u32>> = HashMap::new();
-        let mut file_last_commit_idx: HashMap<String, usize> = HashMap::new();
-        let mut file_raw_churn: HashMap<String, f64> = HashMap::new();
-
-        for (idx, commit) in commits.iter().enumerate() {
-            let weight = (-decay_lambda * commit.days_ago).exp();
-            for file_path in &commit.files {
-                file_commit_indices
-                    .entry(file_path.clone())
-                    .or_default()
-                    .push(idx);
-                *file_authors
-                    .entry(file_path.clone())
-                    .or_default()
-                    .entry(commit.author.clone())
-                    .or_insert(0) += 1;
-                file_last_commit_idx
-                    .entry(file_path.clone())
-                    .and_modify(|existing| {
-                        if commit.days_ago < commits[*existing].days_ago {
-                            *existing = idx;
-                        }
-                    })
-                    .or_insert(idx);
-                *file_raw_churn.entry(file_path.clone()).or_insert(0.0) += weight;
-            }
-        }
-
-        let mut churn_entries: Vec<(String, f64)> = file_raw_churn.into_iter().collect();
-        churn_entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let file_count = churn_entries.len();
-        let mut normalized_churn: HashMap<String, f32> = HashMap::with_capacity(file_count);
-        for (rank, (path, _)) in churn_entries.iter().enumerate() {
-            let score = if file_count <= 1 {
-                if churn_entries[0].1 > 0.0 { 1.0 } else { 0.0 }
-            } else {
-                rank as f32 / (file_count - 1) as f32
-            };
-            normalized_churn.insert(path.clone(), score);
-        }
-
-        let mut pair_counts: HashMap<(String, String), u32> = HashMap::new();
-        for commit in &commits {
-            let mut sorted_files: Vec<&str> = commit.files.iter().map(|s| s.as_str()).collect();
-            sorted_files.sort_unstable();
-            sorted_files.dedup();
-            if sorted_files.len() > MEGA_COMMIT_THRESHOLD {
-                continue;
-            }
-            for i in 0..sorted_files.len() {
-                for j in (i + 1)..sorted_files.len() {
-                    let key = (sorted_files[i].to_string(), sorted_files[j].to_string());
-                    *pair_counts.entry(key).or_insert(0) += 1;
-                }
-            }
-        }
-
-        let mut file_co_changes: HashMap<String, Vec<CoChangeEntry>> = HashMap::new();
-        let mut weak_file_co_changes: HashMap<String, Vec<CoChangeEntry>> = HashMap::new();
-        for ((file_a, file_b), shared) in &pair_counts {
-            let count_a = file_commit_indices
-                .get(file_a)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
-            let count_b = file_commit_indices
-                .get(file_b)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
-            let Some((jaccard, strength)) = classify_co_change_pair(*shared, count_a, count_b)
-            else {
-                continue;
-            };
-            let target = match strength {
-                CoChangeStrength::Strong => &mut file_co_changes,
-                CoChangeStrength::Weak => &mut weak_file_co_changes,
-            };
-            target
-                .entry(file_a.clone())
-                .or_default()
-                .push(CoChangeEntry {
-                    path: file_b.clone(),
-                    coupling_score: jaccard,
-                    shared_commits: *shared,
-                });
-            target
-                .entry(file_b.clone())
-                .or_default()
-                .push(CoChangeEntry {
-                    path: file_a.clone(),
-                    coupling_score: jaccard,
-                    shared_commits: *shared,
-                });
-        }
-        for entries in file_co_changes.values_mut() {
-            sort_and_cap_co_changes(entries, CO_CHANGE_CAP_PER_FILE);
-        }
-        for entries in weak_file_co_changes.values_mut() {
-            sort_and_cap_co_changes(entries, WEAK_CO_CHANGE_CAP_PER_FILE);
-        }
-
-        let mut files: HashMap<String, GitFileHistory> = HashMap::with_capacity(file_count);
-        for (path, commit_indices) in &file_commit_indices {
-            let commit_count = commit_indices.len() as u32;
-            let churn_score = normalized_churn.get(path).copied().unwrap_or(0.0);
-            let last_idx = file_last_commit_idx.get(path).copied().unwrap_or(0);
-            let last = &commits[last_idx];
-            let last_commit = CommitSummary {
-                hash: last.hash.clone(),
-                timestamp: last.timestamp.clone(),
-                author: last.author.clone(),
-                message_head: truncate_message(&last.message, 72),
-                days_ago: last.days_ago,
-            };
-            let contributors = file_authors
-                .get(path)
-                .map(|authors| {
-                    let total = authors.values().sum::<u32>() as f32;
-                    let mut shares: Vec<ContributorShare> = authors
-                        .iter()
-                        .map(|(author, count)| ContributorShare {
-                            author: author.clone(),
-                            commit_count: *count,
-                            percentage: (*count as f32 / total) * 100.0,
-                        })
-                        .collect();
-                    shares.sort_by(|a, b| {
-                        b.percentage
-                            .partial_cmp(&a.percentage)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    shares.truncate(CONTRIBUTOR_CAP);
-                    shares
-                })
-                .unwrap_or_default();
-            let co_changes = file_co_changes.remove(path).unwrap_or_default();
-            let weak_co_changes = weak_file_co_changes.remove(path).unwrap_or_default();
-            files.insert(
-                path.clone(),
-                GitFileHistory {
-                    commit_count,
-                    churn_score,
-                    last_commit,
-                    contributors,
-                    co_changes,
-                    weak_co_changes,
-                },
-            );
-        }
-
-        let mut hotspots: Vec<(String, f32)> = files
-            .iter()
-            .map(|(p, h)| (p.clone(), h.churn_score))
-            .collect();
-        hotspots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        hotspots.truncate(HOTSPOT_CAP);
-
-        let mut most_coupled: Vec<(String, String, f32)> = pair_counts
-            .iter()
-            .filter_map(|((a, b), shared)| {
-                let ca = file_commit_indices
-                    .get(a)
-                    .map(|v| v.len() as u32)
-                    .unwrap_or(0);
-                let cb = file_commit_indices
-                    .get(b)
-                    .map(|v| v.len() as u32)
-                    .unwrap_or(0);
-                match classify_co_change_pair(*shared, ca, cb) {
-                    Some((j, CoChangeStrength::Strong)) => Some((a.clone(), b.clone(), j)),
-                    _ => None,
-                }
-            })
-            .collect();
-        most_coupled.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        most_coupled.truncate(COUPLED_PAIRS_CAP);
-
-        Self {
-            files,
-            stats: GitTemporalStats {
-                total_commits_analyzed: total_commits,
-                analysis_window_days: WINDOW_DAYS,
-                hotspots,
-                most_coupled,
-                computed_at: SystemTime::now(),
-                compute_duration: start.elapsed(),
-            },
-            state: GitTemporalState::Ready,
-        }
+        Self::aggregate(commits, start)
     }
 }
 

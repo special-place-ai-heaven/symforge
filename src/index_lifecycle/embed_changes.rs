@@ -33,13 +33,9 @@ pub(super) fn check_project(
     Ok(())
 }
 
-/// The repository whose work tree IS this source root. Discovery that lands
-/// on an enclosing repository would report paths relative to a different
-/// root, so it is treated as "no repository".
+/// The repository whose work tree IS this source root.
 pub(super) fn open_repository(root: &Path) -> Option<crate::git::GitRepo> {
-    let repo = crate::git::GitRepo::open(root).ok()?;
-    let workdir = std::fs::canonicalize(repo.workdir()?).ok()?;
-    (workdir == std::fs::canonicalize(root).ok()?).then_some(repo)
+    crate::git::GitRepo::open_worktree_root(root)
 }
 
 /// Gated working-tree (`reference` empty) or git-object text, the same pair

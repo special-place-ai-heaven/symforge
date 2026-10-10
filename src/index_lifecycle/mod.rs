@@ -85,6 +85,8 @@ mod embed_symbol;
 #[cfg(feature = "embed")]
 mod embed_symbol_context;
 #[cfg(feature = "embed")]
+mod embed_temporal;
+#[cfg(feature = "embed")]
 mod embed_usage;
 #[cfg(feature = "embed")]
 mod embed_wire_edit;

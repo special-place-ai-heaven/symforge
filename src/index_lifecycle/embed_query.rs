@@ -33,6 +33,8 @@ pub(super) struct EmbeddedQuerySnapshot {
     pub authority_publication: crate::lifecycle_identity::PublicationIdentity,
     pub authority: Arc<super::activation::ProjectSourceAuthority>,
     pub state_anchor: Option<super::embedded::AdmittedStateAnchor>,
+    /// The binding's git temporal cache (see `embed_temporal`).
+    pub temporal_cache: Arc<super::embed_temporal::TemporalCache>,
 }
 
 /// A process incarnation namespace, separate from the frozen core's counters.
@@ -1525,7 +1527,7 @@ pub(super) fn project(
         QueryRequest::Conventions => super::embed_guidance::conventions(live, budget),
         QueryRequest::EditPlan { target } => super::embed_guidance::edit_plan(
             live,
-            &snapshot.generation.code_signals.temporal,
+            &*super::embed_temporal::temporal(snapshot, policy, budget)?,
             target,
             budget,
         ),

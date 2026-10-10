@@ -219,7 +219,7 @@ pub(super) fn execute(
         });
     } else if let Some(path) = &request.changed_with {
         use crate::live_index::git_temporal::GitTemporalState;
-        let temporal = &snapshot.generation.code_signals.temporal;
+        let temporal = super::embed_temporal::temporal(snapshot, policy, budget)?;
         let commits = temporal.stats.total_commits_analyzed as u64;
         let state = match &temporal.state {
             GitTemporalState::Unavailable(reason) => CoChangeState::Unavailable {
