@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::index::{LanguageId, SymbolKind, SymbolRecord};
+use crate::domain::index::{LanguageId, SymbolRecord};
 use crate::live_index::SharedIndex;
 use crate::live_index::query::{
     SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
@@ -2004,77 +2004,9 @@ pub(crate) fn extract_signature(content: &[u8], byte_range: (u32, u32)) -> Strin
     String::from_utf8_lossy(&slice[..first_line_end]).to_string()
 }
 
-/// Find the parent impl block's type name for a symbol, if any.
-///
-/// Walks backward through the file's symbol list to find an `impl` block at a
-/// lower depth that encloses the target symbol's byte range. Extracts the
-/// concrete type name (e.g. `Foo` from `impl Foo` or `impl Trait for Foo`).
-pub(crate) fn find_parent_impl_type(file: &IndexedFile, sym: &SymbolRecord) -> Option<String> {
-    if sym.depth == 0 {
-        return None; // top-level symbol, not inside an impl block
-    }
-    // Walk the symbol list to find the enclosing impl block.
-    for s in &file.symbols {
-        if s.kind != SymbolKind::Impl {
-            continue;
-        }
-        // The impl block must enclose the target symbol.
-        if s.byte_range.0 <= sym.byte_range.0 && s.byte_range.1 >= sym.byte_range.1 {
-            return extract_impl_type_name(&s.name);
-        }
-    }
-    None
-}
-
-/// Extract the concrete type name from an impl block name.
-///
-/// Handles patterns like:
-/// - `impl Foo` -> `Foo`
-/// - `impl Trait for Foo` -> `Foo`
-/// - `impl<T> Foo<T>` -> `Foo`
-/// - `impl<T: Clone> Trait for Foo<T>` -> `Foo`
-fn extract_impl_type_name(impl_name: &str) -> Option<String> {
-    let name = impl_name.trim();
-    // Strip leading "impl" keyword if present (some parsers include it).
-    let rest = name.strip_prefix("impl").unwrap_or(name).trim_start();
-    // Strip generic parameters from the front: `<T: Clone> Trait for Foo<T>` -> `Trait for Foo<T>`
-    let rest = strip_leading_generics(rest);
-    // Check for "for" keyword: `Trait for Foo<T>` -> `Foo<T>`
-    let type_part = if let Some(pos) = rest.find(" for ") {
-        rest[pos + 5..].trim_start()
-    } else {
-        rest.trim_start()
-    };
-    // Strip trailing generics: `Foo<T>` -> `Foo`
-    let type_name = type_part.split('<').next().unwrap_or(type_part).trim();
-    if type_name.is_empty() {
-        None
-    } else {
-        Some(type_name.to_string())
-    }
-}
-
-/// Strip a leading `<...>` generic parameter list, handling nested angle brackets.
-fn strip_leading_generics(s: &str) -> &str {
-    let s = s.trim_start();
-    if !s.starts_with('<') {
-        return s;
-    }
-    let mut depth = 0i32;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '<' => depth += 1,
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    return s[i + 1..].trim_start();
-                }
-            }
-            _ => {}
-        }
-    }
-    s // malformed generics, return as-is
-}
+#[cfg(test)]
+use crate::index_lifecycle::guidance::file_impact::extract_impl_type_name;
+pub(crate) use crate::index_lifecycle::guidance::file_impact::find_parent_impl_type;
 
 /// Detect references that may be stale after a symbol edit.
 /// Compares old vs new signature (first line). Returns (path, line, enclosing_name) triples.

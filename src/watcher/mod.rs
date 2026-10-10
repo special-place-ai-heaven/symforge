@@ -128,37 +128,7 @@ impl Default for BurstTracker {
 // Plan 02: Event processing, path normalization, content hash skip, ENOENT
 // ---------------------------------------------------------------------------
 
-/// Strip `\\?\` Windows extended-length path prefix and normalize backslashes.
-///
-/// Returns the relative forward-slash path if `abs_path` is inside `repo_root`,
-/// or `None` if it lies outside.
-pub(crate) fn normalize_event_path(abs_path: &Path, repo_root: &Path) -> Option<String> {
-    let raw_path = abs_path.to_string_lossy();
-
-    // Strip \\?\ prefix (Windows extended-length format)
-    let stripped_raw: &str = if let Some(stripped) = raw_path.strip_prefix(r"\\?\") {
-        stripped
-    } else {
-        raw_path.as_ref()
-    };
-
-    let clean_abs = Path::new(stripped_raw);
-
-    // Try strip_prefix with the original repo_root first, then with its own \\?\ stripped
-    let relative = clean_abs.strip_prefix(repo_root).or_else(|_| {
-        let root_raw = repo_root.to_string_lossy();
-        let stripped_root: &str = if let Some(stripped) = root_raw.strip_prefix(r"\\?\") {
-            stripped
-        } else {
-            return clean_abs.strip_prefix(repo_root);
-        };
-        clean_abs.strip_prefix(Path::new(stripped_root))
-    });
-
-    relative
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-}
+pub(crate) use crate::paths::normalize_event_path;
 
 /// Return `true` for Create, Modify, or Remove events; `false` for Access and others.
 pub(crate) fn is_relevant_event(event: &DebouncedEvent) -> bool {

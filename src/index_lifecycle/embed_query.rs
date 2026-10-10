@@ -425,6 +425,23 @@ fn execute_inner(
             }
         }
     }
+    if let QueryRequest::FileImpact(input) = request
+        && input.estimate != Some(true)
+    {
+        let admission = handle
+            .analyze_file_impact(input, &|| budget.check())
+            .map_err(|kind| {
+                refuse(
+                    kind,
+                    if kind == QueryRefusalKind::StalePublication {
+                        RetryAdvice::OnEvent
+                    } else {
+                        RetryAdvice::Never
+                    },
+                )
+            })?;
+        budget.file_impact = Some(admission);
+    }
     let snapshot = handle
         .capture_query_snapshot(&normalized)
         .map_err(|error| {
@@ -685,6 +702,8 @@ pub(super) struct Budget {
     /// `validate_file_syntax` then distrusts the indexed hit and answers from
     /// its authoritative disk parse.
     pub(super) syntax_disk_fallback: bool,
+    /// The `FileImpact` re-admission's answer, taken by `project`.
+    pub(super) file_impact: Option<super::embed_file_impact::FileImpactAdmission>,
 }
 
 #[cfg(test)]
@@ -863,6 +882,7 @@ impl Budget {
             cache_output: None,
             cache_truncated: false,
             syntax_disk_fallback: self.syntax_disk_fallback,
+            file_impact: None,
         }
     }
     pub(super) fn limits(&self) -> QueryLimits {
@@ -914,6 +934,7 @@ impl Budget {
             cache_output: None,
             cache_truncated: false,
             syntax_disk_fallback: false,
+            file_impact: None,
         })
     }
 
@@ -1131,6 +1152,7 @@ pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusa
         | QueryRequest::Syntax { path }
         | QueryRequest::Diff { path, .. }
         | QueryRequest::Impact { path, .. } => validate_path(path, false)?,
+        QueryRequest::FileImpact(input) => super::embed_file_impact::validate(input)?,
         QueryRequest::SearchSymbols {
             path_prefix, kind, ..
         } => {
@@ -1730,6 +1752,9 @@ pub(super) fn project(
             observations,
         )
         .map(QueryOutput::Diff),
+        QueryRequest::FileImpact(input) => {
+            super::embed_file_impact::project(snapshot, input, policy, budget)
+        }
         QueryRequest::Impact { path, base_ref } => {
             let diff = diff(snapshot, path, base_ref, None, budget, observations)?;
             let dependents = references(live, live.find_dependents_for_file(path), true, budget)?;

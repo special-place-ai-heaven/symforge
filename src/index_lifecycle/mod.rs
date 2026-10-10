@@ -47,6 +47,8 @@ mod embed_detect_impact;
 #[cfg(feature = "embed")]
 pub(crate) mod embed_federation;
 #[cfg(feature = "embed")]
+mod embed_file_impact;
+#[cfg(feature = "embed")]
 mod embed_file_search;
 #[cfg(feature = "embed")]
 mod embed_git;

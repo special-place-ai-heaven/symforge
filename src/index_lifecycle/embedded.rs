@@ -440,6 +440,8 @@ struct EmbeddedBinding {
     #[cfg(feature = "embed")]
     temporal_cache: Arc<super::embed_temporal::TemporalCache>,
     #[cfg(feature = "embed")]
+    impact_symbols: super::embed_file_impact::ImpactSymbolStore,
+    #[cfg(feature = "embed")]
     open_reset: Option<crate::embed::parity::source_options::SnapshotResetReceipt>,
     state: std::sync::Mutex<EmbeddedRuntimeState>,
     control: std::sync::Mutex<WorkerControl>,
@@ -535,6 +537,8 @@ impl EmbeddedBinding {
             git_view: std::sync::Mutex::new(None),
             #[cfg(feature = "embed")]
             temporal_cache: Arc::default(),
+            #[cfg(feature = "embed")]
+            impact_symbols: Default::default(),
             #[cfg(feature = "embed")]
             open_reset: open_reset.clone(),
             state: std::sync::Mutex::new(EmbeddedRuntimeState {
@@ -738,6 +742,39 @@ impl EmbeddedBinding {
             self.publish_freshened();
         }
         Ok(())
+    }
+
+    /// MCP `analyze_file_impact`'s re-admission and symbol diff on a Current
+    /// source, publishing whatever it indexed as the next Current publication
+    /// exactly as the targeted freshen does.
+    #[cfg(feature = "embed")]
+    fn analyze_file_impact(
+        &self,
+        request: &crate::embed::parity::file_impact::FileImpactRequest,
+        stop: &dyn Fn() -> Result<(), crate::embed::parity::QueryRefusalKind>,
+    ) -> Result<super::embed_file_impact::FileImpactAdmission, crate::embed::parity::QueryRefusalKind>
+    {
+        if self.shutdown_started.load(Ordering::Acquire)
+            || self.authority.verify_physical_root_anchor().is_err()
+            || self.state.lock().expect("embedded state mutex").phase
+                != super::public_api::SourceRuntimePhase::Current
+        {
+            return Err(crate::embed::parity::QueryRefusalKind::SourceUnavailable);
+        }
+        let shared = self.runtime.data_plane();
+        let before = shared.published_generation().publication_generation;
+        let result = super::embed_file_impact::admit(
+            shared,
+            &self.root,
+            &self.authority,
+            &self.impact_symbols,
+            request,
+            stop,
+        );
+        if shared.published_generation().publication_generation != before {
+            self.publish_freshened();
+        }
+        result
     }
 
     /// Advance the Current publication to the data plane's after a freshen,
@@ -1660,6 +1697,22 @@ impl EmbeddedSourceHandle {
                 binding.freshen_exact_path(relative_path)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// MCP `analyze_file_impact`'s re-admission; see the binding's method.
+    #[cfg(feature = "embed")]
+    pub(super) fn analyze_file_impact(
+        &self,
+        request: &crate::embed::parity::file_impact::FileImpactRequest,
+        stop: &dyn Fn() -> Result<(), crate::embed::parity::QueryRefusalKind>,
+    ) -> Result<super::embed_file_impact::FileImpactAdmission, crate::embed::parity::QueryRefusalKind>
+    {
+        match &self.binding {
+            Some(binding) if !self.closed.load(Ordering::Acquire) => {
+                binding.analyze_file_impact(request, stop)
+            }
+            _ => Err(crate::embed::parity::QueryRefusalKind::SourceUnavailable),
         }
     }
 

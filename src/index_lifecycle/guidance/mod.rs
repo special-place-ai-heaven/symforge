@@ -6,6 +6,7 @@ pub(crate) mod edit_plan;
 pub(crate) mod edit_route;
 pub(crate) mod exploration;
 pub mod explore;
+pub(crate) mod file_impact;
 pub(crate) mod file_read;
 pub(crate) mod file_search;
 pub(crate) mod filters;

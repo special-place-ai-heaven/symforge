@@ -3256,6 +3256,13 @@ impl SharedIndexHandle {
         self.impact_mutex.lock().await
     }
 
+    /// [`Self::lock_impact_analysis`] for synchronous callers: `None` while
+    /// another impact analysis holds it.
+    #[cfg(feature = "embed")]
+    pub(crate) fn try_lock_impact_analysis(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.impact_mutex.try_lock().ok()
+    }
+
     pub fn published_generation(&self) -> Arc<PublishedGeneration> {
         self.published_source_set.load_full().current_generation()
     }

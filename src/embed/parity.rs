@@ -11,6 +11,7 @@ pub mod changes;
 pub mod detect_impact;
 pub mod edit;
 pub mod federation;
+pub mod file_impact;
 pub mod guidance;
 pub mod host;
 pub mod knowledge;
@@ -184,6 +185,9 @@ pub enum QueryRequest {
         path: String,
         base_ref: String,
     },
+    /// MCP `analyze_file_impact`: re-admit one file from disk, then report its
+    /// symbol diff (or index it as new), with optional co-changes or estimate.
+    FileImpact(file_impact::FileImpactRequest),
     Explore(guidance::ExploreRequest),
     Conventions,
     ContextInventory,
@@ -251,7 +255,7 @@ impl QueryRequest {
             Self::Graph { .. } => QueryOperationKind::Graph,
             Self::Syntax { .. } => QueryOperationKind::Syntax,
             Self::Diff { .. } => QueryOperationKind::Diff,
-            Self::Impact { .. } => QueryOperationKind::Impact,
+            Self::Impact { .. } | Self::FileImpact(_) => QueryOperationKind::Impact,
             Self::Explore(_) => QueryOperationKind::Explore,
             Self::Conventions => QueryOperationKind::Conventions,
             Self::ContextInventory => QueryOperationKind::ContextInventory,
@@ -498,6 +502,7 @@ pub enum QueryOutput {
         diff: QuerySymbolDiff,
         dependents: Vec<QueryReference>,
     },
+    FileImpact(file_impact::FileImpactReport),
     WhatChanged(changes::WhatChangedResult),
     DiffSymbols(changes::DiffSymbolsResult),
     DetectImpact(detect_impact::DetectImpactResult),

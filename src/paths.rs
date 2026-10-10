@@ -61,6 +61,38 @@ pub const SYMFORGE_INDEX_SNAPSHOT_QUARANTINE_DIR_PATH: &str =
 pub const SYMFORGE_ARTIFACT_QUARANTINE_DIR_PATH: &str = ".symforge/quarantine/artifacts";
 
 /// Display spelling of a path: separators normalized to `/` on Windows.
+/// Strip `\\?\` Windows extended-length path prefix and normalize backslashes.
+///
+/// Returns the relative forward-slash path if `abs_path` is inside `repo_root`,
+/// or `None` if it lies outside.
+pub(crate) fn normalize_event_path(abs_path: &Path, repo_root: &Path) -> Option<String> {
+    let raw_path = abs_path.to_string_lossy();
+
+    // Strip \\?\ prefix (Windows extended-length format)
+    let stripped_raw: &str = if let Some(stripped) = raw_path.strip_prefix(r"\\?\") {
+        stripped
+    } else {
+        raw_path.as_ref()
+    };
+
+    let clean_abs = Path::new(stripped_raw);
+
+    // Try strip_prefix with the original repo_root first, then with its own \\?\ stripped
+    let relative = clean_abs.strip_prefix(repo_root).or_else(|_| {
+        let root_raw = repo_root.to_string_lossy();
+        let stripped_root: &str = if let Some(stripped) = root_raw.strip_prefix(r"\\?\") {
+            stripped
+        } else {
+            return clean_abs.strip_prefix(repo_root);
+        };
+        clean_abs.strip_prefix(Path::new(stripped_root))
+    });
+
+    relative
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+}
+
 pub(crate) fn normalized_path_text(path_text: &str, windows: bool) -> String {
     if windows {
         path_text.replace('\\', "/")

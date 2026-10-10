@@ -3495,12 +3495,9 @@ impl SymForgeServer {
             return refusal;
         }
         if params.0.estimate == Some(true) {
-            let with_co = params.0.include_co_changes.unwrap_or(false);
-            let co_limit = params.0.co_changes_limit.unwrap_or(10) as usize;
-            let est = 200 + if with_co { co_limit * 13 } else { 0 };
-            return format!(
-                "Estimate for analyze_file_impact: ~{} tokens (include_co_changes={})",
-                est, with_co
+            return crate::index_lifecycle::guidance::file_impact::estimate_text(
+                params.0.include_co_changes.unwrap_or(false),
+                params.0.co_changes_limit.unwrap_or(10) as usize,
             );
         }
         // Gate on one queryable baseline before the sidecar await. The impact
@@ -3537,31 +3534,12 @@ impl SymForgeServer {
 
         // Append co-changes if requested
         if params.0.include_co_changes.unwrap_or(false) {
-            let temporal = Arc::clone(&generation.code_signals.temporal);
-            match temporal.state {
-                crate::live_index::git_temporal::GitTemporalState::Ready => {
-                    let limit = params.0.co_changes_limit.unwrap_or(10) as usize;
-                    let path = params.0.path.as_str();
-                    match temporal.files.get(path) {
-                        Some(history) => {
-                            result.push_str("\n\n");
-                            result.push_str(&format::co_changes_result_view(path, history, limit));
-                        }
-                        None => {
-                            result.push_str("\n\nNo git co-change data found for this file.");
-                        }
-                    }
-                }
-                crate::live_index::git_temporal::GitTemporalState::Pending
-                | crate::live_index::git_temporal::GitTemporalState::Computing => {
-                    result.push_str(
-                        "\n\nGit temporal data is still loading. Co-changes unavailable.",
-                    );
-                }
-                crate::live_index::git_temporal::GitTemporalState::Unavailable(ref reason) => {
-                    result.push_str(&format!("\n\nGit temporal data unavailable: {reason}"));
-                }
-            }
+            crate::index_lifecycle::guidance::file_impact::append_co_changes(
+                &mut result,
+                &generation.code_signals.temporal,
+                params.0.path.as_str(),
+                params.0.co_changes_limit.unwrap_or(10) as usize,
+            );
         }
 
         self.session_context.record_summary_output(
@@ -14225,6 +14203,135 @@ mod tests {
         assert_eq!(plan("src/lib.rs::target").await, QUALIFIED_GOLDEN);
         assert_eq!(plan("notes.md").await, FILE_GOLDEN);
         assert_eq!(plan("does_not_exist").await, MISSING_GOLDEN);
+    }
+
+    /// `src/lib.rs` before and after the impact edit: the same byte length, so
+    /// with its mtime restored the embedded worker's scout cannot see the edit.
+    const IMPACT_LIB_BEFORE: &str =
+        "// round 3\npub fn alpha() -> u32 {\n    1\n}\n\npub fn beta() -> u32 {\n    2\n}\n";
+    const IMPACT_LIB_AFTER: &str =
+        "// round 3\npub fn alpha() -> u32 {\n    7\n}\n\npub fn zeta() -> u32 {\n    2\n}\n";
+    const IMPACT_EDIT_GOLDEN: &str = "── Impact: src/lib.rs ──\nStatus: changed on disk since last index\n  [Added]   fn zeta\n  [Changed] fn alpha\n  [Removed] fn beta\n\nCallers to review:\n  Callers of alpha():\n    src/caller.rs  line 2";
+    const IMPACT_ESTIMATE_GOLDEN: &str =
+        "Estimate for analyze_file_impact: ~265 tokens (include_co_changes=true)";
+    const IMPACT_MISSING_GOLDEN: &str = "File not found on disk: src/missing.rs";
+    const IMPACT_NEW_FILE_GOLDEN: &str =
+        "Language: Rust\nSymbols: 1 fn, 1 struct\n[Indexed, 0 callers yet]";
+
+    /// Three commits in which `src/lib.rs` and `src/other.rs` change together.
+    fn impact_parity_fixture(root: &Path) {
+        let repository = git2::Repository::init(root).expect("init");
+        fs::create_dir_all(root.join("src")).expect("src");
+        for round in 1..=3 {
+            let files = [
+                (".gitignore", ".symforge/\n".to_string()),
+                (
+                    "src/lib.rs",
+                    IMPACT_LIB_BEFORE.replace("round 3", &format!("round {round}")),
+                ),
+                (
+                    "src/other.rs",
+                    format!("pub fn other() -> u32 {{\n    {round}\n}}\n"),
+                ),
+                (
+                    "src/caller.rs",
+                    "pub fn call() -> u32 {\n    alpha()\n}\n".to_string(),
+                ),
+            ];
+            let mut index = repository.index().expect("index");
+            for (path, content) in &files {
+                fs::write(root.join(path), content).expect("write");
+                index.add_path(Path::new(path)).expect("add");
+            }
+            index.write().expect("index write");
+            let tree = repository
+                .find_tree(index.write_tree().expect("tree"))
+                .expect("find tree");
+            let signature =
+                git2::Signature::now("Fixture", "fixture@example.invalid").expect("sig");
+            let parent = repository
+                .head()
+                .ok()
+                .and_then(|head| head.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+            repository
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "round",
+                    &tree,
+                    &parents,
+                )
+                .expect("commit");
+        }
+    }
+
+    fn assert_impact_edit_golden(text: &str) {
+        let co_change_tail = format!(
+            "Ownership:\n  Fixture: 3 commits (100%)\n\nCo-changing files (top 1):\n  {:<50} coupling: 1.000  (3 shared commits)",
+            "src/other.rs"
+        );
+        assert!(
+            text.starts_with(&format!(
+                "{IMPACT_EDIT_GOLDEN}\n\nGit temporal data for src/lib.rs\n\nChurn score: "
+            )),
+            "{text}"
+        );
+        assert!(text.contains(" (3 commits)\nLast commit: "), "{text}");
+        assert!(text.ends_with(&co_change_tail), "{text}");
+    }
+
+    /// MCP side of the embed impact golden (`tests/embed_file_impact.rs`): a
+    /// modified file with co-changes, the estimate, a missing new file and a new
+    /// file render the same text.
+    #[tokio::test]
+    async fn analyze_file_impact_matches_embed_parity_golden() {
+        let repo = TempDir::new().expect("temp repo");
+        impact_parity_fixture(repo.path());
+        let server = embed_parity_server(repo.path());
+        let data_plane = server.index.data_plane();
+        let fence = data_plane.git_temporal_publication_fence();
+        assert!(data_plane.update_git_temporal_at_fence(
+            crate::live_index::git_temporal::GitTemporalIndex::compute(repo.path()),
+            &fence,
+        ));
+        let impact = |input: serde_json::Value| {
+            server.analyze_file_impact(Parameters(serde_json::from_value(input).expect("input")))
+        };
+
+        let lib = repo.path().join("src/lib.rs");
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&lib).expect("meta"));
+        fs::write(&lib, IMPACT_LIB_AFTER).expect("edit");
+        filetime::set_file_mtime(&lib, mtime).expect("mtime");
+        let edited = impact(serde_json::json!({
+            "path": "src/lib.rs",
+            "include_co_changes": true,
+            "co_changes_limit": 5
+        }))
+        .await;
+        assert_impact_edit_golden(&edited);
+
+        let estimate = impact(serde_json::json!({
+            "path": "src/lib.rs",
+            "estimate": true,
+            "include_co_changes": true,
+            "co_changes_limit": 5
+        }))
+        .await;
+        assert_eq!(estimate, IMPACT_ESTIMATE_GOLDEN);
+        let missing =
+            impact(serde_json::json!({ "path": "src/missing.rs", "new_file": true })).await;
+        assert_eq!(missing, IMPACT_MISSING_GOLDEN);
+
+        fs::write(
+            repo.path().join("src/fresh.rs"),
+            "pub struct Fresh;\n\npub fn make() -> Fresh {\n    Fresh\n}\n",
+        )
+        .expect("fresh");
+        let fresh = impact(serde_json::json!({ "path": "src/fresh.rs", "new_file": true })).await;
+        assert_eq!(fresh, IMPACT_NEW_FILE_GOLDEN);
     }
 
     /// MCP side of the embed freshen golden (`tests/embed_disk_parity.rs`):
