@@ -1383,14 +1383,20 @@ impl HostRoom {
                 ("symforge://repo/health", "repo-health"),
                 ("symforge://repo/outline", "repo-outline"),
                 ("symforge://repo/map", "repo-map"),
-                ("symforge://repo/changes/uncommitted", "repo-changes-uncommitted"),
+                (
+                    "symforge://repo/changes/uncommitted",
+                    "repo-changes-uncommitted",
+                ),
                 ("symforge://tools/catalog", "tools-catalog"),
                 ("symforge://glossary", "glossary"),
             ]
             .into_iter()
             .filter(|(_, name)| {
                 self.rights.query
-                    || !matches!(*name, "repo-outline" | "repo-map" | "repo-changes-uncommitted")
+                    || !matches!(
+                        *name,
+                        "repo-outline" | "repo-map" | "repo-changes-uncommitted"
+                    )
             })
             .map(|(uri, name)| HostResourceDefinition {
                 uri: uri.into(),

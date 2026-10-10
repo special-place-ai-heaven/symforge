@@ -7386,8 +7386,7 @@ mod tests {
                 .files
                 .get("src/main.rs")
                 .map(|file| file.content.as_slice()),
-            Some(b"fn main() {}
-".as_slice()),
+            Some(b"fn main() {}\n".as_slice()),
             "the re-read keeps the reconciled row"
         );
         assert!(
