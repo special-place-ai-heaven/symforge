@@ -494,6 +494,23 @@ fn admitted_root_matches(
         .is_ok_and(|canonical| canonical == source.admitted_root())
 }
 
+/// The replay gate every lane (secret remediation, edit begin, edit probe)
+/// runs before it touches a replay store: the bound root must still be the
+/// root the source authority admitted, then the state placement is
+/// reconciled. One function, so the three lanes cannot drift apart.
+pub(crate) fn admitted_replay_state(
+    server: &SymForgeServer,
+    root: &Path,
+    runtime: Option<&crate::domain::ProjectStateDir>,
+    source: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    label: &str,
+) -> Result<Option<crate::domain::ProjectStateDir>, String> {
+    if !admitted_root_matches(root, source) {
+        return Err(format!("Error: admitted {label} source changed"));
+    }
+    resolved_project_state(server, root, runtime, label)
+}
+
 /// Reconcile the server's resolved state placement with the pinned index
 /// binding for a replay. The roots must canonicalize equal, and two present
 /// state dirs must agree. When only one side carries a state dir, that one is
@@ -541,10 +558,7 @@ fn begin_secret_replay(
     let decision = server
         .index
         .with_admitted_replay_source(|root, state, source| {
-            if !admitted_root_matches(root, source) {
-                return Err("Error: admitted remediation source changed".to_string());
-            }
-            let placement = resolved_project_state(server, root, state, "remediation")?;
+            let placement = admitted_replay_state(server, root, state, source, "remediation")?;
             let state = placement.as_ref().ok_or_else(|| {
                 "Error: durable project-state replay is unavailable for this binding".to_string()
             })?;
@@ -859,6 +873,55 @@ fn history_note(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::apply_status_for_rescan;
+
+    /// A binding whose root is not the root the source authority admitted is
+    /// refused by the shared gate before any replay store is opened, and all
+    /// three replay lanes route through that gate.
+    #[test]
+    fn replay_gate_refuses_a_root_the_source_authority_did_not_admit() {
+        let bound = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let state = crate::domain::ProjectStateDir::new(bound.path().join("never-created"));
+        let server = super::SymForgeServer::new(
+            crate::live_index::LiveIndex::load(bound.path()).unwrap(),
+            "replay-gate".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(bound.path().to_path_buf()),
+            None,
+        );
+
+        let foreign = crate::index_lifecycle::activation::project_source_authority(other.path());
+        for label in ["edit", "remediation"] {
+            assert_eq!(
+                super::admitted_replay_state(&server, bound.path(), Some(&state), &foreign, label),
+                Err(format!("Error: admitted {label} source changed"))
+            );
+        }
+        assert!(
+            !state.as_path().exists(),
+            "a refused gate must not touch the replay state"
+        );
+
+        // Positive control: the authority for the bound root itself passes.
+        let own = crate::index_lifecycle::activation::project_source_authority(bound.path());
+        assert!(super::admitted_replay_state(&server, bound.path(), None, &own, "edit").is_ok());
+
+        let edit_lanes = include_str!("edit_tools.rs");
+        let secret_lane = include_str!("secret_remediate.rs");
+        assert_eq!(
+            edit_lanes
+                .matches("secret_remediate::admitted_replay_state(")
+                .count(),
+            2,
+            "edit begin and probe must both run the shared replay gate"
+        );
+        assert!(
+            secret_lane
+                .contains("admitted_replay_state(server, root, state, source, \"remediation\")")
+        );
+    }
 
     #[test]
     fn still_sensitive_rescan_is_incomplete() {

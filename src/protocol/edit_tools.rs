@@ -685,10 +685,11 @@ fn begin_mutation_replay<T: Serialize>(
     server
         .index
         .with_admitted_replay_source(|root, project_state, source| {
-            let project_state = super::secret_remediate::resolved_project_state(
+            let project_state = super::secret_remediate::admitted_replay_state(
                 server,
                 root,
                 project_state,
+                source,
                 "edit",
             )?
             .ok_or_else(|| {
@@ -756,10 +757,11 @@ fn probe_mutation_replay<T: Serialize>(
     server
         .index
         .with_admitted_replay_source(|root, project_state, source| {
-            let project_state = super::secret_remediate::resolved_project_state(
+            let project_state = super::secret_remediate::admitted_replay_state(
                 server,
                 root,
                 project_state,
+                source,
                 "edit",
             )?
             .ok_or_else(|| {
