@@ -10,8 +10,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
 use symforge::embed::parity::edit::{
-    AdmittedEditTarget, BatchRenameRequest, EditApplyAuthority, EditError, EditErrorKind,
-    EditTarget, ReplaceRequest,
+    AdmittedEditTarget, BatchEditAction, BatchEditRequest, BatchRenameRequest, EditApplyAuthority,
+    EditError, EditErrorKind, EditTarget, ReplaceRequest, RoutedBatchPart,
 };
 use symforge::embed::{
     EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase,
@@ -223,4 +223,188 @@ fn unadmitted_or_unrelated_working_directory_refuses_before_any_write() {
     for root in [&fixture.main, &fixture.linked, &unrelated_root] {
         assert_eq!(read_lf(&root.join("src/lib.rs")), ORIGINAL);
     }
+}
+
+const OTHER: &str = "pub fn other() -> u32 { 3 }\n";
+
+/// A main worktree and a linked worktree whose repository tracks two files,
+/// so one batch can route `src/other.rs` into the linked worktree while
+/// `src/lib.rs` stays in the main one.
+fn two_file_fixture() -> Fixture {
+    let parent = tempfile::tempdir().unwrap();
+    let main = parent.path().join("main");
+    fs::create_dir_all(main.join("src")).unwrap();
+    let repository = git2::Repository::init(&main).unwrap();
+    fs::write(main.join(".gitignore"), ".symforge/\n").unwrap();
+    fs::write(main.join("src/lib.rs"), ORIGINAL).unwrap();
+    fs::write(main.join("src/other.rs"), OTHER).unwrap();
+    commit_all(&repository, &[".gitignore", "src/lib.rs", "src/other.rs"]);
+    let linked = parent.path().join("linked");
+    repository.worktree("linked", &linked, None).unwrap();
+    Fixture {
+        main: dunce::canonicalize(&main).unwrap(),
+        linked: dunce::canonicalize(&linked).unwrap(),
+        _parent: parent,
+    }
+}
+
+fn plan_of(
+    handle: &EmbeddedSourceHandle,
+    path: &str,
+    name: &str,
+) -> symforge::embed::parity::edit::EditPlan {
+    handle
+        .edit_plan(&EditTarget {
+            path: path.into(),
+            name: name.into(),
+            kind: None,
+            symbol_line: None,
+        })
+        .unwrap()
+}
+
+fn wait_current(handles: &[&EmbeddedSourceHandle]) {
+    let until = Instant::now() + Duration::from_secs(20);
+    for handle in handles {
+        while handle.runtime_view().phase != SourceRuntimePhase::Current {
+            assert!(Instant::now() < until, "source never returned to Current");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn replace(guard: symforge::embed::parity::edit::EditGuard, body: &str) -> BatchEditRequest {
+    BatchEditRequest {
+        actions: vec![BatchEditAction::Replace(ReplaceRequest {
+            guard,
+            new_body: body.into(),
+        })],
+    }
+}
+
+/// MCP stages every file of a batch, rerouted or not, into one
+/// `commit_staged` run. A batch routed across two admitted worktrees commits
+/// both, and its one replay record verifies each worktree's post-image
+/// through that worktree's own source authority on retry.
+#[test]
+fn routed_batch_commits_across_two_worktrees_and_replays_verified_post_images() {
+    let fixture = two_file_fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let main = open(&runtime, &fixture.main);
+    let linked = open(&runtime, &fixture.linked);
+    let main_authority = authority(&fixture.main, "room/main");
+    let linked_authority = authority(&fixture.linked, "room/linked");
+    let admitted = [AdmittedEditTarget {
+        handle: &linked,
+        authority: &linked_authority,
+    }];
+
+    let lib_plan = plan_of(&main, "src/lib.rs", "number");
+    let other_plan = plan_of(&main, "src/other.rs", "other");
+    let route = main
+        .route_edit("src/other.rs", &fixture.linked, &admitted)
+        .unwrap();
+    let other_guard = main.rebase_guard(&route, &other_plan.guard).unwrap();
+    let parts = [
+        RoutedBatchPart {
+            handle: &main,
+            authority: &main_authority,
+            request: replace(lib_plan.guard, "pub fn number() -> u32 { 2 }"),
+        },
+        RoutedBatchPart {
+            handle: &linked,
+            authority: &linked_authority,
+            request: replace(other_guard, "pub fn other() -> u32 { 4 }"),
+        },
+    ];
+
+    let applied = main
+        .apply_routed_batch_edit(&main_authority, &parts, "routed-batch-1")
+        .unwrap();
+    assert!(!applied.replayed);
+    assert_eq!(applied.parts.len(), 2);
+    assert_eq!(applied.parts[0].files[0].0, "src/lib.rs");
+    assert_eq!(applied.parts[1].files[0].0, "src/other.rs");
+    assert_eq!(
+        read_lf(&fixture.main.join("src/lib.rs")),
+        "pub fn number() -> u32 { 2 }\n"
+    );
+    assert_eq!(
+        read_lf(&fixture.linked.join("src/other.rs")),
+        "pub fn other() -> u32 { 4 }\n"
+    );
+    assert_eq!(read_lf(&fixture.main.join("src/other.rs")), OTHER);
+    assert_eq!(read_lf(&fixture.linked.join("src/lib.rs")), ORIGINAL);
+
+    // An identical retry replays after verifying both post-images.
+    wait_current(&[&main, &linked]);
+    let replayed = main
+        .apply_routed_batch_edit(&main_authority, &parts, "routed-batch-1")
+        .unwrap();
+    assert!(replayed.replayed);
+    for (replay, first) in replayed.parts.iter().zip(&applied.parts) {
+        assert_eq!(replay.files, first.files);
+    }
+
+    // A changed post-image in the linked worktree breaks the replay proof.
+    fs::write(
+        fixture.linked.join("src/other.rs"),
+        "pub fn other() -> u32 { 5 }\n",
+    )
+    .unwrap();
+    wait_current(&[&main, &linked]);
+    match main.apply_routed_batch_edit(&main_authority, &parts, "routed-batch-1") {
+        Err(EditError::Edit(EditErrorKind::ReplayConflict)) => {}
+        other => panic!("tampered replay must conflict: {other:?}"),
+    }
+}
+
+/// Every pre-image in every source is verified before any write, as in
+/// MCP's single `commit_staged` run: a conflict in one worktree leaves the
+/// other untouched.
+#[test]
+fn routed_batch_conflict_in_one_worktree_writes_nothing_in_either() {
+    let fixture = two_file_fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let main = open(&runtime, &fixture.main);
+    let linked = open(&runtime, &fixture.linked);
+    let main_authority = authority(&fixture.main, "room/main");
+    let linked_authority = authority(&fixture.linked, "room/linked");
+    let admitted = [AdmittedEditTarget {
+        handle: &linked,
+        authority: &linked_authority,
+    }];
+    let lib_plan = plan_of(&main, "src/lib.rs", "number");
+    let other_plan = plan_of(&main, "src/other.rs", "other");
+    let route = main
+        .route_edit("src/other.rs", &fixture.linked, &admitted)
+        .unwrap();
+    let other_guard = main.rebase_guard(&route, &other_plan.guard).unwrap();
+
+    // Same length and mtime: the worker's scout cannot see it, so only the
+    // commit's pre-image check can.
+    let lib = fixture.main.join("src/lib.rs");
+    let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(&lib).unwrap());
+    let tampered = fs::read_to_string(&lib).unwrap().replace("{ 1 }", "{ 9 }");
+    fs::write(&lib, &tampered).unwrap();
+    filetime::set_file_mtime(&lib, mtime).unwrap();
+
+    let parts = [
+        RoutedBatchPart {
+            handle: &main,
+            authority: &main_authority,
+            request: replace(lib_plan.guard, "pub fn number() -> u32 { 2 }"),
+        },
+        RoutedBatchPart {
+            handle: &linked,
+            authority: &linked_authority,
+            request: replace(other_guard, "pub fn other() -> u32 { 4 }"),
+        },
+    ];
+    match main.apply_routed_batch_edit(&main_authority, &parts, "routed-batch-conflict") {
+        Err(EditError::Edit(EditErrorKind::WriteConflict)) => {}
+        other => panic!("a stale pre-image must refuse the whole batch: {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(&lib).unwrap(), tampered);
+    assert_eq!(read_lf(&fixture.linked.join("src/other.rs")), OTHER);
 }

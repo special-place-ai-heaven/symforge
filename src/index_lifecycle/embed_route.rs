@@ -11,6 +11,7 @@ use crate::embed::parity::edit::{
 };
 
 use super::activation::ProjectSourceAuthority;
+use super::embed_query::EmbeddedQuerySnapshot;
 use super::embedded::EmbeddedSourceHandle;
 
 /// Bytes read from a `.git` gitfile or `HEAD`; both are one short line.
@@ -67,6 +68,13 @@ fn git_common_dir(authority: &ProjectSourceAuthority, root: &Path) -> Option<Vec
     Some(lexical(worktrees.parent()?))
 }
 
+/// Whether two admitted sources are worktrees of one repository, read from
+/// each root's own `.git` entry.
+pub(super) fn same_repository(left: &EmbeddedQuerySnapshot, right: &EmbeddedQuerySnapshot) -> bool {
+    let left_common = git_common_dir(&left.authority, &left.root);
+    left_common.is_some() && left_common == git_common_dir(&right.authority, &right.root)
+}
+
 impl EmbeddedSourceHandle {
     /// Resolve MCP's `working_directory` for an edit of `path` on this source.
     ///
@@ -118,9 +126,7 @@ impl EmbeddedSourceHandle {
         if target.authority.root != target_snapshot.root {
             return Err(EditError::Edit(EditErrorKind::WriteAuthorityRefused));
         }
-        let bound_common = git_common_dir(&snapshot.authority, &snapshot.root);
-        let target_common = git_common_dir(&target_snapshot.authority, &target_snapshot.root);
-        if bound_common.is_none() || bound_common != target_common {
+        if !same_repository(&snapshot, &target_snapshot) {
             return Err(EditError::Edit(EditErrorKind::WorkingDirectoryNotAWorktree));
         }
         match crate::discovery::resolve_repo_path(&target_snapshot.root, path) {

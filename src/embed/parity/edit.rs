@@ -318,6 +318,25 @@ pub struct BatchEditApplied {
     pub refresh_ticket_identity: Option<String>,
 }
 
+/// One admitted source's share of a batch whose per-action
+/// `working_directory` routes files into different worktrees (MCP
+/// `batch_edit` / `batch_insert` per-edit overrides): the source, the write
+/// authority the host minted for it, and the actions that land there, with
+/// guards rebased onto it by `EmbeddedSourceHandle::rebase_guard`.
+pub struct RoutedBatchPart<'a, R = BatchEditRequest> {
+    pub handle: &'a crate::embed::EmbeddedSourceHandle,
+    pub authority: &'a EditApplyAuthority,
+    pub request: R,
+}
+
+/// A routed batch's result, one entry per part in request order. All parts
+/// share one staged commit, one rollback and one replay record.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RoutedBatchApplied {
+    pub parts: Vec<BatchEditApplied>,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EditWithinPreview {
     pub change: StructuralPreview,
