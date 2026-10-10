@@ -187,6 +187,86 @@ fn syntax_reparses_unindexed_disk_bytes_and_refuses_with_mcp_metadata() {
     handle.close().unwrap();
 }
 
+/// Releases the load hold before the handle closes, so a failed assert never
+/// joins a parked worker.
+struct LoadingHold {
+    gate: Option<symforge::live_index::store::ReloadGateForTest>,
+    handle: Option<EmbeddedSourceHandle>,
+}
+
+impl Drop for LoadingHold {
+    fn drop(&mut self) {
+        self.gate.take();
+        self.handle.take();
+    }
+}
+
+/// MCP answers `validate_file_syntax` from disk while its index is not Ready
+/// (`validate_file_syntax_answers_from_disk_when_the_index_is_not_ready`).
+/// The embedded disk lane does the same while the source is Loading, without
+/// claiming a publication, and still withholds secret-bearing bytes.
+#[test]
+fn syntax_disk_lane_answers_while_loading_without_a_publication() {
+    let root = syntax_fixture();
+    let gate = symforge::live_index::store::hold_reload_after_parses_for_test(root.path(), 1);
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let hold = LoadingHold {
+        gate: Some(gate),
+        handle: Some(
+            runtime
+                .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                    root.path().to_path_buf(),
+                ))
+                .unwrap(),
+        ),
+    };
+    assert!(
+        hold.gate
+            .as_ref()
+            .unwrap()
+            .wait_until_blocked(Duration::from_secs(10)),
+        "the cold load never reached the parse hold"
+    );
+    let handle = hold.handle.as_ref().unwrap();
+    assert_eq!(handle.runtime_view().phase, SourceRuntimePhase::Loading);
+
+    let claim = handle
+        .query(
+            &QueryRequest::Syntax {
+                path: "src/broken.rs".into(),
+            },
+            QueryLimits::default(),
+        )
+        .unwrap_err();
+    assert_eq!(claim.kind(), QueryRefusalKind::SourceUnavailable);
+
+    let observed = handle
+        .validate_syntax_from_disk("src/broken.rs", QueryLimits::default())
+        .unwrap();
+    assert_eq!(observed.source_phase, SourceRuntimePhase::Loading);
+    assert_eq!(observed.syntax.authority, ReadAuthority::DiskObservation);
+    assert_eq!(observed.syntax.rendered, INDEXED_SYNTAX_GOLDEN);
+    assert!(!observed.syntax.valid);
+
+    let refused = handle
+        .validate_syntax_from_disk("config/app.json", QueryLimits::default())
+        .unwrap_err();
+    assert_eq!(refused.kind(), QueryRefusalKind::AdmissionUnavailable);
+    let withheld = refused.withheld().expect("withheld findings");
+    assert_eq!(withheld.path, "config/app.json");
+    assert!(
+        withheld
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "secret.context-assignment")
+    );
+
+    let missing = handle
+        .validate_syntax_from_disk("src/absent.rs", QueryLimits::default())
+        .unwrap_err();
+    assert_eq!(missing.kind(), QueryRefusalKind::NotFound);
+}
+
 #[test]
 fn zero_hit_text_search_sweeps_matching_untracked_files_like_mcp() {
     let root = tempfile::tempdir().unwrap();

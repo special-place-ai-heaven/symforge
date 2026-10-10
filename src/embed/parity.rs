@@ -405,6 +405,21 @@ fn published_generation() -> read::ReadAuthority {
     read::ReadAuthority::PublishedGeneration
 }
 
+/// MCP `validate_file_syntax`'s authoritative disk parse, served in any live
+/// phase including Loading and refresh. It reports the bytes on disk now,
+/// read beneath the admitted root and admitted by the latest published
+/// generation's policy, exactly as MCP does while its index is not Ready. It
+/// is deliberately not a [`QueryClaim`]: it carries no publication identity,
+/// generation or session evidence, so it cannot be mistaken for index currency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiskSyntaxObservation {
+    /// Always [`read::ReadAuthority::DiskObservation`].
+    pub syntax: QuerySyntax,
+    /// The source phase observed when the read was admitted.
+    pub source_phase: crate::embed::SourceRuntimePhase,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct QuerySymbolChange {

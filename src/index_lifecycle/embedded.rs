@@ -1494,6 +1494,18 @@ impl EmbeddedSourceHandle {
         super::embed_query::execute(self, request, limits)
     }
 
+    /// MCP `validate_file_syntax`'s disk parse in any live phase, including
+    /// while the source is not Current. Use [`Self::query`] with
+    /// `QueryRequest::Syntax` for the indexed report of a Current publication.
+    #[cfg(feature = "embed")]
+    pub fn validate_syntax_from_disk(
+        &self,
+        path: &str,
+        limits: crate::embed::parity::QueryLimits,
+    ) -> Result<crate::embed::parity::DiskSyntaxObservation, super::embed_query::QueryRefusal> {
+        super::embed_query::validate_syntax_from_disk(self, path, limits)
+    }
+
     /// Execute with the host's deadline and shared cancellation signal.
     /// Stops are checked around engine calls and while projecting rows; a single
     /// parser/search call runs to its next safe checkpoint. The convenience
@@ -1735,6 +1747,27 @@ impl EmbeddedSourceHandle {
             authority,
             state_anchor: binding.state_anchor.clone(),
         })
+    }
+
+    /// Disk-observation capture in ANY live phase: the admitted root authority,
+    /// the latest published generation (for its admission policy only) and the
+    /// observed phase. It authorizes no claim about the publication.
+    #[cfg(feature = "embed")]
+    pub(super) fn capture_disk_observation_context(
+        &self,
+    ) -> Option<(
+        Arc<super::activation::ProjectSourceAuthority>,
+        Arc<crate::live_index::PublishedGeneration>,
+        super::public_api::SourceRuntimePhase,
+    )> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let binding = self.binding.as_ref()?;
+        let phase = binding.state.lock().expect("embedded state mutex").phase;
+        let index = binding.runtime.acquire().ok()?;
+        let generation = index.published_source_set().current_generation();
+        Some((Arc::clone(&binding.authority), generation, phase))
     }
 
     /// Health capture: the bound data plane, root and placement in ANY live

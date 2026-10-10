@@ -244,6 +244,52 @@ impl std::fmt::Display for QueryRefusal {
 
 impl std::error::Error for QueryRefusal {}
 
+/// MCP `validate_file_syntax`'s disk lane without a Current publication. See
+/// [`DiskSyntaxObservation`]: nothing here binds or claims a publication.
+pub(super) fn validate_syntax_from_disk(
+    handle: &EmbeddedSourceHandle,
+    path: &str,
+    limits: QueryLimits,
+) -> Result<DiskSyntaxObservation, QueryRefusal> {
+    let request = QueryRequest::Syntax {
+        path: path.to_owned(),
+    };
+    let normalized =
+        serde_json::to_vec(&("symforge.embed.syntax-disk", API_VERSION, &request, limits))
+            .expect("syntax request fields serialize");
+    let identity = crate::hash::digest_hex(&normalized);
+    let refuse = |kind, withheld| QueryRefusal {
+        kind,
+        operation: QueryOperationKind::Syntax,
+        operation_identity: identity.clone(),
+        retry: if kind == QueryRefusalKind::SourceUnavailable {
+            RetryAdvice::OnEvent
+        } else {
+            RetryAdvice::Never
+        },
+        withheld,
+    };
+    let mut budget = Budget::new(limits, None).map_err(|kind| refuse(kind, None))?;
+    validate_request(&request).map_err(|kind| refuse(kind, None))?;
+    let (authority, generation, source_phase) = handle
+        .capture_disk_observation_context()
+        .ok_or_else(|| refuse(QueryRefusalKind::SourceUnavailable, None))?;
+    let file =
+        super::embed_read::observe_syntax_in(&generation.live, &authority, None, path, &mut budget)
+            .map_err(|kind| refuse(kind, budget.withheld.take()))?;
+    let syntax = syntax_output(
+        path,
+        &file,
+        read::ReadAuthority::DiskObservation,
+        &mut budget,
+    )
+    .map_err(|kind| refuse(kind, None))?;
+    Ok(DiskSyntaxObservation {
+        syntax,
+        source_phase,
+    })
+}
+
 pub(super) fn execute(
     handle: &EmbeddedSourceHandle,
     request: &QueryRequest,
@@ -1371,6 +1417,45 @@ fn scope(prefix: Option<&str>) -> PathScope {
     })
 }
 
+/// The `QuerySyntax` projection of one parsed file, shared by the claim lane
+/// and the publication-free disk lane.
+fn syntax_output(
+    path: &str,
+    file: &IndexedFile,
+    authority: read::ReadAuthority,
+    budget: &mut Budget,
+) -> Result<QuerySyntax, QueryRefusalKind> {
+    let diagnostic = file
+        .parse_diagnostic
+        .as_ref()
+        .map(|diagnostic| diagnostic.message.clone());
+    let rendered = super::guidance::file_read::validate_file_syntax_result(path, file);
+    budget.required(
+        path.len()
+            + file.content_hash.len()
+            + parse_status(file).len()
+            + diagnostic.as_ref().map_or(0, String::len)
+            + rendered.len(),
+    )?;
+    Ok(QuerySyntax {
+        path: path.to_owned(),
+        content_hash: file.content_hash.clone(),
+        valid: matches!(file.parse_status, ParseStatus::Parsed),
+        parse_status: parse_status(file).into(),
+        diagnostic,
+        line: file
+            .parse_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.line),
+        column: file
+            .parse_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.column),
+        authority,
+        rendered,
+    })
+}
+
 pub(super) fn project(
     snapshot: &EmbeddedQuerySnapshot,
     request: &QueryRequest,
@@ -1628,35 +1713,7 @@ pub(super) fn project(
                     (&observed, read::ReadAuthority::DiskObservation)
                 }
             };
-            let diagnostic = file
-                .parse_diagnostic
-                .as_ref()
-                .map(|diagnostic| diagnostic.message.clone());
-            let rendered = super::guidance::file_read::validate_file_syntax_result(path, file);
-            budget.required(
-                path.len()
-                    + file.content_hash.len()
-                    + parse_status(file).len()
-                    + diagnostic.as_ref().map_or(0, String::len)
-                    + rendered.len(),
-            )?;
-            Ok(QueryOutput::Syntax(QuerySyntax {
-                path: path.clone(),
-                content_hash: file.content_hash.clone(),
-                valid: matches!(file.parse_status, ParseStatus::Parsed),
-                parse_status: parse_status(file).into(),
-                diagnostic,
-                line: file
-                    .parse_diagnostic
-                    .as_ref()
-                    .and_then(|diagnostic| diagnostic.line),
-                column: file
-                    .parse_diagnostic
-                    .as_ref()
-                    .and_then(|diagnostic| diagnostic.column),
-                authority,
-                rendered,
-            }))
+            syntax_output(path, file, authority, budget).map(QueryOutput::Syntax)
         }
         QueryRequest::Diff {
             path,
