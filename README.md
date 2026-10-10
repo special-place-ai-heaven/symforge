@@ -76,12 +76,12 @@ Measured token savings, with their method and date, live on the wiki: [Benchmark
 | **Preventive index lifecycle** | One bad observation cannot publish mixed or false-current state. Candidates promote only when complete; queries run under a strict lease; answers that are not current say so |
 | **Content admission** | One gate decides what may be read, parsed, or disclosed — secret-bearing files fail closed to metadata-only under a versioned detector |
 | **Local daemon and HTTP serve** | Share one index across sessions, or run an operator server with a dashboard at `/admin` |
-| **Embeddable engine** | The indexing/search/parsing core compiles without the server behind a semver-stable facade |
+| **Embeddable engine** | The indexing, search, parsing, and editing engine compiles without the server, behind a semver-stable facade plus a versioned MCP-parity namespace |
 
 ## How it works
 
 ```mermaid
-%%{init: {"flowchart": {"htmlLabels": false}}}%%
+%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 400}}}%%
 flowchart TD
     accTitle: SymForge architecture
     accDescr: MCP clients reach the server over stdio or HTTP. Startup restores a current-format snapshot or treats a V10 file as an untrusted seed, then the preventive lifecycle and admission scout feed the live index.
@@ -112,7 +112,7 @@ flowchart TD
     end
 
     subgraph Lanes["Answer + write lanes"]
-        TOOLS["39 advertised tools\nresources + prompts\ntrust envelopes"]
+        TOOLS["40 advertised tools\nresources + prompts\ntrust envelopes"]
         GATE["read_gate\nadmit_disk_read"]
         EDITS["structural edit engine"]
     end
@@ -148,11 +148,11 @@ Depth: [Architecture and How It Works](https://github.com/special-place-ai-heave
 
 ## Index lifecycle (V11)
 
-The 11.x binary runs the **preventive index lifecycle**. There is no flag to turn V10 behavior back on. MCP tools, resources, and prompts are the same 39/40 surface; what changed is the crate doors and what a snapshot is allowed to prove.
+The 11.x binary runs the **preventive index lifecycle**. There is no flag to turn V10 behavior back on. MCP tools, resources, and prompts are the same 40/41 surface; what changed is the crate doors and what a snapshot is allowed to prove.
 
 Operator-visible rules, from the live restore path and the embed contract:
 
-- **V10 snapshots confer no authority.** Format 8 is current. An older `index.bin` stays on disk for rollback; 11.x copies it under `.symforge/v11/` and does not restore it as current. Install a 10.x binary to read the V10 store again; it ignores `.symforge/v11/`.
+- **V10 snapshots confer no authority.** Format 10 is current. An older `index.bin` stays on disk for rollback; 11.x copies it under `.symforge/v11/` and does not restore it as current. Install a 10.x binary to read the V10 store again; it ignores `.symforge/v11/`.
 - **Corrupt current-format snapshots** still go to `.symforge/quarantine/index-snapshots/` with metadata, same as before.
 - **Embedders lost the raw index handle.** Open one `EmbeddedSourceHandle` through `ProcessIndexRuntime`. Search returns claims with provenance; refresh returns a receipt; refusals are `SourceRefusalKind`.
 - **Incomplete observations must not publish as current.** That is the reason the lifecycle exists. The live snapshot gate today is whole-file format admission (current vs prior); richer per-entry re-proof is not on the restore path yet.
@@ -221,7 +221,7 @@ The decisions that separate SymForge from "grep over MCP".
 
 ## Embed the engine
 
-SymForge is also a library. Building with `--no-default-features --features embed` compiles the parsing, indexing, search, and git core **without** the daemon, sidecar, protocol server, or CLI — and without their heavy dependencies. Server-side breakage structurally cannot reach an embedding consumer, because those modules are not in the build.
+SymForge is also a library. Building with `--no-default-features --features embed` compiles the parsing, indexing, search, editing, and git core **without** the daemon, sidecar, protocol server, or CLI — and without their heavy dependencies. Server-side breakage structurally cannot reach an embedding consumer, because those modules are not in the build.
 
 The V11 cut is a breaking change to this facade. Depend on 11.x and open one handle; do not import `symforge::live_index`.
 
@@ -240,10 +240,11 @@ let handle = runtime.open_embedded_source(
 
 `symforge::embed` is the only public coupling surface in the embed cell. Through the handle you get:
 
-- **Typed search** — `SymbolSearchRequest` / `TextSearchRequest`. Hits arrive as `Claim`s with provenance you can audit, not as a raw index dump.
+- **Typed search** — `SymbolSearchRequest` / `TextSearchRequest` / `KnowledgeSearchRequest`. Hits arrive as `Claim`s with provenance you can audit, not as a raw index dump.
 - **Refresh as a receipt** — request a refresh; completion is an `OperationReceipt`, staleness is `RetryAdvice`, never a silent stale serve. Deletions are observations, not `remove_file` commands.
 - **Engine identity** — `engine_info()` returns crate version, snapshot format version, secret-policy version, and every supported grammar as compile-time constants, in one call with no I/O.
 - **Typed refusal** — match `SourceRefusalKind`. Do not scrape error strings.
+- **MCP parity** — `symforge::embed::parity` (contract `API_VERSION` 1, versioned separately from the frozen V11 core) serves every MCP tool, resource, and prompt natively, rendered by the same shared engines as the MCP handlers. Known differences are recorded in the [parity census](./docs/reviews/2026-10-10-embed-parity-gap-matrix.md).
 
 Snapshot restore is engine-internal. You do not call a loader. A pre-existing file may accelerate re-proof; it never confers authority by itself.
 
@@ -284,15 +285,16 @@ Per-environment setup scripts: [Environment Setup Scripts](https://github.com/sp
 Installing does not touch editor configuration. Configure clients explicitly:
 
 ```bash
-symforge init                          # interactive
+symforge init                          # same as --client all
 symforge init --client claude          # also: claude-desktop, codex, gemini,
-                                       #       grok, cursor, kilo-code
+                                       #       grok, cursor, kilo-code, omp,
+                                       #       cline, roo, vscode, copilot, continue
 symforge init --client all             # every harness already installed
 ```
 
 `all` registers only harnesses whose config directory already exists, and prints one `skipped:` line per harness it passes over, naming the command that registers it. Naming a client explicitly creates its directory.
 
-Kilo Code is workspace-local — run `symforge init --client kilo-code` from the repository you want to use (`all` never writes it), and it writes configuration under `.kilocode/` and `.symforge/`.
+Kilo Code, Roo, VS Code (`vscode`), and Continue are workspace-local — run `symforge init --client <name>` from the repository you want to use (`all` never writes their project files). `kilo-code` writes `.kilo/kilo.jsonc` (or an existing root `kilo.jsonc`), `.kilocode/rules/symforge.md`, and the user-level `~/.config/kilo/` config.
 
 Already have MCP configs scattered around? `symforge init --scan` reports per-client attach status without writing anything; adding `--apply --serve-url <url>` writes an HTTP attach entry into each discovered config.
 
@@ -324,16 +326,16 @@ SymForge advertises **40 tools** over MCP `tools/list`. Forty-one are registered
 | **Search** | `search_symbols` · `search_text` · `search_files` · `symforge_retrieve` |
 | **Knowledge** | `search_knowledge` · `review_knowledge` · `curate_knowledge` |
 | **Trace impact** | `find_references` · `find_dependents` · `what_changed` · `diff_symbols` · `analyze_file_impact` · `detect_impact` · `validate_file_syntax` |
-| **Edit** | `edit_plan` · `replace_symbol_body` · `edit_within_symbol` · `insert_symbol` · `delete_symbol` · `batch_edit` · `batch_insert` · `batch_rename` · `symforge_edit` |
+| **Edit** | `edit_plan` · `replace_symbol_body` · `edit_within_symbol` · `insert_symbol` · `delete_symbol` · `batch_edit` · `batch_insert` · `batch_rename` · `symforge_edit` · `secret_remediate` |
 | **Index** | `index_folder` · `checkpoint_now` |
 
 Parameters, output shapes, and worked examples for every tool: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference).
 
-Alongside the tools, SymForge ships six MCP **resources** (repo health, outline, map, uncommitted changes, tool catalog, and a glossary of the surface's own vocabulary), four resource **templates** for file and symbol lookups, and seven **prompts** covering review, architecture, triage, onboarding, refactoring, debugging, and knowledge hygiene.
+Alongside the tools, SymForge ships six MCP **resources** (repo health, outline, map, uncommitted changes, tool catalog, and a glossary of the surface's own vocabulary), four resource **templates** for file and symbol lookups, and eight **prompts** covering review, architecture, triage, onboarding, refactoring, debugging, knowledge hygiene, and the operator dashboard.
 
-**Protocol.** Built on rmcp 3.1.0, serving MCP **2026-07-28** alongside every legacy revision back to 2024-11-05. The advertised set is a frozen allow-list, so protocol exposure changes only by deliberate edit — never by a dependency bump. Static list surfaces carry SEP-2549 cache hints; `resources/read` is pinned uncacheable and private.
+**Protocol.** Built on rmcp 3.5.0 (vendored with a lifecycle patch), serving MCP **2026-07-28** alongside every legacy revision back to 2024-11-05. The advertised set is a frozen allow-list, so protocol exposure changes only by deliberate edit — never by a dependency bump. Static list surfaces carry SEP-2549 cache hints; `resources/read` is pinned uncacheable and private.
 
-**Compact surface.** Setting `SYMFORGE_SURFACE=compact` collapses the surface to three tools (`symforge`, `symforge_edit`, `status`). It is a documented escape hatch for token-sensitive setups, not the default, and not recommended for general agent use. For scale: the full 39-tool `tools/list` payload measures 85,349 B and the compact-3 payload 4,800 B, both measured over real JSON-RPC stdio and pinned by tests that fail if inert schema bytes return.
+**Compact surface.** Setting `SYMFORGE_SURFACE=compact` collapses the surface to three tools (`symforge`, `symforge_edit`, `status`). It is a documented escape hatch for token-sensitive setups, not the default, and not recommended for general agent use. For scale: a test pins the compact-3 `tools/list` payload at or under 5,000 B and fails if inert schema bytes return to it; the full 40-tool payload carries every tool's schema and is not byte-pinned.
 
 ## Configuration
 
@@ -385,7 +387,7 @@ cargo test --no-default-features --features embed --lib -- --test-threads=1
 
 Do not pass `--all-targets` to `cargo test` with `--test-threads=1`: that flag is forwarded into the criterion bench harness (`observed_refresh_gate_v1`), which rejects it. Smoke the bench separately as above. Run the embed-feature suite in its own pass; interleaving it with the default-feature suite in one `target/` can corrupt artifacts.
 
-PR and push CI run version sync, formatting, clippy with warnings denied, the full Rust suite, the embed build including a musl cross-compile gate, a release build, and npm tests. Scheduled runs add bounded performance smoke coverage. Releases are driven by Release Please on `main`.
+PR CI runs version sync, formatting, clippy with warnings denied, the full Rust suite, the embed build including a musl cross-compile gate, a release build, and npm tests. Scheduled runs add bounded performance smoke coverage. Releases are driven by Release Please on `main`.
 
 The forward architecture direction — tree-sitter as the permanent universal Tier-0 index, with per-language semantic engines (LSP, SCIP) as optional lazily-activated depth backends — is in [docs/semantic-tier-roadmap.md](./docs/semantic-tier-roadmap.md).
 

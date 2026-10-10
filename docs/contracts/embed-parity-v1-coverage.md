@@ -1,5 +1,7 @@
 # Embed v1 coverage and acceptance — working inventory
 
+> **Status, 2026-10-11:** this is the historical worklist from the parity campaign. Parity shipped in 11.7.0 through #780. The per-surface status of record is the final census in [docs/reviews/2026-10-10-embed-parity-gap-matrix.md](../reviews/2026-10-10-embed-parity-gap-matrix.md), which marks all 59 surfaces FULL and lists the known differences. Where a row below still says pending and the census says FULL, the census is the record.
+
 As of 2026-10-10. Local unpublished work against SymForge 11.5.6. API additions are under `symforge::embed::parity`; frozen flat V11 types remain intact. This inventory is an implementation worklist, not a completed parity declaration. A row is complete only after full options, shared-engine behavior, authority, lifecycle and meaningful native/MCP fixture comparisons are verified. An Unsupported response does not close a current shipped capability gap.
 
 ## Current tools
