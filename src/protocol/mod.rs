@@ -1171,7 +1171,10 @@ impl SymForgeServer {
 
         let mut value = match serde_json::to_value(params) {
             Ok(value) => value,
-            Err(error) => return Some(format!("Daemon proxy serialization failed: {error}")),
+            Err(error) => {
+                result_status::record_read_outcome(result_status::ReadOutcome::InvalidRequest);
+                return Some(format!("Daemon proxy serialization failed: {error}"));
+            }
         };
         // A daemon session may target an ACTIVE sibling even when the caller
         // omitted `project`. If transport recovery ultimately fails, executing
@@ -1354,6 +1357,9 @@ impl SymForgeServer {
                 );
                 if let Some(refusal) = local_fallback_refusal.clone() {
                     result_status::clear_project_evidence();
+                    // A routing refusal: the request named a project this lane
+                    // cannot serve.
+                    result_status::record_read_outcome(result_status::ReadOutcome::InvalidRequest);
                     return Some(refusal);
                 }
                 self.ensure_local_index().await;
@@ -1425,6 +1431,9 @@ impl SymForgeServer {
         if !reconnected {
             if let Some(refusal) = local_fallback_refusal.clone() {
                 result_status::clear_project_evidence();
+                // A routing refusal: the request named a project this lane
+                // cannot serve.
+                result_status::record_read_outcome(result_status::ReadOutcome::InvalidRequest);
                 return Some(refusal);
             }
             self.restore_local_project_evidence();
@@ -1456,6 +1465,11 @@ impl SymForgeServer {
                     self.note_daemon_failure(client.base_url(), error.to_string());
                     if let Some(refusal) = local_fallback_refusal.clone() {
                         result_status::clear_project_evidence();
+                        // A routing refusal: the request named a project this lane
+                        // cannot serve.
+                        result_status::record_read_outcome(
+                            result_status::ReadOutcome::InvalidRequest,
+                        );
                         return Some(refusal);
                     }
                     self.ensure_local_index().await;
@@ -1473,6 +1487,11 @@ impl SymForgeServer {
                     );
                     if let Some(refusal) = local_fallback_refusal {
                         result_status::clear_project_evidence();
+                        // A routing refusal: the request named a project this lane
+                        // cannot serve.
+                        result_status::record_read_outcome(
+                            result_status::ReadOutcome::InvalidRequest,
+                        );
                         return Some(refusal);
                     }
                     self.ensure_local_index().await;
@@ -2234,7 +2253,9 @@ impl ServerHandler for SymForgeServer {
         // results attach whatever is current at render time.
         result_status::with_project_evidence_scope(initial_project_evidence, async {
             withheld::with_withheld_scope(async {
-                let response = self.tool_router.call(tcc).await;
+                // The outcome the tool's own code decided, when it recorded one.
+                let (response, recorded) =
+                    result_status::with_read_outcome_scope(self.tool_router.call(tcc)).await;
                 // FR-319 central evidence attachment (plan D1): statused results
                 // already attached evidence inside `into_call_tool_result`
                 // (single-writer wins — this seam never overwrites); plain-String
@@ -2266,6 +2287,24 @@ impl ServerHandler for SymForgeServer {
                             tool_name.as_ref(),
                             "get_file_content" | "get_symbol" | "get_symbol_context"
                         );
+                        // A plain-String tool that recorded a typed outcome gets
+                        // its status from it; a statused tool already wrote its
+                        // own (single writer). Either way the body is not re-read.
+                        if let Some(outcome) = recorded
+                            && !admitted_raw_measurement_relay
+                            && result_status::observed_outcome_class(result.meta.as_ref()).is_none()
+                        {
+                            let class = outcome.class();
+                            if class.is_error() {
+                                result.is_error = Some(true);
+                            }
+                            result.meta.get_or_insert_with(Default::default).0.insert(
+                                result_status::RESULT_STATUS_META_KEY.to_string(),
+                                serde_json::to_value(result_status::ResultStatus::new(class))
+                                    .expect("ResultStatus must serialize to JSON"),
+                            );
+                        }
+                        let typed_read = typed_read || recorded.is_some();
                         if !admitted_raw_measurement_relay
                             && !typed_read
                             && result.is_error != Some(true)
@@ -2670,6 +2709,15 @@ mod tests {
                 .expect("fake project evidence is a valid header value"),
             );
         }
+        // A current daemon types every answer it serves.
+        headers.insert(
+            crate::protocol::result_status::READ_OUTCOME_HEADER,
+            HeaderValue::from_str(
+                &serde_json::to_string(&crate::protocol::result_status::ReadOutcome::Found)
+                    .expect("serialize read outcome"),
+            )
+            .expect("read outcome is a valid header value"),
+        );
         let body = if tool_name == "index_folder" {
             "Indexed 0 files, 0 symbols.".to_string()
         } else {

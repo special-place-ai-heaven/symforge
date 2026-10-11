@@ -327,7 +327,7 @@ fn untyped_outcome(tool: &str, text: &str) -> ReadOutcome {
 /// the runtime is starting (`internal_error` with `retryable`).
 fn resource_read_error(outcome: ReadOutcome, uri: &str, text: String) -> Option<McpError> {
     Some(match outcome {
-        ReadOutcome::Found => return None,
+        ReadOutcome::Found | ReadOutcome::Empty => return None,
         ReadOutcome::NotFound => {
             McpError::resource_not_found(text, Some(serde_json::json!({ "uri": uri })))
         }
@@ -1184,8 +1184,8 @@ mod tests {
             None,
             None,
         );
-        let mut wire = WireClient::connect(loaded).await;
-        let mut unready_wire = WireClient::connect(unready).await;
+        let mut wire = WireClient::connect(loaded.clone()).await;
+        let mut unready_wire = WireClient::connect(unready.clone()).await;
         for case in CASES {
             let (uri, tool, arguments) = match &case.read {
                 Read::Content {
@@ -1230,8 +1230,8 @@ mod tests {
                         "symforge://file/context",
                         &[("path", Some(path.to_string()))],
                     )),
-                    None,
-                    serde_json::Value::Null,
+                    Some("get_file_context"),
+                    serde_json::json!({ "path": path }),
                 ),
                 Read::Symbol { path, name, kind } => {
                     let mut arguments = serde_json::json!({ "path": path, "name": name });
@@ -1288,6 +1288,16 @@ mod tests {
                         "symbol": symbol,
                     }),
                 ),
+                Read::Tool { tool, args } => (
+                    None,
+                    Some(*tool),
+                    serde_json::from_str::<serde_json::Value>(args).unwrap(),
+                ),
+                Read::FacadeQuery { query } => (
+                    None,
+                    Some("symforge"),
+                    serde_json::json!({ "query": query }),
+                ),
                 Read::Unready => (
                     Some(build_uri(
                         "symforge://file/content",
@@ -1316,8 +1326,8 @@ mod tests {
             if let Some(tool) = tool {
                 // The facade answers only on the compact surface, which the
                 // server reads from the environment at call time.
-                let _compact =
-                    matches!(case.read, Read::Facade { .. }).then(|| SurfaceEnv::set("compact"));
+                let _compact = matches!(case.read, Read::Facade { .. } | Read::FacadeQuery { .. })
+                    .then(|| SurfaceEnv::set("compact"));
                 let reply = client
                     .request(
                         "tools/call",
@@ -1332,6 +1342,17 @@ mod tests {
                     "tools/call isError: {}: {reply}",
                     case.label
                 );
+                // The same tool as a compact-facade step: the step's own
+                // typed outcome, on the same server.
+                if !matches!(case.read, Read::Facade { .. } | Read::FacadeQuery { .. }) {
+                    let server = if matches!(case.read, Read::Unready) {
+                        &unready
+                    } else {
+                        &loaded
+                    };
+                    let (_, step) = server.facade_step(tool, arguments.clone()).await;
+                    assert_eq!(step, case.expected, "facade step: {}", case.label);
+                }
             }
         }
     }
