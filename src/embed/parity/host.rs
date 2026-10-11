@@ -2744,29 +2744,11 @@ mod resource_outcome_table_tests {
         }
     }
 
-    fn row_class(refusal: Option<QueryRefusalKind>) -> OutcomeClass {
-        match refusal {
-            None => OutcomeClass::Found,
-            Some(QueryRefusalKind::NotFound) => OutcomeClass::NotFound,
-            Some(QueryRefusalKind::AmbiguousSymbol) => OutcomeClass::Ambiguous,
-            Some(_) => OutcomeClass::InvalidRequest,
-        }
-    }
-
+    /// The room's own typed outcome for a query answer, the decision its
+    /// facade steps use.
     fn output_class(output: &QueryOutput) -> OutcomeClass {
-        match output {
-            // A batch is found when any target was served (as on MCP).
-            QueryOutput::SymbolRead(value) => {
-                if value.entries.iter().any(|entry| entry.refusal.is_none()) {
-                    OutcomeClass::Found
-                } else {
-                    row_class(value.entries.first().and_then(|entry| entry.refusal))
-                }
-            }
-            QueryOutput::SymbolContext(value) => row_class(value.refusal),
-            QueryOutput::Symforge(answer) => answer.outcome,
-            _ => OutcomeClass::Found,
-        }
+        crate::embed::lifecycle::embed_query::typed_output_outcome(output)
+            .unwrap_or(OutcomeClass::Found)
     }
 
     fn open_room(repository: &std::path::Path, room_id: &str) -> HostRoom {
@@ -2923,6 +2905,29 @@ mod resource_outcome_table_tests {
                         ..Default::default()
                     }),
                 ),
+                Read::Tool { tool, args } => {
+                    let variant = match *tool {
+                        "find_references" => "ReferenceSearch",
+                        "search_knowledge" => "SearchKnowledge",
+                        "search_files" => "FileSearch",
+                        "search_text" => "TextSearch",
+                        "search_symbols" => "SymbolSearch",
+                        other => panic!("no embed query for {other}"),
+                    };
+                    let args: serde_json::Value = serde_json::from_str(args).unwrap();
+                    (
+                        None,
+                        serde_json::from_value(serde_json::json!({ variant: args }))
+                            .unwrap_or_else(|error| panic!("{}: {error}", case.label)),
+                    )
+                }
+                Read::FacadeQuery { query } => (
+                    None,
+                    QueryRequest::Symforge(crate::embed::parity::stel::StelRequest {
+                        query: query.to_string(),
+                        ..Default::default()
+                    }),
+                ),
                 Read::Unready => {
                     let request = FileContentRequest {
                         path: "src/lib.rs".to_string(),
@@ -2947,18 +2952,40 @@ mod resource_outcome_table_tests {
                 };
                 assert_eq!(class, case.expected, "room resource: {}", case.label);
             }
-            let class = match target.dispatch(
+            let reply = target.dispatch(
                 &HostRequest::Query {
-                    request: query,
+                    request: query.clone(),
                     limits: QueryLimits::default(),
                 },
                 &control,
-            ) {
+            );
+            let class = match &reply {
                 Ok(HostResponse::Query(reply)) => output_class(&reply.output),
                 Ok(_) => panic!("{}: query response", case.label),
-                Err(refusal) => refusal_class(&refusal),
+                Err(refusal) => refusal_class(refusal),
             };
             assert_eq!(class, case.expected, "room query: {}", case.label);
+            // The same answer as a compact-facade step on the room.
+            if !matches!(case.read, Read::Facade { .. } | Read::FacadeQuery { .. }) {
+                let step = match &reply {
+                    Ok(HostResponse::Query(reply)) => {
+                        crate::embed::lifecycle::embed_query::facade_step_class(
+                            &query,
+                            Ok(&reply.output),
+                            None,
+                        )
+                    }
+                    Ok(_) => unreachable!(),
+                    Err(refusal) => crate::embed::lifecycle::embed_query::facade_step_class(
+                        &query,
+                        Err(refusal
+                            .query_kind
+                            .unwrap_or(QueryRefusalKind::SourceUnavailable)),
+                        None,
+                    ),
+                };
+                assert_eq!(step, case.expected, "room facade step: {}", case.label);
+            }
         }
         drop(gate);
     }

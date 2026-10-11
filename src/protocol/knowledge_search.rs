@@ -2,4 +2,7 @@
 
 #[cfg(all(test, feature = "server"))]
 pub(crate) use crate::knowledge::search::select_scoped_sources;
-pub(crate) use crate::knowledge::search::{search_scoped, validate_input};
+pub(crate) use crate::knowledge::search::{
+    KnowledgeSearchProjection, budget_summary, search_scoped, search_scoped_projection,
+    validate_input,
+};

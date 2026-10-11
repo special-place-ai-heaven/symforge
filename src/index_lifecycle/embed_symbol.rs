@@ -260,8 +260,12 @@ pub(super) fn read(
     if estimate {
         full.rendered = format!("Estimated tokens: {}", estimated_tokens.unwrap_or(0));
     } else {
-        budget.cache_output = Some(QueryOutput::SymbolRead(full.clone()));
-        budget.cache_truncated = budget.truncated;
+        // Only a read that served every target is replayed: a repeat hit has
+        // no rows, so it must stand for a found read (as on MCP).
+        if full.entries.iter().all(|entry| entry.refusal.is_none()) {
+            budget.cache_output = Some(QueryOutput::SymbolRead(full.clone()));
+            budget.cache_truncated = budget.truncated;
+        }
         let token_limit = super::guidance::file_read::resolve_read_max_tokens(
             request.max_tokens,
             full.rendered.len(),

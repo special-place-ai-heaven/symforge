@@ -2216,3 +2216,154 @@ fn diff(
         partial: before_partial || after_partial,
     })
 }
+
+/// A compact-facade step's outcome on the embedded room: the typed refusal,
+/// or the native answer's typed outcome. `live`, when given, refines an
+/// implementations lookup for a name no file defines into a miss (as on MCP).
+/// A step answer with no typed outcome is a defect and reads as an internal
+/// failure (the step-tool guard test fails), never as a class guessed from text.
+pub(crate) fn facade_step_class(
+    request: &QueryRequest,
+    result: Result<&QueryOutput, QueryRefusalKind>,
+    live: Option<&crate::live_index::LiveIndex>,
+) -> crate::embed::lifecycle::guidance::outcome::OutcomeClass {
+    use crate::embed::lifecycle::guidance::outcome::OutcomeClass;
+    let output = match result {
+        // MCP's `explore` serves a stopword-only query as an answer.
+        Err(QueryRefusalKind::InvalidRequest) if matches!(request, QueryRequest::Explore(_)) => {
+            return OutcomeClass::Found;
+        }
+        Err(kind) => return refused_class(kind),
+        Ok(output) => output,
+    };
+    let Some(class) = typed_output_outcome(output) else {
+        debug_assert!(false, "facade step output has no typed outcome");
+        return OutcomeClass::InternalFailure;
+    };
+    if class == OutcomeClass::EmptyResult
+        && let QueryRequest::ReferenceSearch(input) = request
+        && input.mode.as_deref() == Some("implementations")
+        && let Some(live) = live
+        && !live
+            .all_files()
+            .any(|(_, file)| file.symbols.iter().any(|symbol| symbol.name == input.name))
+    {
+        return OutcomeClass::NotFound;
+    }
+    class
+}
+
+/// The outcome class of a native refusal.
+pub(crate) fn refused_class(
+    kind: QueryRefusalKind,
+) -> crate::embed::lifecycle::guidance::outcome::OutcomeClass {
+    use crate::embed::lifecycle::guidance::outcome::OutcomeClass;
+    match kind {
+        QueryRefusalKind::NotFound => OutcomeClass::NotFound,
+        QueryRefusalKind::AmbiguousSymbol => OutcomeClass::Ambiguous,
+        QueryRefusalKind::InvalidRequest
+        | QueryRefusalKind::UnsupportedOption
+        | QueryRefusalKind::InvalidSpan => OutcomeClass::InvalidRequest,
+        _ => OutcomeClass::InternalFailure,
+    }
+}
+
+/// The typed outcome of a native query answer, decided from its structured
+/// result exactly as MCP's tool decides its own status, never from the rendered
+/// text, which carries repository content. `None` for outputs with no read
+/// outcome of their own.
+pub(crate) fn typed_output_outcome(
+    output: &QueryOutput,
+) -> Option<crate::embed::lifecycle::guidance::outcome::OutcomeClass> {
+    use crate::embed::lifecycle::guidance::outcome::OutcomeClass;
+    let refused = refused_class;
+    let empty_or_found = |empty: bool| {
+        if empty {
+            OutcomeClass::EmptyResult
+        } else {
+            OutcomeClass::Found
+        }
+    };
+    Some(match output {
+        QueryOutput::FileContent(_) | QueryOutput::FileContext(_) => OutcomeClass::Found,
+        // A batch is found when any target was served.
+        QueryOutput::SymbolRead(value) => {
+            // A repeat hit or an estimate carries no rows; only served reads
+            // are replayed, and an estimate answers the size it found.
+            if value.entries.is_empty() {
+                return (value.cache_hit || value.estimated_tokens.is_some())
+                    .then_some(OutcomeClass::Found);
+            }
+            if value.entries.iter().any(|entry| entry.refusal.is_none()) {
+                OutcomeClass::Found
+            } else {
+                value.entries[0]
+                    .refusal
+                    .map_or(OutcomeClass::Found, refused)
+            }
+        }
+        QueryOutput::SymbolContext(value) => value.refusal.map_or(OutcomeClass::Found, refused),
+        QueryOutput::TextSearch(value) => empty_or_found(value.total_matches == 0),
+        QueryOutput::SymbolSearch(value) => empty_or_found(value.total_matches == 0),
+        QueryOutput::FileSearch(value) => file_search_outcome(value),
+        QueryOutput::SearchKnowledge(value) => {
+            if value.sources.is_empty() {
+                OutcomeClass::InternalFailure
+            } else {
+                empty_or_found(value.absence.is_some())
+            }
+        }
+        QueryOutput::ReferenceSearch(value) => empty_or_found(value.total_references == 0),
+        QueryOutput::Symforge(answer) => answer.outcome,
+        QueryOutput::DependentSearch(_)
+        | QueryOutput::RepoMap(_)
+        | QueryOutput::WhatChanged(_)
+        | QueryOutput::DiffSymbols(_)
+        | QueryOutput::DetectImpact(_)
+        | QueryOutput::FileImpact(_)
+        | QueryOutput::Ask(_)
+        | QueryOutput::Exploration(_)
+        | QueryOutput::Conventions(_)
+        | QueryOutput::ContextInventory(_)
+        | QueryOutput::InvestigationSuggestion(_)
+        | QueryOutput::RetrievedOutput(_)
+        | QueryOutput::SearchEstimate(_)
+        | QueryOutput::FileReadEstimate(_) => OutcomeClass::Found,
+        _ => return None,
+    })
+}
+
+/// `search_files`, from its structured result: an exact resolution, the
+/// deprecated co-change lookup, or a ranked search.
+fn file_search_outcome(
+    value: &crate::embed::parity::search::FileSearchResult,
+) -> crate::embed::lifecycle::guidance::outcome::OutcomeClass {
+    use crate::embed::lifecycle::guidance::outcome::OutcomeClass;
+    use crate::embed::parity::search::{CoChangeState, FileResolution};
+    if let Some(resolution) = &value.resolution {
+        return match resolution {
+            FileResolution::Resolved { .. } => OutcomeClass::Found,
+            FileResolution::Ambiguous { .. } => OutcomeClass::Ambiguous,
+            FileResolution::NotFound => OutcomeClass::NotFound,
+        };
+    }
+    if let Some(cochange) = value
+        .cochange
+        .as_ref()
+        .filter(|summary| summary.deprecated_changed_with)
+    {
+        return match cochange.state {
+            CoChangeState::NoHistory => OutcomeClass::NotFound,
+            CoChangeState::NoCoupling => OutcomeClass::EmptyResult,
+            CoChangeState::Loading
+            | CoChangeState::Unavailable { .. }
+            | CoChangeState::Strong
+            | CoChangeState::Weak => OutcomeClass::Found,
+        };
+    }
+    if value.hits.is_empty() {
+        OutcomeClass::NotFound
+    } else {
+        OutcomeClass::Found
+    }
+}

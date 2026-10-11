@@ -314,6 +314,57 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     build_plan_from_steps(request, vec![step])
 }
 
+/// The compact facade's step tools, read from the code that produces them, for
+/// the step-tool guard tests: `(planned, embedded)`, where `planned` is every
+/// tool this planner can emit as a runnable step (its own `planned(..)` and
+/// `PlannedStep` literals plus the smart-query routes it falls back to) and
+/// `embedded` every tool the embedded facade dispatches (`step_request`). A
+/// step tool added to either without a typed outcome fails those tests.
+#[cfg(test)]
+pub(crate) fn facade_step_tool_sets() -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    fn capture(pattern: &str, text: &str) -> std::collections::BTreeSet<String> {
+        regex::Regex::new(pattern)
+            .expect("step-tool pattern")
+            .captures_iter(text)
+            .map(|captures| captures[1].to_string())
+            .collect()
+    }
+    fn before_tests(text: &str) -> &str {
+        text.find("#[cfg(test)]\nmod tests")
+            .map_or(text, |end| &text[..end])
+    }
+    // Line endings normalized: a CRLF checkout must scan the same as LF.
+    let planner_src = include_str!("planner.rs").replace("\r\n", "\n");
+    let planner = before_tests(&planner_src);
+    let smart_query_src =
+        include_str!("../index_lifecycle/guidance/smart_query.rs").replace("\r\n", "\n");
+    let smart_query = smart_query_src.as_str();
+    let routes = smart_query
+        .find("pub fn route_tool_name")
+        .or_else(|| smart_query.find("fn route_tool_name"))
+        .map(|start| {
+            let end = smart_query[start..]
+                .find("\n}\n")
+                .map_or(smart_query.len(), |end| start + end);
+            &smart_query[start..end]
+        })
+        .expect("smart_query::route_tool_name");
+    let mut planned = capture(r#"planned\(\s*"([a-z_]+)""#, planner);
+    planned.extend(capture(r#"tool:\s*"([a-z_]+)"\.to_string\(\)"#, planner));
+    planned.extend(capture(r#"=> "([a-z_]+)""#, routes));
+    let embed_src = include_str!("../index_lifecycle/embed_symforge.rs").replace("\r\n", "\n");
+    let embed = embed_src.as_str();
+    let start = embed.find("fn step_request").expect("embed step_request");
+    let end = embed[start..]
+        .find("\n}\n")
+        .map_or(embed.len(), |end| start + end);
+    let embedded = capture(r#"(?m)^\s+"([a-z_]+)"\s*=>"#, &embed[start..end]);
+    (planned, embedded)
+}
+
 fn facade_ccr_retrieval_step(request: &StelRequest) -> Option<PlannedStep> {
     const PREFIX: &str = "retrieve ccr hash ";
     let query = request.query.trim();

@@ -103,41 +103,6 @@ fn refusal(text: impl Into<String>) -> Result<QueryOutput, QueryRefusalKind> {
     ))
 }
 
-/// The typed outcome of a read primitive's native answer: a served file read,
-/// or a symbol read whose rows carry their own refusal. `None` for primitives
-/// whose answer has no typed outcome.
-fn typed_read_outcome(output: &QueryOutput) -> Option<OutcomeClass> {
-    let refused = match output {
-        QueryOutput::FileContent(_) | QueryOutput::FileContext(_) => None,
-        QueryOutput::SymbolRead(value) => {
-            if value.entries.is_empty() {
-                return None;
-            }
-            if value.entries.iter().any(|entry| entry.refusal.is_none()) {
-                None
-            } else {
-                value.entries[0].refusal
-            }
-        }
-        QueryOutput::SymbolContext(value) => value.refusal,
-        _ => return None,
-    };
-    Some(refused.map_or(OutcomeClass::Found, refused_outcome))
-}
-
-/// The outcome MCP's classifier would report for a primitive whose native
-/// lane refused instead of rendering an answer.
-fn refused_outcome(kind: QueryRefusalKind) -> OutcomeClass {
-    match kind {
-        QueryRefusalKind::NotFound => OutcomeClass::NotFound,
-        QueryRefusalKind::AmbiguousSymbol => OutcomeClass::Ambiguous,
-        QueryRefusalKind::InvalidRequest
-        | QueryRefusalKind::UnsupportedOption
-        | QueryRefusalKind::InvalidSpan => OutcomeClass::InvalidRequest,
-        _ => OutcomeClass::InternalFailure,
-    }
-}
-
 pub(super) fn project(
     snapshot: &EmbeddedQuerySnapshot,
     request: &StelRequest,
@@ -151,8 +116,7 @@ pub(super) fn project(
         ServedStepResult, apply_compact_serve_caps, apply_degrade_to_plan, chain_failure_decision,
         format_bypass_body, format_cache_hit_body, format_multi_step_serve_body,
         format_partial_multi_step_serve_body, format_single_step_serve_body, is_degrade,
-        route_tool_label, serve_chain_outcome_class, serve_step_outcome,
-        should_skip_legacy_dispatch, tools_executed,
+        route_tool_label, serve_chain_outcome_class, should_skip_legacy_dispatch, tools_executed,
     };
     use crate::stel::handler::{self, metrics_for_decision_tuned};
     use crate::stel::planner::{build_plan, plan_summary_line};
@@ -302,10 +266,13 @@ pub(super) fn project(
                     Some(rendered) => rendered?,
                     None => render_output(session, &nested, &output)?,
                 };
-                // A read output carries its outcome typed; MCP's facade uses the
-                // same typed outcome its read tool recorded.
-                let step_outcome = typed_read_outcome(&output)
-                    .unwrap_or_else(|| serve_step_outcome(&step.tool, &body));
+                // The step's typed outcome, decided from the native result as
+                // MCP's tool decides its own; the body never decides.
+                let step_outcome = super::embed_query::facade_step_class(
+                    &nested,
+                    Ok(&output),
+                    Some(&snapshot.generation.live),
+                );
                 (body, Some(Box::new(output)), step_outcome)
             }
             Err(QueryRefusalKind::Cancelled) => return Err(QueryRefusalKind::Cancelled),
@@ -317,15 +284,19 @@ pub(super) fn project(
             }
             // MCP's `explore` answers a stopword-only query with this text
             // as a served body; the shared engine's refusal is the same one.
-            Err(QueryRefusalKind::InvalidRequest) if step.tool == "explore" => {
-                let body = "Explore requires a non-empty query.".to_string();
-                let step_outcome = serve_step_outcome(&step.tool, &body);
-                (body, None, step_outcome)
-            }
+            Err(QueryRefusalKind::InvalidRequest) if step.tool == "explore" => (
+                "Explore requires a non-empty query.".to_string(),
+                None,
+                super::embed_query::facade_step_class(
+                    &nested,
+                    Err(QueryRefusalKind::InvalidRequest),
+                    None,
+                ),
+            ),
             Err(kind) => (
                 format!("Error: {} refused: {kind:?}", step.tool),
                 None,
-                refused_outcome(kind),
+                super::embed_query::facade_step_class(&nested, Err(kind), None),
             ),
         };
         if step.tool == "search_knowledge" {
@@ -569,4 +540,131 @@ fn render_output(
         QueryOutput::DetectImpact(value) => value.rendered.clone(),
         _ => super::embed_ask::render_routed(request, output)?,
     })
+}
+
+#[cfg(test)]
+mod step_tool_guard_tests {
+    use super::*;
+    use crate::embed::ProcessIndexRuntime;
+    use crate::embed::parity::QueryLimits;
+    use crate::embed::parity::host::{
+        HostLimits, HostPhase, HostRequest, HostResponse, HostRights, HostRoom, HostRoomConfig,
+        HostRoomGrant,
+    };
+    use std::time::{Duration, Instant};
+
+    fn guard_args(tool: &str) -> Value {
+        match tool {
+            "get_file_content" | "get_file_context" | "find_dependents" | "analyze_file_impact" => {
+                serde_json::json!({ "path": "src/lib.rs" })
+            }
+            "get_symbol" => serde_json::json!({ "path": "src/lib.rs", "name": "alpha" }),
+            "get_symbol_context" | "find_references" => serde_json::json!({ "name": "alpha" }),
+            "search_text" | "search_symbols" | "search_files" | "search_knowledge" | "explore" => {
+                serde_json::json!({ "query": "alpha" })
+            }
+            "ask" => serde_json::json!({ "query": "who calls alpha" }),
+            "symforge_retrieve" => serde_json::json!({ "hash": "000000000000" }),
+            "what_changed"
+            | "diff_symbols"
+            | "detect_impact"
+            | "get_repo_map"
+            | "conventions"
+            | "context_inventory"
+            | "investigation_suggest"
+            | "health_compact" => {
+                serde_json::json!({})
+            }
+            other => panic!(
+                "facade step tool `{other}` has no guard arguments: add it here and give it \
+                 a typed outcome"
+            ),
+        }
+    }
+
+    /// Guard: every tool the embedded facade dispatches, and every tool the
+    /// planner can emit that the room runs, answers with a typed outcome: a
+    /// typed refusal, or an output `facade_step_class` types without guessing.
+    /// A planned tool the room cannot dispatch is refused as a whole facade
+    /// request (typed), and is named here so the gap is explicit.
+    #[test]
+    fn every_facade_step_tool_has_a_typed_outcome_on_the_room() {
+        let (planned, embedded) = crate::stel::planner::facade_step_tool_sets();
+        let repository = tempfile::tempdir().unwrap();
+        git2::Repository::init(repository.path()).unwrap();
+        std::fs::create_dir_all(repository.path().join("src")).unwrap();
+        std::fs::write(
+            repository.path().join("src/lib.rs"),
+            "pub fn alpha() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        let grant = HostRoomGrant::new(
+            "step-guard".into(),
+            repository.path().to_path_buf(),
+            "step-guard-source".into(),
+            HostRights::read_only(),
+        )
+        .unwrap();
+        let room = HostRoom::open(
+            ProcessIndexRuntime::acquire().unwrap(),
+            grant,
+            HostRoomConfig {
+                room_id: "step-guard".into(),
+                limits: HostLimits::default(),
+            },
+        )
+        .unwrap();
+        let control = room.control().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let HostResponse::Status(status) =
+                room.dispatch(&HostRequest::Status, &control).unwrap()
+            else {
+                panic!("status response");
+            };
+            if status.phase == HostPhase::Current {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source did not publish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut not_dispatched = Vec::new();
+        for tool in planned.union(&embedded) {
+            let request = match step_request(tool, &guard_args(tool)) {
+                Ok(request) => request,
+                Err(_) => {
+                    assert!(
+                        !embedded.contains(tool),
+                        "the room dispatch set names `{tool}` but cannot build its request"
+                    );
+                    not_dispatched.push(tool.clone());
+                    continue;
+                }
+            };
+            match room.dispatch(
+                &HostRequest::Query {
+                    request: request.clone(),
+                    limits: QueryLimits::default(),
+                },
+                &control,
+            ) {
+                Ok(HostResponse::Query(reply)) => assert!(
+                    crate::embed::lifecycle::embed_query::typed_output_outcome(&reply.output)
+                        .is_some(),
+                    "facade step tool `{tool}` answers with an untyped output on the room"
+                ),
+                Ok(_) => panic!("`{tool}`: query response"),
+                // A refusal is typed by its kind.
+                Err(refusal) => assert!(
+                    refusal.query_kind.is_some()
+                        || refusal.kind
+                            != crate::embed::parity::host::HostRefusalKind::EngineFailure,
+                    "`{tool}` refused without a typed kind: {refusal:?}"
+                ),
+            }
+        }
+        // Planned steps the room does not dispatch: refused as a whole facade
+        // request with a typed refusal. Pinned so a change is deliberate.
+        assert_eq!(not_dispatched, vec!["health_compact".to_string()]);
+    }
 }

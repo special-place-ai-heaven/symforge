@@ -338,6 +338,17 @@ pub(crate) mod read_outcome_cases {
         ),
         ("config.yaml", "Error: boom\nok: yes\n"),
         (
+            "src/refs.rs",
+            "pub fn target() {}\n\npub fn user() {\n    target(); // this symbol is not defined in the indexed project\n}\n",
+        ),
+        (
+            "docs/matcher.md",
+            "# Matcher notes\n\nThe matcher reports\nNo match: when nothing fits the pattern.\n",
+        ),
+        ("src/Ambiguous path hint/guide.rs", "pub fn guide() {}\n"),
+        ("src/a/twin.rs", "pub fn twin_a() {}\n"),
+        ("src/b/twin.rs", "pub fn twin_b() {}\n"),
+        (
             "notes/error.txt",
             "Error: this file starts like an error\nsecond line\n",
         ),
@@ -386,6 +397,16 @@ pub(crate) mod read_outcome_cases {
         },
         /// A raw read of `src/lib.rs` while the index has not published.
         Unready,
+        /// Tool only: a search-family tool with JSON arguments.
+        Tool {
+            tool: &'static str,
+            args: &'static str,
+        },
+        /// Tool only: the compact `symforge` facade planning one step from a
+        /// natural-language query.
+        FacadeQuery {
+            query: &'static str,
+        },
     }
 
     pub(crate) struct Case {
@@ -602,6 +623,123 @@ pub(crate) mod read_outcome_cases {
                 symbol: "Error",
             },
             expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "find_references hit whose line carries the not-defined phrase",
+            read: Read::Tool {
+                tool: "find_references",
+                args: r#"{"name": "target"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "facade find_references hit whose line carries the not-defined phrase",
+            read: Read::FacadeQuery {
+                query: "who calls target",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "find_references with no references",
+            read: Read::Tool {
+                tool: "find_references",
+                args: r#"{"name": "caller"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
+        },
+        Case {
+            label: "find_references in a missing file",
+            read: Read::Tool {
+                tool: "find_references",
+                args: r#"{"name": "target", "path": "src/missing.rs"}"#,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "knowledge snippet with a line starting No match:",
+            read: Read::Tool {
+                tool: "search_knowledge",
+                args: r#"{"query": "matcher reports"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "facade knowledge snippet with a line starting No match:",
+            read: Read::FacadeQuery {
+                query: "search knowledge for matcher reports",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "knowledge search with no match",
+            read: Read::Tool {
+                tool: "search_knowledge",
+                args: r#"{"query": "zqxjv wkpfh"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
+        },
+        Case {
+            label: "search_files hit under a path carrying Ambiguous path hint",
+            read: Read::Tool {
+                tool: "search_files",
+                args: r#"{"query": "guide.rs"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "facade search_files hit under a path carrying Ambiguous path hint",
+            read: Read::FacadeQuery {
+                query: "files named guide.rs",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "search_files ambiguous resolution",
+            read: Read::Tool {
+                tool: "search_files",
+                args: r#"{"query": "twin.rs", "resolve": true}"#,
+            },
+            expected: OutcomeClass::Ambiguous,
+        },
+        Case {
+            label: "search_files with no match",
+            read: Read::Tool {
+                tool: "search_files",
+                args: r#"{"query": "zqxjvwkpfh.rs"}"#,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "search_text hit",
+            read: Read::Tool {
+                tool: "search_text",
+                args: r#"{"query": "not defined in the indexed project"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "search_text with no match",
+            read: Read::Tool {
+                tool: "search_text",
+                args: r#"{"query": "zqxjvwkpfh"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
+        },
+        Case {
+            label: "search_symbols hit",
+            read: Read::Tool {
+                tool: "search_symbols",
+                args: r#"{"query": "target"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "search_symbols with no match",
+            read: Read::Tool {
+                tool: "search_symbols",
+                args: r#"{"query": "zqxjvwkpfh"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
         },
         Case {
             label: "read while the index is unready",
